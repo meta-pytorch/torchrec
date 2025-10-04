@@ -57,12 +57,7 @@ from torchrec.quant.embedding_modules import (
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 # Import the shared types and utilities from benchmark_utils
-from .benchmark_base import (
-    benchmark,
-    BenchmarkResult,
-    CompileMode,
-    multi_process_benchmark,
-)
+from .base import benchmark, BenchmarkResult, CompileMode, multi_process_benchmark
 
 logger: logging.Logger = logging.getLogger()
 

@@ -13,7 +13,7 @@ from typing import Any, List
 
 import click
 import torch
-from torchrec.distributed.benchmark.benchmark_base import benchmark_func
+from torchrec.distributed.benchmark.base import benchmark_func
 from torchrec.distributed.embedding import EmbeddingCollectionContext
 from torchrec.distributed.embedding_sharding import _set_sharding_context_post_a2a
 from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext

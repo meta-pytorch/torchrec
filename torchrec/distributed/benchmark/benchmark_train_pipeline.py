@@ -16,7 +16,7 @@ Buck2 (internal):
 OSS (external):
     python -m torchrec.distributed.benchmark.benchmark_train_pipeline --world_size=4 --pipeline=sparse --batch_size=10
 
-Adding New Model Support:
+To support a new model in pipeline benchmark:
     See benchmark_pipeline_utils.py for step-by-step instructions.
 """
 
@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Type
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torch import nn
-from torchrec.distributed.benchmark.benchmark_base import (
+from torchrec.distributed.benchmark.base import (
     benchmark_func,
     BenchmarkResult,
     cmd_conf,
@@ -37,7 +37,6 @@ from torchrec.distributed.benchmark.benchmark_utils import (
     BaseModelConfig,
     create_model_config,
     generate_data,
-    generate_pipeline,
     generate_planner,
     generate_sharded_model_and_optimizer,
 )
@@ -49,9 +48,10 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     run_multi_process_func,
 )
+from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
 from torchrec.distributed.test_utils.test_input import ModelInput
 from torchrec.distributed.test_utils.test_model import TestOverArchLarge
-from torchrec.distributed.test_utils.test_tables import EmbeddingTablesConfig
+from torchrec.distributed.test_utils.train_pipeline import PipelineConfig
 from torchrec.distributed.train_pipeline import TrainPipeline
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -114,33 +114,6 @@ class RunOptions:
     sparse_momentum: Optional[float] = None
     sparse_weight_decay: Optional[float] = None
     export_stacks: bool = False
-
-
-@dataclass
-class PipelineConfig:
-    """
-    Configuration for training pipelines.
-
-    This class defines the parameters for configuring the training pipeline.
-
-    Args:
-        pipeline (str): The type of training pipeline to use. Options include:
-            - "base": Basic training pipeline
-            - "sparse": Pipeline optimized for sparse operations
-            - "fused": Pipeline with fused sparse distribution
-            - "semi": Semi-synchronous training pipeline
-            - "prefetch": Pipeline with prefetching for sparse distribution
-            Default is "base".
-        emb_lookup_stream (str): The stream to use for embedding lookups.
-            Only used by certain pipeline types (e.g., "fused").
-            Default is "data_dist".
-        apply_jit (bool): Whether to apply JIT (Just-In-Time) compilation to the model.
-            Default is False.
-    """
-
-    pipeline: str = "base"
-    emb_lookup_stream: str = "data_dist"
-    apply_jit: bool = False
 
 
 @dataclass
@@ -279,13 +252,10 @@ def runner(
                 except StopIteration:
                     break
 
-        pipeline = generate_pipeline(
-            pipeline_type=pipeline_config.pipeline,
-            emb_lookup_stream=pipeline_config.emb_lookup_stream,
+        pipeline = pipeline_config.generate_pipeline(
             model=sharded_model,
             opt=optimizer,
             device=ctx.device,
-            apply_jit=pipeline_config.apply_jit,
         )
         pipeline.progress(iter(bench_inputs))
 
