@@ -20,7 +20,7 @@ import torch
 # Otherwise will get error
 # NotImplementedError: fbgemm::permute_1D_sparse_data: We could not find the abstract impl for this operator.
 from fbgemm_gpu import sparse_ops  # noqa: F401, E402
-from torchrec.distributed.benchmark.benchmark_base import (
+from torchrec.distributed.benchmark.base import (
     BenchmarkResult,
     CPUMemoryStats,
     GPUMemoryStats,
