@@ -26,7 +26,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     ComputeDevice,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-from torchrec.distributed.benchmark.benchmark_base import benchmark_func
+from torchrec.distributed.benchmark.base import benchmark_func
 from torchrec.distributed.test_utils.test_model import ModelInput
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor

@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List
 import click
 
 import torch
-from torchrec.distributed.benchmark.benchmark_base import (
+from torchrec.distributed.benchmark.base import (
     benchmark,
     BenchmarkResult,
     CPUMemoryStats,
