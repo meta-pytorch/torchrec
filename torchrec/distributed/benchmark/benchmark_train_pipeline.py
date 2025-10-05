@@ -78,7 +78,7 @@ class RunOptions:
             Default is "kjt" (KeyedJaggedTensor).
         profile (str): Directory to save profiling results. If empty, profiling is disabled.
             Default is "" (disabled).
-        profile_name (str): Name of the profiling file. Default is pipeline classname.
+        name (str): Name of the profiling file. Default is pipeline classname.
         planner_type (str): Type of sharding planner to use. Options are:
             - "embedding": EmbeddingShardingPlanner (default)
             - "hetero": HeteroEmbeddingShardingPlanner
@@ -100,8 +100,8 @@ class RunOptions:
     sharding_type: ShardingType = ShardingType.TABLE_WISE
     compute_kernel: EmbeddingComputeKernel = EmbeddingComputeKernel.FUSED
     input_type: str = "kjt"
-    profile: str = ""
-    profile_name: str = ""
+    name: str = ""
+    profile_dir: str = ""
     planner_type: str = "embedding"
     pooling_factors: Optional[List[float]] = None
     num_poolings: Optional[List[float]] = None
@@ -261,15 +261,13 @@ def runner(
 
         result = benchmark_func(
             name=(
-                type(pipeline).__name__
-                if run_option.profile_name == ""
-                else run_option.profile_name
+                type(pipeline).__name__ if run_option.name == "" else run_option.name
             ),
             bench_inputs=bench_inputs,  # pyre-ignore
             prof_inputs=bench_inputs,  # pyre-ignore
             num_benchmarks=5,
             num_profiles=2,
-            profile_dir=run_option.profile,
+            profile_dir=run_option.profile_dir,
             world_size=run_option.world_size,
             func_to_benchmark=_func_to_benchmark,
             benchmark_func_kwargs={"model": sharded_model, "pipeline": pipeline},

@@ -57,7 +57,12 @@ from torchrec.quant.embedding_modules import (
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 
 # Import the shared types and utilities from benchmark_utils
-from .base import benchmark, BenchmarkResult, CompileMode, multi_process_benchmark
+from .base import (
+    benchmark_model_with_warmup,
+    BenchmarkResult,
+    CompileMode,
+    multi_process_benchmark,
+)
 
 logger: logging.Logger = logging.getLogger()
 
@@ -456,7 +461,7 @@ def _init_module_and_run_benchmark(
         else:
             name = _benchmark_type_name(compile_mode, sharding_type)
 
-        res = benchmark(
+        res = benchmark_model_with_warmup(
             name,
             module,
             warmup_inputs_cuda,

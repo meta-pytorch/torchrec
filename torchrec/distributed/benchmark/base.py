@@ -681,7 +681,7 @@ def _run_benchmark_core(
     )
 
 
-def benchmark(
+def benchmark_model_with_warmup(
     name: str,
     model: torch.nn.Module,
     warmup_inputs: Union[List[KeyedJaggedTensor], List[Dict[str, Any]]],
@@ -750,6 +750,26 @@ def benchmark_func(
     pre_gpu_load: int = 0,
     export_stacks: bool = False,
 ) -> BenchmarkResult:
+    """
+    Args:
+        name: Human-readable benchmark name.
+
+        bench_inputs: List[Dict[str, Any]] will be fed to the function at once
+        prof_inputs: List[Dict[str, Any]] will be fed to the function at once
+        benchmark_func_kwargs: kwargs to be passed to func_to_benchmark
+        func_to_benchmark: Callable that executes one measured iteration.
+            func_to_benchmark(batch_inputs, **kwargs)
+
+        world_size, rank: Distributed context to correctly reset / collect GPU
+            stats. ``rank == -1`` means single-process mode.
+        num_benchmarks: Number of measured iterations.
+        device_type: "cuda" or "cpu".
+        profile_dir: Where to write chrome traces / stack files.
+
+        pre_gpu_load: Number of dummy matmul operations to run before the first
+            measured iteration (helps simulating a loaded allocator).
+        export_stacks: Whether to export flamegraph-compatible stack files.
+    """
     if benchmark_func_kwargs is None:
         benchmark_func_kwargs = {}
 
