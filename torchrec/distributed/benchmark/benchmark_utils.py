@@ -10,7 +10,7 @@
 """
 Utilities for benchmarking training pipelines with different model configurations.
 
-Adding New Model Support:
+To support a new model in pipeline benchmark:
     1. Create config class inheriting from BaseModelConfig with generate_model() method
     2. Add the model to model_configs dict in create_model_config()
     3. Add model-specific params to ModelSelectionConfig and create_model_config's arguments in benchmark_train_pipeline.py
@@ -38,15 +38,6 @@ from torchrec.distributed.test_utils.test_model import (
     TestSparseNN,
     TestTowerCollectionSparseNN,
     TestTowerSparseNN,
-)
-from torchrec.distributed.train_pipeline import (
-    TrainPipelineBase,
-    TrainPipelineFusedSparseDist,
-    TrainPipelineSparseDist,
-)
-from torchrec.distributed.train_pipeline.train_pipelines import (
-    PrefetchTrainPipelineSparseDist,
-    TrainPipelineSemiSync,
 )
 from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingType
 from torchrec.models.deepfm import SimpleDeepFMNNWrapper
@@ -247,80 +238,6 @@ def create_model_config(model_name: str, **kwargs) -> BaseModelConfig:
     filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_field_names}
 
     return model_class(**filtered_kwargs)
-
-
-def generate_pipeline(
-    pipeline_type: str,
-    emb_lookup_stream: str,
-    model: nn.Module,
-    opt: torch.optim.Optimizer,
-    device: torch.device,
-    apply_jit: bool = False,
-) -> Union[TrainPipelineBase, TrainPipelineSparseDist]:
-    """
-    Generate a training pipeline instance based on the configuration.
-
-    This function creates and returns the appropriate training pipeline object
-    based on the pipeline type specified. Different pipeline types are optimized
-    for different training scenarios.
-
-    Args:
-        pipeline_type (str): The type of training pipeline to use. Options include:
-            - "base": Basic training pipeline
-            - "sparse": Pipeline optimized for sparse operations
-            - "fused": Pipeline with fused sparse distribution
-            - "semi": Semi-synchronous training pipeline
-            - "prefetch": Pipeline with prefetching for sparse distribution
-        emb_lookup_stream (str): The stream to use for embedding lookups.
-            Only used by certain pipeline types (e.g., "fused").
-        model (nn.Module): The model to be trained.
-        opt (torch.optim.Optimizer): The optimizer to use for training.
-        device (torch.device): The device to run the training on.
-        apply_jit (bool): Whether to apply JIT (Just-In-Time) compilation to the model.
-            Default is False.
-
-    Returns:
-        Union[TrainPipelineBase, TrainPipelineSparseDist]: An instance of the
-        appropriate training pipeline class based on the configuration.
-
-    Raises:
-        RuntimeError: If an unknown pipeline type is specified.
-    """
-
-    _pipeline_cls: Dict[
-        str, Type[Union[TrainPipelineBase, TrainPipelineSparseDist]]
-    ] = {
-        "base": TrainPipelineBase,
-        "sparse": TrainPipelineSparseDist,
-        "fused": TrainPipelineFusedSparseDist,
-        "semi": TrainPipelineSemiSync,
-        "prefetch": PrefetchTrainPipelineSparseDist,
-    }
-
-    if pipeline_type == "semi":
-        return TrainPipelineSemiSync(
-            model=model,
-            optimizer=opt,
-            device=device,
-            start_batch=0,
-            apply_jit=apply_jit,
-        )
-    elif pipeline_type == "fused":
-        return TrainPipelineFusedSparseDist(
-            model=model,
-            optimizer=opt,
-            device=device,
-            emb_lookup_stream=emb_lookup_stream,
-            apply_jit=apply_jit,
-        )
-    elif pipeline_type == "base":
-        assert apply_jit is False, "JIT is not supported for base pipeline"
-
-        return TrainPipelineBase(model=model, optimizer=opt, device=device)
-    else:
-        Pipeline = _pipeline_cls[pipeline_type]
-        # pyre-ignore[28]
-        return Pipeline(model=model, optimizer=opt, device=device, apply_jit=apply_jit)
 
 
 def generate_data(
