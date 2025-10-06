@@ -440,7 +440,7 @@ def all2all_pooled_sync(
         input_split_sizes = [D_local_sum * B_rank for B_rank in batch_size_per_rank]
         qcomm_ctx = None
 
-    with record_function("## alltoall_fwd_single ##"):
+    with record_function("## all2all_pooled ##"):
         sharded_output_embeddings = AllToAllSingle.apply(
             sharded_input_embeddings,
             output_split_sizes,
@@ -558,7 +558,7 @@ def variable_batch_all2all_pooled_sync(
             for split in input_split_sizes
         ]
 
-    with record_function("## alltoall_fwd_single ##"):
+    with record_function("## variable_batch_all2all_pooled ##"):
         if pg._get_backend_name() == "custom":
             sharded_output_embeddings = torch.empty(
                 sum(output_split_sizes),
@@ -674,7 +674,7 @@ def all2all_sequence_sync(
 
     local_T = lengths_after_sparse_data_all2all.shape[0]
     if local_T > 0:
-        with record_function("## alltoall_seq_embedding_fwd_permute ##"):
+        with record_function("## all2all_sequence_permute ##"):
             if not variable_batch_size:
                 (
                     permuted_lengths_after_sparse_data_all2all,
@@ -719,7 +719,7 @@ def all2all_sequence_sync(
     else:
         qcomm_ctx = None
 
-    with record_function("## alltoall_seq_embedding_fwd_single ##"):
+    with record_function("## all2all_sequence ##"):
         sharded_output_embeddings = AllToAllSingle.apply(
             sharded_input_embeddings,
             output_splits,
@@ -989,7 +989,7 @@ def reduce_scatter_v_sync(
         input = rsi.codecs.forward.encode(input)
 
     if rsi.equal_splits:
-        with record_function("## reduce_scatter_base ##"):
+        with record_function("## reduce_scatter_v ##"):
             output = torch.ops.torchrec.reduce_scatter_tensor(
                 input,
                 reduceOp="sum",
@@ -998,7 +998,7 @@ def reduce_scatter_v_sync(
                 gradient_division=get_gradient_division(),
             )
     else:
-        with record_function("## reduce_scatter_v_via_all_to_all_single ##"):
+        with record_function("## reduce_scatter_v (AllToAllSingle) ##"):
             input_splits = rsi.input_splits
             output_splits = [rsi.input_splits[rank]] * world_size
             # TODO(ivankobzarev): Replace with _functional_collectives.reduce_scatter_v when it is added
@@ -1197,7 +1197,7 @@ class All2All_Pooled_Req(Function):
             device=sharded_input_embeddings.device,
         )
 
-        with record_function("## alltoall_fwd_single ##"):
+        with record_function("## All2All_Pooled_fwd ##"):
             req = dist.all_to_all_single(
                 output=sharded_output_embeddings,
                 input=sharded_input_embeddings,
@@ -1217,7 +1217,6 @@ class All2All_Pooled_Req(Function):
         return myreq.dummy_tensor
 
     @staticmethod
-    # pyre-fixme[2]: Parameter must be annotated.
     # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *unused) -> Tuple[None, None, None, Tensor]:
         pg = ctx.pg
@@ -1360,7 +1359,7 @@ class All2All_Pooled_Wait(Function):
             device=sharded_grad_output.device,
             dtype=sharded_grad_output.dtype,
         )
-        with record_function("## alltoall_bwd_single ##"):
+        with record_function("## All2All_Pooled_bwd ##"):
             req = dist.all_to_all_single(
                 output=sharded_grad_input,
                 input=sharded_grad_output,
@@ -1445,7 +1444,7 @@ class Variable_Batch_All2All_Pooled_Req(Function):
             device=sharded_input_embeddings.device,
         )
 
-        with record_function("## alltoall_fwd_single ##"):
+        with record_function("## Variable_Batch_All2All_Pooled_fwd ##"):
             req = dist.all_to_all_single(
                 output=sharded_output_embeddings,
                 input=sharded_input_embeddings,
@@ -1564,7 +1563,7 @@ class Variable_Batch_All2All_Pooled_Wait(Function):
             device=sharded_grad_output.device,
             dtype=sharded_grad_output.dtype,
         )
-        with record_function("## alltoall_bwd_single ##"):
+        with record_function("## Variable_Batch_All2All_Pooled_bwd ##"):
             req = dist.all_to_all_single(
                 output=sharded_grad_input,
                 input=sharded_grad_output,
@@ -1605,7 +1604,7 @@ class All2All_Seq_Req(Function):
 
         local_T = lengths_after_sparse_data_all2all.shape[0]
         if local_T > 0:
-            with record_function("## alltoall_seq_embedding_fwd_permute ##"):
+            with record_function("## All2All_Seq_fwd_permute ##"):
                 if not variable_batch_size:
                     (
                         permuted_lengths_after_sparse_data_all2all,
@@ -1659,7 +1658,7 @@ class All2All_Seq_Req(Function):
             device=sharded_input_embeddings.device,
         )
 
-        with record_function("## alltoall_seq_embedding_fwd_single ##"):
+        with record_function("## All2All_Seq_fwd ##"):
             req = dist.all_to_all_single(
                 output=sharded_output_embeddings,
                 input=sharded_input_embeddings,
@@ -1707,7 +1706,7 @@ class All2All_Seq_Req(Function):
         myreq.dummy_tensor = None
 
         if permuted_lengths_after_sparse_data_all2all is not None:
-            with record_function("## alltoall_seq_embedding_bwd_permute ##"):
+            with record_function("## All2All_Seq_bwd_permute ##"):
                 if not variable_batch_size:
                     _, sharded_grad_input, _ = torch.ops.fbgemm.permute_2D_sparse_data(
                         backward_recat_tensor,
@@ -1788,7 +1787,7 @@ class All2All_Seq_Req_Wait(Function):
             device=sharded_grad_output.device,
             dtype=sharded_grad_output.dtype,
         )
-        with record_function("## alltoall_seq_embedding_bwd_single ##"):
+        with record_function("## All2All_Seq_bwd ##"):
             req = dist.all_to_all_single(
                 output=sharded_grad_input,
                 input=sharded_grad_output.view(-1),
@@ -1822,7 +1821,7 @@ class All2Allv_Req(Function):
             input = a2ai.codecs.forward.encode(input)
 
         output = input.new_empty(sum(output_split_sizes))
-        with record_function("## alltoallv_bwd_single ##"):
+        with record_function("## All2Allv_fwd ##"):
             req = dist.all_to_all_single(
                 output,
                 input,
@@ -1908,7 +1907,7 @@ class All2Allv_Wait(Function):
         grad_outputs = [gout.contiguous().view([-1]) for gout in grad_outputs]
         grad_output = torch.cat(grad_outputs)
         grad_input = grad_output.new_empty([a2ai.B_global * sum(a2ai.D_local_list)])
-        with record_function("## alltoall_bwd_single ##"):
+        with record_function("## All2Allv_bwd ##"):
             req = dist.all_to_all_single(
                 grad_input,
                 grad_output,
@@ -1944,7 +1943,7 @@ class ReduceScatter_Req(Function):
             dtype=inputs[my_rank].dtype,
             device=inputs[my_rank].device,
         )
-        with record_function("## reduce_scatter ##"):
+        with record_function("## ReduceScatter_fwd ##"):
             req = dist.reduce_scatter(
                 output,
                 list(inputs),
@@ -2023,7 +2022,7 @@ class ReduceScatter_Wait(Function):
             for in_size in rsi.input_sizes
         ]
 
-        with record_function("## reduce_scatter_bw (all_gather) ##"):
+        with record_function("## ReduceScatter_bwd (all_gather) ##"):
             req = dist.all_gather(
                 grad_inputs,
                 grad_output.contiguous(),
@@ -2051,7 +2050,7 @@ class ReduceScatterBase_Req(Function):
         if rsi.codecs is not None:
             inputs = rsi.codecs.forward.encode(inputs)
         output = inputs.new_empty((inputs.size(0) // my_size, inputs.size(1)))
-        with record_function("## reduce_scatter_tensor ##"):
+        with record_function("## ReduceScatterBase_fwd (tensor) ##"):
             req = dist.reduce_scatter_tensor(
                 output,
                 inputs,
@@ -2119,7 +2118,7 @@ class ReduceScatterBase_Wait(Function):
         if rsi.codecs is not None:
             grad_output = rsi.codecs.backward.encode(grad_output)
         grad_inputs = grad_output.new_empty(rsi.input_sizes)
-        with record_function("## reduce_scatter_base_bw (all_gather) ##"):
+        with record_function("## ReduceScatterBase_bwd (all_gather) ##"):
             req = dist.all_gather_into_tensor(
                 grad_inputs,
                 grad_output.contiguous(),
@@ -2148,7 +2147,7 @@ class AllGatherBase_Req(Function):
             input = agi.codecs.forward.encode(input)
 
         outputs = input.new_empty((input.size(0) * my_size, input.size(1)))
-        with record_function("## all_gather_into_tensor ##"):
+        with record_function("## AllGatherBase_fwd (into_tensor) ##"):
             req = dist.all_gather_into_tensor(
                 outputs,
                 input,
@@ -2216,7 +2215,7 @@ class AllGatherBase_Wait(Function):
         if agi.codecs is not None:
             grad_outputs = agi.codecs.backward.encode(grad_outputs)
         grad_input = grad_outputs.new_empty(agi.input_size)
-        with record_function("## all_gather_base_bw (reduce_scatter) ##"):
+        with record_function("## AllGatherBase_bw (reduce_scatter_tensor) ##"):
             req = dist.reduce_scatter_tensor(
                 grad_input,
                 grad_outputs.contiguous(),
@@ -2250,7 +2249,7 @@ class ReduceScatterV_Req(Function):
         # Use dist.reduce_scatter_tensor when a vector reduce-scatter is not needed
         # else use dist.reduce_scatter which internally supports vector reduce-scatter
         if rsi.equal_splits:
-            with record_function("## reduce_scatter_tensor ##"):
+            with record_function("## ReduceScatterV_fwd (tensor) ##"):
                 req = dist.reduce_scatter_tensor(
                     output,
                     input,
@@ -2258,7 +2257,7 @@ class ReduceScatterV_Req(Function):
                     async_op=True,
                 )
         else:
-            with record_function("## reduce_scatter_v ##"):
+            with record_function("## ReduceScatterV_fwd ##"):
                 req = dist.reduce_scatter(
                     output,
                     list(torch.split(input, rsi.input_splits)),
@@ -2331,7 +2330,7 @@ class ReduceScatterV_Wait(Function):
         grad_input = grad_output.new_empty(rsi.total_input_size)
 
         if rsi.equal_splits:
-            with record_function("## reduce_scatter_base_bw (all_gather) ##"):
+            with record_function("## ReduceScatterV_bwd (all_gather) ##"):
                 req = dist.all_gather_into_tensor(
                     grad_input,
                     grad_output.contiguous(),
@@ -2339,7 +2338,7 @@ class ReduceScatterV_Wait(Function):
                     async_op=True,
                 )
         else:
-            with record_function("## reduce_scatter_v_bw (all_gather_v) ##"):
+            with record_function("## ReduceScatterV_bwd (all_gather_v) ##"):
                 req = dist.all_gather(
                     list(torch.split(grad_input, rsi.input_splits)),
                     grad_output.contiguous(),
