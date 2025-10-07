@@ -10,11 +10,14 @@
 
 import unittest
 from functools import partial, update_wrapper
-from typing import Callable, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Type, Union
+from collections import OrderedDict
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
-from torchrec.metrics.metrics_config import DefaultTaskInfo
+from torch import Tensor
+from torchrec.metrics.metrics_config import BatchSizeStage, DefaultTaskInfo
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.rec_metric import (
     RecComputeMode,
@@ -159,6 +162,10 @@ class TestTowerQPSMetric(TestMetric):
 
 
 class TowerQPSMetricTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.world_size = 1
+        self.batch_size = 256
+
     target_clazz: Type[RecMetric] = TowerQPSMetric
     task_names: str = "qps"
 
@@ -377,3 +384,206 @@ class TowerQPSMetricTest(unittest.TestCase):
                     "key_2": torch.rand(batch_size),
                 },
             )
+
+    @patch("torchrec.metrics.tower_qps.time.monotonic")
+    def test_batch_size_schedule(self, time_mock: Mock) -> None:
+
+        def _gen_data_with_batch_size(
+            batch_size: int,
+        ) -> Dict[str, Union[Dict[str, Tensor], Tensor]]:
+            return {
+                "labels": {
+                    "t1": torch.rand(batch_size),
+                    "t2": torch.rand(batch_size),
+                    "t3": torch.rand(batch_size),
+                },
+                "predictions": torch.ones(batch_size),
+                "weights": torch.rand(batch_size),
+            }
+
+        batch_size_stages = [BatchSizeStage(256, 1), BatchSizeStage(512, None)]
+        time_mock.return_value = 1
+        batch_size = 256
+        task_names = ["t1", "t2", "t3"]
+        tasks = gen_test_tasks(task_names)
+        metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=batch_size,
+            world_size=1,
+            window_size=1000,
+            batch_size_stages=batch_size_stages,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+        )
+
+        data = _gen_data_with_batch_size(batch_size_stages[0].batch_size)
+        metric.update(**data)  # pyre-ignore[6]
+
+        self.assertEqual(
+            metric.compute(),
+            {
+                "qps-t1|lifetime_qps": 0,
+                "qps-t2|lifetime_qps": 0,
+                "qps-t3|lifetime_qps": 0,
+                "qps-t1|window_qps": 0,
+                "qps-t2|window_qps": 0,
+                "qps-t3|window_qps": 0,
+                "qps-t1|total_examples": 256,
+                "qps-t2|total_examples": 256,
+                "qps-t3|total_examples": 256,
+            },
+        )
+
+        data = _gen_data_with_batch_size(batch_size_stages[1].batch_size)
+        metric.update(**data)  # pyre-ignore[6]
+
+        self.assertEqual(
+            metric.compute(),
+            {
+                "qps-t1|lifetime_qps": 0,
+                "qps-t2|lifetime_qps": 0,
+                "qps-t3|lifetime_qps": 0,
+                "qps-t1|window_qps": 0,
+                "qps-t2|window_qps": 0,
+                "qps-t3|window_qps": 0,
+                "qps-t1|total_examples": 768,
+                "qps-t2|total_examples": 768,
+                "qps-t3|total_examples": 768,
+            },
+        )
+
+    def test_num_batch_without_batch_size_stages(self) -> None:
+        task_names = ["t1", "t2", "t3"]
+        tasks = gen_test_tasks(task_names)
+        metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_size=1000,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+        )
+
+        self.assertFalse(hasattr(metric, "num_batch"))
+
+        metric.update(
+            labels={
+                "t1": torch.rand(self.batch_size),
+                "t2": torch.rand(self.batch_size),
+                "t3": torch.rand(self.batch_size),
+            },
+            predictions=torch.ones(self.batch_size),
+            weights=torch.rand(self.batch_size),
+        )
+        state_dict: Dict[str, Any] = metric.state_dict()
+        self.assertNotIn("num_batch", state_dict)
+
+    def test_state_dict_load_module_lifecycle(self) -> None:
+        task_names = ["t1", "t2", "t3"]
+        tasks = gen_test_tasks(task_names)
+        metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_size=1000,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            batch_size_stages=[BatchSizeStage(256, 1), BatchSizeStage(512, None)],
+        )
+
+        self.assertTrue(hasattr(metric, "_num_batch"))
+
+        metric.update(
+            labels={
+                "t1": torch.rand(self.batch_size),
+                "t2": torch.rand(self.batch_size),
+                "t3": torch.rand(self.batch_size),
+            },
+            predictions=torch.ones(self.batch_size),
+            weights=torch.rand(self.batch_size),
+        )
+        self.assertEqual(metric._num_batch, 1)
+        state_dict = metric.state_dict()
+        self.assertIn("num_batch", state_dict)
+        self.assertEqual(state_dict["num_batch"].item(), metric._num_batch)
+
+        new_metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_size=1000,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            batch_size_stages=[BatchSizeStage(256, 1), BatchSizeStage(512, None)],
+        )
+        self.assertEqual(new_metric._num_batch, 0)
+        new_metric.load_state_dict(state_dict)
+        self.assertEqual(new_metric._num_batch, 1)
+
+        state_dict = new_metric.state_dict()
+        self.assertIn("num_batch", state_dict)
+        self.assertEqual(state_dict["num_batch"].item(), new_metric._num_batch)
+
+    def test_state_dict_hook_adds_key(self) -> None:
+        task_names = ["t1", "t2", "t3"]
+        tasks = gen_test_tasks(task_names)
+        metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_size=1000,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            batch_size_stages=[BatchSizeStage(256, 1), BatchSizeStage(256, None)],
+        )
+
+        for _ in range(5):
+            metric.update(
+                labels={
+                    "t1": torch.rand(self.batch_size),
+                    "t2": torch.rand(self.batch_size),
+                    "t3": torch.rand(self.batch_size),
+                },
+                predictions=torch.ones(self.batch_size),
+                weights=torch.rand(self.batch_size),
+            )
+        state_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
+        prefix: str = "test_prefix_"
+        metric.state_dict_hook(metric, state_dict, prefix, {})
+        self.assertIn(f"{prefix}num_batch", state_dict)
+        self.assertEqual(state_dict[f"{prefix}num_batch"].item(), 5)
+
+    def test_state_dict_hook_no_batch_size_stages(self) -> None:
+        task_names = ["t1", "t2", "t3"]
+        tasks = gen_test_tasks(task_names)
+        metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_size=1000,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            batch_size_stages=None,
+        )
+        state_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
+        prefix: str = "test_prefix_"
+        metric.state_dict_hook(metric, state_dict, prefix, {})
+        self.assertNotIn(f"{prefix}num_batch", state_dict)
+
+    def test_load_state_dict_hook_restores_value(self) -> None:
+        task_names = ["t1", "t2", "t3"]
+        tasks = gen_test_tasks(task_names)
+        metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_size=1000,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            batch_size_stages=[BatchSizeStage(256, 1), BatchSizeStage(512, None)],
+        )
+        state_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
+        prefix: str = "test_prefix_"
+        state_dict[f"{prefix}num_batch"] = torch.tensor(10, dtype=torch.long)
+        metric.load_state_dict_hook(state_dict, prefix, {}, True, [], [], [])
+        self.assertEqual(metric._num_batch, 10)
