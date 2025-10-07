@@ -17,10 +17,10 @@ python -m torchrec.distributed.benchmark.benchmark_train_pipeline \
 - internal:
 ```
 buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:benchmark_comms -- \
-    a2a_single --name=a2a_sync_base-$(hg whereami | cut -c 1-10)
+    a2a_single --name=a2a_sync_base-$(hg whereami | cut -c 1-10) --memory_snapshot=true
 ```
 - oss:
 ```
 python -m torchrec.distributed.benchmark.benchmark_comms \
-  a2a_single --name=a2a_sync_base-$(git rev-parse --short HEAD || echo $USER)
+  a2a_single --name=a2a_sync_base-$(git rev-parse --short HEAD || echo $USER) --memory_snapshot=true
 ```

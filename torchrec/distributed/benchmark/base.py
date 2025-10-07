@@ -75,6 +75,7 @@ DLRM_NUM_EMBEDDINGS_PER_FEATURE = [
 ]
 
 EMBEDDING_DIM: int = 128
+MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT = 100_000
 
 
 class CompileMode(Enum):
@@ -602,6 +603,7 @@ def _run_benchmark_core(
     export_stacks: bool = False,
     reset_accumulated_memory_stats: bool = False,
     all_rank_traces: bool = False,
+    memory_snapshot: bool = False,
 ) -> BenchmarkResult:
     """Internal helper that contains the core benchmarking logic shared by
     ``benchmark`` and ``benchmark_func``.  All heavy–lifting (timing, memory
@@ -736,6 +738,10 @@ def _run_benchmark_core(
                     f"{output_dir}/stacks-cuda-{name}.stacks", "self_cuda_time_total"
                 )
 
+        if memory_snapshot:
+            torch.cuda.memory._record_memory_history(
+                max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
+            )
         with torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -756,6 +762,17 @@ def _run_benchmark_core(
                 torch.cuda.synchronize(torch.device(f"cuda:{di}"))
         else:
             torch.cuda.synchronize(rank)
+
+        if memory_snapshot:
+            try:
+                torch.cuda.memory._dump_snapshot(
+                    f"{output_dir}/memory-{name}-rank{rank}.pickle"
+                )
+            except Exception as e:
+                logger.error(f"Failed to capture memory snapshot {e}")
+
+            # Stop recording memory snapshot history.
+            torch.cuda.memory._record_memory_history(enabled=None)
 
     return BenchmarkResult(
         short_name=name,
@@ -831,6 +848,7 @@ class BenchFuncConfig:
     pre_gpu_load: int = 0
     export_stacks: bool = False
     all_rank_traces: bool = False
+    memory_snapshot: bool = False
 
     # pyre-ignore [2]
     def benchmark_func_kwargs(self, **kwargs_to_override) -> Dict[str, Any]:
@@ -844,6 +862,7 @@ class BenchFuncConfig:
             "pre_gpu_load": self.pre_gpu_load,
             "export_stacks": self.export_stacks,
             "all_rank_traces": self.all_rank_traces,
+            "memory_snapshot": self.memory_snapshot,
         } | kwargs_to_override
 
 
@@ -862,6 +881,7 @@ def benchmark_func(
     pre_gpu_load: int = 0,
     export_stacks: bool = False,
     all_rank_traces: bool = False,
+    memory_snapshot: bool = False,
 ) -> BenchmarkResult:
     """
     Args:
@@ -870,7 +890,7 @@ def benchmark_func(
             stats. ``rank == -1`` means single-process mode.
 
         func_to_benchmark: Callable that executes one measured iteration.
-            func_to_benchmark(batch_inputs, **kwargs)
+            func_to_benchmark(batch_inputs, **kwargs) -> None
         bench_inputs, prof_inputs: List[Dict[str, Any]] this argument will be fed
             to the function at once, and bench_inputs will be used for benchmarking
             while prof_inputs will be used for profiling
@@ -885,6 +905,7 @@ def benchmark_func(
             measured iteration (helps simulating a loaded allocator).
         export_stacks: Whether to export flamegraph-compatible stack files.
         all_rank_traces: Whether to export traces from all ranks.
+        memory_snapshot: Whether to capture memory snapshot during the profiling
     """
     if benchmark_func_kwargs is None:
         benchmark_func_kwargs = {}
@@ -912,4 +933,5 @@ def benchmark_func(
         export_stacks=export_stacks,
         reset_accumulated_memory_stats=True,
         all_rank_traces=all_rank_traces,
+        memory_snapshot=memory_snapshot,
     )
