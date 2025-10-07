@@ -601,6 +601,7 @@ def _run_benchmark_core(
     pre_gpu_load: int = 0,
     export_stacks: bool = False,
     reset_accumulated_memory_stats: bool = False,
+    all_rank_traces: bool = False,
 ) -> BenchmarkResult:
     """Internal helper that contains the core benchmarking logic shared by
     ``benchmark`` and ``benchmark_func``.  All heavy–lifting (timing, memory
@@ -721,9 +722,10 @@ def _run_benchmark_core(
         def _trace_handler(prof: torch.profiler.profile) -> None:
             total_avg = prof.profiler.total_average()
             logger.info(f" TOTAL_AVERAGE:\n{name}\n{total_avg}")
-            if rank > 0:
+            if not all_rank_traces and rank > 0:
+                # only save trace for rank 0 when all_rank_traces is disabled
                 return
-            trace_file = f"{output_dir}/trace-{name}.json"
+            trace_file = f"{output_dir}/trace-{name}-rank{rank}.json"
             logger.info(f" PROFILE[{name}].chrome_trace:{trace_file}")
             prof.export_chrome_trace(trace_file)
             if export_stacks:
@@ -828,6 +830,7 @@ class BenchFuncConfig:
     device_type: str = "cuda"
     pre_gpu_load: int = 0
     export_stacks: bool = False
+    all_rank_traces: bool = False
 
     # pyre-ignore [2]
     def benchmark_func_kwargs(self, **kwargs_to_override) -> Dict[str, Any]:
@@ -840,6 +843,7 @@ class BenchFuncConfig:
             "device_type": self.device_type,
             "pre_gpu_load": self.pre_gpu_load,
             "export_stacks": self.export_stacks,
+            "all_rank_traces": self.all_rank_traces,
         } | kwargs_to_override
 
 
@@ -857,6 +861,7 @@ def benchmark_func(
     device_type: str = "cuda",
     pre_gpu_load: int = 0,
     export_stacks: bool = False,
+    all_rank_traces: bool = False,
 ) -> BenchmarkResult:
     """
     Args:
@@ -879,6 +884,7 @@ def benchmark_func(
         pre_gpu_load: Number of dummy matmul operations to run before the first
             measured iteration (helps simulating a loaded allocator).
         export_stacks: Whether to export flamegraph-compatible stack files.
+        all_rank_traces: Whether to export traces from all ranks.
     """
     if benchmark_func_kwargs is None:
         benchmark_func_kwargs = {}
@@ -905,4 +911,5 @@ def benchmark_func(
         pre_gpu_load=pre_gpu_load,
         export_stacks=export_stacks,
         reset_accumulated_memory_stats=True,
+        all_rank_traces=all_rank_traces,
     )
