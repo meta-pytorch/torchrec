@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import concurrent
 import copy
 import dataclasses
 import logging
@@ -42,7 +43,7 @@ from torchrec.metrics.metrics_config import (
     ThroughputDef,
 )
 from torchrec.metrics.model_utils import parse_task_model_outputs
-from torchrec.metrics.rec_metric import RecMetricList, RecTaskInfo
+from torchrec.metrics.rec_metric import RecMetricException, RecMetricList, RecTaskInfo
 from torchrec.metrics.test_utils import gen_test_batch
 from torchrec.metrics.throughput import ThroughputMetric
 from torchrec.test_utils import get_free_port, seed_and_log, skip_if_asan_class
@@ -647,6 +648,22 @@ class MetricModuleTest(unittest.TestCase):
         # Make sure num_batch wasn't created on the throughput module (and no exception was thrown above)
         self.assertFalse(hasattr(no_bss_metric_module.throughput_metric, "_num_batch"))
 
+    def test_async_compute_raises_exception(self) -> None:
+        metric_module = generate_metric_module(
+            TestMetricModule,
+            metrics_config=DefaultMetricsConfig,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+        )
+        with self.assertRaisesRegex(
+            RecMetricException,
+            "async_compute is not supported in RecMetricModule",
+        ):
+            metric_module.async_compute(concurrent.futures.Future())
+
 
 def metric_module_gather_state(
     rank: int,
@@ -701,6 +718,8 @@ def metric_module_gather_state(
         for metric, tensor in computed_value.items():
             new_tensor = new_computed_value[metric]
             torch.testing.assert_close(tensor, new_tensor, check_device=False)
+
+        metric_module.shutdown()
 
 
 @skip_if_asan_class
