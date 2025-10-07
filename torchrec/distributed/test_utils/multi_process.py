@@ -222,6 +222,7 @@ def run_multi_process_func(
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
     if world_size == 1:
+        # skip multiprocess env for single-rank job
         kwargs["world_size"] = 1
         kwargs["rank"] = 0
         result = func(**kwargs)

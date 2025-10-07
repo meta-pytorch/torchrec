@@ -27,6 +27,7 @@ import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torch import nn
 from torchrec.distributed.benchmark.base import (
+    BenchFuncConfig,
     benchmark_func,
     BenchmarkResult,
     cmd_conf,
@@ -58,7 +59,7 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
 @dataclass
-class RunOptions:
+class RunOptions(BenchFuncConfig):
     """
     Configuration options for running sparse neural network benchmarks.
 
@@ -78,7 +79,7 @@ class RunOptions:
             Default is "kjt" (KeyedJaggedTensor).
         profile (str): Directory to save profiling results. If empty, profiling is disabled.
             Default is "" (disabled).
-        profile_name (str): Name of the profiling file. Default is pipeline classname.
+        name (str): Name of the profiling file. Default is pipeline classname.
         planner_type (str): Type of sharding planner to use. Options are:
             - "embedding": EmbeddingShardingPlanner (default)
             - "hetero": HeteroEmbeddingShardingPlanner
@@ -100,8 +101,10 @@ class RunOptions:
     sharding_type: ShardingType = ShardingType.TABLE_WISE
     compute_kernel: EmbeddingComputeKernel = EmbeddingComputeKernel.FUSED
     input_type: str = "kjt"
-    profile: str = ""
-    profile_name: str = ""
+    name: str = ""
+    profile_dir: str = ""
+    num_benchmarks: int = 5
+    num_profiles: int = 2
     planner_type: str = "embedding"
     pooling_factors: Optional[List[float]] = None
     num_poolings: Optional[List[float]] = None
@@ -257,24 +260,17 @@ def runner(
             opt=optimizer,
             device=ctx.device,
         )
-        pipeline.progress(iter(bench_inputs))
+        pipeline.progress(iter(bench_inputs))  # warmup
 
+        run_option.name = (
+            type(pipeline).__name__ if run_option.name == "" else run_option.name
+        )
         result = benchmark_func(
-            name=(
-                type(pipeline).__name__
-                if run_option.profile_name == ""
-                else run_option.profile_name
-            ),
             bench_inputs=bench_inputs,  # pyre-ignore
             prof_inputs=bench_inputs,  # pyre-ignore
-            num_benchmarks=5,
-            num_profiles=2,
-            profile_dir=run_option.profile,
-            world_size=run_option.world_size,
             func_to_benchmark=_func_to_benchmark,
             benchmark_func_kwargs={"model": sharded_model, "pipeline": pipeline},
-            rank=rank,
-            export_stacks=run_option.export_stacks,
+            **run_option.benchmark_func_kwargs(rank=rank)
         )
 
         if rank == 0:
@@ -327,7 +323,7 @@ def run_pipeline(
 
 
 # command-line interface
-@cmd_conf
+@cmd_conf  # pyre-ignore [56]
 def main(
     run_option: RunOptions,
     table_config: EmbeddingTablesConfig,

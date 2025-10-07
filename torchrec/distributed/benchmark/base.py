@@ -11,11 +11,13 @@
 #!/usr/bin/env python3
 
 import argparse
+import functools
 import inspect
 import json
 import logging
 import os
 import resource
+import sys
 import time
 import timeit
 from dataclasses import dataclass, fields, is_dataclass, MISSING
@@ -73,6 +75,7 @@ DLRM_NUM_EMBEDDINGS_PER_FEATURE = [
 ]
 
 EMBEDDING_DIM: int = 128
+MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT = 100_000
 
 
 class CompileMode(Enum):
@@ -362,137 +365,210 @@ def set_embedding_config(
     return embedding_configs, pooling_configs
 
 
-# pyre-ignore [24]
-def cmd_conf(func: Callable) -> Callable:
+class cmd_conf:
+    """
+    Decorator for run functions in command line.
+    parse input arguments into the function's arguments and config (dataclass)
 
-    def _load_config_file(config_path: str, is_json: bool = False) -> Dict[str, Any]:
-        if not config_path:
-            return {}
+    Example 1: direct decorating (see the overloaded __new__ method below)
+    ```
+    @cmd_conf  # you might need "pyre-ignore [56]"
+    def main(
+        run_option: RunOptions,
+        table_config: EmbeddingTablesConfig,
+        model_selection: ModelSelectionConfig,
+        pipeline_config: PipelineConfig,
+        model_config: Optional[BaseModelConfig] = None,
+        integer: int
+    ) -> None:
+        pass
 
-        try:
-            with open(config_path, "r") as f:
-                if is_json:
-                    return json.load(f) or {}
-                else:
-                    return yaml.safe_load(f) or {}
-        except Exception as e:
-            logger.error(f"Failed to load config because {e}. Proceeding without it.")
-            return {}
+    if __name__ == "__main__":
+        main()
+    ```
 
-    # pyre-ignore [3]
-    def wrapper() -> Any:
-        sig = inspect.signature(func)
-        parser = argparse.ArgumentParser(func.__doc__)
+    Example 2: register multiple function
+    invoke with: -- (run1|run2) --arg1=...
+    ```
+    _cc = cmd_conf()
+    @_cc.register
+    def func1(input_config: CONF1):
+        pass
 
-        parser.add_argument(
-            "--yaml_config",
-            type=str,
-            default=None,
-            help="YAML config file for benchmarking",
-        )
+    @_cc.register
+    def func2(input_config: CONF2):
+        pass
 
-        parser.add_argument(
-            "--json_config",
-            type=str,
-            default=None,
-            help="JSON config file for benchmarking",
-        )
+    if __name__ == "__main__":
+        _cc.main()
+    ```
+    """
 
-        # Add loglevel argument with current logger level as default
-        parser.add_argument(
-            "--loglevel",
-            type=str,
-            default=logging._levelToName[logger.level],
-            help="Set the logging level (e.g. info, debug, warning, error)",
-        )
+    def __init__(self) -> None:
+        # pyre-ignore [24]
+        self.programs: Dict[str, Callable] = {}
 
-        pre_args, _ = parser.parse_known_args()
+    @classmethod
+    # pyre-ignore [24]
+    def __new__(cls, _, func: Optional[Callable] = None) -> Union["cmd_conf", Callable]:
+        if not func:
+            return super().__new__(cls)
+        else:
+            return cmd_conf.call(func)
 
-        yaml_defaults: Dict[str, Any] = (
-            _load_config_file(pre_args.yaml_config, is_json=False)
-            if pre_args.yaml_config
-            else {}
-        )
-        json_defaults: Dict[str, Any] = (
-            _load_config_file(pre_args.json_config, is_json=True)
-            if pre_args.json_config
-            else {}
-        )
-        # Merge the two dictionaries, JSON overrides YAML
-        merged_defaults = {**yaml_defaults, **json_defaults}
+    @staticmethod
+    def call(func: Callable) -> Callable:  # pyre-ignore [24]
 
-        seen_args = set()  # track all --<name> we've added
+        def _load_config_file(
+            config_path: str, is_json: bool = False
+        ) -> Dict[str, Any]:
+            if not config_path:
+                return {}
 
-        for _name, param in sig.parameters.items():
-            cls = param.annotation
-            if not is_dataclass(cls):
-                continue
-
-            for f in fields(cls):
-                arg_name = f.name
-                if arg_name in seen_args:
-                    logger.warning(f"WARNING: duplicate argument {arg_name}")
-                    continue
-                seen_args.add(arg_name)
-
-                ftype = f.type
-                origin = get_origin(ftype)
-
-                # Unwrapping Optional[X] to X
-                if origin is Union and type(None) in get_args(ftype):
-                    non_none = [t for t in get_args(ftype) if t is not type(None)]
-                    if len(non_none) == 1:
-                        ftype = non_none[0]
-                        origin = get_origin(ftype)
-
-                # Handle default_factory value and allow config to override
-                default_value = merged_defaults.get(
-                    arg_name,  # flat lookup
-                    merged_defaults.get(cls.__name__, {}).get(  # hierarchy lookup
-                        arg_name,
-                        (
-                            f.default_factory()  # pyre-ignore [29]
-                            if f.default_factory is not MISSING
-                            else f.default
-                        ),
-                    ),
+            try:
+                with open(config_path, "r") as f:
+                    if is_json:
+                        return json.load(f) or {}
+                    else:
+                        return yaml.safe_load(f) or {}
+            except Exception as e:
+                logger.error(
+                    f"Failed to load config because {e}. Proceeding without it."
                 )
+                return {}
 
-                arg_kwargs = {
-                    "default": default_value,
-                    "help": f"({cls.__name__}) {arg_name}",
-                }
+        @functools.wraps(func)
+        def wrapper() -> Any:  # pyre-ignore [3]
+            sig = inspect.signature(func)
+            parser = argparse.ArgumentParser(func.__doc__)
 
-                if origin in (list, List):
-                    elem_type = get_args(ftype)[0]
-                    arg_kwargs.update(nargs="*", type=elem_type)
-                elif ftype is bool:
-                    # Special handling for boolean arguments
-                    arg_kwargs.update(type=lambda x: x.lower() in ["true", "1", "yes"])
-                else:
-                    arg_kwargs.update(type=ftype)
+            parser.add_argument(
+                "--yaml_config",
+                type=str,
+                default=None,
+                help="YAML config file for benchmarking",
+            )
 
-                parser.add_argument(f"--{arg_name}", **arg_kwargs)
+            parser.add_argument(
+                "--json_config",
+                type=str,
+                default=None,
+                help="JSON config file for benchmarking",
+            )
 
-        args = parser.parse_args()
-        logger.setLevel(logging.INFO)
+            # Add loglevel argument with current logger level as default
+            parser.add_argument(
+                "--loglevel",
+                type=str,
+                default=logging._levelToName[logger.level],
+                help="Set the logging level (e.g. info, debug, warning, error)",
+            )
 
-        # Build the dataclasses
-        kwargs = {}
-        for name, param in sig.parameters.items():
-            cls = param.annotation
-            if is_dataclass(cls):
-                data = {f.name: getattr(args, f.name) for f in fields(cls)}
-                config_instance = cls(**data)  # pyre-ignore [29]
-                kwargs[name] = config_instance
-                logger.info(config_instance)
+            pre_args, _ = parser.parse_known_args()
 
-        loglevel = logging._nameToLevel[args.loglevel.upper()]
-        logger.setLevel(loglevel)
+            yaml_defaults: Dict[str, Any] = (
+                _load_config_file(pre_args.yaml_config, is_json=False)
+                if pre_args.yaml_config
+                else {}
+            )
+            json_defaults: Dict[str, Any] = (
+                _load_config_file(pre_args.json_config, is_json=True)
+                if pre_args.json_config
+                else {}
+            )
+            # Merge the two dictionaries, JSON overrides YAML
+            merged_defaults = {**yaml_defaults, **json_defaults}
 
-        return func(**kwargs)
+            seen_args = set()  # track all --<name> we've added
 
-    return wrapper
+            for _name, param in sig.parameters.items():
+                cls = param.annotation
+                if not is_dataclass(cls):
+                    continue
+
+                for f in fields(cls):
+                    arg_name = f.name
+                    if arg_name in seen_args:
+                        logger.warning(f"WARNING: duplicate argument {arg_name}")
+                        continue
+                    seen_args.add(arg_name)
+
+                    ftype = f.type
+                    origin = get_origin(ftype)
+
+                    # Unwrapping Optional[X] to X
+                    if origin is Union and type(None) in get_args(ftype):
+                        non_none = [t for t in get_args(ftype) if t is not type(None)]
+                        if len(non_none) == 1:
+                            ftype = non_none[0]
+                            origin = get_origin(ftype)
+
+                    # Handle default_factory value and allow config to override
+                    default_value = merged_defaults.get(
+                        arg_name,  # flat lookup
+                        merged_defaults.get(cls.__name__, {}).get(  # hierarchy lookup
+                            arg_name,
+                            (
+                                f.default_factory()  # pyre-ignore [29]
+                                if f.default_factory is not MISSING
+                                else f.default
+                            ),
+                        ),
+                    )
+
+                    arg_kwargs = {
+                        "default": default_value,
+                        "help": f"({cls.__name__}) {arg_name}",
+                    }
+
+                    if origin in (list, List):
+                        elem_type = get_args(ftype)[0]
+                        arg_kwargs.update(nargs="*", type=elem_type)
+                    elif ftype is bool:
+                        # Special handling for boolean arguments
+                        arg_kwargs.update(
+                            type=lambda x: x.lower() in ["true", "1", "yes"]
+                        )
+                    else:
+                        arg_kwargs.update(type=ftype)
+
+                    parser.add_argument(f"--{arg_name}", **arg_kwargs)
+
+            args = parser.parse_args()
+            logger.setLevel(logging.INFO)
+
+            # Build the dataclasses
+            kwargs = {}
+            for name, param in sig.parameters.items():
+                cls = param.annotation
+                if is_dataclass(cls):
+                    data = {f.name: getattr(args, f.name) for f in fields(cls)}
+                    config_instance = cls(**data)  # pyre-ignore [29]
+                    kwargs[name] = config_instance
+                    logger.info(config_instance)
+
+            loglevel = logging._nameToLevel[args.loglevel.upper()]
+            logger.setLevel(loglevel)
+
+            return func(**kwargs)
+
+        return wrapper
+
+    # pyre-ignore [24]
+    def register(self, func: Callable) -> Callable:
+        wrapper = cmd_conf.call(func)
+        self.programs[func.__name__] = wrapper
+        return wrapper
+
+    def main(self) -> None:
+        program = sys.argv[1]
+        if program in self.programs:
+            sys.argv[:] = [sys.argv[0]] + (sys.argv[2:] if len(sys.argv) > 2 else [])
+            self.programs[program]()
+        else:
+            print(
+                f"Invalid command. Please use select program from {', '.join(self.programs.keys())}."
+            )
 
 
 def init_argparse_and_args() -> argparse.Namespace:
@@ -526,6 +602,8 @@ def _run_benchmark_core(
     pre_gpu_load: int = 0,
     export_stacks: bool = False,
     reset_accumulated_memory_stats: bool = False,
+    all_rank_traces: bool = False,
+    memory_snapshot: bool = False,
 ) -> BenchmarkResult:
     """Internal helper that contains the core benchmarking logic shared by
     ``benchmark`` and ``benchmark_func``.  All heavy–lifting (timing, memory
@@ -534,12 +612,15 @@ def _run_benchmark_core(
 
     Args:
         name: Human-readable benchmark name.
+
         run_iter_fn: Zero-arg callable that executes one measured iteration.
         profile_iter_fn: Optional callable that receives a ``torch.profiler``
             instance and runs the iterations that should be captured.
+
         world_size, rank: Distributed context to correctly reset / collect GPU
             stats. ``rank == -1`` means single-process mode.
         num_benchmarks: Number of measured iterations.
+
         device_type: "cuda" or "cpu".
         output_dir: Where to write chrome traces / stack files.
         pre_gpu_load: Number of dummy matmul operations to run before the first
@@ -597,8 +678,10 @@ def _run_benchmark_core(
             cpu_times_active_ns.append(cpu_end_active_ns - cpu_start_active_ns)
 
         # Convert to milliseconds and drop the first iteration
-        cpu_elapsed_time = torch.tensor(
-            [t / 1e6 for t in cpu_times_active_ns[1:]], dtype=torch.float
+        cpu_elapsed_time = (
+            torch.tensor([t / 1e6 for t in cpu_times_active_ns[1:]], dtype=torch.float)
+            if num_benchmarks >= 2
+            else torch.zeros(1, dtype=torch.float)
         )
 
         # Make sure all kernels are finished before reading timers / stats
@@ -608,8 +691,12 @@ def _run_benchmark_core(
         else:
             torch.cuda.synchronize(rank)
 
-        gpu_elapsed_time = torch.tensor(
-            [s.elapsed_time(e) for s, e in zip(start_events[1:], end_events[1:])]
+        gpu_elapsed_time = (
+            torch.tensor(
+                [s.elapsed_time(e) for s, e in zip(start_events[1:], end_events[1:])]
+            )
+            if num_benchmarks >= 2
+            else torch.zeros(1, dtype=torch.float)
         )
     else:
         # For CPU-only benchmarks we fall back to wall-clock timing via ``timeit``.
@@ -637,9 +724,10 @@ def _run_benchmark_core(
         def _trace_handler(prof: torch.profiler.profile) -> None:
             total_avg = prof.profiler.total_average()
             logger.info(f" TOTAL_AVERAGE:\n{name}\n{total_avg}")
-            if rank > 0:
+            if not all_rank_traces and rank > 0:
+                # only save trace for rank 0 when all_rank_traces is disabled
                 return
-            trace_file = f"{output_dir}/trace-{name}.json"
+            trace_file = f"{output_dir}/trace-{name}-rank{rank}.json"
             logger.info(f" PROFILE[{name}].chrome_trace:{trace_file}")
             prof.export_chrome_trace(trace_file)
             if export_stacks:
@@ -650,6 +738,10 @@ def _run_benchmark_core(
                     f"{output_dir}/stacks-cuda-{name}.stacks", "self_cuda_time_total"
                 )
 
+        if memory_snapshot:
+            torch.cuda.memory._record_memory_history(
+                max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
+            )
         with torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -671,6 +763,17 @@ def _run_benchmark_core(
         else:
             torch.cuda.synchronize(rank)
 
+        if memory_snapshot:
+            try:
+                torch.cuda.memory._dump_snapshot(
+                    f"{output_dir}/memory-{name}-rank{rank}.pickle"
+                )
+            except Exception as e:
+                logger.error(f"Failed to capture memory snapshot {e}")
+
+            # Stop recording memory snapshot history.
+            torch.cuda.memory._record_memory_history(enabled=None)
+
     return BenchmarkResult(
         short_name=name,
         gpu_elapsed_time=gpu_elapsed_time,
@@ -681,7 +784,7 @@ def _run_benchmark_core(
     )
 
 
-def benchmark(
+def benchmark_model_with_warmup(
     name: str,
     model: torch.nn.Module,
     warmup_inputs: Union[List[KeyedJaggedTensor], List[Dict[str, Any]]],
@@ -734,22 +837,76 @@ def benchmark(
     )
 
 
+@dataclass
+class BenchFuncConfig:
+    name: str
+    world_size: int
+    num_profiles: int
+    num_benchmarks: int
+    profile_dir: str
+    device_type: str = "cuda"
+    pre_gpu_load: int = 0
+    export_stacks: bool = False
+    all_rank_traces: bool = False
+    memory_snapshot: bool = False
+
+    # pyre-ignore [2]
+    def benchmark_func_kwargs(self, **kwargs_to_override) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "world_size": self.world_size,
+            "num_profiles": self.num_profiles,
+            "num_benchmarks": self.num_benchmarks,
+            "profile_dir": self.profile_dir,
+            "device_type": self.device_type,
+            "pre_gpu_load": self.pre_gpu_load,
+            "export_stacks": self.export_stacks,
+            "all_rank_traces": self.all_rank_traces,
+            "memory_snapshot": self.memory_snapshot,
+        } | kwargs_to_override
+
+
 def benchmark_func(
     name: str,
+    rank: int,
+    world_size: int,
+    func_to_benchmark: Any,  # pyre-ignore[2]
     bench_inputs: List[Dict[str, Any]],
     prof_inputs: List[Dict[str, Any]],
-    world_size: int,
-    profile_dir: str,
-    num_benchmarks: int,
-    num_profiles: int,
-    # pyre-ignore[2]
-    func_to_benchmark: Any,
     benchmark_func_kwargs: Optional[Dict[str, Any]],
-    rank: int,
+    num_profiles: int,
+    num_benchmarks: int,
+    profile_dir: str,
     device_type: str = "cuda",
     pre_gpu_load: int = 0,
     export_stacks: bool = False,
+    all_rank_traces: bool = False,
+    memory_snapshot: bool = False,
 ) -> BenchmarkResult:
+    """
+    Args:
+        name: Human-readable benchmark name.
+        world_size, rank: Distributed context to correctly reset / collect GPU
+            stats. ``rank == -1`` means single-process mode.
+
+        func_to_benchmark: Callable that executes one measured iteration.
+            func_to_benchmark(batch_inputs, **kwargs) -> None
+        bench_inputs, prof_inputs: List[Dict[str, Any]] this argument will be fed
+            to the function at once, and bench_inputs will be used for benchmarking
+            while prof_inputs will be used for profiling
+        benchmark_func_kwargs: kwargs to be passed to func_to_benchmark
+
+        num_profiles, num_benchmarks: Number of measured iterations, i.e., how many
+            times the function will be called
+        profile_dir: Where to write chrome traces / stack files.
+
+        device_type: "cuda" or "cpu".
+        pre_gpu_load: Number of dummy matmul operations to run before the first
+            measured iteration (helps simulating a loaded allocator).
+        export_stacks: Whether to export flamegraph-compatible stack files.
+        all_rank_traces: Whether to export traces from all ranks.
+        memory_snapshot: Whether to capture memory snapshot during the profiling
+    """
     if benchmark_func_kwargs is None:
         benchmark_func_kwargs = {}
 
@@ -775,4 +932,6 @@ def benchmark_func(
         pre_gpu_load=pre_gpu_load,
         export_stacks=export_stacks,
         reset_accumulated_memory_stats=True,
+        all_rank_traces=all_rank_traces,
+        memory_snapshot=memory_snapshot,
     )

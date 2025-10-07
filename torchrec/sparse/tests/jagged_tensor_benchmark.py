@@ -16,7 +16,7 @@ import click
 
 import torch
 from torchrec.distributed.benchmark.base import (
-    benchmark,
+    benchmark_model_with_warmup,
     BenchmarkResult,
     CPUMemoryStats,
     GPUMemoryStats,
@@ -77,7 +77,7 @@ def bench(
     setattr(model, "forward", lambda kwargs: fn(**kwargs))
     prof_num = 10
     if device_type == "cuda":
-        result = benchmark(
+        result = benchmark_model_with_warmup(
             name=name,
             model=model,
             warmup_inputs=[],

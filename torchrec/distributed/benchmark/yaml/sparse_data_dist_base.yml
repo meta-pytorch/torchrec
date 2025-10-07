@@ -4,8 +4,8 @@ RunOptions:
   world_size: 2
   num_batches: 10
   sharding_type: table_wise
-  profile: "."
-  profile_name: "sparse_data_dist_base"
+  profile_dir: "."
+  name: "sparse_data_dist_base"
   # export_stacks: True # enable this to export stack traces
 PipelineConfig:
   pipeline: "sparse"

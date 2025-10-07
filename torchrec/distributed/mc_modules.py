@@ -827,6 +827,7 @@ class ShardedManagedCollisionCollection(
                     "_output_segments_tensor",
                     "_current_iter_tensor",
                     "_scalar_logger._scalar_logger_steps",
+                    "_hash_zch_bucket",
                 ]:
                     continue
                 if name in module._non_persistent_buffers_set:
