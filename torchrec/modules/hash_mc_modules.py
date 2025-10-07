@@ -305,6 +305,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
 
         self._max_probe = max_probe
         self._buckets = total_num_buckets
+        self.register_buffer("_hash_zch_bucket", torch.tensor(total_num_buckets))
         # Do not need to store in buffer since this is created and consumed
         # at each step https://fburl.com/code/axzimmbx
         self._evicted_indices = []
