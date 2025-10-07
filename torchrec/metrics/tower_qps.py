@@ -7,13 +7,16 @@
 
 # pyre-strict
 
+import copy
 import time
-from typing import Any, cast, Dict, List, Optional, Type
+from typing import Any, cast, Dict, List, Optional, OrderedDict, Type
 
 import torch
 import torch.distributed as dist
+from torch import nn
+from torchrec.distributed.utils import none_throws
 
-from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
+from torchrec.metrics.metrics_config import BatchSizeStage, RecComputeMode, RecTaskInfo
 from torchrec.metrics.metrics_namespace import MetricName, MetricNamespace, MetricPrefix
 from torchrec.metrics.rec_metric import (
     MetricComputationReport,
@@ -194,6 +197,7 @@ class TowerQPSMetric(RecMetric):
         fused_update_limit: int = 0,
         process_group: Optional[dist.ProcessGroup] = None,
         warmup_steps: int = WARMUP_STEPS,
+        batch_size_stages: Optional[List[BatchSizeStage]] = None,
         **kwargs: Any,
     ) -> None:
         if fused_update_limit > 0:
@@ -213,6 +217,18 @@ class TowerQPSMetric(RecMetric):
             **kwargs,
         )
 
+        self._batch_size = batch_size
+        self._world_size = world_size
+        self._batch_size_stages: Optional[List[BatchSizeStage]] = copy.deepcopy(
+            batch_size_stages
+        )
+
+        if self._batch_size_stages is not None:
+            self._num_batch: int = 0
+
+        self._register_load_state_dict_pre_hook(self.load_state_dict_hook)
+        self.register_state_dict_post_hook(self.state_dict_hook)
+
     def update(
         self,
         *,
@@ -221,6 +237,9 @@ class TowerQPSMetric(RecMetric):
         weights: Optional[RecModelOutput],
         **kwargs: Dict[str, Any],
     ) -> None:
+        if self._batch_size_stages is not None:
+            self._num_batch += 1
+            self._batch_size = self._get_batch_size()
         with torch.no_grad():
             if self._compute_mode in [
                 RecComputeMode.FUSED_TASKS_COMPUTATION,
@@ -313,3 +332,53 @@ class TowerQPSMetric(RecMetric):
                         labels=task_labels,
                         weights=None,
                     )
+
+    def _get_batch_size(self) -> int:
+        if not self._batch_size_stages:
+            return self._batch_size
+
+        batch_size_stages = none_throws(self._batch_size_stages)
+        while self._batch_size_stages:
+            stage = self._batch_size_stages[0]
+            if stage.max_iters is None:
+                assert len(batch_size_stages) == 1
+                return stage.batch_size
+            if stage.max_iters < self._num_batch:
+                batch_size_stages.pop(0)
+                continue
+            return stage.batch_size
+        raise AssertionError("Unreachable, batch_size_stages should always has 1 item")
+
+    @staticmethod
+    def state_dict_hook(
+        module: nn.Module,
+        state_dict: OrderedDict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+    ) -> None:
+        """
+        The state dict hook and load state dict hook exist to ensure we load num_batch for a metric with
+        batch_size_stages set. The reason we do this apporach as opposted to saving num_batch as a buffer
+        is in some cases we are accessing the value from a CPU workload where the tensors are on GPU. This
+        incurs a device to head call, which is expensive and blocking.
+        """
+        if module._batch_size_stages is not None:
+            num_batch_key = f"{prefix}num_batch"
+            state_dict[num_batch_key] = torch.tensor(
+                module._num_batch, dtype=torch.long
+            )
+
+    def load_state_dict_hook(
+        self,
+        state_dict: OrderedDict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+        strict: bool,
+        missing_keys: List[str],
+        unexpected_keys: List[str],
+        error_msgs: List[str],
+    ) -> None:
+        key = f"{prefix}num_batch"
+        if key in state_dict and self._batch_size_stages is not None:
+            num_batch_tensor = state_dict.pop(key)
+            self._num_batch = int(num_batch_tensor.item())
