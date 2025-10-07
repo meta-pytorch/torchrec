@@ -9,7 +9,7 @@
 import argparse
 import os
 import sys
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict
 
 import torch
 import yaml
