@@ -188,6 +188,19 @@ class MetricsConfig:
     enable_pt2_compile: bool = False
     should_clone_update_inputs: bool = False
 
+    def __post_init__(self) -> None:
+        for metric_enum, metric_def in self.rec_metrics.items():
+            if metric_def.rec_task_indices:
+                if self.rec_tasks is None:
+                    raise ValueError(
+                        f"rec_task_indices {metric_def.rec_task_indices} is specified, but rec_tasks is None for metric {metric_enum}"
+                    )
+                for idx in metric_def.rec_task_indices:
+                    if idx >= len(self.rec_tasks):
+                        raise ValueError(
+                            f"rec_task_indices {idx} is out of range of {len(self.rec_tasks)} tasks for metric {metric_enum}"
+                        )
+
 
 DefaultTaskInfo = RecTaskInfo(
     name="DefaultTask",
