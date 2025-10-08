@@ -148,7 +148,7 @@ def a2a_async_base(
             async_op=True,
         )
 
-    with record_function("## comms validation ##"):
+    with record_function("## comms pre-check ##"):
         # pre-check is performed before comms' done
         pre_checks = _validate(post_comms, ctx).to("cpu", non_blocking=True)
         # need this cuda.event to record the device-to-host data transfer
@@ -159,13 +159,15 @@ def a2a_async_base(
         pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
 
     ev_d2h.synchronize()  # make sure the pre_checks is available from cpu side
-    with record_function(f"## post-comms compute: pre-check-{pre_checks}##"):
+    with record_function(f"## comms check and pre-check: {pre_checks} ##"):
         # assertion fails without wait(), this wait() makes the main cuda stream wait
         # for the comms to finish, so the post-comms compute will be blocked until
         # the comms is done
         req.wait()
         checks = _validate(post_comms, ctx).to("cpu", non_blocking=True)
         ev_d2h.record()  # record the device-to-host data transfer
+
+    with record_function("## post-comms compute ##"):
         post_comms = _compute(
             dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=post_comms[0]
         )
@@ -174,6 +176,81 @@ def a2a_async_base(
         # again, make sure the device-to-host data transfer is done before the assertion
         ev_d2h.synchronize()
         assert checks
+
+
+# all_to_all_single with sync and single stream
+def a2a_async_twice(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+) -> None:
+    with record_function("## pre-comms compute ##"):
+        pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## pre-allocation ##"):
+        # use zeros instead of empty to make sure no previous data used
+        post_comms1 = torch.zeros_like(pre_comms)
+        post_comms2 = torch.zeros_like(pre_comms)
+
+    with record_function("## comms1 ##"):
+        req1 = dist.all_to_all_single(
+            output=post_comms1,
+            input=pre_comms,
+            group=ctx.pg,
+            async_op=True,
+        )
+
+    with record_function("## comms1 pre-validation ##"):
+        # pre-check is performed before comms' done
+        pre_checks1 = _validate(post_comms1, ctx).to("cpu", non_blocking=True)
+        # need this cuda.event to record the device-to-host data transfer
+        ev_d2h = torch.cuda.Event()
+        ev_d2h.record()
+
+    with record_function("## comms2 ##"):
+        side_stream = torch.cuda.Stream()
+        post_comms2.record_stream(side_stream)
+        with torch.cuda.stream(side_stream):
+            req1.wait()  # let the side stream wait for comms1 to finish
+            pre_comms = torch.sigmoid(post_comms1) + ctx.rank
+            req2 = dist.all_to_all_single(
+                output=post_comms2,
+                input=pre_comms,
+                group=ctx.pg,
+                async_op=True,
+            )
+
+    with record_function("## irrelevant compute1 ##"):
+        pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## comms2 pre-validation ##"):
+        # pre-check is performed before comms' done, actually even before comms2 starts
+        pre_checks2 = _validate(post_comms2, ctx).to("cpu", non_blocking=True)
+        ev_d2h.record()  # record the device-to-host data transfer
+
+    with record_function("## irrelevant compute2 ##"):
+        pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    ev_d2h.synchronize()  # make sure the pre_checks is available from cpu side
+    with record_function(f"## comms1 checks and pre-checks1 {pre_checks1} ##"):
+        req1.wait()  # let the main stream wait for comms1 to finish
+        checks1 = _validate(post_comms1, ctx).to("cpu", non_blocking=True)
+    with record_function(f"## comms2 checks and pre-checks2 {pre_checks2} ##"):
+        req2.wait()  # let the main stream wait for comms2 to finish
+        checks2 = _validate(post_comms2, ctx).to("cpu", non_blocking=True)
+        ev_d2h.record()  # record the device-to-host data transfer
+
+    with record_function("## post-comms comput ##"):
+        post_comms2 = _compute(
+            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=post_comms2[0]
+        )
+
+    with record_function("## assert ##"):
+        # again, make sure the device-to-host data transfer is done before the assertion
+        ev_d2h.synchronize()
+        assert checks1 and checks2
 
 
 # single-rank runner
@@ -195,6 +272,8 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
             func = a2a_sync_base
         elif arg.name.startswith("a2a_async_base"):
             func = a2a_async_base
+        elif arg.name.startswith("a2a_async_twice"):
+            func = a2a_async_twice
         else:
             func = a2a_sync_base
 
