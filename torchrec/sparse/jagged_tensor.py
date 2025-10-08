@@ -25,7 +25,8 @@ from torchrec.pt2.checks import (
     pt2_check_size_nonzero,
     pt2_checks_all_is_size,
     pt2_checks_tensor_slice,
-    pt2_guard_size_oblivious,
+    pt2_guard_or_false,
+    pt2_guard_or_true,
 )
 from torchrec.streamable import Pipelineable
 
@@ -1071,7 +1072,7 @@ def _assert_tensor_has_no_elements_or_has_integers(
         # TODO(ivankobzarev): Use guard_size_oblivious to pass tensor.numel() == 0 once it is torch scriptable.
         return
 
-    assert pt2_guard_size_oblivious(tensor.numel() == 0) or tensor.dtype in [
+    assert pt2_guard_or_false(tensor.numel() == 0) or tensor.dtype in [
         torch.long,
         torch.int,
         torch.short,
@@ -1206,7 +1207,7 @@ def _maybe_compute_length_per_key(
                     torch.sum(
                         pt2_check_size_nonzero(lengths.view(len(keys), stride)), dim=1
                     ).tolist()
-                    if pt2_guard_size_oblivious(lengths.numel() != 0)
+                    if pt2_guard_or_true(lengths.numel() != 0)
                     else [0] * len(keys)
                 )
             )
@@ -1425,7 +1426,7 @@ def _maybe_compute_kjt_to_jt_dict(
             torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
             for lengths in split_lengths
         ]
-    elif pt2_guard_size_oblivious(lengths.numel() > 0):
+    elif pt2_guard_or_true(lengths.numel() > 0):
         strided_lengths = lengths.view(len(keys), stride)
         if not torch.jit.is_scripting() and is_torchdynamo_compiling():
             torch._check(strided_lengths.size(0) > 0)
