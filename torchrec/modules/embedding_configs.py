@@ -7,12 +7,11 @@
 
 # pyre-strict
 
-from abc import ABC
 from dataclasses import dataclass, field
 from enum import Enum, unique
 from functools import partial
 from math import sqrt
-from typing import Callable, Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional
 
 import torch
 from fbgemm_gpu.split_embedding_configs import SparseType

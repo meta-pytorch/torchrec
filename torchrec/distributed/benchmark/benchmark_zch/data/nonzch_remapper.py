@@ -7,7 +7,7 @@
 
 # pyre-strict
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Union
 
 import torch
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
