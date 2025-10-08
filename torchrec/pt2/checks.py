@@ -11,7 +11,7 @@ from typing import List
 
 import torch
 
-from torch.fx.experimental.symbolic_shapes import guard_size_oblivious
+from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
 USE_TORCHDYNAMO_COMPILING_PATH: bool = False
 
@@ -91,8 +91,15 @@ def pt2_check_size_nonzero(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def pt2_guard_size_oblivious(x: bool) -> bool:
+def pt2_guard_or_false(x: bool) -> bool:
     if torch.jit.is_scripting() or not is_pt2_compiling():
         return x
 
-    return guard_size_oblivious(x)
+    return guard_or_false(x)
+
+
+def pt2_guard_or_true(x: bool) -> bool:
+    if torch.jit.is_scripting() or not is_pt2_compiling():
+        return x
+
+    return guard_or_true(x)
