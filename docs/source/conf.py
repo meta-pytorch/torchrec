@@ -87,6 +87,7 @@ html_theme_options = {
     "logo_only": True,
     "collapse_navigation": False,
     "includehidden": True,
+    "analytics_id": "GTM-T8XT4PS",
 }
 
 # Add any paths that contain custom static files (such as style sheets) here,
