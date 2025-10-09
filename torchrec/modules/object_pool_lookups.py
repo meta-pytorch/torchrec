@@ -149,9 +149,11 @@ class KeyedJaggedTensorPoolLookup(abc.ABC, torch.nn.Module):
         """
         return self.lookup(ids)
 
-    @abc.abstractmethod
     def states_to_register(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        pass
+        yield "values", self._tbe_state
+        yield "key_lengths", self._key_lengths
+        if self._is_weighted:
+            yield "weights", self._tbe_weights_state
 
 
 class TensorJaggedIndexSelectLookup(KeyedJaggedTensorPoolLookup):
@@ -249,12 +251,14 @@ class TensorJaggedIndexSelectLookup(KeyedJaggedTensorPoolLookup):
                 )
 
         return JaggedTensor(
-            values=values, weights=weights, lengths=key_lengths_for_ids.flatten()
+            values=values,
+            weights=weights,
+            lengths=key_lengths_for_ids.flatten(),
         )
 
     def update(self, ids: torch.Tensor, values: JaggedTensor) -> None:
 
-        with record_function("## TensorPool update ##"):
+        with record_function("## KJTPool update ##"):
             key_lengths = (
                 # pyre-ignore
                 values.lengths()
@@ -262,7 +266,6 @@ class TensorJaggedIndexSelectLookup(KeyedJaggedTensorPoolLookup):
                 .sum(axis=1)
             )
             key_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(key_lengths)
-
             padded_values = torch.ops.fbgemm.jagged_to_padded_dense(
                 values.values(),
                 [key_offsets],
@@ -289,12 +292,6 @@ class TensorJaggedIndexSelectLookup(KeyedJaggedTensorPoolLookup):
             lengths, offsets = self._infer_jagged_lengths_inclusive_offsets()
             self._jagged_lengths = lengths
             self._jagged_offsets = offsets
-
-    def states_to_register(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        yield "values", self._values
-        yield "key_lengths", self._key_lengths
-        if self._is_weighted:
-            yield "weights", self._weights
 
 
 class UVMCachingInt64Lookup(KeyedJaggedTensorPoolLookup):
@@ -378,29 +375,18 @@ class UVMCachingInt64Lookup(KeyedJaggedTensorPoolLookup):
             kjt_dense_values = output_int_upper | output_int_lower
 
             key_lengths_for_ids = self._key_lengths[ids]
-            lengths_sum = key_lengths_for_ids.sum(dim=1)
-
-            padded_lengths = self._bit_dims_t - lengths_sum
-            # TODO: pre-compute this on class init
-            jagged_lengths = torch.stack(
-                [
-                    lengths_sum,
-                    padded_lengths,
-                ],
-                dim=1,
-            ).flatten()
-
-            lookup_indices = torch.arange(0, ids.shape[0] * 2, 2, device=self._device)
-            output_lengths = jagged_lengths[lookup_indices]
+            lookup_indices = 2 * ids
+            lengths = self._jagged_lengths[lookup_indices]
+            offsets = torch.ops.fbgemm.asynchronous_inclusive_cumsum(lengths)
             values = jagged_index_select_with_empty(
                 kjt_dense_values.flatten().unsqueeze(-1),
                 lookup_indices,
-                torch.ops.fbgemm.asynchronous_inclusive_cumsum(jagged_lengths),
-                torch.ops.fbgemm.asynchronous_inclusive_cumsum(output_lengths),
+                self._jagged_offsets,
+                offsets,
             )
 
         return JaggedTensor(
-            values=values.flatten(),
+            values=values,
             lengths=key_lengths_for_ids.flatten(),
         )
 
@@ -435,10 +421,9 @@ class UVMCachingInt64Lookup(KeyedJaggedTensorPoolLookup):
                 .to(self._key_lengths.dtype)
             )
 
-    def states_to_register(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        yield "values_upper_and_lower_bits", self._tbe_state
-        if self._is_weighted:
-            yield "weights", self._tbe_weights_state
+            lengths, offsets = self._infer_jagged_lengths_inclusive_offsets()
+            self._jagged_lengths = lengths
+            self._jagged_offsets = offsets
 
 
 class UVMCachingInt32Lookup(KeyedJaggedTensorPoolLookup):
@@ -520,24 +505,14 @@ class UVMCachingInt32Lookup(KeyedJaggedTensorPoolLookup):
             kjt_dense_values = output.view(torch.int32)
 
             key_lengths_for_ids = self._key_lengths[ids]
-            lengths_sum = key_lengths_for_ids.sum(dim=1)
-
-            padded_lengths = self._bit_dims_t - lengths_sum
-            jagged_lengths = torch.stack(
-                [
-                    lengths_sum,
-                    padded_lengths,
-                ],
-                dim=1,
-            ).flatten()
-
-            lookup_ids = 2 * torch.arange(ids.shape[0], device=self._device)
-            output_lengths = jagged_lengths[lookup_ids]
+            lookup_indices = 2 * ids
+            lengths = self._jagged_lengths[lookup_indices]
+            offsets = torch.ops.fbgemm.asynchronous_inclusive_cumsum(lengths)
             values = jagged_index_select_with_empty(
                 kjt_dense_values.flatten().unsqueeze(-1),
-                lookup_ids,
-                torch.ops.fbgemm.asynchronous_inclusive_cumsum(jagged_lengths),
-                torch.ops.fbgemm.asynchronous_inclusive_cumsum(output_lengths),
+                lookup_indices,
+                self._jagged_offsets,
+                offsets
             )
 
         return JaggedTensor(
@@ -569,10 +544,9 @@ class UVMCachingInt32Lookup(KeyedJaggedTensorPoolLookup):
                 .to(self._key_lengths.dtype)
             )
 
-    def states_to_register(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        yield "values", self._tbe_state
-        if self._is_weighted:
-            yield "weights", self._tbe_weights_state
+            lengths, offsets = self._infer_jagged_lengths_inclusive_offsets()
+            self._jagged_lengths = lengths
+            self._jagged_offsets = offsets
 
 
 class TensorPoolLookup(abc.ABC, torch.nn.Module):
