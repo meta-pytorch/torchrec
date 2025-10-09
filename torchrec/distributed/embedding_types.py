@@ -535,7 +535,9 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
         sharding_type: str,
         compute_device_type: str,
     ) -> List[str]:
-        ret: List[str] = []
+        ret = [
+            EmbeddingComputeKernel.DENSE.value,
+        ]
         if sharding_type != ShardingType.DATA_PARALLEL.value:
             ret += [
                 EmbeddingComputeKernel.FUSED.value,
@@ -548,11 +550,6 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
                     EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
                     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
                 ]
-        else:
-            # TODO re-enable model parallel and dense
-            ret += [
-                EmbeddingComputeKernel.DENSE.value,
-            ]
         return ret
 
     @property
