@@ -667,15 +667,22 @@ class ShardingOption:
         return result
 
     def __str__(self) -> str:
-        str_obj: str = ""
-        str_obj += f"name: {self.name}"
-        str_obj += f"\nsharding type: {self.sharding_type}"
-        str_obj += f"\ncompute kernel: {self.compute_kernel}"
-        str_obj += f"\nnum shards: {len(self.shards)}"
-        for shard in self.shards:
-            str_obj += f"\n\t{str(shard)}"
-
-        return str_obj
+        tensor_metadata = f"{{shape: {tuple(self.tensor.shape)}, dtype: {self.tensor.dtype}, device: {self.tensor.device}}}"
+        shards_str = f"[{', '.join(str(shard) for shard in self.shards)}]"
+        return f"""{{
+            "name": "{self.name}",
+            "module_fqn": "{self.module[0]}",
+            "tensor": {tensor_metadata},
+            "input_lengths": {self.input_lengths},
+            "batch_size": {self.batch_size},
+            "sharding_type": "{self.sharding_type}",
+            "compute_kernel": "{self.compute_kernel}",
+            "shards": {shards_str},
+            "is_pooled": {self.is_pooled if self.module[1] else None},
+            "feature_names": {self.feature_names},
+            "cache_params": {self.cache_params},
+            "is_weighted": {self.is_weighted}
+        }}"""
 
 
 class PartitionByType(Enum):
