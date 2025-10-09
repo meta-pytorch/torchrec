@@ -14,7 +14,7 @@ from typing import List
 import torch
 from parameterized import parameterized
 from torch.testing import FileCheck  # @manual
-from torchrec.distributed.test_utils.test_input import ModelInput
+from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.fx import symbolic_trace, Tracer
 from torchrec.models.deepfm import (
     DenseArch,

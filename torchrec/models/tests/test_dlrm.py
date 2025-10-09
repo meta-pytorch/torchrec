@@ -16,7 +16,7 @@ from parameterized import parameterized
 from torch import nn
 from torch.testing import FileCheck  # @manual
 from torchrec.datasets.utils import Batch
-from torchrec.distributed.test_utils.test_input import ModelInput
+from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.fx import symbolic_trace
 from torchrec.ir.serializer import JsonSerializer
 from torchrec.ir.utils import decapsulate_ir_modules, encapsulate_ir_modules

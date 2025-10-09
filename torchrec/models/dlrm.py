@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from torchrec.datasets.utils import Batch
-from torchrec.distributed.test_utils.test_input import ModelInput
+from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.modules.crossnet import LowRankCrossNet
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.modules.mlp import MLP
