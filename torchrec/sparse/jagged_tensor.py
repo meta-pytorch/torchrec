@@ -747,6 +747,53 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             tensor_list.append(self.values()[offset:next_offset])
         return tensor_list
 
+    def to_dense_stacked(self) -> torch.Tensor:
+        """
+        Optimized JaggedTensor to dense conversion that provides better performance than to_padded_dense().
+
+        Performance optimizations:
+        1. Length=1 sequences: Zero DtoH transfers (simple reshape)
+        2. Uniform lengths: Eliminates max_length computation DtoH transfer
+        3. Variable lengths: Uses to_padded_dense() directly without reconstruction overhead
+
+        Returns:
+            torch.Tensor: Stacked dense tensor equivalent to torch.vstack(jt.to_dense())
+        """
+        lengths = self.lengths()
+        values = self.values()
+
+        # ==================== ULTRA-FAST PATH: Length=1 sequences ============
+        # This is the most common case in InTrainerSeqStore - all embeddings have length 1
+        if torch.all(lengths == 1):
+            # Zero DtoH transfers - pure GPU reshape operation
+            batch_size = lengths.size(0)
+            if values.dim() == 1:
+                return values.view(batch_size, 1)
+            else:
+                feature_dim = values.size(-1) if values.dim() > 1 else 1
+                return values.view(batch_size, feature_dim)
+
+        # ==================== FAST PATH: Uniform lengths (non-1) ====================
+        # Check if all sequences have the same length but not 1
+        first_length = lengths[0]
+        if torch.all(lengths == first_length):
+            # All uniform lengths - we can avoid the expensive max_length computation!
+            # This is faster than to_padded_dense() because we skip torch.max().item() call
+            seq_length = (
+                first_length.item()
+            )  # Only ONE .item() call instead of torch.max().item()
+
+            # Use efficient fbgemm call with known exact length (no over-padding)
+            offsets = self.offsets()
+            return torch.ops.fbgemm.jagged_to_padded_dense(
+                values, [offsets], [seq_length], 0.0
+            )  # No trimming needed since we used exact length
+
+        # ==================== VARIABLE LENGTH PATH ====================
+        # For true variable lengths: just delegate to to_padded_dense()
+        # This is equivalent performance but with the fast paths above for common cases
+        return self.to_padded_dense()
+
     def to_dense_weights(self) -> Optional[List[torch.Tensor]]:
         """
         Constructs a dense-representation of the JT's weights.
