@@ -26,8 +26,10 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
 from torch import nn
 from torch.autograd.profiler import record_function
 from torchrec import optim as trec_optim
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    KeyedJaggedTensor,
+)
 from torchrec.distributed.types import (
     DataType,
     EmbeddingEvent,
@@ -38,6 +40,7 @@ from torchrec.distributed.types import (
     ShardMetadata,
 )
 from torchrec.modules.embedding_configs import data_type_to_sparse_type
+from torchrec.modules.feature_processor_ import FeatureProcessorsCollection
 from torchrec.types import CopyMixIn
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -758,3 +761,47 @@ class EmbeddingQuantizationUtils:
                 _recalculate_torch_state_helper(child)
 
         _recalculate_torch_state_helper(module)
+        emb_kernel.weights_precision = converted_sparse_dtype  # pyre-ignore [16]
+
+
+def modify_input_for_feature_processor(
+    features: KeyedJaggedTensor,
+    feature_processors: Union[nn.ModuleDict, FeatureProcessorsCollection],
+    is_collection: bool,
+) -> None:
+    """
+    This function applies the feature processor pre input dist. This way we
+    can support row wise based sharding mechanisms.
+
+    This is an inplace modifcation of the input KJT.
+    """
+    with torch.no_grad():
+        if features.weights_or_none() is None:
+            # force creation of weights, this way the feature jagged tensor weights are tied to the original KJT
+            features._weights = torch.zeros_like(features.values(), dtype=torch.float32)
+
+        if is_collection:
+            if hasattr(feature_processors, "pre_process_pipeline_input"):
+                feature_processors.pre_process_pipeline_input(features)  # pyre-ignore[29]
+            else:
+                logging.info(
+                    f"[Feature Processor Pipeline] Skipping pre_process_pipeline_input for feature processor {feature_processors=}"
+                )
+        else:
+            # per feature process
+            for feature in features.keys():
+                if feature in feature_processors:  # pyre-ignore[58]
+                    feature_processor = feature_processors[feature]  # pyre-ignore[29]
+                    if hasattr(feature_processor, "pre_process_pipeline_input"):
+                        feature_processor.pre_process_pipeline_input(features[feature])
+                    else:
+                        logging.info(
+                            f"[Feature Processor Pipeline] Skipping pre_process_pipeline_input for feature processor {feature_processor=}"
+                        )
+                else:
+                    features[feature].weights().copy_(
+                        torch.ones(
+                            features[feature].values().shape[0],
+                            device=features[feature].values().device,
+                        )
+                    )

@@ -40,7 +40,7 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
         self.pg = init_distributed_single_host(backend=backend, rank=0, world_size=1)
 
         num_features = 4
-        num_weighted_features = 2
+        num_weighted_features = 4
         self.tables = [
             EmbeddingBagConfig(
                 num_embeddings=(i + 1) * 100,

@@ -19,7 +19,10 @@ from typing import (
     Generic,
     Iterator,
     List,
+    Mapping,
     Optional,
+    ParamSpec,
+    Sequence,
     Tuple,
     Type,
     TypeVar,
@@ -77,6 +80,8 @@ from torch.distributed._shard.sharding_spec import (  # noqa
     ShardMetadata,
 )
 from torchrec.streamable import Multistreamable
+
+_T = TypeVar("_T")
 
 
 def _tabulate(
@@ -1017,6 +1022,8 @@ class ShardedModule(
         if qcomm_codecs_registry is None:
             qcomm_codecs_registry = {}
         self._qcomm_codecs_registry = qcomm_codecs_registry
+        # In pipelining, this flag is flipped in rewrite_model when the forward is replaced with the pipelined forward
+        self.is_pipelined = False
 
     @abc.abstractmethod
     def create_context(self) -> ShrdCtx:
@@ -1118,6 +1125,19 @@ class ShardedModule(
     def sharded_parameter_names(self, prefix: str = "") -> Iterator[str]:
         for key, _ in self.named_parameters(prefix):
             yield key
+
+    def preprocess_input(
+        self,
+        args: List[_T],
+        kwargs: Mapping[str, _T],
+    ) -> Tuple[List[_T], Mapping[str, _T]]:
+        """
+        This function can be used to preprocess the input arguments prior to module forward call.
+
+        For example, it is used in ShardedFeatureProcessorEmbeddingBagCollection to transform the input data
+        prior to the forward call.
+        """
+        return args, kwargs
 
     @property
     @abc.abstractmethod
