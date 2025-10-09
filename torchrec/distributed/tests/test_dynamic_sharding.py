@@ -566,11 +566,10 @@ class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
         - For Table-Wise sharding: All optimizers including RowWiseAdagrad
         - For Column-Wise sharding: Only Adagrad and SGD (no RowWiseAdagrad)
         """
-        if (
-            self.device == torch.device("cpu")
-            and kernel_type != EmbeddingComputeKernel.FUSED.value
-        ):
-            self.skipTest("CPU does not support uvm.")
+        assume(
+            self.device != torch.device("cpu")
+            or kernel_type == EmbeddingComputeKernel.FUSED.value
+        )
 
         # Fixed to False as variable batch size with CW is more complex
         variable_batch_size = False
