@@ -739,6 +739,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         batch: Optional[In],
         context: TrainPipelineContext,
         pipelined_forward: Type[PipelinedForward] = PipelinedForward,
+        custom_dist_stream: Optional[torch.Stream] = None,
     ) -> None:
         (
             self._pipelined_modules,
@@ -749,7 +750,11 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         ) = _rewrite_model(
             model=self._model,
             context=context,
-            dist_stream=self._data_dist_stream,
+            dist_stream=(
+                self._data_dist_stream
+                if custom_dist_stream is None
+                else custom_dist_stream
+            ),
             default_stream=torch.get_device_module(self._device).current_stream(),
             batch=batch,
             apply_jit=self._apply_jit,
@@ -777,6 +782,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         batch: In,
         context: TrainPipelineContext,
         pipelined_forward: Type[PipelinedForward] = PipelinedForward,
+        custom_dist_stream: Optional[torch.Stream] = None,
     ) -> None:
         """
         Retrieves the pipelined modules after overriding their forwards, initializes the
@@ -788,7 +794,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             self.start_sparse_data_dist(batch, context)
             return
 
-        self._pipeline_model(batch, context, pipelined_forward)
+        self._pipeline_model(batch, context, pipelined_forward, custom_dist_stream)
 
     def copy_batch_to_gpu(
         self,
@@ -1479,7 +1485,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             else None
         )
         self._default_stream: Optional[torch.Stream] = (
-            (torch.get_device_module(self._device).Stream())
+            (torch.get_device_module(self._device).current_stream())
             if self._device.type in ["cuda", "mtia"]
             else None
         )
@@ -1503,6 +1509,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             self._context,
             # pyre-ignore
             self._pipelined_forward_type,
+            self._prefetch_stream,
         )
         self._start_sparse_data_dist(self._batch_i)
         self._wait_sparse_data_dist()
