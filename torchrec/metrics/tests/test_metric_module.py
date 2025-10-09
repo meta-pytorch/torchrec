@@ -722,6 +722,88 @@ def metric_module_gather_state(
         metric_module.shutdown()
 
 
+class MetricsConfigPostInitTest(unittest.TestCase):
+    """Test class for MetricsConfig._post_init() validation functionality."""
+
+    def test_post_init_valid_rec_task_indices(self) -> None:
+        """Test that _post_init() passes when rec_task_indices are valid."""
+        # Setup: create rec_tasks and valid indices
+        task1 = RecTaskInfo(name="task1", label_name="label1", prediction_name="pred1")
+        task2 = RecTaskInfo(name="task2", label_name="label2", prediction_name="pred2")
+        rec_tasks = [task1, task2]
+
+        # Execute: create MetricsConfig with valid rec_task_indices
+        config = MetricsConfig(
+            rec_tasks=rec_tasks,
+            rec_metrics={
+                RecMetricEnum.AUC: RecMetricDef(rec_task_indices=[0, 1]),
+                RecMetricEnum.NE: RecMetricDef(rec_task_indices=[0]),
+            },
+        )
+
+        # Assert: config should be created successfully without raising an exception
+        self.assertEqual(len(config.rec_tasks), 2)
+        self.assertEqual(len(config.rec_metrics), 2)
+
+    def test_post_init_empty_rec_task_indices(self) -> None:
+        """Test that _post_init() passes when rec_task_indices is empty."""
+        # Setup: create rec_tasks but use empty indices
+        task = RecTaskInfo(name="task", label_name="label", prediction_name="pred")
+        rec_tasks = [task]
+
+        # Execute: create MetricsConfig with empty rec_task_indices
+        config = MetricsConfig(
+            rec_tasks=rec_tasks,
+            rec_metrics={
+                RecMetricEnum.AUC: RecMetricDef(rec_task_indices=[]),
+            },
+        )
+
+        # Assert: config should be created successfully with empty indices
+        self.assertEqual(len(config.rec_tasks), 1)
+        self.assertEqual(config.rec_metrics[RecMetricEnum.AUC].rec_task_indices, [])
+
+    def test_post_init_raises_when_rec_tasks_is_none(self) -> None:
+        """Test that _post_init() raises ValueError when rec_tasks is None but rec_task_indices is specified."""
+        # Setup: prepare to create config with None rec_tasks but specified indices
+
+        # Execute & Assert: should raise ValueError about rec_tasks being None
+        with self.assertRaises(ValueError) as context:
+            config = MetricsConfig(
+                rec_tasks=None,  # pyre-ignore[6]: Intentionally passing None for testing
+                rec_metrics={
+                    RecMetricEnum.AUC: RecMetricDef(rec_task_indices=[0]),
+                },
+            )
+
+        error_message = str(context.exception)
+        self.assertIn("rec_task_indices [0] is specified", error_message)
+        self.assertIn("but rec_tasks is None", error_message)
+        self.assertIn("for metric auc", error_message)
+
+    def test_post_init_raises_when_rec_task_index_out_of_range(self) -> None:
+        """Test that _post_init() raises ValueError when rec_task_index is out of range."""
+        # Setup: create single rec_task but try to access index 1
+        task = RecTaskInfo(name="task", label_name="label", prediction_name="pred")
+        rec_tasks = [task]
+
+        # Execute & Assert: should raise ValueError about index out of range
+        with self.assertRaises(ValueError) as context:
+            config = MetricsConfig(
+                rec_tasks=rec_tasks,
+                rec_metrics={
+                    RecMetricEnum.NE: RecMetricDef(
+                        rec_task_indices=[1]
+                    ),  # Index 1 doesn't exist
+                },
+            )
+
+        error_message = str(context.exception)
+        self.assertIn("rec_task_indices 1 is out of range", error_message)
+        self.assertIn("of 1 tasks", error_message)
+        self.assertIn("for metric ne", error_message)
+
+
 @skip_if_asan_class
 class MetricModuleDistributedTest(MultiProcessTestBase):
 

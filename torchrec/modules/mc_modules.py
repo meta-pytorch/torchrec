@@ -376,18 +376,6 @@ class ManagedCollisionCollection(nn.Module):
         self._created_feature_order: List[bool] = [False]
         self._features_order = []
 
-    def _create_feature_order(
-        self,
-        input_feature_names: List[str],
-        device: torch.device,
-    ) -> None:
-        features_order: List[int] = []
-        for f in self._feature_names:
-            features_order.append(input_feature_names.index(f))
-
-        if features_order != list(range(len(features_order))):
-            self._features_order = features_order
-
     def embedding_configs(self) -> Sequence[BaseEmbeddingConfig]:
         return self._embedding_configs
 
