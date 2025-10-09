@@ -7,7 +7,7 @@
 
 # pyre-strict
 import logging as logger
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 from typing import Dict, Iterable, List, Optional
 
 import torch
@@ -33,7 +33,10 @@ UPDATE_MODE_MAP: Dict[TrackingMode, EmbdUpdateMode] = {
 }
 
 # Tracking is current only supported for ShardedEmbeddingCollection and ShardedEmbeddingBagCollection.
-SUPPORTED_MODULES = (ShardedEmbeddingCollection, ShardedEmbeddingBagCollection)
+SUPPORTED_MODULES_TO_PREFIX = {
+    ShardedEmbeddingCollection: ".embeddings",
+    ShardedEmbeddingBagCollection: ".embedding_bags",
+}
 
 
 class ModelDeltaTracker:
@@ -279,61 +282,32 @@ class ModelDeltaTracker:
         if (self._fqn_to_feature_map is not None) and len(self._fqn_to_feature_map) > 0:
             return self._fqn_to_feature_map
 
-        table_to_feature_names: Dict[str, List[str]] = OrderedDict()
-        table_to_fqn: Dict[str, str] = OrderedDict()
+        fqn_to_feature_names: Dict[str, List[str]] = OrderedDict()
         for fqn, named_module in self._model.named_modules():
-            split_fqn = fqn.split(".")
             # Skipping partial FQNs present in fqns_to_skip
             # TODO: Validate if we need to support more complex patterns for skipping fqns
-            should_skip = False
-            for fqn_to_skip in self._fqns_to_skip:
-                if fqn_to_skip in split_fqn:
-                    logger.info(f"Skipping {fqn} because it is part of fqns_to_skip")
-                    should_skip = True
-                    break
-            if should_skip:
-                continue
-            # Using FQNs of the embedding and mapping them to features as state_dict() API uses these to key states.
-            if isinstance(named_module, SUPPORTED_MODULES):
+            if type(named_module) in SUPPORTED_MODULES_TO_PREFIX:
                 for table_name, config in named_module._table_name_to_config.items():
-                    logger.info(
-                        f"Found {table_name} for {fqn} with features {config.feature_names}"
+                    embedding_fqn = (
+                        self._clean_fqn_fn(fqn)
+                        + SUPPORTED_MODULES_TO_PREFIX[type(named_module)]
+                        + f".{table_name}"
                     )
-                    table_to_feature_names[table_name] = config.feature_names
-                    self.tracked_modules[self._clean_fqn_fn(fqn)] = named_module
-            for table_name in table_to_feature_names:
-                # Using the split FQN to get the exact table name matching. Otherwise, checking "table_name in fqn"
-                # will incorrectly match fqn with all the table names that have the same prefix
-                if table_name in split_fqn:
-                    embedding_fqn = self._clean_fqn_fn(fqn)
-                    if table_name in table_to_fqn:
-                        # Sanity check for validating that we don't have more then one table mapping to same fqn.
-                        logger.warning(
-                            f"Override {table_to_fqn[table_name]} with {embedding_fqn} for entry {table_name}"
-                        )
-                    table_to_fqn[table_name] = embedding_fqn
-            logger.info(f"Table to fqn: {table_to_fqn}")
-        flatten_names = [
-            name for names in table_to_feature_names.values() for name in names
-        ]
-        # TODO: Validate if there is a better way to handle duplicate feature names.
-        # Logging a warning if duplicate feature names are found across tables, but continue execution as this could be a valid case.
-        if len(set(flatten_names)) != len(flatten_names):
-            counts = Counter(flatten_names)
-            duplicates = [item for item, count in counts.items() if count > 1]
-            logger.warning(f"duplicate feature names found: {duplicates}")
 
-        fqn_to_feature_names: Dict[str, List[str]] = OrderedDict()
-        for table_name in table_to_feature_names:
-            if table_name not in table_to_fqn:
-                # This is likely unexpected, where we can't locate the FQN associated with this table.
-                logger.warning(
-                    f"Table {table_name} not found in {table_to_fqn}, skipping"
-                )
-                continue
-            fqn_to_feature_names[table_to_fqn[table_name]] = table_to_feature_names[
-                table_name
-            ]
+                    should_skip = False
+                    for fqn_to_skip in self._fqns_to_skip:
+                        if fqn_to_skip in embedding_fqn:
+                            logger.info(
+                                f"Skipping {fqn} because it is part of fqns_to_skip"
+                            )
+                            should_skip = True
+                            break
+                    if should_skip:
+                        continue
+                    if embedding_fqn not in fqn_to_feature_names:
+                        fqn_to_feature_names[embedding_fqn] = []
+                    fqn_to_feature_names[embedding_fqn].extend(config.feature_names)
+                    self.tracked_modules[embedding_fqn] = named_module
         self._fqn_to_feature_map = fqn_to_feature_names
         return fqn_to_feature_names
 
