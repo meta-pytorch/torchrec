@@ -11,7 +11,7 @@ from typing import List, Tuple, Union
 
 import torch
 from torch import nn
-from torchrec.distributed.test_utils.test_input import ModelInput
+from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.modules.deepfm import DeepFM, FactorizationMachine
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor

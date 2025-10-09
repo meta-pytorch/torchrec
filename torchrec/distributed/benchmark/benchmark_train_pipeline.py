@@ -44,15 +44,15 @@ from torchrec.distributed.benchmark.benchmark_utils import (
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import Topology
+from torchrec.distributed.test_utils.model_input import ModelInput
 
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     run_multi_process_func,
 )
+from torchrec.distributed.test_utils.pipeline_config import PipelineConfig
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
-from torchrec.distributed.test_utils.test_input import ModelInput
 from torchrec.distributed.test_utils.test_model import TestOverArchLarge
-from torchrec.distributed.test_utils.train_pipeline import PipelineConfig
 from torchrec.distributed.train_pipeline import TrainPipeline
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig

@@ -32,7 +32,7 @@ from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import NUM_POOLINGS, POOLING_FACTOR
 from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
 from torchrec.distributed.planner.types import ParameterConstraints
-from torchrec.distributed.test_utils.test_input import ModelInput
+from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.distributed.test_utils.test_model import (
     TestEBCSharder,
     TestSparseNN,
