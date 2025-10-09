@@ -24,6 +24,7 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingModule,
 )
 from torchrec.distributed.embeddingbag import (
+    _create_mean_pooling_divisor,
     EmbeddingBagCollectionSharder,
     ShardedEmbeddingBagCollection,
 )
@@ -108,7 +109,7 @@ class BaseShardedManagedCollisionEmbeddingCollection(
             )
         # TODO: This is a hack since _embedding_module doesn't need input
         # dist, so eliminating it so all fused a2a will ignore it.
-        self._embedding_module._has_uninitialized_input_dist = False
+        # self._embedding_module._has_uninitialized_input_dist = False
         embedding_shardings = (
             self._embedding_module._embedding_shardings
             if isinstance(self._embedding_module, ShardedEmbeddingBagCollection)
@@ -155,6 +156,56 @@ class BaseShardedManagedCollisionEmbeddingCollection(
         features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KJTList]]:
         # TODO: resolve incompatiblity with different contexts
+        if self._embedding_module._has_uninitialized_input_dist:
+            if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
+                self._features_order = []
+                # disable feature permutation in mc, because we should
+                # permute features in mc-ebc before mean pooling callback.
+                if self._managed_collision_collection._has_uninitialized_input_dist:
+                    self._managed_collision_collection._create_input_dists(
+                        input_feature_names=features.keys()
+                    )
+                    self._managed_collision_collection._has_uninitialized_input_dist = (
+                        False
+                    )
+                    if self._managed_collision_collection._features_order:
+                        self._features_order = (
+                            self._managed_collision_collection._features_order
+                        )
+                        self._managed_collision_collection._features_order = []
+                if self._embedding_module._has_mean_pooling_callback:
+                    self._embedding_module._init_mean_pooling_callback(
+                        features.keys(),
+                        # pyre-ignore [16]
+                        ctx.inverse_indices,
+                    )
+            self._embedding_module._has_uninitialized_input_dist = False
+        if isinstance(self._embedding_module, ShardedEmbeddingBagCollection):
+            with torch.no_grad():
+                if self._features_order:
+                    features = features.permute(
+                        self._features_order,
+                        self._managed_collision_collection._features_order_tensor,
+                    )
+                if self._embedding_module._has_mean_pooling_callback:
+                    ctx.divisor = _create_mean_pooling_divisor(
+                        lengths=features.lengths(),
+                        stride=features.stride(),
+                        keys=features.keys(),
+                        offsets=features.offsets(),
+                        pooling_type_to_rs_features=self._embedding_module._pooling_type_to_rs_features,
+                        stride_per_key=features.stride_per_key(),
+                        dim_per_key=self._embedding_module._dim_per_key,
+                        embedding_names=self._embedding_module._embedding_names,
+                        embedding_dims=self._embedding_module._embedding_dims,
+                        # pyre-ignore [16]
+                        variable_batch_per_feature=ctx.variable_batch_per_feature,
+                        kjt_inverse_order=self._embedding_module._kjt_inverse_order,
+                        kjt_key_indices=self._embedding_module._kjt_key_indices,
+                        kt_key_ordering=self._embedding_module._kt_key_ordering,
+                        inverse_indices=ctx.inverse_indices,
+                        weights=features.weights_or_none(),
+                    )
         return self._managed_collision_collection.input_dist(
             # pyre-fixme [6]
             ctx,

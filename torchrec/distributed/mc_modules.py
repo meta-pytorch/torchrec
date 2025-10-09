@@ -215,7 +215,7 @@ class ShardedManagedCollisionCollection(
 
         self._feature_to_table: Dict[str, str] = module._feature_to_table
         self._table_to_features: Dict[str, List[str]] = module._table_to_features
-        self._has_uninitialized_input_dists: bool = True
+        self._has_uninitialized_input_dist: bool = True
         self._input_dists: List[nn.Module] = []
         self._managed_collision_modules = nn.ModuleDict()
         self._create_managed_collision_modules(module)
@@ -592,9 +592,9 @@ class ShardedManagedCollisionCollection(
         ctx: ManagedCollisionCollectionContext,
         features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KJTList]]:
-        if self._has_uninitialized_input_dists:
+        if self._has_uninitialized_input_dist:
             self._create_input_dists(input_feature_names=features.keys())
-            self._has_uninitialized_input_dists = False
+            self._has_uninitialized_input_dist = False
 
         with torch.no_grad():
             if self._features_order:
@@ -1010,7 +1010,7 @@ class ShardedQuantManagedCollisionCollection(
 
         self._feature_to_table: Dict[str, str] = module._feature_to_table
         self._table_to_features: Dict[str, List[str]] = module._table_to_features
-        self._has_uninitialized_input_dists: bool = True
+        self._has_uninitialized_input_dist: bool = True
         self._input_dists: torch.nn.ModuleList = torch.nn.ModuleList([])
         self._managed_collision_modules: nn.ModuleDict = nn.ModuleDict()
         self._create_managed_collision_modules(module)
@@ -1223,11 +1223,11 @@ class ShardedQuantManagedCollisionCollection(
         ctx: ManagedCollisionCollectionContext,
         features: KeyedJaggedTensor,
     ) -> ListOfKJTList:
-        if self._has_uninitialized_input_dists:
+        if self._has_uninitialized_input_dist:
             self._create_input_dists(
                 input_feature_names=features.keys(), feature_device=features.device()
             )
-            self._has_uninitialized_input_dists = False
+            self._has_uninitialized_input_dist = False
 
         with torch.no_grad():
             if self._features_order:
