@@ -49,16 +49,6 @@ jobs:
             tag: "py313"
         is_pr:
           - ${{ github.event_name == 'pull_request' }}
-        exclude:
-          - is_pr: true
-            python:
-              version: "3.10"
-          - is_pr: true
-            python:
-              version: "3.11"
-          - is_pr: true
-            python:
-              version: "3.12"
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     permissions:
       id-token: write
