@@ -79,7 +79,7 @@ torch.fx.wrap("len")
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu")
-except OSError:
+except (OSError, RuntimeError):
     pass
 
 # OSS

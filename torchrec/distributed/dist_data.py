@@ -38,7 +38,7 @@ try:
     torch.ops.load_library(
         "//deeplearning/fbgemm/fbgemm_gpu:merge_pooled_embeddings_cpu"
     )
-except OSError:
+except (OSError, RuntimeError):
     pass
 
 # OSS
