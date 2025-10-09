@@ -532,6 +532,7 @@ class ShardingOption:
         feature_names: Optional[List[str]] = None,
         output_dtype: Optional[DataType] = None,
         key_value_params: Optional[KeyValueParams] = None,
+        num_poolings: Optional[List[float]] = None,
     ) -> None:
         self.name = name
         self._tensor = tensor
@@ -554,6 +555,7 @@ class ShardingOption:
         self.feature_names: Optional[List[str]] = feature_names
         self.output_dtype: Optional[DataType] = output_dtype
         self.key_value_params: Optional[KeyValueParams] = key_value_params
+        self.num_poolings: Optional[List[float]] = num_poolings
 
     @property
     def tensor(self) -> torch.Tensor:

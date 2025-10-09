@@ -29,7 +29,10 @@ from torch import nn
 
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import BIGINT_DTYPE, NUM_POOLINGS
-from torchrec.distributed.planner.shard_estimators import _calculate_shard_io_sizes
+from torchrec.distributed.planner.shard_estimators import (
+    _calculate_shard_io_sizes,
+    get_num_poolings,
+)
 from torchrec.distributed.planner.storage_reservations import (
     FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
@@ -361,13 +364,7 @@ class EmbeddingStats(Stats):
         assert shard.ranks
         ranks = shard.ranks
 
-        num_poolings = (
-            cast(List[float], constraints[sharding_option.name].num_poolings)
-            if constraints
-            and constraints.get(sharding_option.name)
-            and constraints[sharding_option.name].num_poolings
-            else [1.0] * sharding_option.num_inputs
-        )
+        num_poolings = get_num_poolings(constraints, sharding_option)
         batch_sizes = (
             cast(List[int], constraints[sharding_option.name].batch_sizes)
             if constraints
@@ -761,18 +758,6 @@ class EmbeddingStats(Stats):
             )
             return embedding_dim
 
-        def _get_num_poolings(
-            constraints: Optional[Dict[str, ParameterConstraints]], so: ShardingOption
-        ) -> List[float]:
-            num_poolings = (
-                cast(List[float], constraints[so.name].num_poolings)
-                if constraints
-                and constraints.get(so.name)
-                and constraints[so.name].num_poolings
-                else [NUM_POOLINGS] * len(so.input_lengths)
-            )
-            return num_poolings
-
         def _get_cache_load_factor(
             sharder: Optional[ModuleSharder[nn.Module]], so: ShardingOption
         ) -> str:
@@ -865,7 +850,7 @@ class EmbeddingStats(Stats):
             shard_storages = _format_storage_breakdown(so_storage)
 
             pooling_factor = str(round(sum(so.input_lengths), 3))
-            num_poolings = _get_num_poolings(constraints, so)
+            num_poolings = get_num_poolings(constraints, so)
             num_indices = str(
                 round(sum(x * y for x, y in zip(so.input_lengths, num_poolings)), 3)
             )
