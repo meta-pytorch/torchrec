@@ -457,22 +457,15 @@ def _get_sharded_local_buckets_for_zero_collision(
     for table in embedding_tables:
         total_num_buckets = none_throws(table.total_num_buckets)
         assert (
+            total_num_buckets % world_size == 0
+        ), f"total_num_buckets={total_num_buckets} must be divisible by world_size={world_size}"
+        assert (
             table.total_num_buckets
             and table.num_embeddings % table.total_num_buckets == 0
         ), f"Table size '{table.num_embeddings}' must be divisible by num_buckets '{table.total_num_buckets}'"
-        extra_local_buckets = int(local_rank < (total_num_buckets % world_size))
-        extra_bucket_padding = (
-            (total_num_buckets % world_size)
-            if local_rank >= (total_num_buckets % world_size)
-            else 0
-        )
-        bucket_offset_start = (
-            total_num_buckets // world_size + extra_local_buckets
-        ) * local_rank + extra_bucket_padding
+        bucket_offset_start = total_num_buckets // world_size * local_rank
         bucket_offset_end = min(
-            total_num_buckets,
-            (total_num_buckets // world_size + extra_local_buckets) * (local_rank + 1)
-            + extra_bucket_padding,
+            total_num_buckets, total_num_buckets // world_size * (local_rank + 1)
         )
         bucket_size = (
             table.num_embeddings + total_num_buckets - 1
