@@ -173,9 +173,33 @@ class _MergePooledEmbeddingsModuleImpl(torch.nn.Module):
         Here we assume input tensors are:
         [TBE_output_0, ..., TBE_output_(n-1)]
         """
-        B = tensors[0].size(1 - cat_dim)
+        # Handle empty shards case (can happen in column-wise sharding)
+        if not tensors or len(tensors) == 0:
+            # Return empty tensor if no tensors provided
+            return torch.empty(0, 0, dtype=torch.float, device=self.current_device)
+
+        # Check if we are in TorchScript mode first to avoid global variable access issues
+        if torch.jit.is_scripting() or torch.jit.is_tracing():
+            # In TorchScript or JIT tracing mode, use all tensors and let FBGEMM handle empties
+            tensors_to_use = tensors
+        else:
+            if torch.fx._symbolic_trace.is_fx_tracing():
+                # During FX tracing, include all tensors to avoid control flow issues
+                tensors_to_use = tensors
+            else:
+                # Normal execution: filter out empty tensors
+                non_empty_tensors = []
+
+                for t in tensors:
+                    if t.numel() > 0 and t.size(cat_dim) > 0:
+                        non_empty_tensors.append(t)
+
+                tensors_to_use = non_empty_tensors if non_empty_tensors else tensors
+
+        # Use the first tensor to determine batch size
+        B = tensors_to_use[0].size(1 - cat_dim)
         return torch.ops.fbgemm.merge_pooled_embeddings(
-            tensors,
+            tensors_to_use,
             B,
             self.current_device,
             cat_dim,

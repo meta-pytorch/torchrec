@@ -371,6 +371,26 @@ class QuantBatchedEmbeddingBag(
         lengths_or_offsets: torch.Tensor,
         weights: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # Check if total embedding dimension is 0 (can happen in column-wise sharding)
+        total_D = sum(table.local_cols for table in self._config.embedding_tables)
+
+        if total_D == 0:
+            # For empty shards, return tensor with correct batch size but 0 embedding dimension
+            # Use tensor operations that are FX symbolic tracing compatible
+            if self.lengths_to_tbe:
+                # For lengths format, batch size equals lengths tensor size
+                # Create [B, 0] tensor using zeros_like and slicing
+                dummy = torch.zeros_like(lengths_or_offsets, dtype=torch.float)
+                return dummy.unsqueeze(-1)[:, :0]  # [B, 0] tensor
+            else:
+                # For offsets format, batch size is one less than offset size
+                # Use tensor slicing to create batch dimension
+                batch_tensor = lengths_or_offsets[
+                    :-1
+                ]  # Remove last element to get batch size
+                dummy = torch.zeros_like(batch_tensor, dtype=torch.float)
+                return dummy.unsqueeze(-1)[:, :0]  # [B, 0] tensor
+
         kwargs = {"indices": indices}
 
         if self.lengths_to_tbe:
@@ -599,6 +619,18 @@ class QuantBatchedEmbedding(
             )
         else:
             values, offsets, _ = _unwrap_kjt(features)
+
+        # Check if total embedding dimension is 0
+        total_D = sum(table.local_cols for table in self._config.embedding_tables)
+
+        if total_D == 0:
+            # For empty shards, return tensor with correct batch size but 0 embedding dimension
+            # Use tensor operations that are FX symbolic tracing compatible
+            # For offsets format, batch size is one less than offset size
+            # Use tensor slicing to create batch dimension
+            batch_tensor = offsets[:-1]  # Remove last element to get batch size
+            dummy = torch.zeros_like(batch_tensor, dtype=torch.float)
+            return dummy.unsqueeze(-1)[:, :0]  # [B, 0] tensor
 
         if self._emb_module_registered:
             return self.emb_module(

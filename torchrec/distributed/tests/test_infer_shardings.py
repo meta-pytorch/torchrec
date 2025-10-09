@@ -579,9 +579,9 @@ class InferShardingsTest(unittest.TestCase):
     def test_uneven_cw(self, weight_dtype: torch.dtype, device_type: str) -> None:
         num_embeddings = 64
         emb_dim = 512
-        dim_1 = 63
+        dim_1 = 0
         dim_2 = 128
-        dim_3 = 65
+        dim_3 = 128
         dim_4 = 256
         local_size = 4
         world_size = 4
