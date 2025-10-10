@@ -7,8 +7,8 @@
 
 # pyre-strict
 
-from dataclasses import dataclass, fields
-from typing import Any, cast, Dict, List, Optional, Tuple, Type, Union
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -40,10 +40,7 @@ class ModelInputConfig:
         Generate model input data for benchmarking.
 
         Args:
-            tables: List of unweighted embedding tables
-            weighted_tables: List of weighted embedding tables
-            model_config: Configuration for model generation
-            num_batches: Number of batches to generate
+            tables: List of embedding tables
 
         Returns:
             A list of ModelInput objects representing the generated batches
