@@ -41,13 +41,17 @@ class TrackingMode(Enum):
     Tracking mode for ``ModelDeltaTracker``.
 
     Enums:
-        ID_ONLY: Tracks row IDs only, providing a lightweight option for monitoring.
-        EMBEDDING: Tracks both row IDs and their corresponding embedding values,
-            enabling precise top-k result calculations. However, this option comes with increased memory usage.
+        ID_ONLY:    Tracks row IDs only, providing a lightweight option for monitoring.
+        EMBEDDING:  Tracks both row IDs and their corresponding embedding values,
+                    enabling precise top-k result calculations. However, this option comes
+                    with increased memory usage.
+        MOMENTUM_LAST:  Tracks both row IDs and their corresponding momentum values. This mode
+                        supports approximate top-k delta-row selection.
     """
 
     ID_ONLY = "id_only"
     EMBEDDING = "embedding"
+    MOMENTUM_LAST = "momentum_last"
 
 
 class EmbdUpdateMode(Enum):
