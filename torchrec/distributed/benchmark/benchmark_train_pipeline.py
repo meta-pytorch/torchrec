@@ -34,12 +34,12 @@ from torchrec.distributed.benchmark.base import (
     CPUMemoryStats,
     GPUMemoryStats,
 )
-from torchrec.distributed.benchmark.benchmark_utils import (
+from torchrec.distributed.test_utils.input_config import ModelInputConfig
+from torchrec.distributed.test_utils.model_config import (
     BaseModelConfig,
     create_model_config,
     generate_sharded_model_and_optimizer,
 )
-from torchrec.distributed.test_utils.input_config import ModelInputConfig
 from torchrec.distributed.test_utils.model_input import ModelInput
 
 from torchrec.distributed.test_utils.multi_process import (

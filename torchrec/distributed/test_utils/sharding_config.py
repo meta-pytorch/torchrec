@@ -75,15 +75,7 @@ class PlannerConfig:
         Generate an embedding sharding planner based on the specified configuration.
 
         Args:
-            planner_type: Type of planner to use ("embedding" or "hetero")
-            topology: Network topology for distributed training
             tables: List of unweighted embedding tables
-            weighted_tables: List of weighted embedding tables
-            sharding_type: Strategy for sharding embedding tables
-            compute_kernel: Compute kernel to use for embedding tables
-            batch_sizes: Sizes of each batch
-            pooling_factors: Pooling factors for each feature of the table
-            num_poolings: Number of poolings for each feature of the table
 
         Returns:
             An instance of EmbeddingShardingPlanner or HeteroEmbeddingShardingPlanner
