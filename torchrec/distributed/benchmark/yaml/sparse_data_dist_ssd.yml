@@ -21,7 +21,7 @@ EmbeddingTablesConfig:
         feature_names: ["additional_0_0"]
         data_type: FP16
       - name: large_table
-        embedding_dim: 2048
+        embedding_dim: 256
         num_embeddings: 1_000_000
         feature_names: ["additional_0_1"]
     - []
@@ -32,4 +32,5 @@ EmbeddingTablesConfig:
 PlannerConfig:
   additional_constraints:
     large_table:
-      sharding_types: [column_wise]
+      compute_kernels: [key_value]
+      sharding_types: [row_wise]
