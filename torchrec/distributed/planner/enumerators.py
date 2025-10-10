@@ -38,10 +38,6 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 from torchrec.modules.embedding_configs import DataType
-from torchrec.modules.embedding_modules import (
-    EmbeddingBagCollection,
-    EmbeddingCollection,
-)
 from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerCollection
 
 
@@ -182,7 +178,7 @@ class EmbeddingEnumerator(Enumerator):
                 # skip for other device groups
                 if device_group and device_group != self._compute_device:
                     continue
-                num_buckets = self._get_num_buckets(name, child_module)
+
                 sharding_options_per_table: List[ShardingOption] = []
 
                 for sharding_type in self._filter_sharding_types(
@@ -204,7 +200,6 @@ class EmbeddingEnumerator(Enumerator):
                                 sharding_type=sharding_type,
                                 col_wise_shard_dim=col_wise_shard_dim,
                                 device_memory_sizes=self._device_memory_sizes,
-                                num_buckets=num_buckets,
                             )
                         except ZeroDivisionError as e:
                             # Re-raise with additional context about the table and module
@@ -268,33 +263,6 @@ class EmbeddingEnumerator(Enumerator):
         # Caching the search space with a copy of sharding options, to avoid unexpected modifications to list
         self._last_stored_search_space = copy.deepcopy(sharding_options)
         return sharding_options
-
-    def _get_num_buckets(self, parameter: str, module: nn.Module) -> Optional[int]:
-        """
-        Get the number of buckets for each embedding table.
-
-        Args:
-            parameter (str): name of the embedding table.
-            module (nn.Module): module to be sharded.
-
-        Returns:
-            Optional[int]: Number of buckets for the table, or None if module is not EmbeddingBagCollection or table not found.
-        """
-        # If module is not of type EmbeddingBagCollection, return None
-        if isinstance(module, EmbeddingBagCollection):
-            embedding_configs = module.embedding_bag_configs()
-        elif isinstance(module, EmbeddingCollection):
-            embedding_configs = module.embedding_configs()
-        else:
-            return None
-
-        # Find the embedding config for the table with the same name as parameter input
-        for config in embedding_configs:
-            if config.name == parameter and config.use_virtual_table:
-                return config.total_num_buckets
-
-        # If table with matching name not found, return None
-        return None
 
     @property
     def last_stored_search_space(self) -> Optional[List[ShardingOption]]:

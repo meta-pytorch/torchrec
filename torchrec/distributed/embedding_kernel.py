@@ -99,16 +99,9 @@ def create_virtual_table_global_metadata(
     # Otherwise it will only set correct size on current rank and
     # virtual PMT will trigger recalc for the correct global size/offset.
     # NOTE this currently only works for row-wise sharding
-    my_rank_shard_size = metadata.shards_metadata[my_rank].shard_sizes[0]
     for rank, shard_metadata in enumerate(metadata.shards_metadata):
         if use_param_size_as_rows:  # respect the param size and treat it as rows
-            # The param size only has the information for my_rank. In order to
-            # correctly calculate the size for other ranks, we need to use the current
-            # rank's shard size compared to the shard size of my_rank.
-            curr_rank_rows = (
-                param.size()[0]  # pyre-ignore[16]
-                * metadata.shards_metadata[rank].shard_sizes[0]
-            ) // my_rank_shard_size
+            curr_rank_rows = param.size()[0]  # pyre-ignore[16]
         else:
             curr_rank_rows = (
                 weight_count_per_rank[rank] if weight_count_per_rank is not None else 1

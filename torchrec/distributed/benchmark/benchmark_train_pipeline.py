@@ -37,22 +37,19 @@ from torchrec.distributed.benchmark.base import (
 from torchrec.distributed.benchmark.benchmark_utils import (
     BaseModelConfig,
     create_model_config,
-    generate_data,
-    generate_planner,
     generate_sharded_model_and_optimizer,
 )
-from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.planner import Topology
+from torchrec.distributed.test_utils.input_config import ModelInputConfig
+from torchrec.distributed.test_utils.model_input import ModelInput
 
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     run_multi_process_func,
 )
+from torchrec.distributed.test_utils.pipeline_config import PipelineConfig
+from torchrec.distributed.test_utils.sharding_config import PlannerConfig
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
-from torchrec.distributed.test_utils.test_input import ModelInput
 from torchrec.distributed.test_utils.test_model import TestOverArchLarge
-from torchrec.distributed.test_utils.train_pipeline import PipelineConfig
 from torchrec.distributed.train_pipeline import TrainPipeline
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -99,14 +96,11 @@ class RunOptions(BenchFuncConfig):
     world_size: int = 2
     num_batches: int = 10
     sharding_type: ShardingType = ShardingType.TABLE_WISE
-    compute_kernel: EmbeddingComputeKernel = EmbeddingComputeKernel.FUSED
     input_type: str = "kjt"
     name: str = ""
     profile_dir: str = ""
     num_benchmarks: int = 5
     num_profiles: int = 2
-    planner_type: str = "embedding"
-    pooling_factors: Optional[List[float]] = None
     num_poolings: Optional[List[float]] = None
     dense_optimizer: str = "SGD"
     dense_lr: float = 0.1
@@ -124,7 +118,7 @@ class ModelSelectionConfig:
     model_name: str = "test_sparse_nn"
 
     # Common config for all model types
-    batch_size: int = 8192
+    batch_size: int = 1024 * 32
     batch_sizes: Optional[List[int]] = None
     num_float_features: int = 10
     feature_pooling_avg: int = 10
@@ -161,6 +155,8 @@ def runner(
     run_option: RunOptions,
     model_config: BaseModelConfig,
     pipeline_config: PipelineConfig,
+    input_config: ModelInputConfig,
+    planner_config: PlannerConfig,
 ) -> BenchmarkResult:
     # Ensure GPUs are available and we have enough of them
     assert (
@@ -180,39 +176,14 @@ def runner(
             dense_device=ctx.device,
         )
 
-        # Create a topology for sharding
-        topology = Topology(
-            local_world_size=get_local_size(world_size),
-            world_size=world_size,
-            compute_device=ctx.device.type,
-        )
-
-        batch_sizes = model_config.batch_sizes
-
-        if batch_sizes is None:
-            batch_sizes = [model_config.batch_size] * run_option.num_batches
-        else:
-            assert (
-                len(batch_sizes) == run_option.num_batches
-            ), "The length of batch_sizes must match the number of batches."
-
         # Create a planner for sharding based on the specified type
-        planner = generate_planner(
-            planner_type=run_option.planner_type,
-            topology=topology,
-            tables=tables,
-            weighted_tables=weighted_tables,
-            sharding_type=run_option.sharding_type,
-            compute_kernel=run_option.compute_kernel,
-            batch_sizes=batch_sizes,
-            pooling_factors=run_option.pooling_factors,
-            num_poolings=run_option.num_poolings,
+        planner = planner_config.generate_planner(
+            tables=tables + weighted_tables,
         )
-        bench_inputs = generate_data(
+
+        bench_inputs = input_config.generate_batches(
             tables=tables,
             weighted_tables=weighted_tables,
-            model_config=model_config,
-            batch_sizes=batch_sizes,
         )
 
         # Prepare fused_params for sparse optimizer
@@ -230,8 +201,6 @@ def runner(
 
         sharded_model, optimizer = generate_sharded_model_and_optimizer(
             model=unsharded_model,
-            sharding_type=run_option.sharding_type.value,
-            kernel_type=run_option.compute_kernel.value,
             # pyre-ignore
             pg=ctx.pg,
             device=ctx.device,
@@ -285,8 +254,9 @@ def run_pipeline(
     table_config: EmbeddingTablesConfig,
     pipeline_config: PipelineConfig,
     model_config: BaseModelConfig,
+    input_config: ModelInputConfig,
+    planner_config: PlannerConfig,
 ) -> BenchmarkResult:
-
     tables, weighted_tables, *_ = table_config.generate_tables()
 
     benchmark_res_per_rank = run_multi_process_func(
@@ -297,6 +267,8 @@ def run_pipeline(
         run_option=run_option,
         model_config=model_config,
         pipeline_config=pipeline_config,
+        input_config=input_config,
+        planner_config=planner_config,
     )
 
     # Combine results from all ranks into a single BenchmarkResult
@@ -329,6 +301,8 @@ def main(
     table_config: EmbeddingTablesConfig,
     model_selection: ModelSelectionConfig,
     pipeline_config: PipelineConfig,
+    input_config: ModelInputConfig,
+    planner_config: PlannerConfig,
     model_config: Optional[BaseModelConfig] = None,
 ) -> None:
     tables, weighted_tables, *_ = table_config.generate_tables()
@@ -367,6 +341,8 @@ def main(
         run_option=run_option,
         model_config=model_config,
         pipeline_config=pipeline_config,
+        input_config=input_config,
+        planner_config=planner_config,
     )
 
 

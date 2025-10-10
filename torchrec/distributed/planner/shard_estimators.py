@@ -24,6 +24,7 @@ from torchrec.distributed.planner.constants import (
     HALF_BLOCK_PENALTY,
     kernel_bw_lookup,
     KV_CACHING_RATIO,
+    NUM_POOLINGS,
     QUARTER_BLOCK_PENALTY,
     UVM_CACHING_RATIO,
     WEIGHTED_KERNEL_MULTIPLIER,
@@ -123,13 +124,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
                     else None
                 )
 
-            num_poolings = (
-                cast(List[float], self._constraints[sharding_option.name].num_poolings)
-                if self._constraints
-                and self._constraints.get(sharding_option.name)
-                and self._constraints[sharding_option.name].num_poolings
-                else [1.0] * sharding_option.num_inputs
-            )
+            num_poolings = get_num_poolings(self._constraints, sharding_option)
             batch_sizes = (
                 cast(List[int], self._constraints[sharding_option.name].batch_sizes)
                 if self._constraints
@@ -1008,11 +1003,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 if self._constraints
                 else None
             )
-            num_poolings = (
-                constraints.num_poolings
-                if constraints and constraints.num_poolings
-                else [1.0] * sharding_option.num_inputs
-            )
+            num_poolings = get_num_poolings(self._constraints, sharding_option)
             assert len(num_poolings) == sharding_option.num_inputs
             batch_sizes = (
                 constraints.batch_sizes
@@ -1311,6 +1302,25 @@ def _is_table_cached(
     }:
         return True
     return False
+
+
+def get_num_poolings(
+    constraints: Optional[Dict[str, ParameterConstraints]], so: ShardingOption
+) -> List[float]:
+    # first priority is given for sharding_option.num_poolings,
+    # otherwise Manifold planner configs will be overwritten by parameter constraints
+    # default path will use constraints
+    if so.num_poolings is not None:
+        num_poolings = so.num_poolings
+        if len(so.input_lengths) == len(num_poolings):
+            return num_poolings
+
+    # Second priority: use constraint-based num_poolings
+    if constraints and constraints.get(so.name) and constraints[so.name].num_poolings:
+        return cast(List[float], constraints[so.name].num_poolings)
+
+    # Fallback: use default NUM_POOLINGS constant
+    return [NUM_POOLINGS] * len(so.input_lengths)
 
 
 def _calculate_shard_io_sizes(

@@ -40,12 +40,12 @@ from torchrec.distributed.sharding_plan import (
     get_module_to_default_sharders,
     table_wise,
 )
+from torchrec.distributed.test_utils.model_input import ModelInput
 
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-from torchrec.distributed.test_utils.test_input import ModelInput
 from torchrec.distributed.test_utils.test_model_parallel import ModelParallelTestShared
 from torchrec.distributed.test_utils.test_sharding import (
     copy_state_dict,

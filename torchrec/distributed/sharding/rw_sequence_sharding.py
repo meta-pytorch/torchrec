@@ -130,9 +130,6 @@ class RwSequenceEmbeddingSharding(
     ) -> BaseSparseFeaturesDist[KeyedJaggedTensor]:
         num_features = self._get_num_features()
         feature_hash_sizes = self._get_feature_hash_sizes()
-        virtual_table_feature_num_buckets = (
-            self._get_virtual_table_feature_num_buckets()
-        )
         return RwSparseFeaturesDist(
             # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
@@ -143,7 +140,6 @@ class RwSequenceEmbeddingSharding(
             is_sequence=True,
             has_feature_processor=self._has_feature_processor,
             need_pos=False,
-            virtual_table_feature_num_buckets=virtual_table_feature_num_buckets,
         )
 
     def create_lookup(

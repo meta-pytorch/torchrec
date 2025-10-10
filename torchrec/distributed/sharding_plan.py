@@ -96,7 +96,6 @@ def calculate_shard_sizes_and_offsets(
     sharding_type: str,
     col_wise_shard_dim: Optional[int] = None,
     device_memory_sizes: Optional[List[int]] = None,
-    num_buckets: Optional[int] = None,
 ) -> Tuple[List[List[int]], List[List[int]]]:
     """
     Calculates sizes and offsets for tensor sharded according to provided sharding type.
@@ -123,12 +122,10 @@ def calculate_shard_sizes_and_offsets(
         return [[rows, columns]], [[0, 0]]
     elif sharding_type == ShardingType.ROW_WISE.value:
         return (
-            _calculate_rw_shard_sizes_and_offsets(
-                rows, world_size, columns, num_buckets
-            )
+            _calculate_rw_shard_sizes_and_offsets(rows, world_size, columns)
             if not device_memory_sizes
             else _calculate_uneven_rw_shard_sizes_and_offsets(
-                rows, world_size, columns, device_memory_sizes, num_buckets
+                rows, world_size, columns, device_memory_sizes
             )
         )
     elif sharding_type == ShardingType.TABLE_ROW_WISE.value:
@@ -173,7 +170,7 @@ def _calculate_grid_shard_sizes_and_offsets(
 
 
 def _calculate_rw_shard_sizes_and_offsets(
-    hash_size: int, num_devices: int, columns: int, num_buckets: Optional[int] = None
+    hash_size: int, num_devices: int, columns: int
 ) -> Tuple[List[List[int]], List[List[int]]]:
     """
     Sets prefix of shard_sizes to be `math.ceil(hash_size/num_devices)`.
@@ -186,43 +183,21 @@ def _calculate_rw_shard_sizes_and_offsets(
 
     Also consider the example of hash_size = 5, num_devices = 4. The expected rows per
     rank is [2,2,1,0].
-
-    If num_buckets is specified, the sharding methodology changes to adapt to ZCH.
-    So, if hash_size = 10, num_devices = 4, num_buckets = 5, each bucket will have 2 rows.
-    After distributing the buckets evenly across ranks we will have the row distribution as
-    [4, 2, 2, 2]
     """
-    shard_sizes: List[List[int]] = []
-    if num_buckets:
-        # number of buckets being specified means zch is enabled
-        assert (
-            hash_size % num_buckets == 0
-        ), "hash_size must be divisible by num_buckets"
-        bucket_size: int = hash_size // num_buckets
-        # number of buckets per rank
-        shard_buckets = math.floor(num_buckets / num_devices)
-        # number of ranks with an extra bucket
-        extra_bucket_shards = num_buckets % num_devices
-        for rank in range(num_devices):
-            if rank < extra_bucket_shards:
-                shard_size = bucket_size * (shard_buckets + 1)
-            else:
-                shard_size = bucket_size * shard_buckets
-            shard_sizes.append([shard_size, columns])
-    else:
-        block_size: int = math.ceil(hash_size / num_devices)
-        last_rank: int = hash_size // block_size
-        last_block_size: int = hash_size - block_size * last_rank
-        shard_sizes: List[List[int]] = []
 
-        for rank in range(num_devices):
-            if rank < last_rank:
-                local_row: int = block_size
-            elif rank == last_rank:
-                local_row: int = last_block_size
-            else:
-                local_row: int = 0
-            shard_sizes.append([local_row, columns])
+    block_size: int = math.ceil(hash_size / num_devices)
+    last_rank: int = hash_size // block_size
+    last_block_size: int = hash_size - block_size * last_rank
+    shard_sizes: List[List[int]] = []
+
+    for rank in range(num_devices):
+        if rank < last_rank:
+            local_row: int = block_size
+        elif rank == last_rank:
+            local_row: int = last_block_size
+        else:
+            local_row: int = 0
+        shard_sizes.append([local_row, columns])
     shard_offsets = [[0, 0]]
 
     for i in range(num_devices - 1):
@@ -232,11 +207,7 @@ def _calculate_rw_shard_sizes_and_offsets(
 
 
 def _calculate_uneven_rw_shard_sizes_and_offsets(
-    hash_size: int,
-    num_devices: int,
-    columns: int,
-    device_memory_sizes: List[int],
-    num_buckets: Optional[int] = None,
+    hash_size: int, num_devices: int, columns: int, device_memory_sizes: List[int]
 ) -> Tuple[List[List[int]], List[List[int]]]:
     assert num_devices == len(device_memory_sizes), "must provide all the memory size"
     total_size = sum(device_memory_sizes)
@@ -244,20 +215,10 @@ def _calculate_uneven_rw_shard_sizes_and_offsets(
     last_rank = num_devices - 1
 
     processed_total_rows = 0
-    if num_buckets is None:
-        num_buckets = hash_size
-        bucket_size = 1
-    else:
-        assert (
-            hash_size % num_buckets == 0
-        ), "hash_size must be divisible by num_buckets"
-        bucket_size = hash_size // num_buckets
+
     for rank in range(num_devices):
         if rank < last_rank:
-            local_row: int = (
-                int(num_buckets * (device_memory_sizes[rank] / total_size))
-                * bucket_size
-            )
+            local_row: int = int(hash_size * (device_memory_sizes[rank] / total_size))
             processed_total_rows += local_row
         elif rank == last_rank:
             local_row: int = hash_size - processed_total_rows

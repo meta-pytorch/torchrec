@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.types import DataType
 
 
 @dataclass
@@ -35,7 +36,15 @@ class EmbeddingTablesConfig:
     num_unweighted_features: int = 100
     num_weighted_features: int = 100
     embedding_feature_dim: int = 128
+    table_data_type: DataType = DataType.FP32
     additional_tables: List[List[Dict[str, Any]]] = field(default_factory=list)
+
+    def convert_to_ebconf(self, kwargs: Dict[str, Any]) -> EmbeddingBagConfig:
+        if "data_type" in kwargs:
+            kwargs["data_type"] = DataType[kwargs["data_type"]]
+        else:
+            kwargs["data_type"] = self.table_data_type
+        return EmbeddingBagConfig(**kwargs)
 
     def generate_tables(
         self,
@@ -62,19 +71,21 @@ class EmbeddingTablesConfig:
         """
         unweighted_tables = [
             EmbeddingBagConfig(
-                num_embeddings=max(i + 1, 100) * 1000,
+                num_embeddings=max(i + 1, 100) * 2000,
                 embedding_dim=self.embedding_feature_dim,
                 name="table_" + str(i),
                 feature_names=["feature_" + str(i)],
+                data_type=self.table_data_type,
             )
             for i in range(self.num_unweighted_features)
         ]
         weighted_tables = [
             EmbeddingBagConfig(
-                num_embeddings=max(i + 1, 100) * 1000,
+                num_embeddings=max(i + 1, 100) * 2000,
                 embedding_dim=self.embedding_feature_dim,
                 name="weighted_table_" + str(i),
                 feature_names=["weighted_feature_" + str(i)],
+                data_type=self.table_data_type,
             )
             for i in range(self.num_weighted_features)
         ]
@@ -87,7 +98,7 @@ class EmbeddingTablesConfig:
             else:
                 tables = []
             for adt in adts:
-                tables.append(EmbeddingBagConfig(**adt))
+                tables.append(self.convert_to_ebconf(adt))
 
         if len(tables_list) == 0:
             tables_list.append(unweighted_tables)
