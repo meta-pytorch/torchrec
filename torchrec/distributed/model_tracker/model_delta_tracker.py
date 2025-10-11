@@ -8,12 +8,23 @@
 # pyre-strict
 import logging as logger
 from collections import Counter, OrderedDict
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
+from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from fbgemm_gpu.split_table_batched_embeddings_ops import (
+    SplitTableBatchedEmbeddingBagsCodegen,
+)
 
 from torch import nn
+from torchrec.distributed.batched_embedding_kernel import BatchedFusedEmbedding
+
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
+from torchrec.distributed.embedding_lookup import (
+    BatchedFusedEmbeddingBag,
+    GroupedEmbeddingsLookup,
+    GroupedPooledEmbeddingsLookup,
+)
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_tracker.delta_store import DeltaStore
 from torchrec.distributed.model_tracker.types import (
@@ -21,15 +32,32 @@ from torchrec.distributed.model_tracker.types import (
     EmbdUpdateMode,
     TrackingMode,
 )
+from torchrec.distributed.utils import none_throws
+
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 UPDATE_MODE_MAP: Dict[TrackingMode, EmbdUpdateMode] = {
     # Only IDs are tracked, no additional state is stored.
     TrackingMode.ID_ONLY: EmbdUpdateMode.NONE,
     # TrackingMode.EMBEDDING utilizes EmbdUpdateMode.FIRST to ensure that
-    # the earliest embedding values are stored since the last checkpoint or snapshot.
-    # This mode is used for computing topk delta rows, which is currently achieved by running (new_emb - old_emb).norm().topk().
+    # the earliest embedding values are stored since the last checkpoint
+    # or snapshot. This mode is used for computing topk delta rows, which
+    # is currently achieved by running (new_emb - old_emb).norm().topk().
     TrackingMode.EMBEDDING: EmbdUpdateMode.FIRST,
+    # TrackingMode.MOMENTUM utilizes EmbdUpdateMode.LAST to ensure that
+    # the most recent momentum values—capturing the accumulated gradient
+    # direction and magnitude—are stored since the last batch.
+    # This mode supports approximate top-k delta-row selection, can be
+    # obtained by running momentum.norm().topk().
+    TrackingMode.MOMENTUM_LAST: EmbdUpdateMode.LAST,
+    # MOMENTUM_DIFF keeps a running sum of the square of the gradients per row.
+    # Within each publishing interval, we track the starting value of this running
+    # sum on all used rows and then do a lookup when ``get_delta`` is called to query
+    # the latest sum. Then we can compute the delta of the two values and return them
+    # together with the row ids.
+    TrackingMode.MOMENTUM_DIFF: EmbdUpdateMode.FIRST,
+    # The same as MOMENTUM_DIFF. Adding for backward compatibility.
+    TrackingMode.ROWWISE_ADAGRAD: EmbdUpdateMode.FIRST,
 }
 
 # Tracking is current only supported for ShardedEmbeddingCollection and ShardedEmbeddingBagCollection.
@@ -87,6 +115,7 @@ class ModelDeltaTracker:
 
         # from module FQN to ShardedEmbeddingCollection/ShardedEmbeddingBagCollection
         self.tracked_modules: Dict[str, nn.Module] = {}
+        self.table_to_fqn: Dict[str, str] = {}
         self.feature_to_fqn: Dict[str, str] = {}
         # Generate the mapping from FQN to feature names.
         self.fqn_to_feature_names()
@@ -141,7 +170,9 @@ class ModelDeltaTracker:
             # Update the current compact index to the end index to avoid duplicate compaction.
             self.curr_compact_index = end_idx
 
-    def record_lookup(self, kjt: KeyedJaggedTensor, states: torch.Tensor) -> None:
+    def record_lookup(
+        self, emb_module: nn.Module, kjt: KeyedJaggedTensor, states: torch.Tensor
+    ) -> None:
         """
         Records the IDs from a given KeyedJaggedTensor and their corresponding embeddings/parameter states.
 
@@ -152,6 +183,7 @@ class ModelDeltaTracker:
         (in ID_ONLY mode) or both IDs and their corresponding embeddings (in EMBEDDING mode).
 
         Args:
+            emb_module (nn.Module): The embedding module in which the lookup was performed.
             kjt (KeyedJaggedTensor): The KeyedJaggedTensor containing IDs to record.
             states (torch.Tensor): The embeddings or states corresponding to the IDs in the kjt.
         """
@@ -162,7 +194,14 @@ class ModelDeltaTracker:
         # In EMBEDDING mode, we track per feature IDs and corresponding embeddings received in the current batch.
         elif self._mode == TrackingMode.EMBEDDING:
             self.record_embeddings(kjt, states)
-
+        # In MOMENTUM_LAST mode, we track per feature IDs and corresponding momentum values received in the current batch.
+        elif self._mode == TrackingMode.MOMENTUM_LAST:
+            self.record_momentum(emb_module, kjt)
+        elif (
+            self._mode == TrackingMode.MOMENTUM_DIFF
+            or self._mode == TrackingMode.ROWWISE_ADAGRAD
+        ):
+            self.record_rowwise_optim_state(emb_module, kjt)
         else:
             raise NotImplementedError(f"Tracking mode {self._mode} is not supported")
 
@@ -228,6 +267,93 @@ class ModelDeltaTracker:
                 states=torch.cat(per_table_emb[table_fqn]),
             )
 
+    def record_momentum(
+        self,
+        emb_module: nn.Module,
+        kjt: KeyedJaggedTensor,
+    ) -> None:
+        # FIXME: this is the momentum from last iteration, use momentum from current iter
+        # for correctness.
+        # pyre-ignore Undefined attribute [16]:
+        momentum = emb_module._emb_module.momentum1_dev
+        # FIXME: support multiple tables per group, information can be extracted from
+        # module._config (i.e., GroupedEmbeddingConfig)
+        # pyre-ignore Undefined attribute [16]:
+        states = momentum.view(-1, emb_module._config.embedding_dims()[0])[
+            kjt.values()
+        ].norm(dim=1)
+
+        offsets: torch.Tensor = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            torch.tensor(kjt.length_per_key(), dtype=torch.int64)
+        )
+        assert (
+            kjt.values().numel() == states.numel()
+        ), f"number of ids and states mismatch, expect {kjt.values()=}, {kjt.values().numel()}, but got {states.numel()} "
+
+        for i, key in enumerate(kjt.keys()):
+            fqn = self.feature_to_fqn[key]
+            per_key_states = states[offsets[i] : offsets[i + 1]]
+            self.store.append(
+                batch_idx=self.curr_batch_idx,
+                table_fqn=fqn,
+                ids=kjt[key].values(),
+                states=per_key_states,
+            )
+
+    def record_rowwise_optim_state(
+        self,
+        emb_module: nn.Module,
+        kjt: KeyedJaggedTensor,
+    ) -> None:
+        opt_states: List[List[torch.Tensor]] = (
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
+            #  `split_optimizer_states`.
+            emb_module._emb_module.split_optimizer_states()
+        )
+        proxy: torch.Tensor = torch.cat([state[0] for state in opt_states])
+        states = proxy[kjt.values()]
+        assert (
+            kjt.values().numel() == states.numel()
+        ), f"number of ids and states mismatch, expect {kjt.values()=}, {kjt.values().numel()}, but got {states.numel()} "
+        offsets: torch.Tensor = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            torch.tensor(kjt.length_per_key(), dtype=torch.int64)
+        )
+        for i, key in enumerate(kjt.keys()):
+            fqn = self.feature_to_fqn[key]
+            per_key_states = states[offsets[i] : offsets[i + 1]]
+            self.store.append(
+                batch_idx=self.curr_batch_idx,
+                table_fqn=fqn,
+                ids=kjt[key].values(),
+                states=per_key_states,
+            )
+
+    def get_latest(self) -> Dict[str, torch.Tensor]:
+        ret: Dict[str, torch.Tensor] = {}
+        for module in self.tracked_modules.values():
+            # pyre-fixme[29]:
+            for lookup in module._lookups:
+                for embs_module in lookup._emb_modules:
+                    assert isinstance(
+                        embs_module, (BatchedFusedEmbeddingBag, BatchedFusedEmbedding)
+                    ), f"expect BatchedFusedEmbeddingBag or BatchedFusedEmbedding, but {type(embs_module)} found"
+                    tbe = embs_module._emb_module
+
+                    assert isinstance(tbe, SplitTableBatchedEmbeddingBagsCodegen)
+                    table_names = [t.name for t in embs_module._config.embedding_tables]
+                    opt_states = tbe.split_optimizer_states()
+                    assert len(table_names) == len(opt_states)
+
+                    for i, table_name in enumerate(table_names):
+                        emb_fqn = self.table_to_fqn[table_name]
+                        table_state = opt_states[i][0]
+                        assert (
+                            emb_fqn not in ret
+                        ), f"a table with {emb_fqn} already exists"
+                        ret[emb_fqn] = table_state
+
+        return ret
+
     def get_delta_ids(self, consumer: Optional[str] = None) -> Dict[str, torch.Tensor]:
         """
         Return a dictionary of hit local IDs for each sparse feature. Ids are
@@ -239,7 +365,13 @@ class ModelDeltaTracker:
         per_table_delta_rows = self.get_delta(consumer)
         return {fqn: delta_rows.ids for fqn, delta_rows in per_table_delta_rows.items()}
 
-    def get_delta(self, consumer: Optional[str] = None) -> Dict[str, DeltaRows]:
+    def get_delta(
+        self,
+        consumer: Optional[str] = None,
+        top_percentage: Optional[float] = 1.0,
+        per_table_percentage: Optional[Dict[str, Tuple[float, str]]] = None,
+        sorted_by_indices: Optional[bool] = True,
+    ) -> Dict[str, DeltaRows]:
         """
         Return a dictionary of hit local IDs and parameter states / embeddings for each sparse feature. The Values are first keyed by submodule FQN.
 
@@ -264,6 +396,17 @@ class ModelDeltaTracker:
         self.per_consumer_batch_idx[consumer] = index_end
         if self._delete_on_read:
             self.store.delete(up_to_idx=min(self.per_consumer_batch_idx.values()))
+
+        if self._mode in (TrackingMode.MOMENTUM_DIFF, TrackingMode.ROWWISE_ADAGRAD):
+            square_sum_map = self.get_latest()
+            for fqn, rows in tracker_rows.items():
+                assert (
+                    fqn in square_sum_map
+                ), f"{fqn} not found in {square_sum_map.keys()}"
+                # pyre-fixme[58]: `-` is not supported for operand types `Tensor`
+                #  and `Optional[Tensor]`.
+                rows.states = square_sum_map[fqn][rows.ids] - rows.states
+
         return tracker_rows
 
     def get_tracked_modules(self) -> Dict[str, nn.Module]:
@@ -280,7 +423,6 @@ class ModelDeltaTracker:
             return self._fqn_to_feature_map
 
         table_to_feature_names: Dict[str, List[str]] = OrderedDict()
-        table_to_fqn: Dict[str, str] = OrderedDict()
         for fqn, named_module in self._model.named_modules():
             split_fqn = fqn.split(".")
             # Skipping partial FQNs present in fqns_to_skip
@@ -306,13 +448,13 @@ class ModelDeltaTracker:
                 # will incorrectly match fqn with all the table names that have the same prefix
                 if table_name in split_fqn:
                     embedding_fqn = self._clean_fqn_fn(fqn)
-                    if table_name in table_to_fqn:
+                    if table_name in self.table_to_fqn:
                         # Sanity check for validating that we don't have more then one table mapping to same fqn.
                         logger.warning(
-                            f"Override {table_to_fqn[table_name]} with {embedding_fqn} for entry {table_name}"
+                            f"Override {self.table_to_fqn[table_name]} with {embedding_fqn} for entry {table_name}"
                         )
-                    table_to_fqn[table_name] = embedding_fqn
-            logger.info(f"Table to fqn: {table_to_fqn}")
+                    self.table_to_fqn[table_name] = embedding_fqn
+            logger.info(f"Table to fqn: {self.table_to_fqn}")
         flatten_names = [
             name for names in table_to_feature_names.values() for name in names
         ]
@@ -325,15 +467,15 @@ class ModelDeltaTracker:
 
         fqn_to_feature_names: Dict[str, List[str]] = OrderedDict()
         for table_name in table_to_feature_names:
-            if table_name not in table_to_fqn:
+            if table_name not in self.table_to_fqn:
                 # This is likely unexpected, where we can't locate the FQN associated with this table.
                 logger.warning(
-                    f"Table {table_name} not found in {table_to_fqn}, skipping"
+                    f"Table {table_name} not found in {self.table_to_fqn}, skipping"
                 )
                 continue
-            fqn_to_feature_names[table_to_fqn[table_name]] = table_to_feature_names[
-                table_name
-            ]
+            fqn_to_feature_names[self.table_to_fqn[table_name]] = (
+                table_to_feature_names[table_name]
+            )
         self._fqn_to_feature_map = fqn_to_feature_names
         return fqn_to_feature_names
 
@@ -380,13 +522,49 @@ class ModelDeltaTracker:
     def _validate_and_init_tracker_fns(self) -> None:
         "To validate the mode is supported for the given module"
         for module in self.tracked_modules.values():
+            # EMBEDDING mode is only supported for ShardedEmbeddingCollection
             assert not (
                 isinstance(module, ShardedEmbeddingBagCollection)
                 and self._mode == TrackingMode.EMBEDDING
             ), "EBC's lookup returns pooled embeddings and currently, we do not support tracking raw embeddings."
-            # register post lookup function
-            # pyre-ignore[29]
-            module.register_post_lookup_tracker_fn(self.record_lookup)
+
+            if (
+                self._mode == TrackingMode.ID_ONLY
+                or self._mode == TrackingMode.EMBEDDING
+            ):
+                # register post lookup function
+                # pyre-ignore[29]
+                module.register_post_lookup_tracker_fn(self.record_lookup)
+            elif self._mode == TrackingMode.MOMENTUM_LAST:
+                # pyre-ignore[29]:
+                for lookup in module._lookups:
+                    assert isinstance(
+                        lookup,
+                        (GroupedEmbeddingsLookup, GroupedPooledEmbeddingsLookup),
+                    )
+                    lookup.register_optim_state_tracker_fn(self.record_lookup)
+            elif (
+                self._mode == TrackingMode.ROWWISE_ADAGRAD
+                or self._mode == TrackingMode.MOMENTUM_DIFF
+            ):
+                # pyre-ignore[29]:
+                for lookup in module._lookups:
+                    assert isinstance(
+                        lookup,
+                        (GroupedEmbeddingsLookup, GroupedPooledEmbeddingsLookup),
+                    ) and all(
+                        # TorchRec maps ROWWISE_ADAGRAD to EXACT_ROWWISE_ADAGRAD
+                        # pyre-ignore[16]:
+                        emb._emb_module.optimizer == OptimType.EXACT_ROWWISE_ADAGRAD
+                        # pyre-ignore[16]:
+                        or emb._emb_module.optimizer == OptimType.PARTIAL_ROWWISE_ADAM
+                        for emb in lookup._emb_modules
+                    )
+                    lookup.register_optim_state_tracker_fn(self.record_lookup)
+            else:
+                raise NotImplementedError(
+                    f"Tracking mode {self._mode} is not supported"
+                )
             # register auto compaction function at odist
             if self._auto_compact:
                 # pyre-ignore[29]
