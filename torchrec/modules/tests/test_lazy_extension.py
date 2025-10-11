@@ -7,8 +7,10 @@
 
 # pyre-strict
 
+import ast
 import inspect
 import re
+import textwrap
 import unittest
 from typing import Tuple
 
@@ -28,9 +30,13 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
         original_call_impl_src = inspect.getsource(torch.nn.Module._call_impl)
         lazy_ext_call_impl_src = inspect.getsource(LazyModuleExtensionMixin._call_impl)
 
-        # remove comments
-        original_call_impl_src = remove_comment(original_call_impl_src)
-        lazy_ext_call_impl_src = remove_comment(lazy_ext_call_impl_src)
+        # normalize the source code
+        original_call_impl_src = ast.unparse(
+            textwrap.dedent(ast.parse(original_call_impl_src))
+        )
+        lazy_ext_call_impl_src = ast.unparse(
+            textwrap.dedent(ast.parse(lazy_ext_call_impl_src))
+        )
 
         # reproduce the only change:
         old_code = """
@@ -62,17 +68,18 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
             LazyModuleExtensionMixin._infer_parameters
         )
 
-        # remove comments
-        original_infer_parameters_src = remove_comment(original_infer_parameters_src)
-        lazy_ext_infer_parameters_src = remove_comment(lazy_ext_infer_parameters_src)
+        # normalize the source code
+        original_infer_parameters_src = ast.unparse(
+            textwrap.dedent(ast.parse(original_infer_parameters_src))
+        )
+        lazy_ext_infer_parameters_src = ast.unparse(
+            textwrap.dedent(ast.parse(lazy_ext_infer_parameters_src))
+        )
 
         # reproduce the only changes:
         expected_lazy_ext_infer_parameters_src = original_infer_parameters_src.replace(
             "def _infer_parameters(self: _LazyProtocol, module, args, kwargs=None):",
             "def _infer_parameters(self: _LazyExtensionProtocol, module, args, kwargs) -> None:",
-        ).replace(
-            "module.initialize_parameters(*args)",
-            "module.initialize_parameters(*args, **kwargs)",
         )
         self.assertEqual(
             lazy_ext_infer_parameters_src,
@@ -202,7 +209,6 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
                     torch.allclose(count, torch.tensor(count_after_first_forward))
                 )
 
-        # fmt: off
         check_result(
             lazy_apply(
                 TestModule(),
@@ -235,7 +241,7 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
                 lazy_apply(
                     torch.nn.Sequential(
                         TestModule(),
-                        TestModule()
+                        TestModule(),
                     ),
                     increment_count,
                 ),
@@ -250,13 +256,12 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
                         TestModule(),
                         increment_count,
                     ),
-                    torch.nn.Identity()
+                    torch.nn.Identity(),
                 ),
                 increment_count,
             ),
             count_after_first_forward=2,
         )
-        # fmt: on
 
     def test_apply(self) -> None:
         class TestModule(LazyModuleExtensionMixin, torch.nn.Module):
