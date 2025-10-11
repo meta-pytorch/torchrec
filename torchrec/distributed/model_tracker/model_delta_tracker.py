@@ -13,7 +13,12 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from torch import nn
+
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
+from torchrec.distributed.embedding_lookup import (
+    GroupedEmbeddingsLookup,
+    GroupedPooledEmbeddingsLookup,
+)
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_tracker.delta_store import DeltaStore
 from torchrec.distributed.model_tracker.types import (
@@ -27,9 +32,16 @@ UPDATE_MODE_MAP: Dict[TrackingMode, EmbdUpdateMode] = {
     # Only IDs are tracked, no additional state is stored.
     TrackingMode.ID_ONLY: EmbdUpdateMode.NONE,
     # TrackingMode.EMBEDDING utilizes EmbdUpdateMode.FIRST to ensure that
-    # the earliest embedding values are stored since the last checkpoint or snapshot.
-    # This mode is used for computing topk delta rows, which is currently achieved by running (new_emb - old_emb).norm().topk().
+    # the earliest embedding values are stored since the last checkpoint
+    # or snapshot. This mode is used for computing topk delta rows, which
+    # is currently achieved by running (new_emb - old_emb).norm().topk().
     TrackingMode.EMBEDDING: EmbdUpdateMode.FIRST,
+    # TrackingMode.MOMENTUM utilizes EmbdUpdateMode.LAST to ensure that
+    # the most recent momentum values—capturing the accumulated gradient
+    # direction and magnitude—are stored since the last batch.
+    # This mode supports approximate top-k delta-row selection, can be
+    # obtained by running momentum.norm().topk().
+    TrackingMode.MOMENTUM_LAST: EmbdUpdateMode.LAST,
 }
 
 # Tracking is current only supported for ShardedEmbeddingCollection and ShardedEmbeddingBagCollection.
@@ -141,7 +153,9 @@ class ModelDeltaTracker:
             # Update the current compact index to the end index to avoid duplicate compaction.
             self.curr_compact_index = end_idx
 
-    def record_lookup(self, kjt: KeyedJaggedTensor, states: torch.Tensor) -> None:
+    def record_lookup(
+        self, emb_module: nn.Module, kjt: KeyedJaggedTensor, states: torch.Tensor
+    ) -> None:
         """
         Records the IDs from a given KeyedJaggedTensor and their corresponding embeddings/parameter states.
 
@@ -152,6 +166,7 @@ class ModelDeltaTracker:
         (in ID_ONLY mode) or both IDs and their corresponding embeddings (in EMBEDDING mode).
 
         Args:
+            emb_module (nn.Module): The embedding module in which the lookup was performed.
             kjt (KeyedJaggedTensor): The KeyedJaggedTensor containing IDs to record.
             states (torch.Tensor): The embeddings or states corresponding to the IDs in the kjt.
         """
@@ -162,7 +177,9 @@ class ModelDeltaTracker:
         # In EMBEDDING mode, we track per feature IDs and corresponding embeddings received in the current batch.
         elif self._mode == TrackingMode.EMBEDDING:
             self.record_embeddings(kjt, states)
-
+        # In MOMENTUM_LAST mode, we track per feature IDs and corresponding momentum values received in the current batch.
+        elif self._mode == TrackingMode.MOMENTUM_LAST:
+            self.record_momentum(emb_module, kjt)
         else:
             raise NotImplementedError(f"Tracking mode {self._mode} is not supported")
 
@@ -226,6 +243,39 @@ class ModelDeltaTracker:
                 table_fqn=table_fqn,
                 ids=torch.cat(ids_list),
                 states=torch.cat(per_table_emb[table_fqn]),
+            )
+
+    def record_momentum(
+        self,
+        emb_module: nn.Module,
+        kjt: KeyedJaggedTensor,
+    ) -> None:
+        # FIXME: this is the momentum from last iteration, use momentum from current iter
+        # for correctness.
+        # pyre-ignore Undefined attribute [16]:
+        momentum = emb_module._emb_module.momentum1_dev
+        # FIXME: support multiple tables per group, information can be extracted from
+        # module._config (i.e., GroupedEmbeddingConfig)
+        # pyre-ignore Undefined attribute [16]:
+        states = momentum.view(-1, emb_module._config.embedding_dims()[0])[
+            kjt.values()
+        ].norm(dim=1)
+
+        offsets: torch.Tensor = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            torch.tensor(kjt.length_per_key(), dtype=torch.int64)
+        )
+        assert (
+            kjt.values().numel() == states.numel()
+        ), f"number of ids and states mismatch, expect {kjt.values()=}, {kjt.values().numel()}, but got {states.numel()} "
+
+        for i, key in enumerate(kjt.keys()):
+            fqn = self.feature_to_fqn[key]
+            per_key_states = states[offsets[i] : offsets[i + 1]]
+            self.store.append(
+                batch_idx=self.curr_batch_idx,
+                table_fqn=fqn,
+                ids=kjt[key].values(),
+                states=per_key_states,
             )
 
     def get_delta_ids(self, consumer: Optional[str] = None) -> Dict[str, torch.Tensor]:
@@ -380,13 +430,31 @@ class ModelDeltaTracker:
     def _validate_and_init_tracker_fns(self) -> None:
         "To validate the mode is supported for the given module"
         for module in self.tracked_modules.values():
+            # EMBEDDING mode is only supported for ShardedEmbeddingCollection
             assert not (
                 isinstance(module, ShardedEmbeddingBagCollection)
                 and self._mode == TrackingMode.EMBEDDING
             ), "EBC's lookup returns pooled embeddings and currently, we do not support tracking raw embeddings."
-            # register post lookup function
-            # pyre-ignore[29]
-            module.register_post_lookup_tracker_fn(self.record_lookup)
+
+            if (
+                self._mode == TrackingMode.ID_ONLY
+                or self._mode == TrackingMode.EMBEDDING
+            ):
+                # register post lookup function
+                # pyre-ignore[29]
+                module.register_post_lookup_tracker_fn(self.record_lookup)
+            elif self._mode == TrackingMode.MOMENTUM_LAST:
+                # pyre-ignore[29]:
+                for lookup in module._lookups:
+                    assert isinstance(
+                        lookup,
+                        (GroupedEmbeddingsLookup, GroupedPooledEmbeddingsLookup),
+                    )
+                    lookup.register_optim_state_tracker_fn(self.record_lookup)
+            else:
+                raise NotImplementedError(
+                    f"Tracking mode {self._mode} is not supported"
+                )
             # register auto compaction function at odist
             if self._auto_compact:
                 # pyre-ignore[29]
