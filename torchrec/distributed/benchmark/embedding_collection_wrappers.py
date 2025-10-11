@@ -36,6 +36,13 @@ from typing import (
 import torch
 from torch import multiprocessing as mp
 from torchrec.distributed import DistributedModelParallel
+
+from torchrec.distributed.benchmark.base import (
+    benchmark_model_with_warmup,
+    BenchmarkResult,
+    CompileMode,
+    multi_process_benchmark,
+)
 from torchrec.distributed.embedding_types import ShardingType
 from torchrec.distributed.global_settings import set_propogate_device
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
@@ -55,14 +62,6 @@ from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
-
-# Import the shared types and utilities from benchmark_utils
-from .base import (
-    benchmark_model_with_warmup,
-    BenchmarkResult,
-    CompileMode,
-    multi_process_benchmark,
-)
 
 logger: logging.Logger = logging.getLogger()
 

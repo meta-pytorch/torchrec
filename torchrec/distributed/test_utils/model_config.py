@@ -52,16 +52,7 @@ class BaseModelConfig(ABC):
     """
 
     # Common parameters for all model types
-    batch_size: int
-    batch_sizes: Optional[List[int]]
-    num_float_features: int
-    feature_pooling_avg: int
-    use_offsets: bool
-    dev_str: str
-    long_kjt_indices: bool
-    long_kjt_offsets: bool
-    long_kjt_lengths: bool
-    pin_memory: bool
+    num_float_features: int  # we assume all model arch has a single dense feature layer
 
     @abstractmethod
     def generate_model(
@@ -69,6 +60,7 @@ class BaseModelConfig(ABC):
         tables: List[EmbeddingBagConfig],
         weighted_tables: List[EmbeddingBagConfig],
         dense_device: torch.device,
+        **kwargs: Any,
     ) -> nn.Module:
         """
         Generate a model instance based on the configuration.
@@ -100,6 +92,7 @@ class TestSparseNNConfig(BaseModelConfig):
         tables: List[EmbeddingBagConfig],
         weighted_tables: List[EmbeddingBagConfig],
         dense_device: torch.device,
+        **kwargs: Any,
     ) -> nn.Module:
         return TestSparseNN(
             tables=tables,
@@ -128,6 +121,7 @@ class TestTowerSparseNNConfig(BaseModelConfig):
         tables: List[EmbeddingBagConfig],
         weighted_tables: List[EmbeddingBagConfig],
         dense_device: torch.device,
+        **kwargs: Any,
     ) -> nn.Module:
         return TestTowerSparseNN(
             num_float_features=self.num_float_features,
@@ -152,6 +146,7 @@ class TestTowerCollectionSparseNNConfig(BaseModelConfig):
         tables: List[EmbeddingBagConfig],
         weighted_tables: List[EmbeddingBagConfig],
         dense_device: torch.device,
+        **kwargs: Any,
     ) -> nn.Module:
         return TestTowerCollectionSparseNN(
             tables=tables,
@@ -176,6 +171,7 @@ class DeepFMConfig(BaseModelConfig):
         tables: List[EmbeddingBagConfig],
         weighted_tables: List[EmbeddingBagConfig],
         dense_device: torch.device,
+        **kwargs: Any,
     ) -> nn.Module:
         # DeepFM only uses unweighted tables
         ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
@@ -201,6 +197,7 @@ class DLRMConfig(BaseModelConfig):
         tables: List[EmbeddingBagConfig],
         weighted_tables: List[EmbeddingBagConfig],
         dense_device: torch.device,
+        **kwargs: Any,
     ) -> nn.Module:
         # DLRM only uses unweighted tables
         ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))

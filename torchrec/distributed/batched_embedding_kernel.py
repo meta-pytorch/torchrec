@@ -337,10 +337,10 @@ def _populate_zero_collision_tbe_params(
         table_names = [table.name for table in config.embedding_tables]
         l2_cache_size = tbe_params["l2_cache_size"]
         if "kvzch_eviction_trigger_mode" in tbe_params:
-            eviction_tirgger_mode = tbe_params["kvzch_eviction_trigger_mode"]
+            eviction_trigger_mode = tbe_params["kvzch_eviction_trigger_mode"]
             tbe_params.pop("kvzch_eviction_trigger_mode")
         else:
-            eviction_tirgger_mode = 2  # 2 means mem_util based eviction
+            eviction_trigger_mode = 2  # 2 means mem_util based eviction
         for i, table in enumerate(config.embedding_tables):
             policy_t = table.virtual_table_eviction_policy
             if policy_t is not None:
@@ -409,7 +409,7 @@ def _populate_zero_collision_tbe_params(
                         f"Unsupported eviction policy {policy_t} for table {table.name}"
                     )
         eviction_policy = EvictionPolicy(
-            eviction_trigger_mode=eviction_tirgger_mode,
+            eviction_trigger_mode=eviction_trigger_mode,
             eviction_mem_threshold_gb=l2_cache_size,
             eviction_strategy=eviction_strategy,
             counter_thresholds=counter_thresholds,
