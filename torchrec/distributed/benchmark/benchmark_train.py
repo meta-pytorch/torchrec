@@ -29,7 +29,7 @@ from torchrec.distributed.benchmark.embedding_collection_wrappers import (
     get_tables,
 )
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel, ShardingType
-from torchrec.distributed.test_utils.test_model import TestEBCSharder
+from torchrec.distributed.test_utils.emb_sharder import TestEBCSharder
 from torchrec.distributed.types import DataType
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
