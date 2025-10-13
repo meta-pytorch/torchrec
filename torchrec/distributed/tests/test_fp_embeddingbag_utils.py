@@ -16,7 +16,7 @@ from torch import nn
 from torchrec.distributed.fp_embeddingbag import (
     FeatureProcessedEmbeddingBagCollectionSharder,
 )
-from torchrec.distributed.test_utils.test_model import TestEBCSharder
+from torchrec.distributed.test_utils.emb_sharder import TestEBCSharder
 from torchrec.distributed.types import QuantizedCommCodecs
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection

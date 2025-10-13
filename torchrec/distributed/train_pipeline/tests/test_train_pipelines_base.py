@@ -18,12 +18,11 @@ from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.optim import Optimizer
 from torchrec.distributed import DistributedModelParallel
-from torchrec.distributed.test_utils.test_model import (
-    ModelInput,
+from torchrec.distributed.test_utils.emb_sharder import (
     TestEBCSharder,
     TestEBCSharderMCH,
-    TestSparseNN,
 )
+from torchrec.distributed.test_utils.test_model import ModelInput, TestSparseNN
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
 from torchrec.distributed.types import ModuleSharder, ShardingEnv
 from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig
