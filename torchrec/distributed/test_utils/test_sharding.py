@@ -43,16 +43,15 @@ from torchrec.distributed.sharding_plan import (
     construct_module_sharding_plan,
     get_sharding_constructor_from_type,
 )
-from torchrec.distributed.test_utils.multi_process import MultiProcessContext
-from torchrec.distributed.test_utils.test_model import (
-    ModelInput,
+from torchrec.distributed.test_utils.emb_sharder import (
     TestEBCSharder,
     TestEBSharder,
     TestECSharder,
     TestETCSharder,
     TestETSharder,
-    TestSparseNNBase,
 )
+from torchrec.distributed.test_utils.multi_process import MultiProcessContext
+from torchrec.distributed.test_utils.test_model import ModelInput, TestSparseNNBase
 from torchrec.distributed.tests.test_sequence_model import (
     TestEmbeddingCollectionSharder,
 )

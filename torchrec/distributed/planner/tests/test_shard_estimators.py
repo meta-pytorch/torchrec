@@ -43,8 +43,9 @@ from torchrec.distributed.planner.types import (
     Topology,
 )
 from torchrec.distributed.quant_embeddingbag import QuantEmbeddingBagCollectionSharder
+from torchrec.distributed.test_utils.emb_sharder import TestEBCSharder
 from torchrec.distributed.test_utils.infer_utils import quantize
-from torchrec.distributed.test_utils.test_model import TestEBCSharder, TestSparseNN
+from torchrec.distributed.test_utils.test_model import TestSparseNN
 from torchrec.distributed.tests.test_sequence_model import TestSequenceSparseNN
 from torchrec.distributed.types import (
     CacheParams,

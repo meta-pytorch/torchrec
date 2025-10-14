@@ -24,7 +24,7 @@ from torchrec.distributed.embedding_lookup import EmbeddingComputeKernel
 from torchrec.distributed.embedding_types import KJTList
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 
-from torchrec.distributed.test_utils.test_model import TestEBCSharder
+from torchrec.distributed.test_utils.emb_sharder import TestEBCSharder
 from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection

@@ -35,11 +35,13 @@ from torchrec.distributed.sharding_plan import (
 )
 from torchrec.distributed.test_utils.test_model import (
     ModelInput,
-    TestEBCSharder,
     TestNegSamplingModule,
     TestSparseNN,
 )
-from torchrec.distributed.test_utils.test_sharding import copy_state_dict
+from torchrec.distributed.test_utils.test_sharding import (
+    copy_state_dict,
+    TestEBCSharder,
+)
 from torchrec.distributed.tests.test_fp_embeddingbag_utils import (
     create_module_and_freeze,
 )
