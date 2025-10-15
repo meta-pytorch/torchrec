@@ -60,7 +60,7 @@ BatchingQueue::BatchingQueue(
       resourceManager_(std::move(resourceManager)) {
   CHECK(observer_ != nullptr);
   for (const auto& [_, metadata] : config_.batchingMetadata) {
-    if (batchingFuncs_.count(metadata.type) > 0) {
+    if (batchingFuncs_.contains(metadata.type)) {
       continue;
     }
     batchingFuncs_[metadata.type] =
