@@ -115,6 +115,7 @@ MODEL_METRIC_LABEL: str = "model"
 
 
 MetricValue = Union[torch.Tensor, float]
+MetricsFuture = concurrent.futures.Future[Dict[str, MetricValue]]
 
 
 class StateMetric(abc.ABC):
@@ -490,9 +491,7 @@ class RecMetricModule(nn.Module):
     def shutdown(self) -> None:
         logger.info("Initiating graceful shutdown...")
 
-    def async_compute(
-        self, future: concurrent.futures.Future[Dict[str, MetricValue]]
-    ) -> None:
+    def async_compute(self) -> MetricsFuture:
         raise RecMetricException("async_compute is not supported in RecMetricModule")
 
 
