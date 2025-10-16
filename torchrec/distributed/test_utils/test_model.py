@@ -10,7 +10,7 @@
 import copy
 import random
 from dataclasses import dataclass
-from typing import cast, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, cast, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -833,34 +833,84 @@ class ModelInput(Pipelineable):
         self.label.record_stream(stream)
 
 
+DENSE_LAYER_OUT_SIZE = 8
+OVER_ARCH_OUT_SIZE = 16
+
+
+def _tables_dim_sum(
+    tables: Union[
+        List[EmbeddingTableConfig], List[EmbeddingBagConfig], List[EmbeddingConfig]
+    ],
+    max_sequence_length: int = 1,  # it's 1 for EBC
+) -> int:
+    return sum(
+        [
+            table.embedding_dim * len(table.feature_names) * max_sequence_length
+            for table in tables
+        ]
+    )
+
+
 class TestDenseArch(nn.Module):
     """
-    Basic nn.Module for testing
+    Basic Dense Arch with multi-layer perceptron (MLP)
+    takes in float/dense features and returns dense embedding
 
     Args:
-        device
+        device: the device on which this module will be placed.
+
+    Keyword Args:
+        num_float_features: the size of input float features (also see the ModelInputConfig)
+        dense_arch_out_size: the size of output dense embedding
+        dense_arch_hidden_sizes: the hidden layer sizes of the MLP, default None (empty)
 
     Call Args:
         dense_input: torch.Tensor
 
     Returns:
-        KeyedTensor
+        torch.Tensor
 
-    Example::
+    Example:
 
-        TestDenseArch()
+        dense_arch = TestDenseArch(num_float_features=10)
     """
 
     def __init__(
         self,
-        num_float_features: int = 10,
+        num_float_features: int,
         device: Optional[torch.device] = None,
+        dense_arch_out_size: Optional[int] = None,
+        dense_arch_hidden_sizes: Optional[List[int]] = None,
     ) -> None:
+        """
+        Args:
+            num_float_features: the size of input float features (also see the ModelInputConfig)
+            dense_arch_out_size: the size of output dense embedding
+            dense_arch_hidden_sizes: the hidden layer sizes of the MLP, default None (empty)
+            device: the device on which this module will be placed.
+        """
         super().__init__()
+        if dense_arch_out_size is None:
+            dense_arch_out_size = DENSE_LAYER_OUT_SIZE
+        if dense_arch_hidden_sizes is None:
+            dense_arch_hidden_sizes = []
         if device is None:
             device = torch.device("cpu")
+
+        hidden_layers: List[nn.Module] = []
+        in_features, out_features = num_float_features, dense_arch_out_size
+
+        for size in dense_arch_hidden_sizes:
+            assert size > 0, "layer size must be positive"
+            hidden_layers.append(nn.Linear(in_features, size, device=device))
+            in_features = size
+
+        self.hidden_layers: Optional[nn.ModuleList] = (
+            nn.ModuleList(hidden_layers) if hidden_layers else None
+        )
+
         self.linear: nn.modules.Linear = nn.Linear(
-            in_features=num_float_features, out_features=8, device=device
+            in_features=in_features, out_features=out_features, device=device
         )
 
         self.dummy_param = torch.nn.Parameter(torch.zeros(2, device=device))
@@ -870,16 +920,32 @@ class TestDenseArch(nn.Module):
         )
 
     def forward(self, dense_input: torch.Tensor) -> torch.Tensor:
-        return self.linear(dense_input)
+        """
+        Args:
+            dense_input: torch.Tensor, dense/float features
+
+        Returns:
+            torch.Tensor, dense embeddings
+        """
+        out = dense_input
+        hidden_layers = self.hidden_layers
+        if hidden_layers is not None:
+            for linear in hidden_layers:
+                out = linear(out)
+
+        return self.linear(out)
 
 
 class TestDHNArch(nn.Module):
     """
-    Simple version of a model with two linear layers.
+    simple version of deep hierarchical network (DHN) with two linear layers.
     We use this to test out recursively wrapped FSDP
+
+    hidden layer's and output layer's feature numbers are all 16
 
     Args:
         in_feature: the size of input dim
+        over_arch_out_size: the size of output dim
         device: the device on which this module will be placed.
 
     Call Args:
@@ -888,30 +954,49 @@ class TestDHNArch(nn.Module):
     Returns:
         torch.Tensor
 
-    Example::
+    Example:
 
-        TestDHNArch()
+        dhn_arch = TestDHNArch(in_features=16)
     """
 
     def __init__(
         self,
         in_features: int,
         device: Optional[torch.device] = None,
+        over_arch_out_size: Optional[int] = None,
     ) -> None:
+        """
+        Args:
+            in_features: the size of input dim
+            over_arch_out_size: the size of output dim
+            device: the device on which this module will be placed.
+        """
         super().__init__()
         if device is None:
             device = torch.device("cpu")
+        if over_arch_out_size is None:
+            over_arch_out_size = OVER_ARCH_OUT_SIZE
 
-        self.device = device
         self.linear0 = nn.Linear(
-            in_features=in_features, out_features=16, device=device
+            in_features=in_features, out_features=over_arch_out_size, device=device
         )
-        self.linear1 = nn.Linear(in_features=16, out_features=16, device=device)
+        self.linear1 = nn.Linear(
+            in_features=over_arch_out_size,
+            out_features=over_arch_out_size,
+            device=device,
+        )
 
     def forward(
         self,
         input: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        Args:
+            input: input tensor,
+
+        Returns:
+            torch.Tensor
+        """
         return self.linear1(self.linear0(input))
 
 
@@ -988,21 +1073,30 @@ class TestOverArchRegroupModule(nn.Module):
 
 class TestOverArch(nn.Module):
     """
-    Basic nn.Module for testing
+    A simple over arch to merge a dense arch and a sparse arch
+    using a KTRegroup module to permute the KT from the sparse arch
+    then call a dhn with the concatenated sparse+dense
+
+    The KTRegroup caches the regrouping logic after first batch.
 
     Args:
-        device
+        tables: the embedding tables
+        weighted_tables: the weighted embedding tables
+        embedding_names: the names of the embedding features
+        dense_arch_out_size: the size of output dense embedding
+        over_arch_out_size: the size of output over arch
+        device: the device on which this module will be placed.
 
     Call Args:
-        dense: torch.Tensor,
-        sparse: KeyedTensor,
+        dense: torch.Tensor, the output of a dense arch
+        sparse: KeyedTensor, the output of a sparse arch
 
     Returns:
         torch.Tensor
 
     Example::
 
-        TestOverArch()
+        over_arch = TestOverArch(tables, weighted_tables)
     """
 
     def __init__(
@@ -1011,35 +1105,49 @@ class TestOverArch(nn.Module):
         weighted_tables: List[EmbeddingBagConfig],
         embedding_names: Optional[List[str]] = None,
         device: Optional[torch.device] = None,
+        dense_arch_out_size: Optional[int] = None,
+        over_arch_out_size: Optional[int] = None,
     ) -> None:
+        """
+        Args:
+            tables: the embedding tables
+            weighted_tables: the weighted embedding tables
+            embedding_names: the names of the embedding features
+            dense_arch_out_size: the size of output dense embedding
+            over_arch_out_size: the size of output over arch
+            device: the device on which this module will be placed.
+        """
         super().__init__()
-        if device is None:
-            device = torch.device("cpu")
-        self._embedding_names: List[str] = (
-            embedding_names
-            if embedding_names
-            else [feature for table in tables for feature in table.feature_names]
-        )
+        self.device: torch.device = device or torch.device("cpu")
+        self._embedding_names: List[str] = embedding_names or [
+            feature for table in tables for feature in table.feature_names
+        ]
+        if dense_arch_out_size is None:
+            dense_arch_out_size = DENSE_LAYER_OUT_SIZE
+        if over_arch_out_size is None:
+            over_arch_out_size = OVER_ARCH_OUT_SIZE
         self._weighted_features: List[str] = [
             feature for table in weighted_tables for feature in table.feature_names
         ]
-        in_features = (
-            8
-            + sum([table.embedding_dim * len(table.feature_names) for table in tables])
-            + sum(
-                [
-                    table.embedding_dim * len(table.feature_names)
-                    for table in weighted_tables
-                ]
-            )
+
+        in_features = dense_arch_out_size + _tables_dim_sum(tables + weighted_tables)
+        self.dhn_arch: nn.Module = TestDHNArch(
+            in_features, over_arch_out_size=over_arch_out_size, device=self.device
         )
-        self.dhn_arch: nn.Module = TestDHNArch(in_features, device)
 
     def forward(
         self,
         dense: torch.Tensor,
         sparse: KeyedTensor,
     ) -> torch.Tensor:
+        """
+        Args:
+            dense: torch.Tensor, the output of a dense arch
+            sparse: KeyedTensor, the output of a sparse arch
+
+        Returns:
+            torch.Tensor
+        """
         sparse_regrouped: List[torch.Tensor] = KeyedTensor.regroup(
             [sparse], [self._embedding_names, self._weighted_features]
         )
@@ -1049,7 +1157,29 @@ class TestOverArch(nn.Module):
 
 class TestOverArchLarge(nn.Module):
     """
-    Basic nn.Module for testing, w 5/ layers.
+    A simple (but larger) over arch to merge a dense arch and a sparse arch
+    using a KTRegroup module to permute the KT from the sparse arch
+    then call a sequential MLP with the concatenated sparse+dense
+
+    Args:
+        tables: the embedding tables
+        weighted_tables: the weighted embedding tables
+        embedding_names: the names of the embedding features
+        dense_arch_out_size: the size of output dense embedding
+        over_arch_out_size: the size of output over arch
+        over_arch_hidden_layers: the number of hidden layers in the MLP
+        device: the device on which this module will be placed.
+
+    Call Args:
+        dense: torch.Tensor, the output of a dense arch
+        sparse: KeyedTensor, the output of a sparse arch
+
+    Returns:
+        torch.Tensor
+
+    Example:
+        over_arch = TestOverArchLarge(tables, weighted_tables)
+
     """
 
     def __init__(
@@ -1058,29 +1188,39 @@ class TestOverArchLarge(nn.Module):
         weighted_tables: List[EmbeddingBagConfig],
         embedding_names: Optional[List[str]] = None,
         device: Optional[torch.device] = None,
+        dense_arch_out_size: Optional[int] = None,
+        over_arch_out_size: Optional[int] = None,
+        over_arch_hidden_layers: Optional[int] = None,
     ) -> None:
+        """
+        Args:
+            tables: the embedding tables
+            weighted_tables: the weighted embedding tables
+            embedding_names: the names of the embedding features
+            dense_arch_out_size: the size of output dense embedding
+            over_arch_out_size: the size of output over arch
+            over_arch_hidden_layers: the number of hidden layers in the MLP
+            device: the device on which this module will be placed.
+        """
         super().__init__()
-        if device is None:
-            device = torch.device("cpu")
-        self._embedding_names: List[str] = (
-            embedding_names
-            if embedding_names
-            else [feature for table in tables for feature in table.feature_names]
-        )
-        self._weighted_features: List[str] = [
+        self.device: torch.device = device or torch.device("cpu")
+        if embedding_names is None:
+            embedding_names = [
+                feature for table in tables for feature in table.feature_names
+            ]
+        weighted_features: List[str] = [
             feature for table in weighted_tables for feature in table.feature_names
         ]
-        in_features = (
-            8
-            + sum([table.embedding_dim * len(table.feature_names) for table in tables])
-            + sum(
-                [
-                    table.embedding_dim * len(table.feature_names)
-                    for table in weighted_tables
-                ]
-            )
-        )
-        out_features = 1000
+        if dense_arch_out_size is None:
+            dense_arch_out_size = DENSE_LAYER_OUT_SIZE
+        if over_arch_out_size is None:
+            over_arch_out_size = OVER_ARCH_OUT_SIZE
+        if over_arch_hidden_layers is None:
+            over_arch_hidden_layers = 5
+
+        in_features = dense_arch_out_size + _tables_dim_sum(tables + weighted_tables)
+
+        out_features = over_arch_out_size
         layers = [
             torch.nn.Linear(
                 in_features=in_features,
@@ -1089,7 +1229,7 @@ class TestOverArchLarge(nn.Module):
             SwishLayerNorm([out_features]),
         ]
 
-        for _ in range(5):
+        for _ in range(over_arch_hidden_layers):
             layers += [
                 torch.nn.Linear(
                     in_features=out_features,
@@ -1100,18 +1240,59 @@ class TestOverArchLarge(nn.Module):
 
         self.overarch = torch.nn.Sequential(*layers)
 
+        self.regroup_module = KTRegroupAsDict(
+            [embedding_names, weighted_features],
+            ["unweighted", "weighted"],
+        )
+
     def forward(
         self,
         dense: torch.Tensor,
         sparse: KeyedTensor,
     ) -> torch.Tensor:
-        ret_list = [dense]
-        ret_list.extend(
-            KeyedTensor.regroup(
-                [sparse], [self._embedding_names, self._weighted_features]
-            )
+        """
+        Args:
+            dense: torch.Tensor, the output of a dense arch
+            sparse: KeyedTensor, the output of a sparse arch
+
+        Returns:
+            torch.Tensor
+        """
+        pooled_emb: Dict[str, torch.Tensor] = self.regroup_module([sparse])
+        values = list(pooled_emb.values())
+        return self.overarch(_concat(dense, values))
+
+
+def _pad_kt_values(
+    kt: KeyedTensor,
+    batch_size: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Pad a KeyedTensor to the given batch size.
+
+    Args:
+        kt: the KeyedTensor to pad
+        batch_size: the desired batch size
+        device: the device on which to pad
+
+    Returns:
+        The padded KeyedTensor
+    """
+    if batch_size is None or kt.values().size(0) == batch_size:
+        return kt.values()
+    else:
+        return torch.concat(
+            [
+                kt.values(),
+                torch.zeros(
+                    batch_size - kt.values().size(0),
+                    kt.values().size(1),
+                    dtype=kt.values().dtype,
+                    device=kt.values().device,
+                ),
+            ],
+            dim=0,
         )
-        return self.overarch(torch.cat(ret_list, dim=1))
 
 
 @torch.fx.wrap
@@ -1121,78 +1302,28 @@ def _post_sparsenn_forward(
     w_ebc: Optional[KeyedTensor],
     batch_size: Optional[int] = None,
 ) -> KeyedTensor:
-    if batch_size is None or ebc.values().size(0) == batch_size:
-        ebc_values = ebc.values()
-        fp_ebc_values = fp_ebc.values() if fp_ebc is not None else None
-        w_ebc_values = w_ebc.values() if w_ebc is not None else None
-    else:
-        ebc_values = torch.zeros(
-            batch_size,
-            ebc.values().size(1),
-            dtype=ebc.values().dtype,
-            device=ebc.values().device,
-        )
-        ebc_values[: ebc.values().size(0), :] = ebc.values()
-        if fp_ebc is not None:
-            fp_ebc_values = torch.zeros(
-                batch_size,
-                fp_ebc.values().size(1),
-                dtype=fp_ebc.values().dtype,
-                device=fp_ebc.values().device,
-            )
-            fp_ebc_values[: fp_ebc.values().size(0), :] = fp_ebc.values()
-        else:
-            fp_ebc_values = None
-        if w_ebc is not None:
-            w_ebc_values = torch.zeros(
-                batch_size,
-                w_ebc.values().size(1),
-                dtype=w_ebc.values().dtype,
-                device=w_ebc.values().device,
-            )
-            w_ebc_values[: w_ebc.values().size(0), :] = w_ebc.values()
-        else:
-            w_ebc_values = None
+    """
+    merge multiple KT together, pad the values to the same batch_size if needed
+    """
+    keys = ebc.keys()[:]
+    length_per_key = ebc.length_per_key()[:]
+    values: List[torch.Tensor] = [_pad_kt_values(ebc, batch_size)]
 
-    if fp_ebc is None and w_ebc is None:
-        return KeyedTensor(
-            keys=ebc.keys(),
-            length_per_key=ebc.length_per_key(),
-            values=ebc_values,
-        )
-    elif fp_ebc is None and w_ebc is not None:
-        return KeyedTensor(
-            keys=ebc.keys() + w_ebc.keys(),
-            length_per_key=ebc.length_per_key() + w_ebc.length_per_key(),
-            values=torch.cat(
-                [ebc_values, torch.jit._unwrap_optional(w_ebc_values)], dim=1
-            ),
-        )
-    elif fp_ebc is not None and w_ebc is None:
-        return KeyedTensor(
-            keys=ebc.keys() + fp_ebc.keys(),
-            length_per_key=ebc.length_per_key() + fp_ebc.length_per_key(),
-            values=torch.cat(
-                [ebc_values, torch.jit._unwrap_optional(fp_ebc_values)], dim=1
-            ),
-        )
-    else:
-        assert fp_ebc is not None and w_ebc is not None
-        return KeyedTensor(
-            keys=ebc.keys() + fp_ebc.keys() + w_ebc.keys(),
-            length_per_key=ebc.length_per_key()
-            + fp_ebc.length_per_key()
-            + w_ebc.length_per_key(),
-            # Comment to torch.jit._unwrap_optional fp_ebc_values is inferred as Optional[Tensor] as it can be None when fp_ebc is None. But at this point we now that it has a value and doing jit._unwrap_optional will tell jit to treat it as Tensor type.
-            values=torch.cat(
-                [
-                    ebc_values,
-                    torch.jit._unwrap_optional(fp_ebc_values),
-                    torch.jit._unwrap_optional(w_ebc_values),
-                ],
-                dim=1,
-            ),
-        )
+    if fp_ebc is not None:
+        keys += fp_ebc.keys()
+        length_per_key += fp_ebc.length_per_key()
+        values.append(_pad_kt_values(fp_ebc, batch_size))
+
+    if w_ebc is not None:
+        keys += w_ebc.keys()
+        length_per_key += w_ebc.length_per_key()
+        values.append(_pad_kt_values(w_ebc, batch_size))
+
+    return KeyedTensor(
+        keys=keys,
+        length_per_key=length_per_key,
+        values=torch.cat(values, dim=1),
+    )
 
 
 class TestECSparseArch(nn.Module):
@@ -1232,23 +1363,33 @@ class TestECSparseArch(nn.Module):
         batch_size: Optional[int] = None,
     ) -> KeyedTensor:
         ec = self.ec(features)
+        # TODO: @kaus ec won't work with _post_sparsenn_forward
         result = _post_sparsenn_forward(ec, None, None, batch_size)
         return result
 
 
-class TestSparseArch(nn.Module):
+class TestEBCSparseArch(nn.Module):
     """
-    Basic nn.Module for testing
+    A simple sparse arch that wraps several EmbeddingBagCollection modules:
+        ebc, fp_ebc, weighted_ebc
+    It should merge the sparse module outputs into a single KeyedTensor.
 
     Args:
-        tables
-        device
+        tables: List[EmbeddingBagConfig],
+        weighted_tables: List[EmbeddingBagConfig],
+        device: Optional[torch.device],
+        max_feature_lengths: Optional[Dict[str, int]],
 
     Call Args:
-        features
+        id_list_features
+        id_score_list_features
 
     Returns:
         KeyedTensor
+
+    Example:
+        sparse_arch = TestEBCSparseArch(tables, weighted_tables)
+        embeddings = sparse_arch(id_list_features, id_score_list_features)
     """
 
     def __init__(
@@ -1258,6 +1399,13 @@ class TestSparseArch(nn.Module):
         device: Optional[torch.device] = None,
         max_feature_lengths: Optional[Dict[str, int]] = None,
     ) -> None:
+        """
+        Args:
+            tables: List[EmbeddingBagConfig],
+            weighted_tables: List[EmbeddingBagConfig],
+            device: torch.device,
+            max_feature_lengths: Optional[Dict[str, int]],
+        """
         super().__init__()
         if device is None:
             device = torch.device("cpu")
@@ -1309,6 +1457,15 @@ class TestSparseArch(nn.Module):
         weighted_features: Optional[KeyedJaggedTensor] = None,
         batch_size: Optional[int] = None,
     ) -> KeyedTensor:
+        """
+        Args:
+            features: KeyedJaggedTensor,
+            weighted_features: Optional[KeyedJaggedTensor],
+            batch_size: Optional[int],
+
+        Returns:
+            KeyedTensor
+        """
         fp_features = features
         if self.fps:
             # pyre-ignore[16]: Undefined attribute [16]: `Optional` has no attribute `__iter__`.
@@ -1337,6 +1494,9 @@ class TestSparseNNBase(nn.Module):
         embedding_groups: Optional[Dict[str, List[str]]],
         dense_device: Optional[torch.device],
         sparse_device: Optional[torch.device],
+
+    Example:
+        sparse_NN = TestSparseNN(tables, weighted_tables, embedding_groups)
     """
 
     def __init__(
@@ -1348,10 +1508,8 @@ class TestSparseNNBase(nn.Module):
         sparse_device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
-        if dense_device is None:
-            dense_device = torch.device("cpu")
-        if sparse_device is None:
-            sparse_device = torch.device("cpu")
+        self.dense_device: torch.device = dense_device or torch.device("cpu")
+        self.sparse_device: torch.device = sparse_device or torch.device("cpu")
 
 
 class TestSparseNN(TestSparseNNBase, CopyableMixin):
@@ -1386,7 +1544,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
         sparse_device: Optional[torch.device] = None,
         max_feature_lengths: Optional[Dict[str, int]] = None,
         feature_processor_modules: Optional[Dict[str, torch.nn.Module]] = None,
-        over_arch_clazz: Type[nn.Module] = TestOverArch,
+        over_arch_clazz: Optional[Type[nn.Module]] = None,
         postproc_module: Optional[nn.Module] = None,
         zch: bool = False,
     ) -> None:
@@ -1397,11 +1555,13 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
             dense_device=dense_device,
             sparse_device=sparse_device,
         )
+        if over_arch_clazz is None:
+            over_arch_clazz = TestOverArch
         if weighted_tables is None:
             weighted_tables = []
-        self.dense = TestDenseArch(num_float_features, dense_device)
+        self.dense = TestDenseArch(num_float_features, device=dense_device)
         if zch:
-            self.sparse: nn.Module = TestSparseArchZCH(
+            self.sparse: nn.Module = TestEBCSparseArchZCH(
                 tables,  # pyre-ignore
                 weighted_tables,
                 torch.device("meta"),
@@ -1413,7 +1573,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
                 sparse_device,
             )
         else:
-            self.sparse = TestSparseArch(
+            self.sparse = TestEBCSparseArch(
                 tables,  # pyre-ignore
                 weighted_tables,
                 sparse_device,
@@ -1432,7 +1592,10 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
             feature for table in weighted_tables for feature in table.feature_names
         ]
         self.over: nn.Module = over_arch_clazz(
-            tables, weighted_tables, embedding_names, dense_device
+            tables,
+            weighted_tables,
+            embedding_names,
+            dense_device,
         )
         self.register_buffer(
             "dummy_ones",
@@ -1465,6 +1628,13 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
         self,
         input: ModelInput,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Args:
+            input: ModelInput,
+
+        Returns:
+            torch.Tensor
+        """
         if self.postproc_module:
             input = self.postproc_module(input)
         return self.dense_forward(input, self.sparse_forward(input))
@@ -1556,7 +1726,7 @@ class TestTowerSparseNN(TestSparseNNBase):
             sparse_device=sparse_device,
         )
 
-        self.dense = TestDenseArch(num_float_features, dense_device)
+        self.dense = TestDenseArch(num_float_features, device=dense_device)
 
         # TODO: after adding planner support for tower_module, we can random assign
         # tables to towers, but for now the match planner default layout
@@ -1568,7 +1738,7 @@ class TestTowerSparseNN(TestSparseNNBase):
             embedding_module=EmbeddingBagCollection(tables=[tables[0]]),
             interaction_module=TestTowerInteraction(tables=[tables[0]]),
         )
-        self.sparse_arch = TestSparseArch(
+        self.sparse_arch = TestEBCSparseArch(
             [tables[1]],
             # pyre-ignore [16]
             [weighted_tables[0]],
@@ -1654,7 +1824,7 @@ class TestTowerCollectionSparseNN(TestSparseNNBase):
             sparse_device=sparse_device,
         )
 
-        self.dense = TestDenseArch(num_float_features, dense_device)
+        self.dense = TestDenseArch(num_float_features, device=dense_device)
         # TODO: after adding planner support for tower_module, we can random assign
         # tables to towers, but for now the match planner default layout
         tower_0 = EmbeddingTower(
@@ -1704,23 +1874,6 @@ class TestTowerCollectionSparseNN(TestSparseNNBase):
             )
         else:
             return pred
-
-
-def _get_default_rtol_and_atol(
-    actual: torch.Tensor, expected: torch.Tensor
-) -> Tuple[float, float]:
-    """
-    default tolerance values for torch.testing.assert_close,
-    consistent with the values of torch.testing.assert_close
-    """
-    _DTYPE_PRECISIONS = {
-        torch.float16: (1e-3, 1e-3),
-        torch.float32: (1e-4, 1e-5),
-        torch.float64: (1e-5, 1e-8),
-    }
-    actual_rtol, actual_atol = _DTYPE_PRECISIONS.get(actual.dtype, (0.0, 0.0))
-    expected_rtol, expected_atol = _DTYPE_PRECISIONS.get(expected.dtype, (0.0, 0.0))
-    return max(actual_rtol, expected_rtol), max(actual_atol, expected_atol)
 
 
 class TestPreprocNonWeighted(nn.Module):
@@ -1816,7 +1969,7 @@ class TestModelWithPreproc(nn.Module):
         run_postproc_inline: bool = False,
     ) -> None:
         super().__init__()
-        self.dense = TestDenseArch(num_float_features, device)
+        self.dense = TestDenseArch(num_float_features, device=device)
 
         self.ebc: EmbeddingBagCollection = EmbeddingBagCollection(
             tables=tables,
@@ -1906,7 +2059,7 @@ class TestModelWithPreprocCollectionArgs(nn.Module):
         num_float_features: int = 10,
     ) -> None:
         super().__init__()
-        self.dense = TestDenseArch(num_float_features, device)
+        self.dense = TestDenseArch(num_float_features, device=device)
 
         self.ebc: EmbeddingBagCollection = EmbeddingBagCollection(
             tables=tables,
@@ -2069,7 +2222,7 @@ class TestPositionWeightedPreprocModule(torch.nn.Module):
         return modified_input
 
 
-class TestSparseArchZCH(nn.Module):
+class TestEBCSparseArchZCH(nn.Module):
     """
     Basic nn.Module for testing MCH EmbeddingBagCollection
 
@@ -2089,7 +2242,7 @@ class TestSparseArchZCH(nn.Module):
 
     Example::
 
-        TestSparseArch()
+        TestEBCSparseArch()
     """
 
     def __init__(
@@ -2196,35 +2349,47 @@ class TestMixedSequenceOverArch(nn.Module):
         ec_tables: List[EmbeddingConfig],
         weighted_tables: List[EmbeddingBagConfig],
         device: Optional[torch.device] = None,
-        max_sequence_length: int = 20,
+        max_sequence_length: Optional[int] = None,
+        dense_arch_out_size: Optional[int] = None,
+        over_arch_out_size: Optional[int] = None,
     ) -> None:
+        """
+        Args:
+            ebc_tables: List[EmbeddingBagConfig],
+            ec_tables: List[EmbeddingConfig],
+            weighted_tables: List[EmbeddingBagConfig],
+            device: torch.device,
+        """
         super().__init__()
         if device is None:
             device = torch.device("cpu")
+        if max_sequence_length is None:
+            max_sequence_length = 10
+        if dense_arch_out_size is None:
+            dense_arch_out_size = DENSE_LAYER_OUT_SIZE
+        if over_arch_out_size is None:
+            over_arch_out_size = OVER_ARCH_OUT_SIZE
 
         # Calculate dimensions
-        dense_dim = 8
-        ebc_dim = sum(
-            [table.embedding_dim * len(table.feature_names) for table in ebc_tables]
-        )
-        ec_dim = sum(
-            [
-                table.embedding_dim * len(table.feature_names) * max_sequence_length
-                for table in ec_tables
-            ]
-        )
-        weighted_dim = sum(
-            [
-                table.embedding_dim * len(table.feature_names)
-                for table in weighted_tables
-            ]
+        in_features = (
+            dense_arch_out_size
+            + _tables_dim_sum(ebc_tables)
+            + _tables_dim_sum(ec_tables, max_sequence_length)
+            + _tables_dim_sum(weighted_tables)
         )
 
-        in_features = dense_dim + ebc_dim + ec_dim + weighted_dim
-
-        self.linear = nn.Linear(in_features=in_features, out_features=16, device=device)
+        self.linear = nn.Linear(
+            in_features=in_features, out_features=over_arch_out_size, device=device
+        )
 
     def forward(self, dense: torch.Tensor, sparse: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            dense: torch.Tensor,
+            sparse: torch.Tensor,
+        Returns:
+            torch.Tensor
+        """
         return self.linear(torch.cat([dense, sparse], dim=1))
 
 
@@ -2311,7 +2476,7 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
             else [feature for table in tables for feature in table.feature_names]
         )
 
-        self.dense = TestDenseArch(num_float_features, dense_device)
+        self.dense = TestDenseArch(num_float_features, device=dense_device)
         self.over: nn.Module = over_arch_clazz(ebc_tables, ec_tables, [], device)
         self.register_buffer(
             "dummy_ones",
@@ -2403,3 +2568,20 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
             ec_embeddings = _post_ec_forward(padded_embeddings, batch_size)
 
         return torch.cat([ebc_embeddings, ec_embeddings], dim=1)
+
+
+def _get_default_rtol_and_atol(
+    actual: torch.Tensor, expected: torch.Tensor
+) -> Tuple[float, float]:
+    """
+    default tolerance values for torch.testing.assert_close,
+    consistent with the values of torch.testing.assert_close
+    """
+    _DTYPE_PRECISIONS = {
+        torch.float16: (1e-3, 1e-3),
+        torch.float32: (1e-4, 1e-5),
+        torch.float64: (1e-5, 1e-8),
+    }
+    actual_rtol, actual_atol = _DTYPE_PRECISIONS.get(actual.dtype, (0.0, 0.0))
+    expected_rtol, expected_atol = _DTYPE_PRECISIONS.get(expected.dtype, (0.0, 0.0))
+    return max(actual_rtol, expected_rtol), max(actual_atol, expected_atol)
