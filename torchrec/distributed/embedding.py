@@ -77,6 +77,7 @@ from torchrec.distributed.types import (
     ShardingEnv,
     ShardingEnv2D,
     ShardMetadata,
+    BoundsCheckMode,
 )
 from torchrec.distributed.utils import (
     add_params_from_parameter_sharding,
@@ -1336,6 +1337,20 @@ class ShardedEmbeddingCollection(
             for i, input_feature in enumerate(input_feature_splits):
                 hash_size_cumsum = self.get_buffer(f"_hash_size_cumsum_tensor_{i}")
                 hash_size_offset = self.get_buffer(f"_hash_size_offset_tensor_{i}")
+                
+                lookup = self._lookups[i]
+                for emb_module in lookup._emb_modules:
+                    emb_module = emb_module._emb_module
+                    if emb_module.bounds_check_mode_int != BoundsCheckMode.NONE.value:
+                        torch.ops.fbgemm.bounds_check_indices(
+                            emb_module.rows_per_table,
+                            input_feature.values().long(), 
+                            input_feature.offsets().long(),
+                            emb_module.bounds_check_mode_int,
+                            emb_module.bounds_check_warning,
+                            None, 
+                        )
+
                 (
                     lengths,
                     offsets,
