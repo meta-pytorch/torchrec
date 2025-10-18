@@ -300,6 +300,35 @@ class BaseRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                 feature_hash_sizes.extend(group_config.feature_hash_sizes())
         return feature_hash_sizes
 
+    def _get_virtual_table_feature_num_buckets(self) -> Tuple[List[int], bool]:
+        """
+        Returns the number of buckets for each KVZCH feature in the GroupedEmbeddingConfigs.
+        If a feature is not a KVZCH feature, the list will have world_size for that feature's corresponding position.
+        This is needed as KVZCH features have to be processed for input_dist with non-KVZCH features.
+        """
+        feature_num_buckets: List[int] = []
+        has_uneven_virtual_tables = False
+        for group_config in self._grouped_embedding_configs:
+            for embedding_table in group_config.embedding_tables:
+                if (
+                    embedding_table.total_num_buckets is not None
+                    and embedding_table.use_virtual_table
+                ):
+                    feature_num_buckets.extend(
+                        [embedding_table.total_num_buckets]
+                        * embedding_table.num_features()
+                    )
+                    has_uneven_virtual_tables = has_uneven_virtual_tables or (
+                        # pyre-ignore[58]
+                        embedding_table.total_num_buckets % self._world_size
+                        != 0
+                    )
+                else:
+                    feature_num_buckets.extend(
+                        [self._world_size] * embedding_table.num_features()
+                    )
+        return feature_num_buckets, has_uneven_virtual_tables
+
 
 class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
     """
@@ -331,6 +360,8 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         has_feature_processor: bool = False,
         need_pos: bool = False,
         keep_original_indices: bool = False,
+        virtual_table_feature_num_buckets: Optional[List[int]] = None,
+        has_uneven_virtual_tables: bool = False,
     ) -> None:
         super().__init__()
         self._world_size: int = pg.size()
@@ -340,10 +371,38 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
 
         for i, hash_size in enumerate(feature_hash_sizes):
             block_divisor = self._world_size
+            # Using different num_bucket lists for MPZCH and KVZCH allows us to process them with
+            # different code paths for now, enabling uneven sharding for KVZCH only. MPZCH can have
+            # uneven sharding enabled for it as well in the future but that will require additional testing
             if feature_total_num_buckets is not None:
-                assert feature_total_num_buckets[i] % self._world_size == 0
+                # MPZCH sharding
+                assert (
+                    feature_total_num_buckets[i] % self._world_size == 0
+                ), f"Number of buckets: {feature_total_num_buckets[i]} should be divisible by world size: {self._world_size} for MPZCH"
+
                 block_divisor = feature_total_num_buckets[i]
+            elif (
+                has_uneven_virtual_tables
+                and virtual_table_feature_num_buckets is not None
+                and len(virtual_table_feature_num_buckets)
+            ):
+                # KVZCH uneven sharding
+                assert (
+                    virtual_table_feature_num_buckets[i] >= self._world_size
+                ), f"Number of buckets: {virtual_table_feature_num_buckets[i]} for a table cannot be less than the word_size: {self._world_size}"
+
+                block_divisor = virtual_table_feature_num_buckets[i]
             feature_block_sizes.append((hash_size + block_divisor - 1) // block_divisor)
+
+        self.kvzch_bucketize_row_pos: Optional[List[torch._tensor.Tensor]] = (
+            (
+                self._get_bucketize_row_pos(
+                    virtual_table_feature_num_buckets, feature_block_sizes
+                )
+            )
+            if has_uneven_virtual_tables
+            else None
+        )
 
         self.register_buffer(
             "_feature_block_sizes_tensor",
@@ -377,6 +436,37 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         self._need_pos = need_pos
         self.unbucketize_permute_tensor: Optional[torch.Tensor] = None
         self._keep_original_indices = keep_original_indices
+
+    def _get_bucketize_row_pos(
+        self,
+        feature_num_buckets: Optional[List[int]],
+        feature_block_sizes: List[int],
+    ) -> Optional[List[torch.Tensor]]:
+        # Creates the bucketize row positions for uneven sharding with buckets. If the number of buckets
+        # is greater than the world size, and world_size % num_buckets != 0, the buckets count will not be
+        # the same on each rank. Bucketize_row_pos object lays out the distribution of buckets in this scenario.
+        # For eg.
+        # Bucketize_row_pos
+        # [
+        #   Tensor([0, 4, 8, 12, 15, 18, 21]), Feature 1 has 4 buckets on ranks 0, 1, 2. 3 buckets on ranks 3, 4, 5
+        #   Tensor([0, 2, 4, 6, 7, 8, 9]), Feature 2 has 2 buckets on ranks 0, 1, 2. 1 bucket on ranks 3, 4, 5
+        # ]
+        if feature_num_buckets is None or len(feature_num_buckets) == 0:
+            return None
+        bucketize_row_pos = [[0] for _ in range(len(feature_num_buckets))]
+        bucketize_row_pos_tensors = []
+        for feature in range(len(feature_num_buckets)):
+            for rank in range(self._world_size):
+                bucketize_row_pos[feature].append(
+                    bucketize_row_pos[feature][-1]
+                    + (
+                        (feature_num_buckets[feature] // self._world_size)
+                        + int(rank < feature_num_buckets[feature] % self._world_size)
+                    )
+                    * feature_block_sizes[feature]
+                )
+            bucketize_row_pos_tensors.append(torch.tensor(bucketize_row_pos[feature]))
+        return bucketize_row_pos_tensors
 
     def forward(
         self,
@@ -413,6 +503,7 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
                 else self._need_pos
             ),
             keep_original_indices=self._keep_original_indices,
+            block_bucketize_row_pos=self.kvzch_bucketize_row_pos,
         )
 
         return self._dist(bucketized_features)
@@ -558,6 +649,9 @@ class RwPooledEmbeddingSharding(
     ) -> BaseSparseFeaturesDist[KeyedJaggedTensor]:
         num_features = self._get_num_features()
         feature_hash_sizes = self._get_feature_hash_sizes()
+        virtual_table_feature_num_buckets, has_uneven_virtual_tables = (
+            self._get_virtual_table_feature_num_buckets()
+        )
         return RwSparseFeaturesDist(
             # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
@@ -567,7 +661,9 @@ class RwPooledEmbeddingSharding(
             device=device if device is not None else self._device,
             is_sequence=False,
             has_feature_processor=self._has_feature_processor,
+            virtual_table_feature_num_buckets=virtual_table_feature_num_buckets,
             need_pos=self._need_pos,
+            has_uneven_virtual_tables=has_uneven_virtual_tables,
         )
 
     def create_lookup(
