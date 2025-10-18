@@ -207,10 +207,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         Note that the comms module's metrics are actually the ones that are computed.
         """
-        future: concurrent.futures.Future[Dict[str, MetricValue]] = (
-            concurrent.futures.Future()
-        )
-
         model_out = {
             "task1-prediction": torch.tensor([0.5]),
             "task1-label": torch.tensor([0.7]),
@@ -220,7 +216,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         for _ in range(10):
             self.cpu_module.update(model_out)
 
-        self.cpu_module.async_compute(future)
+        self.cpu_module.async_compute()
 
         comms_mock_metric = cast(
             MockRecMetric, self.cpu_module.comms_module.rec_metrics.rec_metrics[0]
@@ -234,10 +230,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_async_compute_after_shutdown(self) -> None:
         self.cpu_module.shutdown()
 
-        future: concurrent.futures.Future[Dict[str, MetricValue]] = (
-            concurrent.futures.Future()
-        )
-        self.cpu_module.async_compute(future)
+        future = self.cpu_module.async_compute()
 
         self.assertRaisesRegex(
             RecMetricException, "metric processor thread is shut down.", future.result
@@ -275,7 +268,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             "task1-weight": torch.tensor([1.0]),
         }
         self.cpu_module.update(model_out)
-        self.cpu_module.async_compute(concurrent.futures.Future())
+        self.cpu_module.async_compute()
 
         self.cpu_module.wait_until_queue_is_empty(self.cpu_module.update_queue)
         self.cpu_module.wait_until_queue_is_empty(self.cpu_module.compute_queue)
@@ -576,10 +569,7 @@ def _compare_metric_results_worker(
 
     standard_results = standard_module.compute()
 
-    future: concurrent.futures.Future[Dict[str, MetricValue]] = (
-        concurrent.futures.Future()
-    )
-    cpu_offloaded_module.async_compute(future)
+    future = cpu_offloaded_module.async_compute()
 
     # Wait for async compute to finish. Compare the input to each update()
     offloaded_results = future.result(timeout=10.0)
