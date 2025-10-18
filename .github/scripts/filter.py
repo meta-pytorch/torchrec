@@ -63,9 +63,10 @@ def main():
         if entry["desired_cuda"] == "cu130":
             # fbgemm only supports cuda 12.6, 12.8 and 12.9
             continue
-        if entry["python_version"] in ("3.14", "3.9"):
-            # stop python3.9 support, and will add python3.14 when it's ready
-            # https://devguide.python.org/versions/
+        if entry["python_version"] in ("3.14", "3.14t", "3.9"):
+            # stop python3.9 support, and skipp python3.14 due to incompatibility with torch.compile
+            # for python version: https://devguide.python.org/versions/
+            # for torch.compile: https://github.com/pytorch/pytorch/issues/156856
             continue
         new_matrix_entries.append(entry)
 
