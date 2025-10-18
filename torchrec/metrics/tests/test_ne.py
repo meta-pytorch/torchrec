@@ -194,6 +194,20 @@ class NEMetricTest(unittest.TestCase):
             zero_weights=True,
         )
 
+    def test_ne_allow_missing_label_with_zero_weight(self) -> None:
+        eta = 1e-12
+        ne = compute_ne(
+            ce_sum=torch.rand(3),
+            weighted_num_samples=torch.tensor([3, 0, 2]),
+            pos_labels=torch.tensor([1, 0, 2]),
+            neg_labels=torch.tensor([2, 0, 0]),
+            eta=eta,
+            allow_missing_label_with_zero_weight=True,
+        )
+        self.assertTrue(torch.all(~ne.isinf()))
+        self.assertTrue(torch.all(~ne.isnan()))
+        self.assertTrue(torch.equal(ne.eq(eta), torch.tensor([False, True, False])))
+
     _logloss_metric_test_helper: Callable[..., None] = partial(
         metric_test_helper, include_logloss=True
     )

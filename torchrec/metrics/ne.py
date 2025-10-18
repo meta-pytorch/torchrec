@@ -55,16 +55,14 @@ def compute_ne(
     eta: float,
     allow_missing_label_with_zero_weight: bool = False,
 ) -> torch.Tensor:
-    if allow_missing_label_with_zero_weight and not weighted_num_samples.all():
-        # If nan were to occur, return a dummy value instead of nan if
-        # allow_missing_label_with_zero_weight is True
-        return torch.tensor([eta])
-
-    # Goes into this block if all elements in weighted_num_samples > 0
-    weighted_num_samples = weighted_num_samples.double().clamp(min=eta)
-    mean_label = pos_labels / weighted_num_samples
+    clamped_weighted_num_samples = weighted_num_samples.double().clamp(min=eta)
+    mean_label = pos_labels / clamped_weighted_num_samples
     ce_norm = _compute_cross_entropy_norm(mean_label, pos_labels, neg_labels, eta)
-    return ce_sum / ce_norm
+    ne = ce_sum / ce_norm
+    if allow_missing_label_with_zero_weight and not weighted_num_samples.all():
+        # If inf were to occur, return a dummy value instead.
+        return torch.where(weighted_num_samples > 0, ne, eta)
+    return ne
 
 
 def compute_logloss(
