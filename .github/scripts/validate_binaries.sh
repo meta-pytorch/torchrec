@@ -11,8 +11,6 @@ export CONDA_ENV="build_binary"
 
 if [[ ${MATRIX_PYTHON_VERSION} = '3.14' ]]; then
     exit 0 # fbgemm doesn't support python 3.14 so far
-    # conda currently doesn't support 3.14 unless using the forge channel
-    conda create -y -n "${CONDA_ENV}" python="3.14" -c conda-forge
 elif [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
     exit 0 # fbgemm doesn't support python 3.14 so far
     # use conda-forge to install python3.14t
