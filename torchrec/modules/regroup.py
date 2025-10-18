@@ -64,9 +64,18 @@ class PermuteMultiEmbedding(torch.nn.Module):
     Args:
         groups (List[List[str]]): Groups from KTRegroupAsDict
         multi_device (bool): Whether to move buffers to current guarded device
+
+    Example:
+        groups = [['f1', 'f2'], ['f3']]
+        permute_module = PermuteMultiEmbedding(groups)
     """
 
     def __init__(self, groups: List[List[str]], multi_device: bool = False) -> None:
+        """
+        Args:
+            groups (List[List[str]]): Groups from KTRegroupAsDict
+            multi_device (bool): Whether to move buffers to current guarded device
+        """
         super().__init__()
         self._groups = groups
         self.register_buffer("_permutes", torch.empty(0), persistent=False)
@@ -100,6 +109,13 @@ class PermuteMultiEmbedding(torch.nn.Module):
         self._out_shapes = self._out_shapes.to(device)
 
     def forward(self, values: List[torch.Tensor]) -> List[torch.Tensor]:
+        """
+        Args:
+            values (List[torch.Tensor]): List of tensors to permute
+
+        Returns:
+            List[torch.Tensor]: permuted values
+        """
         permutes = self._permutes
         in_shapes = self._in_shapes
         out_shapes = self._out_shapes
@@ -134,6 +150,7 @@ class KTRegroupAsDict(torch.nn.Module, CacheMixin):
     Args:
         groups (List[List[str]]): features per output group
         keys (List[str]): key of each output group
+        emb_dtype (Optional[DataType]): embedding data type
         multi_device (bool): Whether to move buffers to current guarded device
 
     Example::
@@ -156,6 +173,13 @@ class KTRegroupAsDict(torch.nn.Module, CacheMixin):
         emb_dtype: Optional[DataType] = None,
         multi_device: bool = False,
     ) -> None:
+        """
+        Args:
+            groups (List[List[str]]): features per output group
+            keys (List[str]): key of each output group
+            emb_dtype (Optional[DataType]): embedding data type
+            multi_device (bool): Whether to move buffers to current guarded device
+        """
         super().__init__()
         torch._C._log_api_usage_once(f"torchrec.modules.{self.__class__.__name__}")
         assert len(groups) == len(keys), "Groups and keys should have same length"
@@ -222,6 +246,13 @@ class KTRegroupAsDict(torch.nn.Module, CacheMixin):
         return [emb.to(dtype=dtype) for emb in embs]
 
     def forward(self, keyed_tensors: List[KeyedTensor]) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            keyed_tensors (List[KeyedTensor]): list of KeyedTensors to regroup
+
+        Returns:
+            Dict[str, torch.Tensor]: dictionary of tensors keyed by the keys.
+        """
         if not self._is_inited:
             module_init(self, keyed_tensors)
 
