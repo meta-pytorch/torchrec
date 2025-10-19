@@ -128,12 +128,9 @@ def infer(
     retrieval_sd = None
     if load_dir is not None:
         load_dir = load_dir.rstrip("/")
-        # pyre-ignore[16]
         index = faiss.index_cpu_to_gpu(
-            # pyre-ignore[16]
             faiss.StandardGpuResources(),
             faiss_device_idx,
-            # pyre-ignore[16]
             faiss.read_index(f"{load_dir}/faiss.index"),
         )
         two_tower_sd = torch.load(f"{load_dir}/model.pt", weights_only=True)
@@ -158,7 +155,13 @@ def infer(
         index.add(embeddings)
 
     retrieval_model = TwoTowerRetrieval(
-        index, ebcs[0], ebcs[1], layer_sizes, k, device, dtype=torch.float16
+        index,  # pyre-ignore[6]
+        ebcs[0],
+        ebcs[1],
+        layer_sizes,
+        k,
+        device,
+        dtype=torch.float16,
     )
 
     constraints = {}

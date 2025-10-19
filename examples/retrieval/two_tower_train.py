@@ -227,7 +227,6 @@ def train(
                 model, dtype=torch.qint8, inplace=True
             )
             torch.save(quant_model.state_dict(), f"{save_dir}/model.pt")
-            # pyre-ignore[16]
             faiss.write_index(index, f"{save_dir}/faiss.index")
 
 
