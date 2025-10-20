@@ -327,20 +327,45 @@ class QuantBatchedEmbeddingBag(
         else:
             shard_offsets_for_kv_zch = None
 
-        self._emb_module: IntNBitTableBatchedEmbeddingBagsCodegen = tbe_clazz(
-            embedding_specs=embedding_specs,
-            device=device,
-            pooling_mode=self._pooling,
-            feature_table_map=self._feature_table_map,
-            row_alignment=self._tbe_row_alignment,
-            uvm_host_mapped=True,  # Use cudaHostAlloc for UVM CACHING to fix imbalance numa memory issue
-            bounds_check_mode=(
+        # Determine embedding cache mode for KV embedding tables
+        embedding_cache_mode = False  # Default: False = randomized initialization
+        if tbe_clazz == KVEmbeddingInference:
+            # For KV embedding tables, set cache mode based on embedding table configuration
+            # Check if any table has NoEvictionPolicy - use zero init for those
+            for table in config.embedding_tables:
+                if (
+                    table.virtual_table_eviction_policy is not None
+                    and type(table.virtual_table_eviction_policy).__name__
+                    == "NoEvictionPolicy"
+                ):
+                    embedding_cache_mode = True  # True = zero initialization
+                    break
+
+        # Build kwargs for module construction
+        module_kwargs: Dict[str, Any] = {
+            "embedding_specs": embedding_specs,
+            "device": device,
+            "pooling_mode": self._pooling,
+            "feature_table_map": self._feature_table_map,
+            "row_alignment": self._tbe_row_alignment,
+            "uvm_host_mapped": True,  # Use cudaHostAlloc for UVM CACHING to fix imbalance numa memory issue
+            "bounds_check_mode": (
                 bounds_check_mode if bounds_check_mode else BoundsCheckMode.WARNING
             ),
-            feature_names_per_table=[
+            "feature_names_per_table": [
                 table.feature_names for table in config.embedding_tables
             ],
-            **(tbe_fused_params(fused_params) or {}),
+        }
+
+        # Add KV-specific parameters
+        if tbe_clazz == KVEmbeddingInference:
+            module_kwargs["embedding_cache_mode"] = embedding_cache_mode
+
+        # Add fused params
+        module_kwargs.update(**(tbe_fused_params(fused_params) or {}))
+
+        self._emb_module: IntNBitTableBatchedEmbeddingBagsCodegen = tbe_clazz(
+            **module_kwargs
         )
         if device is not None:
             self._emb_module.initialize_weights()
@@ -495,6 +520,7 @@ class QuantBatchedEmbedding(
 
         managed: List[EmbeddingLocation] = []
         is_virtual_table = False
+        embedding_cache_mode = False
         for table in config.embedding_tables:
             if device is not None and device.type == "cuda":
                 managed.append(
@@ -504,6 +530,8 @@ class QuantBatchedEmbedding(
                 managed.append(EmbeddingLocation.HOST)
             if table.use_virtual_table:
                 is_virtual_table = True
+            if table.enable_embedding_update:
+                embedding_cache_mode = True
         self._config: GroupedEmbeddingConfig = config
         self._emb_module_registered: bool = is_fused_param_register_tbe(fused_params)
         self._quant_state_dict_split_scale_bias: bool = (
@@ -529,8 +557,9 @@ class QuantBatchedEmbedding(
         else:
             shard_offsets_for_kv_zch = None
 
-        self._emb_module: IntNBitTableBatchedEmbeddingBagsCodegen = embedding_clazz(
-            embedding_specs=[
+        # Build kwargs for module construction
+        module_kwargs: Dict[str, Any] = {
+            "embedding_specs": [
                 (
                     table.name,
                     local_rows,
@@ -549,15 +578,25 @@ class QuantBatchedEmbedding(
                     managed,
                 )
             ],
-            device=device,
-            pooling_mode=PoolingMode.NONE,
-            feature_table_map=self._feature_table_map,
-            row_alignment=self._tbe_row_alignment,
-            uvm_host_mapped=True,  # Use cudaHostAlloc for UVM CACHING to fix imbalance numa memory issue
-            feature_names_per_table=[
+            "device": device,
+            "pooling_mode": PoolingMode.NONE,
+            "feature_table_map": self._feature_table_map,
+            "row_alignment": self._tbe_row_alignment,
+            "uvm_host_mapped": True,  # Use cudaHostAlloc for UVM CACHING to fix imbalance numa memory issue
+            "feature_names_per_table": [
                 table.feature_names for table in config.embedding_tables
             ],
-            **(tbe_fused_params(fused_params) or {}),
+        }
+
+        # Add KV-specific parameters
+        if embedding_clazz == KVEmbeddingInference:
+            module_kwargs["embedding_cache_mode"] = embedding_cache_mode
+
+        # Add fused params
+        module_kwargs.update(**(tbe_fused_params(fused_params) or {}))
+
+        self._emb_module: IntNBitTableBatchedEmbeddingBagsCodegen = embedding_clazz(
+            **module_kwargs
         )
         if device is not None:
             self._emb_module.initialize_weights()
