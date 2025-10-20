@@ -764,9 +764,9 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
         self._output_dtype = output_dtype
         self._device = device
         self.row_alignment = row_alignment
-        self._key_to_tables: Dict[Tuple[DataType, bool], List[EmbeddingConfig]] = (
-            defaultdict(list)
-        )
+        self._key_to_tables: Dict[
+            Tuple[DataType, bool, bool], List[EmbeddingConfig]
+        ] = defaultdict(list)
         self._feature_names: List[str] = []
         self._features_order: Optional[List[int]] = None
 
@@ -789,12 +789,24 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
                     + f" {self._embedding_dim}"
                 )
             if hasattr(table, "use_virtual_table"):
-                key = (table.data_type, table.use_virtual_table)
+                key = (table.data_type, table.use_virtual_table, False)
+            if hasattr(table, "use_virtual_table") and hasattr(
+                table, "enable_embedding_update"
+            ):
+                key = (
+                    table.data_type,
+                    table.use_virtual_table,
+                    table.enable_embedding_update,
+                )
             else:
-                key = (table.data_type, False)
+                key = (table.data_type, False, False)
             self._key_to_tables[key].append(table)
         self._feature_splits: List[int] = []
-        for (data_type, use_virtual_table), emb_configs in self._key_to_tables.items():
+        for (
+            data_type,
+            use_virtual_table,
+            enable_embedding_update,
+        ), emb_configs in self._key_to_tables.items():
             embedding_specs = []
             weight_lists: Optional[
                 List[Tuple[torch.Tensor, Optional[torch.Tensor]]]
@@ -825,15 +837,20 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
                 if use_virtual_table
                 else IntNBitTableBatchedEmbeddingBagsCodegen
             )
-            emb_module = embedding_clazz(
-                embedding_specs=embedding_specs,
-                pooling_mode=PoolingMode.NONE,
-                weight_lists=weight_lists,
-                device=device,
-                output_dtype=data_type_to_sparse_type(dtype_to_data_type(output_dtype)),
-                row_alignment=row_alignment,
-                feature_table_map=feature_table_map,
-            )
+            kwargs: Dict[str, Any] = {
+                "embedding_specs": embedding_specs,
+                "pooling_mode": PoolingMode.NONE,
+                "weight_lists": weight_lists,
+                "device": device,
+                "output_dtype": data_type_to_sparse_type(
+                    dtype_to_data_type(output_dtype)
+                ),
+                "row_alignment": row_alignment,
+                "feature_table_map": feature_table_map,
+            }
+            if embedding_clazz == KVEmbeddingInference:
+                kwargs["embedding_cache_mode"] = enable_embedding_update
+            emb_module = embedding_clazz(**kwargs)
             if weight_lists is None:
                 emb_module.initialize_weights()
             self._emb_modules.append(emb_module)
@@ -869,6 +886,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
                         "weight_qbias", qbias
                     )
 
+        # pyre-ignore [8]
         self._embedding_names_by_batched_tables: Dict[
             Tuple[DataType, bool], List[str]
         ] = {
@@ -934,6 +952,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
             f = kjts_per_key[i]
             lengths = _get_feature_length(f)
             indices, offsets = _fx_trec_unwrap_kjt(f)
+            # pyre-ignore [6]
             embedding_names = self._embedding_names_by_batched_tables[key]
             lookup = (
                 emb_module(indices=indices, offsets=offsets)
