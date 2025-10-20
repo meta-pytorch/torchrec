@@ -849,7 +849,7 @@ class BenchFuncConfig:
     world_size: int
     num_profiles: int
     num_benchmarks: int
-    profile_dir: str
+    profile_dir: str = ""
     device_type: str = "cuda"
     pre_gpu_load: int = 0
     export_stacks: bool = False

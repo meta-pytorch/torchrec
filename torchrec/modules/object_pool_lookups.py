@@ -413,7 +413,7 @@ class UVMCachingInt64Lookup(KeyedJaggedTensorPoolLookup):
                 .sum(axis=1)
             )
             key_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(key_lengths)
-            padded_values = torch.ops.fbgemm.jagged_to_padded_dense(
+            padded_values: torch.Tensor = torch.ops.fbgemm.jagged_to_padded_dense(
                 values.values(),
                 [key_offsets],
                 [self._bit_dims],

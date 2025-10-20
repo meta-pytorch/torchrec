@@ -18,7 +18,7 @@ To support a new model in pipeline benchmark:
 
 import copy
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
@@ -31,6 +31,7 @@ from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
 from torchrec.distributed.sharding_plan import get_default_sharders
 from torchrec.distributed.test_utils.test_model import (
+    TestOverArchLarge,
     TestSparseNN,
     TestTowerCollectionSparseNN,
     TestTowerSparseNN,
@@ -51,8 +52,9 @@ class BaseModelConfig(ABC):
     and requires each concrete implementation to provide its own generate_model method.
     """
 
-    # Common parameters for all model types
-    num_float_features: int  # we assume all model arch has a single dense feature layer
+    ## Common parameters for all model types, please do not set default values here
+    # we assume all model arch has a single dense feature layer
+    num_float_features: int
 
     @abstractmethod
     def generate_model(
@@ -80,12 +82,12 @@ class BaseModelConfig(ABC):
 class TestSparseNNConfig(BaseModelConfig):
     """Configuration for TestSparseNN model."""
 
-    embedding_groups: Optional[Dict[str, List[str]]]
-    feature_processor_modules: Optional[Dict[str, torch.nn.Module]]
-    max_feature_lengths: Optional[Dict[str, int]]
-    over_arch_clazz: Type[nn.Module]
-    postproc_module: Optional[nn.Module]
-    zch: bool
+    embedding_groups: Optional[Dict[str, List[str]]] = None
+    feature_processor_modules: Optional[Dict[str, torch.nn.Module]] = None
+    max_feature_lengths: Optional[Dict[str, int]] = None
+    over_arch_clazz: Type[nn.Module] = TestOverArchLarge
+    postproc_module: Optional[nn.Module] = None
+    zch: bool = False
 
     def generate_model(
         self,
@@ -113,8 +115,8 @@ class TestSparseNNConfig(BaseModelConfig):
 class TestTowerSparseNNConfig(BaseModelConfig):
     """Configuration for TestTowerSparseNN model."""
 
-    embedding_groups: Optional[Dict[str, List[str]]]
-    feature_processor_modules: Optional[Dict[str, torch.nn.Module]]
+    embedding_groups: Optional[Dict[str, List[str]]] = None
+    feature_processor_modules: Optional[Dict[str, torch.nn.Module]] = None
 
     def generate_model(
         self,
@@ -138,8 +140,8 @@ class TestTowerSparseNNConfig(BaseModelConfig):
 class TestTowerCollectionSparseNNConfig(BaseModelConfig):
     """Configuration for TestTowerCollectionSparseNN model."""
 
-    embedding_groups: Optional[Dict[str, List[str]]]
-    feature_processor_modules: Optional[Dict[str, torch.nn.Module]]
+    embedding_groups: Optional[Dict[str, List[str]]] = None
+    feature_processor_modules: Optional[Dict[str, torch.nn.Module]] = None
 
     def generate_model(
         self,
@@ -163,8 +165,8 @@ class TestTowerCollectionSparseNNConfig(BaseModelConfig):
 class DeepFMConfig(BaseModelConfig):
     """Configuration for DeepFM model."""
 
-    hidden_layer_size: int
-    deep_fm_dimension: int
+    hidden_layer_size: int = 20
+    deep_fm_dimension: int = 5
 
     def generate_model(
         self,
@@ -189,8 +191,8 @@ class DeepFMConfig(BaseModelConfig):
 class DLRMConfig(BaseModelConfig):
     """Configuration for DLRM model."""
 
-    dense_arch_layer_sizes: List[int]
-    over_arch_layer_sizes: List[int]
+    dense_arch_layer_sizes: List[int] = field(default_factory=lambda: [20, 128])
+    over_arch_layer_sizes: List[int] = field(default_factory=lambda: [5, 1])
 
     def generate_model(
         self,
@@ -213,7 +215,9 @@ class DLRMConfig(BaseModelConfig):
 
 # pyre-ignore[2]: Missing parameter annotation
 def create_model_config(model_name: str, **kwargs) -> BaseModelConfig:
-
+    """
+    deprecated function, please use ModelSelectionConfig.create_model_config instead
+    """
     model_configs = {
         "test_sparse_nn": TestSparseNNConfig,
         "test_tower_sparse_nn": TestTowerSparseNNConfig,
@@ -309,3 +313,39 @@ def generate_sharded_model_and_optimizer(
     optimizer = optimizer_class(dense_params, **optimizer_kwargs)
 
     return sharded_model, optimizer
+
+
+@dataclass
+class ModelSelectionConfig:
+    model_name: str = "test_sparse_nn"
+    model_config: Dict[str, Any] = field(
+        default_factory=lambda: {"num_float_features": 10}
+    )
+
+    def get_model_config_class(self) -> Type[BaseModelConfig]:
+        match self.model_name:
+            case "test_sparse_nn":
+                return TestSparseNNConfig
+            case "test_tower_sparse_nn":
+                return TestTowerSparseNNConfig
+            case "test_tower_collection_sparse_nn":
+                return TestTowerCollectionSparseNNConfig
+            case "deepfm":
+                return DeepFMConfig
+            case "dlrm":
+                return DLRMConfig
+            case _:
+                raise ValueError(f"Unknown model name: {self.model_name}")
+
+    def create_model_config(self) -> BaseModelConfig:
+        config_class = self.get_model_config_class()
+        valid_field_names = {field.name for field in fields(config_class)}
+        filtered_kwargs = {
+            k: v for k, v in self.model_config.items() if k in valid_field_names
+        }
+        # pyre-ignore[45]: Invalid class instantiation
+        return config_class(**filtered_kwargs)
+
+    def create_test_model(self, **kwargs: Any) -> nn.Module:
+        model_config = self.create_model_config()
+        return model_config.generate_model(**kwargs)

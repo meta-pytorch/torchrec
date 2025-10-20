@@ -2364,7 +2364,7 @@ class TestMixedSequenceOverArch(nn.Module):
         if device is None:
             device = torch.device("cpu")
         if max_sequence_length is None:
-            max_sequence_length = 10
+            max_sequence_length = 20
         if dense_arch_out_size is None:
             dense_arch_out_size = DENSE_LAYER_OUT_SIZE
         if over_arch_out_size is None:

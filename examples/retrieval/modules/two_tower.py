@@ -169,7 +169,6 @@ class TwoTowerRetrieval(nn.Module):
 
     def __init__(
         self,
-        # pyre-ignore[11]
         faiss_index: Union[faiss.GpuIndexIVFPQ, faiss.IndexIVFPQ],
         query_ebc: EmbeddingBagCollection,
         candidate_ebc: EmbeddingBagCollection,
@@ -222,6 +221,7 @@ class TwoTowerRetrieval(nn.Module):
             (batch_size, self.k), device=self.device, dtype=torch.int64
         )
         query_embedding = query_embedding.to(torch.float32)  # required by faiss
+        # pyre-ignore[19]
         self.faiss_index.search(query_embedding, self.k, distances, candidates)
 
         # candidate lookup

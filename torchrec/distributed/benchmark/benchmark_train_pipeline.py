@@ -20,8 +20,8 @@ To support a new model in pipeline benchmark:
     See benchmark_pipeline_utils.py for step-by-step instructions.
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Type
+from dataclasses import dataclass
+from typing import List, Optional
 
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
@@ -37,8 +37,8 @@ from torchrec.distributed.benchmark.base import (
 from torchrec.distributed.test_utils.input_config import ModelInputConfig
 from torchrec.distributed.test_utils.model_config import (
     BaseModelConfig,
-    create_model_config,
     generate_sharded_model_and_optimizer,
+    ModelSelectionConfig,
 )
 from torchrec.distributed.test_utils.model_input import ModelInput
 
@@ -49,7 +49,6 @@ from torchrec.distributed.test_utils.multi_process import (
 from torchrec.distributed.test_utils.pipeline_config import PipelineConfig
 from torchrec.distributed.test_utils.sharding_config import PlannerConfig
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
-from torchrec.distributed.test_utils.test_model import TestOverArchLarge
 from torchrec.distributed.train_pipeline import TrainPipeline
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -94,11 +93,11 @@ class RunOptions(BenchFuncConfig):
     """
 
     world_size: int = 2
+    batch_size: int = 1024 * 32
+    num_float_features: int = 10
     num_batches: int = 10
     sharding_type: ShardingType = ShardingType.TABLE_WISE
     input_type: str = "kjt"
-    name: str = ""
-    profile_dir: str = ""
     num_benchmarks: int = 5
     num_profiles: int = 2
     num_poolings: Optional[List[float]] = None
@@ -111,39 +110,6 @@ class RunOptions(BenchFuncConfig):
     sparse_momentum: Optional[float] = None
     sparse_weight_decay: Optional[float] = None
     export_stacks: bool = False
-
-
-@dataclass
-class ModelSelectionConfig:
-    model_name: str = "test_sparse_nn"
-
-    # Common config for all model types
-    batch_size: int = 1024 * 32
-    batch_sizes: Optional[List[int]] = None
-    num_float_features: int = 10
-    feature_pooling_avg: int = 10
-    use_offsets: bool = False
-    dev_str: str = ""
-    long_kjt_indices: bool = True
-    long_kjt_offsets: bool = True
-    long_kjt_lengths: bool = True
-    pin_memory: bool = True
-
-    # TestSparseNN specific config
-    embedding_groups: Optional[Dict[str, List[str]]] = None
-    feature_processor_modules: Optional[Dict[str, torch.nn.Module]] = None
-    max_feature_lengths: Optional[Dict[str, int]] = None
-    over_arch_clazz: Type[nn.Module] = TestOverArchLarge
-    postproc_module: Optional[nn.Module] = None
-    zch: bool = False
-
-    # DeepFM specific config
-    hidden_layer_size: int = 20
-    deep_fm_dimension: int = 5
-
-    # DLRM specific config
-    dense_arch_layer_sizes: List[int] = field(default_factory=lambda: [20, 128])
-    over_arch_layer_sizes: List[int] = field(default_factory=lambda: [5, 1])
 
 
 # single-rank runner
@@ -303,35 +269,9 @@ def main(
     pipeline_config: PipelineConfig,
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
-    model_config: Optional[BaseModelConfig] = None,
 ) -> None:
     tables, weighted_tables, *_ = table_config.generate_tables()
-
-    if model_config is None:
-        model_config = create_model_config(
-            model_name=model_selection.model_name,
-            batch_size=model_selection.batch_size,
-            batch_sizes=model_selection.batch_sizes,
-            num_float_features=model_selection.num_float_features,
-            feature_pooling_avg=model_selection.feature_pooling_avg,
-            use_offsets=model_selection.use_offsets,
-            dev_str=model_selection.dev_str,
-            long_kjt_indices=model_selection.long_kjt_indices,
-            long_kjt_offsets=model_selection.long_kjt_offsets,
-            long_kjt_lengths=model_selection.long_kjt_lengths,
-            pin_memory=model_selection.pin_memory,
-            embedding_groups=model_selection.embedding_groups,
-            feature_processor_modules=model_selection.feature_processor_modules,
-            max_feature_lengths=model_selection.max_feature_lengths,
-            over_arch_clazz=model_selection.over_arch_clazz,
-            postproc_module=model_selection.postproc_module,
-            zch=model_selection.zch,
-            hidden_layer_size=model_selection.hidden_layer_size,
-            deep_fm_dimension=model_selection.deep_fm_dimension,
-            dense_arch_layer_sizes=model_selection.dense_arch_layer_sizes,
-            over_arch_layer_sizes=model_selection.over_arch_layer_sizes,
-        )
-
+    model_config = model_selection.create_model_config()
     # launch trainers
     run_multi_process_func(
         func=runner,

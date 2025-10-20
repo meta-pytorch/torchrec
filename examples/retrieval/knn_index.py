@@ -21,7 +21,6 @@ def get_index(
     num_subquantizers: int,
     bits_per_code: int,
     device: Optional[torch.device] = None,
-    # pyre-ignore[11]
 ) -> Union[faiss.GpuIndexIVFPQ, faiss.IndexIVFPQ]:
     """
     returns a FAISS IVFPQ index, placed on the device passed in
@@ -39,25 +38,19 @@ def get_index(
 
     """
     if device is not None and device.type == "cuda":
-        # pyre-fixme[16]
         res = faiss.StandardGpuResources()
-        # pyre-fixme[16]
         config = faiss.GpuIndexIVFPQConfig()
-        # pyre-ignore[16]
         index = faiss.GpuIndexIVFPQ(
             res,
             embedding_dim,
             num_centroids,
             num_subquantizers,
             bits_per_code,
-            # pyre-fixme[16]
             faiss.METRIC_L2,
             config,
         )
     else:
-        # pyre-fixme[16]
         quantizer = faiss.IndexFlatL2(embedding_dim)
-        # pyre-fixme[16]
         index = faiss.IndexIVFPQ(
             quantizer,
             embedding_dim,
