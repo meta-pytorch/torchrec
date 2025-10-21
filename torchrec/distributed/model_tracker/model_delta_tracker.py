@@ -7,6 +7,7 @@
 
 # pyre-strict
 import logging as logger
+from abc import ABC, abstractmethod
 from collections import Counter, OrderedDict
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -64,10 +65,73 @@ UPDATE_MODE_MAP: Dict[TrackingMode, EmbdUpdateMode] = {
 SUPPORTED_MODULES = (ShardedEmbeddingCollection, ShardedEmbeddingBagCollection)
 
 
-class ModelDeltaTracker:
+class ModelDeltaTracker(ABC):
     r"""
 
-    ModelDeltaTracker provides a way to track and retrieve unique IDs for supported modules, along with optional support
+    Abstract base class for ModelDeltaTracker that provides a way to track and retrieve unique IDs for supported modules,
+    along with optional support for tracking corresponding embeddings or states. This is useful for identifying and
+    retrieving the latest delta or unique rows for a given model, which can help compute topk or to stream updated
+    embeddings from predictors to trainers during online training.
+
+    """
+
+    DEFAULT_CONSUMER: str = "default"
+
+    @abstractmethod
+    def record_lookup(
+        self, emb_module: nn.Module, kjt: KeyedJaggedTensor, states: torch.Tensor
+    ) -> None:
+        """
+        Records the IDs from a given KeyedJaggedTensor and their corresponding embeddings/parameter states.
+
+        Args:
+            emb_module (nn.Module): The embedding module in which the lookup was performed.
+            kjt (KeyedJaggedTensor): The KeyedJaggedTensor containing IDs to record.
+            states (torch.Tensor): The embeddings or states corresponding to the IDs in the kjt.
+        """
+        pass
+
+    @abstractmethod
+    def get_unique_ids(self, consumer: Optional[str] = None) -> Dict[str, torch.Tensor]:
+        """
+        Return a dictionary of hit local IDs for each sparse feature.
+
+        Args:
+            consumer (str, optional): The consumer to retrieve unique IDs for.
+        """
+        pass
+
+    @abstractmethod
+    def get_unique(
+        self,
+        consumer: Optional[str] = None,
+        top_percentage: Optional[float] = 1.0,
+        per_table_percentage: Optional[Dict[str, Tuple[float, str]]] = None,
+        sorted_by_indices: Optional[bool] = True,
+    ) -> Dict[str, DeltaRows]:
+        """
+        Return a dictionary of hit local IDs and parameter states / embeddings for each sparse feature.
+
+        Args:
+            consumer (str, optional): The consumer to retrieve delta values for.
+        """
+        pass
+
+    @abstractmethod
+    def clear(self, consumer: Optional[str] = None) -> None:
+        """
+        Clear tracked IDs for a given consumer.
+
+        Args:
+            consumer (str, optional): The consumer to clear IDs/States for.
+        """
+        pass
+
+
+class ModelDeltaTrackerTrec(ModelDeltaTracker):
+    r"""
+
+    ModelDeltaTrackerTrec provides a way to track and retrieve unique IDs for supported modules, along with optional support
     for tracking corresponding embeddings or states. This is useful for identifying and retrieving the latest delta or
     unique rows for a given model, which can help compute topk or to stream updated embeddings from predictors to trainers during
     online training. Unique IDs or states can be retrieved by calling the get_delta() method.
@@ -84,8 +148,6 @@ class ModelDeltaTracker:
         fqns_to_skip (Iterable[str], optional): list of FQNs to skip tracking. Default: None.
 
     """
-
-    DEFAULT_CONSUMER: str = "default"
 
     def __init__(
         self,
@@ -354,7 +416,7 @@ class ModelDeltaTracker:
 
         return ret
 
-    def get_delta_ids(self, consumer: Optional[str] = None) -> Dict[str, torch.Tensor]:
+    def get_unique_ids(self, consumer: Optional[str] = None) -> Dict[str, torch.Tensor]:
         """
         Return a dictionary of hit local IDs for each sparse feature. Ids are
         first keyed by submodule FQN.
