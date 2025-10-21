@@ -18,6 +18,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops import (
 )
 
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.batched_embedding_kernel import BatchedFusedEmbedding
 
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
@@ -169,12 +170,15 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
         self._fqn_to_feature_map: Dict[str, List[str]] = {}
         self._fqns_to_skip: Iterable[str] = fqns_to_skip
 
+        logger.info(f"Model tracker enabled for {type(model.module)}")
+
         # per_consumer_batch_idx is used to track the batch index for each consumer.
         # This is used to retrieve the delta values for a given consumer as well as
         # start_ids for compaction window.
         self.per_consumer_batch_idx: Dict[str, int] = {
             c: -1 for c in (consumers or [self.DEFAULT_CONSUMER])
         }
+        logger.info(f"Model tracker Consumers: {self.per_consumer_batch_idx}")
         self.curr_batch_idx: int = 0
         self.curr_compact_index: int = 0
 
@@ -401,6 +405,8 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
         for module in self.tracked_modules.values():
             # pyre-fixme[29]:
             for lookup in module._lookups:
+                if isinstance(lookup, DistributedDataParallel):
+                    continue
                 for embs_module in lookup._emb_modules:
                     assert isinstance(
                         embs_module, (BatchedFusedEmbeddingBag, BatchedFusedEmbedding)
@@ -616,18 +622,22 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
             ):
                 # pyre-ignore[29]:
                 for lookup in module._lookups:
-                    assert isinstance(
+                    if isinstance(
                         lookup,
                         (GroupedEmbeddingsLookup, GroupedPooledEmbeddingsLookup),
-                    ) and all(
-                        # TorchRec maps ROWWISE_ADAGRAD to EXACT_ROWWISE_ADAGRAD
-                        # pyre-ignore[16]:
-                        emb._emb_module.optimizer == OptimType.EXACT_ROWWISE_ADAGRAD
-                        # pyre-ignore[16]:
-                        or emb._emb_module.optimizer == OptimType.PARTIAL_ROWWISE_ADAM
-                        for emb in lookup._emb_modules
-                    )
-                    lookup.register_optim_state_tracker_fn(self.record_lookup)
+                    ):
+                        for emb in lookup._emb_modules:
+                            assert (
+                                isinstance(
+                                    emb,
+                                    (BatchedFusedEmbedding, BatchedFusedEmbeddingBag),
+                                )
+                                and emb._emb_module.optimizer
+                                # TorchRec maps ROWWISE_ADAGRAD to EXACT_ROWWISE_ADAGRAD
+                                == OptimType.EXACT_ROWWISE_ADAGRAD
+                                or OptimType.PARTIAL_ROWWISE_ADAM
+                            )
+                            lookup.register_optim_state_tracker_fn(self.record_lookup)
             else:
                 raise NotImplementedError(
                     f"Tracking mode {self._mode} is not supported"
