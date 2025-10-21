@@ -806,8 +806,8 @@ class DeltaStoreTrecTest(unittest.TestCase):
             delta_store.compact(
                 start_idx=test_params.start_idx, end_idx=test_params.end_idx
             )
-            # Verify the result using get_delta method
-            delta_result = delta_store.get_delta()
+            # Verify the result using get_unique method
+            delta_result = delta_store.get_unique()
 
             # compare all fqns in the result
             for table_fqn, delta_rows in test_params.expected_delta.items():

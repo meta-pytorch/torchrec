@@ -125,7 +125,7 @@ class DeltaStore(ABC):
         pass
 
     @abstractmethod
-    def get_delta(self, from_idx: int = 0) -> Dict[str, DeltaRows]:
+    def get_unique(self, from_idx: int = 0) -> Dict[str, DeltaRows]:
         """
         Return all unique/delta ids per table from the Delta Store.
 
@@ -224,7 +224,7 @@ class DeltaStoreTrec(DeltaStore):
             )
         self.per_fqn_lookups = new_per_fqn_lookups
 
-    def get_delta(self, from_idx: int = 0) -> Dict[str, DeltaRows]:
+    def get_unique(self, from_idx: int = 0) -> Dict[str, DeltaRows]:
         r"""
         Return all unique/delta ids per table from the Delta Store.
         """
