@@ -29,36 +29,36 @@ from torchrec.distributed.embedding_lookup import (
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
 from torchrec.distributed.model_tracker.delta_store import DeltaStoreTrec
 from torchrec.distributed.model_tracker.types import (
-    DeltaRows,
-    EmbdUpdateMode,
     TrackingMode,
+    UniqueRows,
+    UpdateMode,
 )
 from torchrec.distributed.utils import none_throws
 
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-UPDATE_MODE_MAP: Dict[TrackingMode, EmbdUpdateMode] = {
+UPDATE_MODE_MAP: Dict[TrackingMode, UpdateMode] = {
     # Only IDs are tracked, no additional state is stored.
-    TrackingMode.ID_ONLY: EmbdUpdateMode.NONE,
-    # TrackingMode.EMBEDDING utilizes EmbdUpdateMode.FIRST to ensure that
+    TrackingMode.ID_ONLY: UpdateMode.NONE,
+    # TrackingMode.EMBEDDING utilizes UpdateMode.FIRST to ensure that
     # the earliest embedding values are stored since the last checkpoint
     # or snapshot. This mode is used for computing topk delta rows, which
     # is currently achieved by running (new_emb - old_emb).norm().topk().
-    TrackingMode.EMBEDDING: EmbdUpdateMode.FIRST,
-    # TrackingMode.MOMENTUM utilizes EmbdUpdateMode.LAST to ensure that
+    TrackingMode.EMBEDDING: UpdateMode.FIRST,
+    # TrackingMode.MOMENTUM utilizes UpdateMode.LAST to ensure that
     # the most recent momentum values—capturing the accumulated gradient
     # direction and magnitude—are stored since the last batch.
     # This mode supports approximate top-k delta-row selection, can be
     # obtained by running momentum.norm().topk().
-    TrackingMode.MOMENTUM_LAST: EmbdUpdateMode.LAST,
+    TrackingMode.MOMENTUM_LAST: UpdateMode.LAST,
     # MOMENTUM_DIFF keeps a running sum of the square of the gradients per row.
     # Within each publishing interval, we track the starting value of this running
     # sum on all used rows and then do a lookup when ``get_delta`` is called to query
     # the latest sum. Then we can compute the delta of the two values and return them
     # together with the row ids.
-    TrackingMode.MOMENTUM_DIFF: EmbdUpdateMode.FIRST,
+    TrackingMode.MOMENTUM_DIFF: UpdateMode.FIRST,
     # The same as MOMENTUM_DIFF. Adding for backward compatibility.
-    TrackingMode.ROWWISE_ADAGRAD: EmbdUpdateMode.FIRST,
+    TrackingMode.ROWWISE_ADAGRAD: UpdateMode.FIRST,
 }
 
 # Tracking is current only supported for ShardedEmbeddingCollection and ShardedEmbeddingBagCollection.
@@ -111,7 +111,7 @@ class ModelDeltaTracker(ABC):
         top_percentage: Optional[float] = 1.0,
         per_table_percentage: Optional[Dict[str, Tuple[float, str]]] = None,
         sorted_by_indices: Optional[bool] = True,
-    ) -> Dict[str, DeltaRows]:
+    ) -> Dict[str, UniqueRows]:
         """
         Return a dictionary of hit local IDs and parameter states / embeddings for each sparse feature.
 
@@ -439,7 +439,7 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
         top_percentage: Optional[float] = 1.0,
         per_table_percentage: Optional[Dict[str, Tuple[float, str]]] = None,
         sorted_by_indices: Optional[bool] = True,
-    ) -> Dict[str, DeltaRows]:
+    ) -> Dict[str, UniqueRows]:
         """
         Return a dictionary of hit local IDs and parameter states / embeddings for each sparse feature. The Values are first keyed by submodule FQN.
 
@@ -471,8 +471,7 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
                 assert (
                     fqn in square_sum_map
                 ), f"{fqn} not found in {square_sum_map.keys()}"
-                # pyre-fixme[58]: `-` is not supported for operand types `Tensor`
-                #  and `Optional[Tensor]`.
+                # pyre-fixme[58]: `-` is not supported for operand types `Tensor` and `Optional[Tensor]`.
                 rows.states = square_sum_map[fqn][rows.ids] - rows.states
 
         return tracker_rows

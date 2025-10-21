@@ -18,9 +18,9 @@ from torchrec.distributed.model_tracker.delta_store import (
     DeltaStoreTrec,
 )
 from torchrec.distributed.model_tracker.types import (
-    DeltaRows,
-    EmbdUpdateMode,
     IndexedLookup,
+    UniqueRows,
+    UpdateMode,
 )
 
 
@@ -214,14 +214,14 @@ class DeltaStoreTrecTest(unittest.TestCase):
         # input parameters
         ids: List[torch.Tensor]
         embeddings: Optional[List[torch.Tensor]]
-        embdUpdateMode: EmbdUpdateMode
+        updateMode: UpdateMode
         # expected output parameters
-        expected_output: DeltaRows
+        expected_output: UniqueRows
         expect_assert: bool
 
     @parameterized.expand(
         [
-            # test cases for EmbdUpdateMode.NONE
+            # test cases for UpdateMode.NONE
             (
                 "unique_ids",
                 ComputeTestParams(
@@ -230,8 +230,8 @@ class DeltaStoreTrecTest(unittest.TestCase):
                         torch.tensor([6, 7, 8, 9, 10]),
                     ],
                     embeddings=None,
-                    embdUpdateMode=EmbdUpdateMode.NONE,
-                    expected_output=DeltaRows(
+                    updateMode=UpdateMode.NONE,
+                    expected_output=UniqueRows(
                         ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
                         states=None,
                     ),
@@ -246,15 +246,15 @@ class DeltaStoreTrecTest(unittest.TestCase):
                         torch.tensor([2, 10, 8, 4, 9, 7]),
                     ],
                     embeddings=None,
-                    embdUpdateMode=EmbdUpdateMode.NONE,
-                    expected_output=DeltaRows(
+                    updateMode=UpdateMode.NONE,
+                    expected_output=UniqueRows(
                         ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
                         states=None,
                     ),
                     expect_assert=False,
                 ),
             ),
-            # test case for EmbdUpdateMode.NONE with embeddings (should assert)
+            # test case for UpdateMode.NONE with embeddings (should assert)
             (
                 "none_mode_with_embeddings",
                 ComputeTestParams(
@@ -266,15 +266,15 @@ class DeltaStoreTrecTest(unittest.TestCase):
                         torch.tensor([[1.0], [2.0], [3.0]]),
                         torch.tensor([[4.0], [5.0], [6.0]]),
                     ],
-                    embdUpdateMode=EmbdUpdateMode.NONE,
-                    expected_output=DeltaRows(
+                    updateMode=UpdateMode.NONE,
+                    expected_output=UniqueRows(
                         ids=torch.tensor([]),
                         states=None,
                     ),
                     expect_assert=True,
                 ),
             ),
-            # test cases for EmbdUpdateMode.FIRST
+            # test cases for UpdateMode.FIRST
             (
                 "first_mode_without_embeddings",
                 ComputeTestParams(
@@ -283,8 +283,8 @@ class DeltaStoreTrecTest(unittest.TestCase):
                         torch.tensor([4, 5, 6]),
                     ],
                     embeddings=None,
-                    embdUpdateMode=EmbdUpdateMode.FIRST,
-                    expected_output=DeltaRows(
+                    updateMode=UpdateMode.FIRST,
+                    expected_output=UniqueRows(
                         ids=torch.tensor([]),
                         states=None,
                     ),
@@ -302,8 +302,8 @@ class DeltaStoreTrecTest(unittest.TestCase):
                         torch.tensor([[1.0], [2.0], [3.0]]),
                         torch.tensor([[4.0], [5.0], [6.0]]),
                     ],
-                    embdUpdateMode=EmbdUpdateMode.FIRST,
-                    expected_output=DeltaRows(
+                    updateMode=UpdateMode.FIRST,
+                    expected_output=UniqueRows(
                         ids=torch.tensor([1, 2, 3, 4, 5, 6]),
                         states=torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]]),
                     ),
@@ -321,8 +321,8 @@ class DeltaStoreTrecTest(unittest.TestCase):
                         torch.tensor([[40.0], [10.0], [30.0], [60.0], [50.0], [20.0]]),
                         torch.tensor([[25.0], [100.0], [80.0], [45.0], [90.0], [70.0]]),
                     ],
-                    embdUpdateMode=EmbdUpdateMode.FIRST,
-                    expected_output=DeltaRows(
+                    updateMode=UpdateMode.FIRST,
+                    expected_output=UniqueRows(
                         ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
                         # First occurrence of each ID is kept
                         states=torch.tensor(
@@ -343,7 +343,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     expect_assert=False,
                 ),
             ),
-            # test cases for EmbdUpdateMode.LAST
+            # test cases for UpdateMode.LAST
             (
                 "last_mode_without_embeddings",
                 ComputeTestParams(
@@ -352,8 +352,8 @@ class DeltaStoreTrecTest(unittest.TestCase):
                         torch.tensor([4, 5, 6]),
                     ],
                     embeddings=None,
-                    embdUpdateMode=EmbdUpdateMode.LAST,
-                    expected_output=DeltaRows(
+                    updateMode=UpdateMode.LAST,
+                    expected_output=UniqueRows(
                         ids=torch.tensor([]),
                         states=None,
                     ),
@@ -371,8 +371,8 @@ class DeltaStoreTrecTest(unittest.TestCase):
                         torch.tensor([[1.0], [2.0], [3.0]]),
                         torch.tensor([[4.0], [5.0], [6.0]]),
                     ],
-                    embdUpdateMode=EmbdUpdateMode.LAST,
-                    expected_output=DeltaRows(
+                    updateMode=UpdateMode.LAST,
+                    expected_output=UniqueRows(
                         ids=torch.tensor([1, 2, 3, 4, 5, 6]),
                         states=torch.tensor([[1.0], [2.0], [3.0], [4.0], [5.0], [6.0]]),
                     ),
@@ -390,8 +390,8 @@ class DeltaStoreTrecTest(unittest.TestCase):
                         torch.tensor([[40.0], [10.0], [30.0], [60.0], [50.0], [20.0]]),
                         torch.tensor([[25.0], [100.0], [80.0], [45.0], [90.0], [70.0]]),
                     ],
-                    embdUpdateMode=EmbdUpdateMode.LAST,
-                    expected_output=DeltaRows(
+                    updateMode=UpdateMode.LAST,
+                    expected_output=UniqueRows(
                         ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]),
                         # Last occurrence of each ID is kept
                         states=torch.tensor(
@@ -421,12 +421,12 @@ class DeltaStoreTrecTest(unittest.TestCase):
             # If we expect an assertion error, check that it's raised
             with self.assertRaises(AssertionError):
                 _compute_unique_rows(
-                    test_params.ids, test_params.embeddings, test_params.embdUpdateMode
+                    test_params.ids, test_params.embeddings, test_params.updateMode
                 )
         else:
             # Otherwise, proceed with the normal test
             result = _compute_unique_rows(
-                test_params.ids, test_params.embeddings, test_params.embdUpdateMode
+                test_params.ids, test_params.embeddings, test_params.updateMode
             )
 
             self.assertTrue(torch.equal(result.ids, test_params.expected_output.ids))
@@ -444,21 +444,21 @@ class DeltaStoreTrecTest(unittest.TestCase):
     @dataclass
     class CompactTestParams:
         # input parameters
-        embdUpdateMode: EmbdUpdateMode
+        updateMode: UpdateMode
         table_fqn_to_lookups: Dict[str, List[IndexedLookup]]
         start_idx: int
         end_idx: int
         # expected output parameters
-        expected_delta: Dict[str, DeltaRows]
+        expected_delta: Dict[str, UniqueRows]
         expect_assert: bool = False
 
     @parameterized.expand(
         [
-            # Test case for compaction with EmbdUpdateMode.NONE
+            # Test case for compaction with UpdateMode.NONE
             (
                 "empty_lookups",
                 CompactTestParams(
-                    embdUpdateMode=EmbdUpdateMode.NONE,
+                    updateMode=UpdateMode.NONE,
                     table_fqn_to_lookups={},
                     start_idx=1,
                     end_idx=5,
@@ -468,7 +468,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
             (
                 "single_lookup_no_compaction",
                 CompactTestParams(
-                    embdUpdateMode=EmbdUpdateMode.NONE,
+                    updateMode=UpdateMode.NONE,
                     table_fqn_to_lookups={
                         "table_fqn_1": [
                             IndexedLookup(
@@ -481,7 +481,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     start_idx=1,
                     end_idx=5,
                     expected_delta={
-                        "table_fqn_1": DeltaRows(
+                        "table_fqn_1": UniqueRows(
                             ids=torch.tensor([1, 2, 3]),
                             states=None,
                         ),
@@ -491,7 +491,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
             (
                 "multi_lookup_all_unique",
                 CompactTestParams(
-                    embdUpdateMode=EmbdUpdateMode.NONE,
+                    updateMode=UpdateMode.NONE,
                     table_fqn_to_lookups={
                         "table_fqn_1": [
                             IndexedLookup(
@@ -514,7 +514,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     start_idx=1,
                     end_idx=3,
                     expected_delta={
-                        "table_fqn_1": DeltaRows(
+                        "table_fqn_1": UniqueRows(
                             ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9]),
                             states=None,
                         ),
@@ -524,7 +524,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
             (
                 "multi_lookup_with_duplicates",
                 CompactTestParams(
-                    embdUpdateMode=EmbdUpdateMode.NONE,
+                    updateMode=UpdateMode.NONE,
                     table_fqn_to_lookups={
                         "table_fqn_1": [
                             IndexedLookup(
@@ -552,18 +552,18 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     start_idx=1,
                     end_idx=4,
                     expected_delta={
-                        "table_fqn_1": DeltaRows(
+                        "table_fqn_1": UniqueRows(
                             ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9]),
                             states=None,
                         ),
                     },
                 ),
             ),
-            # Test case for compaction with EmbdUpdateMode.FIRST
+            # Test case for compaction with UpdateMode.FIRST
             (
                 "multi_lookup_with_duplicates_first_mode",
                 CompactTestParams(
-                    embdUpdateMode=EmbdUpdateMode.FIRST,
+                    updateMode=UpdateMode.FIRST,
                     table_fqn_to_lookups={
                         "table_fqn_1": [
                             IndexedLookup(
@@ -591,7 +591,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     start_idx=1,
                     end_idx=4,
                     expected_delta={
-                        "table_fqn_1": DeltaRows(
+                        "table_fqn_1": UniqueRows(
                             ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9]),
                             states=torch.tensor(
                                 [
@@ -613,7 +613,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
             (
                 "multiple_tables_first_mode",
                 CompactTestParams(
-                    embdUpdateMode=EmbdUpdateMode.FIRST,
+                    updateMode=UpdateMode.FIRST,
                     table_fqn_to_lookups={
                         "table_fqn_1": [
                             IndexedLookup(
@@ -643,13 +643,13 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     start_idx=1,
                     end_idx=3,
                     expected_delta={
-                        "table_fqn_1": DeltaRows(
+                        "table_fqn_1": UniqueRows(
                             ids=torch.tensor([1, 2, 3, 4, 5]),
                             states=torch.tensor(
                                 [[10.0], [20.0], [30.0], [40.0], [50.0]]
                             ),
                         ),
-                        "table_fqn_2": DeltaRows(
+                        "table_fqn_2": UniqueRows(
                             ids=torch.tensor([10, 20, 30, 40, 50]),
                             states=torch.tensor(
                                 [[100.0], [200.0], [300.0], [400.0], [500.0]]
@@ -658,11 +658,11 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     },
                 ),
             ),
-            # Test case for compaction with EmbdUpdateMode.LAST
+            # Test case for compaction with UpdateMode.LAST
             (
                 "multi_lookup_with_duplicates_last_mode",
                 CompactTestParams(
-                    embdUpdateMode=EmbdUpdateMode.LAST,
+                    updateMode=UpdateMode.LAST,
                     table_fqn_to_lookups={
                         "table_fqn_1": [
                             IndexedLookup(
@@ -690,7 +690,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     start_idx=1,
                     end_idx=4,
                     expected_delta={
-                        "table_fqn_1": DeltaRows(
+                        "table_fqn_1": UniqueRows(
                             ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9]),
                             states=torch.tensor(
                                 [
@@ -712,7 +712,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
             (
                 "multiple_tables_last_mode",
                 CompactTestParams(
-                    embdUpdateMode=EmbdUpdateMode.LAST,
+                    updateMode=UpdateMode.LAST,
                     table_fqn_to_lookups={
                         "table_fqn_1": [
                             IndexedLookup(
@@ -742,13 +742,13 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     start_idx=1,
                     end_idx=3,
                     expected_delta={
-                        "table_fqn_1": DeltaRows(
+                        "table_fqn_1": UniqueRows(
                             ids=torch.tensor([1, 2, 3, 4, 5]),
                             states=torch.tensor(
                                 [[10.0], [20.0], [35.0], [40.0], [50.0]]
                             ),
                         ),
-                        "table_fqn_2": DeltaRows(
+                        "table_fqn_2": UniqueRows(
                             ids=torch.tensor([10, 20, 30, 40, 50]),
                             states=torch.tensor(
                                 [[100.0], [200.0], [350.0], [400.0], [500.0]]
@@ -761,7 +761,7 @@ class DeltaStoreTrecTest(unittest.TestCase):
             (
                 "invalid_indices",
                 CompactTestParams(
-                    embdUpdateMode=EmbdUpdateMode.NONE,
+                    updateMode=UpdateMode.NONE,
                     table_fqn_to_lookups={
                         "table_fqn_1": [
                             IndexedLookup(
@@ -783,8 +783,8 @@ class DeltaStoreTrecTest(unittest.TestCase):
         """
         Test the compact method of DeltaStore.
         """
-        # Create a DeltaStoreTrec with the specified embdUpdateMode
-        delta_store = DeltaStoreTrec(embdUpdateMode=test_params.embdUpdateMode)
+        # Create a DeltaStoreTrec with the specified updateMode
+        delta_store = DeltaStoreTrec(updateMode=test_params.updateMode)
 
         # Populate the DeltaStore with the test lookups
         for table_fqn, lookup_list in test_params.table_fqn_to_lookups.items():

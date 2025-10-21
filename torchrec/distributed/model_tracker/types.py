@@ -23,13 +23,14 @@ class IndexedLookup:
     batch_idx: int
     ids: torch.Tensor
     states: Optional[torch.Tensor]
+    compact: bool = False
 
 
 @dataclass
-class DeltaRows:
+class UniqueRows:
     r"""
     Data class as an interface for returning and storing compacted ids and embeddings or optimizer states.
-    compact(List[IndexedLookup]) -> DeltaRows
+    compact(List[IndexedLookup]) -> UniqueRows
     """
 
     ids: torch.Tensor
@@ -58,7 +59,7 @@ class TrackingMode(Enum):
     ROWWISE_ADAGRAD = "rowwise_adagrad"
 
 
-class EmbdUpdateMode(Enum):
+class UpdateMode(Enum):
     r"""
     To identify which embedding value to store while tracking.
 

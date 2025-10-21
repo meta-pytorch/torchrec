@@ -27,9 +27,9 @@ from torchrec.distributed.model_tracker.model_delta_tracker import (
     SUPPORTED_MODULES,  # noqa
 )
 from torchrec.distributed.model_tracker.types import (
-    DeltaRows,  # noqa
-    EmbdUpdateMode,  # noqa
     IndexedLookup,  # noqa
     ModelTrackerConfig,  # noqa
     TrackingMode,  # noqa
+    UniqueRows,  # noqa
+    UpdateMode,  # noqa
 )
