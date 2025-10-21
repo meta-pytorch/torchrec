@@ -47,11 +47,15 @@ class TrackingMode(Enum):
                     with increased memory usage.
         MOMENTUM_LAST:  Tracks both row IDs and their corresponding momentum values. This mode
                         supports approximate top-k delta-row selection.
+        MOMENTUM_DIFF: Tracks both row IDs and their corresponding momentum difference values.
+        ROWWISE_ADAGRAD: Tracks both row IDs and their corresponding rowwise adagrad states.
     """
 
     ID_ONLY = "id_only"
     EMBEDDING = "embedding"
     MOMENTUM_LAST = "momentum_last"
+    MOMENTUM_DIFF = "momentum_diff"
+    ROWWISE_ADAGRAD = "rowwise_adagrad"
 
 
 class EmbdUpdateMode(Enum):
