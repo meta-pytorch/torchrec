@@ -15,7 +15,7 @@ import torch
 from parameterized import parameterized
 from torchrec.distributed.model_tracker.delta_store import (
     _compute_unique_rows,
-    DeltaStore,
+    DeltaStoreTrec,
 )
 from torchrec.distributed.model_tracker.types import (
     DeltaRows,
@@ -24,7 +24,7 @@ from torchrec.distributed.model_tracker.types import (
 )
 
 
-class DeltaStoreTest(unittest.TestCase):
+class DeltaStoreTrecTest(unittest.TestCase):
     # pyre-fixme[2]: Parameter must be annotated.
     def __init__(self, methodName="runTest") -> None:
         super().__init__(methodName)
@@ -188,12 +188,12 @@ class DeltaStoreTest(unittest.TestCase):
     def test_append_and_delete(
         self, _test_name: str, test_params: AppendDeleteTestParams
     ) -> None:
-        delta_store = DeltaStore()
+        delta_store = DeltaStoreTrec()
         for table_fqn, lookup_list in test_params.table_fqn_to_lookups.items():
             for lookup in lookup_list:
                 delta_store.append(
                     batch_idx=lookup.batch_idx,
-                    table_fqn=table_fqn,
+                    fqn=table_fqn,
                     ids=lookup.ids,
                     states=lookup.states,
                 )
@@ -783,15 +783,15 @@ class DeltaStoreTest(unittest.TestCase):
         """
         Test the compact method of DeltaStore.
         """
-        # Create a DeltaStore with the specified embdUpdateMode
-        delta_store = DeltaStore(embdUpdateMode=test_params.embdUpdateMode)
+        # Create a DeltaStoreTrec with the specified embdUpdateMode
+        delta_store = DeltaStoreTrec(embdUpdateMode=test_params.embdUpdateMode)
 
         # Populate the DeltaStore with the test lookups
         for table_fqn, lookup_list in test_params.table_fqn_to_lookups.items():
             for lookup in lookup_list:
                 delta_store.append(
                     batch_idx=lookup.batch_idx,
-                    table_fqn=table_fqn,
+                    fqn=table_fqn,
                     ids=lookup.ids,
                     states=lookup.states,
                 )
