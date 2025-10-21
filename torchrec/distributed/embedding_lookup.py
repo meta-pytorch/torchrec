@@ -10,7 +10,7 @@
 import logging
 from abc import ABC
 from collections import OrderedDict
-from typing import Any, cast, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -208,6 +208,10 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
         )
 
         self.grouped_configs = grouped_configs
+        # Model tracker function to tracker optimizer state
+        self.optim_state_tracker_fn: Optional[
+            Callable[[nn.Module, KeyedJaggedTensor, torch.Tensor], None]
+        ] = None
 
     def _create_embedding_kernel(
         self,
@@ -315,7 +319,13 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
             self._feature_splits,
         )
         for emb_op, features in zip(self._emb_modules, features_by_group):
-            embeddings.append(emb_op(features).view(-1))
+            lookup = emb_op(features).view(-1)
+            embeddings.append(lookup)
+
+            # Model tracker optimizer state function, will only be set called
+            # when model tracker is configured to track optimizer state
+            if self.optim_state_tracker_fn is not None:
+                self.optim_state_tracker_fn(emb_op, features, lookup)
 
         return embeddings_cat_empty_rank_handle(embeddings, self._dummy_embs_tensor)
 
@@ -420,6 +430,19 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
             # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             emb_module.purge()
 
+    def register_optim_state_tracker_fn(
+        self,
+        record_fn: Callable[[nn.Module, KeyedJaggedTensor, torch.Tensor], None],
+    ) -> None:
+        """
+        Model tracker function to tracker optimizer state
+
+         Args:
+             record_fn (Callable[[nn.Module, KeyedJaggedTensor, torch.Tensor], None]): A custom record function to be called after lookup is done.
+
+        """
+        self.optim_state_tracker_fn = record_fn
+
 
 class GroupedEmbeddingsUpdate(BaseEmbeddingUpdate[KeyedJaggedTensor]):
     """
@@ -519,6 +542,10 @@ class GroupedPooledEmbeddingsLookup(
             if scale_weight_gradients and get_gradient_division()
             else 1
         )
+        # Model tracker function to tracker optimizer state
+        self.optim_state_tracker_fn: Optional[
+            Callable[[nn.Module, KeyedJaggedTensor, torch.Tensor], None]
+        ] = None
 
     def _create_embedding_kernel(
         self,
@@ -678,7 +705,12 @@ class GroupedPooledEmbeddingsLookup(
                         features._weights, self._scale_gradient_factor
                     )
 
-                embeddings.append(emb_op(features))
+                lookup = emb_op(features)
+                embeddings.append(lookup)
+                # Model tracker optimizer state function, will only be set called
+                # when model tracker is configured to track optimizer state
+                if self.optim_state_tracker_fn is not None:
+                    self.optim_state_tracker_fn(emb_op, features, lookup)
 
                 if features.variable_stride_per_key() and len(self._emb_modules) > 1:
                     stride_per_rank_per_key = list(
@@ -810,6 +842,19 @@ class GroupedPooledEmbeddingsLookup(
         for emb_module in self._emb_modules:
             # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             emb_module.purge()
+
+    def register_optim_state_tracker_fn(
+        self,
+        record_fn: Callable[[nn.Module, KeyedJaggedTensor, torch.Tensor], None],
+    ) -> None:
+        """
+        Model tracker function to tracker optimizer state
+
+         Args:
+             record_fn (Callable[[nn.Module, KeyedJaggedTensor, torch.Tensor], None]): A custom record function to be called after lookup is done.
+
+        """
+        self.optim_state_tracker_fn = record_fn
 
 
 class MetaInferGroupedEmbeddingsLookup(
