@@ -240,6 +240,9 @@ class FeatureScoreBasedEvictionPolicy(VirtualTableEvictionPolicy):
         None  # 0 means no eviction
     )
     inference_eviction_ttl_mins: Optional[int] = None  # 0 means no eviction
+    feature_score_mapping: Optional[Dict[str, float]] = None  # feature score mapping
+    feature_score_default_value: Optional[float] = None  # default feature score value
+    enable_auto_feature_score_collection: bool = False
 
     def __post_init__(self) -> None:
         if self.inference_eviction_feature_score_threshold is None:
@@ -248,6 +251,19 @@ class FeatureScoreBasedEvictionPolicy(VirtualTableEvictionPolicy):
             self.inference_eviction_ttl_mins = self.eviction_ttl_mins
         if self.max_inference_id_num_per_rank == 0:
             self.max_inference_id_num_per_rank = self.training_id_keep_count
+        if self.enable_auto_feature_score_collection:
+            if self.feature_score_mapping is None:
+                self.feature_score_mapping = {}
+
+
+@dataclass
+class FeatureScoreMapping:
+    """
+    Feature score mapping for virtual table.
+    """
+
+    feature_score_mapping: Dict[str, float] = field(default_factory=dict)
+    eviction_enabled: bool = False
 
 
 @dataclass
