@@ -7,6 +7,7 @@
 
 
 # pyre-strict
+from abc import ABC, abstractmethod
 from bisect import bisect_left
 from typing import Dict, List, Optional
 
@@ -67,34 +68,106 @@ def _compute_unique_rows(
         return DeltaRows(ids=unique_ids, states=unique_states)
 
 
-class DeltaStore:
+class DeltaStore(ABC):
     """
-    DeltaStore is a helper class that stores and manages local delta (row) updates for embeddings/states across
-    various batches during training, designed to be used with TorchRecs ModelDeltaTracker.
+    DeltaStore is an abstract base class that defines the interface for storing and managing
+    local delta (row) updates for embeddings/states across various batches during training.
+
+    Implementations should maintain a representation of requested ids and embeddings/states,
+    providing a way to compact and get delta updates for each embedding table.
+
+    The class supports different embedding update modes (NONE, FIRST, LAST) to determine
+    how to handle duplicate ids when compacting or retrieving embeddings.
+    """
+
+    @abstractmethod
+    def __init__(self, embdUpdateMode: EmbdUpdateMode = EmbdUpdateMode.NONE) -> None:
+        pass
+
+    @abstractmethod
+    def append(
+        self,
+        batch_idx: int,
+        fqn: str,
+        ids: torch.Tensor,
+        states: Optional[torch.Tensor],
+    ) -> None:
+        """
+        Append a batch of ids and states to the store for a specific table.
+
+        Args:
+            batch_idx: The batch index
+            table_fqn: The fully qualified name of the table
+            ids: The tensor of ids to append
+            states: Optional tensor of states to append
+        """
+        pass
+
+    @abstractmethod
+    def delete(self, up_to_idx: Optional[int] = None) -> None:
+        """
+        Delete all idx from the store up to `up_to_idx`
+
+        Args:
+            up_to_idx: Optional index up to which to delete lookups
+        """
+        pass
+
+    @abstractmethod
+    def compact(self, start_idx: int, end_idx: int) -> None:
+        """
+        Compact (ids, embeddings) in batch index range from start_idx to end_idx.
+
+        Args:
+            start_idx: The starting batch index
+            end_idx: The ending batch index
+        """
+        pass
+
+    @abstractmethod
+    def get_delta(self, from_idx: int = 0) -> Dict[str, DeltaRows]:
+        """
+        Return all unique/delta ids per table from the Delta Store.
+
+        Args:
+            from_idx: The batch index from which to get deltas
+
+        Returns:
+            A dictionary mapping table FQNs to their delta rows
+        """
+        pass
+
+
+class DeltaStoreTrec(DeltaStore):
+    """
+    DeltaStoreTrec is a concrete implementation of DeltaStore that stores and manages
+    local delta (row) updates for embeddings/states across various batches during training,
+    designed to be used with TorchRecs ModelDeltaTracker.
+
     It maintains a CUDA in-memory representation of requested ids and embeddings/states,
     providing a way to compact and get delta updates for each embedding table.
 
     The class supports different embedding update modes (NONE, FIRST, LAST) to determine
     how to handle duplicate ids when compacting or retrieving embeddings.
-
     """
 
     def __init__(self, embdUpdateMode: EmbdUpdateMode = EmbdUpdateMode.NONE) -> None:
+        super().__init__(embdUpdateMode)
         self.embdUpdateMode = embdUpdateMode
         self.per_fqn_lookups: Dict[str, List[IndexedLookup]] = {}
 
     def append(
         self,
         batch_idx: int,
-        table_fqn: str,
+        fqn: str,
         ids: torch.Tensor,
         states: Optional[torch.Tensor],
     ) -> None:
-        table_fqn_lookup = self.per_fqn_lookups.get(table_fqn, [])
+        table_fqn_lookup = self.per_fqn_lookups.get(fqn, [])
         table_fqn_lookup.append(
             IndexedLookup(batch_idx=batch_idx, ids=ids, states=states)
         )
-        self.per_fqn_lookups[table_fqn] = table_fqn_lookup
+        self.per_fqn_lookups[fqn] = table_fqn_lookup
 
     def delete(self, up_to_idx: Optional[int] = None) -> None:
         """
