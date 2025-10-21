@@ -26,7 +26,7 @@ from torchrec.distributed.embedding_lookup import (
     GroupedPooledEmbeddingsLookup,
 )
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
-from torchrec.distributed.model_tracker.delta_store import DeltaStore
+from torchrec.distributed.model_tracker.delta_store import DeltaStoreTrec
 from torchrec.distributed.model_tracker.types import (
     DeltaRows,
     EmbdUpdateMode,
@@ -122,7 +122,7 @@ class ModelDeltaTracker:
         # Validate is the mode is supported for the given module and initialize tracker functions
         self._validate_and_init_tracker_fns()
 
-        self.store: DeltaStore = DeltaStore(UPDATE_MODE_MAP[self._mode])
+        self.store: DeltaStoreTrec = DeltaStoreTrec(UPDATE_MODE_MAP[self._mode])
 
         # Mapping feature name to corresponding FQNs. This is used for retrieving
         # the FQN associated with a given feature name in record_lookup().
@@ -222,7 +222,7 @@ class ModelDeltaTracker:
         for table_fqn, ids_list in per_table_ids.items():
             self.store.append(
                 batch_idx=self.curr_batch_idx,
-                table_fqn=table_fqn,
+                fqn=table_fqn,
                 ids=torch.cat(ids_list),
                 states=None,
             )
@@ -262,7 +262,7 @@ class ModelDeltaTracker:
         for table_fqn, ids_list in per_table_ids.items():
             self.store.append(
                 batch_idx=self.curr_batch_idx,
-                table_fqn=table_fqn,
+                fqn=table_fqn,
                 ids=torch.cat(ids_list),
                 states=torch.cat(per_table_emb[table_fqn]),
             )
@@ -295,7 +295,7 @@ class ModelDeltaTracker:
             per_key_states = states[offsets[i] : offsets[i + 1]]
             self.store.append(
                 batch_idx=self.curr_batch_idx,
-                table_fqn=fqn,
+                fqn=fqn,
                 ids=kjt[key].values(),
                 states=per_key_states,
             )
@@ -323,7 +323,7 @@ class ModelDeltaTracker:
             per_key_states = states[offsets[i] : offsets[i + 1]]
             self.store.append(
                 batch_idx=self.curr_batch_idx,
-                table_fqn=fqn,
+                fqn=fqn,
                 ids=kjt[key].values(),
                 states=per_key_states,
             )
