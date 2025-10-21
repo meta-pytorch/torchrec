@@ -475,15 +475,15 @@ registered hooks while the latter silently ignores them.</p>
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="torchrec.distributed.model_parallel.DistributedModelParallel.get_delta">
-<span class="sig-name descname"><span class="pre">get_delta</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">consumer</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Optional</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">DeltaRows</span><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#torchrec.distributed.model_parallel.DistributedModelParallel.get_delta" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns the delta rows for the given consumer.</p>
+<dt class="sig sig-object py" id="torchrec.distributed.model_parallel.DistributedModelParallel.get_model_tracker">
+<span class="sig-name descname"><span class="pre">get_model_tracker</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">ModelDeltaTrackerTrec</span></span></span><a class="headerlink" href="#torchrec.distributed.model_parallel.DistributedModelParallel.get_model_tracker" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the model tracker if it exists.</p>
 </dd></dl>
 
 <dl class="py method">
-<dt class="sig sig-object py" id="torchrec.distributed.model_parallel.DistributedModelParallel.get_model_tracker">
-<span class="sig-name descname"><span class="pre">get_model_tracker</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">ModelDeltaTracker</span></span></span><a class="headerlink" href="#torchrec.distributed.model_parallel.DistributedModelParallel.get_model_tracker" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns the model tracker if it exists.</p>
+<dt class="sig sig-object py" id="torchrec.distributed.model_parallel.DistributedModelParallel.get_unique">
+<span class="sig-name descname"><span class="pre">get_unique</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">consumer</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Optional</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">UniqueRows</span><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#torchrec.distributed.model_parallel.DistributedModelParallel.get_unique" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the delta rows for the given consumer.</p>
 </dd></dl>
 
 <dl class="py method">
@@ -491,6 +491,12 @@ registered hooks while the latter silently ignores them.</p>
 <span class="sig-name descname"><span class="pre">init_data_parallel</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">None</span></span></span><a class="headerlink" href="#torchrec.distributed.model_parallel.DistributedModelParallel.init_data_parallel" title="Permalink to this definition">¶</a></dt>
 <dd><p>See init_data_parallel c-tor argument for usage.
 It’s safe to call this method multiple times.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="torchrec.distributed.model_parallel.DistributedModelParallel.init_torchrec_delta_tracker">
+<span class="sig-name descname"><span class="pre">init_torchrec_delta_tracker</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model_tracker_config</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">ModelTrackerConfig</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">ModelDeltaTrackerTrec</span></span></span><a class="headerlink" href="#torchrec.distributed.model_parallel.DistributedModelParallel.init_torchrec_delta_tracker" title="Permalink to this definition">¶</a></dt>
+<dd><p>Initializes the model delta tracker if it doesn’t exists.</p>
 </dd></dl>
 
 <dl class="py method">
