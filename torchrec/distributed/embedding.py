@@ -1587,7 +1587,7 @@ class ShardedEmbeddingCollection(
             ):
                 embs = lookup(features)
                 if self.post_lookup_tracker_fn is not None:
-                    self.post_lookup_tracker_fn(features, embs)
+                    self.post_lookup_tracker_fn(features, embs, self)
 
             with maybe_annotate_embedding_event(
                 EmbeddingEvent.OUTPUT_DIST, self._module_fqn, sharding_type

@@ -23,13 +23,14 @@ class IndexedLookup:
     batch_idx: int
     ids: torch.Tensor
     states: Optional[torch.Tensor]
+    compact: bool = False
 
 
 @dataclass
-class DeltaRows:
+class UniqueRows:
     r"""
     Data class as an interface for returning and storing compacted ids and embeddings or optimizer states.
-    compact(List[IndexedLookup]) -> DeltaRows
+    compact(List[IndexedLookup]) -> UniqueRows
     """
 
     ids: torch.Tensor
@@ -41,16 +42,24 @@ class TrackingMode(Enum):
     Tracking mode for ``ModelDeltaTracker``.
 
     Enums:
-        ID_ONLY: Tracks row IDs only, providing a lightweight option for monitoring.
-        EMBEDDING: Tracks both row IDs and their corresponding embedding values,
-            enabling precise top-k result calculations. However, this option comes with increased memory usage.
+        ID_ONLY:    Tracks row IDs only, providing a lightweight option for monitoring.
+        EMBEDDING:  Tracks both row IDs and their corresponding embedding values,
+                    enabling precise top-k result calculations. However, this option comes
+                    with increased memory usage.
+        MOMENTUM_LAST:  Tracks both row IDs and their corresponding momentum values. This mode
+                        supports approximate top-k delta-row selection.
+        MOMENTUM_DIFF: Tracks both row IDs and their corresponding momentum difference values.
+        ROWWISE_ADAGRAD: Tracks both row IDs and their corresponding rowwise adagrad states.
     """
 
     ID_ONLY = "id_only"
     EMBEDDING = "embedding"
+    MOMENTUM_LAST = "momentum_last"
+    MOMENTUM_DIFF = "momentum_diff"
+    ROWWISE_ADAGRAD = "rowwise_adagrad"
 
 
-class EmbdUpdateMode(Enum):
+class UpdateMode(Enum):
     r"""
     To identify which embedding value to store while tracking.
 

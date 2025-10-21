@@ -7,14 +7,15 @@
 
 
 # pyre-strict
+from abc import ABC, abstractmethod
 from bisect import bisect_left
 from typing import Dict, List, Optional
 
 import torch
 from torchrec.distributed.model_tracker.types import (
-    DeltaRows,
-    EmbdUpdateMode,
     IndexedLookup,
+    UniqueRows,
+    UpdateMode,
 )
 from torchrec.distributed.utils import none_throws
 
@@ -22,24 +23,24 @@ from torchrec.distributed.utils import none_throws
 def _compute_unique_rows(
     ids: List[torch.Tensor],
     states: Optional[List[torch.Tensor]],
-    mode: EmbdUpdateMode,
-) -> DeltaRows:
+    mode: UpdateMode,
+) -> UniqueRows:
     r"""
     To calculate unique ids and embeddings
     """
-    if mode == EmbdUpdateMode.NONE:
-        assert states is None, f"{mode=} == EmbdUpdateMode.NONE but received embeddings"
+    if mode == UpdateMode.NONE:
+        assert states is None, f"{mode=} == UpdateMode.NONE but received embeddings"
         unique_ids = torch.cat(ids).unique(return_inverse=False)
-        return DeltaRows(ids=unique_ids, states=None)
+        return UniqueRows(ids=unique_ids, states=None)
     else:
         assert (
             states is not None
-        ), f"{mode=} != EmbdUpdateMode.NONE but received no embeddings"
+        ), f"{mode=} != UpdateMode.NONE but received no embeddings"
 
         cat_ids = torch.cat(ids)
         cat_states = torch.cat(states)
 
-        if mode == EmbdUpdateMode.LAST:
+        if mode == UpdateMode.LAST:
             cat_ids = cat_ids.flip(dims=[0])
             cat_states = cat_states.flip(dims=[0])
 
@@ -64,37 +65,109 @@ def _compute_unique_rows(
 
         # Use first occurrence indices to select corresponding embedding row.
         unique_states = cat_states[first_occurrence]
-        return DeltaRows(ids=unique_ids, states=unique_states)
+        return UniqueRows(ids=unique_ids, states=unique_states)
 
 
-class DeltaStore:
+class DeltaStore(ABC):
     """
-    DeltaStore is a helper class that stores and manages local delta (row) updates for embeddings/states across
-    various batches during training, designed to be used with TorchRecs ModelDeltaTracker.
+    DeltaStore is an abstract base class that defines the interface for storing and managing
+    local delta (row) updates for embeddings/states across various batches during training.
+
+    Implementations should maintain a representation of requested ids and embeddings/states,
+    providing a way to compact and get delta updates for each embedding table.
+
+    The class supports different embedding update modes (NONE, FIRST, LAST) to determine
+    how to handle duplicate ids when compacting or retrieving embeddings.
+    """
+
+    @abstractmethod
+    def __init__(self, updateMode: UpdateMode = UpdateMode.NONE) -> None:
+        pass
+
+    @abstractmethod
+    def append(
+        self,
+        batch_idx: int,
+        fqn: str,
+        ids: torch.Tensor,
+        states: Optional[torch.Tensor],
+    ) -> None:
+        """
+        Append a batch of ids and states to the store for a specific table.
+
+        Args:
+            batch_idx: The batch index
+            table_fqn: The fully qualified name of the table
+            ids: The tensor of ids to append
+            states: Optional tensor of states to append
+        """
+        pass
+
+    @abstractmethod
+    def delete(self, up_to_idx: Optional[int] = None) -> None:
+        """
+        Delete all idx from the store up to `up_to_idx`
+
+        Args:
+            up_to_idx: Optional index up to which to delete lookups
+        """
+        pass
+
+    @abstractmethod
+    def compact(self, start_idx: int, end_idx: int) -> None:
+        """
+        Compact (ids, embeddings) in batch index range from start_idx to end_idx.
+
+        Args:
+            start_idx: The starting batch index
+            end_idx: The ending batch index
+        """
+        pass
+
+    @abstractmethod
+    def get_unique(self, from_idx: int = 0) -> Dict[str, UniqueRows]:
+        """
+        Return all unique/delta ids per table from the Delta Store.
+
+        Args:
+            from_idx: The batch index from which to get deltas
+
+        Returns:
+            A dictionary mapping table FQNs to their delta rows
+        """
+        pass
+
+
+class DeltaStoreTrec(DeltaStore):
+    """
+    DeltaStoreTrec is a concrete implementation of DeltaStore that stores and manages
+    local delta (row) updates for embeddings/states across various batches during training,
+    designed to be used with TorchRecs ModelDeltaTracker.
+
     It maintains a CUDA in-memory representation of requested ids and embeddings/states,
     providing a way to compact and get delta updates for each embedding table.
 
     The class supports different embedding update modes (NONE, FIRST, LAST) to determine
     how to handle duplicate ids when compacting or retrieving embeddings.
-
     """
 
-    def __init__(self, embdUpdateMode: EmbdUpdateMode = EmbdUpdateMode.NONE) -> None:
-        self.embdUpdateMode = embdUpdateMode
+    def __init__(self, updateMode: UpdateMode = UpdateMode.NONE) -> None:
+        super().__init__(updateMode)
+        self.updateMode = updateMode
         self.per_fqn_lookups: Dict[str, List[IndexedLookup]] = {}
 
     def append(
         self,
         batch_idx: int,
-        table_fqn: str,
+        fqn: str,
         ids: torch.Tensor,
         states: Optional[torch.Tensor],
     ) -> None:
-        table_fqn_lookup = self.per_fqn_lookups.get(table_fqn, [])
+        table_fqn_lookup = self.per_fqn_lookups.get(fqn, [])
         table_fqn_lookup.append(
             IndexedLookup(batch_idx=batch_idx, ids=ids, states=states)
         )
-        self.per_fqn_lookups[table_fqn] = table_fqn_lookup
+        self.per_fqn_lookups[fqn] = table_fqn_lookup
 
     def delete(self, up_to_idx: Optional[int] = None) -> None:
         """
@@ -132,11 +205,11 @@ class DeltaStore:
             ids = [lookup.ids for lookup in lookups_to_compact]
             states = (
                 [none_throws(lookup.states) for lookup in lookups_to_compact]
-                if self.embdUpdateMode != EmbdUpdateMode.NONE
+                if self.updateMode != UpdateMode.NONE
                 else None
             )
             delta_rows = _compute_unique_rows(
-                ids=ids, states=states, mode=self.embdUpdateMode
+                ids=ids, states=states, mode=self.updateMode
             )
             new_per_fqn_lookups[table_fqn] = (
                 lookups[:index_l]
@@ -151,12 +224,12 @@ class DeltaStore:
             )
         self.per_fqn_lookups = new_per_fqn_lookups
 
-    def get_delta(self, from_idx: int = 0) -> Dict[str, DeltaRows]:
+    def get_unique(self, from_idx: int = 0) -> Dict[str, UniqueRows]:
         r"""
         Return all unique/delta ids per table from the Delta Store.
         """
 
-        delta_per_table_fqn: Dict[str, DeltaRows] = {}
+        delta_per_table_fqn: Dict[str, UniqueRows] = {}
         for table_fqn, lookups in self.per_fqn_lookups.items():
             compact_ids = [
                 lookup.ids for lookup in lookups if lookup.batch_idx >= from_idx
@@ -167,11 +240,11 @@ class DeltaStore:
                     for lookup in lookups
                     if lookup.batch_idx >= from_idx
                 ]
-                if self.embdUpdateMode != EmbdUpdateMode.NONE
+                if self.updateMode != UpdateMode.NONE
                 else None
             )
 
             delta_per_table_fqn[table_fqn] = _compute_unique_rows(
-                ids=compact_ids, states=compact_states, mode=self.embdUpdateMode
+                ids=compact_ids, states=compact_states, mode=self.updateMode
             )
         return delta_per_table_fqn
