@@ -50,6 +50,7 @@ from torchrec.distributed.utils import (
     append_prefix,
     copy_to_device,
     filter_state_dict,
+    none_throws,
     sharded_model_copy,
 )
 from torchrec.optim.fused import FusedOptimizerModule
@@ -455,6 +456,19 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
                 module.reset_parameters()
 
         module.apply(init_parameters)
+
+    def init_torchrec_delta_tracker(
+        self, model_tracker_config: ModelTrackerConfig
+    ) -> ModelDeltaTrackerTrec:
+        """
+        Initializes the model delta tracker if it doesn't exists.
+        """
+        if self.model_delta_tracker is None:
+            self.model_delta_tracker = self._init_delta_tracker(
+                model_tracker_config, self._dmp_wrapped_module
+            )
+
+        return none_throws(self.model_delta_tracker)
 
     def get_model_tracker(self) -> ModelDeltaTrackerTrec:
         """
