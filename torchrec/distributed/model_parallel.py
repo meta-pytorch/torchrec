@@ -30,7 +30,7 @@ from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.model_tracker.model_delta_tracker import ModelDeltaTrackerTrec
-from torchrec.distributed.model_tracker.types import DeltaRows, ModelTrackerConfig
+from torchrec.distributed.model_tracker.types import ModelTrackerConfig, UniqueRows
 
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.sharding_plan import get_default_sharders
@@ -466,7 +466,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         ), "Model tracker is not initialized. Add ModelTrackerConfig at DistributedModelParallel init."
         return self.model_delta_tracker
 
-    def get_unique(self, consumer: Optional[str] = None) -> Dict[str, DeltaRows]:
+    def get_unique(self, consumer: Optional[str] = None) -> Dict[str, UniqueRows]:
         """
         Returns the delta rows for the given consumer.
         """

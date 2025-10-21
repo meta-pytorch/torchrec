@@ -13,9 +13,9 @@ from typing import Dict, List, Optional
 
 import torch
 from torchrec.distributed.model_tracker.types import (
-    DeltaRows,
-    EmbdUpdateMode,
     IndexedLookup,
+    UniqueRows,
+    UpdateMode,
 )
 from torchrec.distributed.utils import none_throws
 
@@ -23,24 +23,24 @@ from torchrec.distributed.utils import none_throws
 def _compute_unique_rows(
     ids: List[torch.Tensor],
     states: Optional[List[torch.Tensor]],
-    mode: EmbdUpdateMode,
-) -> DeltaRows:
+    mode: UpdateMode,
+) -> UniqueRows:
     r"""
     To calculate unique ids and embeddings
     """
-    if mode == EmbdUpdateMode.NONE:
-        assert states is None, f"{mode=} == EmbdUpdateMode.NONE but received embeddings"
+    if mode == UpdateMode.NONE:
+        assert states is None, f"{mode=} == UpdateMode.NONE but received embeddings"
         unique_ids = torch.cat(ids).unique(return_inverse=False)
-        return DeltaRows(ids=unique_ids, states=None)
+        return UniqueRows(ids=unique_ids, states=None)
     else:
         assert (
             states is not None
-        ), f"{mode=} != EmbdUpdateMode.NONE but received no embeddings"
+        ), f"{mode=} != UpdateMode.NONE but received no embeddings"
 
         cat_ids = torch.cat(ids)
         cat_states = torch.cat(states)
 
-        if mode == EmbdUpdateMode.LAST:
+        if mode == UpdateMode.LAST:
             cat_ids = cat_ids.flip(dims=[0])
             cat_states = cat_states.flip(dims=[0])
 
@@ -65,7 +65,7 @@ def _compute_unique_rows(
 
         # Use first occurrence indices to select corresponding embedding row.
         unique_states = cat_states[first_occurrence]
-        return DeltaRows(ids=unique_ids, states=unique_states)
+        return UniqueRows(ids=unique_ids, states=unique_states)
 
 
 class DeltaStore(ABC):
@@ -81,7 +81,7 @@ class DeltaStore(ABC):
     """
 
     @abstractmethod
-    def __init__(self, embdUpdateMode: EmbdUpdateMode = EmbdUpdateMode.NONE) -> None:
+    def __init__(self, updateMode: UpdateMode = UpdateMode.NONE) -> None:
         pass
 
     @abstractmethod
@@ -125,7 +125,7 @@ class DeltaStore(ABC):
         pass
 
     @abstractmethod
-    def get_unique(self, from_idx: int = 0) -> Dict[str, DeltaRows]:
+    def get_unique(self, from_idx: int = 0) -> Dict[str, UniqueRows]:
         """
         Return all unique/delta ids per table from the Delta Store.
 
@@ -151,9 +151,9 @@ class DeltaStoreTrec(DeltaStore):
     how to handle duplicate ids when compacting or retrieving embeddings.
     """
 
-    def __init__(self, embdUpdateMode: EmbdUpdateMode = EmbdUpdateMode.NONE) -> None:
-        super().__init__(embdUpdateMode)
-        self.embdUpdateMode = embdUpdateMode
+    def __init__(self, updateMode: UpdateMode = UpdateMode.NONE) -> None:
+        super().__init__(updateMode)
+        self.updateMode = updateMode
         self.per_fqn_lookups: Dict[str, List[IndexedLookup]] = {}
 
     def append(
@@ -205,11 +205,11 @@ class DeltaStoreTrec(DeltaStore):
             ids = [lookup.ids for lookup in lookups_to_compact]
             states = (
                 [none_throws(lookup.states) for lookup in lookups_to_compact]
-                if self.embdUpdateMode != EmbdUpdateMode.NONE
+                if self.updateMode != UpdateMode.NONE
                 else None
             )
             delta_rows = _compute_unique_rows(
-                ids=ids, states=states, mode=self.embdUpdateMode
+                ids=ids, states=states, mode=self.updateMode
             )
             new_per_fqn_lookups[table_fqn] = (
                 lookups[:index_l]
@@ -224,12 +224,12 @@ class DeltaStoreTrec(DeltaStore):
             )
         self.per_fqn_lookups = new_per_fqn_lookups
 
-    def get_unique(self, from_idx: int = 0) -> Dict[str, DeltaRows]:
+    def get_unique(self, from_idx: int = 0) -> Dict[str, UniqueRows]:
         r"""
         Return all unique/delta ids per table from the Delta Store.
         """
 
-        delta_per_table_fqn: Dict[str, DeltaRows] = {}
+        delta_per_table_fqn: Dict[str, UniqueRows] = {}
         for table_fqn, lookups in self.per_fqn_lookups.items():
             compact_ids = [
                 lookup.ids for lookup in lookups if lookup.batch_idx >= from_idx
@@ -240,11 +240,11 @@ class DeltaStoreTrec(DeltaStore):
                     for lookup in lookups
                     if lookup.batch_idx >= from_idx
                 ]
-                if self.embdUpdateMode != EmbdUpdateMode.NONE
+                if self.updateMode != UpdateMode.NONE
                 else None
             )
 
             delta_per_table_fqn[table_fqn] = _compute_unique_rows(
-                ids=compact_ids, states=compact_states, mode=self.embdUpdateMode
+                ids=compact_ids, states=compact_states, mode=self.updateMode
             )
         return delta_per_table_fqn
