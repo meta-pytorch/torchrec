@@ -51,6 +51,10 @@ from torchrec.distributed.embedding_types import (
     KJTList,
     ShardedEmbeddingModule,
 )
+from torchrec.distributed.feature_score_utils import (
+    create_sharding_type_to_feature_score_mapping,
+    may_collect_feature_scores,
+)
 from torchrec.distributed.fused_params import (
     FUSED_PARAM_IS_SSD_TABLE,
     FUSED_PARAM_SSD_TABLE_LIST,
@@ -565,6 +569,24 @@ class ShardedEmbeddingBagCollection(
         # forward pass flow control
         self._has_uninitialized_input_dist: bool = True
         self._has_features_permute: bool = True
+
+        self._enable_feature_score_weight_accumulation: bool = False
+        self._enabled_feature_score_auto_collection: bool = False
+        self._sharding_type_feature_score_mapping: Dict[str, Dict[str, float]] = {}
+        (
+            self._enable_feature_score_weight_accumulation,
+            self._enabled_feature_score_auto_collection,
+            self._sharding_type_feature_score_mapping,
+        ) = create_sharding_type_to_feature_score_mapping(
+            self._embedding_bag_configs, self.sharding_type_to_sharding_infos
+        )
+
+        logger.info(
+            f"EBC feature score weight accumulation enabled: {self._enable_feature_score_weight_accumulation}, "
+            f"auto collection enabled: {self._enabled_feature_score_auto_collection}, "
+            f"sharding type to feature score mapping: {self._sharding_type_feature_score_mapping}"
+        )
+
         # Get all fused optimizers and combine them.
         optims = []
         for lookup in self._lookups:
@@ -1564,6 +1586,11 @@ class ShardedEmbeddingBagCollection(
 
             features_by_shards = features.split(
                 self._feature_splits,
+            )
+            features_by_shards = may_collect_feature_scores(
+                features_by_shards,
+                self._enabled_feature_score_auto_collection,
+                self._sharding_type_feature_score_mapping,
             )
             awaitables = []
             for input_dist, features_by_shard, sharding_type in zip(
