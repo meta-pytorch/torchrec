@@ -18,7 +18,10 @@ from torchrec.distributed.embedding_tower_sharding import (
     EmbeddingTowerSharder,
 )
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.embeddingbag import (
+    EmbeddingBagCollection,
+    EmbeddingBagCollectionSharder,
+)
 from torchrec.distributed.mc_embeddingbag import (
     ManagedCollisionEmbeddingBagCollectionSharder,
 )
@@ -45,11 +48,25 @@ EXPECTED_RW_SHARD_SIZES = [
     [[17, 80], [17, 80], [17, 80], [17, 80], [17, 80], [17, 80], [17, 80], [11, 80]],
 ]
 
+EXPECTED_RW_SHARD_SIZES_WITH_BUCKETS = [
+    [[20, 20], [20, 20], [10, 20], [10, 20], [10, 20], [10, 20], [10, 20], [10, 20]],
+    [[22, 40], [22, 40], [11, 40], [11, 40], [11, 40], [11, 40], [11, 40], [11, 40]],
+    [[24, 60], [24, 60], [12, 60], [12, 60], [12, 60], [12, 60], [12, 60], [12, 60]],
+    [[26, 80], [26, 80], [13, 80], [13, 80], [13, 80], [13, 80], [13, 80], [13, 80]],
+]
+
 EXPECTED_RW_SHARD_OFFSETS = [
     [[0, 0], [13, 0], [26, 0], [39, 0], [52, 0], [65, 0], [78, 0], [91, 0]],
     [[0, 0], [14, 0], [28, 0], [42, 0], [56, 0], [70, 0], [84, 0], [98, 0]],
     [[0, 0], [15, 0], [30, 0], [45, 0], [60, 0], [75, 0], [90, 0], [105, 0]],
     [[0, 0], [17, 0], [34, 0], [51, 0], [68, 0], [85, 0], [102, 0], [119, 0]],
+]
+
+EXPECTED_RW_SHARD_OFFSETS_WITH_BUCKETS = [
+    [[0, 0], [20, 0], [40, 0], [50, 0], [60, 0], [70, 0], [80, 0], [90, 0]],
+    [[0, 0], [22, 0], [44, 0], [55, 0], [66, 0], [77, 0], [88, 0], [99, 0]],
+    [[0, 0], [24, 0], [48, 0], [60, 0], [72, 0], [84, 0], [96, 0], [108, 0]],
+    [[0, 0], [26, 0], [52, 0], [65, 0], [78, 0], [91, 0], [104, 0], [117, 0]],
 ]
 
 
@@ -101,6 +118,48 @@ EXPECTED_RW_SHARD_STORAGE = [
     ],
 ]
 
+EXPECTED_VIRTUAL_TABLE_RW_SHARD_STORAGE_WITH_BUCKETS = [
+    [
+        Storage(hbm=165888, ddr=0),
+        Storage(hbm=165888, ddr=0),
+        Storage(hbm=165888, ddr=0),
+        Storage(hbm=165888, ddr=0),
+        Storage(hbm=165888, ddr=0),
+        Storage(hbm=165888, ddr=0),
+        Storage(hbm=165888, ddr=0),
+        Storage(hbm=165888, ddr=0),
+    ],
+    [
+        Storage(hbm=1001472, ddr=0),
+        Storage(hbm=1001472, ddr=0),
+        Storage(hbm=1001472, ddr=0),
+        Storage(hbm=1001472, ddr=0),
+        Storage(hbm=1001472, ddr=0),
+        Storage(hbm=1001472, ddr=0),
+        Storage(hbm=1001472, ddr=0),
+        Storage(hbm=1001472, ddr=0),
+    ],
+    [
+        Storage(hbm=1003520, ddr=0),
+        Storage(hbm=1003520, ddr=0),
+        Storage(hbm=1003520, ddr=0),
+        Storage(hbm=1003520, ddr=0),
+        Storage(hbm=1003520, ddr=0),
+        Storage(hbm=1003520, ddr=0),
+        Storage(hbm=1003520, ddr=0),
+        Storage(hbm=1003520, ddr=0),
+    ],
+    [
+        Storage(hbm=2648064, ddr=0),
+        Storage(hbm=2648064, ddr=0),
+        Storage(hbm=2648064, ddr=0),
+        Storage(hbm=2648064, ddr=0),
+        Storage(hbm=2648064, ddr=0),
+        Storage(hbm=2648064, ddr=0),
+        Storage(hbm=2648064, ddr=0),
+        Storage(hbm=2648064, ddr=0),
+    ],
+]
 
 EXPECTED_UVM_CACHING_RW_SHARD_STORAGE = [
     [
@@ -145,6 +204,48 @@ EXPECTED_UVM_CACHING_RW_SHARD_STORAGE = [
     ],
 ]
 
+EXPECTED_UVM_CACHING_RW_SHARD_STORAGE_WITH_BUCKETS = [
+    [
+        Storage(hbm=166352, ddr=1600),
+        Storage(hbm=166352, ddr=1600),
+        Storage(hbm=166120, ddr=800),
+        Storage(hbm=166120, ddr=800),
+        Storage(hbm=166120, ddr=800),
+        Storage(hbm=166120, ddr=800),
+        Storage(hbm=166120, ddr=800),
+        Storage(hbm=166120, ddr=800),
+    ],
+    [
+        Storage(hbm=1002335, ddr=3520),
+        Storage(hbm=1002335, ddr=3520),
+        Storage(hbm=1001904, ddr=1760),
+        Storage(hbm=1001904, ddr=1760),
+        Storage(hbm=1001904, ddr=1760),
+        Storage(hbm=1001904, ddr=1760),
+        Storage(hbm=1001904, ddr=1760),
+        Storage(hbm=1001904, ddr=1760),
+    ],
+    [
+        Storage(hbm=1004845, ddr=5760),
+        Storage(hbm=1004845, ddr=5760),
+        Storage(hbm=1004183, ddr=2880),
+        Storage(hbm=1004183, ddr=2880),
+        Storage(hbm=1004183, ddr=2880),
+        Storage(hbm=1004183, ddr=2880),
+        Storage(hbm=1004183, ddr=2880),
+        Storage(hbm=1004183, ddr=2880),
+    ],
+    [
+        Storage(hbm=2649916, ddr=8320),
+        Storage(hbm=2649916, ddr=8320),
+        Storage(hbm=2648990, ddr=4160),
+        Storage(hbm=2648990, ddr=4160),
+        Storage(hbm=2648990, ddr=4160),
+        Storage(hbm=2648990, ddr=4160),
+        Storage(hbm=2648990, ddr=4160),
+        Storage(hbm=2648990, ddr=4160),
+    ],
+]
 
 EXPECTED_TWRW_SHARD_SIZES = [
     [[25, 20], [25, 20], [25, 20], [25, 20]],
@@ -246,6 +347,16 @@ class RWSharder(EmbeddingBagCollectionSharder):
         self, sharding_type: str, compute_device_type: str
     ) -> List[str]:
         return [EmbeddingComputeKernel.FUSED.value]
+
+
+class VirtualTableRWSharder(EmbeddingBagCollectionSharder):
+    def sharding_types(self, compute_device_type: str) -> List[str]:
+        return [ShardingType.ROW_WISE.value]
+
+    def compute_kernels(
+        self, sharding_type: str, compute_device_type: str
+    ) -> List[str]:
+        return [EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value]
 
 
 class UVMCachingRWSharder(EmbeddingBagCollectionSharder):
@@ -357,6 +468,27 @@ class TestEnumerators(unittest.TestCase):
                 min_partition=40, pooling_factors=[2, 1, 3, 7]
             ),
         }
+        self._virtual_table_constraints = {
+            "table_0": ParameterConstraints(
+                min_partition=20,
+                compute_kernels=[EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value],
+            ),
+            "table_1": ParameterConstraints(
+                min_partition=20,
+                pooling_factors=[1, 3, 5],
+                compute_kernels=[EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value],
+            ),
+            "table_2": ParameterConstraints(
+                min_partition=20,
+                pooling_factors=[8, 2],
+                compute_kernels=[EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value],
+            ),
+            "table_3": ParameterConstraints(
+                min_partition=40,
+                pooling_factors=[2, 1, 3, 7],
+                compute_kernels=[EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value],
+            ),
+        }
         self.num_tables = 4
         tables = [
             EmbeddingBagConfig(
@@ -364,6 +496,17 @@ class TestEnumerators(unittest.TestCase):
                 embedding_dim=20 + i * 20,
                 name="table_" + str(i),
                 feature_names=["feature_" + str(i)],
+            )
+            for i in range(self.num_tables)
+        ]
+        tables_with_buckets = [
+            EmbeddingBagConfig(
+                num_embeddings=100 + i * 10,
+                embedding_dim=20 + i * 20,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+                total_num_buckets=10,
+                use_virtual_table=True,
             )
             for i in range(self.num_tables)
         ]
@@ -377,6 +520,9 @@ class TestEnumerators(unittest.TestCase):
             for i in range(4)
         ]
         self.model = TestSparseNN(tables=tables, weighted_tables=[])
+        self.model_with_buckets = EmbeddingBagCollection(
+            tables=tables_with_buckets,
+        )
         self.enumerator = EmbeddingEnumerator(
             topology=Topology(
                 world_size=self.world_size,
@@ -385,6 +531,15 @@ class TestEnumerators(unittest.TestCase):
             ),
             batch_size=self.batch_size,
             constraints=self.constraints,
+        )
+        self.virtual_table_enumerator = EmbeddingEnumerator(
+            topology=Topology(
+                world_size=self.world_size,
+                compute_device=self.compute_device,
+                local_world_size=self.local_world_size,
+            ),
+            batch_size=self.batch_size,
+            constraints=self._virtual_table_constraints,
         )
         self.tower_model = TestTowerSparseNN(
             tables=tables, weighted_tables=weighted_tables
@@ -514,6 +669,26 @@ class TestEnumerators(unittest.TestCase):
                 EXPECTED_RW_SHARD_STORAGE[i],
             )
 
+    def test_virtual_table_rw_sharding_with_buckets(self) -> None:
+        sharding_options = self.virtual_table_enumerator.enumerate(
+            self.model_with_buckets,
+            [cast(ModuleSharder[torch.nn.Module], VirtualTableRWSharder())],
+        )
+        for i, sharding_option in enumerate(sharding_options):
+            self.assertEqual(sharding_option.sharding_type, ShardingType.ROW_WISE.value)
+            self.assertEqual(
+                [shard.size for shard in sharding_option.shards],
+                EXPECTED_RW_SHARD_SIZES_WITH_BUCKETS[i],
+            )
+            self.assertEqual(
+                [shard.offset for shard in sharding_option.shards],
+                EXPECTED_RW_SHARD_OFFSETS_WITH_BUCKETS[i],
+            )
+            self.assertEqual(
+                [shard.storage for shard in sharding_option.shards],
+                EXPECTED_VIRTUAL_TABLE_RW_SHARD_STORAGE_WITH_BUCKETS[i],
+            )
+
     def test_uvm_caching_rw_sharding(self) -> None:
         sharding_options = self.enumerator.enumerate(
             self.model,
@@ -533,6 +708,26 @@ class TestEnumerators(unittest.TestCase):
             self.assertEqual(
                 [shard.storage for shard in sharding_option.shards],
                 EXPECTED_UVM_CACHING_RW_SHARD_STORAGE[i],
+            )
+
+    def test_uvm_caching_rw_sharding_with_buckets(self) -> None:
+        sharding_options = self.enumerator.enumerate(
+            self.model_with_buckets,
+            [cast(ModuleSharder[torch.nn.Module], UVMCachingRWSharder())],
+        )
+        for i, sharding_option in enumerate(sharding_options):
+            self.assertEqual(sharding_option.sharding_type, ShardingType.ROW_WISE.value)
+            self.assertEqual(
+                [shard.size for shard in sharding_option.shards],
+                EXPECTED_RW_SHARD_SIZES_WITH_BUCKETS[i],
+            )
+            self.assertEqual(
+                [shard.offset for shard in sharding_option.shards],
+                EXPECTED_RW_SHARD_OFFSETS_WITH_BUCKETS[i],
+            )
+            self.assertEqual(
+                [shard.storage for shard in sharding_option.shards],
+                EXPECTED_UVM_CACHING_RW_SHARD_STORAGE_WITH_BUCKETS[i],
             )
 
     def test_twrw_sharding(self) -> None:
