@@ -466,14 +466,14 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         ), "Model tracker is not initialized. Add ModelTrackerConfig at DistributedModelParallel init."
         return self.model_delta_tracker
 
-    def get_delta(self, consumer: Optional[str] = None) -> Dict[str, DeltaRows]:
+    def get_unique(self, consumer: Optional[str] = None) -> Dict[str, DeltaRows]:
         """
         Returns the delta rows for the given consumer.
         """
         assert (
             self.model_delta_tracker is not None
         ), "Model tracker is not initialized. Add ModelTrackerConfig at DistributedModelParallel init."
-        return self.model_delta_tracker.get_delta(consumer)
+        return self.model_delta_tracker.get_unique(consumer)
 
     def sparse_grad_parameter_names(
         self, destination: Optional[List[str]] = None, prefix: str = ""
