@@ -13,6 +13,9 @@ from typing import cast, Dict, Iterable, List, Optional, Tuple, Type, Union
 import torch
 import torchrec
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from fbgemm_gpu.split_table_batched_embeddings_ops import (
+    SplitTableBatchedEmbeddingBagsCodegen,
+)
 
 from parameterized import parameterized
 from torch import nn
@@ -1558,6 +1561,101 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
             test_params=test_params,
         )
 
+    @parameterized.expand(
+        [
+            (
+                "EC_and_single_feature",
+                ModelDeltaTrackerInputTestParams(
+                    embedding_config_type=EmbeddingConfig,
+                    embedding_tables=[
+                        EmbeddingTableProps(
+                            embedding_table_config=EmbeddingConfig(
+                                name="sparse_table_1",
+                                num_embeddings=NUM_EMBEDDINGS,
+                                embedding_dim=EMBEDDING_DIM,
+                                feature_names=["f1"],
+                            ),
+                            sharding=ShardingType.ROW_WISE,
+                        ),
+                    ],
+                    model_tracker_config=ModelTrackerConfig(
+                        tracking_mode=TrackingMode.MOMENTUM_DIFF,
+                        delete_on_read=True,
+                    ),
+                    model_inputs=[
+                        ModelInput(
+                            keys=["f1"],
+                            values=torch.tensor([0, 2, 4, 6, 8, 10, 12, 14]),
+                            offsets=torch.tensor([0, 2, 2, 4, 6, 7, 8]),
+                        ),
+                        ModelInput(
+                            keys=["f1"],
+                            values=torch.tensor([8, 10, 12, 14, 0, 2, 4, 6]),
+                            offsets=torch.tensor([0, 2, 2, 4, 6, 6, 8]),
+                        ),
+                        ModelInput(
+                            keys=["f1"],
+                            values=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]),
+                            offsets=torch.tensor([0, 0, 0, 4, 4, 4, 8]),
+                        ),
+                    ],
+                ),
+            ),
+            (
+                "EBC_and_multiple_feature",
+                ModelDeltaTrackerInputTestParams(
+                    embedding_config_type=EmbeddingBagConfig,
+                    embedding_tables=[
+                        EmbeddingTableProps(
+                            embedding_table_config=EmbeddingBagConfig(
+                                name="sparse_table_1",
+                                num_embeddings=NUM_EMBEDDINGS,
+                                embedding_dim=EMBEDDING_DIM,
+                                feature_names=["f1", "f2"],
+                                pooling=PoolingType.SUM,
+                            ),
+                            sharding=ShardingType.ROW_WISE,
+                        ),
+                    ],
+                    model_tracker_config=ModelTrackerConfig(
+                        tracking_mode=TrackingMode.ROWWISE_ADAGRAD,
+                        delete_on_read=True,
+                    ),
+                    model_inputs=[
+                        ModelInput(
+                            keys=["f1", "f2"],
+                            values=torch.tensor([0, 2, 4, 6, 8, 10, 12, 14]),
+                            offsets=torch.tensor([0, 2, 2, 4, 6, 7, 8]),
+                        ),
+                        ModelInput(
+                            keys=["f1", "f2"],
+                            values=torch.tensor([8, 10, 12, 14, 0, 2, 4, 6]),
+                            offsets=torch.tensor([0, 2, 2, 4, 6, 6, 8]),
+                        ),
+                        ModelInput(
+                            keys=["f1", "f2"],
+                            values=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]),
+                            offsets=torch.tensor([0, 0, 0, 4, 4, 4, 8]),
+                        ),
+                    ],
+                ),
+            ),
+        ]
+    )
+    @skip_if_asan
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
+    def test_duplication_with_rowwise_adagrad(
+        self,
+        _test_name: str,
+        test_params: ModelDeltaTrackerInputTestParams,
+    ) -> None:
+        self._run_multi_process_test(
+            callable=_test_duplication_with_rowwise_adagrad,
+            world_size=self.world_size,
+            test_params=test_params,
+        )
+
 
 def _test_fqn_to_feature_names(
     rank: int,
@@ -2003,3 +2101,75 @@ def _test_duplication_with_momentum(
             unittest.TestCase().assertTrue(states is not None)
             unittest.TestCase().assertTrue(ids.numel() == states.numel())
             unittest.TestCase().assertTrue(bool((states != 0).all().item()))
+
+
+def _test_duplication_with_rowwise_adagrad(
+    rank: int,
+    world_size: int,
+    test_params: ModelDeltaTrackerInputTestParams,
+) -> None:
+    with MultiProcessContext(
+        rank=rank,
+        world_size=world_size,
+        backend="nccl" if torch.cuda.is_available() else "gloo",
+    ) as ctx:
+        dt_model, baseline_model = get_models(
+            rank=rank,
+            world_size=world_size,
+            ctx=ctx,
+            embedding_config_type=test_params.embedding_config_type,
+            tables=test_params.embedding_tables,
+            config=test_params.model_tracker_config,
+            optimizer_type=OptimType.EXACT_ROWWISE_ADAGRAD,
+        )
+
+        # read momemtum directly from the table
+        tbe: SplitTableBatchedEmbeddingBagsCodegen = (
+            (
+                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
+                #  attribute `ec`.
+                dt_model._dmp_wrapped_module.module.ec._lookups[0]
+                ._emb_modules[0]
+                .emb_module
+            )
+            if test_params.embedding_config_type == EmbeddingConfig
+            else (
+                dt_model._dmp_wrapped_module.module.ebc._lookups[0]  # pyre-ignore
+                ._emb_modules[0]
+                .emb_module
+            )
+        )
+        assert isinstance(tbe, SplitTableBatchedEmbeddingBagsCodegen)
+        start_momentums = tbe.split_optimizer_states()[0][0].detach().clone()
+
+        dt_model_opt = torch.optim.Adam(dt_model.parameters(), lr=0.1)
+        baseline_opt = torch.optim.Adam(baseline_model.parameters(), lr=0.1)
+        features_list = model_input_generator(test_params.model_inputs, rank)
+
+        dt = dt_model.get_model_tracker()
+        table_fqns = dt.fqn_to_feature_names().keys()
+        table_fqns_list = list(table_fqns)
+
+        for features in features_list:
+            tracked_out = dt_model(features)
+            baseline_out = baseline_model(features)
+            unittest.TestCase().assertTrue(tracked_out.allclose(baseline_out))
+            tracked_out.sum().backward()
+            baseline_out.sum().backward()
+
+            dt_model_opt.step()
+            baseline_opt.step()
+
+        end_momentums = tbe.split_optimizer_states()[0][0].detach().clone()
+
+        delta_rows = dt.get_delta()
+        table_fqn = table_fqns_list[0]
+
+        ids = delta_rows[table_fqn].ids
+        tracked_momentum = none_throws(delta_rows[table_fqn].states)
+        unittest.TestCase().assertTrue(tracked_momentum is not None)
+        unittest.TestCase().assertTrue(ids.numel() == tracked_momentum.numel())
+        unittest.TestCase().assertTrue(bool((tracked_momentum != 0).all().item()))
+
+        expected_momentum = end_momentums[ids] - start_momentums[ids]
+        unittest.TestCase().assertTrue(tracked_momentum.allclose(expected_momentum))
