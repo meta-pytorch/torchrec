@@ -391,7 +391,7 @@ class ShardedEmbeddingModule(
         self._lookups: List[nn.Module] = []
         self._output_dists: List[nn.Module] = []
         self.post_lookup_tracker_fn: Optional[
-            Callable[[nn.Module, KeyedJaggedTensor, torch.Tensor], None]
+            Callable[[KeyedJaggedTensor, torch.Tensor, Optional[nn.Module]], None]
         ] = None
         self.post_odist_tracker_fn: Optional[Callable[..., None]] = None
 
@@ -444,14 +444,16 @@ class ShardedEmbeddingModule(
 
     def register_post_lookup_tracker_fn(
         self,
-        record_fn: Callable[[nn.Module, KeyedJaggedTensor, torch.Tensor], None],
+        record_fn: Callable[
+            [KeyedJaggedTensor, torch.Tensor, Optional[nn.Module]], None
+        ],
     ) -> None:
         """
         Register a function to be called after lookup is done. This is used for
         tracking the lookup results and optimizer states.
 
         Args:
-            record_fn (Callable[[nn.Module, KeyedJaggedTensor, torch.Tensor], None]): A custom record function to be called after lookup is done.
+            record_fn (Callable[[KeyedJaggedTensor, torch.Tensor,Optional[nn.Module]], None]): A custom record function to be called after lookup is done.
 
         """
         if self.post_lookup_tracker_fn is not None:
