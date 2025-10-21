@@ -1739,7 +1739,7 @@ def _test_id_mode(
             tracked_out.sum().backward()
             baseline_out.sum().backward()
 
-        delta_ids = dt.get_delta_ids()
+        delta_ids = dt.get_unique_ids()
 
         table_fqns = dt.fqn_to_feature_names().keys()
 
@@ -2035,7 +2035,7 @@ def _test_multiple_consumer(
             unittest.TestCase().assertTrue(tracked_out.allclose(baseline_out))
             tracked_out.sum().backward()
             baseline_out.sum().backward()
-            delta_rows = dt.get_delta_ids(consumer=consumer)
+            delta_rows = dt.get_unique_ids(consumer=consumer)
 
             # Verify that the current batch index is correct
             unittest.TestCase().assertTrue(dt.curr_batch_idx, i + 1)
