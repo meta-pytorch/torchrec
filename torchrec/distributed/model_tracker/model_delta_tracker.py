@@ -79,7 +79,10 @@ class ModelDeltaTracker(ABC):
 
     @abstractmethod
     def record_lookup(
-        self, emb_module: nn.Module, kjt: KeyedJaggedTensor, states: torch.Tensor
+        self,
+        kjt: KeyedJaggedTensor,
+        states: torch.Tensor,
+        emb_module: Optional[nn.Module] = None,
     ) -> None:
         """
         Records the IDs from a given KeyedJaggedTensor and their corresponding embeddings/parameter states.
@@ -233,7 +236,10 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
             self.curr_compact_index = end_idx
 
     def record_lookup(
-        self, emb_module: nn.Module, kjt: KeyedJaggedTensor, states: torch.Tensor
+        self,
+        kjt: KeyedJaggedTensor,
+        states: torch.Tensor,
+        emb_module: Optional[nn.Module] = None,
     ) -> None:
         """
         Records the IDs from a given KeyedJaggedTensor and their corresponding embeddings/parameter states.
@@ -258,12 +264,12 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
             self.record_embeddings(kjt, states)
         # In MOMENTUM_LAST mode, we track per feature IDs and corresponding momentum values received in the current batch.
         elif self._mode == TrackingMode.MOMENTUM_LAST:
-            self.record_momentum(emb_module, kjt)
+            self.record_momentum(none_throws(emb_module), kjt)
         elif (
             self._mode == TrackingMode.MOMENTUM_DIFF
             or self._mode == TrackingMode.ROWWISE_ADAGRAD
         ):
-            self.record_rowwise_optim_state(emb_module, kjt)
+            self.record_rowwise_optim_state(none_throws(emb_module), kjt)
         else:
             raise NotImplementedError(f"Tracking mode {self._mode} is not supported")
 
