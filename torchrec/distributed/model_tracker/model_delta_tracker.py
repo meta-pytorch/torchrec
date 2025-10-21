@@ -362,10 +362,10 @@ class ModelDeltaTracker:
         Args:
             consumer (str, optional): The consumer to retrieve unique IDs for. If not specified, "default" is used as the default consumer.
         """
-        per_table_delta_rows = self.get_delta(consumer)
+        per_table_delta_rows = self.get_unique(consumer)
         return {fqn: delta_rows.ids for fqn, delta_rows in per_table_delta_rows.items()}
 
-    def get_delta(
+    def get_unique(
         self,
         consumer: Optional[str] = None,
         top_percentage: Optional[float] = 1.0,
@@ -390,7 +390,7 @@ class ModelDeltaTracker:
         # and index_start could be equal to index_end, in which case we should not compact again.
         if index_start < index_end:
             self.compact(index_start, index_end)
-        tracker_rows = self.store.get_delta(
+        tracker_rows = self.store.get_unique(
             from_idx=self.per_consumer_batch_idx[consumer]
         )
         self.per_consumer_batch_idx[consumer] = index_end
