@@ -447,7 +447,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                 ),
             ),
             (
-                "get_delta",
+                "get_unique",
                 ModelDeltaTrackerInputTestParams(
                     embedding_config_type=EmbeddingConfig,
                     embedding_tables=[
@@ -464,7 +464,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                     model_tracker_config=ModelTrackerConfig(),
                 ),
                 TrackerNotInitOutputTestParams(
-                    dmp_tracker_atter="get_delta",
+                    dmp_tracker_atter="get_unique",
                 ),
             ),
         ]
@@ -1843,7 +1843,7 @@ def _test_embedding_mode(
                 tracked_out.sum().backward()
                 baseline_out.sum().backward()
 
-            delta_rows = dt.get_delta()
+            delta_rows = dt.get_unique()
 
             table_fqns = dt.fqn_to_feature_names().keys()
             table_fqns_list = list(table_fqns)
@@ -1964,7 +1964,7 @@ def _test_multiple_get(
             unittest.TestCase().assertTrue(tracked_out.allclose(baseline_out))
             tracked_out.sum().backward()
             baseline_out.sum().backward()
-            delta_rows = dt.get_delta()
+            delta_rows = dt.get_unique()
 
             # Verify that the current batch index is correct
             unittest.TestCase().assertTrue(dt.curr_batch_idx, i + 1)
@@ -2093,7 +2093,7 @@ def _test_duplication_with_momentum(
             dt_model_opt.step()
             baseline_opt.step()
 
-        delta_rows = dt.get_delta()
+        delta_rows = dt.get_unique()
         for table_fqn in table_fqns_list:
             ids = delta_rows[table_fqn].ids
             states = none_throws(delta_rows[table_fqn].states)
@@ -2162,7 +2162,7 @@ def _test_duplication_with_rowwise_adagrad(
 
         end_momentums = tbe.split_optimizer_states()[0][0].detach().clone()
 
-        delta_rows = dt.get_delta()
+        delta_rows = dt.get_unique()
         table_fqn = table_fqns_list[0]
 
         ids = delta_rows[table_fqn].ids
