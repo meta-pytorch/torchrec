@@ -463,6 +463,24 @@ class LazyNoWait(LazyAwaitable[W]):
         return self._obj
 
 
+class DeviceToHostTensorAwaitable(LazyAwaitable[torch.Tensor]):
+    """An awaitable that waits for a tensor to be copied from device to host."""
+
+    def __init__(self, tensor_on_device: torch.Tensor) -> None:
+        super().__init__()
+        # self._tensor has unintialized value at this momenet
+        self._tensor: torch.Tensor = tensor_on_device.to("cpu", non_blocking=True)
+
+        # cuda event to record the completion of the copy
+        self._event = torch.cuda.Event()
+        self._event.record()
+
+    def _wait_impl(self) -> torch.Tensor:
+        # wait for the copy to complete
+        self._event.synchronize()
+        return self._tensor
+
+
 KT = TypeVar("KT")
 VT_co = TypeVar("VT_co")
 ParentW = TypeVar("ParentW")
