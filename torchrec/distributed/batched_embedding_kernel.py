@@ -157,6 +157,7 @@ def _populate_ssd_tbe_params(config: GroupedEmbeddingConfig) -> Dict[str, Any]:
     Construct SSD TBE params dict from config and fused params dict.
     """
     fused_params = config.fused_params or {}
+    logger.info(f"Populate_ssd_tbe_params with {fused_params=}")
 
     ssd_tbe_params: Dict[str, Any] = {}
 
