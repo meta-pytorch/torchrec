@@ -298,7 +298,7 @@ class ModelInput(Pipelineable):
                     idlist_features, global_idlist_indices, global_idlist_lengths
                 )
             }
-            global_idlist_input = TensorDict(source=dict_of_nt)
+            global_idlist_input = TensorDict(source=dict_of_nt)  # pyre-ignore[6]
 
             assert (
                 len(idscore_features) == 0
@@ -409,7 +409,7 @@ class ModelInput(Pipelineable):
                         local_idlist_lengths,
                     )
                 }
-                local_idlist_input = TensorDict(source=dict_of_nt)
+                local_idlist_input = TensorDict(source=dict_of_nt)  # pyre-ignore[6]
                 assert (
                     len(idscore_features) == 0
                 ), "TensorDict does not support weighted features"
