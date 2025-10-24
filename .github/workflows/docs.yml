@@ -17,8 +17,8 @@ jobs:
       matrix:
         include:
          - os: linux.24_04.4x
-           python-version: 3.9
-           python-tag: "py39"
+           python-version: 3.12
+           python-tag: "py312"
     steps:
     - name: Check ldd --version
       run: ldd --version
