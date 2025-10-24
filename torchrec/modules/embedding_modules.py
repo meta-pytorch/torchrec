@@ -408,6 +408,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         tables: List[EmbeddingConfig],
         device: Optional[torch.device] = None,
         need_indices: bool = False,
+        use_gather_select: bool = False,
     ) -> None:
         super().__init__()
         torch._C._log_api_usage_once(f"torchrec.modules.{self.__class__.__name__}")
@@ -415,6 +416,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         self._embedding_configs = tables
         self._embedding_dim: int = -1
         self._need_indices: bool = need_indices
+        self._use_gather_select: bool = use_gather_select
         self._device: torch.device = (
             device if device is not None else torch.device("cpu")
         )
@@ -541,3 +543,10 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
             param = self.embeddings[f"{table_config.name}"].weight
             # pyre-ignore
             table_config.init_fn(param)
+
+    def use_gather_select(self) -> bool:
+        """
+        Returns:
+            bool: Whether the EmbeddingCollection uses torch.gather to select embeddings.
+        """
+        return self._use_gather_select

@@ -245,14 +245,22 @@ def construct_jagged_tensors(
     original_features: Optional[KeyedJaggedTensor] = None,
     reverse_indices: Optional[torch.Tensor] = None,
     seq_vbe_ctx: Optional[SequenceVBEContext] = None,
+    use_gather_select: bool = False,
 ) -> Dict[str, JaggedTensor]:
     with record_function("## construct_jagged_tensors ##"):
         if original_features is not None:
             features = original_features
         if reverse_indices is not None:
-            embeddings = torch.index_select(
-                embeddings, 0, reverse_indices.to(torch.int32)
-            )
+            if use_gather_select:
+                # gather has better backward performance than index_select in many cases
+                expanded_indices = reverse_indices.unsqueeze(1).expand(
+                    -1, embeddings.size(-1)
+                )
+                embeddings = torch.gather(embeddings, 0, expanded_indices)
+            else:
+                embeddings = torch.index_select(
+                    embeddings, 0, reverse_indices.to(torch.int32)
+                )
         ret: Dict[str, JaggedTensor] = {}
 
         if seq_vbe_ctx is not None:
