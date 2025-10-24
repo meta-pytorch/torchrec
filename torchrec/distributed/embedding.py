@@ -338,6 +338,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         features_to_permute_indices: Optional[Dict[str, List[int]]] = None,
         module_fqn: Optional[str] = None,
         sharding_types: Optional[List[str]] = None,
+        use_gather_select: bool = False,
     ) -> None:
         super().__init__()
         self._awaitables_per_sharding = awaitables_per_sharding
@@ -348,6 +349,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         self._ctx = ctx
         self._module_fqn = module_fqn
         self._sharding_types = sharding_types
+        self._use_gather_select = use_gather_select
 
     def _wait_impl(self) -> Dict[str, JaggedTensor]:
         jt_dict: Dict[str, JaggedTensor] = {}
@@ -389,6 +391,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                     original_features=original_features,
                     reverse_indices=reverse_indices,
                     seq_vbe_ctx=seq_vbe_ctx,
+                    use_gather_select=self._use_gather_select,
                 )
             )
         return jt_dict
@@ -529,6 +532,7 @@ class ShardedEmbeddingCollection(
                 module.embedding_configs(), table_name_to_parameter_sharding
             )
         self._need_indices: bool = module.need_indices()
+        self._use_gather_select: bool = module.use_gather_select()
         self._inverse_indices_permute_per_sharding: Optional[List[torch.Tensor]] = None
         self._skip_missing_weight_key: List[str] = []
 
@@ -1563,6 +1567,7 @@ class ShardedEmbeddingCollection(
             need_indices=self._need_indices,
             features_to_permute_indices=self._features_to_permute_indices,
             ctx=ctx,
+            use_gather_select=self._use_gather_select,
         )
 
     def compute_and_output_dist(
@@ -1612,6 +1617,7 @@ class ShardedEmbeddingCollection(
             ctx=ctx,
             module_fqn=self._module_fqn,
             sharding_types=list(self._sharding_type_to_sharding.keys()),
+            use_gather_select=self._use_gather_select,
         )
 
     def _embedding_dim_for_sharding_type(self, sharding_type: str) -> int:
