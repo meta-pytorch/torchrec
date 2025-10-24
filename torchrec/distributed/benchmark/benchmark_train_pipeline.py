@@ -37,6 +37,7 @@ from torchrec.distributed.benchmark.base import (
 from torchrec.distributed.test_utils.input_config import ModelInputConfig
 from torchrec.distributed.test_utils.model_config import (
     BaseModelConfig,
+    DLSeqConfig,
     generate_sharded_model_and_optimizer,
     ModelSelectionConfig,
 )
@@ -116,8 +117,7 @@ class RunOptions(BenchFuncConfig):
 def runner(
     rank: int,
     world_size: int,
-    tables: List[EmbeddingBagConfig],
-    weighted_tables: List[EmbeddingBagConfig],
+    table_list: List[List[EmbeddingBagConfig]],
     run_option: RunOptions,
     model_config: BaseModelConfig,
     pipeline_config: PipelineConfig,
@@ -136,21 +136,34 @@ def runner(
         backend="nccl",
         use_deterministic_algorithms=False,
     ) as ctx:
-        unsharded_model = model_config.generate_model(
-            tables=tables,
-            weighted_tables=weighted_tables,
-            dense_device=ctx.device,
-        )
 
-        # Create a planner for sharding based on the specified type
-        planner = planner_config.generate_planner(
-            tables=tables + weighted_tables,
-        )
-
-        bench_inputs = input_config.generate_batches(
-            tables=tables,
-            weighted_tables=weighted_tables,
-        )
+        if isinstance(model_config, DLSeqConfig):
+            bench_inputs = input_config.generate_list_batches(
+                tables=table_list,  # pyre-ignore
+                table_options=model_config.table_options,
+            )
+            unsharded_model = model_config.generate_model(
+                tables=table_list,  # pyre-ignore
+                dense_device=ctx.device,
+            )
+            planner = planner_config.generate_planner(
+                tables=[table for tables in table_list for table in tables],
+            )
+        else:
+            tables, weighted_tables, *_ = table_list
+            bench_inputs = input_config.generate_std_batches(
+                tables=tables,
+                weighted_tables=weighted_tables,
+            )
+            unsharded_model = model_config.generate_model(
+                tables=tables,
+                weighted_tables=weighted_tables,
+                dense_device=ctx.device,
+            )
+            # Create a planner for sharding based on the specified type
+            planner = planner_config.generate_planner(
+                tables=tables + weighted_tables,
+            )
 
         # Prepare fused_params for sparse optimizer
         fused_params = {
@@ -228,8 +241,7 @@ def run_pipeline(
     benchmark_res_per_rank = run_multi_process_func(
         func=runner,
         world_size=run_option.world_size,
-        tables=tables,
-        weighted_tables=weighted_tables,
+        table_list=[tables, weighted_tables],
         run_option=run_option,
         model_config=model_config,
         pipeline_config=pipeline_config,
@@ -270,14 +282,14 @@ def main(
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
 ) -> None:
-    tables, weighted_tables, *_ = table_config.generate_tables()
+    table_list = table_config.generate_tables()
     model_config = model_selection.create_model_config()
+
     # launch trainers
     run_multi_process_func(
         func=runner,
         world_size=run_option.world_size,
-        tables=tables,
-        weighted_tables=weighted_tables,
+        table_list=table_list,
         run_option=run_option,
         model_config=model_config,
         pipeline_config=pipeline_config,

@@ -16,7 +16,10 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torchrec import EmbeddingCollection
+from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.embedding_types import EmbeddingTableConfig
+from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
+from torchrec.distributed.test_utils.model_input import ListModelInput
 from torchrec.distributed.utils import CopyableMixin
 from torchrec.modules.activation import SwishLayerNorm
 from torchrec.modules.embedding_configs import (
@@ -36,7 +39,12 @@ from torchrec.modules.mc_modules import (
     MCHManagedCollisionModule,
 )
 from torchrec.modules.regroup import KTRegroupAsDict
-from torchrec.sparse.jagged_tensor import _to_offsets, KeyedJaggedTensor, KeyedTensor
+from torchrec.sparse.jagged_tensor import (
+    _to_offsets,
+    JaggedTensor,
+    KeyedJaggedTensor,
+    KeyedTensor,
+)
 from torchrec.streamable import Pipelineable
 
 
@@ -835,6 +843,7 @@ class ModelInput(Pipelineable):
 
 DENSE_LAYER_OUT_SIZE = 8
 OVER_ARCH_OUT_SIZE = 16
+MAX_SEQUENCE_LENGTH = 20
 
 
 def _tables_dim_sum(
@@ -1263,6 +1272,109 @@ class TestOverArchLarge(nn.Module):
         return self.overarch(_concat(dense, values))
 
 
+class TestOverArchMultiEmb(nn.Module):
+    """
+    A simple (but larger) over arch to merge a dense arch and a sparse arch
+    using a KTRegroup module to permute the KT from the sparse arch
+    then call a sequential MLP with the concatenated sparse+dense
+
+    Args:
+        tables: the embedding tables
+        tables: the list of embedding tables
+        dense_arch_out_size: the size of output dense embedding
+        over_arch_out_size: the size of output over arch
+        over_arch_hidden_layers: the number of hidden layers in the MLP
+        device: the device on which this module will be placed.
+
+    Call Args:
+        dense: torch.Tensor, the output of a dense arch
+        sparse: KeyedTensor, the output of a sparse arch
+
+    Returns:
+        torch.Tensor
+
+    Example:
+        over_arch = TestOverArchLarge(tables, weighted_tables)
+
+    """
+
+    def __init__(
+        self,
+        tables: List[Union[List[EmbeddingBagCollection], List[EmbeddingConfig]]],
+        table_options: Optional[List[Dict[str, Any]]] = None,
+        device: Optional[torch.device] = None,
+        dense_arch_out_size: Optional[int] = None,
+        over_arch_out_size: Optional[int] = None,
+        over_arch_hidden_layers: Optional[int] = None,
+    ) -> None:
+        """
+        Args:
+            tables: the embedding tables
+            weighted_tables: the weighted embedding tables
+            embedding_names: the names of the embedding features
+            dense_arch_out_size: the size of output dense embedding
+            over_arch_out_size: the size of output over arch
+            over_arch_hidden_layers: the number of hidden layers in the MLP
+            device: the device on which this module will be placed.
+        """
+        super().__init__()
+        if device is None:
+            device = torch.device("cpu")
+        if dense_arch_out_size is None:
+            dense_arch_out_size = DENSE_LAYER_OUT_SIZE
+        if over_arch_out_size is None:
+            over_arch_out_size = OVER_ARCH_OUT_SIZE
+        if over_arch_hidden_layers is None:
+            over_arch_hidden_layers = 5
+
+        in_features = dense_arch_out_size
+        for idx, table in enumerate(tables):
+            options = table_options[idx] if table_options else {}
+            if isinstance(table[0], EmbeddingConfig):
+                max_sequence_length = options.get(
+                    "max_sequence_length", MAX_SEQUENCE_LENGTH
+                )
+            else:
+                max_sequence_length = 1
+            # pyre-ignore[6]
+            in_features += _tables_dim_sum(table, max_sequence_length)
+
+        out_features = over_arch_out_size
+        layers = [
+            torch.nn.Linear(
+                in_features=in_features,
+                out_features=out_features,
+            ),
+            SwishLayerNorm([out_features]),
+        ]
+
+        for _ in range(over_arch_hidden_layers):
+            layers += [
+                torch.nn.Linear(
+                    in_features=out_features,
+                    out_features=out_features,
+                ),
+                SwishLayerNorm([out_features]),
+            ]
+
+        self.overarch = torch.nn.Sequential(*layers)
+
+    def forward(
+        self,
+        dense: torch.Tensor,
+        sparse: List[KeyedTensor],
+    ) -> torch.Tensor:
+        """
+        Args:
+            dense: torch.Tensor, the output of a dense arch
+            sparse: KeyedTensor, the output of a sparse arch
+
+        Returns:
+            torch.Tensor
+        """
+        return self.overarch(_concat(dense, [kt.values() for kt in sparse]))
+
+
 def _pad_kt_values(
     kt: KeyedTensor,
     batch_size: Optional[int] = None,
@@ -1293,6 +1405,38 @@ def _pad_kt_values(
             ],
             dim=0,
         )
+
+
+@torch.fx.wrap
+def _pad_jt_values(
+    djt: Dict[str, JaggedTensor], max_sequence_length: int
+) -> KeyedTensor:
+    """
+    Pad a Dict[str, JaggedTensor] to the given batch size.
+
+    Args:
+        djt: the Dict[str, JaggedTensor] to pad
+        batch_size: the desired batch size
+        device: the device on which to pad
+
+    Returns:
+        The padded KeyedTensor
+    """
+    keys: List[str] = []
+    length_per_key: List[int] = []
+    values: List[torch.Tensor] = []
+    for key, jt in djt.items():
+        keys.append(key)
+        dim = jt.values().size(1)
+        length_per_key.append(dim)
+
+        padded_embeddings = torch.ops.fbgemm.jagged_2d_to_dense(
+            values=jt.values(),
+            offsets=jt.offsets(),
+            max_sequence_length=max_sequence_length,
+        )
+        values.append(padded_embeddings.view(-1, max_sequence_length * dim))
+    return KeyedTensor.from_tensor_list(keys, values)
 
 
 @torch.fx.wrap
@@ -1484,6 +1628,129 @@ class TestEBCSparseArch(nn.Module):
         return result
 
 
+class TestMultiEmbSparseArch(nn.Module):
+    """
+    A simple sparse arch that wraps three EmbeddingBagCollection modules
+
+    It does not merge the sparse module outputs into a single KeyedTensor.
+
+    Args:
+        tables: List[EmbeddingBagConfig],
+        table_options: Optional[List[Dict[str, Any]]],
+        device: Optional[torch.device],
+
+    Call Args:
+        id_list_features
+        id_score_list_features
+
+    Returns:
+        Tuple[KeyedTensor, Optional[KeyedTensor], Optional[KeyedTensor]]
+
+    Example:
+        sparse_arch = TestMultiEmbSparseArch(tables, weighted_tables)
+        kt_list = sparse_arch(id_list_features, id_score_list_features)
+    """
+
+    def __init__(
+        self,
+        tables: List[Union[List[EmbeddingBagCollection], List[EmbeddingConfig]]],
+        table_options: Optional[List[Dict[str, Any]]] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        if device is None:
+            device = torch.device("cpu")
+        self.embedding_modules = nn.ModuleList()
+        assert table_options is None or len(table_options) == len(tables)
+        self.max_sequence_lengths: Dict[int, int] = {}
+        for idx, table in enumerate(tables):
+            options = table_options[idx] if table_options else {}
+            self.embedding_modules.append(
+                self.create_embedding_module(table, device, **options)
+            )
+            max_sequence_length = options.get(
+                "max_sequence_length", MAX_SEQUENCE_LENGTH
+            )
+            self.max_sequence_lengths[idx] = max_sequence_length
+
+    @classmethod
+    def create_embedding_module(
+        cls,
+        tables: Union[List[EmbeddingBagCollection], List[EmbeddingConfig]],
+        device: Optional[torch.device] = None,
+        is_weighted: bool = False,
+        max_feature_length: Optional[int] = None,
+        max_sequence_length: Optional[int] = None,
+    ) -> nn.Module:
+        if device is None:
+            device = torch.device("cpu")
+        if isinstance(tables[0], EmbeddingConfig):
+            # EC
+            return EmbeddingCollection(
+                tables=cast(List[EmbeddingConfig], tables),
+                device=device,
+            )
+        elif is_weighted:
+            # weighted EBC
+            return EmbeddingBagCollection(
+                tables=cast(List[EmbeddingBagConfig], tables),
+                device=device,
+                is_weighted=True,
+            )
+        elif max_feature_length:
+            # FP_EBC
+            max_feature_lengths: Dict[str, int] = {
+                str(table.name): max_feature_length for table in tables
+            }
+            return FeatureProcessedEmbeddingBagCollection(
+                embedding_bag_collection=EmbeddingBagCollection(
+                    tables=cast(List[EmbeddingBagConfig], tables),
+                    device=device,
+                    is_weighted=True,
+                ),
+                feature_processors=PositionWeightedModuleCollection(
+                    max_feature_lengths=max_feature_lengths,
+                    device=(
+                        device
+                        if device != torch.device("meta")
+                        else torch.device("cpu")
+                    ),
+                ),
+            )
+        else:
+            # EBC
+            return EmbeddingBagCollection(
+                tables=cast(List[EmbeddingBagConfig], tables),
+                device=device,
+            )
+
+    def forward(
+        self,
+        input_list: List[KeyedJaggedTensor],
+        batch_size: Optional[int] = None,
+    ) -> List[KeyedTensor]:
+        """
+        Args:
+            input_list: List[KeyedJaggedTensor],
+            batch_size: Optional[int],
+
+        Returns:
+            List[KeyedTensor]
+        """
+        results: List[KeyedTensor] = []
+
+        for idx, module in enumerate(self.embedding_modules):
+            res = module(input_list[idx])
+            if isinstance(module, ShardedEmbeddingBagCollection):
+                results.append(res)
+            elif isinstance(module, ShardedEmbeddingCollection):
+                results.append(_pad_jt_values(res, self.max_sequence_lengths[idx]))
+            else:
+                raise ValueError(f"Unsupported output type {type(res)}")
+
+        return results
+
+
 class TestSparseNNBase(nn.Module):
     """
     Base class for a SparseNN model.
@@ -1638,6 +1905,49 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
         if self.postproc_module:
             input = self.postproc_module(input)
         return self.dense_forward(input, self.sparse_forward(input))
+
+
+class TestMultiSparseNN(nn.Module):
+    """
+    Simple version of a SparseNN model.
+
+    Args:
+        sparse: nn.Module,
+        dense: nn.Module,
+        over: nn.Module,
+
+    Call Args:
+        input: ModelInput,
+
+    Returns:
+        torch.Tensor
+
+    Example:
+        TestMultiSparseNN()
+    """
+
+    def __init__(self, sparse: nn.Module, dense: nn.Module, over: nn.Module) -> None:
+        super().__init__()
+        self.sparse = sparse
+        self.dense = dense
+        self.over = over
+
+    def forward(
+        self, model_input: ListModelInput
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        sparse_output = self.sparse(model_input.sparse_feature_list)
+        dense_output = self.dense(model_input.float_features)
+        over_output = self.over(dense_output, sparse_output)
+        pred = torch.sigmoid(torch.mean(over_output, dim=1))
+        if self.training:
+            return (
+                torch.nn.functional.binary_cross_entropy_with_logits(
+                    pred, model_input.label
+                ),
+                pred,
+            )
+        else:
+            return pred
 
 
 class TestTowerInteraction(nn.Module):
@@ -2341,7 +2651,28 @@ class TestEBCSparseArchZCH(nn.Module):
 
 
 class TestMixedSequenceOverArch(nn.Module):
-    """Simple overarch that handles both pooled and flattened sequence embeddings"""
+    """
+    Simple overarch that handles both pooled and flattened sequence embeddings
+
+    Args:
+        ebc_tables: List[EmbeddingBagConfig],
+        ec_tables: List[EmbeddingConfig],
+        weighted_tables: List[EmbeddingBagConfig],
+        device: torch.device,
+        max_sequence_length: Optional[int],
+        dense_arch_out_size: Optional[int],
+        over_arch_out_size: Optional[int],
+
+    Call Args:
+        dense: torch.Tensor,
+        sparse: torch.Tensor,
+
+    Returns:
+        torch.Tensor
+
+    Example:
+        >>> TestMixedSequenceOverArch(ebc_tables, ec_tables, weighted_tables, device)
+    """
 
     def __init__(
         self,
@@ -2364,7 +2695,7 @@ class TestMixedSequenceOverArch(nn.Module):
         if device is None:
             device = torch.device("cpu")
         if max_sequence_length is None:
-            max_sequence_length = 20
+            max_sequence_length = MAX_SEQUENCE_LENGTH
         if dense_arch_out_size is None:
             dense_arch_out_size = DENSE_LAYER_OUT_SIZE
         if over_arch_out_size is None:
@@ -2413,7 +2744,7 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
         embedding_groups: Optional[Dict[str, List[str]]] = None,
         dense_device: Optional[torch.device] = None,
         sparse_device: Optional[torch.device] = None,
-        feature_processor_modules: Optional[Dict[str, torch.nn.Module]] = None,
+        max_sequence_length: Optional[int] = None,
         over_arch_clazz: Type[nn.Module] = TestMixedSequenceOverArch,
         device: Optional[torch.device] = None,
     ) -> None:
@@ -2428,6 +2759,7 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
         )
         if device is None:
             device = torch.device("cpu")
+        self.max_sequence_length: int = max_sequence_length or MAX_SEQUENCE_LENGTH
 
         ebc_tables: List[EmbeddingBagConfig] = []
         ec_tables: List[EmbeddingConfig] = []
@@ -2541,8 +2873,8 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
                 torch.ops.fbgemm.jagged_2d_to_dense(
                     values=ec_result[e].values(),
                     offsets=ec_result[e].offsets(),
-                    max_sequence_length=20,
-                ).view(-1, 20 * self.ec_embedding_dim)
+                    max_sequence_length=self.max_sequence_length,
+                ).view(-1, self.max_sequence_length * self.ec_embedding_dim)
                 for e in self._ec_features
             ]
 
