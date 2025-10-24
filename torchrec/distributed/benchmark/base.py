@@ -606,7 +606,7 @@ def _run_benchmark_core(
     output_dir: str,
     pre_gpu_load: int = 0,
     export_stacks: bool = False,
-    reset_accumulated_memory_stats: bool = False,
+    reset_accumulated_memory_stats: bool = True,
     all_rank_traces: bool = False,
     memory_snapshot: bool = False,
 ) -> BenchmarkResult:
@@ -635,23 +635,24 @@ def _run_benchmark_core(
             stats in addition to peak memory stats.
     """
 
+    def _reset_memory_stats() -> None:
+        if device_type != "cuda":
+            return
+        ranks = range(world_size) if rank == -1 else [rank]
+        for di in ranks:
+            torch.cuda.reset_peak_memory_stats(di)
+            if reset_accumulated_memory_stats:
+                torch.cuda.reset_accumulated_memory_stats(di)
+
     # Preparation & memory reset
     if device_type == "cuda":
-        if rank == -1:
-            for di in range(world_size):
-                torch.cuda.reset_peak_memory_stats(di)
-                if reset_accumulated_memory_stats:
-                    torch.cuda.reset_accumulated_memory_stats(di)
-        else:
-            torch.cuda.reset_peak_memory_stats(rank)
-            if reset_accumulated_memory_stats:
-                torch.cuda.reset_accumulated_memory_stats(rank)
-
         # Optional allocator warm-up to create fragmentation similar to production
         if pre_gpu_load:
             _tmp = torch.rand(16384, 16384, device="cuda")
             for _ in range(pre_gpu_load):
                 _tmp = _tmp * torch.rand(16384, 16384, device="cuda")
+
+    _reset_memory_stats()
 
     # Timings
     start_events, end_events, times = [], [], []
@@ -745,6 +746,7 @@ def _run_benchmark_core(
                 )
 
         if memory_snapshot:
+            torch.cuda.empty_cache()
             torch.cuda.memory._record_memory_history(
                 max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
             )
