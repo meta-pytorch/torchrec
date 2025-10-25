@@ -50,6 +50,7 @@ class RecMetricEnum(RecMetricEnumBase):
     CALI_FREE_NE = "cali_free_ne"
     UNWEIGHTED_NE = "unweighted_ne"
     HINDSIGHT_TARGET_PR = "hindsight_target_pr"
+    NMSE = "nmse"
 
 
 @dataclass(unsafe_hash=True, eq=True)

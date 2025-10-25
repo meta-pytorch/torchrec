@@ -90,6 +90,9 @@ class MetricName(MetricNameBase):
 
     EFFECTIVE_SAMPLE_RATE = "effective_sample_rate"
 
+    NMSE = "nmse"
+    NRMSE = "nrmse"
+
 
 class MetricNamespaceBase(StrValueMixin, Enum):
     pass
@@ -147,6 +150,8 @@ class MetricNamespace(MetricNamespaceBase):
     # For example, effective_sample_rate, effective_pos_sample_rate, etc.
     # This is particularly useful for MTML models train with composite pipelines to figure out per-batch blending ratio.
     EFFECTIVE_RATE = "effective_rate"
+
+    NMSE = "nmse"
 
 
 class MetricPrefix(StrValueMixin, Enum):
