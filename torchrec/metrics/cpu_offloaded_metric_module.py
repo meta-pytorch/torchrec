@@ -22,7 +22,7 @@ from torchrec.metrics.metric_job_types import (
     MetricUpdateJob,
     SynchronizationMarker,
 )
-from torchrec.metrics.metric_module import MetricValue, RecMetricModule
+from torchrec.metrics.metric_module import MetricsFuture, MetricValue, RecMetricModule
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.rec_metric import RecMetricException
@@ -254,9 +254,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         )
 
     @override
-    def async_compute(
-        self, future: concurrent.futures.Future[Dict[str, MetricValue]]
-    ) -> None:
+    def async_compute(self) -> MetricsFuture:
         """
         Entry point for asynchronous metric compute. It enqueues a synchronization marker
         to the update queue.
@@ -264,14 +262,16 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         Args:
             future: Pre-created future where the computed metrics will be set.
         """
+        metrics_future = concurrent.futures.Future()
         if self._shutdown_event.is_set():
-            future.set_exception(
+            metrics_future.set_exception(
                 RecMetricException("metric processor thread is shut down.")
             )
-            return
+            return metrics_future
 
-        self.update_queue.put_nowait(SynchronizationMarker(future))
+        self.update_queue.put_nowait(SynchronizationMarker(metrics_future))
         self.update_queue_size_logger.add(self.update_queue.qsize())
+        return metrics_future
 
     def _process_synchronization_marker(
         self, synchronization_marker: SynchronizationMarker
