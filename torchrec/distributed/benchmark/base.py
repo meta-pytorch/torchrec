@@ -633,6 +633,9 @@ def _run_benchmark_core(
         export_stacks: Whether to export flamegraph-compatible stack files.
         reset_accumulated_memory_stats: Whether to reset accumulated memory
             stats in addition to peak memory stats.
+        all_rank_traces: Whether to save traces for all ranks or just rank 0.
+        memory_snapshot: Whether to capture memory snapshot during the profiling
+            ussage: https://docs.pytorch.org/memory_viz
     """
 
     def _reset_memory_stats() -> None:
@@ -914,6 +917,7 @@ def benchmark_func(
         export_stacks: Whether to export flamegraph-compatible stack files.
         all_rank_traces: Whether to export traces from all ranks.
         memory_snapshot: Whether to capture memory snapshot during the profiling
+            ussage: https://docs.pytorch.org/memory_viz
     """
     if benchmark_func_kwargs is None:
         benchmark_func_kwargs = {}
