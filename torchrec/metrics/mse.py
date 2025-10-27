@@ -21,7 +21,7 @@ from torchrec.metrics.rec_metric import (
 
 
 ERROR_SUM = "error_sum"
-WEIGHTED_NUM_SAMPES = "weighted_num_samples"
+WEIGHTED_NUM_SAMPLES = "weighted_num_samples"
 LABEL_SUM = "label_sum"
 LABEL_SQUARED_SUM = "label_squared_sum"
 
@@ -162,7 +162,7 @@ class MSEMetricComputation(RecMetricComputation):
                 metric_prefix=MetricPrefix.WINDOW,
                 value=compute_mse(
                     self.get_window_state(ERROR_SUM),
-                    self.get_window_state(WEIGHTED_NUM_SAMPES),
+                    self.get_window_state(WEIGHTED_NUM_SAMPLES),
                 ),
             ),
             MetricComputationReport(
@@ -170,7 +170,7 @@ class MSEMetricComputation(RecMetricComputation):
                 metric_prefix=MetricPrefix.WINDOW,
                 value=compute_rmse(
                     self.get_window_state(ERROR_SUM),
-                    self.get_window_state(WEIGHTED_NUM_SAMPES),
+                    self.get_window_state(WEIGHTED_NUM_SAMPLES),
                 ),
             ),
         ]
@@ -192,7 +192,7 @@ class MSEMetricComputation(RecMetricComputation):
                     metric_prefix=MetricPrefix.WINDOW,
                     value=compute_r_squared(
                         self.get_window_state(ERROR_SUM),
-                        self.get_window_state(WEIGHTED_NUM_SAMPES),
+                        self.get_window_state(WEIGHTED_NUM_SAMPLES),
                         self.get_window_state(LABEL_SUM),
                         self.get_window_state(LABEL_SQUARED_SUM),
                     ),
