@@ -8,7 +8,7 @@
 # pyre-strict
 
 from dataclasses import dataclass
-from typing import cast, List, Optional, Tuple, Union
+from typing import Any, cast, Dict, List, Optional, Tuple, Union
 
 import torch
 from tensordict import TensorDict
@@ -233,6 +233,27 @@ class ModelInput(Pipelineable):
         ]
 
     @classmethod
+    def generate_float_features(
+        cls,
+        batch_size: int,
+        num_float_features: Optional[int],
+        all_zeros: bool,
+        device: Optional[torch.device],
+    ) -> torch.Tensor:
+        if num_float_features is None:  # for label
+            return (
+                torch.zeros((batch_size,), device=device)
+                if all_zeros
+                else torch.rand((batch_size,), device=device)
+            )
+        else:
+            return (
+                torch.zeros((batch_size, num_float_features), device=device)
+                if all_zeros
+                else torch.rand((batch_size, num_float_features), device=device)
+            )
+
+    @classmethod
     def generate(
         cls,
         batch_size: int = 1,
@@ -270,10 +291,8 @@ class ModelInput(Pipelineable):
         on pinned memory for a fast transfer to gpu. For more on pin_memory:
         https://pytorch.org/tutorials/intermediate/pinmem_nonblock.html#pin-memory
         """
-        float_features = (
-            torch.zeros((batch_size, num_float_features), device=device)
-            if all_zeros
-            else torch.rand((batch_size, num_float_features), device=device)
+        float_features = cls.generate_float_features(
+            batch_size, num_float_features, all_zeros, device
         )
         idlist_features = (
             ModelInput.create_standard_kjt(
@@ -311,11 +330,7 @@ class ModelInput(Pipelineable):
             if weighted_tables is not None and len(weighted_tables) > 0
             else None
         )
-        label = (
-            torch.zeros((batch_size,), device=device)
-            if all_zeros
-            else torch.rand((batch_size,), device=device)
-        )
+        label = cls.generate_float_features(batch_size, None, all_zeros, device)
         if pin_memory:
             # all tensors in `ModelInput` should be on pinned memory otherwise
             # the `_to_copy` (host-to-device) data transfer still blocks cpu execution
@@ -555,17 +570,99 @@ class ModelInput(Pipelineable):
         return global_kjt, local_kjts
 
 
-# @dataclass
-# class VbModelInput(ModelInput):
-#     pass
+@dataclass
+class ListModelInput(ModelInput):
+    sparse_feature_list: List[KeyedJaggedTensor]
 
-#     @staticmethod
-#     def _create_variable_batch_kjt() -> KeyedJaggedTensor:
-#         pass
+    def to(self, device: torch.device, non_blocking: bool = False) -> "ListModelInput":
+        return ListModelInput(
+            float_features=self.float_features.to(
+                device=device, non_blocking=non_blocking
+            ),
+            idlist_features=(
+                self.idlist_features.to(device=device, non_blocking=non_blocking)
+                if self.idlist_features is not None
+                else None
+            ),
+            idscore_features=(
+                self.idscore_features.to(device=device, non_blocking=non_blocking)
+                if self.idscore_features is not None
+                else None
+            ),
+            label=self.label.to(device=device, non_blocking=non_blocking),
+            sparse_feature_list=[
+                kjt.to(device=device, non_blocking=non_blocking)
+                for kjt in self.sparse_feature_list
+            ],
+        )
 
-#     @staticmethod
-#     def _merge_variable_batch_kjts(kjts: List[KeyedJaggedTensor]) -> KeyedJaggedTensor:
-#         pass
+    @classmethod
+    def generate(  # pyre-ignore[14]
+        cls,
+        batch_size: int,
+        tables: List[
+            Union[
+                List[EmbeddingTableConfig],
+                List[EmbeddingBagConfig],
+                List[EmbeddingConfig],
+            ]
+        ],
+        num_float_features: int = 16,
+        pooling_avg: int = 10,
+        tables_pooling: Optional[List[int]] = None,
+        max_feature_lengths: Optional[List[int]] = None,
+        use_offsets: bool = False,
+        device: Optional[torch.device] = None,
+        indices_dtype: torch.dtype = torch.int64,
+        offsets_dtype: torch.dtype = torch.int64,
+        lengths_dtype: torch.dtype = torch.int64,
+        all_zeros: bool = False,
+        pin_memory: bool = False,  # pin_memory is needed for training job qps benchmark
+        table_options: Optional[List[Dict[str, Any]]] = None,
+    ) -> "ListModelInput":
+        kjt_list: List[KeyedJaggedTensor] = []
+        for idx, table in enumerate(tables):
+            option = table_options[idx] if table_options else {}
+            kjt = ModelInput.create_standard_kjt(
+                batch_size=batch_size,
+                tables=table,
+                pooling_avg=option.get("pooling_avg", pooling_avg),
+                tables_pooling=option.get("tables_pooling", tables_pooling),
+                weighted=(
+                    option.get("is_weighted", False)
+                    in (True, "is_weighted", "1", "true", "True")
+                ),
+                max_feature_lengths=option.get(
+                    "max_feature_lengths", max_feature_lengths
+                ),
+                use_offsets=option.get("use_offsets", use_offsets),
+                device=device,
+                indices_dtype=option.get("indices_dtype", indices_dtype),
+                offsets_dtype=option.get("offsets_dtype", offsets_dtype),
+                lengths_dtype=option.get("lengths_dtype", lengths_dtype),
+                all_zeros=option.get("all_zeros", all_zeros),
+            )
+            kjt = kjt.pin_memory() if pin_memory else kjt
+            kjt_list.append(kjt)
+
+        float_features = cls.generate_float_features(
+            batch_size=batch_size,
+            num_float_features=num_float_features,
+            all_zeros=all_zeros,
+            device=device,
+        )
+        label = cls.generate_float_features(batch_size, None, all_zeros, device)
+
+        if pin_memory:
+            float_features = float_features.pin_memory()
+            label = label.pin_memory()
+        return ListModelInput(
+            float_features=float_features,
+            idlist_features=None,
+            idscore_features=None,
+            label=label,
+            sparse_feature_list=kjt_list,
+        )
 
 
 @dataclass

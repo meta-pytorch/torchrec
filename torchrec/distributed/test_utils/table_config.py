@@ -8,9 +8,9 @@
 # pyre-strict
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
-from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.types import DataType
 
 
@@ -39,11 +39,19 @@ class EmbeddingTablesConfig:
     table_data_type: DataType = DataType.FP32
     additional_tables: List[List[Dict[str, Any]]] = field(default_factory=list)
 
-    def convert_to_ebconf(self, kwargs: Dict[str, Any]) -> EmbeddingBagConfig:
+    def convert_to_ebconf(
+        self, kwargs: Dict[str, Any]
+    ) -> Union[EmbeddingConfig, EmbeddingBagConfig]:
         if "data_type" in kwargs:
             kwargs["data_type"] = DataType[kwargs["data_type"]]
         else:
             kwargs["data_type"] = self.table_data_type
+        if "config_class" in kwargs:
+            config_class = kwargs.pop("config_class")
+            if config_class == "EmbeddingConfig":
+                return EmbeddingConfig(**kwargs)
+            elif config_class != "EmbeddingBagConfig":
+                raise ValueError(f"Unknown config class: {config_class}")
         return EmbeddingBagConfig(**kwargs)
 
     def generate_tables(
@@ -99,6 +107,7 @@ class EmbeddingTablesConfig:
                 tables = []
             for adt in adts:
                 tables.append(self.convert_to_ebconf(adt))
+            tables_list.append(tables)
 
         if len(tables_list) == 0:
             tables_list.append(unweighted_tables)

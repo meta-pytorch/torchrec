@@ -8,12 +8,16 @@
 # pyre-strict
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import torch
-from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_configs import (
+    EmbeddingBagConfig,
+    EmbeddingConfig,
+    EmbeddingTableConfig,
+)
 
-from .model_input import ModelInput
+from .model_input import ListModelInput, ModelInput
 
 
 @dataclass
@@ -31,7 +35,7 @@ class ModelInputConfig:
     long_kjt_lengths: bool = True
     pin_memory: bool = True
 
-    def generate_batches(
+    def generate_std_batches(
         self,
         tables: List[EmbeddingBagConfig],
         weighted_tables: List[EmbeddingBagConfig],
@@ -60,6 +64,45 @@ class ModelInputConfig:
                 offsets_dtype=(torch.int64 if self.long_kjt_offsets else torch.int32),
                 lengths_dtype=(torch.int64 if self.long_kjt_lengths else torch.int32),
                 pin_memory=self.pin_memory,
+            )
+            for batch_size in range(self.num_batches)
+        ]
+
+    def generate_list_batches(
+        self,
+        tables: List[
+            Union[
+                List[EmbeddingTableConfig],
+                List[EmbeddingBagConfig],
+                List[EmbeddingConfig],
+            ]
+        ],
+        table_options: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[ListModelInput]:
+        """
+        Generate model input data for benchmarking.
+
+        Args:
+            tables: List of embedding tables
+
+        Returns:
+            A list of ModelInput objects representing the generated batches
+        """
+        device = torch.device(self.device) if self.device is not None else None
+
+        return [
+            ListModelInput.generate(
+                batch_size=self.batch_size,
+                tables=tables,
+                num_float_features=self.num_float_features,
+                pooling_avg=self.feature_pooling_avg,
+                use_offsets=self.use_offsets,
+                device=device,
+                indices_dtype=(torch.int64 if self.long_kjt_indices else torch.int32),
+                offsets_dtype=(torch.int64 if self.long_kjt_offsets else torch.int32),
+                lengths_dtype=(torch.int64 if self.long_kjt_lengths else torch.int32),
+                pin_memory=self.pin_memory,
+                table_options=table_options,
             )
             for batch_size in range(self.num_batches)
         ]

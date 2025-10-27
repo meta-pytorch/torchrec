@@ -31,7 +31,11 @@ from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
 from torchrec.distributed.sharding_plan import get_default_sharders
 from torchrec.distributed.test_utils.test_model import (
+    TestDenseArch,
+    TestMultiEmbSparseArch,
+    TestMultiSparseNN,
     TestOverArchLarge,
+    TestOverArchMultiEmb,
     TestSparseNN,
     TestTowerCollectionSparseNN,
     TestTowerSparseNN,
@@ -39,7 +43,7 @@ from torchrec.distributed.test_utils.test_model import (
 from torchrec.distributed.types import ShardingEnv
 from torchrec.models.deepfm import SimpleDeepFMNNWrapper
 from torchrec.models.dlrm import DLRMWrapper
-from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
 
@@ -213,6 +217,44 @@ class DLRMConfig(BaseModelConfig):
         )
 
 
+@dataclass
+class DLSeqConfig(BaseModelConfig):
+    """Configuration for DLRM model."""
+
+    table_options: Optional[List[Dict[str, Any]]] = None
+    dense_arch_out_size: Optional[int] = None
+    dense_arch_layer_sizes: Optional[List[int]] = None
+    over_arch_out_size: Optional[int] = None
+    over_arch_hidden_layers: Optional[int] = None
+
+    # pyre-ignore[14]
+    def generate_model(
+        self,
+        tables: List[Union[List[EmbeddingBagCollection], List[EmbeddingConfig]]],
+        device: Optional[torch.device] = None,
+        **kwargs: Any,
+    ) -> nn.Module:
+        if device is None:
+            device = torch.device("cpu")
+
+        # DLRM only uses unweighted tables
+        sparse = TestMultiEmbSparseArch(tables, self.table_options, device=device)
+        dense = TestDenseArch(
+            self.num_float_features,
+            device=device,
+            dense_arch_hidden_sizes=self.dense_arch_layer_sizes,
+            dense_arch_out_size=self.dense_arch_out_size,
+        )
+        over = TestOverArchMultiEmb(
+            tables,
+            device=device,
+            dense_arch_out_size=self.dense_arch_out_size,
+            over_arch_out_size=self.over_arch_out_size,
+            over_arch_hidden_layers=self.over_arch_hidden_layers,
+        )
+        return TestMultiSparseNN(sparse, dense, over)
+
+
 # pyre-ignore[2]: Missing parameter annotation
 def create_model_config(model_name: str, **kwargs) -> BaseModelConfig:
     """
@@ -334,6 +376,8 @@ class ModelSelectionConfig:
                 return DeepFMConfig
             case "dlrm":
                 return DLRMConfig
+            case "dlseq":
+                return DLSeqConfig
             case _:
                 raise ValueError(f"Unknown model name: {self.model_name}")
 
