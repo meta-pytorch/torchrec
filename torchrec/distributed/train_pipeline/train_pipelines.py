@@ -110,6 +110,8 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
         # pipeline state such as in foward, in backward etc, used in training recover scenarios
         self._state: PipelineState = PipelineState.IDLE
 
+        logger.info(f"TrainPipeline class: {type(self)}")
+
     def sync_embeddings(
         self,
         model: torch.nn.Module,
