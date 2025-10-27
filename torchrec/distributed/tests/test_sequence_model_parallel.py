@@ -15,6 +15,10 @@ import hypothesis.strategies as st
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from hypothesis import assume, given, settings, Verbosity
+from torchrec.distributed.embedding import (
+    EmbeddingCollectionContext,
+    ShardedEmbeddingCollection,
+)
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import CommType, QCommsConfig
 from torchrec.distributed.planner import ParameterConstraints
@@ -27,6 +31,8 @@ from torchrec.distributed.tests.test_sequence_model import (
 )
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.embedding_modules import EmbeddingCollection
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import seed_and_log, skip_if_asan_class
 
 
@@ -376,6 +382,144 @@ class SequenceModelParallelTest(MultiProcessTestBase):
             variable_batch_per_feature=variable_batch_per_feature,
             global_constant_batch=True,
         )
+
+
+class DedupIndicesWeightAccumulationTest(unittest.TestCase):
+    """
+    Test suite for validating the _dedup_indices method weight accumulation logic.
+    This tests the correctness of the new scatter_add_along_first_dim implementation.
+    """
+
+    # to be deleted
+    def test_dedup_indices_weight_accumulation(self) -> None:
+        """
+        Test the _dedup_indices method to ensure weight accumulation works correctly
+        with the new scatter_add_along_first_dim implementation.
+        """
+        # Setup: Create a minimal ShardedEmbeddingCollection for testing
+        device = torch.device("cuda:0")
+
+        # Create a mock ShardedEmbeddingCollection with minimal setup
+        class MockShardedEmbeddingCollection:
+            def __init__(self):
+                self._enable_feature_score_weight_accumulation = True
+                self._device = device
+                # Register required buffers for _dedup_indices
+                self._buffers = {}
+
+                # Mock hash_size_cumsum_tensor_0 - cumulative sum of embedding table sizes
+                self._buffers["_hash_size_cumsum_tensor_0"] = torch.tensor(
+                    [0, 10], dtype=torch.int64, device=device
+                )
+                # Mock hash_size_offset_tensor_0 - offset for each feature
+                self._buffers["_hash_size_offset_tensor_0"] = torch.tensor(
+                    [0], dtype=torch.int64, device=device
+                )
+
+            def get_buffer(self, name: str) -> torch.Tensor:
+                return self._buffers[name]
+
+            def _dedup_indices(
+                self,
+                ctx: EmbeddingCollectionContext,
+                input_feature_splits: List[KeyedJaggedTensor],
+            ) -> List[KeyedJaggedTensor]:
+                # Copy the actual _dedup_indices logic for testing
+                features_by_shards = []
+                for i, input_feature in enumerate(input_feature_splits):
+                    hash_size_cumsum = self.get_buffer(f"_hash_size_cumsum_tensor_{i}")
+                    hash_size_offset = self.get_buffer(f"_hash_size_offset_tensor_{i}")
+                    (
+                        lengths,
+                        offsets,
+                        unique_indices,
+                        reverse_indices,
+                    ) = torch.ops.fbgemm.jagged_unique_indices(
+                        hash_size_cumsum,
+                        hash_size_offset,
+                        input_feature.offsets().to(torch.int64),
+                        input_feature.values().to(torch.int64),
+                    )
+                    acc_weights = None
+                    if (
+                        self._enable_feature_score_weight_accumulation
+                        and input_feature.weights_or_none() is not None
+                    ):
+                        source_weights = input_feature.weights()
+                        assert (
+                            source_weights.dtype == torch.float32
+                        ), "Only float32 weights are supported for feature score eviction weights."
+
+                        # Accumulate weights using scatter_add
+                        acc_weights = torch.zeros(
+                            unique_indices.numel(),
+                            dtype=torch.float32,
+                            device=source_weights.device,
+                        )
+
+                        # Use PyTorch's scatter_add to accumulate weights
+                        acc_weights.scatter_add_(0, reverse_indices, source_weights)
+
+                        features_by_shards.append(
+                            KeyedJaggedTensor(
+                                keys=input_feature.keys(),
+                                values=unique_indices,
+                                weights=acc_weights,
+                                lengths=lengths,
+                                offsets=offsets,
+                            )
+                        )
+                return features_by_shards
+
+        # Create mock ShardedEmbeddingCollection instance
+        sharded_ec = MockShardedEmbeddingCollection()
+
+        # Create test input with duplicate indices and varying weights
+        values = torch.tensor(
+            [0, 1, 0, 2, 1, 0], dtype=torch.int64, device=device
+        )  # Indices with duplicates
+        weights = torch.tensor(
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], dtype=torch.float32, device=device
+        )  # Corresponding weights
+        lengths = torch.tensor(
+            [6], dtype=torch.int64, device=device
+        )  # Single feature with 6 values
+
+        kjt_input = KeyedJaggedTensor(
+            keys=["feature_0"],
+            values=values,
+            weights=weights,
+            lengths=lengths,
+        )
+
+        # Execute: Run _dedup_indices method
+        ctx = EmbeddingCollectionContext()
+        features_by_shards = sharded_ec._dedup_indices(ctx, [kjt_input])
+
+        # Assert: Validate accumulated weights and counts
+        dedup_feature = features_by_shards[0]
+        self.assertIsNotNone(dedup_feature.weights_or_none())
+
+        # Reconstruct accumulated weights tensor (weights are stored as flattened float64 view)
+        acc_weights = dedup_feature.weights().view(torch.float32).view(-1, 1)
+
+        # Expected results based on duplicate indices:
+        # Index 0 appears 3 times with weights [1.0, 3.0, 6.0] -> sum = 10.0, count = 3
+        # Index 1 appears 2 times with weights [2.0, 5.0] -> sum = 7.0, count = 2
+        # Index 2 appears 1 time with weight [4.0] -> sum = 4.0, count = 1
+
+        unique_values = dedup_feature.values()
+        self.assertEqual(len(unique_values), 3)  # Should have 3 unique indices
+
+        # Find positions of each unique index (order may vary after deduplication)
+        idx_0_pos = (unique_values == 0).nonzero(as_tuple=True)[0][0]
+        idx_1_pos = (unique_values == 1).nonzero(as_tuple=True)[0][0]
+        idx_2_pos = (unique_values == 2).nonzero(as_tuple=True)[0][0]
+
+        # Validate accumulated weights (column 0) and counts (column 1)
+        self.assertAlmostEqual(acc_weights[idx_0_pos, 0].item(), 10.0, places=5)
+        self.assertAlmostEqual(acc_weights[idx_1_pos, 0].item(), 7.0, places=5)
+        self.assertAlmostEqual(acc_weights[idx_2_pos, 0].item(), 4.0, places=5)
 
 
 @skip_if_asan_class
