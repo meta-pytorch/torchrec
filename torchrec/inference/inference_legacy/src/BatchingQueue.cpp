@@ -97,13 +97,14 @@ void BatchingQueue::add(
                            promise = std::move(promise),
                            addedTime = addedTime](auto& queue) mutable {
     const auto batchSize = request->batch_size;
-    queue.push(QueryQueueEntry{
-        std::move(request),
-        RequestContext{
-            batchSize,
-            std::move(promise),
-            folly::RequestContext::saveContext()},
-        addedTime});
+    queue.push(
+        QueryQueueEntry{
+            std::move(request),
+            RequestContext{
+                batchSize,
+                std::move(promise),
+                folly::RequestContext::saveContext()},
+            addedTime});
   });
 }
 
@@ -165,10 +166,11 @@ void BatchingQueue::createBatch() {
           config_.batchingInterval))) {
       const auto requestsCount = requests.size();
 
-      batchingQueues_[roundRobinIdx++]->blockingWrite(BatchingQueueEntry{
-          .requests = std::move(requests),
-          .contexts = std::move(contexts),
-          .addedTime = *startTime});
+      batchingQueues_[roundRobinIdx++]->blockingWrite(
+          BatchingQueueEntry{
+              .requests = std::move(requests),
+              .contexts = std::move(contexts),
+              .addedTime = *startTime});
 
       observer_->addRequestsCount(requestsCount);
       observer_->recordBatchCreationLatency(
@@ -192,8 +194,9 @@ void BatchingQueue::createBatch() {
 
 void BatchingQueue::pinMemory(int gpuIdx) {
   at::cuda::CUDAGuard deviceGuard(gpuIdx);
-  at::cuda::CUDAStreamGuard streamGuard(at::cuda::getStreamFromPool(
-      /* isHighPriority */ FLAGS_batching_queue_use_high_pri_stream));
+  at::cuda::CUDAStreamGuard streamGuard(
+      at::cuda::getStreamFromPool(
+          /* isHighPriority */ FLAGS_batching_queue_use_high_pri_stream));
   if (config_.warmupFn) {
     config_.warmupFn();
   }
@@ -295,14 +298,15 @@ void BatchingQueue::pinMemory(int gpuIdx) {
 
         for (auto& [featureName, metadata] : config_.batchingMetadata) {
           const auto batchingFuncStart = std::chrono::steady_clock::now();
-          combineForwardArgs(batchingFuncs_[metadata.type]->batch(
-              featureName,
-              requests,
-              combinedBatchSize,
-              batchOffsetsLazy,
-              metadata.device == "cpu" ? c10::Device(c10::kCPU)
-                                       : c10::Device(c10::kCUDA, gpuIdx),
-              batchItemsLazy));
+          combineForwardArgs(
+              batchingFuncs_[metadata.type]->batch(
+                  featureName,
+                  requests,
+                  combinedBatchSize,
+                  batchOffsetsLazy,
+                  metadata.device == "cpu" ? c10::Device(c10::kCPU)
+                                           : c10::Device(c10::kCUDA, gpuIdx),
+                  batchItemsLazy));
           observer_->recordBatchingFuncLatency(
               getTimeElapsedMS(batchingFuncStart).count(), metadata.type);
         }

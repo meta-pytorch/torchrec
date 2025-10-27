@@ -50,10 +50,11 @@ class LocalShardList : public torch::CustomClassHolder {
       int64_t col_size,
       c10::intrusive_ptr<TensorList> tensors) {
     // col_start/col_size not used for now.
-    shards_.emplace_back(LocalShard{
-        .row_start_ = row_start,
-        .row_size_ = row_size,
-        .tensors_ = std::move(tensors)});
+    shards_.emplace_back(
+        LocalShard{
+            .row_start_ = row_start,
+            .row_size_ = row_size,
+            .tensors_ = std::move(tensors)});
   }
 
   Container::const_iterator begin() const {

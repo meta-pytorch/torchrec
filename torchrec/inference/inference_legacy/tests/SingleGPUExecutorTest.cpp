@@ -74,8 +74,9 @@ TEST(TorchDeployGPUTest, SimpleModelSingleGPU) {
     folly::Promise<std::unique_ptr<torchrec::PredictionResponse>> promise;
     auto future = promise.getSemiFuture();
 
-    executor->schedule(std::make_shared<torchrec::PredictionBatch>(
-        "forward", inputs, std::move(promise)));
+    executor->schedule(
+        std::make_shared<torchrec::PredictionBatch>(
+            "forward", inputs, std::move(promise)));
 
     auto forward_result_0 = std::move(future).get()->predictions.toTensor();
     auto expected = example_inputs[0].toTensor() + at::ones({10, 20});
@@ -89,8 +90,9 @@ TEST(TorchDeployGPUTest, SimpleModelSingleGPU) {
 
     std::vector<c10::IValue> set_weight_inputs = {at::zeros({10, 20})};
 
-    executor->schedule(std::make_shared<torchrec::PredictionBatch>(
-        "set_weight", set_weight_inputs, std::move(promise)));
+    executor->schedule(
+        std::make_shared<torchrec::PredictionBatch>(
+            "set_weight", set_weight_inputs, std::move(promise)));
 
     auto predictionResponse = std::move(future).get();
   }
@@ -100,8 +102,9 @@ TEST(TorchDeployGPUTest, SimpleModelSingleGPU) {
     folly::Promise<std::unique_ptr<torchrec::PredictionResponse>> promise;
     auto future = promise.getSemiFuture();
 
-    executor->schedule(std::make_shared<torchrec::PredictionBatch>(
-        "forward", inputs, std::move(promise)));
+    executor->schedule(
+        std::make_shared<torchrec::PredictionBatch>(
+            "forward", inputs, std::move(promise)));
 
     auto forward_result_1 = std::move(future).get()->predictions.toTensor();
     auto expected = example_inputs[0].toTensor();
@@ -116,8 +119,9 @@ c10::IValue execute(
   folly::Promise<std::unique_ptr<torchrec::PredictionResponse>> promise;
   auto future = promise.getSemiFuture();
 
-  executor.schedule(std::make_shared<torchrec::PredictionBatch>(
-      methodName, std::move(args), std::move(promise)));
+  executor.schedule(
+      std::make_shared<torchrec::PredictionBatch>(
+          methodName, std::move(args), std::move(promise)));
   return std::move(future).get()->predictions;
 }
 

@@ -166,11 +166,12 @@ void GPUExecutor::process(int idx) {
   c10::InferenceMode inferenceModeGuard;
   std::vector<c10::cuda::CUDAStream> streams;
   for (size_t i = 0; i < worldSize_; ++i) {
-    streams.push_back(at::cuda::getStreamFromPool(
-        /* isHighPriority */ i == rank_
-            ? FLAGS_gpu_executor_use_high_pri_stream_main_device
-            : FLAGS_gpu_executor_use_high_pri_stream_peer_device,
-        i));
+    streams.push_back(
+        at::cuda::getStreamFromPool(
+            /* isHighPriority */ i == rank_
+                ? FLAGS_gpu_executor_use_high_pri_stream_main_device
+                : FLAGS_gpu_executor_use_high_pri_stream_peer_device,
+            i));
   }
   at::cuda::CUDAMultiStreamGuard streamGuard(streams);
   at::cuda::CUDAGuard deviceGuard(rank_);

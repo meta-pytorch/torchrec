@@ -142,8 +142,9 @@ void Redis::start_thread() {
 void Redis::heartbeat(helper::ContextPtr& connection) {
   for (uint32_t retry = 0; retry < opt_.retry_limit; ++retry) {
     try {
-      auto reply = helper::ReplyPtr(reinterpret_cast<redisReply*>(
-          redisCommand(connection.get(), "PING")));
+      auto reply = helper::ReplyPtr(
+          reinterpret_cast<redisReply*>(
+              redisCommand(connection.get(), "PING")));
       TORCH_CHECK(
           reply && reply->type == REDIS_REPLY_STRING,
           "Ping should return string");
@@ -161,7 +162,7 @@ helper::ContextPtr Redis::connect() const {
   if (opt_.timeout_ms == 0) {
     connection = helper::ContextPtr(redisConnect(opt_.host.c_str(), opt_.port));
   } else {
-    struct timeval interval {};
+    struct timeval interval{};
     interval.tv_sec = opt_.timeout_ms / 1000;
     interval.tv_usec = opt_.timeout_ms % 1000 * 1000;
     connection = helper::ContextPtr(
@@ -177,21 +178,24 @@ helper::ContextPtr Redis::connect() const {
   if (!opt_.password.empty()) {
     helper::ReplyPtr reply;
     if (opt_.username.empty()) {
-      reply = helper::ReplyPtr(reinterpret_cast<redisReply*>(
-          redisCommand(connection.get(), "AUTH %s", opt_.password.c_str())));
+      reply = helper::ReplyPtr(
+          reinterpret_cast<redisReply*>(redisCommand(
+              connection.get(), "AUTH %s", opt_.password.c_str())));
     } else {
-      reply = helper::ReplyPtr(reinterpret_cast<redisReply*>(redisCommand(
-          connection.get(),
-          "AUTH %s %s",
-          opt_.username.c_str(),
-          opt_.password.c_str())));
+      reply = helper::ReplyPtr(
+          reinterpret_cast<redisReply*>(redisCommand(
+              connection.get(),
+              "AUTH %s %s",
+              opt_.username.c_str(),
+              opt_.password.c_str())));
     }
     check_status("auth error", connection, reply);
   }
 
   if (opt_.db != 0) {
-    auto reply = helper::ReplyPtr(reinterpret_cast<redisReply*>(
-        redisCommand(connection.get(), "SELECT %d", opt_.db)));
+    auto reply = helper::ReplyPtr(
+        reinterpret_cast<redisReply*>(
+            redisCommand(connection.get(), "SELECT %d", opt_.db)));
     check_status("select db error", connection, reply);
   }
 
