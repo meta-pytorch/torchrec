@@ -38,13 +38,14 @@ TORCH_LIBRARY(tde, m) {
   m.class_<FetchHandle>("FetchHandle").def("wait", &FetchHandle::Wait);
 
   m.class_<PS>("PS")
-      .def(torch::init<
-           std::string,
-           c10::intrusive_ptr<LocalShardList>,
-           int64_t,
-           int64_t,
-           std::string,
-           int64_t>())
+      .def(
+          torch::init<
+              std::string,
+              c10::intrusive_ptr<LocalShardList>,
+              int64_t,
+              int64_t,
+              std::string,
+              int64_t>())
       .def("fetch", &PS::Fetch)
       .def("evict", &PS::Evict);
 }

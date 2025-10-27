@@ -92,9 +92,10 @@ struct DB {
 
 struct Prefix {
   constexpr static auto rule = LEXY_LIT("prefix=") >>
-      dsl::capture(dsl::token(dsl::identifier(
-          dsl::ascii::alpha_underscore,
-          dsl::ascii::alpha_digit_underscore)));
+      dsl::capture(dsl::token(
+          dsl::identifier(
+              dsl::ascii::alpha_underscore,
+              dsl::ascii::alpha_digit_underscore)));
   constexpr static auto value =
       lexy::callback<PrefixOpt>([](auto&& str) -> PrefixOpt {
         return PrefixOpt{std::string(str.data(), str.size())};
@@ -263,8 +264,9 @@ void RedisV1::StartThread() {
 void RedisV1::HeartBeat(redis::ContextPtr& connection) {
   for (uint32_t retry = 0; retry < opt_.retry_limit_; ++retry) {
     try {
-      auto reply = redis::ReplyPtr(reinterpret_cast<redisReply*>(
-          redisCommand(connection.get(), "PING")));
+      auto reply = redis::ReplyPtr(
+          reinterpret_cast<redisReply*>(
+              redisCommand(connection.get(), "PING")));
       TORCH_CHECK(
           reply && reply->type == REDIS_REPLY_STRING,
           "Ping should return string");
@@ -283,7 +285,7 @@ redis::ContextPtr RedisV1::Connect() const {
     connection =
         redis::ContextPtr(redisConnect(opt_.host_.c_str(), opt_.port_));
   } else {
-    struct timeval interval {};
+    struct timeval interval{};
     interval.tv_sec = opt_.timeout_ms_ / 1000;
     interval.tv_usec = opt_.timeout_ms_ % 1000 * 1000;
     connection = redis::ContextPtr(
@@ -299,21 +301,24 @@ redis::ContextPtr RedisV1::Connect() const {
   if (!opt_.password_.empty()) {
     redis::ReplyPtr reply;
     if (opt_.username_.empty()) {
-      reply = redis::ReplyPtr(reinterpret_cast<redisReply*>(
-          redisCommand(connection.get(), "AUTH %s", opt_.password_.c_str())));
+      reply = redis::ReplyPtr(
+          reinterpret_cast<redisReply*>(redisCommand(
+              connection.get(), "AUTH %s", opt_.password_.c_str())));
     } else {
-      reply = redis::ReplyPtr(reinterpret_cast<redisReply*>(redisCommand(
-          connection.get(),
-          "AUTH %s %s",
-          opt_.username_.c_str(),
-          opt_.password_.c_str())));
+      reply = redis::ReplyPtr(
+          reinterpret_cast<redisReply*>(redisCommand(
+              connection.get(),
+              "AUTH %s %s",
+              opt_.username_.c_str(),
+              opt_.password_.c_str())));
     }
     CheckStatus("auth error", connection, reply);
   }
 
   if (opt_.db_ != 0) {
-    auto reply = redis::ReplyPtr(reinterpret_cast<redisReply*>(
-        redisCommand(connection.get(), "SELECT %d", opt_.db_)));
+    auto reply = redis::ReplyPtr(
+        reinterpret_cast<redisReply*>(
+            redisCommand(connection.get(), "SELECT %d", opt_.db_)));
     CheckStatus("select db error", connection, reply);
   }
 

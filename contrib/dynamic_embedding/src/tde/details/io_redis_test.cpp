@@ -43,12 +43,18 @@ TEST(TDE, IO_redis) {
       torch::kF32,
       [&](std::vector<torch::Tensor> val) {
         ASSERT_EQ(val.size(), 3);
-        ASSERT_TRUE(val[0].allclose(
-            torch::tensor({1, 2}, torch::TensorOptions().dtype(torch::kF32))));
-        ASSERT_TRUE(val[1].allclose(
-            torch::tensor({3, 4}, torch::TensorOptions().dtype(torch::kF32))));
-        ASSERT_TRUE(val[2].allclose(
-            torch::tensor({5, 9}, torch::TensorOptions().dtype(torch::kF32))));
+        ASSERT_TRUE(
+            val[0].allclose(
+                torch::tensor(
+                    {1, 2}, torch::TensorOptions().dtype(torch::kF32))));
+        ASSERT_TRUE(
+            val[1].allclose(
+                torch::tensor(
+                    {3, 4}, torch::TensorOptions().dtype(torch::kF32))));
+        ASSERT_TRUE(
+            val[2].allclose(
+                torch::tensor(
+                    {5, 9}, torch::TensorOptions().dtype(torch::kF32))));
 
         notification.Done();
       });

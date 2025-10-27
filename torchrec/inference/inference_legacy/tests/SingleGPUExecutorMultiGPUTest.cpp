@@ -46,8 +46,9 @@ c10::IValue execute(
   folly::Promise<std::unique_ptr<torchrec::PredictionResponse>> promise;
   auto future = promise.getSemiFuture();
 
-  executor.schedule(std::make_shared<torchrec::PredictionBatch>(
-      methodName, std::move(args), std::move(promise)));
+  executor.schedule(
+      std::make_shared<torchrec::PredictionBatch>(
+          methodName, std::move(args), std::move(promise)));
   return std::move(future).get()->predictions;
 }
 
@@ -92,10 +93,11 @@ TEST(TorchDeployGPUTest, SimpleModel_multiGPU) {
   std::vector<std::unique_ptr<torchrec::SingleGPUExecutor>> workExecutors;
   for (size_t i = 0; i < numGpu; i++) {
     const std::vector<size_t> interp_idxs = {static_cast<size_t>(i)};
-    workExecutors.push_back(std::make_unique<torchrec::SingleGPUExecutor>(
-        manager,
-        torchrec::SingleGPUExecutor::ExecInfos{{i, numGpu + i, models[i]}},
-        numGpu));
+    workExecutors.push_back(
+        std::make_unique<torchrec::SingleGPUExecutor>(
+            manager,
+            torchrec::SingleGPUExecutor::ExecInfos{{i, numGpu + i, models[i]}},
+            numGpu));
   }
 
   std::vector<torchrec::SingleGPUExecutor::ExecInfo> execInfos;

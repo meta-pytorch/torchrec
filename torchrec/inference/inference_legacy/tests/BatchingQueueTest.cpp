@@ -95,9 +95,10 @@ TEST(BatchingQueueTest, Basic) {
       2 * (2 + 4), value->forwardArgs.at("cpu_features").toTensor().numel());
   ASSERT_EQ(
       value->forwardArgs.at("cpu_features").toTensor().device(), at::kCPU);
-  ASSERT_TRUE(at::allclose(
-      value->forwardArgs.at("cuda_features").toTensor().cpu(),
-      value->forwardArgs.at("cpu_features").toTensor()));
+  ASSERT_TRUE(
+      at::allclose(
+          value->forwardArgs.at("cuda_features").toTensor().cpu(),
+          value->forwardArgs.at("cpu_features").toTensor()));
 }
 
 TEST(BatchingQueueTest, MaxBatchSize) {

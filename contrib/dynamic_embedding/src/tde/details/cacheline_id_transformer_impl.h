@@ -40,9 +40,10 @@ inline CachelineIDTransformer<
     : num_groups_(
           ((capacity == 0 ? 2 * num_embedding : capacity) + group_size_ - 1) /
           group_size_) /*capacity by default is 2 * num_embedding */,
-      cache_values_(reinterpret_cast<CacheValue*>(alignMalloc(
-          CachelineSize,
-          sizeof(CacheValue) * num_groups_ * group_size_))),
+      cache_values_(
+          reinterpret_cast<CacheValue*>(alignMalloc(
+              CachelineSize,
+              sizeof(CacheValue) * num_groups_ * group_size_))),
       bitmap_(num_embedding) {
   memset(
       cache_values_.get(), 0, sizeof(CacheValue) * num_groups_ * group_size_);

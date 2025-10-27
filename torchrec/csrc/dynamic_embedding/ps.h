@@ -65,10 +65,11 @@ class LocalShardList : public torch::CustomClassHolder {
       int64_t col_size,
       std::vector<torch::Tensor> tensors) {
     // col_start/col_size not supported now.
-    shards_.emplace_back(LocalShard{
-        .row_start = row_start,
-        .row_size = row_size,
-        .tensors = std::move(tensors)});
+    shards_.emplace_back(
+        LocalShard{
+            .row_start = row_start,
+            .row_size = row_size,
+            .tensors = std::move(tensors)});
   }
 
   Container::const_iterator begin() const {
