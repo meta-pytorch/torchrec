@@ -20,7 +20,7 @@ from torchrec.metrics.rec_metric import (
 
 
 ERROR_SUM = "error_sum"
-WEIGHTED_NUM_SAMPES = "weighted_num_samples"
+WEIGHTED_NUM_SAMPLES = "weighted_num_samples"
 
 
 def compute_mae(
@@ -106,7 +106,7 @@ class MAEMetricComputation(RecMetricComputation):
                 metric_prefix=MetricPrefix.WINDOW,
                 value=compute_mae(
                     self.get_window_state(ERROR_SUM),
-                    self.get_window_state(WEIGHTED_NUM_SAMPES),
+                    self.get_window_state(WEIGHTED_NUM_SAMPLES),
                 ),
             ),
         ]

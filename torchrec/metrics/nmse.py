@@ -19,7 +19,7 @@ from torchrec.metrics.mse import (
     ERROR_SUM,
     get_mse_states,
     MSEMetricComputation,
-    WEIGHTED_NUM_SAMPES,
+    WEIGHTED_NUM_SAMPLES,
 )
 from torchrec.metrics.rec_metric import (
     MetricComputationReport,
@@ -117,21 +117,21 @@ class NMSEMetricComputation(MSEMetricComputation):
 
         window_mse = compute_mse(
             self.get_window_state(ERROR_SUM),
-            self.get_window_state(WEIGHTED_NUM_SAMPES),
+            self.get_window_state(WEIGHTED_NUM_SAMPLES),
         )
         window_const_pred_mse = compute_mse(
             self.get_window_state(CONST_PRED_ERROR_SUM),
-            self.get_window_state(WEIGHTED_NUM_SAMPES),
+            self.get_window_state(WEIGHTED_NUM_SAMPLES),
         )
         window_nmse = compute_norm(window_mse, window_const_pred_mse)
 
         window_rmse = compute_rmse(
             self.get_window_state(ERROR_SUM),
-            self.get_window_state(WEIGHTED_NUM_SAMPES),
+            self.get_window_state(WEIGHTED_NUM_SAMPLES),
         )
         window_const_pred_rmse = compute_rmse(
             self.get_window_state(CONST_PRED_ERROR_SUM),
-            self.get_window_state(WEIGHTED_NUM_SAMPES),
+            self.get_window_state(WEIGHTED_NUM_SAMPLES),
         )
         window_nrmse = compute_norm(window_rmse, window_const_pred_rmse)
 
