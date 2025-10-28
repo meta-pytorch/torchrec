@@ -53,6 +53,7 @@ from torchrec.metrics.ndcg import NDCGMetric
 from torchrec.metrics.ne import NEMetric
 from torchrec.metrics.ne_positive import NEPositiveMetric
 from torchrec.metrics.ne_with_recalibration import RecalibratedNEMetric
+from torchrec.metrics.nmse import NMSEMetric
 from torchrec.metrics.output import OutputMetric
 from torchrec.metrics.precision import PrecisionMetric
 from torchrec.metrics.precision_session import PrecisionSessionMetric
@@ -105,6 +106,7 @@ REC_METRICS_MAPPING: Dict[RecMetricEnumBase, Type[RecMetric]] = {
     RecMetricEnum.CALI_FREE_NE: CaliFreeNEMetric,
     RecMetricEnum.UNWEIGHTED_NE: UnweightedNEMetric,
     RecMetricEnum.HINDSIGHT_TARGET_PR: HindsightTargetPRMetric,
+    RecMetricEnum.NMSE: NMSEMetric,
 }
 
 
