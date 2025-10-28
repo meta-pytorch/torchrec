@@ -242,9 +242,9 @@ def _populate_ssd_tbe_params(config: GroupedEmbeddingConfig) -> Dict[str, Any]:
             )
             ssd_tbe_params["cache_sets"] = int(max_cache_sets)
 
-    if "kvzch_eviction_trigger_mode" in fused_params and config.is_using_virtual_table:
-        ssd_tbe_params["kvzch_eviction_trigger_mode"] = fused_params.get(
-            "kvzch_eviction_trigger_mode"
+    if "kvzch_eviction_tbe_config" in fused_params and config.is_using_virtual_table:
+        ssd_tbe_params["kvzch_eviction_tbe_config"] = fused_params.get(
+            "kvzch_eviction_tbe_config"
         )
 
     ssd_tbe_params["table_names"] = [table.name for table in config.embedding_tables]
@@ -334,14 +334,46 @@ def _populate_zero_collision_tbe_params(
         training_id_eviction_trigger_count = [0] * len(config.embedding_tables)
         training_id_keep_count = [0] * len(config.embedding_tables)
         l2_weight_thresholds = [0.0] * len(config.embedding_tables)
+        enable_eviction_for_feature_score_eviction_policy = [True] * len(
+            config.embedding_tables
+        )
         eviction_strategy = -1
         table_names = [table.name for table in config.embedding_tables]
         l2_cache_size = tbe_params["l2_cache_size"]
-        if "kvzch_eviction_trigger_mode" in tbe_params:
-            eviction_trigger_mode = tbe_params["kvzch_eviction_trigger_mode"]
-            tbe_params.pop("kvzch_eviction_trigger_mode")
-        else:
-            eviction_trigger_mode = 2  # 2 means mem_util based eviction
+
+        # Eviction tbe config default values
+        eviction_trigger_mode = 2  # 2 means mem_util based eviction
+        eviction_free_mem_threshold_gb = (
+            200  # Eviction free memory trigger threshold in GB
+        )
+        eviction_free_mem_check_interval_batch = (
+            1000  # how many batchs to check free memory when trigger model is free_mem
+        )
+        threshold_calculation_bucket_stride = 0.2
+        threshold_calculation_bucket_num = 1000000  # 1M
+        if "kvzch_eviction_tbe_config" in tbe_params:
+            eviction_tbe_config = tbe_params["kvzch_eviction_tbe_config"]
+            tbe_params.pop("kvzch_eviction_tbe_config")
+
+            if eviction_tbe_config.kvzch_eviction_trigger_mode is not None:
+                eviction_trigger_mode = eviction_tbe_config.kvzch_eviction_trigger_mode
+            if eviction_tbe_config.eviction_free_mem_threshold_gb is not None:
+                eviction_free_mem_threshold_gb = (
+                    eviction_tbe_config.eviction_free_mem_threshold_gb
+                )
+            if eviction_tbe_config.eviction_free_mem_check_interval_batch is not None:
+                eviction_free_mem_check_interval_batch = (
+                    eviction_tbe_config.eviction_free_mem_check_interval_batch
+                )
+            if eviction_tbe_config.threshold_calculation_bucket_stride is not None:
+                threshold_calculation_bucket_stride = (
+                    eviction_tbe_config.threshold_calculation_bucket_stride
+                )
+            if eviction_tbe_config.threshold_calculation_bucket_num is not None:
+                threshold_calculation_bucket_num = (
+                    eviction_tbe_config.threshold_calculation_bucket_num
+                )
+
         for i, table in enumerate(config.embedding_tables):
             policy_t = table.virtual_table_eviction_policy
             if policy_t is not None:
@@ -364,6 +396,9 @@ def _populate_zero_collision_tbe_params(
                     )
                     training_id_keep_count[i] = policy_t.training_id_keep_count
                     ttls_in_mins[i] = policy_t.eviction_ttl_mins
+                    enable_eviction_for_feature_score_eviction_policy[i] = (
+                        policy_t.enable_eviction
+                    )
                     if eviction_strategy == -1 or eviction_strategy == 5:
                         eviction_strategy = 5
                     else:
@@ -421,6 +456,11 @@ def _populate_zero_collision_tbe_params(
             training_id_keep_count=training_id_keep_count,
             l2_weight_thresholds=l2_weight_thresholds,
             meta_header_lens=meta_header_lens,
+            eviction_free_mem_threshold_gb=eviction_free_mem_threshold_gb,
+            eviction_free_mem_check_interval_batch=eviction_free_mem_check_interval_batch,
+            threshold_calculation_bucket_stride=threshold_calculation_bucket_stride,
+            threshold_calculation_bucket_num=threshold_calculation_bucket_num,
+            enable_eviction_for_feature_score_eviction_policy=enable_eviction_for_feature_score_eviction_policy,
         )
     else:
         eviction_policy = EvictionPolicy(meta_header_lens=meta_header_lens)
@@ -1768,6 +1808,7 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
             feature_table_map=self._feature_table_map,
             ssd_cache_location=embedding_location,
             pooling_mode=PoolingMode.NONE,
+            pg=pg,
             **ssd_tbe_params,
         ).to(device)
 
@@ -2000,6 +2041,7 @@ class ZeroCollisionKeyValueEmbedding(
             ssd_cache_location=embedding_location,
             pooling_mode=PoolingMode.NONE,
             backend_type=backend_type,
+            pg=pg,
             **ssd_tbe_params,
         ).to(device)
 
@@ -2680,6 +2722,7 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
             feature_table_map=self._feature_table_map,
             ssd_cache_location=embedding_location,
             pooling_mode=self._pooling,
+            pg=pg,
             **ssd_tbe_params,
         ).to(device)
 
@@ -2900,6 +2943,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
             ssd_cache_location=embedding_location,
             pooling_mode=self._pooling,
             backend_type=backend_type,
+            pg=pg,
             **ssd_tbe_params,
         ).to(device)
 

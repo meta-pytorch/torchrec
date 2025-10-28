@@ -240,6 +240,9 @@ class FeatureScoreBasedEvictionPolicy(VirtualTableEvictionPolicy):
         None  # 0 means no eviction
     )
     inference_eviction_ttl_mins: Optional[int] = None  # 0 means no eviction
+    enable_eviction: bool = (
+        True  # Currently we only support using same eviction policy in one tbe for mutiple tables, if one table doesn't need eviction we can set this flag to False
+    )
 
     def __post_init__(self) -> None:
         if self.inference_eviction_feature_score_threshold is None:
