@@ -46,6 +46,11 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingModule,
     ShardingType,
 )
+
+from torchrec.distributed.feature_score_utils import (
+    create_sharding_type_to_feature_score_mapping,
+    may_collect_feature_scores,
+)
 from torchrec.distributed.fused_params import (
     FUSED_PARAM_IS_SSD_TABLE,
     FUSED_PARAM_SSD_TABLE_LIST,
@@ -90,7 +95,6 @@ from torchrec.distributed.utils import (
 from torchrec.modules.embedding_configs import (
     EmbeddingConfig,
     EmbeddingTableConfig,
-    FeatureScoreBasedEvictionPolicy,
     PoolingType,
 )
 from torchrec.modules.embedding_modules import (
@@ -463,12 +467,12 @@ class ShardedEmbeddingCollection(
         ] = {
             sharding_type: self.create_embedding_sharding(
                 sharding_type=sharding_type,
-                sharding_infos=embedding_confings,
+                sharding_infos=embedding_configs,
                 env=env,
                 device=device,
                 qcomm_codecs_registry=self.qcomm_codecs_registry,
             )
-            for sharding_type, embedding_confings in sharding_type_to_sharding_infos.items()
+            for sharding_type, embedding_configs in sharding_type_to_sharding_infos.items()
         }
 
         self.enable_embedding_update: bool = any(
@@ -490,16 +494,20 @@ class ShardedEmbeddingCollection(
         self._has_uninitialized_input_dist: bool = True
         logger.info(f"EC index dedup enabled: {self._use_index_dedup}.")
 
-        for config in self._embedding_configs:
-            virtual_table_eviction_policy = config.virtual_table_eviction_policy
-            if virtual_table_eviction_policy is not None and isinstance(
-                virtual_table_eviction_policy, FeatureScoreBasedEvictionPolicy
-            ):
-                self._enable_feature_score_weight_accumulation = True
-                break
-
+        self._enable_feature_score_weight_accumulation: bool = False
+        self._enabled_feature_score_auto_collection: bool = False
+        self._sharding_type_feature_score_mapping: Dict[str, Dict[str, float]] = {}
+        (
+            self._enable_feature_score_weight_accumulation,
+            self._enabled_feature_score_auto_collection,
+            self._sharding_type_feature_score_mapping,
+        ) = create_sharding_type_to_feature_score_mapping(
+            self._embedding_configs, sharding_type_to_sharding_infos
+        )
         logger.info(
-            f"EC feature score weight accumulation enabled: {self._enable_feature_score_weight_accumulation}."
+            f"EC feature score weight accumulation enabled: {self._enable_feature_score_weight_accumulation}, "
+            f"auto collection enabled: {self._enabled_feature_score_auto_collection}, "
+            f"sharding type to feature score mapping: {self._sharding_type_feature_score_mapping}"
         )
 
         # Get all fused optimizers and combine them.
@@ -1361,22 +1369,22 @@ class ShardedEmbeddingCollection(
                         source_weights.dtype == torch.float32
                     ), "Only float32 weights are supported for feature score eviction weights."
 
-                    acc_weights = torch.ops.fbgemm.jagged_acc_weights_and_counts(
-                        source_weights.view(-1),
-                        reverse_indices,
+                    # Accumulate weights using scatter_add
+                    acc_weights = torch.zeros(
                         unique_indices.numel(),
+                        dtype=torch.float32,
+                        device=source_weights.device,
                     )
+
+                    # Use PyTorch's scatter_add to accumulate weights
+                    acc_weights.scatter_add_(0, reverse_indices, source_weights)
 
                 dedup_features = KeyedJaggedTensor(
                     keys=input_feature.keys(),
                     lengths=lengths,
                     offsets=offsets,
                     values=unique_indices,
-                    weights=(
-                        acc_weights.view(torch.float64).view(-1)
-                        if acc_weights is not None
-                        else None
-                    ),
+                    weights=(acc_weights.view(-1) if acc_weights is not None else None),
                 )
 
                 ctx.input_features.append(input_feature)
@@ -1495,6 +1503,11 @@ class ShardedEmbeddingCollection(
                     self._features_order_tensor,
                 )
             features_by_shards = features.split(self._feature_splits)
+            features_by_shards = may_collect_feature_scores(
+                features_by_shards,
+                self._enabled_feature_score_auto_collection,
+                self._sharding_type_feature_score_mapping,
+            )
             if self._use_index_dedup:
                 features_by_shards = self._dedup_indices(ctx, features_by_shards)
 
