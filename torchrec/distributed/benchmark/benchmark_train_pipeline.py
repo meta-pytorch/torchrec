@@ -129,7 +129,7 @@ def runner(
         torch.cuda.is_available() and torch.cuda.device_count() >= world_size
     ), "CUDA not available or insufficient GPUs for the requested world_size"
 
-    torch.autograd.set_detect_anomaly(True)
+    run_option.set_log_level()
     with MultiProcessContext(
         rank=rank,
         world_size=world_size,

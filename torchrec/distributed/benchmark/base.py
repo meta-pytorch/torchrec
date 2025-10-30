@@ -425,17 +425,11 @@ class cmd_conf:
             if not config_path:
                 return {}
 
-            try:
-                with open(config_path, "r") as f:
-                    if is_json:
-                        return json.load(f) or {}
-                    else:
-                        return yaml.safe_load(f) or {}
-            except Exception as e:
-                logger.error(
-                    f"Failed to load config because {e}. Proceeding without it."
-                )
-                return {}
+            with open(config_path, "r") as f:
+                if is_json:
+                    return json.load(f) or {}
+                else:
+                    return yaml.safe_load(f) or {}
 
         @functools.wraps(func)
         def wrapper() -> Any:  # pyre-ignore [3]
@@ -479,7 +473,12 @@ class cmd_conf:
             # Merge the two dictionaries, JSON overrides YAML
             merged_defaults = {**yaml_defaults, **json_defaults}
 
-            seen_args = set()  # track all --<name> we've added
+            # track all --<name> we've added
+            seen_args = {
+                "json_config",
+                "yaml_config",
+                "loglevel",
+            }
 
             for _name, param in sig.parameters.items():
                 cls = param.annotation
@@ -548,7 +547,12 @@ class cmd_conf:
                     logger.info(config_instance)
 
             loglevel = logging._nameToLevel[args.loglevel.upper()]
-            logger.setLevel(loglevel)
+            # Set loglevel for all existing loggers
+            for existing_logger_name in logging.root.manager.loggerDict:
+                existing_logger = logging.getLogger(existing_logger_name)
+                existing_logger.setLevel(loglevel)
+            # Also set the root logger
+            logging.root.setLevel(loglevel)
 
             return func(**kwargs)
 
@@ -857,6 +861,7 @@ class BenchFuncConfig:
     export_stacks: bool = False
     all_rank_traces: bool = False
     memory_snapshot: bool = False
+    loglevel: str = "WARNING"
 
     # pyre-ignore [2]
     def benchmark_func_kwargs(self, **kwargs_to_override) -> Dict[str, Any]:
@@ -872,6 +877,10 @@ class BenchFuncConfig:
             "all_rank_traces": self.all_rank_traces,
             "memory_snapshot": self.memory_snapshot,
         } | kwargs_to_override
+
+    def set_log_level(self) -> None:
+        loglevel = logging._nameToLevel[self.loglevel.upper()]
+        logging.root.setLevel(loglevel)
 
 
 def benchmark_func(
