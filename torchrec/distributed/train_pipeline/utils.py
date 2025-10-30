@@ -118,8 +118,8 @@ def _wait_for_events(
         ), f"{type(batch)} must implement Multistreamable interface"
         batch.record_stream(stream)
 
-
-def _start_data_dist(
+# We only asynchronously move the computation and blocking wait parts, while keeping the communication synchronous because Torch's communication is not thread-safe.
+def _prepare_data_dist(
     pipelined_modules: List[ShardedModule],
     batch: Pipelineable,
     context: TrainPipelineContext,
@@ -157,6 +157,14 @@ def _start_data_dist(
         context.input_dist_splits_requests[forward.name] = module.input_dist(
             module_ctx, *args, **kwargs
         )
+
+def _start_data_dist(
+    pipelined_modules: List[ShardedModule],
+    batch: Pipelineable,
+    context: TrainPipelineContext,
+) -> None:
+
+    _prepare_data_dist(pipelined_modules, batch, context)
     _fuse_input_dist_splits(context)
 
 
