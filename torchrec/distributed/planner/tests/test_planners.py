@@ -78,6 +78,28 @@ class TestEmbeddingShardingPlanner(unittest.TestCase):
         )
         self.planner = EmbeddingShardingPlanner(topology=self.topology)
 
+    def test_tw_rank_assignment(self) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(4)
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        sharding_plan = self.planner.plan(module=model, sharders=[TWSharder()])
+        ranks = [
+            cast(List[int], param_shard.ranks)
+            for param_shard in cast(
+                EmbeddingModuleShardingPlan, sharding_plan.plan["sparse.ebc"]
+            ).values()
+        ]
+        for rank_list in ranks:
+            for rank in rank_list:
+                self.assertTrue(0 <= rank <= 1, f"Rank {rank} not in [0,1]")
+
     def test_tw_solution(self) -> None:
         tables = [
             EmbeddingBagConfig(
