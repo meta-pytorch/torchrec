@@ -86,7 +86,12 @@ class SparseArch(nn.Module):
         pred = torch.cat(
             [
                 fp_ebc_out[key]
-                for key in ["feature_0", "feature_1", "feature_2", "feature_3"]
+                for key in [
+                    "feature_0",
+                    "feature_1",
+                    "feature_2",
+                    "feature_3",
+                ]
             ],
             dim=1,
         )

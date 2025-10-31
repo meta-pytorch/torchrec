@@ -8,7 +8,18 @@
 # pyre-strict
 
 from functools import partial
-from typing import Any, Dict, Iterator, List, Optional, Type, Union
+from typing import (
+    Any,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+)
 
 import torch
 from torch import nn
@@ -31,13 +42,19 @@ from torchrec.distributed.types import (
     ShardingEnv,
     ShardingType,
 )
-from torchrec.distributed.utils import append_prefix, init_parameters
+from torchrec.distributed.utils import (
+    append_prefix,
+    init_parameters,
+    modify_input_for_feature_processor,
+)
 from torchrec.modules.feature_processor_ import FeatureProcessorsCollection
 from torchrec.modules.fp_embedding_modules import (
     apply_feature_processors_to_kjt,
     FeatureProcessedEmbeddingBagCollection,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
+
+_T = TypeVar("_T")
 
 
 def param_dp_sync(kt: KeyedTensor, no_op_tensor: torch.Tensor) -> KeyedTensor:
@@ -74,6 +91,16 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
             )
         )
 
+        self._row_wise_sharded: bool = False
+        for param_sharding in table_name_to_parameter_sharding.values():
+            if param_sharding.sharding_type in [
+                ShardingType.ROW_WISE.value,
+                ShardingType.TABLE_ROW_WISE.value,
+                ShardingType.GRID_SHARD.value,
+            ]:
+                self._row_wise_sharded = True
+                break
+
         self._lookups: List[nn.Module] = self._embedding_bag_collection._lookups
 
         self._is_collection: bool = False
@@ -96,6 +123,11 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
     def input_dist(
         self, ctx: EmbeddingBagCollectionContext, features: KeyedJaggedTensor
     ) -> Awaitable[Awaitable[KJTList]]:
+        if not self.is_pipelined and self._row_wise_sharded:
+            # transform input to support row based sharding when not pipelined
+            modify_input_for_feature_processor(
+                features, self._feature_processors, self._is_collection
+            )
         return self._embedding_bag_collection.input_dist(ctx, features)
 
     def apply_feature_processors_to_kjt_list(self, dist_input: KJTList) -> KJTList:
@@ -105,10 +137,7 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
                 kjt_list.append(self._feature_processors(features))
             else:
                 kjt_list.append(
-                    apply_feature_processors_to_kjt(
-                        features,
-                        self._feature_processors,
-                    )
+                    apply_feature_processors_to_kjt(features, self._feature_processors)
                 )
         return KJTList(kjt_list)
 
@@ -117,7 +146,6 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
         ctx: EmbeddingBagCollectionContext,
         dist_input: KJTList,
     ) -> List[torch.Tensor]:
-
         fp_features = self.apply_feature_processors_to_kjt_list(dist_input)
         return self._embedding_bag_collection.compute(ctx, fp_features)
 
@@ -166,6 +194,18 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
     def _initialize_torch_state(self, skip_registering: bool = False) -> None:  # noqa
         self._embedding_bag_collection._initialize_torch_state(skip_registering)
 
+    def preprocess_input(
+        self, args: List[_T], kwargs: Mapping[str, _T]
+    ) -> Tuple[List[_T], Mapping[str, _T]]:
+        for x in args + list(kwargs.values()):
+            if isinstance(x, KeyedJaggedTensor):
+                modify_input_for_feature_processor(
+                    features=x,
+                    feature_processors=self._feature_processors,
+                    is_collection=self._is_collection,
+                )
+        return args, kwargs
+
 
 class FeatureProcessedEmbeddingBagCollectionSharder(
     BaseEmbeddingSharder[FeatureProcessedEmbeddingBagCollection]
@@ -191,7 +231,6 @@ class FeatureProcessedEmbeddingBagCollectionSharder(
         device: Optional[torch.device] = None,
         module_fqn: Optional[str] = None,
     ) -> ShardedFeatureProcessedEmbeddingBagCollection:
-
         if device is None:
             device = torch.device("cuda")
 
@@ -228,12 +267,14 @@ class FeatureProcessedEmbeddingBagCollectionSharder(
         if compute_device_type in {"mtia"}:
             return [ShardingType.TABLE_WISE.value, ShardingType.COLUMN_WISE.value]
 
-        # No row wise because position weighted FP and RW don't play well together.
         types = [
             ShardingType.DATA_PARALLEL.value,
             ShardingType.TABLE_WISE.value,
             ShardingType.COLUMN_WISE.value,
             ShardingType.TABLE_COLUMN_WISE.value,
+            ShardingType.TABLE_ROW_WISE.value,
+            ShardingType.ROW_WISE.value,
+            ShardingType.GRID_SHARD.value,
         ]
 
         return types
