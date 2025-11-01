@@ -357,9 +357,11 @@ class ManagedCollisionCollection(nn.Module):
             len(features) for features in self._table_to_features.values()
         ]
 
-        table_to_config = {config.name: config for config in embedding_configs}
+        self._table_name_to_config: Dict[str, BaseEmbeddingConfig] = {
+            config.name: config for config in embedding_configs
+        }
 
-        for name, config in table_to_config.items():
+        for name, config in self._table_name_to_config.items():
             if name not in managed_collision_modules:
                 raise ValueError(
                     f"Table {name} is not present in managed_collision_modules"
