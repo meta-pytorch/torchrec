@@ -29,8 +29,16 @@ from torch.distributed.tensor import DeviceMesh
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.model_tracker.model_delta_tracker import ModelDeltaTrackerTrec
-from torchrec.distributed.model_tracker.types import ModelTrackerConfig, UniqueRows
+from torchrec.distributed.model_tracker.model_delta_tracker import (
+    ModelDeltaTracker,
+    ModelDeltaTrackerTrec,
+)
+from torchrec.distributed.model_tracker.trackers.raw_id_tracker import RawIdTracker
+from torchrec.distributed.model_tracker.types import (
+    ModelTrackerConfig,
+    TrackerType,
+    UniqueRows,
+)
 
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.sharding_plan import get_default_sharders
@@ -53,6 +61,7 @@ from torchrec.distributed.utils import (
     none_throws,
     sharded_model_copy,
 )
+
 from torchrec.optim.fused import FusedOptimizerModule
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizer
 
@@ -294,11 +303,20 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         if init_data_parallel:
             self.init_data_parallel()
 
-        self.model_delta_tracker: Optional[ModelDeltaTrackerTrec] = (
+        self.model_delta_tracker: Optional[ModelDeltaTracker] = (
             self._init_delta_tracker(model_tracker_config, self._dmp_wrapped_module)
             if model_tracker_config is not None
+            and model_tracker_config.tracker_type == TrackerType.TREC
             else None
         )
+
+        if (
+            model_tracker_config is not None
+            and model_tracker_config.tracker_type == TrackerType.RAW_ID
+        ):
+            self.raw_id_tracker: Optional[RawIdTracker] = self.init_raw_id_tracker(
+                model_tracker_config, self._dmp_wrapped_module
+            )
 
     @property
     def module(self) -> nn.Module:
@@ -370,7 +388,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
 
     def _init_delta_tracker(
         self, model_tracker_config: ModelTrackerConfig, module: nn.Module
-    ) -> ModelDeltaTrackerTrec:
+    ) -> ModelDeltaTracker:
         # Init delta tracker if config is provided
         return ModelDeltaTrackerTrec(
             model=module,
@@ -378,6 +396,15 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             delete_on_read=model_tracker_config.delete_on_read,
             auto_compact=model_tracker_config.auto_compact,
             mode=model_tracker_config.tracking_mode,
+            fqns_to_skip=model_tracker_config.fqns_to_skip,
+        )
+
+    def init_raw_id_tracker(
+        self, model_tracker_config: ModelTrackerConfig, module: nn.Module
+    ) -> Optional[RawIdTracker]:
+        return RawIdTracker(
+            model=module,
+            delete_on_read=model_tracker_config.delete_on_read,
             fqns_to_skip=model_tracker_config.fqns_to_skip,
         )
 
@@ -459,7 +486,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
 
     def init_torchrec_delta_tracker(
         self, model_tracker_config: ModelTrackerConfig
-    ) -> ModelDeltaTrackerTrec:
+    ) -> ModelDeltaTracker:
         """
         Initializes the model delta tracker if it doesn't exists.
         """
@@ -470,7 +497,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
 
         return none_throws(self.model_delta_tracker)
 
-    def get_model_tracker(self) -> ModelDeltaTrackerTrec:
+    def get_model_tracker(self) -> ModelDeltaTracker:
         """
         Returns the model tracker if it exists.
         """
