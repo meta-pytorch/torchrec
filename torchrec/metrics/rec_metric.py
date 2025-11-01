@@ -136,6 +136,7 @@ class RecMetricComputation(Metric, abc.ABC):
         compute_on_all_ranks: bool = False,
         should_validate_update: bool = False,
         fuse_state_tensors: bool = False,
+        fuse_task_tensors: bool = False,
         process_group: Optional[dist.ProcessGroup] = None,
         fused_update_limit: int = 0,
         allow_missing_label_with_zero_weight: bool = False,
@@ -145,6 +146,8 @@ class RecMetricComputation(Metric, abc.ABC):
         metric_init_signature = inspect.signature(Metric.__init__)
         if "fuse_state_tensors" in metric_init_signature.parameters:
             kwargs["fuse_state_tensors"] = fuse_state_tensors
+        if "fuse_task_tensors" in metric_init_signature.parameters:
+            kwargs["fuse_task_tensors"] = fuse_task_tensors
         super().__init__(
             process_group=process_group,
             *args,
@@ -169,6 +172,15 @@ class RecMetricComputation(Metric, abc.ABC):
                 dist_reduce_fx=lambda x: torch.any(x, dim=0).byte(),
                 persistent=True,
             )
+        self._compute_mode: RecComputeMode = (
+            RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
+            if fuse_state_tensors and fuse_task_tensors
+            else (
+                RecComputeMode.FUSED_TASKS_COMPUTATION
+                if fuse_task_tensors
+                else RecComputeMode.UNFUSED_TASKS_COMPUTATION
+            )
+        )
 
     @staticmethod
     def get_window_state_name(state_name: str) -> str:
@@ -430,6 +442,10 @@ class RecMetric(nn.Module, abc.ABC):
                 should_validate_update=self._should_validate_update,
                 fuse_state_tensors=(
                     compute_mode == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
+                ),
+                fuse_task_tensors=(
+                    compute_mode == RecComputeMode.FUSED_TASKS_COMPUTATION
+                    or compute_mode == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
                 ),
                 process_group=process_group,
                 **{**kwargs, **self._get_task_kwargs(task_config)},
