@@ -21,6 +21,7 @@ from torchrec.modules.embedding_modules import (
 from torchrec.modules.mc_embedding_modules import (
     ManagedCollisionEmbeddingBagCollection,
     ManagedCollisionEmbeddingCollection,
+    return_remapped_lengths_as_mask,
 )
 from torchrec.modules.mc_modules import (
     DistanceLFU_EvictionPolicy,
@@ -409,3 +410,20 @@ class MCHManagedCollisionEmbeddingBagCollectionTest(unittest.TestCase):
         )
         mcc.train(False)
         symbolic_trace(mcc, leaf_modules=[ComputeJTDictToKJT.__name__])
+
+    def test_return_remapped_lengths_as_mask(self) -> None:
+        mask = return_remapped_lengths_as_mask(
+            KeyedJaggedTensor(
+                keys=["f0"],
+                values=torch.rand(6),
+                lengths=torch.tensor([1, 0, 1, 0, 1, 0, 0, 1, 1, 1], dtype=torch.int64),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                mask,
+                torch.tensor(
+                    [True, False, True, False, True, False, False, True, True, True]
+                ),
+            )
+        )
