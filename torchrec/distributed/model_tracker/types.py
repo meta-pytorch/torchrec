@@ -75,6 +75,20 @@ class UpdateMode(Enum):
     LAST = "last"
 
 
+class TrackerType(Enum):
+    r"""
+    To identify the type of tracker.
+
+    Enums:
+    TREC: Used for Trec EC/EBC.
+    RAW_ID: Used for MPZCH.
+    """
+
+    NONE = "none"
+    TREC = "trec"
+    RAW_ID = "raw_id"
+
+
 @dataclass
 class ModelTrackerConfig:
     r"""
@@ -92,3 +106,4 @@ class ModelTrackerConfig:
     delete_on_read: bool = True
     auto_compact: bool = False
     fqns_to_skip: List[str] = field(default_factory=list)
+    tracker_type: TrackerType = TrackerType.NONE
