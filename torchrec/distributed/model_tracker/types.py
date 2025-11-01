@@ -23,6 +23,7 @@ class IndexedLookup:
     batch_idx: int
     ids: torch.Tensor
     states: Optional[torch.Tensor]
+    raw_ids: Optional[torch.Tensor] = None
     compact: bool = False
 
 

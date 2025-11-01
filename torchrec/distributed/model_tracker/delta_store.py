@@ -91,6 +91,7 @@ class DeltaStore(ABC):
         fqn: str,
         ids: torch.Tensor,
         states: Optional[torch.Tensor],
+        raw_ids: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Append a batch of ids and states to the store for a specific table.
@@ -162,10 +163,11 @@ class DeltaStoreTrec(DeltaStore):
         fqn: str,
         ids: torch.Tensor,
         states: Optional[torch.Tensor],
+        raw_ids: Optional[torch.Tensor] = None,
     ) -> None:
         table_fqn_lookup = self.per_fqn_lookups.get(fqn, [])
         table_fqn_lookup.append(
-            IndexedLookup(batch_idx=batch_idx, ids=ids, states=states)
+            IndexedLookup(batch_idx=batch_idx, ids=ids, states=states, raw_ids=raw_ids)
         )
         self.per_fqn_lookups[fqn] = table_fqn_lookup
 
@@ -223,6 +225,20 @@ class DeltaStoreTrec(DeltaStore):
                 + lookups[index_r:]
             )
         self.per_fqn_lookups = new_per_fqn_lookups
+
+    def get_indexed_lookups(
+        self, start_idx: int, end_idx: int
+    ) -> Dict[str, List[IndexedLookup]]:
+        r"""
+        Return all unique/delta ids per table from the Delta Store.
+        """
+        per_fqn_lookups: Dict[str, List[IndexedLookup]] = {}
+        for table_fqn, lookups in self.per_fqn_lookups.items():
+            indexices = [h.batch_idx for h in lookups]
+            index_l = bisect_left(indexices, start_idx)
+            index_r = bisect_left(indexices, end_idx)
+            per_fqn_lookups[table_fqn] = lookups[index_l:index_r]
+        return per_fqn_lookups
 
     def get_unique(self, from_idx: int = 0) -> Dict[str, UniqueRows]:
         r"""
