@@ -105,9 +105,9 @@ GPUExecutor::GPUExecutor(
     if (gcConfig_->optimizationEnabled) {
       gcConfig_->threadIdToNumForwards[threadId] = 0;
       // Freeze all python objects in each interpreter
-      auto model =
+      auto session =
           model_.acquireSession(&manager_->allInstances().at(threadId));
-      model.global("gc", "freeze")(at::ArrayRef<torch::deploy::Obj>());
+      session.global("gc", "freeze")(at::ArrayRef<torch::deploy::Obj>());
     }
 
     processThreads_.emplace_back([this, threadId] {
@@ -189,7 +189,7 @@ void GPUExecutor::process(int idx) {
     auto start = std::chrono::steady_clock::now();
     model_.acquireSession(&manager_->allInstances().at(idx));
     {
-      std::lock_guard<std::mutex> lock(warmUpMutex_);
+      std::lock_guard<std::mutex> warmUpLock(warmUpMutex_);
       warmUpCounter_++;
       warmUpCV_.notify_one();
     }
