@@ -749,7 +749,7 @@ def _run_benchmark_core(
                     f"{output_dir}/stacks-cuda-{name}.stacks", "self_cuda_time_total"
                 )
 
-        if memory_snapshot:
+        if memory_snapshot and (all_rank_traces or rank == 0):
             torch.cuda.empty_cache()
             torch.cuda.memory._record_memory_history(
                 max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
@@ -775,7 +775,7 @@ def _run_benchmark_core(
         else:
             torch.cuda.synchronize(rank)
 
-        if memory_snapshot:
+        if memory_snapshot and (all_rank_traces or rank == 0):
             try:
                 torch.cuda.memory._dump_snapshot(
                     f"{output_dir}/memory-{name}-rank{rank}.pickle"
