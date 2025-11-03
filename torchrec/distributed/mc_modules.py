@@ -13,7 +13,17 @@ import logging
 import math
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass
-from typing import Any, DefaultDict, Dict, Iterator, List, Optional, Type, Union
+from typing import (
+    Any,
+    Callable,
+    DefaultDict,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Type,
+    Union,
+)
 
 import torch
 import torch.distributed as dist
@@ -58,6 +68,7 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 from torchrec.distributed.utils import append_prefix
+from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.modules.mc_modules import ManagedCollisionCollection
 from torchrec.modules.utils import construct_jagged_tensors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -215,6 +226,9 @@ class ShardedManagedCollisionCollection(
 
         self._feature_to_table: Dict[str, str] = module._feature_to_table
         self._table_to_features: Dict[str, List[str]] = module._table_to_features
+        self._table_name_to_config: Dict[str, BaseEmbeddingConfig] = (
+            module._table_name_to_config
+        )
         self._has_uninitialized_input_dists: bool = True
         self._input_dists: List[nn.Module] = []
         self._managed_collision_modules = nn.ModuleDict()
@@ -223,6 +237,9 @@ class ShardedManagedCollisionCollection(
         self._create_output_dists()
         self._use_index_dedup = use_index_dedup
         self._initialize_torch_state()
+        self.post_lookup_tracker_fn: Optional[
+            Callable[[KeyedJaggedTensor, torch.Tensor], None]
+        ] = None
 
     def _initialize_torch_state(self) -> None:
         self._model_parallel_mc_buffer_name_to_sharded_tensor = OrderedDict()
@@ -732,6 +749,17 @@ class ShardedManagedCollisionCollection(
                     mc_input = mcm.remap(mc_input)
                     mc_input = self.global_to_local_index(mc_input)
                     output.update(mc_input)
+                    if hasattr(
+                        mcm,
+                        "_hash_zch_identities",
+                    ):
+                        if self.post_lookup_tracker_fn is not None:
+                            self.post_lookup_tracker_fn(
+                                KeyedJaggedTensor.from_jt_dict(mc_input),
+                                mcm._hash_zch_identities.index_select(
+                                    dim=0, index=mc_input[table].values()
+                                ),
+                            )
                 values = torch.cat([jt.values() for jt in output.values()])
             else:
                 table: str = tables[0]
@@ -750,6 +778,12 @@ class ShardedManagedCollisionCollection(
                 mc_input = mcm.remap(mc_input)
                 mc_input = self.global_to_local_index(mc_input)
                 values = mc_input[table].values()
+                if hasattr(mcm, "_hash_zch_identities"):
+                    if self.post_lookup_tracker_fn is not None:
+                        self.post_lookup_tracker_fn(
+                            KeyedJaggedTensor.from_jt_dict(mc_input),
+                            mcm._hash_zch_identities.index_select(dim=0, index=values),
+                        )
 
             remapped_kjts.append(
                 KeyedJaggedTensor(
@@ -839,6 +873,24 @@ class ShardedManagedCollisionCollection(
     @property
     def unsharded_module_type(self) -> Type[ManagedCollisionCollection]:
         return ManagedCollisionCollection
+
+    def register_post_lookup_tracker_fn(
+        self,
+        record_fn: Callable[[KeyedJaggedTensor, torch.Tensor], None],
+    ) -> None:
+        """
+        Register a function to be called after lookup is done. This is used for
+        tracking the lookup results and optimizer states.
+
+        Args:
+            record_fn (Callable[[KeyedJaggedTensor, torch.Tensor], None]): A custom record function to be called after lookup is done.
+
+        """
+        if self.post_lookup_tracker_fn is not None:
+            logger.warning(
+                "[ModelDeltaTracker] Custom record function already defined, overriding with new callable"
+            )
+        self.post_lookup_tracker_fn = record_fn
 
 
 class ManagedCollisionCollectionSharder(
