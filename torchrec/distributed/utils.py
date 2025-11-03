@@ -781,7 +781,9 @@ def modify_input_for_feature_processor(
 
         if is_collection:
             if hasattr(feature_processors, "pre_process_pipeline_input"):
-                feature_processors.pre_process_pipeline_input(features)  # pyre-ignore[29]
+                feature_processors.pre_process_pipeline_input(
+                    features
+                )  # pyre-ignore[29]
             else:
                 logging.info(
                     f"[Feature Processor Pipeline] Skipping pre_process_pipeline_input for feature processor {feature_processors=}"
