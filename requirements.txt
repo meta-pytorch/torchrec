@@ -16,6 +16,7 @@ tqdm
 usort
 parameterized
 PyYAML
+psutil
 
 # for tests
 # https://github.com/pytorch/pytorch/blob/b96b1e8cff029bb0a73283e6e7f6cc240313f1dc/requirements.txt#L3
