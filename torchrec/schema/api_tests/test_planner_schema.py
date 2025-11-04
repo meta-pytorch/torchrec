@@ -37,7 +37,7 @@ from torchrec.distributed.planner.types import (
     StorageReservation,
     Topology,
 )
-from torchrec.distributed.types import ModuleSharder, PipelineType, ShardingPlan
+from torchrec.distributed.types import ModuleSharder, PipelineType
 from torchrec.schema.utils import is_signature_compatible
 
 
