@@ -288,6 +288,15 @@ def _get_unbucketize_tensor_via_length_alignment(
     return bucketize_permute_tensor
 
 
+@torch.fx.wrap
+def _fx_split_embeddings_per_feature_length(
+    embeddings: torch.Tensor,
+    features: KeyedJaggedTensor,
+) -> List[torch.Tensor]:
+    length_per_key: List[int] = features.length_per_key()
+    return embeddings.split(length_per_key, dim=0)
+
+
 def _construct_jagged_tensors_tw(
     embeddings: List[torch.Tensor],
     embedding_names_per_rank: List[List[str]],
@@ -307,13 +316,13 @@ def _construct_jagged_tensors_tw(
 
         lengths = features_i.lengths().view(-1, features_i.stride())
         values = features_i.values()
-        length_per_key = features_i.length_per_key()
-
-        embeddings_list = torch.split(embeddings_i, length_per_key, dim=0)
+        embeddings_list = _fx_split_embeddings_per_feature_length(
+            embeddings_i, features_i
+        )
         stride = features_i.stride()
         lengths_tuple = torch.unbind(lengths.view(-1, stride), dim=0)
         if need_indices:
-            values_list = torch.split(values, length_per_key)
+            values_list = _fx_split_embeddings_per_feature_length(values, features_i)
             for j, key in enumerate(embedding_names_per_rank[i]):
                 ret[key] = JaggedTensor(
                     lengths=lengths_tuple[j],
