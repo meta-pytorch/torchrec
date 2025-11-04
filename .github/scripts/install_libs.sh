@@ -28,4 +28,4 @@ elif [ "$CHANNEL" = "test" ]; then
 fi
 
 
-${CONDA_RUN} pip install importlib-metadata click PyYAML
+${CONDA_RUN} pip install importlib-metadata click PyYAML psutil
