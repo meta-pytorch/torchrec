@@ -1402,6 +1402,7 @@ def _maybe_compute_kjt_to_jt_dict(
     variable_stride_per_key: bool,
     weights: Optional[torch.Tensor],
     jt_dict: Optional[Dict[str, JaggedTensor]],
+    compute_offsets: bool = True,
 ) -> Dict[str, JaggedTensor]:
     if not length_per_key:
         return {}
@@ -1418,50 +1419,49 @@ def _maybe_compute_kjt_to_jt_dict(
             torch._check(cat_size <= total_size)
         torch._check(cat_size == total_size)
         torch._check_is_size(stride)
+
     values_list = torch.split(values, length_per_key)
+    split_offsets: list[torch.Tensor] = []
     if variable_stride_per_key:
         split_lengths = torch.split(lengths, stride_per_key)
-        split_offsets = [
-            torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
-            for lengths in split_lengths
-        ]
+        if compute_offsets:
+            split_offsets = [
+                torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+                for lengths in split_lengths
+            ]
     elif pt2_guard_size_oblivious(lengths.numel() > 0):
         strided_lengths = lengths.view(len(keys), stride)
         if not torch.jit.is_scripting() and is_torchdynamo_compiling():
             torch._check(strided_lengths.size(0) > 0)
             torch._check(strided_lengths.size(1) > 0)
-        split_lengths = torch.unbind(
-            strided_lengths,
-            dim=0,
-        )
-        split_offsets = torch.unbind(
-            _batched_lengths_to_offsets(strided_lengths),
-            dim=0,
-        )
+
+        split_lengths = torch.unbind(strided_lengths, dim=0)
+        if compute_offsets:
+            split_offsets = torch.unbind(  # pyre-ignore
+                _batched_lengths_to_offsets(strided_lengths), dim=0
+            )
     else:
         split_lengths = torch.unbind(lengths, dim=0)
-        split_offsets = torch.unbind(lengths, dim=0)
+        if compute_offsets:
+            split_offsets = split_lengths  # pyre-ignore
 
     if weights is not None:
         weights_list = torch.split(weights, length_per_key)
         for idx, key in enumerate(keys):
-            length = split_lengths[idx]
-            offset = split_offsets[idx]
             _jt_dict[key] = JaggedTensor(
-                lengths=length,
-                offsets=offset,
+                lengths=split_lengths[idx],
+                offsets=split_offsets[idx] if compute_offsets else None,
                 values=values_list[idx],
                 weights=weights_list[idx],
             )
     else:
         for idx, key in enumerate(keys):
-            length = split_lengths[idx]
-            offset = split_offsets[idx]
             _jt_dict[key] = JaggedTensor(
-                lengths=length,
-                offsets=offset,
+                lengths=split_lengths[idx],
+                offsets=split_offsets[idx] if compute_offsets else None,
                 values=values_list[idx],
             )
+
     return _jt_dict
 
 
@@ -2698,10 +2698,13 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                 offsets=None,
             )
 
-    def to_dict(self) -> Dict[str, JaggedTensor]:
+    def to_dict(self, compute_offsets: bool = True) -> Dict[str, JaggedTensor]:
         """
         Returns a dictionary of JaggedTensor for each key.
         Will cache result in self._jt_dict.
+
+        Args:
+            compute_offsets (str): compute offsets when true.
 
         Returns:
             Dict[str, JaggedTensor]: dictionary of JaggedTensor for each key.
@@ -2720,6 +2723,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             variable_stride_per_key=self.variable_stride_per_key(),
             weights=self.weights_or_none(),
             jt_dict=self._jt_dict,
+            compute_offsets=compute_offsets,
         )
         self._jt_dict = _jt_dict
         return _jt_dict
