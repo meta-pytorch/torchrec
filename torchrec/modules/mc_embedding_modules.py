@@ -93,6 +93,19 @@ class BaseManagedCollisionEmbeddingCollection(nn.Module):
             return embedding_res, None
         return embedding_res, features
 
+    def lookup_remapped_lengths_mask(
+        self,
+        features: KeyedJaggedTensor,
+    ) -> torch.Tensor:
+        features = self._managed_collision_collection(features)
+        remapped_lengths = return_remapped_lengths_as_mask(features)
+        return remapped_lengths
+
+
+@torch.fx.wrap
+def return_remapped_lengths_as_mask(features: KeyedJaggedTensor) -> torch.Tensor:
+    return features.lengths().to(torch.bool)
+
 
 class ManagedCollisionEmbeddingCollection(BaseManagedCollisionEmbeddingCollection):
     """
