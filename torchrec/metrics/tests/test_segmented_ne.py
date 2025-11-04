@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Union
 
 import torch
 from torch import no_grad
+from torchrec.metrics.metrics_config import RecComputeMode
 from torchrec.metrics.rec_metric import RecTaskInfo
 from torchrec.metrics.segmented_ne import SegmentedNEMetric
 
@@ -33,6 +34,7 @@ class SegementedNEValueTest(unittest.TestCase):
         grouping_keys: torch.Tensor,
         grouping_key_tensor_name: str = "grouping_keys",
         cast_keys_to_int: bool = False,
+        compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
     ) -> None:
         num_task = labels.shape[0]
         batch_size = labels.shape[0]
@@ -70,6 +72,7 @@ class SegementedNEValueTest(unittest.TestCase):
             grouping_keys=grouping_key_tensor_name,
             # pyre-ignore
             cast_keys_to_int=cast_keys_to_int,
+            compute_mode=compute_mode,
         )
         ne.update(**inputs)
         actual_ne = ne.compute()
@@ -95,9 +98,39 @@ class SegementedNEValueTest(unittest.TestCase):
         test_data = generate_model_outputs_cases()
         for inputs in test_data:
             try:
-                self._test_segemented_ne_helper(**inputs)
+                self._test_segemented_ne_helper(
+                    **inputs,
+                    compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+                )
             except AssertionError:
-                print("Assertion error caught with data set ", inputs)
+                print(
+                    "Assertion error caught with data set in UNFUSED_TASKS_COMPUTATION mode",
+                    inputs,
+                )
+                raise
+
+            try:
+                self._test_segemented_ne_helper(
+                    **inputs,
+                    compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+                )
+            except AssertionError:
+                print(
+                    "Assertion error caught with data set in FUSED_TASKS_COMPUTATION mode",
+                    inputs,
+                )
+                raise
+
+            try:
+                self._test_segemented_ne_helper(
+                    **inputs,
+                    compute_mode=RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION,
+                )
+            except AssertionError:
+                print(
+                    "Assertion error caught with data set in FUSED_TASKS_AND_STATES_COMPUTATION mode",
+                    inputs,
+                )
                 raise
 
 
