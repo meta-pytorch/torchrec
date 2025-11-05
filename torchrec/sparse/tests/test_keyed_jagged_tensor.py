@@ -1064,6 +1064,335 @@ class TestKeyedJaggedTensor(unittest.TestCase):
 
         self.assertEqual(kjt.stride(), inverse_indices.shape[-1])
 
+    def test_empty_like_basic(self) -> None:
+        # Setup: Create a weighted KJT with explicit stride
+        values = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        weights = torch.tensor([1.0, 0.5, 1.5, 1.0, 0.5, 1.0, 1.0, 1.5])
+        keys = ["index_0", "index_1"]
+        offsets = torch.tensor([0, 2, 2, 3, 4, 5, 8])
+
+        kjt = KeyedJaggedTensor(
+            values=values,
+            keys=keys,
+            offsets=offsets,
+            weights=weights,
+        )
+
+        # Execute: Create an empty_like KJT
+        empty_kjt = KeyedJaggedTensor.empty_like(kjt)
+
+        # Assert: Verify the empty KJT has the same structure but empty tensors
+        self.assertEqual(empty_kjt.keys(), [])
+        self.assertEqual(empty_kjt.device(), kjt.device())
+        self.assertEqual(empty_kjt.values().dtype, kjt.values().dtype)
+        self.assertEqual(empty_kjt.values().numel(), 0)
+        self.assertEqual(empty_kjt.lengths().numel(), 0)
+        self.assertEqual(empty_kjt.weights().numel(), 0)
+        self.assertEqual(empty_kjt.weights().dtype, kjt.weights().dtype)
+        # Assert: Verify stride is preserved
+        self.assertEqual(empty_kjt.stride(), kjt.stride())
+        # Assert: Verify stride_per_key_per_rank is None (since original KJT doesn't have it)
+        self.assertIsNone(empty_kjt._stride_per_key_per_rank)
+
+    def test_empty_like_without_weights(self) -> None:
+        # Setup: Create a non-weighted KJT with explicit stride
+        values = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        keys = ["index_0"]
+        lengths = torch.tensor([2, 2])
+
+        kjt = KeyedJaggedTensor(
+            values=values,
+            keys=keys,
+            lengths=lengths,
+        )
+
+        # Execute: Create an empty_like KJT
+        empty_kjt = KeyedJaggedTensor.empty_like(kjt)
+
+        # Assert: Verify the empty KJT has no weights
+        self.assertEqual(empty_kjt.keys(), [])
+        self.assertEqual(empty_kjt.values().numel(), 0)
+        self.assertEqual(empty_kjt.lengths().numel(), 0)
+        self.assertIsNone(empty_kjt.weights_or_none())
+        # Assert: Verify stride is preserved
+        self.assertEqual(empty_kjt.stride(), kjt.stride())
+        # Assert: Verify stride_per_key_per_rank is None (since original KJT doesn't have it)
+        self.assertIsNone(empty_kjt._stride_per_key_per_rank)
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_empty_like_with_device(self) -> None:
+        # Setup: Create a KJT on CPU
+        values = torch.tensor([1.0, 2.0, 3.0])
+        weights = torch.tensor([0.1, 0.2, 0.3])
+        keys = ["index_0"]
+        lengths = torch.tensor([3])
+
+        kjt = KeyedJaggedTensor(
+            values=values,
+            keys=keys,
+            lengths=lengths,
+            weights=weights,
+        )
+
+        # Execute: Create an empty_like KJT on CUDA device (cross-device)
+        empty_kjt = KeyedJaggedTensor.empty_like(kjt, device=torch.device("cuda"))
+
+        # Assert: Verify the empty KJT preserves structure and is on the correct device
+        self.assertEqual(empty_kjt.keys(), kjt.keys())
+        self.assertEqual(empty_kjt.device().type, "cuda")
+        self.assertEqual(empty_kjt.values().dtype, kjt.values().dtype)
+        self.assertEqual(empty_kjt.weights().dtype, kjt.weights().dtype)
+        # Assert: Verify tensors are allocated on CUDA
+        self.assertTrue(empty_kjt.values().is_cuda)
+        self.assertTrue(empty_kjt.lengths().is_cuda)
+        self.assertTrue(empty_kjt.weights().is_cuda)
+        # Assert: Verify tensor sizes match the original
+        self.assertEqual(empty_kjt.values().size(), kjt.values().size())
+        self.assertEqual(empty_kjt.weights().size(), kjt.weights().size())
+        self.assertEqual(empty_kjt.lengths().size(), kjt.lengths().size())
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_empty_like_with_device_and_inverse_indices(self) -> None:
+        # Setup: Create a KJT with inverse_indices on CPU
+        values = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        weights = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+        keys = ["index_0", "index_1"]
+        lengths = torch.tensor([3, 3])
+        stride_per_key_per_rank = [[1], [1]]
+        inverse_indices = torch.tensor([[0, 1, 0], [0, 0, 0]])
+
+        kjt = KeyedJaggedTensor(
+            values=values,
+            keys=keys,
+            lengths=lengths,
+            weights=weights,
+            stride_per_key_per_rank=stride_per_key_per_rank,
+            inverse_indices=(keys, inverse_indices),
+        )
+
+        # Execute: Create an empty_like KJT on CUDA device (cross-device)
+        empty_kjt = KeyedJaggedTensor.empty_like(kjt, device=torch.device("cuda"))
+
+        # Assert: Verify the empty KJT preserves structure and is on the correct device
+        self.assertEqual(empty_kjt.keys(), kjt.keys())
+        self.assertEqual(empty_kjt.device().type, "cuda")
+        self.assertEqual(empty_kjt.values().dtype, kjt.values().dtype)
+        self.assertEqual(empty_kjt.weights().dtype, kjt.weights().dtype)
+        # Assert: Verify tensors are allocated on CUDA
+        self.assertTrue(empty_kjt.values().is_cuda)
+        self.assertTrue(empty_kjt.lengths().is_cuda)
+        self.assertTrue(empty_kjt.weights().is_cuda)
+        # Assert: Verify tensor sizes match the original
+        self.assertEqual(empty_kjt.values().size(), kjt.values().size())
+        self.assertEqual(empty_kjt.weights().size(), kjt.weights().size())
+        self.assertEqual(empty_kjt.lengths().size(), kjt.lengths().size())
+        # Assert: Verify stride_per_key_per_rank is preserved
+        self.assertEqual(
+            empty_kjt.stride_per_key_per_rank(), kjt.stride_per_key_per_rank()
+        )
+        # Assert: Verify inverse_indices are preserved and on CUDA
+        self.assertIsNotNone(empty_kjt.inverse_indices_or_none())
+        empty_inverse_indices = empty_kjt.inverse_indices()
+        kjt_inverse_indices = kjt.inverse_indices()
+        self.assertEqual(empty_inverse_indices[0], kjt_inverse_indices[0])
+        self.assertTrue(empty_inverse_indices[1].is_cuda)
+        self.assertEqual(empty_inverse_indices[1].size(), kjt_inverse_indices[1].size())
+
+    def test_empty_like_with_stride_per_key_per_rank(self) -> None:
+        # Setup: Create a KJT with variable stride per key
+        values = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        keys = ["index_0", "index_1"]
+        lengths = torch.tensor([2, 1, 3])
+        stride_per_key_per_rank = [[2], [1]]
+
+        kjt = KeyedJaggedTensor(
+            values=values,
+            keys=keys,
+            lengths=lengths,
+            stride_per_key_per_rank=stride_per_key_per_rank,
+        )
+
+        # Execute: Create an empty_like KJT
+        empty_kjt = KeyedJaggedTensor.empty_like(kjt)
+
+        # Assert: Verify stride per key per rank is preserved
+        self.assertEqual(empty_kjt.keys(), [])
+        self.assertTrue(empty_kjt.variable_stride_per_key())
+        self.assertEqual(empty_kjt.values().numel(), 0)
+        # Assert: Verify stride_per_key_per_rank is correctly preserved
+        self.assertEqual(
+            empty_kjt.stride_per_key_per_rank(), kjt.stride_per_key_per_rank()
+        )
+        self.assertIsNotNone(empty_kjt._stride_per_key_per_rank)
+        self.assertTrue(
+            torch.equal(
+                # pyre-ignore[6]
+                empty_kjt._stride_per_key_per_rank,
+                kjt._stride_per_key_per_rank,
+            )
+        )
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_copy_basic(self) -> None:
+        # Setup: Create source KJT on CPU and destination KJT on CUDA
+        source_values = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        source_weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
+        source_lengths = torch.tensor([2, 2])
+        keys = ["index_0"]
+
+        source_kjt = KeyedJaggedTensor(
+            values=source_values,
+            keys=keys,
+            lengths=source_lengths,
+            weights=source_weights,
+        )
+
+        dest_values = torch.zeros(4, device=torch.device("cuda"))
+        dest_weights = torch.zeros(4, device=torch.device("cuda"))
+        dest_lengths = torch.zeros(2, dtype=torch.int32, device=torch.device("cuda"))
+
+        dest_kjt = KeyedJaggedTensor(
+            values=dest_values,
+            keys=keys,
+            lengths=dest_lengths,
+            weights=dest_weights,
+        )
+
+        # Execute: Copy source KJT (CPU) to destination KJT (CUDA)
+        result_kjt = dest_kjt.copy_(source_kjt)
+
+        # Assert: Verify the destination KJT has the source values
+        self.assertTrue(torch.equal(result_kjt.values().cpu(), source_values))
+        self.assertTrue(torch.equal(result_kjt.weights().cpu(), source_weights))
+        self.assertTrue(torch.equal(result_kjt.lengths().cpu(), source_lengths))
+        # Verify it returns the same object (in-place operation)
+        self.assertIs(result_kjt, dest_kjt)
+        # Assert: Verify tensors are on CUDA
+        self.assertTrue(result_kjt.values().is_cuda)
+        self.assertTrue(result_kjt.weights().is_cuda)
+        self.assertTrue(result_kjt.lengths().is_cuda)
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_copy_without_weights(self) -> None:
+        # Setup: Create source KJT on CPU and destination KJT on CUDA without weights
+        source_values = torch.tensor([5.0, 6.0, 7.0])
+        source_lengths = torch.tensor([1, 2])
+        keys = ["index_0"]
+
+        source_kjt = KeyedJaggedTensor(
+            values=source_values,
+            keys=keys,
+            lengths=source_lengths,
+        )
+
+        dest_values = torch.zeros(3, device=torch.device("cuda"))
+        dest_lengths = torch.zeros(2, dtype=torch.int32, device=torch.device("cuda"))
+
+        dest_kjt = KeyedJaggedTensor(
+            values=dest_values,
+            keys=keys,
+            lengths=dest_lengths,
+        )
+
+        # Execute: Copy source KJT (CPU) to destination KJT (CUDA)
+        result_kjt = dest_kjt.copy_(source_kjt)
+
+        # Assert: Verify the destination KJT has the source values
+        self.assertTrue(torch.equal(result_kjt.values().cpu(), source_values))
+        self.assertTrue(torch.equal(result_kjt.lengths().cpu(), source_lengths))
+        self.assertIsNone(result_kjt.weights_or_none())
+        # Assert: Verify tensors are on CUDA
+        self.assertTrue(result_kjt.values().is_cuda)
+        self.assertTrue(result_kjt.lengths().is_cuda)
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_copy_with_offsets(self) -> None:
+        # Setup: Create source KJT on CPU and destination KJT on CUDA with offsets
+        source_values = torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
+        source_offsets = torch.tensor([0, 2, 5])
+        keys = ["index_0", "index_1"]
+
+        source_kjt = KeyedJaggedTensor(
+            values=source_values,
+            keys=keys,
+            offsets=source_offsets,
+        )
+
+        dest_values = torch.zeros(5, device=torch.device("cuda"))
+        dest_offsets = torch.zeros(3, dtype=torch.int32, device=torch.device("cuda"))
+
+        dest_kjt = KeyedJaggedTensor(
+            values=dest_values,
+            keys=keys,
+            offsets=dest_offsets,
+        )
+
+        # Execute: Copy source KJT (CPU) to destination KJT (CUDA)
+        result_kjt = dest_kjt.copy_(source_kjt)
+
+        # Assert: Verify the destination KJT has the source values and offsets
+        self.assertTrue(torch.equal(result_kjt.values().cpu(), source_values))
+        self.assertTrue(torch.equal(result_kjt.offsets().cpu(), source_offsets))
+        # Assert: Verify tensors are on CUDA
+        self.assertTrue(result_kjt.values().is_cuda)
+        self.assertTrue(result_kjt.offsets().is_cuda)
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_copy_non_blocking(self) -> None:
+        # Setup: Create source KJT on CPU and destination KJT on CUDA
+        source_values = torch.tensor([1.0, 2.0, 3.0])
+        source_lengths = torch.tensor([3])
+        keys = ["index_0"]
+
+        source_kjt = KeyedJaggedTensor(
+            values=source_values,
+            keys=keys,
+            lengths=source_lengths,
+        )
+
+        dest_values = torch.zeros(3, device=torch.device("cuda"))
+        dest_lengths = torch.zeros(1, dtype=torch.int32, device=torch.device("cuda"))
+
+        dest_kjt = KeyedJaggedTensor(
+            values=dest_values,
+            keys=keys,
+            lengths=dest_lengths,
+        )
+
+        # Execute: Copy source KJT (CPU) to destination KJT (CUDA) with non_blocking=True
+        result_kjt = dest_kjt.copy_(source_kjt, non_blocking=True)
+
+        # Assert: Verify the copy succeeded
+        self.assertTrue(torch.equal(result_kjt.values().cpu(), source_values))
+        self.assertTrue(torch.equal(result_kjt.lengths().cpu(), source_lengths))
+        # Assert: Verify tensors are on CUDA
+        self.assertTrue(result_kjt.values().is_cuda)
+        self.assertTrue(result_kjt.lengths().is_cuda)
+
 
 class TestKeyedJaggedTensorScripting(unittest.TestCase):
     def test_scriptable_forward(self) -> None:
