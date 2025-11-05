@@ -1718,6 +1718,85 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    def test_pipelining_embedding_lookup(self) -> None:
+        model = self._setup_model()
+
+        sharding_type = ShardingType.TABLE_WISE.value
+        kernel_type = EmbeddingComputeKernel.FUSED.value
+
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type
+        )
+        (
+            sharded_model_pipelined,
+            optim_pipelined,
+        ) = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type
+        )
+
+        copy_state_dict(
+            sharded_model.state_dict(), sharded_model_pipelined.state_dict()
+        )
+
+        num_batches = 12
+        data = self._generate_data(
+            num_batches=num_batches,
+            batch_size=32,
+        )
+
+        non_pipelined_outputs = []
+        for batch in data:
+            batch = batch.to(self.device)
+            optim.zero_grad()
+            loss, pred = sharded_model(batch)
+            loss.backward()
+            optim.step()
+            non_pipelined_outputs.append(pred)
+
+        embedding_lookup_stream = torch.cuda.Stream()
+        sdd = SparseDataDistUtil[ModelInput](
+            model=sharded_model_pipelined,
+            data_dist_stream=torch.cuda.Stream(),
+            apply_jit=False,
+            embedding_lookup_stream=embedding_lookup_stream,
+        )
+
+        pipeline_stages = [
+            PipelineStage(
+                name="data_copy",
+                runnable=partial(get_h2d_func, device=self.device),
+                stream=torch.cuda.Stream(),
+            ),
+            sdd.start_sparse_data_dist_stage(),
+            sdd.start_embedding_lookup_stage(),
+        ]
+        pipeline = StagedTrainPipeline(
+            pipeline_stages=pipeline_stages, compute_stream=torch.cuda.current_stream()
+        )
+        dataloader = iter(data)
+
+        pipelined_out = []
+        num_batches_processed = 0
+
+        while model_in := pipeline.progress(dataloader):
+            num_batches_processed += 1
+            optim_pipelined.zero_grad()
+            loss, pred = sharded_model_pipelined(model_in)
+            loss.backward()
+            optim_pipelined.step()
+            pipelined_out.append(pred)
+
+        self.assertEqual(num_batches_processed, num_batches)
+
+        self.assertEqual(len(pipelined_out), len(non_pipelined_outputs))
+        for out, ref_out in zip(pipelined_out, non_pipelined_outputs):
+            torch.testing.assert_close(out, ref_out)
+
+    # pyre-ignore
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     def test_pipeline_flush(self) -> None:
         model = self._setup_model()
 
