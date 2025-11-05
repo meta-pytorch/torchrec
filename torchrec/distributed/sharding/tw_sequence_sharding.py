@@ -175,12 +175,21 @@ class InferTwSequenceEmbeddingDist(
         device: torch.device,
         world_size: int,
         storage_device_type_from_sharding_infos: Optional[str] = None,
+        embedding_names_per_rank: Optional[List[List[str]]] = None,
     ) -> None:
         super().__init__()
-        self._dist: SeqEmbeddingsAllToOne = SeqEmbeddingsAllToOne(device, world_size)
+        self._adjusted_world_size: int = (
+            world_size
+            if embedding_names_per_rank is None
+            else sum(1 for sublist in embedding_names_per_rank if len(sublist) > 0)
+        )
+        self._dist: SeqEmbeddingsAllToOne = SeqEmbeddingsAllToOne(
+            device, self._adjusted_world_size
+        )
         self._storage_device_type_from_sharding_infos: Optional[str] = (
             storage_device_type_from_sharding_infos
         )
+        self._embedding_names_per_rank = embedding_names_per_rank
 
     def forward(
         self,
@@ -216,6 +225,8 @@ class InferTwSequenceEmbeddingDist(
                     local_emb,
                 )
                 for i, local_emb in enumerate(local_embs)
+                if self._embedding_names_per_rank is not None
+                and len(self._embedding_names_per_rank[i]) > 0
             ]
             return self._dist(local_embs)
         else:
@@ -269,4 +280,5 @@ class InferTwSequenceEmbeddingSharding(
             device,
             self._world_size,
             self._storage_device_type_from_sharding_infos,
+            self.embedding_names_per_rank(),
         )

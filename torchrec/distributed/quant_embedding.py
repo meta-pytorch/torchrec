@@ -305,37 +305,49 @@ def _construct_jagged_tensors_tw(
     storage_device_type: str,
 ) -> Dict[str, JaggedTensor]:
     ret: Dict[str, JaggedTensor] = {}
+    index = 0
     for i in range(len(embedding_names_per_rank)):
-        embeddings_i = embeddings[i]
-        features_i: KeyedJaggedTensor = features[i]
-        if storage_device_type in ["ssd", "cpu"]:
-            embeddings_i = _get_batching_hinted_output(
-                _fx_trec_get_feature_length(features_i, embedding_names_per_rank[i]),
-                embeddings_i,
-            )
+        if len(embedding_names_per_rank[i]) > 0:
+            embeddings_i = embeddings[index]
+            features_i: KeyedJaggedTensor = features[i]
+            if storage_device_type in ["ssd", "cpu"]:
+                embeddings_i = _get_batching_hinted_output(
+                    _fx_trec_get_feature_length(
+                        features_i, embedding_names_per_rank[index]
+                    ),
+                    embeddings_i,
+                )
 
-        lengths = features_i.lengths().view(-1, features_i.stride())
-        values = features_i.values()
-        embeddings_list = _fx_split_embeddings_per_feature_length(
-            embeddings_i, features_i
-        )
-        stride = features_i.stride()
-        lengths_tuple = torch.unbind(lengths.view(-1, stride), dim=0)
-        if need_indices:
-            values_list = _fx_split_embeddings_per_feature_length(values, features_i)
-            for j, key in enumerate(embedding_names_per_rank[i]):
-                ret[key] = JaggedTensor(
-                    lengths=lengths_tuple[j],
-                    values=embeddings_list[j],
-                    weights=values_list[j],
+            lengths = features_i.lengths().view(-1, features_i.stride())
+            values = features_i.values()
+            embeddings_list = _fx_split_embeddings_per_feature_length(
+                embeddings_i, features_i
+            )
+            stride = features_i.stride()
+            lengths_tuple = torch.unbind(lengths.view(-1, stride), dim=0)
+            if need_indices:
+                values_list = _fx_split_embeddings_per_feature_length(
+                    values, features_i
                 )
-        else:
-            for j, key in enumerate(embedding_names_per_rank[i]):
-                ret[key] = JaggedTensor(
-                    lengths=lengths_tuple[j],
-                    values=embeddings_list[j],
-                    weights=None,
-                )
+                for j, key in enumerate(embedding_names_per_rank[i]):
+                    ret[key] = JaggedTensor(
+                        lengths=lengths_tuple[j],
+                        values=embeddings_list[j],
+                        weights=values_list[j],
+                    )
+            else:
+                for j, key in enumerate(embedding_names_per_rank[i]):
+                    ret[key] = JaggedTensor(
+                        lengths=lengths_tuple[j],
+                        values=embeddings_list[j],
+                        weights=None,
+                    )
+            index += 1
+        # for cuda storage device, empty embeddding per rank is already skipped
+        # as part of tw_sequence_sharding output dist before executing
+        # SeqEmbeddingsAllToOne (for cpu / ssd SeqEmbeddingsAllToOne is not required)
+        elif storage_device_type in ["cpu", "ssd"]:
+            index += 1
     return ret
 
 
