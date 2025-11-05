@@ -474,3 +474,234 @@ class MayCollectFeatureScoresTest(unittest.TestCase):
         weights = result[0].weights_or_none()
         self.assertIsNotNone(weights)
         self.assertEqual(weights.device, device)
+
+
+class EmbeddingBagConfigSupportTest(unittest.TestCase):
+    def test_embedding_bag_config_with_auto_collection_enabled(self) -> None:
+        # Setup: create EmbeddingBagConfig with auto collection enabled
+        mock_embedding_bag_config = EmbeddingBagConfig(
+            name="table_0",
+            embedding_dim=64,
+            num_embeddings=100,
+            feature_names=["feature_0", "feature_1"],
+            use_virtual_table=True,
+            virtual_table_eviction_policy=FeatureScoreBasedEvictionPolicy(
+                feature_score_mapping={"feature_0": 1.5, "feature_1": 2.0},
+                enable_auto_feature_score_collection=True,
+            ),
+        )
+
+        mock_param = torch.nn.Parameter(torch.randn(100, 64))
+        mock_param_sharding = Mock(spec=ParameterSharding)
+
+        sharding_info = EmbeddingShardingInfo(
+            embedding_config=_convert_to_table_config(mock_embedding_bag_config),
+            param_sharding=mock_param_sharding,
+            param=mock_param,
+        )
+
+        embedding_configs = [mock_embedding_bag_config]
+        sharding_type_to_sharding_infos = {
+            ShardingType.TABLE_WISE.value: [sharding_info],
+        }
+
+        # Execute: run create_sharding_type_to_feature_score_mapping
+        (
+            enable_weight_acc,
+            enable_auto_collection,
+            mapping,
+        ) = create_sharding_type_to_feature_score_mapping(
+            embedding_configs, sharding_type_to_sharding_infos
+        )
+
+        # Assert: both flags are enabled and mapping contains feature scores
+        self.assertTrue(enable_weight_acc)
+        self.assertTrue(enable_auto_collection)
+        self.assertIn(ShardingType.TABLE_WISE.value, mapping)
+        self.assertEqual(
+            mapping[ShardingType.TABLE_WISE.value],
+            {"feature_0": 1.5, "feature_1": 2.0},
+        )
+
+    def test_embedding_bag_config_with_default_value(self) -> None:
+        # Setup: create EmbeddingBagConfig with default value for missing features
+        mock_embedding_bag_config = EmbeddingBagConfig(
+            name="table_0",
+            embedding_dim=64,
+            num_embeddings=100,
+            feature_names=["feature_0", "feature_1", "feature_2"],
+            use_virtual_table=True,
+            virtual_table_eviction_policy=FeatureScoreBasedEvictionPolicy(
+                feature_score_mapping={"feature_0": 1.5, "feature_1": 2.0},
+                feature_score_default_value=0.5,
+                enable_auto_feature_score_collection=True,
+            ),
+        )
+
+        mock_param = torch.nn.Parameter(torch.randn(100, 64))
+        mock_param_sharding = Mock(spec=ParameterSharding)
+
+        sharding_info = EmbeddingShardingInfo(
+            embedding_config=_convert_to_table_config(mock_embedding_bag_config),
+            param_sharding=mock_param_sharding,
+            param=mock_param,
+        )
+
+        embedding_configs = [mock_embedding_bag_config]
+        sharding_type_to_sharding_infos = {
+            ShardingType.TABLE_WISE.value: [sharding_info],
+        }
+
+        # Execute: run create_sharding_type_to_feature_score_mapping
+        (
+            enable_weight_acc,
+            enable_auto_collection,
+            mapping,
+        ) = create_sharding_type_to_feature_score_mapping(
+            embedding_configs, sharding_type_to_sharding_infos
+        )
+
+        # Assert: mapping contains explicit scores and default for feature_2
+        self.assertTrue(enable_weight_acc)
+        self.assertTrue(enable_auto_collection)
+        self.assertEqual(
+            mapping[ShardingType.TABLE_WISE.value],
+            {"feature_0": 1.5, "feature_1": 2.0, "feature_2": 0.5},
+        )
+
+    def test_mixed_embedding_config_and_bag_config(self) -> None:
+        # Setup: create both EmbeddingConfig and EmbeddingBagConfig with auto collection
+        embedding_config = EmbeddingConfig(
+            name="table_0",
+            embedding_dim=64,
+            num_embeddings=100,
+            feature_names=["feature_0"],
+            use_virtual_table=True,
+            virtual_table_eviction_policy=FeatureScoreBasedEvictionPolicy(
+                feature_score_mapping={"feature_0": 1.0},
+                enable_auto_feature_score_collection=True,
+            ),
+        )
+
+        embedding_bag_config = EmbeddingBagConfig(
+            name="table_1",
+            embedding_dim=32,
+            num_embeddings=50,
+            feature_names=["feature_1"],
+            use_virtual_table=True,
+            virtual_table_eviction_policy=FeatureScoreBasedEvictionPolicy(
+                feature_score_mapping={"feature_1": 2.0},
+                enable_auto_feature_score_collection=True,
+            ),
+        )
+
+        mock_param_0 = torch.nn.Parameter(torch.randn(100, 64))
+        mock_param_1 = torch.nn.Parameter(torch.randn(50, 32))
+        mock_param_sharding = Mock(spec=ParameterSharding)
+
+        sharding_info_0 = EmbeddingShardingInfo(
+            embedding_config=_convert_to_table_config(embedding_config),
+            param_sharding=mock_param_sharding,
+            param=mock_param_0,
+        )
+
+        sharding_info_1 = EmbeddingShardingInfo(
+            embedding_config=_convert_to_table_config(embedding_bag_config),
+            param_sharding=mock_param_sharding,
+            param=mock_param_1,
+        )
+
+        embedding_configs = [embedding_config, embedding_bag_config]
+        sharding_type_to_sharding_infos = {
+            ShardingType.TABLE_WISE.value: [sharding_info_0, sharding_info_1],
+        }
+
+        # Execute: run create_sharding_type_to_feature_score_mapping
+        (
+            enable_weight_acc,
+            enable_auto_collection,
+            mapping,
+        ) = create_sharding_type_to_feature_score_mapping(
+            embedding_configs, sharding_type_to_sharding_infos
+        )
+
+        # Assert: mapping contains scores from both config types
+        self.assertTrue(enable_weight_acc)
+        self.assertTrue(enable_auto_collection)
+        self.assertIn(ShardingType.TABLE_WISE.value, mapping)
+        self.assertEqual(
+            mapping[ShardingType.TABLE_WISE.value],
+            {"feature_0": 1.0, "feature_1": 2.0},
+        )
+
+    def test_embedding_bag_config_without_virtual_table(self) -> None:
+        # Setup: create EmbeddingBagConfig without virtual table
+        embedding_bag_configs = [
+            EmbeddingBagConfig(
+                name="table_0",
+                embedding_dim=64,
+                num_embeddings=100,
+                feature_names=["feature_0"],
+            ),
+        ]
+        sharding_type_to_sharding_infos: Dict[str, List[EmbeddingShardingInfo]] = {}
+
+        # Execute: run create_sharding_type_to_feature_score_mapping
+        (
+            enable_weight_acc,
+            enable_auto_collection,
+            mapping,
+        ) = create_sharding_type_to_feature_score_mapping(
+            embedding_bag_configs, sharding_type_to_sharding_infos
+        )
+
+        # Assert: both flags should be False and mapping should be empty
+        self.assertFalse(enable_weight_acc)
+        self.assertFalse(enable_auto_collection)
+        self.assertEqual(mapping, {})
+
+    def test_embedding_bag_config_with_eviction_ttl_mins(self) -> None:
+        # Setup: create EmbeddingBagConfig with positive eviction_ttl_mins
+        mock_embedding_bag_config = EmbeddingBagConfig(
+            name="table_0",
+            embedding_dim=64,
+            num_embeddings=100,
+            feature_names=["feature_0", "feature_1"],
+            use_virtual_table=True,
+            virtual_table_eviction_policy=FeatureScoreBasedEvictionPolicy(
+                feature_score_mapping={},
+                eviction_ttl_mins=60,
+                enable_auto_feature_score_collection=True,
+            ),
+        )
+
+        mock_param = torch.nn.Parameter(torch.randn(100, 64))
+        mock_param_sharding = Mock(spec=ParameterSharding)
+
+        sharding_info = EmbeddingShardingInfo(
+            embedding_config=_convert_to_table_config(mock_embedding_bag_config),
+            param_sharding=mock_param_sharding,
+            param=mock_param,
+        )
+
+        embedding_configs = [mock_embedding_bag_config]
+        sharding_type_to_sharding_infos = {
+            ShardingType.TABLE_WISE.value: [sharding_info],
+        }
+
+        # Execute: run create_sharding_type_to_feature_score_mapping
+        (
+            enable_weight_acc,
+            enable_auto_collection,
+            mapping,
+        ) = create_sharding_type_to_feature_score_mapping(
+            embedding_configs, sharding_type_to_sharding_infos
+        )
+
+        # Assert: all features get 0.0 score when eviction_ttl_mins is positive
+        self.assertTrue(enable_weight_acc)
+        self.assertTrue(enable_auto_collection)
+        self.assertEqual(
+            mapping[ShardingType.TABLE_WISE.value],
+            {"feature_0": 0.0, "feature_1": 0.0},
+        )
