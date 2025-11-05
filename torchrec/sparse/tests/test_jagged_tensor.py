@@ -811,6 +811,54 @@ class TestJaggedTensor(unittest.TestCase):
             torch.equal(j1.values(), torch.Tensor([3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))
         )
 
+    def test_to_dict_compute_offsets_false(self) -> None:
+        # Setup: KJT with two keys and standard stride
+        values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        keys = ["f1", "f2"]
+        lengths = torch.IntTensor([2, 0, 1, 1, 1, 3])
+
+        kjt = KeyedJaggedTensor(values=values, keys=keys, lengths=lengths)
+
+        # Execute: call to_dict with compute_offsets=False
+        jt_dict = kjt.to_dict(compute_offsets=False)
+
+        # Assert: offsets_or_none() should be None for each JaggedTensor
+        self.assertIsNone(jt_dict["f1"].offsets_or_none())
+        self.assertIsNone(jt_dict["f2"].offsets_or_none())
+        # Lengths should still be available
+        self.assertTrue(
+            torch.equal(jt_dict["f1"].lengths(), torch.IntTensor([2, 0, 1]))
+        )
+        self.assertTrue(
+            torch.equal(jt_dict["f2"].lengths(), torch.IntTensor([1, 1, 3]))
+        )
+
+    def test_to_dict_compute_offsets_false_variable_stride(self) -> None:
+        # Setup: KJT with variable stride per key (reusing test_from_jt_dict_vb data)
+        values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        keys = ["f1", "f2"]
+        lengths = torch.IntTensor([2, 0, 1, 1, 1, 3])
+        stride_per_key_per_rank = [[2], [4]]
+
+        kjt = KeyedJaggedTensor(
+            values=values,
+            keys=keys,
+            lengths=lengths,
+            stride_per_key_per_rank=stride_per_key_per_rank,
+        )
+
+        # Execute: call to_dict with compute_offsets=False
+        jt_dict = kjt.to_dict(compute_offsets=False)
+
+        # Assert: offsets_or_none() should be None for each JaggedTensor
+        self.assertIsNone(jt_dict["f1"].offsets_or_none())
+        self.assertIsNone(jt_dict["f2"].offsets_or_none())
+        # Lengths should still be available
+        self.assertTrue(torch.equal(jt_dict["f1"].lengths(), torch.IntTensor([2, 0])))
+        self.assertTrue(
+            torch.equal(jt_dict["f2"].lengths(), torch.IntTensor([1, 1, 1, 3]))
+        )
+
 
 class TestJaggedTensorTracing(unittest.TestCase):
     def test_jagged_tensor(self) -> None:
