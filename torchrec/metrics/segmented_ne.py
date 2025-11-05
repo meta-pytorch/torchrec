@@ -102,6 +102,29 @@ def compute_ne(
     return result_ne
 
 
+def compute_ne_fused(
+    ce_sum: torch.Tensor,
+    weighted_num_samples: torch.Tensor,
+    pos_labels: torch.Tensor,
+    neg_labels: torch.Tensor,
+    num_groups: int,
+    n_tasks: int,
+    eta: float,
+) -> torch.Tensor:
+    # size should be (n_tasks, num_groups)
+    result_ne = torch.zeros([n_tasks, num_groups])
+    for group in range(num_groups):
+        mean_label = pos_labels[:, group] / weighted_num_samples[:, group]
+        ce_norm = _compute_cross_entropy_norm(
+            mean_label, pos_labels[:, group], neg_labels[:, group], eta
+        )
+        ne = ce_sum[:, group] / ce_norm
+        result_ne[:, group] = ne
+
+    # ne indexed by group - tensor size (num_groups)
+    return result_ne
+
+
 def get_segemented_ne_states(
     labels: torch.Tensor,
     predictions: torch.Tensor,
@@ -111,12 +134,8 @@ def get_segemented_ne_states(
     num_groups: int,
 ) -> Dict[str, torch.Tensor]:
     groups = torch.unique(grouping_keys)
-    cross_entropy, weighted_num_samples, pos_labels, neg_labels = (
-        torch.zeros(num_groups).to(labels.device),
-        torch.zeros(num_groups).to(labels.device),
-        torch.zeros(num_groups).to(labels.device),
-        torch.zeros(num_groups).to(labels.device),
-    )
+    buffer = torch.zeros((4, num_groups), device=labels.device)
+    cross_entropy, weighted_num_samples, pos_labels, neg_labels = buffer.unbind(0)
     for group in groups:
         group_mask = grouping_keys == group
 
@@ -142,6 +161,53 @@ def get_segemented_ne_states(
         weighted_num_samples[group] = weighted_num_samples_group.item()
         pos_labels[group] = pos_labels_group.item()
         neg_labels[group] = neg_labels_group.item()
+
+    # tensor size for each value is (num_groups)
+    return {
+        "cross_entropy_sum": cross_entropy,
+        "weighted_num_samples": weighted_num_samples,
+        "pos_labels": pos_labels,
+        "neg_labels": neg_labels,
+    }
+
+
+def get_segemented_ne_states_fused(
+    labels: torch.Tensor,
+    predictions: torch.Tensor,
+    weights: torch.Tensor,
+    grouping_keys: torch.Tensor,
+    eta: float,
+    num_groups: int,
+    n_tasks: int,
+) -> Dict[str, torch.Tensor]:
+    groups = torch.unique(grouping_keys)
+    buffer = torch.zeros((4, n_tasks, num_groups), device=labels.device)
+    cross_entropy, weighted_num_samples, pos_labels, neg_labels = buffer.unbind(0)
+    for group in groups:
+        group_mask = grouping_keys == group
+
+        group_labels = labels[:, group_mask]
+        group_predictions = predictions[:, group_mask]
+        group_weights = weights[:, group_mask]
+
+        ce_sum_group = torch.sum(
+            compute_cross_entropy(
+                labels=group_labels,
+                predictions=group_predictions,
+                weights=group_weights,
+                eta=eta,
+            ),
+            dim=-1,
+        )
+
+        weighted_num_samples_group = torch.sum(group_weights, dim=-1)
+        pos_labels_group = torch.sum(group_weights * group_labels, dim=-1)
+        neg_labels_group = torch.sum(group_weights * (1.0 - group_labels), dim=-1)
+
+        cross_entropy[:, group] = ce_sum_group
+        weighted_num_samples[:, group] = weighted_num_samples_group
+        pos_labels[:, group] = pos_labels_group
+        neg_labels[:, group] = neg_labels_group
 
     # tensor size for each value is (num_groups)
     return {
@@ -251,21 +317,91 @@ class SegmentedNEMetricComputation(RecMetricComputation):
                 )
 
         grouping_keys = kwargs["required_inputs"][self._grouping_keys]
-        states = get_segemented_ne_states(
-            labels,
-            predictions,
-            weights,
-            grouping_keys,
-            eta=self.eta,
-            num_groups=self._num_groups,
-        )
+        # When labels is 2D, we're in a fused mode (either FUSED_TASKS_COMPUTATION or FUSED_TASKS_AND_STATES_COMPUTATION)
+        # The states update and NE computation need to be done differently.
+        # On fused path, we need to group all tasks together to compute NE and update states for all tasks in one tensor.
+        if (
+            self._compute_mode == RecComputeMode.FUSED_TASKS_COMPUTATION
+            or self._compute_mode == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
+        ):
+            states = get_segemented_ne_states_fused(
+                labels,
+                predictions,
+                weights,
+                grouping_keys,
+                eta=self.eta,
+                num_groups=self._num_groups,
+                n_tasks=self._n_tasks,
+            )
+        else:
+            states = get_segemented_ne_states(
+                labels,
+                predictions,
+                weights,
+                grouping_keys,
+                eta=self.eta,
+                num_groups=self._num_groups,
+            )
 
         for state_name, state_value in states.items():
             state = getattr(self, state_name)
             state += state_value
 
+    def _compute_fused(self) -> List[MetricComputationReport]:
+        reports = []
+        computed_ne = compute_ne_fused(
+            # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
+            self.cross_entropy_sum,
+            # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
+            self.weighted_num_samples,
+            # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
+            self.pos_labels,
+            # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
+            self.neg_labels,
+            num_groups=self._num_groups,
+            n_tasks=self._n_tasks,
+            eta=self.eta,
+        )
+        for group in range(self._num_groups):
+            reports.append(
+                MetricComputationReport(
+                    name=MetricName.SEGMENTED_NE,
+                    metric_prefix=MetricPrefix.LIFETIME,
+                    value=computed_ne[:, group],
+                    description="_" + str(group),
+                ),
+            )
+
+        if self._include_logloss:
+            log_loss_groups = compute_logloss(
+                # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
+                self.cross_entropy_sum,
+                # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
+                self.pos_labels,
+                # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
+                self.neg_labels,
+                eta=self.eta,
+            )
+            for group in range(self._num_groups):
+                reports.append(
+                    MetricComputationReport(
+                        name=MetricName.LOG_LOSS,
+                        metric_prefix=MetricPrefix.LIFETIME,
+                        value=log_loss_groups[:, group],
+                        description="_" + str(group),
+                    )
+                )
+
+        return reports
+
     def _compute(self) -> List[MetricComputationReport]:
         reports = []
+        if (
+            self._compute_mode == RecComputeMode.FUSED_TASKS_COMPUTATION
+            or self._compute_mode == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
+        ):
+            return self._compute_fused()
+
         computed_ne = compute_ne(
             # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             self.cross_entropy_sum[0],
@@ -349,8 +485,3 @@ class SegmentedNEMetric(RecMetric):
         else:
             # pyre-ignore[6]
             self._required_inputs.add(kwargs["grouping_keys"])
-        if self._compute_mode == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION:
-            logging.warning(
-                f"compute_mode FUSED_TASKS_AND_STATES_COMPUTATION can't support {self._namespace} yet "
-                "because its states are not 1D Tensors. Only FUSED_TASKS_COMPUTATION will take effect."
-            )

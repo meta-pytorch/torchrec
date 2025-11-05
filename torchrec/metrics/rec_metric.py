@@ -135,7 +135,7 @@ class RecMetricComputation(Metric, abc.ABC):
         window_size: int,
         compute_on_all_ranks: bool = False,
         should_validate_update: bool = False,
-        fuse_state_tensors: bool = False,
+        compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         process_group: Optional[dist.ProcessGroup] = None,
         fused_update_limit: int = 0,
         allow_missing_label_with_zero_weight: bool = False,
@@ -144,7 +144,13 @@ class RecMetricComputation(Metric, abc.ABC):
     ) -> None:
         metric_init_signature = inspect.signature(Metric.__init__)
         if "fuse_state_tensors" in metric_init_signature.parameters:
-            kwargs["fuse_state_tensors"] = fuse_state_tensors
+            kwargs["fuse_state_tensors"] = (
+                True
+                if compute_mode == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
+                else False
+            )
+        if "compute_mode" in metric_init_signature.parameters:
+            kwargs["compute_mode"] = compute_mode
         super().__init__(
             process_group=process_group,
             *args,
@@ -169,6 +175,7 @@ class RecMetricComputation(Metric, abc.ABC):
                 dist_reduce_fx=lambda x: torch.any(x, dim=0).byte(),
                 persistent=True,
             )
+        self._compute_mode: RecComputeMode = compute_mode
 
     @staticmethod
     def get_window_state_name(state_name: str) -> str:
@@ -428,9 +435,7 @@ class RecMetric(nn.Module, abc.ABC):
                 window_size=self._window_size,
                 compute_on_all_ranks=compute_on_all_ranks,
                 should_validate_update=self._should_validate_update,
-                fuse_state_tensors=(
-                    compute_mode == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
-                ),
+                compute_mode=compute_mode,
                 process_group=process_group,
                 **{**kwargs, **self._get_task_kwargs(task_config)},
             )
