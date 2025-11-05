@@ -32,12 +32,14 @@ from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
 
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
+    EmbeddingTrainPipelineContext,
     In,
     PrefetchTrainPipelineContext,
     TrainPipelineContext,
 )
 from torchrec.distributed.train_pipeline.runtime_forwards import (
     BaseForward,
+    InSyncEmbeddingPipelinedForward,
     PipelinedForward,
     PrefetchPipelinedForward,
 )
@@ -48,6 +50,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _prefetch_embeddings,
     _rewrite_model,
     _start_data_dist,
+    _start_embedding_lookup,
     use_context_for_postprocs,
 )
 from torchrec.distributed.types import Awaitable
@@ -91,7 +94,8 @@ class PipelineStage:
 class SparseDataDistUtil(Generic[In]):
     """
     Helper class exposing methods for sparse data dist and prefetch pipelining.
-    Currently used for `StagedTrainPipeline` pipeline stages
+    Currently used for `StagedTrainPipeline` pipeline stages.\n
+    Specifying `embedding_lookup_stream` makes `StagedTrainPipeline` semi-synchronous.
 
     Args:
         model (torch.nn.Module): Model to pipeline
@@ -100,8 +104,11 @@ class SparseDataDistUtil(Generic[In]):
         prefetch_stream (Optional[torch.cuda.Stream]): Stream on which model prefetch runs
             Defaults to `None`. This needs to be passed in to enable prefetch pipelining.
         pipeline_postproc (bool): whether to pipeline postproc modules. Defaults to `False`.
+        embedding_lookup_stream (Optional[torch.cuda.Stream]): Stream on which embedding lookup runs
+            Defaults to `None`. This needs to be passed in to enable embedding lookup pipelining.
 
     Example::
+        # With prefetch pipeline:
         sdd = SparseDataDistUtil(
             model=model,
             data_dist_stream=torch.cuda.Stream(),
@@ -129,6 +136,33 @@ class SparseDataDistUtil(Generic[In]):
             ),
         ]
 
+        # With embedding lookup pipeline:
+        sdd = SparseDataDistUtil(
+            model=model,
+            data_dist_stream=torch.cuda.Stream(),
+            embedding_lookup_stream=torch.cuda.Stream(), <-- required to enable embedding lookup pipeline
+        )
+        pipeline = [
+            PipelineStage(
+                name="data_copy",
+                runnable=lambda batch, context: batch.to(
+                    self._device, non_blocking=True
+                ),
+                stream=torch.cuda.Stream(),
+            ),
+            PipelineStage(
+                name="start_sparse_data_dist",
+                runnable=sdd.start_sparse_data_dist,
+                stream=sdd.data_dist_stream,
+                fill_callback=sdd.wait_sdd_fill_callback,
+            ),
+            PipelineStage(
+                name="start_embedding_lookup",
+                runnable=sdd.start_embedding_lookup,
+                stream=sdd.embedding_lookup_stream,
+            ),
+        ]
+
         return StagedTrainPipeline(pipeline_stages=pipeline)
     """
 
@@ -144,12 +178,14 @@ class SparseDataDistUtil(Generic[In]):
         apply_jit: bool = False,
         prefetch_stream: Optional[torch.Stream] = None,
         pipeline_postproc: bool = False,
+        embedding_lookup_stream: Optional[torch.Stream] = None,
     ) -> None:
         super().__init__()
         self.model = model
         self.data_dist_stream = data_dist_stream
         self.apply_jit = apply_jit
         self.prefetch_stream = prefetch_stream
+        self.embedding_lookup_stream = embedding_lookup_stream
         self._next_index: int = 0
         self._contexts: Deque[TrainPipelineContext] = deque()
         self.initialized = False
@@ -157,6 +193,10 @@ class SparseDataDistUtil(Generic[In]):
         self._pipelined_postprocs: List[PipelinedPostproc] = []
         self.fwd_hook: Optional[RemovableHandle] = None
         self._device: torch.device = data_dist_stream.device
+
+        assert not (
+            self._with_prefetch and self._with_embedding_lookup
+        ), "Cannot enable both prefetch and embedding lookup at the same time. Prefetch is redundant with embedding lookup."
 
         self._stream_context: Callable[
             [Optional[torch.Stream]], torch.cuda.StreamContext
@@ -172,10 +212,17 @@ class SparseDataDistUtil(Generic[In]):
             Callable[[KeyedJaggedTensor], Awaitable[KJTAllToAllTensorsAwaitable]]
         ] = []
 
-        self._pipelined_forward: Type[BaseForward[TrainPipelineContext]] = cast(
-            Type[BaseForward[TrainPipelineContext]],
-            (PrefetchPipelinedForward if self._with_prefetch else PipelinedForward),
-        )
+        self._pipelined_forward: Type[BaseForward[TrainPipelineContext]]
+        if self._with_prefetch:
+            self._pipelined_forward = cast(
+                Type[BaseForward[TrainPipelineContext]], PrefetchPipelinedForward
+            )
+        elif self._with_embedding_lookup:
+            self._pipelined_forward = cast(
+                Type[BaseForward[TrainPipelineContext]], InSyncEmbeddingPipelinedForward
+            )
+        else:
+            self._pipelined_forward = PipelinedForward
 
         self._default_stream: Optional[torch.Stream] = (
             (torch.get_device_module(self._device).Stream())
@@ -195,6 +242,10 @@ class SparseDataDistUtil(Generic[In]):
     @property
     def _with_prefetch(self) -> bool:
         return self.prefetch_stream is not None
+
+    @property
+    def _with_embedding_lookup(self) -> bool:
+        return self.embedding_lookup_stream is not None
 
     def _is_reattaching(self) -> bool:
         return len(self._contexts) > 0
@@ -239,7 +290,8 @@ class SparseDataDistUtil(Generic[In]):
     # advancing the list at the beginning of the `progress`.
     # Tricky part is that SparseDataDistUtil might be participating in TWO stages:
     # * "main" with start_data_dist -> wait_data_dist pair for `runnable` and `fill_callback`
-    # * "prefetch" with prefetch -> load_prefetch for `runnable` and `fill_callback`
+    # * "prefetch" with prefetch -> load_prefetch for `runnable` and `fill_callback` (optional)
+    # * "embedding_lookup" with start_embedding_lookup for `runnable` (optional)
     #
     # For this to work, we:
     # (1) need to manage contexts in a lockstep with batch advancing through stages (_advance_context)
@@ -248,18 +300,18 @@ class SparseDataDistUtil(Generic[In]):
     # (3) set contexts for the _pipelined_modules and _pipelined_postprocs to the "current batch context"
     #       for the model to run correctly (_set_module_context)
     #
-    # SDD Util uses two or three contexts, depending on if prefetch is present
+    # SDD Util uses two or three contexts, depending on if prefetch or embedding_lookup is enabled
     # * context[0] is always the "current batch" context - used for model forward (outside this class)
-    # * context[1] is used for prefetch if it is set, and start/wait_sparse_data_dist if not
-    # * context[2] is used for start/wait_sparse_data_dist if prefetch is not set
+    # * context[1] is used for prefetch/embedding_lookup if either is set, and start/wait_sparse_data_dist if not
+    # * context[2] is used for start/wait_sparse_data_dist if prefetch or embedding_lookup is set
 
     def _create_context(self, index: int) -> TrainPipelineContext:
         version = self._TRAIN_CONTEXT_VERSION
-        return (
-            PrefetchTrainPipelineContext(index=index, version=version)
-            if self._with_prefetch
-            else TrainPipelineContext(index=index, version=version)
-        )
+        if self._with_prefetch:
+            return PrefetchTrainPipelineContext(index=index, version=version)
+        if self._with_embedding_lookup:
+            return EmbeddingTrainPipelineContext(index=index, version=version)
+        return TrainPipelineContext(index=index, version=version)
 
     def _add_context(self) -> None:
         self._contexts.append(self._create_context(self._next_index))
@@ -283,7 +335,7 @@ class SparseDataDistUtil(Generic[In]):
         if not self._WITH_CONTEXT_ASSERTIONS:
             return
         contexts_len = len(self._contexts)
-        expected = 3 if self._with_prefetch else 2
+        expected = 3 if (self._with_prefetch or self._with_embedding_lookup) else 2
         assert (
             contexts_len == expected
         ), f"Expected to have {expected} contexts, but had {contexts_len}"
@@ -325,6 +377,14 @@ class SparseDataDistUtil(Generic[In]):
             specified_keys == expected_fqns
         ), f"Context(idx:{context.index}).module_input_post_prefetch {specified_keys} != pipelined modules fqns {expected_fqns}"
 
+    def _assert_embedding_a2a_requests(
+        self, context: EmbeddingTrainPipelineContext, expected_fqns: Set[str]
+    ) -> None:
+        specified_keys = context.embedding_a2a_requests.keys()
+        assert (
+            specified_keys == expected_fqns
+        ), f"Context(idx:{context.index}).embedding_a2a_requests {specified_keys} != pipelined modules fqns {expected_fqns}"
+
     def _context_for_model_forward(self) -> TrainPipelineContext:
         ctx = self._current_context()
         if self.should_assert_context_invariants(ctx):
@@ -333,13 +393,16 @@ class SparseDataDistUtil(Generic[In]):
                 assert isinstance(ctx, PrefetchTrainPipelineContext)
                 self._assert_module_input_post_prefetch(ctx, target_fqns)
                 self._assert_module_contexts_post_prefetch(ctx, target_fqns)
+            elif self._with_embedding_lookup:
+                assert isinstance(ctx, EmbeddingTrainPipelineContext)
+                self._assert_embedding_a2a_requests(ctx, target_fqns)
             else:
                 self._assert_input_dist_tensors(ctx, target_fqns)
                 self._assert_module_contexts(ctx, target_fqns)
         return ctx
 
     def _start_dist_context(self) -> TrainPipelineContext:
-        if self._with_prefetch:
+        if self._with_prefetch or self._with_embedding_lookup:
             ctx = self._contexts[2]
         else:
             ctx = self._contexts[1]
@@ -365,6 +428,16 @@ class SparseDataDistUtil(Generic[In]):
             target_fqns = self._pipelined_modules_fqns()
             self._assert_input_dist_tensors(ctx, target_fqns)
             self._assert_module_contexts(ctx, target_fqns)
+        return ctx
+
+    def _embedding_lookup_context(self) -> EmbeddingTrainPipelineContext:
+        ctx = self._contexts[1]
+        assert isinstance(
+            ctx, EmbeddingTrainPipelineContext
+        ), "Pass embedding_lookup_stream into SparseDataDistUtil to use embedding_lookup_context()"
+        if self.should_assert_context_invariants(ctx):
+            target_fqns = self._pipelined_modules_fqns()
+            self._assert_embedding_a2a_requests(ctx, target_fqns)
         return ctx
 
     # ====== End "Named" contexts ====== #
@@ -408,7 +481,7 @@ class SparseDataDistUtil(Generic[In]):
             context_for_rewrite = self._current_context()
         else:
             # if initializing, no contexts are present, so we add them:
-            if self._with_prefetch:
+            if self._with_prefetch or self._with_embedding_lookup:
                 self._contexts.append(self._create_context(-2))  # throwaway context
             self._contexts.append(self._create_context(-1))  # throwaway context
             self._add_context()  # actual context to be used for everything in the initial iteration
@@ -548,3 +621,50 @@ class SparseDataDistUtil(Generic[In]):
         # with version=1, there's nothing to do - they are managed at a context level,
         # so this is essentially done by _advance_context + prefetch above
         pass
+
+    def start_embedding_lookup(self, batch: In) -> In:
+        """
+        Initiates embedding lookup on the embedding_lookup_stream after data distribution.
+        This enables pipelining of embedding lookup operations independently from the main
+        model forward pass.
+        """
+        context = self._embedding_lookup_context()
+        with record_function(f"## start_embedding_lookup {context.index} ##"):
+            current_stream = torch.get_device_module(self._device).current_stream()
+            with self._stream_context(self.embedding_lookup_stream):
+                for module in self._pipelined_modules:
+                    _start_embedding_lookup(
+                        module,
+                        context,
+                        source_stream=self.data_dist_stream,
+                        target_stream=current_stream,
+                        stream_context=self._stream_context,
+                    )
+        return batch
+
+    def start_sparse_data_dist_stage(
+        self,
+        name: str = "start_sparse_data_dist",
+        runnable: Optional[RunnableType] = None,
+    ) -> PipelineStage:
+        return PipelineStage(
+            name=name,
+            runnable=runnable or self.start_sparse_data_dist,
+            stream=self.data_dist_stream,
+            fill_callback=self.wait_sdd_fill_callback,
+            data_exhausted_callback=self.data_exhausted_callback,
+        )
+
+    def start_embedding_lookup_stage(
+        self,
+        name: str = "start_embedding_lookup",
+        runnable: Optional[RunnableType] = None,
+    ) -> PipelineStage:
+        assert (
+            self.embedding_lookup_stream is not None
+        ), "embedding_lookup_stream is not set"
+        return PipelineStage(
+            name=name,
+            runnable=runnable or self.start_embedding_lookup,
+            stream=self.embedding_lookup_stream,
+        )

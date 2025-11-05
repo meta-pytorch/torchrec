@@ -1402,6 +1402,7 @@ def _maybe_compute_kjt_to_jt_dict(
     variable_stride_per_key: bool,
     weights: Optional[torch.Tensor],
     jt_dict: Optional[Dict[str, JaggedTensor]],
+    compute_offsets: bool = True,
 ) -> Dict[str, JaggedTensor]:
     if not length_per_key:
         return {}
@@ -1418,56 +1419,56 @@ def _maybe_compute_kjt_to_jt_dict(
             torch._check(cat_size <= total_size)
         torch._check(cat_size == total_size)
         torch._check_is_size(stride)
+
     values_list = torch.split(values, length_per_key)
+    split_offsets: list[torch.Tensor] = []
     if variable_stride_per_key:
         split_lengths = torch.split(lengths, stride_per_key)
-        split_offsets = [
-            torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
-            for lengths in split_lengths
-        ]
+        if compute_offsets:
+            split_offsets = [
+                torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+                for lengths in split_lengths
+            ]
     elif pt2_guard_size_oblivious(lengths.numel() > 0):
         strided_lengths = lengths.view(len(keys), stride)
         if not torch.jit.is_scripting() and is_torchdynamo_compiling():
             torch._check(strided_lengths.size(0) > 0)
             torch._check(strided_lengths.size(1) > 0)
-        split_lengths = torch.unbind(
-            strided_lengths,
-            dim=0,
-        )
-        split_offsets = torch.unbind(
-            _batched_lengths_to_offsets(strided_lengths),
-            dim=0,
-        )
+
+        split_lengths = torch.unbind(strided_lengths, dim=0)
+        if compute_offsets:
+            split_offsets = torch.unbind(  # pyre-ignore
+                _batched_lengths_to_offsets(strided_lengths), dim=0
+            )
     else:
         split_lengths = torch.unbind(lengths, dim=0)
-        split_offsets = torch.unbind(lengths, dim=0)
+        if compute_offsets:
+            split_offsets = split_lengths  # pyre-ignore
 
     if weights is not None:
         weights_list = torch.split(weights, length_per_key)
         for idx, key in enumerate(keys):
-            length = split_lengths[idx]
-            offset = split_offsets[idx]
             _jt_dict[key] = JaggedTensor(
-                lengths=length,
-                offsets=offset,
+                lengths=split_lengths[idx],
+                offsets=split_offsets[idx] if compute_offsets else None,
                 values=values_list[idx],
                 weights=weights_list[idx],
             )
     else:
         for idx, key in enumerate(keys):
-            length = split_lengths[idx]
-            offset = split_offsets[idx]
             _jt_dict[key] = JaggedTensor(
-                lengths=length,
-                offsets=offset,
+                lengths=split_lengths[idx],
+                offsets=split_offsets[idx] if compute_offsets else None,
                 values=values_list[idx],
             )
+
     return _jt_dict
 
 
 @torch.fx.wrap
-def _kjt_empty_like(kjt: "KeyedJaggedTensor") -> "KeyedJaggedTensor":
+def _kjt_empty_like_stride(kjt: "KeyedJaggedTensor") -> "KeyedJaggedTensor":
     # empty like function fx wrapped, also avoids device hardcoding
+    # basically the empty KJT only preserve the stride and stride_per_key_per_rank
     stride, stride_per_key_per_rank = (
         (None, kjt._stride_per_key_per_rank)
         if kjt._stride_per_key_per_rank is not None and kjt.variable_stride_per_key()
@@ -1485,6 +1486,51 @@ def _kjt_empty_like(kjt: "KeyedJaggedTensor") -> "KeyedJaggedTensor":
         lengths=torch.empty(0, device=kjt.device(), dtype=kjt.lengths().dtype),
         stride=stride,
         stride_per_key_per_rank=stride_per_key_per_rank,
+    )
+
+
+@torch.fx.wrap
+def _kjt_empty_like_device(
+    kjt: "KeyedJaggedTensor", device: torch.device
+) -> "KeyedJaggedTensor":
+    # more likely the torch.Tensor.empty_like function, allocate the memory on device
+    stride, stride_per_key_per_rank = (
+        (None, kjt._stride_per_key_per_rank)
+        if kjt._stride_per_key_per_rank is not None and kjt.variable_stride_per_key()
+        else (kjt.stride(), None)
+    )
+    inverse_indices = kjt._inverse_indices
+    return KeyedJaggedTensor(
+        keys=kjt.keys(),
+        values=torch.empty_like(kjt.values(), device=device),
+        weights=(
+            None
+            if kjt.weights_or_none() is None
+            else torch.empty_like(kjt.weights(), device=device)
+        ),
+        lengths=(
+            None
+            if kjt.lengths_or_none() is None
+            else torch.empty_like(kjt.lengths(), device=device)
+        ),
+        offsets=(
+            None
+            if kjt.offsets_or_none() is None
+            else torch.empty_like(kjt.offsets(), device=device)
+        ),
+        stride=stride,
+        inverse_indices=(
+            None
+            if inverse_indices is None
+            else (
+                inverse_indices[0],
+                torch.empty_like(inverse_indices[1], device=device),
+            )
+        ),
+        stride_per_key_per_rank=stride_per_key_per_rank,
+        stride_per_key=kjt._stride_per_key,
+        length_per_key=kjt._length_per_key,
+        offset_per_key=kjt._offset_per_key,
     )
 
 
@@ -1940,17 +1986,83 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         )
 
     @staticmethod
-    def empty_like(kjt: "KeyedJaggedTensor") -> "KeyedJaggedTensor":
+    def empty_like(
+        kjt: "KeyedJaggedTensor",
+        device: Optional[torch.device] = None,
+    ) -> "KeyedJaggedTensor":
         """
-        Constructs an empty KeyedJaggedTensor with the same device and dtypes as the input KeyedJaggedTensor.
+        original usage:
+            Constructs an empty KeyedJaggedTensor with the same device and dtypes as the input KeyedJaggedTensor.
+            this perserves stride/stride_per_key_per_rank but the actual data (values, lengths, etc.) is empty
+
+        device-copy usage:
+            Constructs an empty KeyedJaggedTensor with the empty tensors on the new device
 
         Args:
             kjt (KeyedJaggedTensor): input KeyedJaggedTensor.
+            device (Optional[torch.device]): device on which the KeyedJaggedTensor will be placed.
 
         Returns:
             KeyedJaggedTensor: empty KeyedJaggedTensor.
         """
-        return _kjt_empty_like(kjt)
+        if device is None:
+            return _kjt_empty_like_stride(kjt)
+        else:
+            return _kjt_empty_like_device(kjt, device)
+
+    def copy_(
+        self, kjt: "KeyedJaggedTensor", non_blocking: bool = False
+    ) -> "KeyedJaggedTensor":
+        """
+        Copies the values, weights, lengths, and offsets of the input KeyedJaggedTensor to the current KeyedJaggedTensor.
+        Assume host-side meta data like the keys, stride, stride_per_key, etc. are already ready.
+
+        Args:
+            kjt (KeyedJaggedTensor): input KeyedJaggedTensor.
+            non_blocking (bool): whether to perform the copy asynchronously.
+
+        Returns:
+            KeyedJaggedTensor: copied KeyedJaggedTensor.
+        """
+        self._stride_per_key_per_rank = (
+            kjt._stride_per_key_per_rank if kjt.variable_stride_per_key() else None
+        )
+        self._length_per_key = kjt._length_per_key
+        self._lengths_offset_per_key = kjt._lengths_offset_per_key
+        self._offset_per_key = kjt._offset_per_key
+        self._index_per_key = kjt._index_per_key
+        self._stride_per_key = kjt._stride_per_key
+        self._jt_dict = kjt._jt_dict
+
+        # tensor in-place copy
+        self._values.copy_(kjt._values, non_blocking=non_blocking)
+
+        weights_self = self._weights
+        weights_kjt = kjt._weights
+        if weights_self is not None and weights_kjt is not None:
+            weights_self.copy_(weights_kjt, non_blocking=non_blocking)
+
+        lengths_self = self._lengths
+        lengths_kjt = kjt._lengths
+        if lengths_self is not None and lengths_kjt is not None:
+            lengths_self.copy_(lengths_kjt, non_blocking=non_blocking)
+
+        offsets_self = self._offsets
+        offsets_kjt = kjt._offsets
+        if offsets_self is not None and offsets_kjt is not None:
+            offsets_self.copy_(offsets_kjt, non_blocking=non_blocking)
+
+        inverse_indices_self = self._inverse_indices
+        inverse_indices_kjt = kjt._inverse_indices
+        if inverse_indices_self is not None and inverse_indices_kjt is not None:
+            self._inverse_indices = (
+                inverse_indices_kjt[0],
+                inverse_indices_self[1].copy_(
+                    inverse_indices_kjt[1], non_blocking=non_blocking
+                ),
+            )
+
+        return self
 
     @staticmethod
     def from_jt_dict(jt_dict: Dict[str, JaggedTensor]) -> "KeyedJaggedTensor":
@@ -2698,10 +2810,13 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                 offsets=None,
             )
 
-    def to_dict(self) -> Dict[str, JaggedTensor]:
+    def to_dict(self, compute_offsets: bool = True) -> Dict[str, JaggedTensor]:
         """
         Returns a dictionary of JaggedTensor for each key.
         Will cache result in self._jt_dict.
+
+        Args:
+            compute_offsets (str): compute offsets when true.
 
         Returns:
             Dict[str, JaggedTensor]: dictionary of JaggedTensor for each key.
@@ -2720,6 +2835,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             variable_stride_per_key=self.variable_stride_per_key(),
             weights=self.weights_or_none(),
             jt_dict=self._jt_dict,
+            compute_offsets=compute_offsets,
         )
         self._jt_dict = _jt_dict
         return _jt_dict

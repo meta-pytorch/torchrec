@@ -34,22 +34,101 @@ class ModelInput(Pipelineable):
     idscore_features: Optional[KeyedJaggedTensor]
     label: torch.Tensor
 
-    def to(self, device: torch.device, non_blocking: bool = False) -> "ModelInput":
-        return ModelInput(
-            float_features=self.float_features.to(
-                device=device, non_blocking=non_blocking
-            ),
-            idlist_features=(
-                self.idlist_features.to(device=device, non_blocking=non_blocking)
+    def to(
+        self,
+        device: torch.device,
+        non_blocking: bool = False,
+        data_copy_stream: Optional[torch.cuda.streams.Stream] = None,
+    ) -> "ModelInput":
+        """
+        Move ModelInput to the specified device.
+
+        Args:
+            device: Target device to move tensors to.
+            non_blocking: Whether to perform asynchronous copies.
+            data_copy_stream: Optional CUDA stream for async data copies. When provided,
+                tensors are pre-allocated on the target device and copied within this stream.
+                This enables pipelined data transfers with computation on other streams.
+
+        Returns:
+            ModelInput on the target device.
+
+        Example:
+            # Standard synchronous transfer
+            batch_gpu = batch_cpu.to(device="cuda")
+
+            # Async transfer with dedicated stream
+            copy_stream = torch.cuda.Stream()
+            batch_gpu = batch_cpu.to(device="cuda", non_blocking=True, data_copy_stream=copy_stream)
+        """
+        if data_copy_stream is None:
+            # Standard .to() method
+            float_features = self.float_features.to(
+                device=device,
+                non_blocking=non_blocking,
+            )
+            idlist_features = (
+                self.idlist_features.to(
+                    device=device,
+                    non_blocking=non_blocking,
+                )
                 if self.idlist_features is not None
                 else None
-            ),
-            idscore_features=(
-                self.idscore_features.to(device=device, non_blocking=non_blocking)
+            )
+            idscore_features = (
+                self.idscore_features.to(
+                    device=device,
+                    non_blocking=non_blocking,
+                )
                 if self.idscore_features is not None
                 else None
-            ),
-            label=self.label.to(device=device, non_blocking=non_blocking),
+            )
+            label = self.label.to(
+                device=device,
+                non_blocking=non_blocking,
+            )
+        else:
+            # Async copy using dedicated stream
+            current_stream = torch.cuda.current_stream(device)
+
+            # Pre-allocate tensors on target device
+            float_features = torch.empty_like(self.float_features, device=device)
+            label = torch.empty_like(self.label, device=device)
+            idlist_features = (
+                None
+                if self.idlist_features is None
+                else KeyedJaggedTensor.empty_like(self.idlist_features, device=device)
+            )
+            idscore_features = (
+                None
+                if self.idscore_features is None
+                else KeyedJaggedTensor.empty_like(self.idscore_features, device=device)
+            )
+
+            # Perform async copy in dedicated stream
+            with data_copy_stream:
+                # Wait for current stream to finish memory allocation
+                data_copy_stream.wait_stream(current_stream)
+
+                float_features.copy_(self.float_features, non_blocking=non_blocking)
+                label.copy_(self.label, non_blocking=non_blocking)
+                if idlist_features is not None:
+                    idlist_features.copy_(
+                        # pyre-ignore[6]: Pyre doesn't understand self.idlist_features is not None here
+                        self.idlist_features,
+                        non_blocking=non_blocking,
+                    )
+                if idscore_features is not None:
+                    idscore_features.copy_(
+                        # pyre-ignore[6]: Pyre doesn't understand self.idscore_features is not None here
+                        self.idscore_features,
+                        non_blocking=non_blocking,
+                    )
+        return ModelInput(
+            float_features=float_features,
+            idlist_features=idlist_features,
+            idscore_features=idscore_features,
+            label=label,
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
@@ -299,7 +378,7 @@ class ModelInput(Pipelineable):
                 tables=weighted_tables,
                 pooling_avg=pooling_avg,
                 tables_pooling=tables_pooling,
-                weighted=False,  # weighted
+                weighted=True,  # weighted
                 max_feature_lengths=max_feature_lengths,
                 use_offsets=use_offsets,
                 device=device,
