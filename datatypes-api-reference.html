@@ -899,6 +899,27 @@ offset_per_key: List[int] = [0, 3, 8]  # start offset for each key and final off
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="torchrec.sparse.jagged_tensor.KeyedJaggedTensor.copy_">
+<span class="sig-name descname"><span class="pre">copy_</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kjt</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor"><span class="pre">KeyedJaggedTensor</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">non_blocking</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">bool</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor"><span class="pre">KeyedJaggedTensor</span></a></span></span><a class="headerlink" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor.copy_" title="Permalink to this definition">¶</a></dt>
+<dd><p>Copies the values, weights, lengths, and offsets of the input KeyedJaggedTensor to the current KeyedJaggedTensor.
+Assume host-side meta data like the keys, stride, stride_per_key, etc. are already ready.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>kjt</strong> (<a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor"><em>KeyedJaggedTensor</em></a>) – input KeyedJaggedTensor.</p></li>
+<li><p><strong>non_blocking</strong> (<em>bool</em>) – whether to perform the copy asynchronously.</p></li>
+</ul>
+</dd>
+<dt class="field-even">Returns<span class="colon">:</span></dt>
+<dd class="field-even"><p>copied KeyedJaggedTensor.</p>
+</dd>
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p><a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor">KeyedJaggedTensor</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="torchrec.sparse.jagged_tensor.KeyedJaggedTensor.device">
 <span class="sig-name descname"><span class="pre">device</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">device</span></span></span><a class="headerlink" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor.device" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns the device of the KeyedJaggedTensor.</p>
@@ -937,11 +958,20 @@ offset_per_key: List[int] = [0, 3, 8]  # start offset for each key and final off
 
 <dl class="py method">
 <dt class="sig sig-object py" id="torchrec.sparse.jagged_tensor.KeyedJaggedTensor.empty_like">
-<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">empty_like</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kjt</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor"><span class="pre">KeyedJaggedTensor</span></a></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor"><span class="pre">KeyedJaggedTensor</span></a></span></span><a class="headerlink" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor.empty_like" title="Permalink to this definition">¶</a></dt>
-<dd><p>Constructs an empty KeyedJaggedTensor with the same device and dtypes as the input KeyedJaggedTensor.</p>
+<em class="property"><span class="pre">static</span><span class="w"> </span></em><span class="sig-name descname"><span class="pre">empty_like</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kjt</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor"><span class="pre">KeyedJaggedTensor</span></a></span></em>, <em class="sig-param"><span class="n"><span class="pre">device</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Optional</span><span class="p"><span class="pre">[</span></span><span class="pre">device</span><span class="p"><span class="pre">]</span></span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor"><span class="pre">KeyedJaggedTensor</span></a></span></span><a class="headerlink" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor.empty_like" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="simple">
+<dt>original usage:</dt><dd><p>Constructs an empty KeyedJaggedTensor with the same device and dtypes as the input KeyedJaggedTensor.
+this perserves stride/stride_per_key_per_rank but the actual data (values, lengths, etc.) is empty</p>
+</dd>
+<dt>device-copy usage:</dt><dd><p>Constructs an empty KeyedJaggedTensor with the empty tensors on the new device</p>
+</dd>
+</dl>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><p><strong>kjt</strong> (<a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor"><em>KeyedJaggedTensor</em></a>) – input KeyedJaggedTensor.</p>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>kjt</strong> (<a class="reference internal" href="#torchrec.sparse.jagged_tensor.KeyedJaggedTensor" title="torchrec.sparse.jagged_tensor.KeyedJaggedTensor"><em>KeyedJaggedTensor</em></a>) – input KeyedJaggedTensor.</p></li>
+<li><p><strong>device</strong> (<em>Optional</em><em>[</em><em>torch.device</em><em>]</em>) – device on which the KeyedJaggedTensor will be placed.</p></li>
+</ul>
 </dd>
 <dt class="field-even">Returns<span class="colon">:</span></dt>
 <dd class="field-even"><p>empty KeyedJaggedTensor.</p>
