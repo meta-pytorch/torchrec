@@ -118,6 +118,45 @@ def to_sharding_plan(
     return ShardingPlan(plan)
 
 
+def validate_rank_assignment(sharding_plan: ShardingPlan, topology: Topology) -> None:
+    """
+    Validates that all shards in the given sharding plan have valid rank assignments.
+
+    This function iterates through each module and parameter in the provided sharding plan,
+    checking that each shard's placement has a valid rank (i.e., not None, not negative, and
+    less than the topology's world size). If any shard fails these checks, a PlannerError is raised.
+
+    Args:
+        sharding_plan (ShardingPlan): The sharding plan to validate.
+        topology (Topology): The topology containing world size information.
+
+    Raises:
+        PlannerError: If any shard has an invalid rank assignment or if a sharding spec is missing.
+    """
+    for module_name, module_plan in sharding_plan.plan.items():
+        # pyre-ignore
+        for param_name, param_plan in module_plan.items():
+            if param_plan.sharding_spec is not None:
+                for shard in param_plan.sharding_spec.shards:
+                    if shard.placement.rank() is None or shard.placement.rank() < 0:
+                        msg = f"Rank is not assigned for shard {shard}"
+                        logging.error(msg)
+                        raise PlannerError(
+                            error_type=PlannerErrorType.INVALID_RANK_ASSIGNMENT,
+                            message=msg,
+                        )
+                    if shard.placement.rank() >= topology.world_size:
+                        msg = f"Shard {shard} has rank {shard.placement.rank()} which is greater than world size {dist.get_world_size()}."
+                        logging.error(msg)
+                        raise PlannerError(
+                            error_type=PlannerErrorType.INVALID_RANK_ASSIGNMENT,
+                            message=msg,
+                        )
+            else:
+                msg = f"Sharding spec not found for {module_name}.{param_name}"
+                logging.warning(msg)
+
+
 def extract_plan(
     search_space: List[ShardingOption],
     loaded_sharding_options: Dict[int, ShardingOption],
@@ -634,6 +673,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                         timeout_seconds=self._timeout_seconds,
                     ),
                 )
+
+            validate_rank_assignment(sharding_plan, self._topology)
             return sharding_plan
         else:
             global_storage_capacity = reduce(
@@ -997,6 +1038,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                 sharding_plan = to_sharding_plan(
                     best_plan, self._topology_groups[group]
                 )
+                validate_rank_assignment(sharding_plan, self._topology_groups[group])
                 best_plans.append(sharding_plan)
 
                 end_time = perf_counter()
@@ -1090,4 +1132,5 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                         + last_planner_error_info,
                     )
 
-        return _merge_plans(best_plans)
+        sharding_plan = _merge_plans(best_plans)
+        return sharding_plan
