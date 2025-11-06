@@ -8,7 +8,8 @@
 # mypy: allow-untyped-defs
 import functools
 import inspect
-from typing import Any, Callable, TypeVar
+import logging
+from typing import Any, Callable, Dict, TypeVar
 
 import torchrec.distributed.torchrec_logger as torchrec_logger
 from torchrec.distributed.torchrec_logging_handlers import TORCHREC_LOGGER_NAME
@@ -34,16 +35,25 @@ def _torchrec_method_logger(
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
             msg_dict = torchrec_logger._get_msg_dict(func.__name__, **kwargs)
             try:
-                ## Add function input to log message
-                msg_dict["input"] = _get_input_from_func(func, *args, **kwargs)
                 # exceptions
                 result = func(*args, **kwargs)
             except BaseException as error:
                 msg_dict["error"] = f"{error}"
+                ## Add function input to log message
+                msg_dict["input"] = _get_input_from_func(
+                    func, msg_dict, *args, **kwargs
+                )
                 _torchrec_logger.error(msg_dict)
                 raise
-            msg_dict["output"] = str(result)
-            _torchrec_logger.debug(msg_dict)
+            ## Add function input to log message
+            try:
+                msg_dict["input"] = _get_input_from_func(
+                    func, msg_dict, *args, **kwargs
+                )
+                msg_dict["output"] = str(result)
+                _torchrec_logger.debug(msg_dict)
+            except Exception as error:
+                logging.info(f"Torchrec logger: Failed in static logger: {error}")
             return result
 
         return wrapper
@@ -52,15 +62,29 @@ def _torchrec_method_logger(
 
 
 def _get_input_from_func(
-    func: Callable[_P, _T], *args: _P.args, **kwargs: _P.kwargs
+    func: Callable[_P, _T],
+    msg_dict: Dict[str, Any],
+    *args: _P.args,
+    **kwargs: _P.kwargs,
 ) -> str:
-    signature = inspect.signature(func)
-    bound_args = signature.bind_partial(*args, **kwargs)
-    bound_args.apply_defaults()
-    input_vars = {param.name: param.default for param in signature.parameters.values()}
-    for key, value in bound_args.arguments.items():
-        if isinstance(value, (int, float)):
-            input_vars[key] = value
-        else:
-            input_vars[key] = str(value)
-    return str(input_vars)
+    try:
+        signature = inspect.signature(func)
+        bound_args = signature.bind_partial(*args, **kwargs)
+        bound_args.apply_defaults()
+        input_vars = {
+            param.name: param.default for param in signature.parameters.values()
+        }
+        for key, value in bound_args.arguments.items():
+            if key == "self" and func.__name__ == "__init__":
+                # Add class name to function name if the function is a constructor
+                msg_dict["func_name"] = (
+                    f"{value.__class__.__name__}.{msg_dict['func_name']}"
+                )
+            if isinstance(value, (int, float)):
+                input_vars[key] = value
+            else:
+                input_vars[key] = str(value)
+        return str(input_vars)
+    except Exception as error:
+        logging.error(f"Torchrec Logger: Error in _get_input_from_func: {error}")
+        return "Error in _get_input_from_func: " + str(error)

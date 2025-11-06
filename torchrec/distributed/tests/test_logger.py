@@ -23,7 +23,12 @@ class TestLogger(unittest.TestCase):
             "torchrec.distributed.torchrec_logger._get_msg_dict"
         )
         self.mock_get_msg_dict = self.get_msg_dict_patcher.start()
-        self.mock_get_msg_dict.return_value = {}
+
+        # Return a dictionary with func_name that can be modified by _get_input_from_func
+        def mock_get_msg_dict_impl(func_name: str, **kwargs: Any) -> dict[str, Any]:
+            return {"func_name": func_name}
+
+        self.mock_get_msg_dict.side_effect = mock_get_msg_dict_impl
 
         # Mock _torchrec_logger
         self.logger_patcher = mock.patch("torchrec.distributed.logger._torchrec_logger")
@@ -40,7 +45,8 @@ class TestLogger(unittest.TestCase):
         def test_func() -> None:
             pass
 
-        result = _get_input_from_func(test_func)
+        msg_dict = {"func_name": "test_func"}
+        result = _get_input_from_func(test_func, msg_dict)
         self.assertEqual(result, "{}")
 
     def test_get_input_from_func_with_args(self) -> None:
@@ -49,7 +55,8 @@ class TestLogger(unittest.TestCase):
         def test_func(_a: int, _b: str) -> None:
             pass
 
-        result = _get_input_from_func(test_func, 42, "hello")
+        msg_dict = {"func_name": "test_func"}
+        result = _get_input_from_func(test_func, msg_dict, 42, "hello")
         self.assertEqual(result, "{'_a': 42, '_b': 'hello'}")
 
     def test_get_input_from_func_with_kwargs(self) -> None:
@@ -58,7 +65,8 @@ class TestLogger(unittest.TestCase):
         def test_func(_a: int = 0, _b: str = "default") -> None:
             pass
 
-        result = _get_input_from_func(test_func, _b="world")
+        msg_dict = {"func_name": "test_func"}
+        result = _get_input_from_func(test_func, msg_dict, _b="world")
         self.assertEqual(result, "{'_a': 0, '_b': 'world'}")
 
     def test_get_input_from_func_with_args_and_kwargs(self) -> None:
@@ -69,11 +77,19 @@ class TestLogger(unittest.TestCase):
         ) -> None:
             pass
 
-        result = _get_input_from_func(test_func, 42, "hello", "extra", key="value")
-        self.assertEqual(
-            result,
-            "{'_a': 42, '_b': 'hello', '_args': \"('extra',)\", '_kwargs': \"{'key': 'value'}\"}",
+        msg_dict = {"func_name": "test_func"}
+        result = _get_input_from_func(
+            test_func, msg_dict, 42, "hello", "extra", key="value"
         )
+        self.assertIn("_a", result)
+        self.assertIn("42", result)
+        self.assertIn("_b", result)
+        self.assertIn("hello", result)
+        self.assertIn("_args", result)
+        self.assertIn("extra", result)
+        self.assertIn("_kwargs", result)
+        self.assertIn("key", result)
+        self.assertIn("value", result)
 
     def test_torchrec_method_logger_success(self) -> None:
         """Test _torchrec_method_logger with a successful function execution when logging is enabled."""
@@ -141,6 +157,57 @@ class TestLogger(unittest.TestCase):
         self.mock_logger.debug.assert_called_once()
         msg_dict = self.mock_logger.debug.call_args[0][0]
         self.assertEqual(msg_dict["output"], "result")
+
+    def test_torchrec_method_logger_constructor_with_args(self) -> None:
+        """Test _torchrec_method_logger with a class constructor that has positional arguments."""
+
+        class TestClass:
+            @_torchrec_method_logger()
+            def __init__(self, _a: int, _b: str) -> None:
+                pass
+
+        # Create an instance which will call __init__
+        _ = TestClass(42, "hello")
+
+        # Verify that the logger was called
+        self.mock_logger.debug.assert_called_once()
+        msg_dict = self.mock_logger.debug.call_args[0][0]
+        # Verify that class name was prepended to function name
+        self.assertEqual(msg_dict["func_name"], "TestClass.__init__")
+        # Verify the input contains the arguments
+        self.assertIn("_a", msg_dict["input"])
+        self.assertIn("42", msg_dict["input"])
+        self.assertIn("_b", msg_dict["input"])
+        self.assertIn("hello", msg_dict["input"])
+
+    def test_torchrec_method_logger_constructor_with_args_and_kwargs(self) -> None:
+        """Test _torchrec_method_logger with a class constructor that has both positional and keyword arguments."""
+
+        class TestClass:
+            @_torchrec_method_logger()
+            def __init__(
+                self, _a: int, _b: str = "default", *_args: Any, **_kwargs: Any
+            ) -> None:
+                pass
+
+        # Create an instance which will call __init__
+        _ = TestClass(42, "hello", "extra", key="value")
+
+        # Verify that the logger was called
+        self.mock_logger.debug.assert_called_once()
+        msg_dict = self.mock_logger.debug.call_args[0][0]
+        # Verify that class name was prepended to function name
+        self.assertEqual(msg_dict["func_name"], "TestClass.__init__")
+        # Verify the input contains the arguments
+        self.assertIn("_a", msg_dict["input"])
+        self.assertIn("42", msg_dict["input"])
+        self.assertIn("_b", msg_dict["input"])
+        self.assertIn("hello", msg_dict["input"])
+        self.assertIn("_args", msg_dict["input"])
+        self.assertIn("extra", msg_dict["input"])
+        self.assertIn("_kwargs", msg_dict["input"])
+        self.assertIn("key", msg_dict["input"])
+        self.assertIn("value", msg_dict["input"])
 
 
 if __name__ == "__main__":

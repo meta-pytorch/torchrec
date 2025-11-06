@@ -42,12 +42,16 @@ def _get_logging_handler(
 
 
 def _get_msg_dict(func_name: str, **kwargs: Any) -> dict[str, Any]:
-    msg_dict = {
-        "func_name": f"{func_name}",
-    }
-    if dist.is_initialized():
-        group = kwargs.get("group") or kwargs.get("process_group")
-        msg_dict["group"] = f"{group}"
-        msg_dict["world_size"] = f"{dist.get_world_size(group)}"
-        msg_dict["rank"] = f"{dist.get_rank(group)}"
-    return msg_dict
+    try:
+        msg_dict = {
+            "func_name": f"{func_name}",
+        }
+        if dist.is_initialized():
+            group = kwargs.get("group") or kwargs.get("process_group")
+            msg_dict["group"] = f"{group}"
+            msg_dict["world_size"] = f"{dist.get_world_size(group)}"
+            msg_dict["rank"] = f"{dist.get_rank(group)}"
+        return msg_dict
+    except Exception as error:
+        logging.error(f"Torchrec Logger: Error in _get_msg_dict: {error}")
+        return {"_get_msg_dict_error": str(error)}
