@@ -1240,7 +1240,9 @@ class SeqEmbeddingsAllToOne(nn.Module):
             Awaitable[torch.Tensor]: awaitable of the merged pooled embeddings.
         """
 
-        assert len(tensors) == self._world_size
+        assert (
+            len(tensors) == self._world_size
+        ), f"length of input tensor {len(tensors)} must match with world size {self._world_size}"
         return torch.ops.fbgemm.all_to_one_device(
             tensors,
             self._device,
