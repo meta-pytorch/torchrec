@@ -66,7 +66,6 @@ from torchrec.distributed.quant_embedding_kernel import (
     QuantBatchedEmbeddingBag,
 )
 from torchrec.distributed.types import rank_device, ShardedTensor, ShardingType
-from torchrec.modules.embedding_configs import FeatureScoreBasedEvictionPolicy
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -516,23 +515,6 @@ class GroupedPooledEmbeddingsLookup(
     ) -> None:
         super().__init__()
         self._emb_modules: nn.ModuleList = nn.ModuleList()
-        self._feature_score_auto_collections: List[bool] = []
-        for config in grouped_configs:
-            collection = False
-            for table in config.embedding_tables:
-                if table.use_virtual_table and isinstance(
-                    table.virtual_table_eviction_policy, FeatureScoreBasedEvictionPolicy
-                ):
-                    if (
-                        table.virtual_table_eviction_policy.enable_auto_feature_score_collection
-                    ):
-                        collection = True
-            self._feature_score_auto_collections.append(collection)
-
-        logger.info(
-            f"GroupedPooledEmbeddingsLookup: {self._feature_score_auto_collections=}"
-        )
-
         for config in grouped_configs:
             self._emb_modules.append(
                 self._create_embedding_kernel(config, device, pg, sharding_type)
@@ -710,11 +692,8 @@ class GroupedPooledEmbeddingsLookup(
             features_by_group = sparse_features.split(
                 self._feature_splits,
             )
-            for config, emb_op, features, fs_auto_collection in zip(
-                self.grouped_configs,
-                self._emb_modules,
-                features_by_group,
-                self._feature_score_auto_collections,
+            for config, emb_op, features in zip(
+                self.grouped_configs, self._emb_modules, features_by_group
             ):
                 if (
                     config.has_feature_processor
@@ -724,19 +703,9 @@ class GroupedPooledEmbeddingsLookup(
                     features = self._feature_processor(features)
 
                 if config.is_weighted:
-                    feature_weights = CommOpGradientScaling.apply(
+                    features._weights = CommOpGradientScaling.apply(
                         features._weights, self._scale_gradient_factor
-                    ).float()
-
-                    if fs_auto_collection and features.weights_or_none() is not None:
-                        score_weights = features.weights().float()
-                        assert (
-                            feature_weights.numel() == score_weights.numel()
-                        ), f"feature_weights.numel() {feature_weights.numel()} != score_weights.numel() {score_weights.numel()}"
-                        cat_weights = torch.cat(
-                            [feature_weights, score_weights], dim=1
-                        ).view(torch.float64)
-                        features._weights = cat_weights
+                    )
 
                 lookup = emb_op(features)
                 embeddings.append(lookup)

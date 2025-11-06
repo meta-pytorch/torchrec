@@ -17,7 +17,7 @@ from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.embedding_types import ShardingType
 
 from torchrec.modules.embedding_configs import (
-    BaseEmbeddingConfig,
+    EmbeddingConfig,
     FeatureScoreBasedEvictionPolicy,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -26,7 +26,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def create_sharding_type_to_feature_score_mapping(
-    embedding_configs: Sequence[BaseEmbeddingConfig],
+    embedding_configs: Sequence[EmbeddingConfig],
     sharding_type_to_sharding_infos: Dict[str, List[EmbeddingShardingInfo]],
 ) -> Tuple[bool, bool, Dict[str, Dict[str, float]]]:
     enable_feature_score_weight_accumulation = False
