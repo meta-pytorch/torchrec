@@ -354,6 +354,9 @@ def _populate_zero_collision_tbe_params(
         training_id_eviction_trigger_count = [0] * len(config.embedding_tables)
         training_id_keep_count = [0] * len(config.embedding_tables)
         l2_weight_thresholds = [0.0] * len(config.embedding_tables)
+        enable_eviction_for_feature_score_eviction_policy = [True] * len(
+            config.embedding_tables
+        )
         eviction_strategy = -1
         table_names = [table.name for table in config.embedding_tables]
         l2_cache_size = tbe_params["l2_cache_size"]
@@ -398,6 +401,9 @@ def _populate_zero_collision_tbe_params(
                     )
                     training_id_keep_count[i] = policy_t.training_id_keep_count
                     ttls_in_mins[i] = policy_t.eviction_ttl_mins
+                    enable_eviction_for_feature_score_eviction_policy[i] = (
+                        policy_t.enable_eviction
+                    )
                     if eviction_strategy == -1 or eviction_strategy == 5:
                         eviction_strategy = 5
                     else:
@@ -459,6 +465,7 @@ def _populate_zero_collision_tbe_params(
             eviction_free_mem_check_interval_batch=eviction_free_mem_check_interval_batch,
             threshold_calculation_bucket_stride=threshold_calculation_bucket_stride,
             threshold_calculation_bucket_num=threshold_calculation_bucket_num,
+            enable_eviction_for_feature_score_eviction_policy=enable_eviction_for_feature_score_eviction_policy,
         )
     else:
         eviction_policy = EvictionPolicy(meta_header_lens=meta_header_lens)
