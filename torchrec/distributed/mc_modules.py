@@ -238,7 +238,15 @@ class ShardedManagedCollisionCollection(
         self._use_index_dedup = use_index_dedup
         self._initialize_torch_state()
         self.post_lookup_tracker_fn: Optional[
-            Callable[[KeyedJaggedTensor, torch.Tensor], None]
+            Callable[
+                [
+                    KeyedJaggedTensor,
+                    torch.Tensor,
+                    Optional[nn.Module],
+                    Optional[torch.Tensor],
+                ],
+                None,
+            ]
         ] = None
 
     def _initialize_torch_state(self) -> None:
@@ -756,6 +764,8 @@ class ShardedManagedCollisionCollection(
                         if self.post_lookup_tracker_fn is not None:
                             self.post_lookup_tracker_fn(
                                 KeyedJaggedTensor.from_jt_dict(mc_input),
+                                torch.empty(0),
+                                None,
                                 mcm._hash_zch_identities.index_select(
                                     dim=0, index=mc_input[table].values()
                                 ),
@@ -782,6 +792,8 @@ class ShardedManagedCollisionCollection(
                     if self.post_lookup_tracker_fn is not None:
                         self.post_lookup_tracker_fn(
                             KeyedJaggedTensor.from_jt_dict(mc_input),
+                            torch.empty(0),
+                            None,
                             mcm._hash_zch_identities.index_select(dim=0, index=values),
                         )
 
@@ -876,7 +888,15 @@ class ShardedManagedCollisionCollection(
 
     def register_post_lookup_tracker_fn(
         self,
-        record_fn: Callable[[KeyedJaggedTensor, torch.Tensor], None],
+        record_fn: Callable[
+            [
+                KeyedJaggedTensor,
+                torch.Tensor,
+                Optional[nn.Module],
+                Optional[torch.Tensor],
+            ],
+            None,
+        ],
     ) -> None:
         """
         Register a function to be called after lookup is done. This is used for
