@@ -28,7 +28,8 @@ from torchrec.distributed.model_tracker.model_delta_tracker import (
 )
 from torchrec.distributed.model_tracker.types import (
     IndexedLookup,  # noqa
-    ModelTrackerConfig,  # noqa
+    ModelTrackerConfigs,  # noqa
+    Trackers,  # noqa
     TrackingMode,  # noqa
     UniqueRows,  # noqa
     UpdateMode,  # noqa
