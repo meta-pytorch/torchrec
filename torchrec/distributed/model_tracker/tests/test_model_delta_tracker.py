@@ -24,13 +24,14 @@ from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import ModuleSharder, ShardingType
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.model_tracker.model_delta_tracker import ModelDeltaTrackerTrec
 from torchrec.distributed.model_tracker.tests.utils import (
     EmbeddingTableProps,
     generate_planner_constraints,
     TestEBCModel,
     TestECModel,
 )
-from torchrec.distributed.model_tracker.types import ModelTrackerConfig, TrackingMode
+from torchrec.distributed.model_tracker.types import DeltaTrackerConfig, TrackingMode
 
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.test_utils.multi_process import (
@@ -81,7 +82,7 @@ class ModelInput:
 class ModelDeltaTrackerInputTestParams:
     # input parameters
     embedding_config_type: Union[Type[EmbeddingConfig], Type[EmbeddingBagConfig]]
-    model_tracker_config: ModelTrackerConfig
+    delta_tracker_config: DeltaTrackerConfig
     embedding_tables: List[EmbeddingTableProps]
     model_inputs: List[ModelInput] = field(default_factory=list)
     consumers: List[str] = field(default_factory=list)
@@ -131,7 +132,7 @@ def get_models(
     embedding_config_type: Union[Type[EmbeddingConfig], Type[EmbeddingBagConfig]],
     tables: Iterable[EmbeddingTableProps],
     optimizer_type: OptimType = OptimType.ADAM,
-    config: Optional[ModelTrackerConfig] = None,
+    config: Optional[DeltaTrackerConfig] = None,
 ) -> Tuple[DistributedModelParallel, DistributedModelParallel]:
     # Create the model
     torch.manual_seed(0)
@@ -179,8 +180,9 @@ def get_models(
         env=torchrec.distributed.ShardingEnv.from_process_group(ctx.pg),
         plan=plan,
         sharders=sharders,
-        model_tracker_config=config,
     )
+    if config:
+        dt_dmp.init_torchrec_delta_tracker(delta_tracker_config=config)
 
     torch.manual_seed(0)
     baseline_module = generate_test_models(embedding_config_type, tables)
@@ -228,7 +230,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(),
+                    delta_tracker_config=DeltaTrackerConfig(),
                 ),
                 FqnToFeatureNamesOutputTestParams(
                     expected_fqn_to_feature_names={
@@ -263,7 +265,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(),
+                    delta_tracker_config=DeltaTrackerConfig(),
                 ),
                 FqnToFeatureNamesOutputTestParams(
                     expected_fqn_to_feature_names={
@@ -296,7 +298,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(),
+                    delta_tracker_config=DeltaTrackerConfig(),
                 ),
                 FqnToFeatureNamesOutputTestParams(
                     expected_fqn_to_feature_names={
@@ -331,8 +333,8 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
-                        fqns_to_skip=["sparse_table_1"]
+                    delta_tracker_config=DeltaTrackerConfig(
+                        fqns_to_skip=["sparse_table_1"],
                     ),
                 ),
                 FqnToFeatureNamesOutputTestParams(
@@ -367,8 +369,8 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
-                        fqns_to_skip=["embedding_bags"]
+                    delta_tracker_config=DeltaTrackerConfig(
+                        fqns_to_skip=["embedding_bags"],
                     ),
                 ),
                 FqnToFeatureNamesOutputTestParams(
@@ -399,7 +401,9 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(fqns_to_skip=["ec"]),
+                    delta_tracker_config=DeltaTrackerConfig(
+                        fqns_to_skip=["ec"],
+                    ),
                 ),
                 FqnToFeatureNamesOutputTestParams(
                     expected_fqn_to_feature_names={},
@@ -440,31 +444,10 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(),
+                    delta_tracker_config=DeltaTrackerConfig(),
                 ),
                 TrackerNotInitOutputTestParams(
-                    dmp_tracker_atter="get_model_tracker",
-                ),
-            ),
-            (
-                "get_unique",
-                ModelDeltaTrackerInputTestParams(
-                    embedding_config_type=EmbeddingConfig,
-                    embedding_tables=[
-                        EmbeddingTableProps(
-                            embedding_table_config=EmbeddingConfig(
-                                name="table_fqn_1",
-                                num_embeddings=NUM_EMBEDDINGS,
-                                embedding_dim=EMBEDDING_DIM,
-                                feature_names=["f1", "f2", "f3"],
-                            ),
-                            sharding=ShardingType.ROW_WISE,
-                        ),
-                    ],
-                    model_tracker_config=ModelTrackerConfig(),
-                ),
-                TrackerNotInitOutputTestParams(
-                    dmp_tracker_atter="get_unique",
+                    dmp_tracker_atter="get_delta_tracker",
                 ),
             ),
         ]
@@ -511,7 +494,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ID_ONLY,
                         delete_on_read=True,
                     ),
@@ -560,7 +543,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ID_ONLY,
                         delete_on_read=True,
                     ),
@@ -607,7 +590,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ID_ONLY,
                         delete_on_read=True,
                     ),
@@ -650,7 +633,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ID_ONLY,
                         delete_on_read=True,
                     ),
@@ -712,7 +695,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.EMBEDDING,
                         delete_on_read=True,
                     ),
@@ -760,7 +743,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.EMBEDDING,
                         delete_on_read=True,
                     ),
@@ -805,7 +788,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.EMBEDDING,
                         delete_on_read=True,
                     ),
@@ -878,7 +861,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.EMBEDDING,
                         delete_on_read=True,
                     ),
@@ -972,7 +955,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ID_ONLY,
                         delete_on_read=True,
                     ),
@@ -1084,7 +1067,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ID_ONLY,
                         delete_on_read=True,
                         consumers=["A", "B"],
@@ -1181,7 +1164,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ID_ONLY,
                         delete_on_read=False,
                         consumers=["A", "B"],
@@ -1278,7 +1261,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ID_ONLY,
                         delete_on_read=True,
                         consumers=["A", "B"],
@@ -1375,7 +1358,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ID_ONLY,
                         delete_on_read=False,
                         consumers=["A", "B"],
@@ -1483,7 +1466,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.MOMENTUM_LAST,
                         delete_on_read=True,
                     ),
@@ -1522,7 +1505,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.MOMENTUM_LAST,
                         delete_on_read=True,
                     ),
@@ -1578,7 +1561,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.MOMENTUM_DIFF,
                         delete_on_read=True,
                     ),
@@ -1617,7 +1600,7 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
                             sharding=ShardingType.ROW_WISE,
                         ),
                     ],
-                    model_tracker_config=ModelTrackerConfig(
+                    delta_tracker_config=DeltaTrackerConfig(
                         tracking_mode=TrackingMode.ROWWISE_ADAGRAD,
                         delete_on_read=True,
                     ),
@@ -1675,10 +1658,11 @@ def _test_fqn_to_feature_names(
             ctx=ctx,
             embedding_config_type=input_params.embedding_config_type,
             tables=input_params.embedding_tables,
-            config=input_params.model_tracker_config,
+            config=input_params.delta_tracker_config,
         )
 
-        dt = dt_model.get_model_tracker()
+        dt = dt_model.get_delta_tracker()
+        assert isinstance(dt, ModelDeltaTrackerTrec)
         unittest.TestCase().assertEqual(
             dt.fqn_to_feature_names(), output_params.expected_fqn_to_feature_names
         )
@@ -1704,11 +1688,9 @@ def _test_tracker_init(
             tables=input_params.embedding_tables,
             config=None,
         )
-        with unittest.TestCase().assertRaisesRegex(
-            AssertionError,
-            "Model tracker is not initialized. Add ModelTrackerConfig at DistributedModelParallel init.",
-        ):
-            getattr(dt_model, output_params.dmp_tracker_atter)()
+        unittest.TestCase().assertEqual(
+            getattr(dt_model, output_params.dmp_tracker_atter)(), None
+        )
 
 
 def _test_id_mode(
@@ -1728,10 +1710,11 @@ def _test_id_mode(
             ctx=ctx,
             embedding_config_type=test_params.embedding_config_type,
             tables=test_params.embedding_tables,
-            config=test_params.model_tracker_config,
+            config=test_params.delta_tracker_config,
         )
         features_list = model_input_generator(test_params.model_inputs, rank)
-        dt = dt_model.get_model_tracker()
+        dt = dt_model.get_delta_tracker()
+        assert isinstance(dt, ModelDeltaTrackerTrec)
         for features in features_list:
             tracked_out = dt_model(features)
             baseline_out = baseline_model(features)
@@ -1811,7 +1794,7 @@ def _test_embedding_mode(
                     ctx=ctx,
                     embedding_config_type=test_params.embedding_config_type,
                     tables=test_params.embedding_tables,
-                    config=test_params.model_tracker_config,
+                    config=test_params.delta_tracker_config,
                 )
         else:
             dt_model, baseline_model = get_models(
@@ -1820,12 +1803,13 @@ def _test_embedding_mode(
                 ctx=ctx,
                 embedding_config_type=test_params.embedding_config_type,
                 tables=test_params.embedding_tables,
-                config=test_params.model_tracker_config,
+                config=test_params.delta_tracker_config,
             )
 
             # Only proceed with the rest of the test if models were created successfully
             features_list = model_input_generator(test_params.model_inputs, rank)
-            dt = dt_model.get_model_tracker()
+            dt = dt_model.get_delta_tracker()
+            assert isinstance(dt, ModelDeltaTrackerTrec)
 
             orig_emb1 = (
                 # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
@@ -1935,10 +1919,11 @@ def _test_multiple_get(
             ctx=ctx,
             embedding_config_type=test_params.embedding_config_type,
             tables=test_params.embedding_tables,
-            config=test_params.model_tracker_config,
+            config=test_params.delta_tracker_config,
         )
         features_list = model_input_generator(test_params.model_inputs, rank)
-        dt = dt_model.get_model_tracker()
+        dt = dt_model.get_delta_tracker()
+        assert isinstance(dt, ModelDeltaTrackerTrec)
         table_fqns = dt.fqn_to_feature_names().keys()
         table_fqns_list = list(table_fqns)
         expected_emb1 = torch.tensor([])
@@ -2015,10 +2000,11 @@ def _test_multiple_consumer(
             ctx=ctx,
             embedding_config_type=test_params.embedding_config_type,
             tables=test_params.embedding_tables,
-            config=test_params.model_tracker_config,
+            config=test_params.delta_tracker_config,
         )
         features_list = model_input_generator(test_params.model_inputs, rank)
-        dt = dt_model.get_model_tracker()
+        dt = dt_model.get_delta_tracker()
+        assert isinstance(dt, ModelDeltaTrackerTrec)
         table_fqns = dt.fqn_to_feature_names().keys()
         table_fqns_list = list(table_fqns)
 
@@ -2076,12 +2062,13 @@ def _test_duplication_with_momentum(
             ctx=ctx,
             embedding_config_type=test_params.embedding_config_type,
             tables=test_params.embedding_tables,
-            config=test_params.model_tracker_config,
+            config=test_params.delta_tracker_config,
         )
         dt_model_opt = torch.optim.Adam(dt_model.parameters(), lr=0.1)
         baseline_opt = torch.optim.Adam(baseline_model.parameters(), lr=0.1)
         features_list = model_input_generator(test_params.model_inputs, rank)
-        dt = dt_model.get_model_tracker()
+        dt = dt_model.get_delta_tracker()
+        assert isinstance(dt, ModelDeltaTrackerTrec)
         table_fqns = dt.fqn_to_feature_names().keys()
         table_fqns_list = list(table_fqns)
         for features in features_list:
@@ -2119,7 +2106,7 @@ def _test_duplication_with_rowwise_adagrad(
             ctx=ctx,
             embedding_config_type=test_params.embedding_config_type,
             tables=test_params.embedding_tables,
-            config=test_params.model_tracker_config,
+            config=test_params.delta_tracker_config,
             optimizer_type=OptimType.EXACT_ROWWISE_ADAGRAD,
         )
 
@@ -2146,7 +2133,8 @@ def _test_duplication_with_rowwise_adagrad(
         baseline_opt = torch.optim.Adam(baseline_model.parameters(), lr=0.1)
         features_list = model_input_generator(test_params.model_inputs, rank)
 
-        dt = dt_model.get_model_tracker()
+        dt = dt_model.get_delta_tracker()
+        assert isinstance(dt, ModelDeltaTrackerTrec)
         table_fqns = dt.fqn_to_feature_names().keys()
         table_fqns_list = list(table_fqns)
 
