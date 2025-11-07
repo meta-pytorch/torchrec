@@ -183,6 +183,7 @@ def runner(
             model: nn.Module,
             pipeline: TrainPipeline,
         ) -> None:
+            pipeline.reset()
             dataloader = iter(bench_inputs)
             while True:
                 try:
