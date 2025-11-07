@@ -243,6 +243,9 @@ class FeatureScoreBasedEvictionPolicy(VirtualTableEvictionPolicy):
     feature_score_mapping: Optional[Dict[str, float]] = None  # feature score mapping
     feature_score_default_value: Optional[float] = None  # default feature score value
     enable_auto_feature_score_collection: bool = False
+    enable_eviction: bool = (
+        True  # Currently we only support using same eviction policy in one tbe for mutiple tables, if one table doesn't need eviction we can set this flag to False
+    )
 
     def __post_init__(self) -> None:
         if self.inference_eviction_feature_score_threshold is None:
