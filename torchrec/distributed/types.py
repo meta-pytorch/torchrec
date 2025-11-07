@@ -33,7 +33,7 @@ from fbgemm_gpu.runtime_monitor import TBEStatsReporterConfig
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
     CacheAlgorithm,
-    KVZCHEvictionTBEConfig,
+    KVZCHTBEConfig,
     MultiPassPrefetchConfig,
 )
 
@@ -668,7 +668,7 @@ class KeyValueParams:
         lazy_bulk_init_enabled: bool: whether to enable lazy(async) bulk init for SSD TBE
         enable_raw_embedding_streaming: Optional[bool]: enable raw embedding streaming for SSD TBE
         res_store_shards: Optional[int] = None: the number of shards to store the raw embeddings
-        kvzch_eviction_tbe_config: Optional[KVZCHEvictionTBEConfig]: KVZCH eviction config for TBE
+        kvzch_tbe_config: Optional[KVZCHTBEConfig]: KVZCH config for TBE
 
         # Parameter Server (PS) Attributes
         ps_hosts (Optional[Tuple[Tuple[str, int]]]): List of PS host ip addresses
@@ -694,7 +694,7 @@ class KeyValueParams:
         None  # enable raw embedding streaming for SSD TBE
     )
     res_store_shards: Optional[int] = None  # shards to store the raw embeddings
-    kvzch_eviction_tbe_config: Optional[KVZCHEvictionTBEConfig] = None
+    kvzch_tbe_config: Optional[KVZCHTBEConfig] = None
 
     # Parameter Server (PS) Attributes
     ps_hosts: Optional[Tuple[Tuple[str, int], ...]] = None
@@ -723,7 +723,7 @@ class KeyValueParams:
                 self.lazy_bulk_init_enabled,
                 self.enable_raw_embedding_streaming,
                 self.res_store_shards,
-                self.kvzch_eviction_tbe_config,
+                self.kvzch_tbe_config,
             )
         )
 

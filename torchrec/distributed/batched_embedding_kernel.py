@@ -262,10 +262,8 @@ def _populate_ssd_tbe_params(config: GroupedEmbeddingConfig) -> Dict[str, Any]:
             )
             ssd_tbe_params["cache_sets"] = int(max_cache_sets)
 
-    if "kvzch_eviction_tbe_config" in fused_params and config.is_using_virtual_table():
-        ssd_tbe_params["kvzch_eviction_tbe_config"] = fused_params.get(
-            "kvzch_eviction_tbe_config"
-        )
+    if "kvzch_tbe_config" in fused_params and config.is_using_virtual_table():
+        ssd_tbe_params["kvzch_tbe_config"] = fused_params.get("kvzch_tbe_config")
 
     ssd_tbe_params["table_names"] = [table.name for table in config.embedding_tables]
 
@@ -359,10 +357,10 @@ def _populate_zero_collision_tbe_params(
         l2_cache_size = tbe_params["l2_cache_size"]
 
         assert (
-            "kvzch_eviction_tbe_config" in tbe_params
-        ), "kvzch_eviction_tbe_config should be in tbe_params"
-        eviction_tbe_config = tbe_params["kvzch_eviction_tbe_config"]
-        tbe_params.pop("kvzch_eviction_tbe_config")
+            "kvzch_tbe_config" in tbe_params
+        ), "kvzch_tbe_config should be in tbe_params"
+        eviction_tbe_config = tbe_params["kvzch_tbe_config"]
+        tbe_params.pop("kvzch_tbe_config")
         eviction_trigger_mode = eviction_tbe_config.kvzch_eviction_trigger_mode
         eviction_free_mem_threshold_gb = (
             eviction_tbe_config.eviction_free_mem_threshold_gb
