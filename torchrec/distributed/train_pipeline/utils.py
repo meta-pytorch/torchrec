@@ -68,11 +68,33 @@ from torchrec.streamable import Multistreamable, Pipelineable
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-def _to_device(batch: In, device: torch.device, non_blocking: bool) -> In:
+def _to_device(
+    batch: In,
+    device: torch.device,
+    non_blocking: bool,
+    data_copy_stream: Optional[torch.Stream] = None,
+) -> In:
     assert isinstance(
         batch, (torch.Tensor, Pipelineable)
     ), f"{type(batch)} must implement Pipelineable interface"
-    return cast(In, batch.to(device=device, non_blocking=non_blocking))
+    if data_copy_stream is not None:
+        return cast(
+            In,
+            # pyre-ignore[28]
+            batch.to(
+                device=device,
+                non_blocking=non_blocking,
+                data_copy_stream=data_copy_stream,
+            ),
+        )
+    else:
+        return cast(
+            In,
+            batch.to(
+                device=device,
+                non_blocking=non_blocking,
+            ),
+        )
 
 
 def _wait_for_batch(batch: In, stream: Optional[torch.Stream]) -> None:
