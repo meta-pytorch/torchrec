@@ -187,6 +187,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         custom_model_fwd: Optional[
             Callable[[In], Tuple[torch.Tensor, List[torch.Tensor]]]
         ] = None,
+        inplace_copy_batch_to_gpu: bool = False,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -196,6 +197,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             if device.type in ["cuda", "mtia"]
             else None
         )
+        self._inplace_copy_batch_to_gpu = inplace_copy_batch_to_gpu
 
         # pyre-ignore
         self._stream_context = (
@@ -217,8 +219,18 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         cur_batch = next(dataloader_iter)
         self._cur_batch = cur_batch
         if cur_batch is not None:
-            with self._stream_context(self._memcpy_stream):
-                self._cur_batch = _to_device(cur_batch, self._device, non_blocking=True)
+            if self._inplace_copy_batch_to_gpu:
+                self._cur_batch = _to_device(
+                    cur_batch,
+                    self._device,
+                    non_blocking=True,
+                    data_copy_stream=self._memcpy_stream,
+                )
+            else:
+                with self._stream_context(self._memcpy_stream):
+                    self._cur_batch = _to_device(
+                        cur_batch, self._device, non_blocking=True
+                    )
         self._connected = True
 
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
@@ -241,8 +253,18 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
 
     def _copy_batch_to_gpu(self, cur_batch: In) -> None:
         with record_function("## copy_batch_to_gpu ##"):
-            with self._stream_context(self._memcpy_stream):
-                self._cur_batch = _to_device(cur_batch, self._device, non_blocking=True)
+            if self._inplace_copy_batch_to_gpu:
+                self._cur_batch = _to_device(
+                    cur_batch,
+                    self._device,
+                    non_blocking=True,
+                    data_copy_stream=self._memcpy_stream,
+                )
+            else:
+                with self._stream_context(self._memcpy_stream):
+                    self._cur_batch = _to_device(
+                        cur_batch, self._device, non_blocking=True
+                    )
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         if not self._connected:
@@ -440,6 +462,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         ] = None,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
+        inplace_copy_batch_to_gpu: bool = False,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -447,6 +470,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._execute_all_batches = execute_all_batches
         self._apply_jit = apply_jit
         self._enqueue_batch_after_forward = enqueue_batch_after_forward
+        self._inplace_copy_batch_to_gpu = inplace_copy_batch_to_gpu
 
         logger.info(
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
@@ -587,7 +611,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         load a data batch from dataloader, and copy it from cpu to gpu
         also create the context for this batch.
         """
-        batch, context = self.copy_batch_to_gpu(dataloader_iter)
+        if self._inplace_copy_batch_to_gpu:
+            batch, context = self.inplace_copy_batch_to_gpu(dataloader_iter)
+        else:
+            batch, context = self.copy_batch_to_gpu(dataloader_iter)
         if batch is None:
             return False
         self.batches.append(batch)
@@ -820,6 +847,38 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                     )
                 return batch, context
 
+    def inplace_copy_batch_to_gpu(
+        self,
+        dataloader_iter: Iterator[In],
+    ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
+        """
+        Moves batch to the provided device on memcpy stream.
+
+        Raises:
+            StopIteration: if the dataloader iterator is exhausted; unless
+                `self._execute_all_batches=True`, then returns None.
+        """
+        context = self._create_context()
+        with record_function(f"## inplace_copy_batch_to_gpu {context.index} ##"):
+            batch = self._next_batch(dataloader_iter)
+            if batch is not None:
+                batch = _to_device(
+                    batch,
+                    self._device,
+                    non_blocking=True,
+                    data_copy_stream=self._memcpy_stream,
+                )
+            elif not self._execute_all_batches:
+                logger.info(
+                    "inplace_copy_batch_to_gpu: raising StopIteration for None Batch (execute_all_batches=False)"
+                )
+                raise StopIteration
+            else:
+                logger.info(
+                    "inplace_copy_batch_to_gpu: returning None batch (execute_all_batches=True)"
+                )
+            return batch, context
+
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
         """
         Retrieves next batch from dataloader and prevents calling `next` on an already
@@ -984,6 +1043,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         strict: bool = False,
         emb_lookup_stream: str = "data_dist",  # new, current, data_dist (default)
         embedding_lookup_after_data_dist: bool = False,
+        inplace_copy_batch_to_gpu: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -994,6 +1054,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             context_type=EmbeddingTrainPipelineContext,
             pipeline_postproc=pipeline_postproc,
             custom_model_fwd=custom_model_fwd,
+            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
         )
         self._embedding_lookup_after_data_dist = embedding_lookup_after_data_dist
 
@@ -1155,6 +1216,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
         ] = None,
         strict: bool = False,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
+        inplace_copy_batch_to_gpu: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1166,6 +1228,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             pipeline_postproc=pipeline_postproc,
             custom_model_fwd=custom_model_fwd,
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
+            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
         )
         self._start_batch = start_batch
         self._stash_gradients = stash_gradients

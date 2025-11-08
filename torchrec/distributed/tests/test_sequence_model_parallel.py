@@ -390,8 +390,14 @@ class DedupIndicesWeightAccumulationTest(unittest.TestCase):
     This tests the correctness of the new scatter_add_along_first_dim implementation.
     """
 
-    # to be deleted
-    def test_dedup_indices_weight_accumulation(self) -> None:
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_dedup_indices_weight_accumulation_disabled_in_oss_compatibility(
+        self,
+    ) -> None:
         """
         Test the _dedup_indices method to ensure weight accumulation works correctly
         with the new scatter_add_along_first_dim implementation.

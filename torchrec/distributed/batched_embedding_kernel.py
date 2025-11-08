@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from math import sqrt
 from typing import (
     Any,
+    Callable,
     cast,
     Dict,
     Generic,
@@ -70,6 +71,7 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
+from torchrec.distributed.model_tracker.types import IndexedLookup
 from torchrec.distributed.shards_wrapper import LocalShardsWrapper
 from torchrec.distributed.types import (
     Shard,
@@ -80,6 +82,7 @@ from torchrec.distributed.types import (
     TensorProperties,
 )
 from torchrec.distributed.utils import append_prefix, none_throws
+
 from torchrec.modules.embedding_configs import (
     CountBasedEvictionPolicy,
     CountTimestampMixedEvictionPolicy,
@@ -97,11 +100,28 @@ from torchrec.optim.fused import (
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 RES_ENABLED_TABLES_STR = "res_enabled_tables"
 RES_STORE_SHARDS_STR = "res_store_shards"
 ENABLE_RAW_EMBEDDING_STREAMING_STR = "enable_raw_embedding_streaming"
+
+
+class RawIdTrackerWrapper:
+    def __init__(
+        self,
+        get_indexed_lookups: Callable[
+            [List[str], Optional[str]],
+            Dict[str, List[torch.Tensor]],
+        ],
+        delete: Callable[
+            [int],
+            None,
+        ],
+    ) -> None:
+        self.get_indexed_lookups = get_indexed_lookups
+        self.delete = delete
 
 
 def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParams]:
@@ -334,6 +354,9 @@ def _populate_zero_collision_tbe_params(
         training_id_eviction_trigger_count = [0] * len(config.embedding_tables)
         training_id_keep_count = [0] * len(config.embedding_tables)
         l2_weight_thresholds = [0.0] * len(config.embedding_tables)
+        enable_eviction_for_feature_score_eviction_policy = [True] * len(
+            config.embedding_tables
+        )
         eviction_strategy = -1
         table_names = [table.name for table in config.embedding_tables]
         l2_cache_size = tbe_params["l2_cache_size"]
@@ -378,6 +401,9 @@ def _populate_zero_collision_tbe_params(
                     )
                     training_id_keep_count[i] = policy_t.training_id_keep_count
                     ttls_in_mins[i] = policy_t.eviction_ttl_mins
+                    enable_eviction_for_feature_score_eviction_policy[i] = (
+                        policy_t.enable_eviction
+                    )
                     if eviction_strategy == -1 or eviction_strategy == 5:
                         eviction_strategy = 5
                     else:
@@ -439,6 +465,7 @@ def _populate_zero_collision_tbe_params(
             eviction_free_mem_check_interval_batch=eviction_free_mem_check_interval_batch,
             threshold_calculation_bucket_stride=threshold_calculation_bucket_stride,
             threshold_calculation_bucket_num=threshold_calculation_bucket_num,
+            enable_eviction_for_feature_score_eviction_policy=enable_eviction_for_feature_score_eviction_policy,
         )
     else:
         eviction_policy = EvictionPolicy(meta_header_lens=meta_header_lens)
@@ -2526,6 +2553,7 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         self._lengths_per_emb: List[int] = []
         self.table_name_to_count: Dict[str, int] = {}
         self._param_per_table: Dict[str, TableBatchedEmbeddingSlice] = {}
+        self._raw_id_tracker_wrapper: Optional[RawIdTrackerWrapper] = None
 
         for idx, table_config in enumerate(self._config.embedding_tables):
             self._local_rows.append(table_config.local_rows)
@@ -2667,6 +2695,22 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         """
         for name, param in self._param_per_table.items():
             yield name, param
+
+    def init_raw_id_tracker(
+        self,
+        get_indexed_lookups: Callable[
+            [List[str], Optional[str]],
+            Dict[str, List[torch.Tensor]],
+        ],
+        delete: Callable[
+            [int],
+            None,
+        ],
+    ) -> None:
+        if isinstance(self._emb_module, SplitTableBatchedEmbeddingBagsCodegen):
+            self._raw_id_tracker_wrapper = RawIdTrackerWrapper(
+                get_indexed_lookups, delete
+            )
 
 
 class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizerModule):

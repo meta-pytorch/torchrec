@@ -391,7 +391,15 @@ class ShardedEmbeddingModule(
         self._lookups: List[nn.Module] = []
         self._output_dists: List[nn.Module] = []
         self.post_lookup_tracker_fn: Optional[
-            Callable[[KeyedJaggedTensor, torch.Tensor, Optional[nn.Module]], None]
+            Callable[
+                [
+                    KeyedJaggedTensor,
+                    torch.Tensor,
+                    Optional[nn.Module],
+                    Optional[torch.Tensor],
+                ],
+                None,
+            ]
         ] = None
         self.post_odist_tracker_fn: Optional[Callable[..., None]] = None
 
@@ -445,7 +453,13 @@ class ShardedEmbeddingModule(
     def register_post_lookup_tracker_fn(
         self,
         record_fn: Callable[
-            [KeyedJaggedTensor, torch.Tensor, Optional[nn.Module]], None
+            [
+                KeyedJaggedTensor,
+                torch.Tensor,
+                Optional[nn.Module],
+                Optional[torch.Tensor],
+            ],
+            None,
         ],
     ) -> None:
         """

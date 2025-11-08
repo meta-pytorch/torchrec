@@ -23,6 +23,7 @@ class IndexedLookup:
     batch_idx: int
     ids: torch.Tensor
     states: Optional[torch.Tensor]
+    raw_ids: Optional[torch.Tensor] = None
     compact: bool = False
 
 
@@ -74,8 +75,36 @@ class UpdateMode(Enum):
     LAST = "last"
 
 
+class Trackers(Enum):
+    r"""
+    Supported Tracker in TorchRec
+
+    Enums:
+        DeltaTracker: Generic Tracker for EC and EBC which tracks ids/states configured througs modes
+        RawIdTracker: Specialized tracker for MPZCH for tracking Raw ids
+    """
+
+    DELTA_TRACKER = "delta_tracker"
+    RAW_ID_TRACKER = "raw_id_tracker"
+
+
 @dataclass
-class ModelTrackerConfig:
+class RawIdTrackerConfig:
+    r"""
+    Configuration for ``RawIdTracker``.
+
+    Args:
+        delete_on_read (bool): whether to delete the compacted data after get_delta method is called.
+        fqns_to_skip (List[str]): list of FQNs to skip tracking.
+
+    """
+
+    delete_on_read: bool = True
+    fqns_to_skip: List[str] = field(default_factory=list)
+
+
+@dataclass
+class DeltaTrackerConfig:
     r"""
     Configuration for ``ModelDeltaTracker``.
 
@@ -83,6 +112,8 @@ class ModelTrackerConfig:
         tracking_mode (TrackingMode): tracking mode for the delta tracker.
         consumers (Optional[List[str]]): list of consumers for the delta tracker.
         delete_on_read (bool): whether to delete the compacted data after get_delta method is called.
+        fqns_to_skip (List[str]): list of FQNs to skip tracking.
+
 
     """
 
@@ -91,3 +122,16 @@ class ModelTrackerConfig:
     delete_on_read: bool = True
     auto_compact: bool = False
     fqns_to_skip: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ModelTrackerConfigs:
+    r"""
+    Configuration for ``ModelTracker Implementations``.
+
+    Args:
+        RawIdTrackerConfig
+
+    """
+
+    raw_id_tracker_config: Optional[RawIdTrackerConfig] = None

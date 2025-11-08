@@ -84,6 +84,7 @@ class ModelDeltaTracker(ABC):
         kjt: KeyedJaggedTensor,
         states: torch.Tensor,
         emb_module: Optional[nn.Module] = None,
+        raw_ids: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Records the IDs from a given KeyedJaggedTensor and their corresponding embeddings/parameter states.
@@ -128,6 +129,13 @@ class ModelDeltaTracker(ABC):
 
         Args:
             consumer (str, optional): The consumer to clear IDs/States for.
+        """
+        pass
+
+    @abstractmethod
+    def step(self) -> None:
+        """
+        Advance the batch index for all consumers.
         """
         pass
 
@@ -244,6 +252,7 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
         kjt: KeyedJaggedTensor,
         states: torch.Tensor,
         emb_module: Optional[nn.Module] = None,
+        raw_ids: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Records the IDs from a given KeyedJaggedTensor and their corresponding embeddings/parameter states.

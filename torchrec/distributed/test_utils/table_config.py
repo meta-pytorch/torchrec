@@ -36,6 +36,7 @@ class EmbeddingTablesConfig:
     num_unweighted_features: int = 100
     num_weighted_features: int = 100
     embedding_feature_dim: int = 128
+    base_row_size: int = 100_000
     table_data_type: DataType = DataType.FP32
     additional_tables: List[List[Dict[str, Any]]] = field(default_factory=list)
 
@@ -71,7 +72,7 @@ class EmbeddingTablesConfig:
         """
         unweighted_tables = [
             EmbeddingBagConfig(
-                num_embeddings=max(i + 1, 100) * 2000,
+                num_embeddings=max(i + 1, 100) * self.base_row_size // 100,
                 embedding_dim=self.embedding_feature_dim,
                 name="table_" + str(i),
                 feature_names=["feature_" + str(i)],
@@ -81,7 +82,7 @@ class EmbeddingTablesConfig:
         ]
         weighted_tables = [
             EmbeddingBagConfig(
-                num_embeddings=max(i + 1, 100) * 2000,
+                num_embeddings=max(i + 1, 100) * self.base_row_size // 100,
                 embedding_dim=self.embedding_feature_dim,
                 name="weighted_table_" + str(i),
                 feature_names=["weighted_feature_" + str(i)],
