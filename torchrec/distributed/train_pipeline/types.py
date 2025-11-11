@@ -96,6 +96,7 @@ class PipelineState(Enum):
     IDLE = 0
     CALL_FWD = 1
     CALL_BWD = 2
+    UNKNOWN = 3
 
     def __str__(self) -> str:
         return self.name
