@@ -144,6 +144,18 @@ class DeviceHardware:
     storage: Storage
     perf: Perf
 
+    def __hash__(self) -> int:
+        return hash((self.rank, self.storage, self.perf))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DeviceHardware):
+            return False
+        return (
+            self.rank == other.rank
+            and self.storage == other.storage
+            and self.perf == other.perf
+        )
+
 
 class CustomTopologyData:
     """
@@ -246,6 +258,17 @@ class BasicCommsBandwidths(GeneralizedCommsBandwidth):
             return self.intra_host_bw
         else:
             return self.inter_host_bw
+
+    def __hash__(self) -> int:
+        return hash((self._inter_host_bw, self._intra_host_bw))
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, BasicCommsBandwidths):
+            return False
+        return (
+            self._inter_host_bw == other._inter_host_bw
+            and self._intra_host_bw == other._intra_host_bw
+        )
 
 
 class Topology:
