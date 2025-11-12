@@ -231,6 +231,7 @@ class ShardedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
     def test_sharding_ebc(
         self, set_gradient_division: bool, use_dmp: bool, use_fp_collection: bool
     ) -> None:
+
         import hypothesis
 
         # don't need to test entire matrix
