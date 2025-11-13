@@ -23,8 +23,18 @@ class IndexedLookup:
     batch_idx: int
     ids: torch.Tensor
     states: Optional[torch.Tensor]
-    raw_ids: Optional[torch.Tensor] = None
     compact: bool = False
+
+
+@dataclass
+class RawIndexedLookup:
+    r"""
+    Data class for storing per batch lookedup ids and embeddings or optimizer states.
+    """
+
+    batch_idx: int
+    ids: torch.Tensor
+    raw_ids: Optional[torch.Tensor] = None
 
 
 @dataclass
