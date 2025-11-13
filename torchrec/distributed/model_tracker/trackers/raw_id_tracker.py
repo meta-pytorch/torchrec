@@ -23,7 +23,7 @@ from torchrec.distributed.mc_embeddingbag import (
     ShardedManagedCollisionEmbeddingBagCollection,
 )
 from torchrec.distributed.mc_modules import ShardedManagedCollisionCollection
-from torchrec.distributed.model_tracker.delta_store import DeltaStoreTrec
+from torchrec.distributed.model_tracker.delta_store import RawIdTrackerStore
 
 from torchrec.distributed.model_tracker.model_delta_tracker import ModelDeltaTracker
 from torchrec.distributed.model_tracker.types import IndexedLookup, UniqueRows
@@ -71,7 +71,7 @@ class RawIdTracker(ModelDeltaTracker):
             c: -1 for c in (self._consumers or [self.DEFAULT_CONSUMER])
         }
 
-        self.store: DeltaStoreTrec = DeltaStoreTrec()
+        self.store: RawIdTrackerStore = RawIdTrackerStore()
 
         # Mapping feature name to corresponding FQNs. This is used for retrieving
         # the FQN associated with a given feature name in record_lookup().
@@ -212,7 +212,6 @@ class RawIdTracker(ModelDeltaTracker):
                 batch_idx=self.curr_batch_idx,
                 fqn=table_fqn,
                 ids=torch.cat(ids_list),
-                states=None,
                 raw_ids=torch.cat(per_table_raw_ids[table_fqn]),
             )
 

@@ -14,6 +14,7 @@ from typing import Dict, List, Optional
 import torch
 from torchrec.distributed.model_tracker.types import (
     IndexedLookup,
+    RawIndexedLookup,
     UniqueRows,
     UpdateMode,
 )
@@ -90,7 +91,7 @@ class DeltaStore(ABC):
         batch_idx: int,
         fqn: str,
         ids: torch.Tensor,
-        states: Optional[torch.Tensor],
+        states: Optional[torch.Tensor] = None,
         raw_ids: Optional[torch.Tensor] = None,
     ) -> None:
         """
@@ -162,12 +163,12 @@ class DeltaStoreTrec(DeltaStore):
         batch_idx: int,
         fqn: str,
         ids: torch.Tensor,
-        states: Optional[torch.Tensor],
+        states: Optional[torch.Tensor] = None,
         raw_ids: Optional[torch.Tensor] = None,
     ) -> None:
         table_fqn_lookup = self.per_fqn_lookups.get(fqn, [])
         table_fqn_lookup.append(
-            IndexedLookup(batch_idx=batch_idx, ids=ids, states=states, raw_ids=raw_ids)
+            IndexedLookup(batch_idx=batch_idx, ids=ids, states=states)
         )
         self.per_fqn_lookups[fqn] = table_fqn_lookup
 
@@ -264,3 +265,64 @@ class DeltaStoreTrec(DeltaStore):
                 ids=compact_ids, states=compact_states, mode=self.updateMode
             )
         return delta_per_table_fqn
+
+
+class RawIdTrackerStore(DeltaStore):
+    """
+    RawIdTrackerStore is a concrete implementation of DeltaStore that stores and manages raw ids tracked by RawIdTracker.
+    """
+
+    def __init__(self, updateMode: UpdateMode = UpdateMode.NONE) -> None:
+        super().__init__(updateMode)
+        self.updateMode = updateMode
+        self.per_fqn_lookups: Dict[str, List[RawIndexedLookup]] = {}
+
+    def append(
+        self,
+        batch_idx: int,
+        fqn: str,
+        ids: torch.Tensor,
+        states: Optional[torch.Tensor] = None,
+        raw_ids: Optional[torch.Tensor] = None,
+    ) -> None:
+        table_fqn_lookup = self.per_fqn_lookups.get(fqn, [])
+        table_fqn_lookup.append(
+            RawIndexedLookup(batch_idx=batch_idx, ids=ids, raw_ids=raw_ids)
+        )
+        self.per_fqn_lookups[fqn] = table_fqn_lookup
+
+    def delete(self, up_to_idx: Optional[int] = None) -> None:
+        """
+        Delete all idx from the store up to `up_to_idx`
+        """
+        if up_to_idx is None:
+            # If up_to_idx is None, delete all lookups
+            self.per_fqn_lookups = {}
+        else:
+            # lookups are sorted by idx.
+            up_to_idx = none_throws(up_to_idx)
+            for table_fqn, lookups in self.per_fqn_lookups.items():
+                # remove all lookups up to up_to_idx
+                self.per_fqn_lookups[table_fqn] = [
+                    lookup for lookup in lookups if lookup.batch_idx >= up_to_idx
+                ]
+
+    def compact(self, start_idx: int, end_idx: int) -> None:
+        pass
+
+    def get_indexed_lookups(
+        self, start_idx: int, end_idx: int
+    ) -> Dict[str, List[RawIndexedLookup]]:
+        r"""
+        Return all unique/delta ids per table from the Delta Store.
+        """
+        per_fqn_lookups: Dict[str, List[RawIndexedLookup]] = {}
+        for table_fqn, lookups in self.per_fqn_lookups.items():
+            indexices = [h.batch_idx for h in lookups]
+            index_l = bisect_left(indexices, start_idx)
+            index_r = bisect_left(indexices, end_idx)
+            per_fqn_lookups[table_fqn] = lookups[index_l:index_r]
+        return per_fqn_lookups
+
+    def get_unique(self, from_idx: int = 0) -> Dict[str, UniqueRows]:
+        return {}
