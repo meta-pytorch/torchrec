@@ -94,7 +94,7 @@ class ModelDeltaTracker(ABC):
             kjt (KeyedJaggedTensor): The KeyedJaggedTensor containing IDs to record.
             states (torch.Tensor): The embeddings or states corresponding to the IDs in the kjt.
         """
-        pass
+        ...
 
     @abstractmethod
     def get_unique_ids(self, consumer: Optional[str] = None) -> Dict[str, torch.Tensor]:
@@ -104,7 +104,7 @@ class ModelDeltaTracker(ABC):
         Args:
             consumer (str, optional): The consumer to retrieve unique IDs for.
         """
-        pass
+        ...
 
     @abstractmethod
     def get_unique(
@@ -120,7 +120,7 @@ class ModelDeltaTracker(ABC):
         Args:
             consumer (str, optional): The consumer to retrieve delta values for.
         """
-        pass
+        ...
 
     @abstractmethod
     def clear(self, consumer: Optional[str] = None) -> None:
@@ -130,7 +130,7 @@ class ModelDeltaTracker(ABC):
         Args:
             consumer (str, optional): The consumer to clear IDs/States for.
         """
-        pass
+        ...
 
     def step(self) -> None:
         """
