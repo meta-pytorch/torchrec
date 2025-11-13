@@ -102,6 +102,7 @@ class InferObjectPoolSharding(ABC):
         pool_size: int,
         env: ShardingEnv,
         device: torch.device,
+        memory_capacity_per_rank: Optional[list[int]] = None,
     ) -> None:
         self._pool_size = pool_size
         self._env = env
@@ -117,12 +118,39 @@ class InferObjectPoolSharding(ABC):
         self._last_block_size: int = self._pool_size - self._block_size * (
             self._world_size - 1
         )
-        self.local_pool_size_per_rank: List[int] = [self._block_size] * (
-            self._world_size - 1
-        ) + [self._last_block_size]
+        # only used for uneven sharding case when memory_capacity_per_rank is provided
+        row_offset_per_rank = []
 
+        if memory_capacity_per_rank is None:
+            self.local_pool_size_per_rank: List[int] = [self._block_size] * (
+                self._world_size - 1
+            ) + [self._last_block_size]
+        else:
+            row_offset_per_rank = [0]
+            self.local_pool_size_per_rank: List[int] = []
+            row_offset = 0
+            assert (
+                len(memory_capacity_per_rank) == self._world_size
+            ), "If memory_capacity_per_rank is provided for sharded tensor pool, it must have the same length as world_size"
+            total_mem_cap = sum(memory_capacity_per_rank)
+            for cap in memory_capacity_per_rank[:-1]:
+                rows_per_shard = int(cap / total_mem_cap * self._pool_size)
+                self.local_pool_size_per_rank.append(rows_per_shard)
+                row_offset += rows_per_shard
+                row_offset_per_rank.append(row_offset)
+            self.local_pool_size_per_rank.append(
+                self._pool_size - sum(self.local_pool_size_per_rank)
+            )
+            row_offset_per_rank.append(self._pool_size)
         self._block_size_t: torch.Tensor = torch.tensor(
             [self._block_size], device=self._device, dtype=torch.long
+        )
+        # for uneven sharding case, we get the row offsets for each rank to
+        # enable input_dist and lookup of ids to correct rank
+        self._block_bucketize_row_pos: Optional[List[torch.Tensor]] = (
+            None
+            if memory_capacity_per_rank is None
+            else [torch.tensor(row_offset_per_rank, device=self._device)]
         )
 
     @abstractmethod
