@@ -84,6 +84,7 @@ from torchrec.modules.embedding_configs import (
 from torchrec.modules.utils import (
     _fx_trec_get_feature_length,
     _get_batching_hinted_output,
+    _get_unbucketize_tensor_via_length_alignment,
 )
 from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
@@ -96,6 +97,7 @@ from torchrec.streamable import Multistreamable
 torch.fx.wrap("len")
 torch.fx.wrap("_get_batching_hinted_output")
 torch.fx.wrap("_fx_trec_get_feature_length")
+torch.fx.wrap("_get_unbucketize_tensor_via_length_alignment")
 
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
@@ -276,16 +278,6 @@ def _fx_trec_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.T
 @torch.fx.wrap
 def _fx_trec_wrap_length_tolist(length: torch.Tensor) -> List[int]:
     return length.long().tolist()
-
-
-@torch.fx.wrap
-def _get_unbucketize_tensor_via_length_alignment(
-    lengths: torch.Tensor,
-    bucketize_length: torch.Tensor,
-    bucketize_permute_tensor: torch.Tensor,
-    bucket_mapping_tensor: torch.Tensor,
-) -> torch.Tensor:
-    return bucketize_permute_tensor
 
 
 @torch.fx.wrap

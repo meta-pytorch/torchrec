@@ -166,6 +166,9 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
         block_size (torch.Tensor): tensor containing block sizes for each rank.
             e.g. if block_size=torch.tensor(100), then IDs 0-99 will be assigned to rank
             0, 100-199 to rank 1, and so on.
+        block_bucketize_row_pos (torch.Tensor]): tensor containing shard/row offsets for each
+            rank in case of uneven sharding of the tensor pool across ranks. If not provided,
+            then block_size will be used to permute the IDs across ranks.
 
     Example:
         device = torch.device("cpu")
@@ -179,22 +182,27 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
     _world_size: int
     _device: torch.device
     _block_size: torch.Tensor
+    _block_bucketize_row_pos: list[torch.Tensor]
 
     def __init__(
         self,
         env: ShardingEnv,
         device: torch.device,
         block_size: torch.Tensor,
+        block_bucketize_row_pos: Optional[list[torch.Tensor]] = None,
     ) -> None:
         super().__init__()
         self._world_size = env.world_size
         self._device = device
         self._block_size = block_size
+        self._block_bucketize_row_pos: list[torch.Tensor] = (
+            [] if block_bucketize_row_pos is None else block_bucketize_row_pos
+        )
 
     def forward(
         self,
         ids: torch.Tensor,
-    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Bucketizes ids tensor into a list of tensors each containing ids
         for the corresponding rank. Places each tensor on the appropriate device.
@@ -203,24 +211,34 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
             ids (torch.Tensor): Tensor with ids
 
         Returns:
-           Tuple[List[torch.Tensor], torch.Tensor]: Tuple containing list of ids tensors
-            for each rank given the bucket sizes, and the tensor containing indices
-            to permute the ids to get the original order before bucketization.
+           Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
+           Tuple containing
+           1. list of ids tensors for each rank given the bucket sizes
+           2. the tensor containing indices to permute the ids to get the original order before bucketization.
+           3. the tensor containing the bucket mapping for each id
+           4. the tensor containing the bucketized lengths
         """
         (
             bucketized_lengths,
             bucketized_indices,
-            _bucketized_weights,
-            _bucketize_permute,
+            _,  # bucketized_weights
+            _,  # _bucketize_permute
             unbucketize_permute,
-        ) = torch.ops.fbgemm.block_bucketize_sparse_features(
-            _get_bucketize_shape(ids, ids.device),
-            ids.long(),
+            bucket_mapping,
+        ) = torch.ops.fbgemm.block_bucketize_sparse_features_inference(
+            lengths=_get_bucketize_shape(ids, ids.device),
+            indices=ids.long(),
             bucketize_pos=False,
             sequence=True,
             block_sizes=self._block_size.long(),
             my_size=self._world_size,
             weights=None,
+            block_bucketize_pos=(
+                self._block_bucketize_row_pos
+                if len(self._block_bucketize_row_pos) > 0
+                else None
+            ),
+            return_bucket_mapping=True,
         )
 
         id_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(bucketized_lengths)
@@ -236,7 +254,13 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
             )
 
         assert unbucketize_permute is not None, "unbucketize permute must not be None"
-        return dist_ids, unbucketize_permute
+        assert bucket_mapping is not None, "bucket mapping must not be None"
+        return (
+            dist_ids,
+            unbucketize_permute,
+            bucket_mapping,
+            bucketized_lengths,
+        )
 
     def update(
         self,
@@ -270,6 +294,11 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
             block_sizes=self._block_size.long(),
             my_size=self._world_size,
             weights=None,
+            block_bucketize_pos=(
+                self._block_bucketize_row_pos
+                if len(self._block_bucketize_row_pos) > 0
+                else None
+            ),
         )
 
         id_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(bucketized_lengths)

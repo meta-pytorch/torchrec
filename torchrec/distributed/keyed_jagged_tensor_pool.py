@@ -608,7 +608,7 @@ class ShardedInferenceKeyedJaggedTensorPool(
     def _lookup_ids_dist(
         self,
         ids: torch.Tensor,
-    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._lookup_ids_dist_impl(ids)
 
     # pyre-ignore
@@ -630,7 +630,7 @@ class ShardedInferenceKeyedJaggedTensorPool(
 
     # pyre-ignore
     def forward(self, ids: torch.Tensor) -> KeyedJaggedTensor:
-        dist_input, unbucketize_permute = self._lookup_ids_dist(ids)
+        dist_input, unbucketize_permute, _, _ = self._lookup_ids_dist(ids)
         lookup = self._lookup_local(dist_input)
         # Here we are playing a trick to workaround a fx tracing issue,
         # as proxy is not iteratable.

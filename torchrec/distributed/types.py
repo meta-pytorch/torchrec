@@ -1326,12 +1326,22 @@ class ObjectPoolShardingType(Enum):
 class ObjectPoolShardingPlan(ModuleShardingPlan):
     sharding_type: ObjectPoolShardingType
     inference: bool = False
+    # Currently used to propagate the metadata used to shard the tensor pool
+    # unevenly across different devices (HBM/DRAM) based on the memory capacity
+    # of each device type
+    memory_capacity_per_rank: Optional[list[int]] = None
 
     def _serialize(self) -> dict[str, Any]:
-        return {
+        output = {
             "sharding_type": self.sharding_type.name,
             "inference": self.inference,
         }
+        if self.memory_capacity_per_rank is not None:
+            output["memory_capacity_per_rank"] = (
+                # pyre-fixme: Incompatible parameter type [6]
+                self.memory_capacity_per_rank
+            )
+        return output
 
 
 @dataclass
