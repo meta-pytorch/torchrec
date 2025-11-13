@@ -132,7 +132,6 @@ class ModelDeltaTracker(ABC):
         """
         pass
 
-    @abstractmethod
     def step(self) -> None:
         """
         Advance the batch index for all consumers.
