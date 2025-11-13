@@ -1,0 +1,67 @@
+# This is a very basic KV-ZCH (ZCH v.Next) benchmark configuration
+#   For guidelines, see document `ZCH v.Next Onboarding Guidelines`
+#   KV-ZCH parameters have comments next to them below.
+# Runs on 2 ranks, showing traces with reasonable workloads
+RunOptions:
+  world_size: 2
+  num_batches: 10
+  num_benchmarks: 1
+  num_profiles: 1
+  sharding_type: table_wise
+  profile_dir: "."
+  name: "sparsenn_prefetch_kvzch_dram"
+PipelineConfig:
+  pipeline: "prefetch"
+ModelInputConfig:
+  feature_pooling_avg: 30
+EmbeddingTablesConfig:
+  num_unweighted_features: 10
+  num_weighted_features: 10
+  embedding_feature_dim: 256
+  additional_tables:
+    - - name: FP16_table
+        embedding_dim: 512
+        num_embeddings: 100_000              # Both feature hashsize and virtual table size
+        feature_names: ["additional_0_0"]
+        data_type: FP16
+        total_num_buckets: 100               # num_embedding should be divisible by total_num_buckets
+        location: "DRAM_VIRTUAL_TABLE"       # See sparsenn.configs::LocationType,
+                                             #   either SSD_VIRTUAL_TABLE, DRAM_VIRTUAL_TABLE
+        # weight_init_max: 10                # Controls initial Embedding table values
+        # weight_init_min: -10               # Controls initial Embedding table values
+        # virtual_table_eviction_policy:     # If want eviction policy
+        #   CountBasedEvictionPolicy:
+        #     training_id_eviction_trigger_count: 10000
+        #     eviction_threshold: 15
+        #     decay_rate: 0.99
+
+      - name: large_table
+        embedding_dim: 2048
+        num_embeddings: 1_000_000
+        feature_names: ["additional_0_1"]
+    - []
+    - - name: skipped_table
+        embedding_dim: 128
+        num_embeddings: 100_000
+        feature_names: ["additional_2_1"]
+PlannerConfig:
+  additional_constraints:
+    large_table:
+      sharding_types: [column_wise]
+    FP16_table:
+      sharding_types: [row_wise]              # KV-ZCH virtual tables currently only support row_wise sharding
+      compute_kernels: [dram_virtual_table]   # Either ['ssd_virtual_table', 'dram_virtual_table'], must match above
+      cache_params:
+        prefetch_pipeline: True               # Required for SSD/DRAM virtual tables
+      key_value_params:
+        max_l1_cache_size: 1250               # in MB, check warnings in log to see if it is actually used.
+        l2_cache_size: 64                     # in GB
+        gather_ssd_cache_stats: False
+        ssd_rocksdb_shards: 32
+        # Only use if `virtual_table_eviction_policy` is set above.
+        # kvzch_tbe_config:                               # See fbgemm_gpu/split_table_batched_embeddings_ops_common.py::KVZCHEvictionTBEConfig
+        #   kvzch_eviction_trigger_mode: 2                # 0:disabled, 1:iteration, 2:mem_util, 3:manual, 4:id_count, 5:free_mem
+        #   eviction_free_mem_threshold_gb: 200           # Minimum free memory in GB before eviction
+        #   eviction_free_mem_check_interval_batch: 1000  # Batches between free memory checks
+        #   threshold_calculation_bucket_stride: 0.2      # Feature score bucket width
+        #   threshold_calculation_bucket_num: 1000000     # Total number of feature score buckets
