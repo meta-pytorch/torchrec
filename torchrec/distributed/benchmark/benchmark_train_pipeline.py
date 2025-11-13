@@ -196,7 +196,8 @@ def runner(
             opt=optimizer,
             device=ctx.device,
         )
-        pipeline.progress(iter(bench_inputs))  # warmup
+        # Commented out due to potential conflict with pipeline.reset()
+        # pipeline.progress(iter(bench_inputs))  # warmup
 
         run_option.name = (
             type(pipeline).__name__ if run_option.name == "" else run_option.name

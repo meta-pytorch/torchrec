@@ -169,7 +169,6 @@ def _start_data_dist(
         # and this info was done in the _rewrite_model by tracing the
         # entire model to get the arg_info_list
         args, kwargs = forward.args.build_args_kwargs(batch)
-        args, kwargs = module.preprocess_input(args, kwargs)
 
         # Start input distribution.
         module_ctx = module.create_context()
@@ -405,8 +404,6 @@ def _rewrite_model(  # noqa C901
             logger.info(f"Module '{node.target}' will be pipelined")
             child = sharded_modules[node.target]
             original_forwards.append(child.forward)
-            # Set pipelining flag on the child module
-            child.is_pipelined = True
             # pyre-ignore[8] Incompatible attribute type
             child.forward = pipelined_forward(
                 node.target,

@@ -9,14 +9,16 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+from fbgemm_gpu.split_table_batched_embeddings_ops_common import KVZCHTBEConfig
+
 from torchrec.distributed.comm import get_local_size
 
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
-from torchrec.distributed.planner.types import ParameterConstraints
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.planner.types import CacheParams, ParameterConstraints
+from torchrec.distributed.types import KeyValueParams, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 
 
@@ -63,6 +65,25 @@ class PlannerConfig:
             kwargs = default_kwargs
         else:
             kwargs = default_kwargs | kwargs
+
+        # (KVZCH) Convert key_value_params dict to KeyValueParams object if present
+        if "key_value_params" in kwargs:
+            key_value_params = kwargs["key_value_params"]
+            # If eviction policy is set then construct object
+            if (
+                isinstance(key_value_params, dict)
+                and "kvzch_tbe_config" in key_value_params
+            ):
+                key_value_params["kvzch_tbe_config"] = KVZCHTBEConfig(
+                    **key_value_params["kvzch_tbe_config"]
+                )
+            # pyre-ignore[6,32]
+            kwargs["key_value_params"] = KeyValueParams(**key_value_params)
+
+        # Convert cache_params dict to CacheParams object if present
+        if "cache_params" in kwargs:
+            # pyre-ignore[6,32]
+            kwargs["cache_params"] = CacheParams(**kwargs["cache_params"])
 
         constraint = ParameterConstraints(**kwargs)  # pyre-ignore [6]
         return table.name, constraint
