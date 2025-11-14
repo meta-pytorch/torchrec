@@ -20,7 +20,6 @@
 #include <ATen/core/Dict.h>
 #include <ATen/record_function.h> // @manual
 #include <c10/core/Device.h>
-#include <c10/core/DeviceType.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <fmt/format.h>
