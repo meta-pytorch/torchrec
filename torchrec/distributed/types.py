@@ -664,6 +664,7 @@ class KeyValueParams:
         enable_raw_embedding_streaming: Optional[bool]: enable raw embedding streaming for SSD TBE
         res_store_shards: Optional[int] = None: the number of shards to store the raw embeddings
         kvzch_tbe_config: Optional[KVZCHTBEConfig]: KVZCH config for TBE
+        load_ckpt_without_opt: bool: whether it is st publish
 
         # Parameter Server (PS) Attributes
         ps_hosts (Optional[Tuple[Tuple[str, int]]]): List of PS host ip addresses
@@ -690,6 +691,7 @@ class KeyValueParams:
     )
     res_store_shards: Optional[int] = None  # shards to store the raw embeddings
     kvzch_tbe_config: Optional[KVZCHTBEConfig] = None
+    load_ckpt_without_opt: bool = False  # is st publish
 
     # Parameter Server (PS) Attributes
     ps_hosts: Optional[Tuple[Tuple[str, int], ...]] = None
@@ -719,6 +721,7 @@ class KeyValueParams:
                 self.enable_raw_embedding_streaming,
                 self.res_store_shards,
                 self.kvzch_tbe_config,
+                self.load_ckpt_without_opt,
             )
         )
 
