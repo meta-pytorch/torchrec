@@ -477,6 +477,7 @@ def _populate_zero_collision_tbe_params(
             else False
         )
     )
+
     tbe_params["kv_zch_params"] = KVZCHParams(
         bucket_offsets=bucket_offsets,
         bucket_sizes=bucket_sizes,
@@ -484,6 +485,7 @@ def _populate_zero_collision_tbe_params(
         backend_return_whole_row=(backend_type == BackendType.DRAM),
         eviction_policy=eviction_policy,
         embedding_cache_mode=embedding_cache_mode_,
+        load_ckpt_without_opt=eviction_tbe_config.load_ckpt_without_opt,
     )
 
 
