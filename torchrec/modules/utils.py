@@ -434,3 +434,13 @@ def _fx_trec_get_feature_length(
         "embedding output and features mismatch",
     )
     return features.lengths()
+
+
+@torch.fx.wrap
+def _get_unbucketize_tensor_via_length_alignment(
+    lengths: torch.Tensor,
+    bucketize_length: torch.Tensor,
+    bucketize_permute_tensor: torch.Tensor,
+    bucket_mapping_tensor: torch.Tensor,
+) -> torch.Tensor:
+    return bucketize_permute_tensor

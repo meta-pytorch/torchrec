@@ -213,6 +213,8 @@ class InferRwTensorPoolOutputDist(torch.nn.Module):
         vals = torch.Tensor([1,2,3,4,5,6], device=device)
     """
 
+    __annotations__ = {"_device": Optional[torch.device]}
+
     def __init__(
         self,
         env: ShardingEnv,
@@ -223,6 +225,11 @@ class InferRwTensorPoolOutputDist(torch.nn.Module):
         self._world_size: int = env.world_size
         self._cat_dim = 0
         self._placeholder: torch.Tensor = torch.ones(1, device=device)
+
+    @torch.jit.export
+    def set_device(self, device_str: str) -> None:
+        self._device = torch.device(device_str)
+        self._placeholder = torch.ones(1, device=self._device)
 
     def forward(
         self,
@@ -256,12 +263,16 @@ class InferRwTensorPoolSharding(InferObjectPoolSharding):
         pool_size: int,
         env: ShardingEnv,
         device: torch.device,
+        memory_capacity_per_rank: Optional[list[int]] = None,
     ) -> None:
-        super().__init__(pool_size, env, device)
+        super().__init__(pool_size, env, device, memory_capacity_per_rank)
 
     def create_lookup_ids_dist(self) -> InferRwObjectPoolInputDist:
         return InferRwObjectPoolInputDist(
-            self._env, device=self._device, block_size=self._block_size_t
+            self._env,
+            device=self._device,
+            block_size=self._block_size_t,
+            block_bucketize_row_pos=self._block_bucketize_row_pos,
         )
 
     def create_lookup_values_dist(

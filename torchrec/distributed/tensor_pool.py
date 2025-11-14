@@ -32,7 +32,14 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.object_pool_lookups import TensorLookup, TensorPoolLookup
 from torchrec.modules.tensor_pool import TensorPool
-from torchrec.modules.utils import deterministic_dedup
+from torchrec.modules.utils import (
+    _get_batching_hinted_output,
+    _get_unbucketize_tensor_via_length_alignment,
+    deterministic_dedup,
+)
+
+torch.fx.wrap("_get_unbucketize_tensor_via_length_alignment")
+torch.fx.wrap("_get_batching_hinted_output")
 
 
 @torch.fx.wrap
@@ -42,6 +49,17 @@ def index_select_view(
     dim: int,
 ) -> torch.Tensor:
     return output[unbucketize_permute].view(-1, dim)
+
+
+@torch.fx.wrap
+def _fx_item_unwrap_optional_tensor(optional: Optional[torch.Tensor]) -> torch.Tensor:
+    assert optional is not None, "Expected optional to be non-None Tensor"
+    return optional
+
+
+@torch.fx.wrap
+def _get_id_length_sharded_tensor_pool(ids: torch.Tensor) -> torch.Tensor:
+    return torch.tensor([ids.size(dim=0)], device=ids.device, dtype=torch.long)
 
 
 class TensorPoolAwaitable(LazyAwaitable[torch.Tensor]):
@@ -271,6 +289,8 @@ class LocalShardPool(torch.nn.Module):
         # out is tensor([1,2,3]) i.e. first row of the shard
     """
 
+    current_device: torch.device
+
     def __init__(
         self,
         shard: torch.Tensor,
@@ -280,6 +300,12 @@ class LocalShardPool(torch.nn.Module):
             shard,
             requires_grad=False,
         )
+        self.current_device = self._shard.device
+
+    @torch.jit.export
+    def set_device(self, device_str: str) -> None:
+        self.current_device = torch.device(device_str)
+        self._shard.to(self.current_device)
 
     def forward(self, rank_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -291,7 +317,7 @@ class LocalShardPool(torch.nn.Module):
         Returns:
             torch.Tensor: Tensor of values corresponding to the given rank ids.
         """
-        return self._shard[rank_ids]
+        return self._shard[rank_ids.to(self.current_device)]
 
     def update(self, rank_ids: torch.Tensor, values: torch.Tensor) -> None:
         _ = update(self._shard, rank_ids, values)
@@ -337,6 +363,11 @@ class ShardedInferenceTensorPool(
                 env=self._sharding_env,
                 device=self._device,
                 pool_size=self._pool_size,
+                memory_capacity_per_rank=(
+                    self._sharding_plan.memory_capacity_per_rank
+                    if self._sharding_plan.memory_capacity_per_rank is not None
+                    else None
+                ),
             )
         else:
             raise NotImplementedError(
@@ -356,6 +387,7 @@ class ShardedInferenceTensorPool(
                 if device == torch.device("cpu")
                 else torch.device("cuda", rank)
             )
+
             self._local_shard_pools.append(
                 LocalShardPool(
                     torch.empty(
@@ -409,7 +441,7 @@ class ShardedInferenceTensorPool(
     def _lookup_ids_dist(
         self,
         ids: torch.Tensor,
-    ) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._lookup_ids_dist_impl(ids)
 
     # pyre-ignore
@@ -439,18 +471,54 @@ class ShardedInferenceTensorPool(
 
     # pyre-ignore
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        dist_input, unbucketize_permute = self._lookup_ids_dist(ids)
+        dist_input, unbucketize_permute, bucket_mapping, bucketized_lengths = (
+            self._lookup_ids_dist(ids)
+        )
+        unbucketize_permute_non_opt = _fx_item_unwrap_optional_tensor(
+            unbucketize_permute
+        )
+
         lookup = self._lookup_local(dist_input)
 
         # Here we are playing a trick to workaround a fx tracing issue,
         # as proxy is not iteratable.
         lookup_list = []
-        for i in range(self._world_size):
-            lookup_list.append(lookup[i])
+        # In case of non-heterogenous even sharding keeping the behavior
+        # consistent with existing logic to ensure that additional fx wrappers
+        # do not impact the model split logic during inference in anyway
+        if self._sharding_plan.memory_capacity_per_rank is None:
+            for i in range(self._world_size):
+                lookup_list.append(lookup[i])
+        else:
+            # Adding fx wrappers in case of uneven heterogenous sharding to
+            # make it compatible with model split boundaries during inference
+            for i in range(self._world_size):
+                lookup_list.append(
+                    _get_batching_hinted_output(
+                        _get_id_length_sharded_tensor_pool(dist_input[i]), lookup[i]
+                    )
+                )
+
+            features_before_input_dist_length = _get_id_length_sharded_tensor_pool(ids)
+            bucketized_lengths_col_view = bucketized_lengths.view(self._world_size, -1)
+            unbucketize_permute_non_opt = _fx_item_unwrap_optional_tensor(
+                unbucketize_permute
+            )
+            bucket_mapping_non_opt = _fx_item_unwrap_optional_tensor(bucket_mapping)
+            unbucketize_permute_non_opt = _get_unbucketize_tensor_via_length_alignment(
+                features_before_input_dist_length,
+                bucketized_lengths_col_view,
+                unbucketize_permute_non_opt,
+                bucket_mapping_non_opt,
+            )
 
         output = self._lookup_values_dist(lookup_list)
 
-        return index_select_view(output, unbucketize_permute, self._dim)
+        return index_select_view(
+            output,
+            unbucketize_permute_non_opt.to(device=output.device),
+            self._dim,
+        )
 
     # pyre-ignore
     def _update_values_dist(self, ctx: ObjectPoolShardingContext, values: torch.Tensor):
