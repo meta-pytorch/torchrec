@@ -474,6 +474,9 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         )
         self.comms_module.load_pre_compute_states(aggregated_states)
 
+        # Sync _trained_batches to comms module
+        self.comms_module._trained_batches.copy_(self._trained_batches)
+
         logger.info("CPUOffloadedRecMetricModule synced.")
 
     @override
