@@ -20,6 +20,7 @@ from typing import (
     Callable,
     cast,
     Dict,
+    FrozenSet,
     Generic,
     Iterator,
     List,
@@ -344,6 +345,7 @@ def _populate_zero_collision_tbe_params(
         meta_header_lens[i] = table.virtual_table_eviction_policy.get_meta_header_len()
         if not isinstance(table.virtual_table_eviction_policy, NoEvictionPolicy):
             enabled = True
+    kvzch_tbe_config = None
     if enabled:
         counter_thresholds = [0] * len(config.embedding_tables)
         ttls_in_mins = [0] * len(config.embedding_tables)
@@ -362,20 +364,18 @@ def _populate_zero_collision_tbe_params(
         assert (
             "kvzch_tbe_config" in tbe_params
         ), "kvzch_tbe_config should be in tbe_params"
-        eviction_tbe_config = tbe_params["kvzch_tbe_config"]
+        kvzch_tbe_config = tbe_params["kvzch_tbe_config"]
         tbe_params.pop("kvzch_tbe_config")
-        eviction_trigger_mode = eviction_tbe_config.kvzch_eviction_trigger_mode
-        eviction_free_mem_threshold_gb = (
-            eviction_tbe_config.eviction_free_mem_threshold_gb
-        )
+        eviction_trigger_mode = kvzch_tbe_config.kvzch_eviction_trigger_mode
+        eviction_free_mem_threshold_gb = kvzch_tbe_config.eviction_free_mem_threshold_gb
         eviction_free_mem_check_interval_batch = (
-            eviction_tbe_config.eviction_free_mem_check_interval_batch
+            kvzch_tbe_config.eviction_free_mem_check_interval_batch
         )
         threshold_calculation_bucket_stride = (
-            eviction_tbe_config.threshold_calculation_bucket_stride
+            kvzch_tbe_config.threshold_calculation_bucket_stride
         )
         threshold_calculation_bucket_num = (
-            eviction_tbe_config.threshold_calculation_bucket_num
+            kvzch_tbe_config.threshold_calculation_bucket_num
         )
         for i, table in enumerate(config.embedding_tables):
             policy_t = table.virtual_table_eviction_policy
@@ -478,6 +478,12 @@ def _populate_zero_collision_tbe_params(
         )
     )
 
+    optimizer_type_for_st: Optional[str] = None
+    optimizer_state_dtypes_for_st: Optional[FrozenSet[Tuple[str, int]]] = None
+    if kvzch_tbe_config and kvzch_tbe_config.is_st_publish:
+        optimizer_type_for_st = kvzch_tbe_config.optimizer_type_for_st
+        optimizer_state_dtypes_for_st = kvzch_tbe_config.optimizer_state_dtypes_for_st
+
     tbe_params["kv_zch_params"] = KVZCHParams(
         bucket_offsets=bucket_offsets,
         bucket_sizes=bucket_sizes,
@@ -485,7 +491,9 @@ def _populate_zero_collision_tbe_params(
         backend_return_whole_row=(backend_type == BackendType.DRAM),
         eviction_policy=eviction_policy,
         embedding_cache_mode=embedding_cache_mode_,
-        load_ckpt_without_opt=eviction_tbe_config.load_ckpt_without_opt,
+        load_ckpt_without_opt=kvzch_tbe_config.load_ckpt_without_opt,
+        optimizer_type_for_st=optimizer_type_for_st,
+        optimizer_state_dtypes_for_st=optimizer_state_dtypes_for_st,
     )
 
 
