@@ -19,6 +19,7 @@ from torchrec.distributed.embedding_types import (
     KeyedJaggedTensor,
     ShardedEmbeddingTable,
 )
+from torchrec.distributed.mc_embedding import ShardedManagedCollisionEmbeddingCollection
 from torchrec.distributed.mc_embeddingbag import (
     ShardedManagedCollisionEmbeddingBagCollection,
 )
@@ -26,11 +27,16 @@ from torchrec.distributed.mc_modules import ShardedManagedCollisionCollection
 from torchrec.distributed.model_tracker.delta_store import RawIdTrackerStore
 
 from torchrec.distributed.model_tracker.model_delta_tracker import ModelDeltaTracker
-from torchrec.distributed.model_tracker.types import IndexedLookup, UniqueRows
+from torchrec.distributed.model_tracker.types import UniqueRows
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-SUPPORTED_MODULES = (ShardedManagedCollisionCollection,)
+SUPPORTED_TRACKING_MODULES = (ShardedManagedCollisionCollection,)
+
+MANAGED_COLLISION_WRAPPER_MODULES = (
+    ShardedManagedCollisionEmbeddingCollection,
+    ShardedManagedCollisionEmbeddingBagCollection,
+)
 
 
 class RawIdTracker(ModelDeltaTracker):
@@ -49,7 +55,7 @@ class RawIdTracker(ModelDeltaTracker):
         self.curr_batch_idx: int = 0
         self.curr_compact_index: int = 0
 
-        # from module FQN to SUPPORTED_MODULES
+        # from module FQN to SUPPORTED_TRACKING_MODULES
         self.tracked_modules: Dict[str, nn.Module] = {}
         self.table_to_fqn: Dict[str, str] = {}
         self.feature_to_fqn: Dict[str, str] = {}
@@ -124,7 +130,7 @@ class RawIdTracker(ModelDeltaTracker):
             if self._should_skip_fqn(fqn):
                 continue
             # Using FQNs of the embedding and mapping them to features as state_dict() API uses these to key states.
-            if isinstance(named_module, SUPPORTED_MODULES):
+            if isinstance(named_module, SUPPORTED_TRACKING_MODULES):
                 should_track_module = True
                 for table_name, config in named_module._table_name_to_config.items():
                     for fqn_to_skip in self._fqns_to_skip:
@@ -227,7 +233,7 @@ class RawIdTracker(ModelDeltaTracker):
     def _validate_and_init_tracker_fns(self) -> None:
         "To validate the mode is supported for the given module"
         for module in self.tracked_modules.values():
-            if isinstance(module, SUPPORTED_MODULES):
+            if isinstance(module, SUPPORTED_TRACKING_MODULES):
                 # register post lookup function
                 module.register_post_lookup_tracker_fn(self.record_lookup)
 
@@ -235,7 +241,7 @@ class RawIdTracker(ModelDeltaTracker):
         for fqn, named_module in self._model.named_modules():
             if self._should_skip_fqn(fqn):
                 continue
-            if isinstance(named_module, ShardedManagedCollisionEmbeddingBagCollection):
+            if isinstance(named_module, MANAGED_COLLISION_WRAPPER_MODULES):
                 for lookup in named_module._embedding_module._lookups:
                     # pyre-ignore
                     for emb in lookup._emb_modules:
