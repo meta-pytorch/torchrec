@@ -474,9 +474,7 @@ class ShardedInferenceTensorPool(
         dist_input, unbucketize_permute, bucket_mapping, bucketized_lengths = (
             self._lookup_ids_dist(ids)
         )
-        unbucketize_permute_non_opt = _fx_item_unwrap_optional_tensor(
-            unbucketize_permute
-        )
+        unbucketize_permute_non_opt = unbucketize_permute
 
         lookup = self._lookup_local(dist_input)
 
@@ -513,12 +511,20 @@ class ShardedInferenceTensorPool(
             )
 
         output = self._lookup_values_dist(lookup_list)
-
-        return index_select_view(
-            output,
-            unbucketize_permute_non_opt.to(device=output.device),
-            self._dim,
-        )
+        # When memory_capacity_per_rank is added then boundary split for the
+        # model is different. Handling device movement accordingly
+        if self._sharding_plan.memory_capacity_per_rank is None:
+            return index_select_view(
+                output,
+                unbucketize_permute_non_opt,
+                self._dim,
+            )
+        else:
+            return index_select_view(
+                output,
+                unbucketize_permute_non_opt.to(device=output.device),
+                self._dim,
+            )
 
     # pyre-ignore
     def _update_values_dist(self, ctx: ObjectPoolShardingContext, values: torch.Tensor):
