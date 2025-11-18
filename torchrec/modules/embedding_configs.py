@@ -237,7 +237,7 @@ class FeatureScoreBasedEvictionPolicy(VirtualTableEvictionPolicy):
         0  # max number of inference ids per rank, default is training_id_keep_count
     )
     inference_eviction_feature_score_threshold: Optional[float] = (
-        None  # 0 means no eviction
+        None  # [DO NOT SET THIS] feature score threshold for inference eviction policy. This is used for inference only, and will be set during publish time
     )
     inference_eviction_ttl_mins: Optional[int] = None  # 0 means no eviction
     feature_score_mapping: Optional[Dict[str, float]] = None  # feature score mapping
