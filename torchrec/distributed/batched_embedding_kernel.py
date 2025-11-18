@@ -17,7 +17,6 @@ from dataclasses import dataclass
 from math import sqrt
 from typing import (
     Any,
-    Callable,
     cast,
     Dict,
     FrozenSet,
@@ -107,22 +106,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 RES_ENABLED_TABLES_STR = "res_enabled_tables"
 RES_STORE_SHARDS_STR = "res_store_shards"
 ENABLE_RAW_EMBEDDING_STREAMING_STR = "enable_raw_embedding_streaming"
-
-
-class RawIdTrackerWrapper:
-    def __init__(
-        self,
-        get_indexed_lookups: Callable[
-            [List[str], Optional[str]],
-            Dict[str, List[torch.Tensor]],
-        ],
-        delete: Callable[
-            [int],
-            None,
-        ],
-    ) -> None:
-        self.get_indexed_lookups = get_indexed_lookups
-        self.delete = delete
 
 
 def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParams]:
@@ -1723,9 +1706,17 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
                 )
 
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        hash_zch_identities = self._get_hash_zch_identities(features)
+        if hash_zch_identities is None:
+            return self.emb_module(
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
+            )
+
         return self.emb_module(
             indices=features.values().long(),
             offsets=features.offsets().long(),
+            hash_zch_identities=hash_zch_identities,
         )
 
     # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
@@ -2563,7 +2554,6 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         self._lengths_per_emb: List[int] = []
         self.table_name_to_count: Dict[str, int] = {}
         self._param_per_table: Dict[str, TableBatchedEmbeddingSlice] = {}
-        self._raw_id_tracker_wrapper: Optional[RawIdTrackerWrapper] = None
 
         for idx, table_config in enumerate(self._config.embedding_tables):
             self._local_rows.append(table_config.local_rows)
@@ -2616,62 +2606,6 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
                     weight_init_min,
                     weight_init_max,
                 )
-
-    def _get_hash_zch_identities(
-        self, features: KeyedJaggedTensor
-    ) -> Optional[torch.Tensor]:
-        if self._raw_id_tracker_wrapper is None or not isinstance(
-            self.emb_module, SplitTableBatchedEmbeddingBagsCodegen
-        ):
-            return None
-
-        raw_id_tracker_wrapper = self._raw_id_tracker_wrapper
-        assert (
-            raw_id_tracker_wrapper is not None
-        ), "self._raw_id_tracker_wrapper should not be None"
-        assert hasattr(
-            self.emb_module, "res_params"
-        ), "res_params should exist when raw_id_tracker is enabled"
-        res_params: RESParams = self.emb_module.res_params  # pyre-ignore[9]
-        table_names = res_params.table_names
-
-        # TODO: get_indexed_lookups() may return multiple IndexedLookup objects
-        # across multiple training iterations. Current logic appends raw_ids from
-        # all batches sequentially. This may cause misalignment with
-        # features.values() which only contains the current batch.
-        raw_ids_dict = raw_id_tracker_wrapper.get_indexed_lookups(
-            table_names, self.emb_module.uuid
-        )
-
-        # Build hash_zch_identities by concatenating raw IDs from tracked tables.
-        # Output maintains 1-to-1 alignment with features.values().
-        # Iterate through table_names explicitly (not raw_ids_dict.values()) to
-        # ensure correct ordering, since there is no guarantee on dict ordering.
-        #
-        # E.g. If features.values() = [f1_val1, f1_val2, f2_val1, f2_val2, ...]
-        #      where table1 has [feature1, feature2] and table2 has [feature3, feature4]
-        #      then hash_zch_identities = [f1_id1, f1_id2, f2_id1, f2_id2, ...]
-        #
-        # TODO: Handle tables without identity tracking. Currently, only tables with
-        # raw_ids are included. If some tables lack identity while others have them,
-        # padding with -1 may be needed to maintain alignment.
-        all_raw_ids = []
-        for table_name in table_names:
-            if table_name in raw_ids_dict:
-                raw_ids_list = raw_ids_dict[table_name]
-                for raw_ids in raw_ids_list:
-                    all_raw_ids.append(raw_ids)
-
-        if not all_raw_ids:
-            return None
-
-        hash_zch_identities = torch.cat(all_raw_ids)
-        assert hash_zch_identities.size(0) == features.values().numel(), (
-            f"hash_zch_identities row count ({hash_zch_identities.size(0)}) must match "
-            f"features.values() length ({features.values().numel()}) to maintain 1-to-1 alignment"
-        )
-
-        return hash_zch_identities
 
     def forward(
         self,
@@ -2774,22 +2708,6 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         """
         for name, param in self._param_per_table.items():
             yield name, param
-
-    def init_raw_id_tracker(
-        self,
-        get_indexed_lookups: Callable[
-            [List[str], Optional[str]],
-            Dict[str, List[torch.Tensor]],
-        ],
-        delete: Callable[
-            [int],
-            None,
-        ],
-    ) -> None:
-        if isinstance(self._emb_module, SplitTableBatchedEmbeddingBagsCodegen):
-            self._raw_id_tracker_wrapper = RawIdTrackerWrapper(
-                get_indexed_lookups, delete
-            )
 
 
 class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizerModule):
