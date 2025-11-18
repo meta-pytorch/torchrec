@@ -305,7 +305,6 @@ class LocalShardPool(torch.nn.Module):
     @torch.jit.export
     def set_device(self, device_str: str) -> None:
         self.current_device = torch.device(device_str)
-        self._shard.to(self.current_device)
 
     def forward(self, rank_ids: torch.Tensor) -> torch.Tensor:
         """
