@@ -341,7 +341,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "rec_metrics.rec_metrics.0._metrics_computations.0.state_3": torch.tensor(
                     [6.0]
                 ),
-                "_trained_batches": torch.tensor(0),
             },
         )
 

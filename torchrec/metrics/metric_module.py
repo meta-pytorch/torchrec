@@ -202,9 +202,7 @@ class RecMetricModule(nn.Module):
         self.rec_metrics = rec_metrics if rec_metrics else RecMetricList([])
         self.throughput_metric = throughput_metric
         self.state_metrics = state_metrics if state_metrics else {}
-
-        self.register_buffer("_trained_batches", torch.tensor(0), persistent=True)
-
+        self.trained_batches: int = 0
         self.batch_size = batch_size
         self.world_size = world_size
         self.oom_count = 0
@@ -229,15 +227,6 @@ class RecMetricModule(nn.Module):
             persistent=False,
         )
         self.last_compute_time = -1.0
-
-    @property
-    def trained_batches(self) -> int:
-        # .trained_batches should return an int
-        return int(self._trained_batches.item())
-
-    @trained_batches.setter
-    def trained_batches(self, value: int) -> None:
-        self._trained_batches.fill_(int(value))
 
     def _update_rec_metrics(
         self, model_out: Dict[str, torch.Tensor], **kwargs: Any
@@ -271,7 +260,7 @@ class RecMetricModule(nn.Module):
             self._update_rec_metrics(model_out, **kwargs)
             if self.throughput_metric:
                 self.throughput_metric.update()
-            self._trained_batches.add_(1)
+            self.trained_batches += 1
 
     def _adjust_compute_interval(self) -> None:
         """
