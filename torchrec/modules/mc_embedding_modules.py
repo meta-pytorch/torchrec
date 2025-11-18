@@ -12,6 +12,7 @@ from typing import cast, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from torchrec.distributed.logger import _torchrec_method_logger
 
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -125,6 +126,7 @@ class ManagedCollisionEmbeddingCollection(BaseManagedCollisionEmbeddingCollectio
 
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         embedding_collection: EmbeddingCollection,
@@ -164,6 +166,7 @@ class ManagedCollisionEmbeddingBagCollection(BaseManagedCollisionEmbeddingCollec
 
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         embedding_bag_collection: EmbeddingBagCollection,

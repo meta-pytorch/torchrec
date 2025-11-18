@@ -18,6 +18,7 @@ import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.logger import _torchrec_method_logger
 from torchrec.distributed.planner.constants import BATCH_SIZE, MAX_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.partitioners import (
@@ -498,6 +499,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             sharders,
         )
 
+    @_torchrec_method_logger()
     def plan(
         self,
         module: nn.Module,
