@@ -12,7 +12,7 @@
 import logging
 import operator
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple, Type, Union
+from typing import cast, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 
@@ -370,25 +370,33 @@ def prune_pytree_flatten_unflatten(
     # remove tree_unflatten from the in_fqns (in-coming nodes)
     for fqn in in_fqns:
         submodule, node = _get_graph_node(module, fqn)
-        assert len(node.args) == 1
-        getitem_getitem: Node = node.args[0]  # pyre-ignore[9]
+        # kt_regroup node will have either one arg or one kwarg
+        assert len(node.args) == 1 or len(node.kwargs) == 1
+        use_args = len(node.args) == 1
+
+        getitem_getitem = cast(
+            Node, node.args[0] if use_args else list(node.kwargs.values())[0]
+        )
         assert (
             getitem_getitem.op == "call_function"
             and getitem_getitem.target == operator.getitem
         )
-        tree_unflatten_getitem = node.args[0].args[0]  # pyre-ignore[16]
+        tree_unflatten_getitem = cast(Node, getitem_getitem.args[0])
         assert (
             tree_unflatten_getitem.op == "call_function"
             and tree_unflatten_getitem.target == operator.getitem
         )
-        tree_unflatten = tree_unflatten_getitem.args[0]
+        tree_unflatten = cast(Node, tree_unflatten_getitem.args[0])
         assert (
             tree_unflatten.op == "call_function"
             and tree_unflatten.target == torch.utils._pytree.tree_unflatten
         )
         logger.info(f"Removing tree_unflatten from {fqn}")
         input_nodes = tree_unflatten.args[0]
-        node.args = (input_nodes,)
+        if use_args:
+            node.args = (input_nodes,)
+        else:
+            node.kwargs = {list(node.kwargs.keys())[0]: input_nodes}
         # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
         #  `eliminate_dead_code`.
         submodule.graph.eliminate_dead_code()
