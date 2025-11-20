@@ -435,6 +435,7 @@ class TwPooledEmbeddingSharding(
             pg=self._pg,
             device=device if device is not None else self._device,
             feature_processor=feature_processor,
+            env=self._env,
         )
 
     def create_output_dist(
