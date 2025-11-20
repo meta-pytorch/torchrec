@@ -16,6 +16,7 @@ import torch
 import torchrec.optim as trec_optim
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.logger import _torchrec_method_logger
 from torchrec.distributed.planner.constants import (
     BATCHED_COPY_PERF_FACTOR,
     BIGINT_DTYPE,
@@ -955,6 +956,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
         is_inference (bool): If the model is inference model. Default to False.
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         topology: Topology,

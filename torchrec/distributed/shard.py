@@ -15,6 +15,7 @@ from torch import nn
 from torch.distributed._composable.contract import contract
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.global_settings import get_propogate_device
+from torchrec.distributed.logger import _torchrec_method_logger
 from torchrec.distributed.model_parallel import get_default_sharders
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.sharding_plan import (
@@ -146,6 +147,7 @@ def _shard(
 
 # pyre-ignore
 @contract()
+@_torchrec_method_logger()
 def shard_modules(
     module: nn.Module,
     env: Optional[ShardingEnv] = None,
@@ -194,6 +196,7 @@ def shard_modules(
     return _shard_modules(module, env, device, plan, sharders, init_params)
 
 
+@_torchrec_method_logger()
 def _shard_modules(  # noqa: C901
     module: nn.Module,
     # TODO: Consolidate to using Dict[str, ShardingEnv]

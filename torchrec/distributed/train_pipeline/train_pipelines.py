@@ -32,6 +32,7 @@ from typing import (
 import torch
 from torch.autograd.profiler import record_function
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
+from torchrec.distributed.logger import _torchrec_method_logger
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
@@ -106,6 +107,8 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         pass
 
+    # pyre-ignore [56]
+    @_torchrec_method_logger()
     def __init__(self) -> None:
         # pipeline state such as in foward, in backward etc, used in training recover scenarios
         self._state: PipelineState = PipelineState.IDLE
