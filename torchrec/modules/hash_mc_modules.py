@@ -286,6 +286,9 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 zch_size=self._zch_size,
                 frequency=self._tb_logging_frequency,
                 start_bucket=self._start_bucket,
+                num_buckets_per_rank=self._end_bucket - self._start_bucket,
+                num_reserved_slots_per_bucket=self.get_reserved_slots_per_bucket(),
+                device=self._device,
                 disable_fallback=self._disable_fallback,
             )
         else:
@@ -542,9 +545,9 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 # record the on-device remapped ids
                 self.table_name_on_device_remapped_ids_dict[name] = remapped_ids.clone()
                 lengths: torch.Tensor = feature.lengths()
+                hit_indices = remapped_ids != -1
                 if self._disable_fallback:
                     # Only works on GPU when read only is true.
-                    hit_indices = remapped_ids != -1
                     remapped_ids = remapped_ids[hit_indices]
                     lengths = torch.masked_fill(lengths, ~hit_indices, 0)
                 if self._scalar_logger is not None:
@@ -554,9 +557,9 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                         identities_1=self._hash_zch_identities,
                         values=values,
                         remapped_ids=remapped_ids,
+                        hit_indices=hit_indices,
                         evicted_emb_indices=evictions,
                         metadata=metadata,
-                        num_reserved_slots=num_reserved_slots,
                         eviction_config=self._eviction_config,
                     )
 

@@ -42,6 +42,9 @@ class ScalarLogger(torch.nn.Module):
         zch_size: int,
         frequency: int,
         start_bucket: int,
+        num_buckets_per_rank: int,
+        num_reserved_slots_per_bucket: int,
+        device: torch.device,
         disable_fallback: bool,
         log_file_path: str = "",
     ) -> None:
@@ -57,7 +60,31 @@ class ScalarLogger(torch.nn.Module):
         self._zch_size: int = zch_size
         self._frequency: int = frequency
         self._start_bucket: int = start_bucket
+        self._num_buckets_per_rank: int = num_buckets_per_rank
+        self._num_reserved_slots_per_bucket: int = num_reserved_slots_per_bucket
+        self._device: torch.device = device
         self._disable_fallback: bool = disable_fallback
+
+        assert (
+            self._zch_size % self._num_buckets_per_rank == 0
+        ), f"{self._zch_size} must be divisible by {self._num_buckets_per_rank}"
+        indice_per_bucket = torch.tensor(
+            [
+                (self._zch_size // self._num_buckets_per_rank) * bucket
+                for bucket in range(1, self._num_buckets_per_rank + 1)
+            ],
+            dtype=torch.int64,
+            device=self._device,
+        )
+
+        self._opt_in_ranges: torch.Tensor = torch.sub(
+            indice_per_bucket,
+            (
+                self._num_reserved_slots_per_bucket
+                if self._num_reserved_slots_per_bucket > 0
+                else 0
+            ),
+        )
 
         self._dtype_checked: bool = False
         self._total_cnt: int = 0
@@ -77,6 +104,13 @@ class ScalarLogger(torch.nn.Module):
             )  # initialize file handler
             self.logger.addHandler(file_handler)  # add file handler to logger
 
+        self.logger.info(
+            f"ScalarLogger: {self._name=}, {self._device=}, "
+            f"{self._zch_size=}, {self._frequency=}, {self._start_bucket=}, "
+            f"{self._num_buckets_per_rank=}, {self._num_reserved_slots_per_bucket=}, "
+            f"{self._opt_in_ranges=}, {self._disable_fallback=}"
+        )
+
     def should_report(self) -> bool:
         # We only need to report metrics from rank0 (start_bucket = 0)
 
@@ -95,9 +129,9 @@ class ScalarLogger(torch.nn.Module):
         identities_1: torch.Tensor,
         values: torch.Tensor,
         remapped_ids: torch.Tensor,
+        hit_indices: torch.Tensor,
         evicted_emb_indices: Optional[torch.Tensor],
         metadata: Optional[torch.Tensor],
-        num_reserved_slots: int,
         eviction_config: Optional[HashZchEvictionConfig] = None,
     ) -> None:
         if not self._dtype_checked:
@@ -125,9 +159,17 @@ class ScalarLogger(torch.nn.Module):
         self._hit_cnt += hit_cnt
         self._collision_cnt += values.numel() - hit_cnt - insert_cnt
 
-        opt_in_range = self._zch_size - num_reserved_slots
-        opt_in_ids = torch.lt(remapped_ids, opt_in_range)
-        self._opt_in_cnt += int(torch.sum(opt_in_ids).item())
+        if self._disable_fallback:
+            hit_values = values[hit_indices]
+            train_buckets = hit_values % self._num_buckets_per_rank
+        else:
+            train_buckets = values % self._num_buckets_per_rank
+
+        opt_in_ranges = self._opt_in_ranges.index_select(dim=0, index=train_buckets)
+        opt_in_ids = torch.lt(remapped_ids, opt_in_ranges)
+        opt_in_ids_cnt = int(torch.sum(opt_in_ids).item())
+        # opt_in_cnt: # of ids assigned to opt-in block
+        self._opt_in_cnt += opt_in_ids_cnt
 
         if evicted_emb_indices is not None and evicted_emb_indices.numel() > 0:
             deduped_evicted_indices = torch.unique(evicted_emb_indices)
