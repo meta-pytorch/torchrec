@@ -664,6 +664,52 @@ class MetricModuleTest(unittest.TestCase):
         ):
             metric_module.async_compute(concurrent.futures.Future())
 
+    def test_load_state_dict_with_trained_batches_key(self) -> None:
+        metric_module = generate_metric_module(
+            TestMetricModule,
+            metrics_config=DefaultMetricsConfig,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+        )
+        state_dict = metric_module.state_dict()
+
+        # Add the _trained_batches key to simulate old checkpoint
+        state_dict["_trained_batches"] = torch.tensor(42, dtype=torch.long)
+
+        # Load the state_dict with _trained_batches
+        # This should not raise an error
+        metric_module.load_state_dict(state_dict)
+        metric_module.update(gen_test_batch(128))
+        result = metric_module.compute()
+        self.assertIsInstance(result, dict)
+        self.assertTrue(len(result) > 0)
+
+    def test_load_state_dict_without_trained_batches_key(self) -> None:
+        metric_module = generate_metric_module(
+            TestMetricModule,
+            metrics_config=DefaultMetricsConfig,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+        )
+        state_dict = metric_module.state_dict()
+
+        # Verify the key is not in the state_dict
+        self.assertNotIn("_trained_batches", state_dict)
+
+        # Load the clean state_dict
+        # This should not raise an error
+        metric_module.load_state_dict(state_dict)
+        metric_module.update(gen_test_batch(128))
+        result = metric_module.compute()
+        self.assertIsInstance(result, dict)
+        self.assertTrue(len(result) > 0)
+
 
 def metric_module_gather_state(
     rank: int,

@@ -13,7 +13,7 @@ import abc
 import concurrent
 import logging
 import time
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from typing import Any, Dict, List, Optional, Type, TypeVar, Union
 
 import torch
@@ -227,6 +227,26 @@ class RecMetricModule(nn.Module):
             persistent=False,
         )
         self.last_compute_time = -1.0
+
+        self._register_load_state_dict_pre_hook(self.load_state_dict_hook)
+
+    def load_state_dict_hook(
+        self,
+        state_dict: OrderedDict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: Dict[str, Any],
+        strict: bool,
+        missing_keys: List[str],
+        unexpected_keys: List[str],
+        error_msgs: List[str],
+    ) -> None:
+        """Remove _trained_batches key for backward compatibility."""
+        key = f"{prefix}_trained_batches"
+        if key in state_dict:
+            state_dict.pop(key)
+            logger.warning(
+                f"Removed key '{key}' from state_dict for backward compatibility"
+            )
 
     def _update_rec_metrics(
         self, model_out: Dict[str, torch.Tensor], **kwargs: Any
