@@ -54,6 +54,7 @@ from torchrec.distributed.types import (
     ShardingEnv,
     ShardingEnv2D,
     ShardingPlan,
+    ShardingStrategy,
 )
 from torchrec.distributed.utils import (
     add_prefix_to_state_dict,
@@ -885,6 +886,7 @@ class DMPCollection(DistributedModelParallel):
         world_size: int,
         sharding_group_size: int,
         global_pg: dist.ProcessGroup,
+        sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
         node_group_size: Optional[int] = None,
         sharders: Optional[List[ModuleSharder[torch.nn.Module]]] = None,
         init_data_parallel: bool = True,
@@ -974,9 +976,11 @@ class DMPCollection(DistributedModelParallel):
         default_env = ShardingEnv2D(
             global_pg=self._pg,
             sharding_pg=self._ctxs[0].sharding_pg,
+            replica_pg=self._ctxs[0].replica_pg,
             device_mesh=self._ctxs[0].device_mesh,
             node_group_size=node_group_size,
             use_inter_host_allreduce=self._ctxs[0].use_inter_host_allreduce,
+            sharding_strategy=sharding_strategy,
         )
 
         super().__init__(  # type: ignore[misc]
@@ -1014,6 +1018,7 @@ class DMPCollection(DistributedModelParallel):
                     env = ShardingEnv2D(
                         global_pg=self._pg,
                         sharding_pg=ctx.sharding_pg,
+                        replica_pg=ctx.replica_pg,
                         device_mesh=ctx.device_mesh,
                         node_group_size=ctx.sharding_group_size,
                         use_inter_host_allreduce=ctx.use_inter_host_allreduce,
@@ -1062,15 +1067,14 @@ class DMPCollection(DistributedModelParallel):
     def _sync(
         self,
         replica_pg: dist.ProcessGroup,
-        modules_to_sync: List[nn.Module],
+        modules_to_sync: List[Tuple[nn.Module, nn.Module]],
         include_optimizer_state: bool = True,
     ) -> None:
         assert replica_pg is not None, "replica_pg is not initialized!"
         all_weights_by_dtype: dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
 
-        for emb_kernel in modules_to_sync:
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-            for w in emb_kernel.split_embedding_weights():
+        for emb_kernel, _ in modules_to_sync:
+            for w in emb_kernel.split_embedding_weights():  # pyre-ignore[29]
                 all_weights_by_dtype[w.dtype].append(w)
 
         opts = None
@@ -1085,7 +1089,7 @@ class DMPCollection(DistributedModelParallel):
             optimizer_tensors_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = (
                 defaultdict(list)
             )
-            for emb_kernel in modules_to_sync:
+            for emb_kernel, _ in modules_to_sync:
                 # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 optimizer_states = emb_kernel.get_optimizer_state()
                 for state in optimizer_states:
@@ -1267,46 +1271,49 @@ class DMPCollection(DistributedModelParallel):
         # Group leftover embedding kernels, with respect to default context
         # pyre-ignore[9]
         modules_to_skip: List[nn.Module] = [c.sharded_module for c in contexts[1:]]
-        sharded_modules: List[nn.Module] = []
+        sharded_modules: List[Tuple[nn.Module, nn.Module]] = []
 
         def _find_sharded_modules(
             module: nn.Module,
+            prev_module: nn.Module,
         ) -> None:
             if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
-                sharded_modules.append(module)
+                sharded_modules.append((module, prev_module))
             if not isinstance(
                 module, tuple(modules_to_skip)  # pyre-ignore[6]
             ) and hasattr(module, "_lookups"):
                 for lookup in module._lookups:  # pyre-ignore[29]
-                    _find_sharded_modules(lookup)
+                    _find_sharded_modules(lookup, module)
 
             for _, child in module.named_children():
-                _find_sharded_modules(child)
+                _find_sharded_modules(child, module)
 
-        _find_sharded_modules(self._dmp_wrapped_module)
+        # pyre-ignore[6]
+        _find_sharded_modules(self._dmp_wrapped_module, None)
         contexts[0].modules_to_sync = sharded_modules
 
     def _group_sharded_module(
         self,
         sharded_module: nn.Module,
-    ) -> List[nn.Module]:
+    ) -> List[Tuple[nn.Module, nn.Module]]:
         # Traverse module and find all sharded module kernels matching the sharded module
         # Post init DMP, save the embedding kernels
-        sharded_modules: List[nn.Module] = []
+        sharded_modules: List[Tuple[nn.Module, nn.Module]] = []
 
         def _find_sharded_modules(
             module: nn.Module,
+            prev_module: nn.Module,
         ) -> None:
             if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
-                sharded_modules.append(module)
+                sharded_modules.append((module, prev_module))
             if isinstance(module, sharded_module):  # pyre-ignore[6]
                 for lookup in module._lookups:  # pyre-ignore[29]
-                    _find_sharded_modules(lookup)
+                    _find_sharded_modules(lookup, module)
 
             for _, child in module.named_children():
-                _find_sharded_modules(child)
+                _find_sharded_modules(child, module)
 
-        _find_sharded_modules(self._dmp_wrapped_module)
+        _find_sharded_modules(self._dmp_wrapped_module, None)
         return sharded_modules
 
     @property
