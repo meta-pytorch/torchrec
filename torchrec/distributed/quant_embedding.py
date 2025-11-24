@@ -343,6 +343,7 @@ def _construct_jagged_tensors_tw(
     return ret
 
 
+@torch.fx.wrap
 def _fx_marker_construct_jagged_tensor(
     values: torch.Tensor,
     lengths: torch.Tensor,
