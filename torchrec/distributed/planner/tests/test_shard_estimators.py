@@ -141,6 +141,7 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.000654920154856466,
                     bwd_comms=6.357828776041667e-05,
+                    input_dist_comms=1.2715657552083334e-05,
                 )
             ],
             ("fused_uvm", "table_wise"): [
@@ -149,6 +150,7 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.18358230590820312,
                     bwd_comms=6.357828776041667e-05,
+                    input_dist_comms=1.2715657552083334e-05,
                 )
             ],
             ("fused_uvm_caching", "table_wise"): [
@@ -157,6 +159,7 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.02865675019054878,
                     bwd_comms=6.357828776041667e-05,
+                    input_dist_comms=1.2715657552083334e-05,
                 )
             ],
             ("fused", "column_wise"): [
@@ -165,6 +168,7 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.000654920154856466,
                     bwd_comms=6.357828776041667e-05,
+                    input_dist_comms=1.2715657552083334e-05,
                 )
             ],
             ("fused_uvm", "column_wise"): [
@@ -173,6 +177,7 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.18358230590820312,
                     bwd_comms=6.357828776041667e-05,
+                    input_dist_comms=1.2715657552083334e-05,
                 )
             ],
             ("fused_uvm_caching", "column_wise"): [
@@ -181,6 +186,7 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.02865675019054878,
                     bwd_comms=6.357828776041667e-05,
+                    input_dist_comms=1.2715657552083334e-05,
                 )
             ],
             ("fused", "table_column_wise"): [
@@ -189,6 +195,7 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.000654920154856466,
                     bwd_comms=6.357828776041667e-05,
+                    input_dist_comms=1.2715657552083334e-05,
                 )
             ],
             ("fused_uvm", "table_column_wise"): [
@@ -197,6 +204,7 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.18358230590820312,
                     bwd_comms=6.357828776041667e-05,
+                    input_dist_comms=1.2715657552083334e-05,
                 )
             ],
             ("fused_uvm_caching", "table_column_wise"): [
@@ -205,6 +213,7 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.02865675019054878,
                     bwd_comms=6.357828776041667e-05,
+                    input_dist_comms=1.2715657552083334e-05,
                 )
             ],
             ("fused", "row_wise"): [
@@ -213,12 +222,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
                 Perf(
                     fwd_compute=6.804365245261984e-05,
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
             ],
             ("fused_uvm", "row_wise"): [
@@ -227,12 +238,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.029329458872477215,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
                 Perf(
                     fwd_compute=0.019073486328125,
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.029329458872477215,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
             ],
             ("fused_uvm_caching", "row_wise"): [
@@ -241,12 +254,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004631910866838161,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
                 Perf(
                     fwd_compute=0.0029773246951219513,
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004631910866838161,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
             ],
             ("fused", "table_row_wise"): [
@@ -255,12 +270,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
                 Perf(
                     fwd_compute=6.804365245261984e-05,
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
             ],
             ("fused_uvm", "table_row_wise"): [
@@ -269,12 +286,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.029329458872477215,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
                 Perf(
                     fwd_compute=0.019073486328125,
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.029329458872477215,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
             ],
             ("fused_uvm_caching", "table_row_wise"): [
@@ -283,12 +302,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004631910866838161,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
                 Perf(
                     fwd_compute=0.0029773246951219513,
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004631910866838161,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
             ],
             # grid_shard is the same as table_row_wise
@@ -298,12 +319,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
                 Perf(
                     fwd_compute=6.804365245261984e-05,
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
             ],
             ("fused_uvm", "grid_shard"): [
@@ -312,12 +335,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.029329458872477215,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
                 Perf(
                     fwd_compute=0.019073486328125,
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.029329458872477215,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
             ],
             ("fused_uvm_caching", "grid_shard"): [
@@ -326,12 +351,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004631910866838161,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
                 Perf(
                     fwd_compute=0.0029773246951219513,
                     fwd_comms=6.357828776041667e-05,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004631910866838161,
+                    input_dist_comms=1.2715657552083334e-05,
                 ),
             ],
         }
@@ -860,6 +887,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     bwd_compute=0.000654920154856466,
                     bwd_comms=6.357828776041667e-05
                     * 2,  # bw is set to half in this test
+                    input_dist_comms=2.5431315104166668e-05,
                 )
             ],
             ("fused_uvm", "table_wise"): [
@@ -868,6 +896,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.18358230590820312,
                     bwd_comms=6.357828776041667e-05 * 2,
+                    input_dist_comms=2.5431315104166668e-05,
                 )
             ],
             ("fused_uvm_caching", "table_wise"): [
@@ -876,6 +905,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.02865675019054878,
                     bwd_comms=6.357828776041667e-05 * 2,
+                    input_dist_comms=2.5431315104166668e-05,
                 )
             ],
             ("fused", "column_wise"): [
@@ -884,6 +914,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.000654920154856466,
                     bwd_comms=6.357828776041667e-05 * 2,
+                    input_dist_comms=2.5431315104166668e-05,
                 )
             ],
             ("fused_uvm", "column_wise"): [
@@ -892,6 +923,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.18358230590820312,
                     bwd_comms=6.357828776041667e-05 * 2,
+                    input_dist_comms=2.5431315104166668e-05,
                 )
             ],
             ("fused_uvm_caching", "column_wise"): [
@@ -900,6 +932,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.02865675019054878,
                     bwd_comms=6.357828776041667e-05 * 2,
+                    input_dist_comms=2.5431315104166668e-05,
                 )
             ],
             ("fused", "table_column_wise"): [
@@ -908,6 +941,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.000654920154856466,
                     bwd_comms=6.357828776041667e-05 * 2,
+                    input_dist_comms=2.5431315104166668e-05,
                 )
             ],
             ("fused_uvm", "table_column_wise"): [
@@ -916,6 +950,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.18358230590820312,
                     bwd_comms=6.357828776041667e-05 * 2,
+                    input_dist_comms=2.5431315104166668e-05,
                 )
             ],
             ("fused_uvm_caching", "table_column_wise"): [
@@ -924,6 +959,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.02865675019054878,
                     bwd_comms=6.357828776041667e-05 * 2,
+                    input_dist_comms=2.5431315104166668e-05,
                 )
             ],
             ("fused", "row_wise"): [
@@ -932,12 +968,14 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
                 Perf(
                     fwd_compute=6.804365245261984e-05,
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
             ],
             ("fused_uvm", "row_wise"): [
@@ -946,12 +984,14 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.02939303716023763,  # 0.029329458872477215 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
                 Perf(
                     fwd_compute=0.019073486328125,
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.02939303716023763,  # 0.029329458872477215 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
             ],
             ("fused_uvm_caching", "row_wise"): [
@@ -960,12 +1000,14 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004695489154598577,  # 0.004631910866838161 + 6.357828776041667e-05
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
                 Perf(
                     fwd_compute=0.0029773246951219513,
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004695489154598577,  # 0.004631910866838161 + 6.357828776041667e-05
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
             ],
             ("fused", "table_row_wise"): [
@@ -974,12 +1016,14 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
                 Perf(
                     fwd_compute=6.804365245261984e-05,
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
             ],
             ("fused_uvm", "table_row_wise"): [
@@ -988,12 +1032,14 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.02939303716023763,  # 0.029329458872477215 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
                 Perf(
                     fwd_compute=0.019073486328125,
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.02939303716023763,  # 0.029329458872477215 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
             ],
             ("fused_uvm_caching", "table_row_wise"): [
@@ -1002,12 +1048,14 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004695489154598577,  # 0.004631910866838161 + 6.357828776041667e-05
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
                 Perf(
                     fwd_compute=0.0029773246951219513,
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004695489154598577,  # 0.004631910866838161 + 6.357828776041667e-05
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
             ],
             # grid_shard is the same as table_row_wise
@@ -1017,12 +1065,14 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
                 Perf(
                     fwd_compute=6.804365245261984e-05,
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0001360873049052397,
                     bwd_comms=0.00016798276699240525 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
             ],
             ("fused_uvm", "grid_shard"): [
@@ -1031,12 +1081,14 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.02939303716023763,  # 0.029329458872477215 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
                 Perf(
                     fwd_compute=0.019073486328125,
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.03814697265625,
                     bwd_comms=0.02939303716023763,  # 0.029329458872477215 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
             ],
             ("fused_uvm_caching", "grid_shard"): [
@@ -1045,12 +1097,14 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004695489154598577,  # 0.004631910866838161 + 6.357828776041667e-05,
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
                 Perf(
                     fwd_compute=0.0029773246951219513,
                     fwd_comms=6.357828776041667e-05 * 2,
                     bwd_compute=0.0059546493902439025,
                     bwd_comms=0.004695489154598577,  # 0.004631910866838161 + 6.357828776041667e-05
+                    input_dist_comms=2.5431315104166668e-05,
                 ),
             ],
         }
@@ -1070,6 +1124,7 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
             ): [shard.perf for shard in sharding_option.shards]
             for sharding_option in sharding_options2
         }
+
         self.assertEqual(expected_perfs, perfs)
         self.assertEqual(expected_perfs, perfs2)
 
