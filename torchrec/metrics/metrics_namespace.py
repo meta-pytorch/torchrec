@@ -93,6 +93,10 @@ class MetricName(MetricNameBase):
     NMSE = "nmse"
     NRMSE = "nrmse"
 
+    NUM_POSITIVE_SAMPLES = "num_positive_samples"
+    SUM_WEIGHTS = "sum_weights"
+    NUM_MISSING_LABELS = "num_missing_labels"
+
 
 class MetricNamespaceBase(StrValueMixin, Enum):
     pass
@@ -152,6 +156,10 @@ class MetricNamespace(MetricNamespaceBase):
     EFFECTIVE_RATE = "effective_rate"
 
     NMSE = "nmse"
+
+    NUM_POSITIVE_SAMPLES = "num_positive_samples"
+    SUM_WEIGHTS = "sum_weights"
+    NUM_MISSING_LABELS = "num_missing_labels"
 
 
 class MetricPrefix(StrValueMixin, Enum):
