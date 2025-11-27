@@ -55,6 +55,7 @@ from torchrec.distributed.fused_params import (
     FUSED_PARAM_IS_SSD_TABLE,
     FUSED_PARAM_SSD_TABLE_LIST,
 )
+from torchrec.distributed.logger import _torchrec_method_logger
 from torchrec.distributed.sharding.cw_sharding import CwPooledEmbeddingSharding
 from torchrec.distributed.sharding.dp_sharding import DpPooledEmbeddingSharding
 from torchrec.distributed.sharding.dynamic_sharding import (
@@ -466,6 +467,7 @@ class ShardedEmbeddingBagCollection(
     This is part of the public API to allow for manual data dist pipelining.
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         module: EmbeddingBagCollectionInterface,
@@ -2021,6 +2023,7 @@ class ShardedEmbeddingBag(
     This is part of the public API to allow for manual data dist pipelining.
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         module: nn.EmbeddingBag,
