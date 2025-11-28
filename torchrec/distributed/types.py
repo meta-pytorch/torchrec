@@ -921,6 +921,16 @@ class ShardingEnv:
         return cls(world_size, rank, None)
 
 
+class ShardingStrategy(Enum):
+    """
+    Sharding strategy for DMPCollection.
+    """
+
+    DEFAULT = "default"
+    PER_MODULE = "per_module"
+    FULLY_SHARDED = "fully_sharded"
+
+
 class ShardingEnv2D(ShardingEnv):
     """
     Creates a sharding environment for 2D parallelism, enables usage of 2D parallelism in sharding
@@ -945,10 +955,12 @@ class ShardingEnv2D(ShardingEnv):
     def __init__(
         self,
         sharding_pg: dist.ProcessGroup,
+        replica_pg: dist.ProcessGroup,
         global_pg: dist.ProcessGroup,
         device_mesh: DeviceMesh,
         node_group_size: Optional[int] = None,
         use_inter_host_allreduce: bool = False,
+        sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
     ) -> None:
         assert device_mesh.ndim == 2, "DeviceMesh must be two dimensional!"
         self.world_size: int = dist.get_world_size(sharding_pg)
@@ -959,10 +971,12 @@ class ShardingEnv2D(ShardingEnv):
             global_pg  # to keep consistent naming between ShardingEnv and ShardingEnv2D
         )
         self.sharding_pg: dist.ProcessGroup = sharding_pg
+        self.replica_pg: dist.ProcessGroup = replica_pg
         self.device_mesh: DeviceMesh = device_mesh
         self.node_group_size: Optional[int] = node_group_size
         self.output_dtensor: bool = True
         self.use_inter_host_allreduce: bool = use_inter_host_allreduce
+        self.sharding_strategy: ShardingStrategy = sharding_strategy
 
     def num_sharding_groups(self) -> int:
         """
@@ -1396,5 +1410,7 @@ class DMPCollectionContext(DMPCollectionConfig):
     device_mesh: "DeviceMesh" = field(init=False)
     sharding_pg: "dist.ProcessGroup" = field(init=False)
     replica_pg: "dist.ProcessGroup" = field(init=False)
-    modules_to_sync: List[nn.Module] = field(init=False, default_factory=list)
+    modules_to_sync: List[Tuple[nn.Module, nn.Module]] = field(
+        init=False, default_factory=list
+    )
     sharded_module: Optional[nn.Module] = field(init=False, default=None)

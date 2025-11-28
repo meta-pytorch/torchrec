@@ -407,6 +407,7 @@ class EmbeddingBagCollectionAwaitable(
         embedding_names: List[str],
         module_fqn: Optional[str] = None,
         sharding_types: Optional[List[str]] = None,
+        resize_awaitables: Optional[List[Awaitable[torch.Tensor]]] = None,
     ) -> None:
         super().__init__()
         self._awaitables = awaitables
@@ -414,6 +415,7 @@ class EmbeddingBagCollectionAwaitable(
         self._embedding_names = embedding_names
         self._module_fqn = module_fqn
         self._sharding_types = sharding_types
+        self._resize_awaitables = resize_awaitables
 
     def _wait_impl(self) -> KeyedTensor:
         embeddings = []
@@ -424,6 +426,12 @@ class EmbeddingBagCollectionAwaitable(
                 self._sharding_types[i] if self._sharding_types else None,
             ):
                 embeddings.append(w.wait())
+
+        # free memory and resize
+        if self._resize_awaitables is not None:
+            # pyre-ignore[16]
+            for awaitable in self._resize_awaitables:
+                awaitable.wait()
 
         return construct_output_kt(
             embeddings=embeddings,
@@ -1655,6 +1663,7 @@ class ShardedEmbeddingBagCollection(
         """
         batch_size_per_feature_pre_a2a = []
         awaitables = []
+        resize_awaitables = []
 
         # No usage of zip for dynamo
         for i in range(len(self._lookups)):
@@ -1669,7 +1678,11 @@ class ShardedEmbeddingBagCollection(
                 self._module_fqn,
                 sharding_type,
             ):
+                # with fully sharded 2D enabled, it returns an awaitable for the reduce scatter and resize operation
                 embs = lookup(features)
+                if hasattr(lookup, "get_resize_awaitables"):
+                    # pyre-ignore[29]
+                    resize_awaitables.extend(lookup.get_resize_awaitables())
                 if self.post_lookup_tracker_fn is not None:
                     self.post_lookup_tracker_fn(features, embs, self, None)
 
@@ -1710,6 +1723,7 @@ class ShardedEmbeddingBagCollection(
                 embedding_names=self._embedding_names,
                 module_fqn=self._module_fqn,
                 sharding_types=self._sharding_types,
+                resize_awaitables=resize_awaitables,
             )
 
         # register callback if there are features that need mean pooling

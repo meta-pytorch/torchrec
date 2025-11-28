@@ -678,6 +678,7 @@ class RwPooledEmbeddingSharding(
             device=device if device is not None else self._device,
             feature_processor=feature_processor,
             sharding_type=ShardingType.ROW_WISE,
+            env=self._env,
         )
 
     def create_output_dist(
