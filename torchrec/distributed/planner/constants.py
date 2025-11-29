@@ -42,6 +42,9 @@ WEIGHTED_FEATURE_BWD_COMPUTE_MULTIPLIER: float = 1  # empirical studies
 WEIGHTED_KERNEL_MULTIPLIER: float = 1.1  # empirical studies
 DP_ELEMENTWISE_KERNELS_PERF_FACTOR: float = 9.22  # empirical studies
 
+# TODO: This can be hardware dependent, need more empirical results to verify
+A2A_INVERSE_BANDWITH_COEFFICIENT: float = 1  # empirical studies
+
 
 def kernel_bw_lookup(
     compute_device: str,
