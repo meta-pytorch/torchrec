@@ -2825,11 +2825,15 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             logger.warning(
                 "Trying to non-strict torch.export KJT to_dict, which is extremely slow and not recommended!"
             )
+        length_per_key = self.length_per_key()
+        if isinstance(length_per_key, torch.Tensor):
+            # length_per_key should be a list of ints, but in some (incorrect) cases it is a tensor
+            length_per_key = length_per_key.tolist()
         _jt_dict = _maybe_compute_kjt_to_jt_dict(
             stride=self.stride(),
             stride_per_key=self.stride_per_key(),
             keys=self.keys(),
-            length_per_key=self.length_per_key(),
+            length_per_key=length_per_key,
             lengths=self.lengths(),
             values=self.values(),
             variable_stride_per_key=self.variable_stride_per_key(),
