@@ -117,6 +117,9 @@ MODEL_METRIC_LABEL: str = "model"
 
 
 MetricValue = Union[torch.Tensor, float]
+MetricsResult = Dict[str, MetricValue]
+MetricsFuture = concurrent.futures.Future[MetricsResult]
+MetricsOutput = Union[MetricsResult, MetricsFuture]
 
 
 class StateMetric(abc.ABC):
@@ -125,7 +128,7 @@ class StateMetric(abc.ABC):
     """
 
     @abc.abstractmethod
-    def get_metrics(self) -> Dict[str, MetricValue]:
+    def get_metrics(self) -> MetricsResult:
         pass
 
 
@@ -189,6 +192,7 @@ class RecMetricModule(nn.Module):
         self,
         batch_size: int,
         world_size: int,
+        device: torch.device,
         rec_tasks: Optional[List[RecTaskInfo]] = None,
         rec_metrics: Optional[RecMetricList] = None,
         throughput_metric: Optional[ThroughputMetric] = None,
@@ -205,6 +209,7 @@ class RecMetricModule(nn.Module):
         self.trained_batches: int = 0
         self.batch_size = batch_size
         self.world_size = world_size
+        self.device = device
         self.oom_count = 0
         self.compute_count = 0
 
@@ -335,12 +340,12 @@ class RecMetricModule(nn.Module):
     def should_compute(self) -> bool:
         return self.trained_batches % self.compute_interval_steps == 0
 
-    def compute(self) -> Dict[str, MetricValue]:
+    def compute(self) -> MetricsResult:
         r"""compute() is called when the global metrics are required, usually
         right before logging the metrics results to the data sink.
         """
         self.compute_count += 1
-        ret: Dict[str, MetricValue] = {}
+        ret: MetricsResult = {}
         with record_function("## RecMetricModule:compute ##"):
             if self.rec_metrics:
                 self._adjust_compute_interval()
@@ -357,11 +362,11 @@ class RecMetricModule(nn.Module):
                     )
         return ret
 
-    def local_compute(self) -> Dict[str, MetricValue]:
+    def local_compute(self) -> MetricsResult:
         r"""local_compute() is called when per-trainer metrics are required. It's
         can be used for debugging. Currently only rec_metrics is supported.
         """
-        ret: Dict[str, MetricValue] = {}
+        ret: MetricsResult = {}
         if self.rec_metrics:
             ret.update(self.rec_metrics.local_compute())
         return ret
@@ -512,9 +517,7 @@ class RecMetricModule(nn.Module):
     def shutdown(self) -> None:
         logger.info("Initiating graceful shutdown...")
 
-    def async_compute(
-        self, future: concurrent.futures.Future[Dict[str, MetricValue]]
-    ) -> None:
+    def async_compute(self) -> MetricsFuture:
         raise RecMetricException("async_compute is not supported in RecMetricModule")
 
 
@@ -630,6 +633,7 @@ def generate_metric_module(
     metrics = metric_class(
         batch_size=batch_size,
         world_size=world_size,
+        device=device,
         rec_tasks=metrics_config.rec_tasks,
         rec_metrics=rec_metrics,
         throughput_metric=throughput_metric,

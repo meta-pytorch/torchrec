@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# pyre-strict
+
+"""
+Tests for metrics_output_util - utilities for handling MetricsOutput (dict or Future).
+
+These tests focus on our utility functions' behavior, not on testing Python's
+concurrent.futures module which is already well-tested.
+"""
+
+import unittest
+from concurrent.futures import Future
+from typing import Callable
+
+import torch
+from torchrec.metrics.metric_module import MetricsFuture, MetricsResult
+from torchrec.metrics.metrics_output_util import get_metrics_sync, on_metrics_ready
+
+
+class OnMetricsReadyTest(unittest.TestCase):
+    """Tests that on_metrics_ready correctly dispatches between sync/async paths."""
+
+    def setUp(self) -> None:
+        self.metrics: MetricsResult = {"loss": torch.tensor(0.5)}
+        self.received_metrics: MetricsResult | None = None
+        self.received_error: Exception | None = None
+
+    def _callback(self, metrics: MetricsResult) -> None:
+        self.received_metrics = metrics
+
+    def _error_handler(self, error: Exception) -> None:
+        self.received_error = error
+
+    def test_synchronous_dict_path(self) -> None:
+        result = on_metrics_ready(self.metrics, self._callback)
+
+        self.assertIsNone(result)
+        self.assertIs(self.received_metrics, self.metrics)
+
+    def test_synchronous_dict_returns_callback_value(self) -> None:
+        result = on_metrics_ready(self.metrics, lambda metrics: "success")
+        self.assertEqual(result, "success")
+
+    def test_asynchronous_future_path(self) -> None:
+        future: MetricsFuture = Future()
+
+        on_metrics_ready(future, self._callback)
+        self.assertIsNone(self.received_metrics)
+
+        future.set_result(self.metrics)
+        self.assertEqual(self.received_metrics, self.metrics)
+
+    def test_error_handler_receives_callback_exceptions(self) -> None:
+        """Error handler receives exceptions raised by callbacks."""
+        future: MetricsFuture = Future()
+
+        def failing_callback(metrics: MetricsResult) -> None:
+            raise ValueError("callback failed")
+
+        on_metrics_ready(future, failing_callback, on_error=self._error_handler)
+        future.set_result(self.metrics)
+
+        self.assertIsInstance(self.received_error, ValueError)
+
+    def test_error_handler_receives_future_exceptions(self) -> None:
+        """Error handler receives exceptions from Future resolution."""
+        future: MetricsFuture = Future()
+
+        on_metrics_ready(future, self._callback, on_error=self._error_handler)
+        future.set_exception(RuntimeError("computation failed"))
+
+        self.assertIsInstance(self.received_error, RuntimeError)
+
+
+class GetMetricsSyncTest(unittest.TestCase):
+    """Tests that get_metrics_sync correctly handles both dict and Future inputs."""
+
+    def setUp(self) -> None:
+        self.metrics: MetricsResult = {"loss": torch.tensor(0.5)}
+
+    def test_dict_returns_immediately(self) -> None:
+        result = get_metrics_sync(self.metrics)
+        self.assertEqual(result, self.metrics)
+
+    def test_future_blocks_until_resolved(self) -> None:
+        future: MetricsFuture = Future()
+        future.set_result(self.metrics)
+
+        result = get_metrics_sync(future)
+        self.assertEqual(result, self.metrics)
+
+    def test_future_exception_propagates(self) -> None:
+        """Exceptions from Future are propagated to caller."""
+        future: MetricsFuture = Future()
+        future.set_exception(RuntimeError("failed"))
+
+        with self.assertRaises(RuntimeError):
+            get_metrics_sync(future)
+
+    def test_timeout_raises_timeout_error(self) -> None:
+        """Timeout on unresolved Future raises TimeoutError."""
+        future: MetricsFuture = Future()
+
+        with self.assertRaises(TimeoutError):
+            get_metrics_sync(future, timeout=0.001)
+
+
+class MultipleCallbacksTest(unittest.TestCase):
+    """Tests that multiple callbacks can be attached and all execute correctly."""
+
+    def setUp(self) -> None:
+        self.sample_data: MetricsResult = {
+            "metric_a": torch.tensor(1.0),
+            "metric_b": torch.tensor(2.0),
+        }
+        self.callback_executions: dict[str, bool] = {
+            "callback_1": False,
+            "callback_2": False,
+            "callback_3": False,
+        }
+        self.extracted_value: float | None = None
+
+    def _make_tracking_callback(self, name: str) -> Callable[[MetricsResult], None]:
+        """Factory for callbacks that track execution."""
+
+        def callback(metrics: MetricsResult) -> None:
+            self.callback_executions[name] = True
+
+        return callback
+
+    def _value_extraction_callback(self, metrics: MetricsResult) -> None:
+        """Callback that extracts a value from metrics."""
+        metric = metrics.get("metric_a")
+        if isinstance(metric, torch.Tensor):
+            self.extracted_value = metric.item()
+
+    def test_multiple_callbacks_on_future(self) -> None:
+        """Multiple callbacks attached to same Future all execute when resolved."""
+        future: Future[MetricsResult] = Future()
+
+        # Attach multiple callbacks to the same Future
+        on_metrics_ready(future, self._make_tracking_callback("callback_1"))
+        on_metrics_ready(future, self._make_tracking_callback("callback_2"))
+        on_metrics_ready(future, self._make_tracking_callback("callback_3"))
+        on_metrics_ready(future, self._value_extraction_callback)
+
+        # Verify no callbacks executed yet
+        self.assertEqual(
+            self.callback_executions,
+            {"callback_1": False, "callback_2": False, "callback_3": False},
+        )
+        self.assertIsNone(self.extracted_value)
+
+        # Resolve the Future
+        future.set_result(self.sample_data)
+
+        # Verify all callbacks executed
+        self.assertEqual(
+            self.callback_executions,
+            {"callback_1": True, "callback_2": True, "callback_3": True},
+        )
+        self.assertIsNotNone(self.extracted_value)
+        self.assertAlmostEqual(self.extracted_value, 1.0, places=5)
+
+    def test_multiple_callbacks_on_dict(self) -> None:
+        """Multiple callbacks with dict input all execute immediately."""
+        on_metrics_ready(self.sample_data, self._make_tracking_callback("callback_1"))
+        on_metrics_ready(self.sample_data, self._make_tracking_callback("callback_2"))
+        on_metrics_ready(self.sample_data, self._value_extraction_callback)
+
+        # Verify all callbacks executed immediately
+        self.assertEqual(
+            self.callback_executions,
+            {"callback_1": True, "callback_2": True, "callback_3": False},
+        )
+        self.assertIsNotNone(self.extracted_value)
+        self.assertAlmostEqual(self.extracted_value, 1.0, places=5)
