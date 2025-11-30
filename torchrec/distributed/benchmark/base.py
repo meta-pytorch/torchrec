@@ -75,7 +75,7 @@ DLRM_NUM_EMBEDDINGS_PER_FEATURE = [
 ]
 
 EMBEDDING_DIM: int = 128
-MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT = 100_000
+MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT = 1_000_000
 
 
 class CompileMode(Enum):
@@ -89,6 +89,8 @@ class GPUMemoryStats:
     malloc_retries: int
     max_mem_allocated_mbs: int
     max_mem_reserved_mbs: int
+    free_mbs: int
+    total_mbs: int
 
     @classmethod
     def for_device(cls, rank: int) -> "GPUMemoryStats":
@@ -96,15 +98,24 @@ class GPUMemoryStats:
         alloc_retries = stats.get("num_alloc_retries", 0)
         max_allocated = stats.get("allocated_bytes.all.peak", 0)
         max_reserved = stats.get("reserved_bytes.all.peak", 0)
+
+        free, total = torch.cuda.mem_get_info(rank)
         return cls(
             rank,
             alloc_retries,
             max_allocated // 1024 // 1024,
             max_reserved // 1024 // 1024,
+            free // 1024 // 1024,
+            total // 1024 // 1024,
         )
 
     def __str__(self) -> str:
-        return f"Rank {self.rank}: retries={self.malloc_retries}, allocated={self.max_mem_allocated_mbs:7}mb, reserved={self.max_mem_reserved_mbs:7}mb"
+        return (
+            f"GPUMemoryStats: Rank {self.rank}: retries={self.malloc_retries}, "
+            + f"allocated={self.max_mem_allocated_mbs:6}mb, reserved={self.max_mem_reserved_mbs:6}mb, "
+            + f"free={self.free_mbs:6}mb, total={self.total_mbs:6}mb, used={self.total_mbs - self.free_mbs:6}mb"
+            + f"overhead={self.total_mbs - self.free_mbs - self.max_mem_reserved_mbs:6}mb"
+        )
 
 
 @dataclass
@@ -136,21 +147,55 @@ class BenchmarkResult:
 
     def __str__(self) -> str:
         gpu_runtime = (
-            f"GPU Runtime (P90): {self.runtime_percentile(90, device='gpu'):.2f} ms"
+            "GPU Runtime (P90)",
+            f"{self.runtime_percentile(90, device='gpu'):.2f} ms",
         )
         cpu_runtime = (
-            f"CPU Runtime (P90): {self.runtime_percentile(90, device='cpu'):.2f} ms"
+            "CPU Runtime (P90)",
+            f"{self.runtime_percentile(90, device='cpu'):.2f} ms",
         )
-        cpu_mem = f"CPU Peak RSS (P90): {self.cpu_mem_percentile(90)/1000:.2f} GB"
+        cpu_mem = "CPU Peak RSS (P90)", f"{self.cpu_mem_percentile(90)/1000:.2f} GB"
 
-        if len(self.gpu_mem_stats) == 0:
-            return (
-                f"{self.short_name: <{35}} |  {gpu_runtime} | {cpu_runtime} | {cpu_mem}"
+        short_name_length = 35
+
+        if len(self.gpu_mem_stats) > 0:
+            mem_used = (
+                "GPU Mem used (P90)",
+                f"{self.device_mem_used(90)/1000:.2f} GB",
             )
-        mem_alloc = f"GPU Peak Memory alloc (P90): {self.max_mem_alloc_percentile(90)/1000:.2f} GB"
-        mem_reserved = f"GPU Peak Memory reserved (P90): {self.max_mem_reserved_percentile(90)/1000:.2f} GB"
-        malloc_retries = f"Malloc retries (P50/P90/P100): {self.mem_retries(50)} / {self.mem_retries(90)} / {self.mem_retries(100)}"
-        return f"{self.short_name: <{35}} | {malloc_retries} | {gpu_runtime} | {cpu_runtime} | {mem_alloc} | {mem_reserved} | {cpu_mem}"
+            mem_alloc = (
+                "GPU Peak Mem alloc (P90)",
+                f"{self.max_mem_alloc_percentile(90)/1000:.2f} GB",
+            )
+            mem_reserved = (
+                "GPU Peak Mem reserved (P90)",
+                f"{self.max_mem_reserved_percentile(90)/1000:.2f} GB",
+            )
+            malloc_retries = (
+                "Malloc retries (P50/P90/P100)",
+                f"{self.mem_retries(50)} / {self.mem_retries(90)} / {self.mem_retries(100)}",
+            )
+        else:
+            mem_used = mem_alloc = mem_reserved = malloc_retries = ("", "")
+        head = "|short name" + " " * (short_name_length - len("short name")) + "|"
+        split = "|--|"
+        content = f"|{self.short_name: <{35}}|"
+        for h, c in [
+            gpu_runtime,
+            cpu_runtime,
+            mem_alloc,
+            mem_reserved,
+            mem_used,
+            malloc_retries,
+            cpu_mem,
+        ]:
+            if len(h) == 0:
+                continue
+            length = max(len(h), len(c))
+            head += f"{h: <{length}}|"
+            split += "-" * 2 + "|"
+            content += f"{c: <{length}}|"
+        return head + "\n" + split + "\n" + content + "\n"
 
     def runtime_percentile(
         self,
@@ -170,6 +215,13 @@ class BenchmarkResult:
             timings,
             percentile / 100.0,
             interpolation=interpolation,
+        )
+
+    def device_mem_used(
+        self, percentile: int = 50, interpolation: str = "nearest"
+    ) -> torch.Tensor:
+        return self._mem_percentile(
+            lambda m: m.total_mbs - m.free_mbs, percentile, interpolation
         )
 
     def max_mem_alloc_percentile(
@@ -310,7 +362,9 @@ def multi_process_benchmark(
         short_name=benchmark_res_per_rank[0].short_name,
         gpu_elapsed_time=benchmark_res_per_rank[0].gpu_elapsed_time,
         cpu_elapsed_time=benchmark_res_per_rank[0].cpu_elapsed_time,
-        gpu_mem_stats=[GPUMemoryStats(rank, 0, 0, 0) for rank in range(world_size)],
+        gpu_mem_stats=[
+            GPUMemoryStats(rank, 0, 0, 0, 0, 0) for rank in range(world_size)
+        ],
         cpu_mem_stats=[CPUMemoryStats(rank, 0) for rank in range(world_size)],
         rank=0,
     )
@@ -688,10 +742,15 @@ def _run_benchmark_core(
             cpu_times_active_ns.append(cpu_end_active_ns - cpu_start_active_ns)
 
         # Convert to milliseconds and drop the first iteration
+
         cpu_elapsed_time = (
             torch.tensor([t / 1e6 for t in cpu_times_active_ns[1:]], dtype=torch.float)
-            if num_benchmarks >= 2
-            else torch.zeros(1, dtype=torch.float)
+            if num_benchmarks >= 5  # count from 2nd iteration to remove outliers
+            else (
+                torch.tensor([t / 1e6 for t in cpu_times_active_ns], dtype=torch.float)
+                if num_benchmarks > 0
+                else torch.zeros(1, dtype=torch.float)
+            )
         )
 
         # Make sure all kernels are finished before reading timers / stats
@@ -705,8 +764,14 @@ def _run_benchmark_core(
             torch.tensor(
                 [s.elapsed_time(e) for s, e in zip(start_events[1:], end_events[1:])]
             )
-            if num_benchmarks >= 2
-            else torch.zeros(1, dtype=torch.float)
+            if num_benchmarks >= 5  # count from 2nd iteration to remove outliers
+            else (
+                torch.tensor(
+                    [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
+                )
+                if num_benchmarks > 0
+                else torch.zeros(1, dtype=torch.float)
+            )
         )
     else:
         # For CPU-only benchmarks we fall back to wall-clock timing via ``timeit``.
