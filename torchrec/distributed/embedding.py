@@ -343,6 +343,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         module_fqn: Optional[str] = None,
         sharding_types: Optional[List[str]] = None,
         use_gather_select: bool = False,
+        resize_awaitables: Optional[List[Awaitable[torch.Tensor]]] = None,
     ) -> None:
         super().__init__()
         self._awaitables_per_sharding = awaitables_per_sharding
@@ -354,6 +355,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         self._module_fqn = module_fqn
         self._sharding_types = sharding_types
         self._use_gather_select = use_gather_select
+        self._resize_awaitables = resize_awaitables
 
     def _wait_impl(self) -> Dict[str, JaggedTensor]:
         jt_dict: Dict[str, JaggedTensor] = {}
@@ -398,6 +400,13 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                     use_gather_select=self._use_gather_select,
                 )
             )
+
+        # free memory and resize
+        if self._resize_awaitables:
+            # pyre-ignore[16]
+            for awaitable in self._resize_awaitables:
+                awaitable.wait()
+
         return jt_dict
 
 
@@ -1588,6 +1597,8 @@ class ShardedEmbeddingCollection(
     ) -> LazyAwaitable[Dict[str, JaggedTensor]]:
         awaitables_per_sharding: List[Awaitable[torch.Tensor]] = []
         features_before_all2all_per_sharding: List[KeyedJaggedTensor] = []
+        resize_awaitables = []
+
         for lookup, odist, features, sharding_ctx, sharding_type in zip(
             self._lookups,
             self._output_dists,
@@ -1604,6 +1615,9 @@ class ShardedEmbeddingCollection(
                 EmbeddingEvent.LOOKUP, self._module_fqn, sharding_type
             ):
                 embs = lookup(features)
+                if hasattr(lookup, "get_resize_awaitables"):
+                    # pyre-ignore[29]
+                    resize_awaitables.extend(lookup.get_resize_awaitables())
                 if self.post_lookup_tracker_fn is not None:
                     self.post_lookup_tracker_fn(features, embs, self, None)
 
@@ -1631,6 +1645,7 @@ class ShardedEmbeddingCollection(
             module_fqn=self._module_fqn,
             sharding_types=list(self._sharding_type_to_sharding.keys()),
             use_gather_select=self._use_gather_select,
+            resize_awaitables=resize_awaitables,
         )
 
     def _embedding_dim_for_sharding_type(self, sharding_type: str) -> int:

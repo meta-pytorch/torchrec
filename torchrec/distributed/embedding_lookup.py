@@ -39,6 +39,8 @@ from torchrec.distributed.batched_embedding_kernel import (
     BatchedFusedEmbeddingBag,
     KeyValueEmbedding,
     KeyValueEmbeddingBag,
+    ShardedBatchedFusedEmbedding,
+    ShardedBatchedFusedEmbeddingBag,
     ZeroCollisionEmbeddingCache,
     ZeroCollisionKeyValueEmbedding,
     ZeroCollisionKeyValueEmbeddingBag,
@@ -65,7 +67,15 @@ from torchrec.distributed.quant_embedding_kernel import (
     QuantBatchedEmbedding,
     QuantBatchedEmbeddingBag,
 )
-from torchrec.distributed.types import rank_device, ShardedTensor, ShardingType
+from torchrec.distributed.types import (
+    LazyAwaitable,
+    rank_device,
+    ShardedTensor,
+    ShardingEnv,
+    ShardingEnv2D,
+    ShardingStrategy,
+    ShardingType,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -185,12 +195,15 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
         grouped_configs: List[GroupedEmbeddingConfig],
         pg: Optional[dist.ProcessGroup] = None,
         device: Optional[torch.device] = None,
+        env: Optional[ShardingEnv] = None,
     ) -> None:
         super().__init__()
         self._emb_modules: nn.ModuleList = nn.ModuleList()
         self._need_prefetch: bool = False
         for config in grouped_configs:
-            self._emb_modules.append(self._create_embedding_kernel(config, pg, device))
+            self._emb_modules.append(
+                self._create_embedding_kernel(config, pg, device, env)
+            )
 
         self._feature_splits: List[int] = []
         for config in grouped_configs:
@@ -218,6 +231,7 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
         config: GroupedEmbeddingConfig,
         pg: Optional[dist.ProcessGroup],
         device: Optional[torch.device],
+        env: Optional[ShardingEnv] = None,
     ) -> BaseEmbedding:
         for table in config.embedding_tables:
             if (
@@ -234,11 +248,20 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                 device=device,
             )
         elif config.compute_kernel == EmbeddingComputeKernel.FUSED:
-            return BatchedFusedEmbedding(
-                config=config,
-                pg=pg,
-                device=device,
-            )
+            if (
+                env
+                and isinstance(env, ShardingEnv2D)
+                and env.sharding_strategy == ShardingStrategy.FULLY_SHARDED
+            ):
+                return ShardedBatchedFusedEmbedding(
+                    config=config, pg=pg, device=device, env=env
+                )
+            else:
+                return BatchedFusedEmbedding(
+                    config=config,
+                    pg=pg,
+                    device=device,
+                )
         elif config.compute_kernel == EmbeddingComputeKernel.KEY_VALUE:
             return KeyValueEmbedding(
                 config=config,
@@ -328,6 +351,14 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                 self.optim_state_tracker_fn(features, lookup, emb_op)
 
         return embeddings_cat_empty_rank_handle(embeddings, self._dummy_embs_tensor)
+
+    def get_resize_awaitables(self) -> List[LazyAwaitable[torch.Tensor]]:
+        # TODO - we can probably do some smart grouping to make this more efficient
+        return [
+            emb_module.get_rs_awaitable()  # pyre-ignore[29]
+            for emb_module in self._emb_modules
+            if hasattr(emb_module, "get_rs_awaitable")
+        ]
 
     # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
@@ -512,12 +543,14 @@ class GroupedPooledEmbeddingsLookup(
         feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
         scale_weight_gradients: bool = True,
         sharding_type: Optional[ShardingType] = None,
+        env: Optional[ShardingEnv] = None,
     ) -> None:
         super().__init__()
+        self._env = env
         self._emb_modules: nn.ModuleList = nn.ModuleList()
         for config in grouped_configs:
             self._emb_modules.append(
-                self._create_embedding_kernel(config, device, pg, sharding_type)
+                self._create_embedding_kernel(config, device, pg, sharding_type, env)
             )
 
         self._feature_splits: List[int] = []
@@ -555,6 +588,7 @@ class GroupedPooledEmbeddingsLookup(
         device: Optional[torch.device],
         pg: Optional[dist.ProcessGroup],
         sharding_type: Optional[ShardingType],
+        env: Optional[ShardingEnv],
     ) -> BaseEmbedding:
         if config.compute_kernel == EmbeddingComputeKernel.DENSE:
             return BatchedDenseEmbeddingBag(
@@ -564,12 +598,26 @@ class GroupedPooledEmbeddingsLookup(
                 sharding_type=sharding_type,
             )
         elif config.compute_kernel == EmbeddingComputeKernel.FUSED:
-            return BatchedFusedEmbeddingBag(
-                config=config,
-                pg=pg,
-                device=device,
-                sharding_type=sharding_type,
-            )
+            if (
+                env
+                and isinstance(env, ShardingEnv2D)
+                and env.sharding_strategy == ShardingStrategy.FULLY_SHARDED
+            ):
+                return ShardedBatchedFusedEmbeddingBag(
+                    config=config,
+                    pg=pg,
+                    device=device,
+                    sharding_type=sharding_type,
+                    env=env,
+                )
+            else:
+                return BatchedFusedEmbeddingBag(
+                    config=config,
+                    pg=pg,
+                    device=device,
+                    sharding_type=sharding_type,
+                    env=env,
+                )
         elif config.compute_kernel in {
             EmbeddingComputeKernel.KEY_VALUE,
         }:
@@ -743,6 +791,14 @@ class GroupedPooledEmbeddingsLookup(
             dummy_embedding,
             dim=1,
         )
+
+    def get_resize_awaitables(self) -> List[LazyAwaitable[torch.Tensor]]:
+        # TODO - we can probably do some smart grouping to make this more efficient
+        return [
+            emb_module.get_rs_awaitable()  # pyre-ignore[29]
+            for emb_module in self._emb_modules
+            if hasattr(emb_module, "get_rs_awaitable")
+        ]
 
     # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
