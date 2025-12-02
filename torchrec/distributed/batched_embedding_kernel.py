@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from math import sqrt
 from typing import (
     Any,
+    Callable,
     cast,
     Dict,
     FrozenSet,
@@ -74,9 +75,12 @@ from torchrec.distributed.embedding_types import (
 from torchrec.distributed.model_tracker.types import IndexedLookup
 from torchrec.distributed.shards_wrapper import LocalShardsWrapper
 from torchrec.distributed.types import (
+    LazyAwaitable,
     Shard,
     ShardedTensor,
     ShardedTensorMetadata,
+    ShardingEnv,
+    ShardingEnv2D,
     ShardingType,
     ShardMetadata,
     TensorProperties,
@@ -106,6 +110,61 @@ logger: logging.Logger = logging.getLogger(__name__)
 RES_ENABLED_TABLES_STR = "res_enabled_tables"
 RES_STORE_SHARDS_STR = "res_store_shards"
 ENABLE_RAW_EMBEDDING_STREAMING_STR = "enable_raw_embedding_streaming"
+
+
+class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
+    """
+    Awaitable that packages async reduce scatter work with a deferred resize operation.
+    The resize happens only when wait() is called, allowing maximum overlap with computation.
+
+    This enables allows us to ensure we're 1) calling wait() on the async operation until the last
+    possible moment and 2) avoid race conditions with tensor memory with the collecitve and resize op.
+    """
+
+    def __init__(
+        self,
+        async_work: Optional[dist.Work],
+        async_event: Optional[torch.cuda.Event],
+        async_stream: Optional[torch.cuda.Stream],
+        unsharded_param: torch.Tensor,
+        shard_buf: torch.Tensor,
+        resize_callback: Callable[[], None],
+    ) -> None:
+        """
+        Args:
+            async_work: The async reduce scatter work handle
+            async_event: CUDA event to synchronize streams
+            async_stream: The communication stream
+            unsharded_param: The original unsharded parameter tensor
+            shard_buf: The buffer containing the sharded result
+            resize_callback: Callback to perform resize operation (called on wait())
+        """
+        super().__init__()
+        self._async_work = async_work
+        self._async_event = async_event
+        self._async_stream = async_stream
+        self._unsharded_param = unsharded_param
+        self._shard_buf = shard_buf
+        self._resize_callback = resize_callback
+        self._completed = False
+
+    def _wait_impl(self) -> torch.Tensor:
+        """
+        Wait for the async reduce scatter to complete, then perform the resize operation.
+        This is where the deferred resize actually happens.
+        """
+        if self._completed:
+            return self._shard_buf
+
+        if self._async_event is not None:
+            torch.cuda.current_stream().wait_event(self._async_event)
+        if self._async_work is not None:
+            self._async_work.wait()
+
+        self._resize_callback()
+
+        self._completed = True
+        return self._shard_buf
 
 
 def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParams]:
@@ -2467,6 +2526,157 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
         self._emb_module.reset_cache_states()
 
 
+class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
+    """
+    Hybird Sharded Version of BatchedFusedEmbedding.
+
+    This is used with DMPCollection when ShardingStrategy.HYBRID is enabled.
+    """
+
+    def __init__(
+        self,
+        config: GroupedEmbeddingConfig,
+        pg: Optional[dist.ProcessGroup] = None,
+        device: Optional[torch.device] = None,
+        env: Optional[ShardingEnv] = None,
+    ) -> None:
+        super().__init__(config, pg, device)
+
+        assert isinstance(
+            env, ShardingEnv2D
+        ), "env is required for ShardedBatchedFusedEmbeddingBag"
+        self._env: ShardingEnv2D = env
+
+        self.weights_sharded = False
+        # pyre-ignore[8]
+        self._original_shape: torch.Size = self._emb_module.weights_dev.shape
+        # pyre-ignore[8]
+        self._unsharded_param: torch.Tensor = self._emb_module.weights_dev
+        self._stash_nbytes: int = (
+            self._emb_module.weights_dev.untyped_storage().nbytes()  # pyre-ignore[29]
+        )
+        self._shard_buf_nbytes: int = 0
+        self.shard_buf: Optional[torch.Tensor] = None
+
+        self._async_stream: torch.cuda.Stream = torch.cuda.Stream(
+            device=self._emb_module.weights_dev.device
+        )
+        self._async_work: Optional[dist.Work] = None
+        self._async_event: Optional[torch.cuda.Event] = None
+        self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
+
+        self.register_full_backward_pre_hook(
+            self._hybird_sharded_backward_hook,  # pyre-ignore[6]
+        )
+
+    def _all_gather_table_weights(self) -> None:
+        if not self.weights_sharded:
+            return
+        self._wait_on_reduce_scatter()
+        self._unsharded_param.untyped_storage().resize_(self._stash_nbytes)
+
+        dist.all_gather_into_tensor(
+            output_tensor=self._unsharded_param,
+            input_tensor=self.shard_buf,
+            group=self._env.replica_pg,
+            async_op=False,
+        )
+        # pyre-ignore[16]
+        self._emb_module.weights_dev = self._unsharded_param
+        # pyre-ignore[16]
+        self.shard_buf.untyped_storage().resize_(0)
+        self.weights_sharded = False
+
+    def _hybird_sharded_backward_hook(
+        self, module: nn.Module, grad_input: List[torch.Tensor]
+    ) -> None:
+        self._all_gather_table_weights()
+
+    def _wait_on_reduce_scatter(self) -> None:
+        """
+        Ensure the post embedding lookup reduce scatter is finished before backward.
+
+        Ideally, backward does not need to wait on RS, as we will be all gathering the shards
+        in the backward pass.
+
+        Now uses the awaitable mechanism to defer resize until needed.
+        """
+        # pyre-ignore[16]
+        self._rs_awaitable.wait()
+        self._rs_awaitable = None
+
+    def get_rs_awaitable(self) -> Optional[ReduceScatterResizeAwaitable]:
+        """
+        Get the current reduce scatter awaitable.
+        This can be used by higher-level modules to compose awaitables.
+        """
+        return self._rs_awaitable
+
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        embs = super().forward(features)
+        self._async_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._async_stream):
+            self._rs_awaitable = self._reduce_scatter_weights_async()
+        return embs
+
+    def _reduce_scatter_weights_async(self) -> ReduceScatterResizeAwaitable:
+        """
+        Launch async reduce scatter but defer the resize operation.
+        Returns an awaitable that will perform resize on wait().
+
+        This allows the resize operation to be deferred until the result is actually needed,
+        maximizing overlap between async communication and computation.
+        """
+        with torch.no_grad():
+            self.weights_sharded = True
+            num_groups = self._env.num_sharding_groups()
+
+            # pyre-ignore[29]
+            total_size = self._emb_module.weights_dev.numel()
+            shard_size = total_size // num_groups
+
+            if self.shard_buf is None:
+                self.shard_buf = torch.empty(
+                    shard_size,
+                    # pyre-ignore[6]
+                    dtype=self._emb_module.weights_dev.dtype,
+                    # pyre-ignore[6]
+                    device=self._emb_module.weights_dev.device,
+                )
+                # pyre-ignore[16]
+                self._shard_buf_nbytes = self.shard_buf.untyped_storage().nbytes()
+            else:
+                self.shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
+
+            # pyre-ignore[29]
+            input_tensor = self._emb_module.weights_dev.contiguous()
+
+            self._async_work = dist.reduce_scatter_tensor(
+                output=self.shard_buf,
+                input=input_tensor,
+                op=dist.ReduceOp.AVG,
+                group=self._env.replica_pg,
+                async_op=True,
+            )
+
+            self._async_event = torch.cuda.Event(enable_timing=False, blocking=False)
+            # pyre-ignore[16]
+            self._async_event.record(self._async_stream)
+
+            def resize_callback() -> None:
+                self._emb_module.weights_dev.untyped_storage().resize_(0)  # pyre-ignore[29]
+                self._emb_module.weights_dev = self.shard_buf  # pyre-ignore[16]
+
+            return ReduceScatterResizeAwaitable(
+                async_work=self._async_work,
+                async_event=self._async_event,
+                async_stream=self._async_stream,
+                unsharded_param=self._unsharded_param,
+                shard_buf=self.shard_buf,
+                resize_callback=resize_callback,
+            )
+
+
 class BatchedDenseEmbedding(BaseBatchedEmbedding[torch.Tensor]):
     def __init__(
         self,
@@ -3238,6 +3448,7 @@ class BatchedFusedEmbeddingBag(
         pg: Optional[dist.ProcessGroup] = None,
         device: Optional[torch.device] = None,
         sharding_type: Optional[ShardingType] = None,
+        env: Optional[ShardingEnv] = None,
     ) -> None:
         super().__init__(config, pg, device, sharding_type)
 
@@ -3354,6 +3565,158 @@ class BatchedFusedEmbeddingBag(
 
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
+
+
+class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
+    """
+    Hybird Sharded Version of BatchedFusedEmbeddingBag.
+
+    This is used with DMPCollection when ShardingStrategy.HYBRID is enabled.
+    """
+
+    def __init__(
+        self,
+        config: GroupedEmbeddingConfig,
+        pg: Optional[dist.ProcessGroup] = None,
+        device: Optional[torch.device] = None,
+        sharding_type: Optional[ShardingType] = None,
+        env: Optional[ShardingEnv] = None,
+    ) -> None:
+        super().__init__(config, pg, device, sharding_type)
+
+        assert isinstance(
+            env, ShardingEnv2D
+        ), "env is required for ShardedBatchedFusedEmbeddingBag"
+        self._env: ShardingEnv2D = env
+
+        self.weights_sharded = False
+        # pyre-ignore[8]
+        self._original_shape: torch.Size = self._emb_module.weights_dev.shape
+        # pyre-ignore[8]
+        self._unsharded_param: torch.Tensor = self._emb_module.weights_dev
+        self._stash_nbytes: int = (
+            self._emb_module.weights_dev.untyped_storage().nbytes()  # pyre-ignore[29]
+        )
+        self._shard_buf_nbytes: int = 0
+        self.shard_buf: Optional[torch.Tensor] = None
+
+        self._async_stream: torch.cuda.Stream = torch.cuda.Stream(
+            device=self._emb_module.weights_dev.device
+        )
+        self._async_work: Optional[dist.Work] = None
+        self._async_event: Optional[torch.cuda.Event] = None
+        self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
+
+        self.register_full_backward_pre_hook(
+            self._hybird_sharded_backward_hook,  # pyre-ignore[6]
+        )
+
+    def _all_gather_table_weights(self) -> None:
+        if not self.weights_sharded:
+            return
+        self._wait_on_reduce_scatter()
+        self._unsharded_param.untyped_storage().resize_(self._stash_nbytes)
+
+        dist.all_gather_into_tensor(
+            output_tensor=self._unsharded_param,
+            input_tensor=self.shard_buf,
+            group=self._env.replica_pg,
+            async_op=False,
+        )
+        # pyre-ignore[16]
+        self._emb_module.weights_dev = self._unsharded_param
+        # pyre-ignore[16]
+        self.shard_buf.untyped_storage().resize_(0)
+        self.weights_sharded = False
+
+    def _hybird_sharded_backward_hook(
+        self, module: nn.Module, grad_input: List[torch.Tensor]
+    ) -> None:
+        self._all_gather_table_weights()
+
+    def _wait_on_reduce_scatter(self) -> None:
+        """
+        Ensure the post embedding lookup reduce scatter is finished before backward.
+
+        Ideally, backward does not need to wait on RS, as we will be all gathering the shards
+        in the backward pass.
+
+        Now uses the awaitable mechanism to defer resize until needed.
+        """
+        # pyre-ignore[16]
+        self._rs_awaitable.wait()
+        self._rs_awaitable = None
+
+    def get_rs_awaitable(self) -> Optional[ReduceScatterResizeAwaitable]:
+        """
+        Get the current reduce scatter awaitable.
+        This can be used by higher-level modules to compose awaitables.
+        """
+        return self._rs_awaitable
+
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        embs = super().forward(features)
+        self._async_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._async_stream):
+            self._rs_awaitable = self._reduce_scatter_weights_async()
+        return embs
+
+    def _reduce_scatter_weights_async(self) -> ReduceScatterResizeAwaitable:
+        """
+        Launch async reduce scatter but defer the resize operation.
+        Returns an awaitable that will perform resize on wait().
+
+        This allows the resize operation to be deferred until the result is actually needed,
+        maximizing overlap between async communication and computation.
+        """
+        with torch.no_grad():
+            self.weights_sharded = True
+            num_groups = self._env.num_sharding_groups()
+
+            # pyre-ignore[29]
+            total_size = self._emb_module.weights_dev.numel()
+            shard_size = total_size // num_groups
+
+            if self.shard_buf is None:
+                self.shard_buf = torch.empty(
+                    shard_size,
+                    # pyre-ignore[6]
+                    dtype=self._emb_module.weights_dev.dtype,
+                    # pyre-ignore[6]
+                    device=self._emb_module.weights_dev.device,
+                )
+                # pyre-ignore[16]
+                self._shard_buf_nbytes = self.shard_buf.untyped_storage().nbytes()
+            else:
+                self.shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
+
+            # pyre-ignore[29]
+            input_tensor = self._emb_module.weights_dev.contiguous()
+
+            self._async_work = dist.reduce_scatter_tensor(
+                output=self.shard_buf,
+                input=input_tensor,
+                op=dist.ReduceOp.AVG,
+                group=self._env.replica_pg,
+                async_op=True,
+            )
+
+            self._async_event = torch.cuda.Event(enable_timing=False, blocking=False)
+            # pyre-ignore[16]
+            self._async_event.record(self._async_stream)
+
+            def resize_callback() -> None:
+                self._emb_module.weights_dev.untyped_storage().resize_(0)  # pyre-ignore[29]
+                self._emb_module.weights_dev = self.shard_buf  # pyre-ignore[16]
+
+            return ReduceScatterResizeAwaitable(
+                async_work=self._async_work,
+                async_event=self._async_event,
+                async_stream=self._async_stream,
+                unsharded_param=self._unsharded_param,
+                shard_buf=self.shard_buf,
+                resize_callback=resize_callback,
+            )
 
 
 class BatchedDenseEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
