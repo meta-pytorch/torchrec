@@ -26,7 +26,7 @@ from torchrec.distributed.test_utils.test_sharding import (
     SharderType,
     sharding_single_rank_test,
 )
-from torchrec.distributed.types import ModuleSharder, ShardingType
+from torchrec.distributed.types import ModuleSharder, ShardingStrategy, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
 from torchrec.test_utils import seed_and_log, skip_if_asan_class
 from torchrec.types import DataType
@@ -161,6 +161,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
         indices_dtype: torch.dtype = torch.int64,
         offsets_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
+        sharding_strategy: Optional[ShardingStrategy] = None,
     ) -> None:
         self._build_tables_and_groups(data_type=data_type)
         # directly run the test with single process
@@ -191,6 +192,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
                 indices_dtype=indices_dtype,
                 offsets_dtype=offsets_dtype,
                 lengths_dtype=lengths_dtype,
+                sharding_strategy=sharding_strategy,
             )
         else:
             self._run_multi_process_test(
@@ -219,6 +221,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
                 indices_dtype=indices_dtype,
                 offsets_dtype=offsets_dtype,
                 lengths_dtype=lengths_dtype,
+                sharding_strategy=sharding_strategy,
             )
 
     def _test_dynamic_sharding(

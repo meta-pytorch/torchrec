@@ -2548,15 +2548,13 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         self._env: ShardingEnv2D = env
 
         self.weights_sharded = False
+        self._element_size = self._emb_module.weights_dev.element_size()
         # pyre-ignore[8]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
         # pyre-ignore[8]
         self._unsharded_param: torch.Tensor = self._emb_module.weights_dev
-        self._stash_nbytes: int = (
-            self._emb_module.weights_dev.untyped_storage().nbytes()  # pyre-ignore[29]
-        )
         self._shard_buf_nbytes: int = 0
-        self.shard_buf: Optional[torch.Tensor] = None
+        self._shard_buf: Optional[torch.Tensor] = None
 
         self._async_stream: torch.cuda.Stream = torch.cuda.Stream(
             device=self._emb_module.weights_dev.device
@@ -2573,18 +2571,26 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         if not self.weights_sharded:
             return
         self._wait_on_reduce_scatter()
-        self._unsharded_param.untyped_storage().resize_(self._stash_nbytes)
+        num_groups = self._env.num_sharding_groups()
+        shard_size = self._shard_buf.numel()
+        padded_total_size = shard_size * num_groups
+
+        self._unsharded_param.untyped_storage().resize_(
+            padded_total_size * self._element_size
+        )
 
         dist.all_gather_into_tensor(
             output_tensor=self._unsharded_param,
-            input_tensor=self.shard_buf,
+            input_tensor=self._shard_buf,
             group=self._env.replica_pg,
             async_op=False,
         )
         # pyre-ignore[16]
-        self._emb_module.weights_dev = self._unsharded_param
+        self._emb_module.weights_dev = self._unsharded_param[
+            : self._original_shape.numel()
+        ]
         # pyre-ignore[16]
-        self.shard_buf.untyped_storage().resize_(0)
+        self._shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
     def _hybird_sharded_backward_hook(
@@ -2633,10 +2639,22 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
 
             # pyre-ignore[29]
             total_size = self._emb_module.weights_dev.numel()
-            shard_size = total_size // num_groups
 
-            if self.shard_buf is None:
-                self.shard_buf = torch.empty(
+            shard_size = (total_size + num_groups - 1) // num_groups  # ceil division
+            padded_total_size = shard_size * num_groups
+            padding_size = padded_total_size - total_size
+
+            if padding_size > 0:
+                input_tensor = torch.nn.functional.pad(
+                    self._emb_module.weights_dev.contiguous(),
+                    (0, padding_size),
+                    value=0.0,
+                )
+            else:
+                input_tensor = self._emb_module.weights_dev.contiguous()
+
+            if self._shard_buf is None:
+                self._shard_buf = torch.empty(
                     shard_size,
                     # pyre-ignore[6]
                     dtype=self._emb_module.weights_dev.dtype,
@@ -2644,15 +2662,15 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
                     device=self._emb_module.weights_dev.device,
                 )
                 # pyre-ignore[16]
-                self._shard_buf_nbytes = self.shard_buf.untyped_storage().nbytes()
+                self._shard_buf_nbytes = self._shard_buf.untyped_storage().nbytes()
             else:
-                self.shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
+                self._shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
 
             # pyre-ignore[29]
             input_tensor = self._emb_module.weights_dev.contiguous()
 
             self._async_work = dist.reduce_scatter_tensor(
-                output=self.shard_buf,
+                output=self._shard_buf,
                 input=input_tensor,
                 op=dist.ReduceOp.AVG,
                 group=self._env.replica_pg,
@@ -2665,14 +2683,14 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
 
             def resize_callback() -> None:
                 self._emb_module.weights_dev.untyped_storage().resize_(0)  # pyre-ignore[29]
-                self._emb_module.weights_dev = self.shard_buf  # pyre-ignore[16]
+                self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
 
             return ReduceScatterResizeAwaitable(
                 async_work=self._async_work,
                 async_event=self._async_event,
                 async_stream=self._async_stream,
                 unsharded_param=self._unsharded_param,
-                shard_buf=self.shard_buf,
+                shard_buf=self._shard_buf,
                 resize_callback=resize_callback,
             )
 
@@ -3590,15 +3608,13 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self._env: ShardingEnv2D = env
 
         self.weights_sharded = False
+        self._element_size = self._emb_module.weights_dev.element_size()
         # pyre-ignore[8]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
         # pyre-ignore[8]
         self._unsharded_param: torch.Tensor = self._emb_module.weights_dev
-        self._stash_nbytes: int = (
-            self._emb_module.weights_dev.untyped_storage().nbytes()  # pyre-ignore[29]
-        )
         self._shard_buf_nbytes: int = 0
-        self.shard_buf: Optional[torch.Tensor] = None
+        self._shard_buf: Optional[torch.Tensor] = None
 
         self._async_stream: torch.cuda.Stream = torch.cuda.Stream(
             device=self._emb_module.weights_dev.device
@@ -3615,18 +3631,27 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         if not self.weights_sharded:
             return
         self._wait_on_reduce_scatter()
-        self._unsharded_param.untyped_storage().resize_(self._stash_nbytes)
+
+        num_groups = self._env.num_sharding_groups()
+        shard_size = self._shard_buf.numel()
+        padded_total_size = shard_size * num_groups
+
+        self._unsharded_param.untyped_storage().resize_(
+            padded_total_size * self._element_size
+        )
 
         dist.all_gather_into_tensor(
             output_tensor=self._unsharded_param,
-            input_tensor=self.shard_buf,
+            input_tensor=self._shard_buf,
             group=self._env.replica_pg,
             async_op=False,
         )
         # pyre-ignore[16]
-        self._emb_module.weights_dev = self._unsharded_param
+        self._emb_module.weights_dev = self._unsharded_param[
+            : self._original_shape.numel()
+        ]
         # pyre-ignore[16]
-        self.shard_buf.untyped_storage().resize_(0)
+        self._shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
     def _hybird_sharded_backward_hook(
@@ -3675,10 +3700,22 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
 
             # pyre-ignore[29]
             total_size = self._emb_module.weights_dev.numel()
-            shard_size = total_size // num_groups
 
-            if self.shard_buf is None:
-                self.shard_buf = torch.empty(
+            shard_size = (total_size + num_groups - 1) // num_groups  # ceil division
+            padded_total_size = shard_size * num_groups
+            padding_size = padded_total_size - total_size
+
+            if padding_size > 0:
+                input_tensor = torch.nn.functional.pad(
+                    self._emb_module.weights_dev.contiguous(),
+                    (0, padding_size),
+                    value=0.0,
+                )
+            else:
+                input_tensor = self._emb_module.weights_dev.contiguous()
+
+            if self._shard_buf is None:
+                self._shard_buf = torch.empty(
                     shard_size,
                     # pyre-ignore[6]
                     dtype=self._emb_module.weights_dev.dtype,
@@ -3686,15 +3723,12 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
                     device=self._emb_module.weights_dev.device,
                 )
                 # pyre-ignore[16]
-                self._shard_buf_nbytes = self.shard_buf.untyped_storage().nbytes()
+                self._shard_buf_nbytes = self._shard_buf.untyped_storage().nbytes()
             else:
-                self.shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
-
-            # pyre-ignore[29]
-            input_tensor = self._emb_module.weights_dev.contiguous()
+                self._shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
 
             self._async_work = dist.reduce_scatter_tensor(
-                output=self.shard_buf,
+                output=self._shard_buf,
                 input=input_tensor,
                 op=dist.ReduceOp.AVG,
                 group=self._env.replica_pg,
@@ -3707,14 +3741,14 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
 
             def resize_callback() -> None:
                 self._emb_module.weights_dev.untyped_storage().resize_(0)  # pyre-ignore[29]
-                self._emb_module.weights_dev = self.shard_buf  # pyre-ignore[16]
+                self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
 
             return ReduceScatterResizeAwaitable(
                 async_work=self._async_work,
                 async_event=self._async_event,
                 async_stream=self._async_stream,
                 unsharded_param=self._unsharded_param,
-                shard_buf=self.shard_buf,
+                shard_buf=self._shard_buf,
                 resize_callback=resize_callback,
             )
 
