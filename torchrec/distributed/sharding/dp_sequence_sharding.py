@@ -80,6 +80,7 @@ class DpSequenceEmbeddingSharding(
             grouped_configs=self._grouped_embedding_configs,
             pg=self._env.process_group,
             device=device if device is not None else self._device,
+            env=self._env,
         )
 
     def create_output_dist(
