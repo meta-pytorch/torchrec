@@ -60,6 +60,7 @@ from torchrec.distributed.sharding.sequence_sharding import (
 from torchrec.distributed.types import (
     Awaitable,
     LazyAwaitable,
+    NullShardedModuleContext,
     ParameterSharding,
     QuantizedCommCodecs,
     ShardedModule,
@@ -1292,8 +1293,9 @@ class ShardedQuantManagedCollisionCollection(
     # pyre-ignore
     def input_dist(
         self,
-        ctx: ManagedCollisionCollectionContext,
+        ctx: Union[ManagedCollisionCollectionContext, NullShardedModuleContext],
         features: KeyedJaggedTensor,
+        is_sequence_embedding: bool = True,
     ) -> ListOfKJTList:
         if self._has_uninitialized_input_dists:
             self._create_input_dists(
@@ -1345,19 +1347,20 @@ class ShardedQuantManagedCollisionCollection(
             for feature_split, input_dist in zip(feature_splits, self._input_dists):
                 out = input_dist(feature_split)
                 input_dist_result_list.append(out.features)
-                ctx.sharding_contexts.append(
-                    InferSequenceShardingContext(
-                        features=out.features,
-                        features_before_input_dist=features,
-                        unbucketize_permute_tensor=(
-                            out.unbucketize_permute_tensor
-                            if isinstance(input_dist, InferRwSparseFeaturesDist)
-                            else None
-                        ),
-                        bucket_mapping_tensor=out.bucket_mapping_tensor,
-                        bucketized_length=out.bucketized_length,
+                if is_sequence_embedding:
+                    ctx.sharding_contexts.append(
+                        InferSequenceShardingContext(
+                            features=out.features,
+                            features_before_input_dist=features,
+                            unbucketize_permute_tensor=(
+                                out.unbucketize_permute_tensor
+                                if isinstance(input_dist, InferRwSparseFeaturesDist)
+                                else None
+                            ),
+                            bucket_mapping_tensor=out.bucket_mapping_tensor,
+                            bucketized_length=out.bucketized_length,
+                        )
                     )
-                )
 
         return ListOfKJTList(input_dist_result_list)
 

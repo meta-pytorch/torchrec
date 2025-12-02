@@ -57,6 +57,7 @@ from torchrec.modules.fp_embedding_modules import (
     FeatureProcessedEmbeddingBagCollection as OriginalFeatureProcessedEmbeddingBagCollection,
 )
 from torchrec.modules.mc_embedding_modules import (
+    ManagedCollisionEmbeddingBagCollection as OriginalManagedCollisionEmbeddingBagCollection,
     ManagedCollisionEmbeddingCollection as OriginalManagedCollisionEmbeddingCollection,
 )
 from torchrec.modules.mc_modules import ManagedCollisionCollection
@@ -218,6 +219,7 @@ def quantize_state_dict(
         splits = key.split(".")
         assert splits[-1] == "weight"
         table_name = splits[-2]
+
         data_type = table_name_to_data_type[table_name]
         num_rows = tensor.shape[0]
 
@@ -371,7 +373,7 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface, ModuleNoCopyMixin)
         self._device: torch.device = device
         self._table_name_to_quantized_weights: Optional[
             Dict[str, Tuple[Tensor, Tensor]]
-        ] = None
+        ] = table_name_to_quantized_weights
         self.row_alignment = row_alignment
         self._kjt_to_jt_dict = ComputeKJTToJTDict()
 
@@ -1193,4 +1195,160 @@ class QuantManagedCollisionEmbeddingCollection(EmbeddingCollection):
             managed_collision_collection=mc_ec._managed_collision_collection,
             return_remapped_features=mc_ec._return_remapped_features,
             cache_features_order=getattr(ec, MODULE_ATTR_CACHE_FEATURES_ORDER, False),
+        )
+
+
+class QuantManagedCollisionEmbeddingBagCollection(EmbeddingBagCollection):
+    """
+    QuantManagedCollisionEmbeddingBagCollection represents a quantized EBC module and a set of managed collision modules.
+    The inputs into the MC-EBC will first be modified by the managed collision module before being passed into the embedding bag collection.
+
+    Args:
+        tables (List[EmbeddingBagConfig]): list of embedding bag configs
+        is_weighted (bool): whether the embedding bag collection is weighted
+        device (torch.device): device on which the embedding collection will be allocated
+        output_dtype (torch.dtype): data type of the output embeddings. Defaults to torch.float
+        table_name_to_quantized_weights (Optional[Dict[str, Tuple[Tensor, Tensor]]]): dictionary mapping table names to their corresponding quantized weights. Defaults to None
+        register_tbes (bool): whether to register the TBEs in the model. Defaults to False
+        quant_state_dict_split_scale_bias (bool): whether to split the scale and bias parameters when saving the quantized state dict. Defaults to False
+        row_alignment (int): alignment of rows in the quantized weights. Defaults to DEFAULT_ROW_ALIGNMENT
+        managed_collision_collection (Optional[ManagedCollisionCollection]): managed collision collection to use for managing collisions. Defaults to None
+        return_remapped_features (bool): whether to return the remapped input features in addition to the embeddings. Defaults to False
+        cache_features_order (bool): whether to cache the features order. Defaults to False
+
+    Example::
+
+    """
+
+    def __init__(
+        self,
+        tables: List[EmbeddingBagConfig],
+        is_weighted: bool,
+        device: torch.device,
+        output_dtype: torch.dtype = torch.float,
+        table_name_to_quantized_weights: Optional[
+            Dict[str, Tuple[Tensor, Tensor]]
+        ] = None,
+        register_tbes: bool = False,
+        quant_state_dict_split_scale_bias: bool = False,
+        row_alignment: int = DEFAULT_ROW_ALIGNMENT,
+        managed_collision_collection: Optional[ManagedCollisionCollection] = None,
+        return_remapped_features: bool = False,
+        cache_features_order: bool = False,
+    ) -> None:
+        super().__init__(
+            tables,
+            is_weighted,
+            device,
+            output_dtype,
+            table_name_to_quantized_weights,
+            register_tbes,
+            quant_state_dict_split_scale_bias,
+            row_alignment,
+            cache_features_order,
+        )
+        assert (
+            managed_collision_collection
+        ), "Managed collision collection cannot be None"
+        self._managed_collision_collection: ManagedCollisionCollection = (
+            managed_collision_collection
+        )
+        self._return_remapped_features = return_remapped_features
+
+        assert str(self.embedding_bag_configs()) == str(
+            self._managed_collision_collection.embedding_configs()
+        ), "Embedding Bag Collection and Managed Collision Collection must contain the same Embedding Configs"
+
+        # Assuming quantized MCEBC is used in inference only
+        for (
+            managed_collision_module
+        ) in self._managed_collision_collection._managed_collision_modules.values():
+            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            managed_collision_module.reset_inference_mode()
+
+    def to(
+        self, *args: List[Any], **kwargs: Dict[str, Any]
+    ) -> "QuantManagedCollisionEmbeddingBagCollection":
+        device, dtype, non_blocking, _ = torch._C._nn._parse_to(
+            *args,  # pyre-ignore
+            **kwargs,  # pyre-ignore
+        )
+        for param in self.parameters():
+            if param.device.type != "meta":
+                param.to(device)
+
+        for buffer in self.buffers():
+            if buffer.device.type != "meta":
+                buffer.to(device)
+        # Skip device movement and continue with other args
+        super().to(
+            dtype=dtype,
+            non_blocking=non_blocking,
+        )
+        return self
+
+    # pyre-ignore
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+    ) -> Tuple[
+        Union[KeyedTensor, Dict[str, JaggedTensor]], Optional[KeyedJaggedTensor]
+    ]:
+        features = self._managed_collision_collection(features)
+
+        return (super().forward(features), features)
+
+    def _get_name(self) -> str:
+        return "QuantManagedCollisionEmbeddingBagCollection"
+
+    @classmethod
+    # pyre-ignore
+    def from_float(
+        cls,
+        module: OriginalManagedCollisionEmbeddingBagCollection,
+        return_remapped_features: bool = False,
+    ) -> "QuantManagedCollisionEmbeddingBagCollection":
+        mc_ebc = module
+        ebc = module._embedding_module
+
+        # pyre-ignore[9]
+        qconfig: torch.quantization.QConfig = module.qconfig
+        assert hasattr(
+            module, "qconfig"
+        ), "QuantManagedCollisionEmbeddingBagCollection input float module must have qconfig defined"
+
+        # pyre-ignore[29]
+        embedding_bag_configs = copy.deepcopy(ebc.embedding_bag_configs())
+        _update_embedding_configs(
+            cast(List[BaseEmbeddingConfig], embedding_bag_configs),
+            qconfig,
+        )
+        _update_embedding_configs(
+            mc_ebc._managed_collision_collection._embedding_configs,
+            qconfig,
+        )
+
+        # pyre-ignore[9]
+        table_name_to_quantized_weights: Dict[str, Tuple[Tensor, Tensor]] | None = (
+            ebc._table_name_to_quantized_weights
+            if hasattr(ebc, "_table_name_to_quantized_weights")
+            else None
+        )
+        device = _get_device(ebc)
+        return cls(
+            embedding_bag_configs,
+            ebc.is_weighted(),
+            device,
+            output_dtype=qconfig.activation().dtype,
+            table_name_to_quantized_weights=table_name_to_quantized_weights,
+            register_tbes=getattr(module, MODULE_ATTR_REGISTER_TBES_BOOL, False),
+            quant_state_dict_split_scale_bias=getattr(
+                ebc, MODULE_ATTR_QUANT_STATE_DICT_SPLIT_SCALE_BIAS, False
+            ),
+            row_alignment=getattr(
+                ebc, MODULE_ATTR_ROW_ALIGNMENT_INT, DEFAULT_ROW_ALIGNMENT
+            ),
+            managed_collision_collection=mc_ebc._managed_collision_collection,
+            return_remapped_features=mc_ebc._return_remapped_features,
+            cache_features_order=getattr(ebc, MODULE_ATTR_CACHE_FEATURES_ORDER, False),
         )
