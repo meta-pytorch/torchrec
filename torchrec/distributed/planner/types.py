@@ -54,6 +54,7 @@ class Perf:
     fwd_comms: float
     bwd_compute: float
     bwd_comms: float
+    input_dist_comms: float = 0.0
     prefetch_compute: float = 0.0
 
     @property
@@ -87,6 +88,7 @@ class Perf:
             fwd_comms=self.fwd_comms + other.fwd_comms,
             bwd_compute=self.bwd_compute + other.bwd_compute,
             bwd_comms=self.bwd_comms + other.bwd_comms,
+            input_dist_comms=self.input_dist_comms + other.input_dist_comms,
             prefetch_compute=self.prefetch_compute + other.prefetch_compute,
         )
 
@@ -97,6 +99,7 @@ class Perf:
                 self.fwd_comms,
                 self.bwd_compute,
                 self.bwd_comms,
+                self.input_dist_comms,
                 self.prefetch_compute,
             )
         )
