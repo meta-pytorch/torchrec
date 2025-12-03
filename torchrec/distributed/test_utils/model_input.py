@@ -7,8 +7,9 @@
 
 # pyre-strict
 
+import random
 from dataclasses import dataclass
-from typing import cast, List, Optional, Tuple, Union
+from typing import cast, Dict, List, Optional, Tuple, Union
 
 import torch
 from tensordict import TensorDict
@@ -396,16 +397,12 @@ class ModelInput(Pipelineable):
             else torch.rand((batch_size,), device=device)
         )
         if pin_memory:
-            # all tensors in `ModelInput` should be on pinned memory otherwise
-            # the `_to_copy` (host-to-device) data transfer still blocks cpu execution
-            float_features = float_features.pin_memory()
-            label = label.pin_memory()
-            idlist_features = (
-                None if idlist_features is None else idlist_features.pin_memory()
+            float_features, idlist_features, idscore_features, label = (
+                ModelInput._pin_memory(
+                    float_features, idlist_features, idscore_features, label
+                )
             )
-            idscore_features = (
-                None if idscore_features is None else idscore_features.pin_memory()
-            )
+
         return ModelInput(
             float_features=float_features,
             idlist_features=idlist_features,
@@ -524,6 +521,31 @@ class ModelInput(Pipelineable):
         return KeyedJaggedTensor(features, indices, weights, lengths, offsets)
 
     @staticmethod
+    def _pin_memory(
+        float_features: torch.Tensor,
+        idlist_features: Optional[KeyedJaggedTensor],
+        idscore_features: Optional[KeyedJaggedTensor],
+        label: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[KeyedJaggedTensor],
+        Optional[KeyedJaggedTensor],
+        torch.Tensor,
+    ]:
+        """
+        Pin memory for all tensors in `ModelInput`
+
+        All tensors in `ModelInput` should be on pinned memory otherwise
+        the `_to_copy` (host-to-device) data transfer still blocks cpu execution
+        """
+        return (
+            float_features.pin_memory(),
+            idlist_features.pin_memory(),
+            idscore_features.pin_memory(),
+            label.pin_memory(),
+        )
+
+    @staticmethod
     def create_standard_kjt(
         batch_size: int,
         tables: Union[
@@ -634,17 +656,210 @@ class ModelInput(Pipelineable):
         return global_kjt, local_kjts
 
 
-# @dataclass
-# class VbModelInput(ModelInput):
-#     pass
+@dataclass
+class VariableBatchModelInput(ModelInput):
 
-#     @staticmethod
-#     def _create_variable_batch_kjt() -> KeyedJaggedTensor:
-#         pass
+    float_features: torch.Tensor
+    idlist_features: Optional[KeyedJaggedTensor]
+    idscore_features: Optional[KeyedJaggedTensor]
+    label: torch.Tensor
 
-#     @staticmethod
-#     def _merge_variable_batch_kjts(kjts: List[KeyedJaggedTensor]) -> KeyedJaggedTensor:
-#         pass
+    @classmethod
+    def generate(
+        cls,
+        batch_size: int = 1,
+        num_float_features: int = 16,
+        dedup_factor: int = 2,
+        tables: Optional[
+            Union[
+                List[EmbeddingTableConfig],
+                List[EmbeddingBagConfig],
+                List[EmbeddingConfig],
+            ]
+        ] = None,
+        weighted_tables: Optional[
+            Union[
+                List[EmbeddingTableConfig],
+                List[EmbeddingBagConfig],
+                List[EmbeddingConfig],
+            ]
+        ] = None,
+        pooling_avg: int = 10,
+        tables_pooling: Optional[List[int]] = None,
+        max_feature_lengths: Optional[List[int]] = None,
+        use_offsets: bool = False,
+        indices_dtype: torch.dtype = torch.int64,
+        offsets_dtype: torch.dtype = torch.int64,
+        lengths_dtype: torch.dtype = torch.int64,
+        all_zeros: bool = False,
+        device: Optional[torch.device] = None,
+        pin_memory: bool = False,  # pin_memory is needed for training job qps benchmark
+    ) -> "VariableBatchModelInput":
+        """
+        Returns a single batch of `VariableBatchModelInput`
+
+        Different from `ModelInput`, `batch_size` is the average batch size which
+        is used together with the `dedup_factor` to get the actual batch size.
+        """
+
+        float_features = torch.rand(
+            (dedup_factor * batch_size, num_float_features), device=device
+        )
+
+        idlist_features = (
+            VariableBatchModelInput._create_variable_batch_kjt(
+                tables=tables,
+                average_batch_size=batch_size,
+                dedup_factor=dedup_factor,
+                use_offsets=use_offsets,
+                indices_dtype=indices_dtype,
+                offsets_dtype=offsets_dtype,
+                lengths_dtype=lengths_dtype,
+                device=device,
+            )
+            if tables is not None and len(tables) > 0
+            else None
+        )
+
+        idscore_features = (
+            VariableBatchModelInput._create_variable_batch_kjt(
+                tables=weighted_tables,
+                average_batch_size=batch_size,
+                dedup_factor=dedup_factor,
+                use_offsets=use_offsets,
+                indices_dtype=indices_dtype,
+                offsets_dtype=offsets_dtype,
+                lengths_dtype=lengths_dtype,
+                device=device,
+            )
+            if weighted_tables is not None and len(weighted_tables) > 0
+            else None
+        )
+
+        label = torch.rand((dedup_factor * batch_size), device=device)
+
+        if pin_memory:
+            float_features, idlist_features, idscore_features, label = (
+                ModelInput._pin_memory(
+                    float_features, idlist_features, idscore_features, label
+                )
+            )
+
+        return VariableBatchModelInput(
+            float_features=float_features,
+            idlist_features=idlist_features,
+            idscore_features=idscore_features,
+            label=label,
+        )
+
+    @staticmethod
+    def _create_variable_batch_kjt(
+        tables: Union[
+            List[EmbeddingTableConfig], List[EmbeddingBagConfig], List[EmbeddingConfig]
+        ],
+        average_batch_size: int,
+        dedup_factor: int,
+        use_offsets: bool = False,
+        indices_dtype: torch.dtype = torch.int64,
+        offsets_dtype: torch.dtype = torch.int64,
+        lengths_dtype: torch.dtype = torch.int64,
+        device: Optional[torch.device] = None,
+    ) -> KeyedJaggedTensor:
+
+        is_weighted = (
+            True if tables and getattr(tables[0], "is_weighted", False) else False
+        )
+
+        feature_num_embeddings = {}
+        for table in tables:
+            for feature_name in table.feature_names:
+                feature_num_embeddings[feature_name] = (
+                    table.num_embeddings_post_pruning
+                    if table.num_embeddings_post_pruning
+                    else table.num_embeddings
+                )
+
+        keys = list(feature_num_embeddings.keys())
+        lengths_per_feature = {}
+        values_per_feature = {}
+        strides_per_feature = {}
+        inverse_indices_per_feature = {}
+        weights_per_feature = {} if is_weighted else None
+
+        for key, num_embeddings in feature_num_embeddings.items():
+            batch_size = random.randint(1, average_batch_size * dedup_factor - 1)
+            lengths = torch.randint(
+                low=0,
+                high=5,
+                size=(batch_size,),
+                dtype=lengths_dtype,
+                device=device,
+            )
+            lengths_per_feature[key] = lengths
+            lengths_sum = sum(lengths.tolist())
+            values = torch.randint(
+                0,
+                num_embeddings,
+                (lengths_sum,),
+                dtype=indices_dtype,
+                device=device,
+            )
+            values_per_feature[key] = values
+            if weights_per_feature is not None:
+                weights_per_feature[key] = torch.rand(
+                    lengths_sum,
+                    device=device,
+                )
+            strides_per_feature[key] = batch_size
+            inverse_indices_per_feature[key] = torch.randint(
+                0,
+                batch_size,
+                (dedup_factor * average_batch_size,),
+                dtype=indices_dtype,
+                device=device,
+            )
+
+        values = torch.cat(list(values_per_feature.values()))
+        lengths = torch.cat(list(lengths_per_feature.values()))
+        weights = (
+            torch.cat(list(weights_per_feature.values()))
+            if weights_per_feature is not None
+            else None
+        )
+        inverse_indices = (
+            keys,
+            torch.stack(list(inverse_indices_per_feature.values())),
+        )
+        strides = [[stride] for stride in strides_per_feature.values()]
+
+        if use_offsets:
+            offsets = torch.cat(
+                [
+                    torch.tensor(
+                        [0],
+                        dtype=offsets_dtype,
+                        device=device,
+                    ),
+                    lengths.cumsum(0),
+                ]
+            )
+            return KeyedJaggedTensor(
+                keys=keys,
+                values=values,
+                offsets=offsets,
+                weights=weights,
+                stride_per_key_per_rank=strides,
+                inverse_indices=inverse_indices,
+            )
+
+        return KeyedJaggedTensor(
+            keys=keys,
+            values=values,
+            lengths=lengths,
+            weights=weights,
+            stride_per_key_per_rank=strides,
+            inverse_indices=inverse_indices,
+        )
 
 
 @dataclass
