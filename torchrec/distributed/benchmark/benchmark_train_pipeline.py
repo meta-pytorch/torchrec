@@ -247,7 +247,9 @@ def run_pipeline(
         short_name=benchmark_res_per_rank[0].short_name,
         gpu_elapsed_time=benchmark_res_per_rank[0].gpu_elapsed_time,
         cpu_elapsed_time=benchmark_res_per_rank[0].cpu_elapsed_time,
-        gpu_mem_stats=[GPUMemoryStats(rank, 0, 0, 0) for rank in range(world_size)],
+        gpu_mem_stats=[
+            GPUMemoryStats(rank, 0, 0, 0, 0, 0) for rank in range(world_size)
+        ],
         cpu_mem_stats=[CPUMemoryStats(rank, 0) for rank in range(world_size)],
         rank=0,
     )

@@ -62,6 +62,7 @@ from torchrec.distributed.types import (
     ShardedTensor,
     ShardingEnv,
     ShardingPlan,
+    ShardingStrategy,
     ShardingType,
 )
 from torchrec.modules.embedding_configs import (
@@ -790,6 +791,7 @@ def sharding_single_rank_test_single_process(
     offsets_dtype: torch.dtype = torch.int64,
     lengths_dtype: torch.dtype = torch.int64,
     random_seed: Optional[int] = None,
+    sharding_strategy: Optional[ShardingStrategy] = None,
 ) -> None:
     batch_size = random.randint(0, batch_size) if allow_zero_batch_size else batch_size
     # Generate model & inputs.
@@ -956,6 +958,7 @@ def sharding_single_rank_test_single_process(
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=all_reduce_func,
             submodule_configs=submodule_configs,
+            sharding_strategy=sharding_strategy,
         )
     else:
         local_model = DistributedModelParallel(
@@ -1069,6 +1072,7 @@ def sharding_single_rank_test(
     offsets_dtype: torch.dtype = torch.int64,
     lengths_dtype: torch.dtype = torch.int64,
     random_seed: Optional[int] = None,
+    sharding_strategy: Optional[ShardingStrategy] = None,
 ) -> None:
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         assert ctx.pg is not None
@@ -1104,6 +1108,7 @@ def sharding_single_rank_test(
             offsets_dtype=offsets_dtype,
             lengths_dtype=lengths_dtype,
             random_seed=random_seed,
+            sharding_strategy=sharding_strategy,
         )
 
 
