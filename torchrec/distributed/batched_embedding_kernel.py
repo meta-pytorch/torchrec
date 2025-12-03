@@ -2682,7 +2682,8 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             self._async_event.record(self._async_stream)
 
             def resize_callback() -> None:
-                self._emb_module.weights_dev.untyped_storage().resize_(0)  # pyre-ignore[29]
+                # pyre-ignore[29]
+                self._emb_module.weights_dev.untyped_storage().resize_(0)
                 self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
 
             return ReduceScatterResizeAwaitable(
@@ -3740,7 +3741,8 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             self._async_event.record(self._async_stream)
 
             def resize_callback() -> None:
-                self._emb_module.weights_dev.untyped_storage().resize_(0)  # pyre-ignore[29]
+                # pyre-ignore[29]
+                self._emb_module.weights_dev.untyped_storage().resize_(0)
                 self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
 
             return ReduceScatterResizeAwaitable(
