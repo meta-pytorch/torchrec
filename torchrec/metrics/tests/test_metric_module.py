@@ -223,6 +223,188 @@ class MetricModuleTest(unittest.TestCase):
             metric_module_unified_task_info.rec_metrics[0]._tasks,
         )
 
+    def test_compatibility_with_older_metric_module(self) -> None:
+        """
+        This test checks if latest RecMetricModule can load up
+        metric module from an older checkpoint
+        """
+
+        def _create_comprehensive_metrics_config() -> MetricsConfig:
+            """
+            Similar to DefaultMetricsConfig, but with comprehensive metrics and tasks.
+            """
+            from torchrec.metrics.metric_module import REC_METRICS_MAPPING
+            from torchrec.metrics.metrics_config import SessionMetricDef
+
+            metric_arguments = {
+                RecMetricEnum.MULTICLASS_RECALL: {"number_of_classes": 2},
+                RecMetricEnum.TOWER_QPS: {"warmup_steps": 100},
+            }
+
+            # Session-level metrics require special task configuration with session_metric_def
+            session_task_info = RecTaskInfo(
+                name="SessionTask",
+                label_name="label",
+                prediction_name="prediction",
+                weight_name="weight",
+                session_metric_def=SessionMetricDef(
+                    session_var_name="session",
+                    top_threshold=10,
+                    run_ranking_of_labels=False,
+                ),
+            )
+
+            # Tensor weighted average metric requires tensor_name
+            tensor_task_info = RecTaskInfo(
+                name="TensorTask",
+                label_name="label",
+                prediction_name="prediction",
+                weight_name="weight",
+                tensor_name="target_tensor",
+            )
+
+            session_metrics = {
+                RecMetricEnum.RECALL_SESSION_LEVEL,
+                RecMetricEnum.PRECISION_SESSION_LEVEL,
+            }
+
+            tensor_metrics = {
+                RecMetricEnum.TENSOR_WEIGHTED_AVG,
+            }
+
+            all_metric_defs: Dict[RecMetricEnum, RecMetricDef] = {}
+            for metric_enum in REC_METRICS_MAPPING.keys():
+                if isinstance(metric_enum, RecMetricEnum):
+                    # Session-level metrics require special task configuration
+                    if metric_enum in session_metrics:
+                        all_metric_defs[metric_enum] = RecMetricDef(
+                            rec_tasks=[session_task_info],
+                            window_size=_DEFAULT_WINDOW_SIZE,
+                            arguments=metric_arguments.get(metric_enum),
+                        )
+                    # Tensor metrics require tensor_name
+                    elif metric_enum in tensor_metrics:
+                        all_metric_defs[metric_enum] = RecMetricDef(
+                            rec_tasks=[tensor_task_info],
+                            window_size=_DEFAULT_WINDOW_SIZE,
+                            arguments=metric_arguments.get(metric_enum),
+                        )
+                    else:
+                        arguments = metric_arguments.get(metric_enum)
+                        all_metric_defs[metric_enum] = RecMetricDef(
+                            rec_tasks=[DefaultTaskInfo],
+                            window_size=_DEFAULT_WINDOW_SIZE,
+                            arguments=arguments,
+                        )
+            comprehensive_config = MetricsConfig(
+                rec_tasks=[DefaultTaskInfo],
+                rec_metrics=all_metric_defs,
+                throughput_metric=ThroughputDef(),
+                state_metrics=[],
+            )
+            return comprehensive_config
+
+        ComprehensiveMetricsConfig: MetricsConfig = (
+            _create_comprehensive_metrics_config()
+        )
+        # This simulates what an older checkpoint may have
+        predefined_state_dict_keys = [
+            "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
+            "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.0._metrics_computations.0.pos_labels",
+            "rec_metrics.rec_metrics.0._metrics_computations.0.neg_labels",
+            "rec_metrics.rec_metrics.1._metrics_computations.0.cross_entropy_positive_sum",
+            "rec_metrics.rec_metrics.1._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.1._metrics_computations.0.pos_labels",
+            "rec_metrics.rec_metrics.1._metrics_computations.0.neg_labels",
+            "rec_metrics.rec_metrics.2._metrics_computations.0.cross_entropy_sum",
+            "rec_metrics.rec_metrics.2._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.2._metrics_computations.0.pos_labels",
+            "rec_metrics.rec_metrics.2._metrics_computations.0.neg_labels",
+            "rec_metrics.rec_metrics.3._metrics_computations.0.cross_entropy_sum",
+            "rec_metrics.rec_metrics.3._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.3._metrics_computations.0.pos_labels",
+            "rec_metrics.rec_metrics.3._metrics_computations.0.neg_labels",
+            "rec_metrics.rec_metrics.4._metrics_computations.0.calibration_num",
+            "rec_metrics.rec_metrics.4._metrics_computations.0.calibration_denom",
+            "rec_metrics.rec_metrics.5._metrics_computations.0.ctr_num",
+            "rec_metrics.rec_metrics.5._metrics_computations.0.ctr_denom",
+            "rec_metrics.rec_metrics.6._metrics_computations.0.calibration_num",
+            "rec_metrics.rec_metrics.6._metrics_computations.0.calibration_denom",
+            "rec_metrics.rec_metrics.10._metrics_computations.0.error_sum",
+            "rec_metrics.rec_metrics.10._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.11._metrics_computations.0.error_sum",
+            "rec_metrics.rec_metrics.11._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.12._metrics_computations.0.tp_at_k",
+            "rec_metrics.rec_metrics.12._metrics_computations.0.total_weights",
+            "rec_metrics.rec_metrics.13._metrics_computations.0.weighted_sum",
+            "rec_metrics.rec_metrics.13._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.14._metrics_computations.0.num_examples",
+            "rec_metrics.rec_metrics.14._metrics_computations.0.warmup_examples",
+            "rec_metrics.rec_metrics.14._metrics_computations.0.time_lapse",
+            "rec_metrics.rec_metrics.15._metrics_computations.0.num_true_pos",
+            "rec_metrics.rec_metrics.15._metrics_computations.0.num_false_neg",
+            "rec_metrics.rec_metrics.16._metrics_computations.0.num_true_pos",
+            "rec_metrics.rec_metrics.16._metrics_computations.0.num_false_pos",
+            "rec_metrics.rec_metrics.17._metrics_computations.0.accuracy_sum",
+            "rec_metrics.rec_metrics.17._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.18._metrics_computations.0.sum_ndcg",
+            "rec_metrics.rec_metrics.18._metrics_computations.0.num_sessions",
+            "rec_metrics.rec_metrics.19._metrics_computations.0.error_sum",
+            "rec_metrics.rec_metrics.19._metrics_computations.0.weighted_num_pairs",
+            "rec_metrics.rec_metrics.21._metrics_computations.0.true_pos_sum",
+            "rec_metrics.rec_metrics.21._metrics_computations.0.false_pos_sum",
+            "rec_metrics.rec_metrics.22._metrics_computations.0.true_pos_sum",
+            "rec_metrics.rec_metrics.22._metrics_computations.0.false_neg_sum",
+            "rec_metrics.rec_metrics.23._metrics_computations.0.cross_entropy_sum",
+            "rec_metrics.rec_metrics.23._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.23._metrics_computations.0.pos_labels",
+            "rec_metrics.rec_metrics.23._metrics_computations.0.neg_labels",
+            "rec_metrics.rec_metrics.23._metrics_computations.0.num_examples",
+            "rec_metrics.rec_metrics.24._metrics_computations.0.calibration_num",
+            "rec_metrics.rec_metrics.24._metrics_computations.0.calibration_denom",
+            "rec_metrics.rec_metrics.24._metrics_computations.0.num_examples",
+            "rec_metrics.rec_metrics.26._metrics_computations.0.weighted_sum",
+            "rec_metrics.rec_metrics.26._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.27._metrics_computations.0.cross_entropy_sum",
+            "rec_metrics.rec_metrics.27._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.27._metrics_computations.0.pos_labels",
+            "rec_metrics.rec_metrics.27._metrics_computations.0.neg_labels",
+            "rec_metrics.rec_metrics.27._metrics_computations.0.weighted_sum_predictions",
+            "rec_metrics.rec_metrics.28._metrics_computations.0.cross_entropy_sum",
+            "rec_metrics.rec_metrics.28._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.28._metrics_computations.0.pos_labels",
+            "rec_metrics.rec_metrics.28._metrics_computations.0.neg_labels",
+            "rec_metrics.rec_metrics.29._metrics_computations.0.true_pos_sum",
+            "rec_metrics.rec_metrics.29._metrics_computations.0.false_pos_sum",
+            "rec_metrics.rec_metrics.29._metrics_computations.0.false_neg_sum",
+            "rec_metrics.rec_metrics.30._metrics_computations.0.error_sum",
+            "rec_metrics.rec_metrics.30._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.30._metrics_computations.0.const_pred_error_sum",
+            "throughput_metric.total_examples",
+            "throughput_metric.warmup_examples",
+            "throughput_metric.time_lapse_after_warmup",
+        ]
+
+        # This is the latest RecMetricModule
+        mock_optimizer = MockOptimizer()
+
+        latest_metric_module = generate_metric_module(
+            TestMetricModule,
+            metrics_config=ComprehensiveMetricsConfig,
+            batch_size=128,
+            world_size=64,
+            my_rank=0,
+            state_metrics_mapping={StateMetricEnum.OPTIMIZERS: mock_optimizer},
+            device=torch.device("cpu"),
+        )
+        tc = unittest.TestCase()
+        tc.assertSetEqual(
+            set(predefined_state_dict_keys),
+            set(latest_metric_module.state_dict().keys()),
+            "RecMetricModule state_dict keys have changed - ensure backward compatibility with older checkpoints",
+        )
+
     @staticmethod
     def _run_trainer_checkpointing(rank: int, world_size: int, backend: str) -> None:
         dist.init_process_group(
