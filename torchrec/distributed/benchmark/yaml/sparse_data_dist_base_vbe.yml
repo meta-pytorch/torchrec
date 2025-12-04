@@ -1,0 +1,40 @@
+# this is a very basic sparse data dist config
+# runs on 2 ranks, showing traces with reasonable workloads
+RunOptions:
+  world_size: 2
+  batch_size: 16384
+  num_batches: 10
+  num_benchmarks: 1
+  num_profiles: 1
+  sharding_type: table_wise
+  profile_dir: "."
+  name: "sparse_data_dist_base"
+  # export_stacks: True # enable this to export stack traces
+PipelineConfig:
+  pipeline: "sparse"
+ModelInputConfig:
+  feature_pooling_avg: 30
+  use_variable_batch: True
+EmbeddingTablesConfig:
+  num_unweighted_features: 90
+  num_weighted_features: 80
+  embedding_feature_dim: 256
+  additional_tables:
+    - - name: FP16_table
+        embedding_dim: 512
+        num_embeddings: 100_000
+        feature_names: ["additional_0_0"]
+        data_type: FP16
+      - name: large_table
+        embedding_dim: 2048
+        num_embeddings: 1_000_000
+        feature_names: ["additional_0_1"]
+    - []
+    - - name: skipped_table
+        embedding_dim: 128
+        num_embeddings: 100_000
+        feature_names: ["additional_2_1"]
+PlannerConfig:
+  additional_constraints:
+    large_table:
+      sharding_types: [column_wise]

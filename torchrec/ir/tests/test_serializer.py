@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 from torch import nn
+from torch.fx.passes.utils.fuser_utils import fuse_by_partitions
 from torchrec.ir.serializer import JsonSerializer
 
 from torchrec.ir.utils import (
@@ -885,6 +886,109 @@ class TestJsonSerializer(unittest.TestCase):
             preserve_module_call_signature=(tuple(sparse_fqns)),
         )
         unflatten_ep = torch.export.unflatten(ep)
+        deserialized_model = decapsulate_ir_modules(
+            unflatten_ep,
+            JsonSerializer,
+            short_circuit_pytree_ebc_regroup=True,
+            finalize_interpreter_modules=True,
+        )
+
+        #  we export the model with ebc1 and unflatten the model,
+        #  and then swap with ebc2 (you can think this as the the sharding process
+        #  resulting a shardedEBC), so that we can mimic the key-order change
+        # pyre-fixme[16]: `Module` has no attribute `ebc`.
+        # pyre-fixme[16]: `Tensor` has no attribute `ebc`.
+        deserialized_model.sparse.ebc = ebc2
+
+        deserialized_out = deserialized_model(id_list_features)
+        for key in eager_out.keys():
+            torch.testing.assert_close(deserialized_out[key], eager_out[key])
+
+    def test_key_order_with_ebc_and_regroup_in_subgraph(self) -> None:
+        tb1_config = EmbeddingBagConfig(
+            name="t1",
+            embedding_dim=3,
+            num_embeddings=10,
+            feature_names=["f1"],
+        )
+        tb2_config = EmbeddingBagConfig(
+            name="t2",
+            embedding_dim=4,
+            num_embeddings=10,
+            feature_names=["f2"],
+        )
+        tb3_config = EmbeddingBagConfig(
+            name="t3",
+            embedding_dim=5,
+            num_embeddings=10,
+            feature_names=["f3"],
+        )
+        id_list_features = KeyedJaggedTensor.from_offsets_sync(
+            keys=["f1", "f2", "f3", "f4", "f5"],
+            values=torch.tensor([0, 1, 2, 3, 2, 3, 4, 5, 6, 7, 8, 9, 1, 1, 2]),
+            offsets=torch.tensor([0, 2, 2, 3, 4, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]),
+        )
+        ebc1 = EmbeddingBagCollection(
+            tables=[tb1_config, tb2_config, tb3_config],
+            is_weighted=False,
+        )
+        ebc2 = EmbeddingBagCollection(
+            tables=[tb1_config, tb3_config, tb2_config],
+            is_weighted=False,
+        )
+        ebc2.load_state_dict(ebc1.state_dict())
+        regroup = KTRegroupAsDict([["f1", "f3"], ["f2"]], ["odd", "even"])
+
+        class mySparse(nn.Module):
+            def __init__(self, ebc, regroup):
+                super().__init__()
+                self.ebc = ebc
+                self.regroup = regroup
+
+            def forward(
+                self,
+                features: KeyedJaggedTensor,
+            ) -> Dict[str, torch.Tensor]:
+                return self.regroup(keyed_tensors=[self.ebc(features)])
+
+        class myModel(nn.Module):
+            def __init__(self, ebc, regroup):
+                super().__init__()
+                self.sparse = mySparse(ebc, regroup)
+
+            def forward(
+                self,
+                features: KeyedJaggedTensor,
+            ) -> Dict[str, torch.Tensor]:
+                return self.sparse(features)
+
+        model = myModel(ebc1, regroup)
+        eager_out = model(id_list_features)
+
+        model, sparse_fqns = encapsulate_ir_modules(model, JsonSerializer)
+        ep = torch.export.export(
+            model,
+            (id_list_features,),
+            {},
+            strict=False,
+            # Allows KJT to not be unflattened and run a forward on unflattened EP
+            preserve_module_call_signature=(tuple(sparse_fqns)),
+        )
+        unflatten_ep = torch.export.unflatten(ep)
+        # Create subgraph for regroup node
+        regroup_nodes = []
+        mod = unflatten_ep.sparse
+        for node in mod.graph.nodes:
+            if node.op == "call_module" and "regroup" in str(node.target):
+                regroup_nodes.append(node)
+        partitions: List[Dict[torch.fx.Node, Optional[int]]] = []
+        partitions.append(dict.fromkeys(regroup_nodes, None))
+        fuse_by_partitions(unflatten_ep.sparse.graph_module, partitions)
+        sub_mod = torch.fx.graph_module._get_attr(mod.graph_module, "fused_0")
+        mod.add_module("fused_0", sub_mod)
+        mod.graph = mod.graph_module.graph
+
+        # decapsulate method will short circuit the kt_regroup node
         deserialized_model = decapsulate_ir_modules(
             unflatten_ep,
             JsonSerializer,

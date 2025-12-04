@@ -13,7 +13,7 @@ from typing import List, Optional
 import torch
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
-from .model_input import ModelInput
+from .model_input import ModelInput, VariableBatchModelInput
 
 
 @dataclass
@@ -30,6 +30,7 @@ class ModelInputConfig:
     long_kjt_offsets: bool = True
     long_kjt_lengths: bool = True
     pin_memory: bool = True
+    use_variable_batch: bool = False
 
     def generate_batches(
         self,
@@ -47,6 +48,29 @@ class ModelInputConfig:
         """
         device = torch.device(self.device) if self.device is not None else None
 
+        if self.use_variable_batch:
+            return [
+                VariableBatchModelInput.generate(
+                    batch_size=self.batch_size,
+                    num_float_features=self.num_float_features,
+                    tables=tables,
+                    weighted_tables=weighted_tables,
+                    use_offsets=self.use_offsets,
+                    indices_dtype=(
+                        torch.int64 if self.long_kjt_indices else torch.int32
+                    ),
+                    offsets_dtype=(
+                        torch.int64 if self.long_kjt_offsets else torch.int32
+                    ),
+                    lengths_dtype=(
+                        torch.int64 if self.long_kjt_lengths else torch.int32
+                    ),
+                    device=device,
+                    pin_memory=self.pin_memory,
+                )
+                for _ in range(self.num_batches)
+            ]
+
         return [
             ModelInput.generate(
                 batch_size=self.batch_size,
@@ -61,5 +85,5 @@ class ModelInputConfig:
                 lengths_dtype=(torch.int64 if self.long_kjt_lengths else torch.int32),
                 pin_memory=self.pin_memory,
             )
-            for batch_size in range(self.num_batches)
+            for _ in range(self.num_batches)
         ]
