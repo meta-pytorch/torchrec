@@ -1559,6 +1559,10 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
         )
 
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 7,
+        "Not enough GPUs, this test requires at least eight GPUs",
+    )
     @given(
         sharding_type=st.just(ShardingType.TABLE_WISE.value),
         kernel_type=st.sampled_from(
