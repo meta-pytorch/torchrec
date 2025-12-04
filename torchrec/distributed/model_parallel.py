@@ -385,7 +385,13 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         return copy_dmp
 
     def _init_dmp(self, module: nn.Module) -> nn.Module:
-        return self._shard_modules_impl(module)
+        if torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:enable_module_id_cache_for_dmp_shard_modules"
+        ):
+            module_id_cache: Dict[int, ShardedModule] = {}
+        else:
+            module_id_cache = None
+        return self._shard_modules_impl(module, module_id_cache=module_id_cache)
 
     def _init_delta_tracker(
         self, delta_tracker_config: DeltaTrackerConfig, module: nn.Module
@@ -435,28 +441,37 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         self,
         module: nn.Module,
         path: str = "",
+        module_id_cache: Optional[Dict[str, ShardedModule]] = None,
     ) -> nn.Module:
         # pre-sharded module
         if isinstance(module, ShardedModule):
             return module
 
+        if module_id_cache is not None:
+            module_id = id(module)
+            if module_id in module_id_cache:
+                return module_id_cache[module_id]
+
         # shardable module
         module_sharding_plan = self._plan.get_plan_for_module(path)
         if module_sharding_plan:
             sharder_key = type(module)
-            module = self._sharder_map[sharder_key].shard(
+            sharded_module = self._sharder_map[sharder_key].shard(
                 module,
                 module_sharding_plan,
                 self._env,
                 self.device,
                 path,
             )
-            return module
+            if module_id_cache is not None:
+                module_id_cache[module_id] = sharded_module
+            return sharded_module
 
         for name, child in module.named_children():
             child = self._shard_modules_impl(
                 child,
                 path + "." + name if path else name,
+                module_id_cache,
             )
             setattr(module, name, child)
 
@@ -1001,11 +1016,17 @@ class DMPCollection(DistributedModelParallel):
         self,
         module: nn.Module,
         path: str = "",
+        module_id_cache: Optional[Dict[int, ShardedModule]] = None,
     ) -> nn.Module:
 
         # pre-sharded module
         if isinstance(module, ShardedModule):
             return module
+
+        if module_id_cache is not None:
+            module_id = id(module)
+            if module_id in module_id_cache:
+                return module_id_cache[module_id]
 
         # shardable module
         module_sharding_plan = self._plan.get_plan_for_module(path)
@@ -1025,19 +1046,22 @@ class DMPCollection(DistributedModelParallel):
                     )
                     break
 
-            module = self._sharder_map[sharder_key].shard(
+            sharded_module = self._sharder_map[sharder_key].shard(
                 module,
                 module_sharding_plan,
                 env,
                 self.device,
                 path,
             )
-            return module
+            if module_id_cache is not None:
+                module_id_cache[module_id] = sharded_module
+            return sharded_module
 
         for name, child in module.named_children():
             child = self._shard_modules_impl(
                 child,
                 path + "." + name if path else name,
+                module_id_cache,
             )
             setattr(module, name, child)
 
