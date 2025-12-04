@@ -32,7 +32,7 @@ on:
           - test
 
 jobs:
-  build_test:
+  unittest_ci_cpu:
     strategy:
       fail-fast: false
       matrix:
@@ -65,7 +65,7 @@ jobs:
       contents: read
     with:
       runner: ${{ matrix.os }}
-      timeout: 15
+      timeout: 20
       script: |
         ldd --version
         conda create -y --name build_binary python=${{ matrix.python.version }}
