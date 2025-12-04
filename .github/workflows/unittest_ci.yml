@@ -32,7 +32,7 @@ on:
           - test
 
 jobs:
-  build_test:
+  unittest_ci_gpu:
     strategy:
       fail-fast: false
       matrix:
