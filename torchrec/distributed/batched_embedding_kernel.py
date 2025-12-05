@@ -125,8 +125,6 @@ class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
         self,
         async_work: Optional[dist.Work],
         async_event: Optional[torch.cuda.Event],
-        async_stream: Optional[torch.cuda.Stream],
-        unsharded_param: torch.Tensor,
         shard_buf: torch.Tensor,
         resize_callback: Callable[[], None],
     ) -> None:
@@ -134,16 +132,12 @@ class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
         Args:
             async_work: The async reduce scatter work handle
             async_event: CUDA event to synchronize streams
-            async_stream: The communication stream
-            unsharded_param: The original unsharded parameter tensor
             shard_buf: The buffer containing the sharded result
             resize_callback: Callback to perform resize operation (called on wait())
         """
         super().__init__()
         self._async_work = async_work
         self._async_event = async_event
-        self._async_stream = async_stream
-        self._unsharded_param = unsharded_param
         self._shard_buf = shard_buf
         self._resize_callback = resize_callback
         self._completed = False
@@ -2689,8 +2683,6 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             return ReduceScatterResizeAwaitable(
                 async_work=self._async_work,
                 async_event=self._async_event,
-                async_stream=self._async_stream,
-                unsharded_param=self._unsharded_param,
                 shard_buf=self._shard_buf,
                 resize_callback=resize_callback,
             )
@@ -3748,8 +3740,6 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             return ReduceScatterResizeAwaitable(
                 async_work=self._async_work,
                 async_event=self._async_event,
-                async_stream=self._async_stream,
-                unsharded_param=self._unsharded_param,
                 shard_buf=self._shard_buf,
                 resize_callback=resize_callback,
             )
