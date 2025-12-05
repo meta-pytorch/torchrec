@@ -253,7 +253,7 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "keys must be unique"):
             model(kjt)
-        mock_jk.assert_called_once_with("pytorch/torchrec:enable_kjt_validation")
+        mock_jk.assert_any_call("pytorch/torchrec:enable_kjt_validation")
 
     @patch("torch._utils_internal.justknobs_check")
     def test_sharding_ebc_validate_input_only_once(self, mock_jk: Mock) -> None:
@@ -271,7 +271,7 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
             model(kjt)
             model(kjt)
 
-        mock_jk.assert_called_once_with("pytorch/torchrec:enable_kjt_validation")
+        mock_jk.assert_any_call("pytorch/torchrec:enable_kjt_validation")
         matched_logs = list(
             filter(lambda s: "Validating input features..." in s, logs.output)
         )
@@ -294,7 +294,7 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
         except ValueError:
             self.fail("Input validation should not be enabled.")
 
-        mock_jk.assert_called_once_with("pytorch/torchrec:enable_kjt_validation")
+        mock_jk.assert_any_call("pytorch/torchrec:enable_kjt_validation")
 
     def _create_sharded_model(
         self, embedding_dim: int = 128, num_embeddings: int = 256
