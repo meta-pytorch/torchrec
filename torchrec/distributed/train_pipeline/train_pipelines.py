@@ -73,6 +73,22 @@ from torchrec.pt2.utils import default_pipeline_input_transformer
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Pipelineable
 
+try:
+    # This is a safety measure against torch package issues for when
+    # Torchrec is included in the inference side model code. We should
+    # remove this once we are sure all model side packages have the required
+    # dependencies
+    from torchrec.distributed.logger import _torchrec_method_logger
+except Exception:
+
+    def _torchrec_method_logger(*args, **kwargs):
+        """A no-op decorator that accepts any arguments."""
+
+        def decorator(func):
+            return func
+
+        return decorator
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -106,6 +122,8 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         pass
 
+    # pyre-ignore [56]
+    @_torchrec_method_logger()
     def __init__(self) -> None:
         # pipeline state such as in foward, in backward etc, used in training recover scenarios
         self._state: PipelineState = PipelineState.IDLE
