@@ -36,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda-tag: ["cu126", "cu128"]
+        cuda-tag: ["cu126", "cu128", "cu129"]
         os:
           - linux.g5.12xlarge.nvidia.gpu
         python:
