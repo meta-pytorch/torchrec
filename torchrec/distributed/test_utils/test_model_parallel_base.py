@@ -253,21 +253,7 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "keys must be unique"):
             model(kjt)
-
-        # Count only calls with the input "pytorch/torchrec:enable_kjt_validation"
-        # This ignores any other calls to justknobs_check() with other inputs
-        # and protects the test from breaking when new JK checks are added.
-        validation_calls = [
-            call
-            for call in mock_jk.call_args_list
-            if len(call[0]) > 0
-            and call[0][0] == "pytorch/torchrec:enable_kjt_validation"
-        ]
-        self.assertEqual(
-            1,
-            len(validation_calls),
-            "There should be exactly one call to JK with pytorch/torchrec:enable_kjt_validation",
-        )
+        mock_jk.assert_any_call("pytorch/torchrec:enable_kjt_validation")
 
     @patch("torch._utils_internal.justknobs_check")
     def test_sharding_ebc_validate_input_only_once(self, mock_jk: Mock) -> None:
@@ -285,20 +271,7 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
             model(kjt)
             model(kjt)
 
-        # Count only calls with the input "pytorch/torchrec:enable_kjt_validation"
-        # This ignores any other calls to justknobs_check() with other inputs
-        # and protects the test from breaking when new JK checks are added.
-        validation_calls = [
-            call
-            for call in mock_jk.call_args_list
-            if len(call[0]) > 0
-            and call[0][0] == "pytorch/torchrec:enable_kjt_validation"
-        ]
-        self.assertEqual(
-            1,
-            len(validation_calls),
-            "There should be exactly one call to JK with pytorch/torchrec:enable_kjt_validation",
-        )
+        mock_jk.assert_any_call("pytorch/torchrec:enable_kjt_validation")
         matched_logs = list(
             filter(lambda s: "Validating input features..." in s, logs.output)
         )
@@ -321,20 +294,7 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
         except ValueError:
             self.fail("Input validation should not be enabled.")
 
-        # Count only calls with the input "pytorch/torchrec:enable_kjt_validation"
-        # This ignores any other calls to justknobs_check() with other inputs
-        # and protects the test from breaking when new JK checks are added.
-        validation_calls = [
-            call
-            for call in mock_jk.call_args_list
-            if len(call[0]) > 0
-            and call[0][0] == "pytorch/torchrec:enable_kjt_validation"
-        ]
-        self.assertEqual(
-            1,
-            len(validation_calls),
-            "There should be exactly one call to JK with pytorch/torchrec:enable_kjt_validation",
-        )
+        mock_jk.assert_any_call("pytorch/torchrec:enable_kjt_validation")
 
     def _create_sharded_model(
         self, embedding_dim: int = 128, num_embeddings: int = 256

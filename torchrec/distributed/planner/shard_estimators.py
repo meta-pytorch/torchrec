@@ -53,23 +53,6 @@ from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
 
 from torchrec.modules.embedding_modules import EmbeddingBagCollectionInterface
 
-try:
-    # This is a safety measure against torch package issues for when
-    # Torchrec is included in the inference side model code. We should
-    # remove this once we are sure all model side packages have the required
-    # dependencies
-    from torchrec.distributed.logger import _torchrec_method_logger
-except Exception:
-
-    def _torchrec_method_logger(*args, **kwargs):
-        """A no-op decorator that accepts any arguments."""
-
-        def decorator(func):
-            return func
-
-        return decorator
-
-
 logger: logging.Logger = logging.getLogger(__name__)
 
 
@@ -972,7 +955,6 @@ class EmbeddingStorageEstimator(ShardEstimator):
         is_inference (bool): If the model is inference model. Default to False.
     """
 
-    @_torchrec_method_logger()
     def __init__(
         self,
         topology: Topology,

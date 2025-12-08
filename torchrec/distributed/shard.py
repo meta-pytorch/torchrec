@@ -30,22 +30,6 @@ from torchrec.distributed.types import (
 from torchrec.distributed.utils import init_parameters
 from torchrec.modules.utils import reset_module_states_post_sharding
 
-try:
-    # This is a safety measure against torch package issues for when
-    # Torchrec is included in the inference side model code. We should
-    # remove this once we are sure all model side packages have the required
-    # dependencies
-    from torchrec.distributed.logger import _torchrec_method_logger
-except Exception:
-
-    def _torchrec_method_logger(*args, **kwargs):
-        """A no-op decorator that accepts any arguments."""
-
-        def decorator(func):
-            return func
-
-        return decorator
-
 
 def _join_module_path(path: str, name: str) -> str:
     return (path + "." + name) if path else name
@@ -162,7 +146,6 @@ def _shard(
 
 # pyre-ignore
 @contract()
-@_torchrec_method_logger()
 def shard_modules(
     module: nn.Module,
     env: Optional[ShardingEnv] = None,
@@ -211,7 +194,6 @@ def shard_modules(
     return _shard_modules(module, env, device, plan, sharders, init_params)
 
 
-@_torchrec_method_logger()
 def _shard_modules(  # noqa: C901
     module: nn.Module,
     # TODO: Consolidate to using Dict[str, ShardingEnv]
