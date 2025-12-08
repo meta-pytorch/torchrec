@@ -417,6 +417,10 @@ class ManagedCollisionCollection(nn.Module):
             values=values,
             lengths=lengths,
             weights=features.weights_or_none(),
+            stride=features.stride(),
+            stride_per_key=features.stride_per_key(),
+            stride_per_key_per_rank=features._stride_per_key_per_rank,
+            inverse_indices=features.inverse_indices_or_none(),
         )
 
     def evict(self) -> Dict[str, Optional[torch.Tensor]]:
