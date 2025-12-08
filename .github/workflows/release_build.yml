@@ -20,10 +20,6 @@ jobs:
       matrix:
         include:
           - os: linux.2xlarge
-            python-version: 3.9
-            python-tag: "py39"
-            cuda-tag: "cu126"
-          - os: linux.2xlarge
             python-version: '3.10'
             python-tag: "py310"
             cuda-tag: "cu126"
@@ -115,7 +111,6 @@ jobs:
         os:
           - linux.g5.12xlarge.nvidia.gpu
         python-version:
-          - 3.9
           - "3.10"
           - "3.11"
           - "3.12"

@@ -100,7 +100,7 @@ def main(argv: List[str]) -> None:
             "sharding",
             "distributed training",
         ],
-        python_requires=">=3.9",
+        python_requires=">=3.10",
         install_requires=install_requires,
         packages=packages,
         zip_safe=False,
