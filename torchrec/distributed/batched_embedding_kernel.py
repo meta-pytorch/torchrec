@@ -2571,9 +2571,8 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         if not self.weights_sharded:
             return
         self._wait_on_reduce_scatter()
-        num_groups = self._env.num_sharding_groups()
         shard_size = self._shard_buf.numel()
-        padded_total_size = shard_size * num_groups
+        padded_total_size = shard_size * self._env.num_sharding_groups()
 
         self._unsharded_param.untyped_storage().resize_(
             padded_total_size * self._element_size
@@ -2635,11 +2634,11 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         """
         with torch.no_grad():
             self.weights_sharded = True
-            num_groups = self._env.num_sharding_groups()
 
             # pyre-ignore[29]
             total_size = self._emb_module.weights_dev.numel()
 
+            num_groups = self._env.num_sharding_groups()
             shard_size = (total_size + num_groups - 1) // num_groups  # ceil division
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size
@@ -3602,7 +3601,6 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         env: Optional[ShardingEnv] = None,
     ) -> None:
         super().__init__(config, pg, device, sharding_type)
-
         assert isinstance(
             env, ShardingEnv2D
         ), "env is required for ShardedBatchedFusedEmbeddingBag"
@@ -3633,9 +3631,8 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             return
         self._wait_on_reduce_scatter()
 
-        num_groups = self._env.num_sharding_groups()
         shard_size = self._shard_buf.numel()
-        padded_total_size = shard_size * num_groups
+        padded_total_size = shard_size * self._env.num_sharding_groups()
 
         self._unsharded_param.untyped_storage().resize_(
             padded_total_size * self._element_size
@@ -3697,11 +3694,11 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         """
         with torch.no_grad():
             self.weights_sharded = True
-            num_groups = self._env.num_sharding_groups()
 
             # pyre-ignore[29]
             total_size = self._emb_module.weights_dev.numel()
 
+            num_groups = self._env.num_sharding_groups()
             shard_size = (total_size + num_groups - 1) // num_groups  # ceil division
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size

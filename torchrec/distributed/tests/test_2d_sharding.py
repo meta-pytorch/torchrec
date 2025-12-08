@@ -952,6 +952,172 @@ class TestDynamic2DParallel(MultiProcessTestBase):
             submodule_configs=[ec_submodule_config],
         )
 
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 7,
+        "Not enough GPUs, this test requires at least eight GPUs",
+    )
+    # pyre-fixme[56]
+    @given(
+        sharding_type=st.just(ShardingType.ROW_WISE.value),
+        kernel_type=st.sampled_from(
+            [
+                # EmbeddingComputeKernel.DENSE.value,
+                EmbeddingComputeKernel.FUSED.value,
+            ]
+        ),
+        qcomms_config=st.sampled_from(
+            [
+                None,
+                QCommsConfig(
+                    forward_precision=CommType.FP16, backward_precision=CommType.BF16
+                ),
+            ]
+        ),
+        apply_optimizer_in_backward_config=st.sampled_from(
+            [
+                None,
+                {
+                    "embedding_bags": (torch.optim.SGD, {"lr": 0.01}),
+                    "embeddings": (torch.optim.SGD, {"lr": 0.2}),
+                },
+            ]
+        ),
+        variable_batch_size=st.booleans(),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    def test_fully_sharded_dynamic_2D(
+        self,
+        sharding_type: str,
+        kernel_type: str,
+        qcomms_config: Optional[QCommsConfig],
+        apply_optimizer_in_backward_config: Optional[
+            Dict[str, Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]]
+        ],
+        variable_batch_size: bool,
+    ) -> None:
+        assume(
+            apply_optimizer_in_backward_config is None
+            or kernel_type != EmbeddingComputeKernel.DENSE.value
+        )
+
+        # add sharding plan for embedding collection later
+        ec_submodule_config = DMPCollectionConfig(
+            module=EmbeddingCollection,
+            sharding_group_size=2,
+            plan=None,  # pyre-ignore[6]
+            sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+        )
+
+        self._test_sharding(
+            world_size=self.WORLD_SIZE,
+            world_size_2D=self.WORLD_SIZE_2D,
+            sharders=[  # pyre-ignore[6]
+                cast(
+                    ModuleSharder[nn.Module],
+                    create_test_sharder(
+                        SharderType.EMBEDDING_BAG_COLLECTION.value,
+                        sharding_type,
+                        kernel_type,
+                        qcomms_config=qcomms_config,
+                        device=torch.device("cuda"),
+                    ),
+                ),
+            ],
+            backend="nccl",
+            qcomms_config=qcomms_config,
+            constraints={
+                table.name: ParameterConstraints(min_partition=2)
+                for table in self.tables
+            },
+            apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
+            variable_batch_size=variable_batch_size,
+            submodule_configs=[ec_submodule_config],
+            sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 7,
+        "Not enough GPUs, this test requires at least eight GPUs",
+    )
+    # pyre-fixme[56]
+    @given(
+        sharding_type=st.just(ShardingType.ROW_WISE.value),
+        kernel_type=st.sampled_from(
+            [
+                # EmbeddingComputeKernel.DENSE.value,
+                EmbeddingComputeKernel.FUSED.value,
+            ]
+        ),
+        qcomms_config=st.sampled_from(
+            [
+                None,
+                QCommsConfig(
+                    forward_precision=CommType.FP16, backward_precision=CommType.BF16
+                ),
+            ]
+        ),
+        apply_optimizer_in_backward_config=st.sampled_from(
+            [
+                None,
+                {
+                    "embedding_bags": (torch.optim.SGD, {"lr": 0.01}),
+                    "embeddings": (torch.optim.SGD, {"lr": 0.2}),
+                },
+            ]
+        ),
+        variable_batch_size=st.booleans(),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    def test_partially_fully_sharded_dynamic_2D(
+        self,
+        sharding_type: str,
+        kernel_type: str,
+        qcomms_config: Optional[QCommsConfig],
+        apply_optimizer_in_backward_config: Optional[
+            Dict[str, Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]]
+        ],
+        variable_batch_size: bool,
+    ) -> None:
+        assume(
+            apply_optimizer_in_backward_config is None
+            or kernel_type != EmbeddingComputeKernel.DENSE.value
+        )
+
+        # add sharding plan for embedding collection later
+        ec_submodule_config = DMPCollectionConfig(
+            module=EmbeddingCollection,
+            sharding_group_size=2,
+            plan=None,  # pyre-ignore[6]
+            sharding_strategy=ShardingStrategy.FULLY_SHARDED,  # only apply fully sharded to EC tables
+        )
+
+        self._test_sharding(
+            world_size=self.WORLD_SIZE,
+            world_size_2D=self.WORLD_SIZE_2D,
+            sharders=[  # pyre-ignore[6]
+                cast(
+                    ModuleSharder[nn.Module],
+                    create_test_sharder(
+                        SharderType.EMBEDDING_BAG_COLLECTION.value,
+                        sharding_type,
+                        kernel_type,
+                        qcomms_config=qcomms_config,
+                        device=torch.device("cuda"),
+                    ),
+                ),
+            ],
+            backend="nccl",
+            qcomms_config=qcomms_config,
+            constraints={
+                table.name: ParameterConstraints(min_partition=2)
+                for table in self.tables
+            },
+            apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
+            variable_batch_size=variable_batch_size,
+            submodule_configs=[ec_submodule_config],
+            sharding_strategy=ShardingStrategy.DEFAULT,
+        )
+
     def _test_sharding(
         self,
         sharders: List[TestEmbeddingCollectionSharder],
@@ -969,6 +1135,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         variable_batch_size: bool = False,
         variable_batch_per_feature: bool = False,
         submodule_configs: Optional[List[DMPCollectionConfig]] = None,
+        sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
     ) -> None:
         self._run_multi_process_test(
             callable=sharding_single_rank_test,
@@ -988,6 +1155,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
             variable_batch_per_feature=variable_batch_per_feature,
             global_constant_batch=True,
             submodule_configs=submodule_configs,
+            sharding_strategy=sharding_strategy,
         )
 
 
