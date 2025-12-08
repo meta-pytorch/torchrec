@@ -1,6 +1,6 @@
 dataset_path: "/home/lizhouyu/oss_github/generative-recommenders/tmp/data/ml-1m"
 batch_size: 16
-train_split_percentage: 0.75
+train_split_percentage: 0.8
 num_workers: 4
 prefetch_factor: 4
 max_num_candidates: 10
