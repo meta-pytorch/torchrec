@@ -122,3 +122,7 @@ jobs:
           if-no-files-found: error
           path: docs
           s3-prefix: meta-pytorch/torchrec/${{ github.event.pull_request.number }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ inputs.repository }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true

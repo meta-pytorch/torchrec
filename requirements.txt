@@ -1,7 +1,7 @@
 black
 click
 cmake
-fbgemm-gpu
+fbgemm-gpu>=1.4.0
 hypothesis==6.70.1
 importlib-metadata
 iopath
@@ -16,7 +16,5 @@ tqdm
 usort
 parameterized
 PyYAML
-
-# for tests
-# https://github.com/pytorch/pytorch/blob/b96b1e8cff029bb0a73283e6e7f6cc240313f1dc/requirements.txt#L3
-expecttest
+psutil
+expecttest>=0.3.0
