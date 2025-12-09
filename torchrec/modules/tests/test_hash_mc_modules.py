@@ -927,3 +927,215 @@ class TestMCH(unittest.TestCase):
                 torch.nonzero(row_mask, as_tuple=False).squeeze(),
             )
         )
+
+
+@unittest.skipIf(
+    torch.cuda.device_count() < 1,
+    "Not enough GPUs, this test requires at least one GPU",
+)
+class TestVBEWithManagedCollision(unittest.TestCase):
+    """Tests for Variable Batch Embeddings (VBE) with ManagedCollisionCollection."""
+
+    def setUp(self) -> None:
+        """Set up common test fixtures for VBE tests."""
+        self.hash_sizes_table = {"product_table": 5, "user_table": 8}
+        self.total_ids = {"product_table": 10, "user_table": 20}
+
+        # Create hash modules for collision management
+        self.hash_modules = {
+            "user_table": HashZchManagedCollisionModule(
+                zch_size=self.hash_sizes_table["user_table"],
+                device=torch.device("cuda"),
+                input_hash_size=self.total_ids["user_table"],
+                total_num_buckets=1,
+            ),
+            "product_table": HashZchManagedCollisionModule(
+                zch_size=self.hash_sizes_table["product_table"],
+                device=torch.device("cuda"),
+                input_hash_size=self.total_ids["product_table"],
+                total_num_buckets=1,
+            ),
+        }
+
+        # Create embedding configs
+        self.embedding_configs = [
+            EmbeddingBagConfig(
+                name="user_table",
+                embedding_dim=3,
+                num_embeddings=self.hash_sizes_table["user_table"],
+                feature_names=["user"],
+            ),
+            EmbeddingBagConfig(
+                name="product_table",
+                embedding_dim=2,
+                num_embeddings=self.hash_sizes_table["product_table"],
+                feature_names=["product"],
+            ),
+        ]
+
+        # Create ManagedCollisionCollection
+        self.mcc = ManagedCollisionCollection(
+            managed_collision_modules=self.hash_modules,
+            embedding_configs=self.embedding_configs,
+        )
+
+        # Create test KJT with VBE (deduped values with inverse_indices)
+        # User values: [[5, 6, 7], [1, 2, 3]] - 2 unique pooled groups
+        # Product values: [[0, 1]] - 1 unique pooled group
+        self.kjt = KeyedJaggedTensor(
+            keys=["user", "product"],
+            values=torch.tensor([5, 6, 7, 1, 2, 3, 0, 1]),
+            lengths=torch.tensor([3, 3, 2]),
+            stride_per_key_per_rank=[[2], [1]],
+            inverse_indices=(["user", "product"], torch.tensor([[0, 1, 0], [0, 0, 0]])),
+        ).to("cuda")
+
+    def test_mcc_preserves_kjt_attributes(self) -> None:
+        """Test that ManagedCollisionCollection preserves all KJT attributes with VBE."""
+        # Add weights to test kjt
+        kjt_with_weights = KeyedJaggedTensor(
+            keys=self.kjt.keys(),
+            values=self.kjt.values(),
+            lengths=self.kjt.lengths(),
+            weights=torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]),
+            stride_per_key_per_rank=self.kjt.stride_per_key_per_rank(),
+            inverse_indices=self.kjt.inverse_indices(),
+        ).to("cuda")
+
+        # Pass through MCC
+        output = self.mcc.forward(kjt_with_weights)
+
+        # Verify ID remapping on values is correct for each table
+        for i, table in enumerate(["user_table", "product_table"]):
+            mapping = torch.ravel(
+                self.mcc._managed_collision_modules[table]._hash_zch_identities
+            )
+            original_inds = kjt_with_weights.values()[
+                kjt_with_weights.offset_per_key()[
+                    i
+                ] : kjt_with_weights.offset_per_key()[i + 1]
+            ]
+            remapped_inds = output.values()[
+                kjt_with_weights.offset_per_key()[
+                    i
+                ] : kjt_with_weights.offset_per_key()[i + 1]
+            ]
+            self.assertTrue(
+                torch.equal(original_inds, mapping[remapped_inds]),
+                f"ID remapping incorrect for {table}",
+            )
+
+        # Verify all other attributes (relevant to VBE) are preserved
+        self.assertTrue(
+            torch.equal(kjt_with_weights.lengths(), output.lengths()),
+            "Lengths should be preserved",
+        )
+        self.assertTrue(
+            torch.equal(kjt_with_weights.weights(), output.weights()),
+            "Weights should be preserved",
+        )
+        self.assertEqual(
+            kjt_with_weights.stride(), output.stride(), "Stride should be preserved"
+        )
+        self.assertEqual(
+            kjt_with_weights.stride_per_key(),
+            output.stride_per_key(),
+            "stride_per_key should be preserved",
+        )
+        self.assertEqual(
+            kjt_with_weights.stride_per_key_per_rank(),
+            output.stride_per_key_per_rank(),
+            "stride_per_key_per_rank should be preserved",
+        )
+
+        # Verify inverse_indices are preserved (VBE support)
+        input_inverse_indices = kjt_with_weights.inverse_indices()
+        output_inverse_indices = output.inverse_indices()
+
+        self.assertEqual(
+            input_inverse_indices[0],
+            output_inverse_indices[0],
+            "inverse_indices keys should be preserved",
+        )
+        self.assertTrue(
+            torch.equal(input_inverse_indices[1], output_inverse_indices[1]),
+            "inverse_indices tensor should be preserved",
+        )
+
+    def test_mcebc_with_vbe(self) -> None:
+        """Test that MCEBC correctly handles VBE  using inverse_indices."""
+        # Set up MCEBC
+        ebc = EmbeddingBagCollection(
+            device="cuda",
+            tables=self.embedding_configs,
+        )
+        mcebc = ManagedCollisionEmbeddingBagCollection(
+            embedding_bag_collection=ebc,
+            managed_collision_collection=self.mcc,
+        )
+
+        # Run forward pass
+        actual_output, _ = mcebc(self.kjt)
+
+        # Manually compute results on hard-coded VBE example
+        tables = {
+            "user_table": ebc.embedding_bags["user_table"].weight,
+            "product_table": ebc.embedding_bags["product_table"].weight,
+        }
+
+        pooled_embeddings = {
+            "user_table": torch.zeros((2, 3)),
+            "product_table": torch.zeros((1, 2)),
+        }
+
+        i_length = 0
+        for i_table, table in enumerate(["user_table", "product_table"]):
+            stride_per_key = self.kjt.stride_per_key()
+            mcc_table = mcebc._managed_collision_collection._managed_collision_modules[
+                table
+            ]
+            remapped_indices = torch.ravel(mcc_table._hash_zch_identities)
+
+            original_inds_per_key = self.kjt.values()[
+                self.kjt.offset_per_key()[i_table] : self.kjt.offset_per_key()[
+                    i_table + 1
+                ]
+            ]
+
+            # Process each unique pooled group
+            offset_per_key_per_pool = 0
+            for i_pooled in range(stride_per_key[i_table]):
+                length_of_pool = self.kjt.lengths()[i_length]
+
+                pooled_original_indices = original_inds_per_key[
+                    offset_per_key_per_pool : offset_per_key_per_pool + length_of_pool
+                ]
+
+                # Get the new indices from hash-map
+                new_indices = torch.tensor(
+                    [
+                        torch.where(remapped_indices == idx)[0].item()
+                        for idx in pooled_original_indices
+                    ]
+                )
+
+                # Sum embeddings for the pooled group from new_indices
+                pooled_embeddings[table][i_pooled] = (
+                    tables[table][new_indices, :].sum(axis=0).to("cpu")
+                )
+
+                i_length += 1
+                offset_per_key_per_pool += length_of_pool
+
+        # Use inverse_indices to expand pooled embeddings to final output
+        inverse_keys, inverse_tensor = self.kjt.inverse_indices()
+
+        user_inverse = inverse_tensor[inverse_keys.index("user")].to("cpu")
+        expected_user = pooled_embeddings["user_table"][user_inverse]
+
+        prod_inverse = inverse_tensor[inverse_keys.index("product")].to("cpu")
+        expected_prod = pooled_embeddings["product_table"][prod_inverse]
+
+        # Verify actual output matches expected output
+        self.assertTrue(torch.equal(expected_user, actual_output["user"].to("cpu")))
+        self.assertTrue(torch.equal(expected_prod, actual_output["product"].to("cpu")))

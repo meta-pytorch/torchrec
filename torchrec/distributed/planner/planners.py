@@ -70,6 +70,23 @@ from torchrec.distributed.types import (
 )
 from torchrec.distributed.utils import get_device_type, none_throws
 
+try:
+    # This is a safety measure against torch package issues for when
+    # Torchrec is included in the inference side model code. We should
+    # remove this once we are sure all model side packages have the required
+    # dependencies
+    from torchrec.distributed.logger import _torchrec_method_logger
+except Exception:
+
+    def _torchrec_method_logger(*args, **kwargs):
+        """A no-op decorator that accepts any arguments."""
+
+        def decorator(func):
+            return func
+
+        return decorator
+
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 
@@ -498,6 +515,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             sharders,
         )
 
+    @_torchrec_method_logger()
     def plan(
         self,
         module: nn.Module,
