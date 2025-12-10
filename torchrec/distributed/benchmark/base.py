@@ -504,14 +504,6 @@ class cmd_conf:
                 help="JSON config file for benchmarking",
             )
 
-            # Add loglevel argument with current logger level as default
-            parser.add_argument(
-                "--loglevel",
-                type=str,
-                default=logging._levelToName[logger.level],
-                help="Set the logging level (e.g. info, debug, warning, error)",
-            )
-
             pre_args, _ = parser.parse_known_args()
 
             yaml_defaults: Dict[str, Any] = (
@@ -531,7 +523,6 @@ class cmd_conf:
             seen_args = {
                 "json_config",
                 "yaml_config",
-                "loglevel",
             }
 
             for _name, param in sig.parameters.items():
