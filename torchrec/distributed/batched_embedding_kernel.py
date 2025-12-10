@@ -125,8 +125,6 @@ class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
         self,
         async_work: Optional[dist.Work],
         async_event: Optional[torch.cuda.Event],
-        async_stream: Optional[torch.cuda.Stream],
-        unsharded_param: torch.Tensor,
         shard_buf: torch.Tensor,
         resize_callback: Callable[[], None],
     ) -> None:
@@ -134,16 +132,12 @@ class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
         Args:
             async_work: The async reduce scatter work handle
             async_event: CUDA event to synchronize streams
-            async_stream: The communication stream
-            unsharded_param: The original unsharded parameter tensor
             shard_buf: The buffer containing the sharded result
             resize_callback: Callback to perform resize operation (called on wait())
         """
         super().__init__()
         self._async_work = async_work
         self._async_event = async_event
-        self._async_stream = async_stream
-        self._unsharded_param = unsharded_param
         self._shard_buf = shard_buf
         self._resize_callback = resize_callback
         self._completed = False
@@ -2571,9 +2565,8 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         if not self.weights_sharded:
             return
         self._wait_on_reduce_scatter()
-        num_groups = self._env.num_sharding_groups()
         shard_size = self._shard_buf.numel()
-        padded_total_size = shard_size * num_groups
+        padded_total_size = shard_size * self._env.num_sharding_groups()
 
         self._unsharded_param.untyped_storage().resize_(
             padded_total_size * self._element_size
@@ -2635,11 +2628,11 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         """
         with torch.no_grad():
             self.weights_sharded = True
-            num_groups = self._env.num_sharding_groups()
 
             # pyre-ignore[29]
             total_size = self._emb_module.weights_dev.numel()
 
+            num_groups = self._env.num_sharding_groups()
             shard_size = (total_size + num_groups - 1) // num_groups  # ceil division
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size
@@ -2689,8 +2682,6 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             return ReduceScatterResizeAwaitable(
                 async_work=self._async_work,
                 async_event=self._async_event,
-                async_stream=self._async_stream,
-                unsharded_param=self._unsharded_param,
                 shard_buf=self._shard_buf,
                 resize_callback=resize_callback,
             )
@@ -3602,7 +3593,6 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         env: Optional[ShardingEnv] = None,
     ) -> None:
         super().__init__(config, pg, device, sharding_type)
-
         assert isinstance(
             env, ShardingEnv2D
         ), "env is required for ShardedBatchedFusedEmbeddingBag"
@@ -3633,9 +3623,8 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             return
         self._wait_on_reduce_scatter()
 
-        num_groups = self._env.num_sharding_groups()
         shard_size = self._shard_buf.numel()
-        padded_total_size = shard_size * num_groups
+        padded_total_size = shard_size * self._env.num_sharding_groups()
 
         self._unsharded_param.untyped_storage().resize_(
             padded_total_size * self._element_size
@@ -3697,11 +3686,11 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         """
         with torch.no_grad():
             self.weights_sharded = True
-            num_groups = self._env.num_sharding_groups()
 
             # pyre-ignore[29]
             total_size = self._emb_module.weights_dev.numel()
 
+            num_groups = self._env.num_sharding_groups()
             shard_size = (total_size + num_groups - 1) // num_groups  # ceil division
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size
@@ -3748,8 +3737,6 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             return ReduceScatterResizeAwaitable(
                 async_work=self._async_work,
                 async_event=self._async_event,
-                async_stream=self._async_stream,
-                unsharded_param=self._unsharded_param,
                 shard_buf=self._shard_buf,
                 resize_callback=resize_callback,
             )

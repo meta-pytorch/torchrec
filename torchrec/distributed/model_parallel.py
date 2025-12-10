@@ -931,6 +931,7 @@ class DMPCollection(DistributedModelParallel):
                         plan=submodule_config.plan,
                         sharding_group_size=submodule_config.sharding_group_size,
                         use_inter_host_allreduce=submodule_config.use_inter_host_allreduce,
+                        sharding_strategy=submodule_config.sharding_strategy,
                     )
                 )
 
@@ -1022,6 +1023,7 @@ class DMPCollection(DistributedModelParallel):
                         device_mesh=ctx.device_mesh,
                         node_group_size=ctx.sharding_group_size,
                         use_inter_host_allreduce=ctx.use_inter_host_allreduce,
+                        sharding_strategy=ctx.sharding_strategy,
                     )
                     break
 

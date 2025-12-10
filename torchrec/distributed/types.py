@@ -931,6 +931,51 @@ class ShardingStrategy(Enum):
     FULLY_SHARDED = "fully_sharded"
 
 
+class DMPCollectionConfig:
+    module: Type[nn.Module]
+    plan: "ShardingPlan" = field(repr=False)  # sub-tree-specific sharding plan
+    sharding_group_size: int
+    node_group_size: Optional[int] = None
+    use_inter_host_allreduce: bool = False
+    sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT
+
+    def __init__(
+        self,
+        module: Type[nn.Module],
+        plan: "ShardingPlan",
+        sharding_group_size: int,
+        node_group_size: Optional[int] = None,
+        use_inter_host_allreduce: bool = False,
+        sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
+    ) -> None:
+        self.module = module
+        self.plan = plan
+        self.sharding_group_size = sharding_group_size
+        self.node_group_size = node_group_size
+        self.use_inter_host_allreduce = use_inter_host_allreduce
+        self.sharding_strategy = sharding_strategy
+
+    def __post_init__(self) -> None:
+        if isinstance(self.module, ShardedModule):
+            raise ValueError(
+                f"ShardedModule should not be passed into DMPCollectionConfig: got {type(self.module)}"
+            )
+
+
+# for internal use in DMPCollection
+class DMPCollectionContext(DMPCollectionConfig):
+    device_mesh: "DeviceMesh" = field(init=False)
+    sharding_pg: "dist.ProcessGroup" = field(init=False)
+    replica_pg: "dist.ProcessGroup" = field(init=False)
+    modules_to_sync: List[Tuple[nn.Module, nn.Module]] = field(
+        init=False, default_factory=list
+    )
+    sharded_module: Optional[nn.Module] = field(init=False, default=None)
+    sharding_strategy: ShardingStrategy = field(
+        init=False, default=ShardingStrategy.DEFAULT
+    )
+
+
 class ShardingEnv2D(ShardingEnv):
     """
     Creates a sharding environment for 2D parallelism, enables usage of 2D parallelism in sharding
@@ -1375,42 +1420,3 @@ class ShardingBucketMetadata:
     num_buckets_per_shard: List[int]
     bucket_offsets_per_shard: List[int]
     bucket_size: int
-
-
-class DMPCollectionConfig:
-    module: Type[nn.Module]
-    plan: "ShardingPlan" = field(repr=False)  # sub-tree-specific sharding plan
-    sharding_group_size: int
-    node_group_size: Optional[int] = None
-    use_inter_host_allreduce: bool = False
-
-    def __init__(
-        self,
-        module: Type[nn.Module],
-        plan: "ShardingPlan",
-        sharding_group_size: int,
-        node_group_size: Optional[int] = None,
-        use_inter_host_allreduce: bool = False,
-    ) -> None:
-        self.module = module
-        self.plan = plan
-        self.sharding_group_size = sharding_group_size
-        self.node_group_size = node_group_size
-        self.use_inter_host_allreduce = use_inter_host_allreduce
-
-    def __post_init__(self) -> None:
-        if isinstance(self.module, ShardedModule):
-            raise ValueError(
-                f"ShardedModule should not be passed into DMPCollectionConfig: got {type(self.module)}"
-            )
-
-
-# for internal use in DMPCollection
-class DMPCollectionContext(DMPCollectionConfig):
-    device_mesh: "DeviceMesh" = field(init=False)
-    sharding_pg: "dist.ProcessGroup" = field(init=False)
-    replica_pg: "dist.ProcessGroup" = field(init=False)
-    modules_to_sync: List[Tuple[nn.Module, nn.Module]] = field(
-        init=False, default_factory=list
-    )
-    sharded_module: Optional[nn.Module] = field(init=False, default=None)
