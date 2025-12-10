@@ -881,6 +881,7 @@ class TestDenseArch(nn.Module):
         device: Optional[torch.device] = None,
         dense_arch_out_size: Optional[int] = None,
         dense_arch_hidden_sizes: Optional[List[int]] = None,
+        **_kwargs: Any,
     ) -> None:
         """
         Args:
@@ -1191,6 +1192,8 @@ class TestOverArchLarge(nn.Module):
         dense_arch_out_size: Optional[int] = None,
         over_arch_out_size: Optional[int] = None,
         over_arch_hidden_layers: Optional[int] = None,
+        over_arch_hidden_repeat: Optional[int] = None,
+        **_kwargs: Any,
     ) -> None:
         """
         Args:
@@ -1237,7 +1240,8 @@ class TestOverArchLarge(nn.Module):
                 ),
                 SwishLayerNorm([out_features]),
             ]
-
+        for _ in range(over_arch_hidden_repeat or 0):
+            layers += layers[1:]
         self.overarch = torch.nn.Sequential(*layers)
 
         self.regroup_module = KTRegroupAsDict(
@@ -1398,6 +1402,7 @@ class TestEBCSparseArch(nn.Module):
         weighted_tables: List[EmbeddingBagConfig],
         device: Optional[torch.device] = None,
         max_feature_lengths: Optional[Dict[str, int]] = None,
+        **_kwargs: Any,
     ) -> None:
         """
         Args:
@@ -1547,6 +1552,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
         over_arch_clazz: Optional[Type[nn.Module]] = None,
         postproc_module: Optional[nn.Module] = None,
         zch: bool = False,
+        submodule_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(
             tables=cast(List[BaseEmbeddingConfig], tables),
@@ -1559,7 +1565,9 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
             over_arch_clazz = TestOverArch
         if weighted_tables is None:
             weighted_tables = []
-        self.dense = TestDenseArch(num_float_features, device=dense_device)
+        self.dense = TestDenseArch(
+            num_float_features, device=dense_device, **(submodule_kwargs or {})
+        )
         if zch:
             self.sparse: nn.Module = TestEBCSparseArchZCH(
                 tables,  # pyre-ignore
@@ -1571,6 +1579,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
             self.sparse = TestECSparseArch(
                 tables,  # pyre-ignore [6]
                 sparse_device,
+                **(submodule_kwargs or {}),
             )
         else:
             self.sparse = TestEBCSparseArch(
@@ -1578,6 +1587,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
                 weighted_tables,
                 sparse_device,
                 max_feature_lengths,
+                **(submodule_kwargs or {}),
             )
 
         embedding_names = (
@@ -1596,6 +1606,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
             weighted_tables,
             embedding_names,
             dense_device,
+            **(submodule_kwargs or {}),
         )
         self.register_buffer(
             "dummy_ones",

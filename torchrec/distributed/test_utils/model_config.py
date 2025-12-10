@@ -88,6 +88,7 @@ class TestSparseNNConfig(BaseModelConfig):
     over_arch_clazz: Type[nn.Module] = TestOverArchLarge
     postproc_module: Optional[nn.Module] = None
     zch: bool = False
+    submodule_kwargs: Optional[Dict[str, Any]] = None
 
     def generate_model(
         self,
@@ -108,6 +109,7 @@ class TestSparseNNConfig(BaseModelConfig):
             postproc_module=self.postproc_module,
             embedding_groups=self.embedding_groups,
             zch=self.zch,
+            submodule_kwargs=self.submodule_kwargs,
         )
 
 
