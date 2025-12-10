@@ -110,9 +110,9 @@ class BaseEmbedding(abc.ABC, nn.Module):
                 get_indexed_lookups, delete
             )
 
-    def _get_hash_zch_identities(
+    def _get_hash_zch_identities_and_metadata(
         self, features: KeyedJaggedTensor
-    ) -> Optional[torch.Tensor]:
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
         if self._raw_id_tracker_wrapper is None or not isinstance(
             self.emb_module, SplitTableBatchedEmbeddingBagsCodegen
         ):
@@ -131,7 +131,7 @@ class BaseEmbedding(abc.ABC, nn.Module):
         # across multiple training iterations. Current logic appends raw_ids from
         # all batches sequentially. This may cause misalignment with
         # features.values() which only contains the current batch.
-        raw_ids_dict = raw_id_tracker_wrapper.get_indexed_lookups(
+        indexed_lookups_dict = raw_id_tracker_wrapper.get_indexed_lookups(
             table_names, emb_module.uuid
         )
 
@@ -148,11 +148,14 @@ class BaseEmbedding(abc.ABC, nn.Module):
         # raw_ids are included. If some tables lack identity while others have them,
         # padding with -1 may be needed to maintain alignment.
         all_raw_ids = []
+        all_runtime_meta = []
         for table_name in table_names:
-            if table_name in raw_ids_dict:
-                raw_ids_list = raw_ids_dict[table_name]
+            if table_name in indexed_lookups_dict:
+                raw_ids_list, runtime_meta_list = indexed_lookups_dict[table_name]
                 for raw_ids in raw_ids_list:
                     all_raw_ids.append(raw_ids)
+                for runtime_meta in runtime_meta_list:
+                    all_runtime_meta.append(runtime_meta)
 
         if not all_raw_ids:
             return None
@@ -162,7 +165,16 @@ class BaseEmbedding(abc.ABC, nn.Module):
             f"hash_zch_identities row count ({hash_zch_identities.size(0)}) must match "
             f"features.values() length ({features.values().numel()}) to maintain 1-to-1 alignment"
         )
-        return hash_zch_identities
+
+        if all_runtime_meta:
+            hash_zch_runtime_meta = torch.cat(all_runtime_meta)
+            assert hash_zch_runtime_meta.size(0) == hash_zch_identities.size(0), (
+                f"hash_zch_runtime_meta row count ({hash_zch_runtime_meta.size(0)}) must match "
+                f"hash_zch_identities length ({hash_zch_identities.size(0)}) to maintain 1-to-1 alignment"
+            )
+            return (hash_zch_identities, hash_zch_runtime_meta)
+        else:
+            return (hash_zch_identities, None)
 
 
 def create_virtual_table_local_metadata(
