@@ -1543,7 +1543,7 @@ class ShardedEmbeddingBagCollection(
                 "pytorch/torchrec:enable_kjt_validation"
             ):
                 logger.info("Validating input features...")
-                validate_keyed_jagged_tensor(features)
+                validate_keyed_jagged_tensor(features, self._embedding_bag_configs)
 
             self._create_input_dist(features.keys())
             self._has_uninitialized_input_dist = False
