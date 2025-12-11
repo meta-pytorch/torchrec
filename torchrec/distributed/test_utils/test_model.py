@@ -1575,7 +1575,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
                 torch.device("meta"),
                 return_remapped=True,
             )
-        elif isinstance(tables[0], EmbeddingConfig):
+        elif len(tables) > 0 and isinstance(tables[0], EmbeddingConfig):
             self.sparse = TestECSparseArch(
                 tables,  # pyre-ignore [6]
                 sparse_device,
