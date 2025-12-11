@@ -980,6 +980,13 @@ class DMPCollectionContext(DMPCollectionConfig):
     )
     sharded_module: Optional[nn.Module] = field(init=False, default=None, repr=False)
 
+    weights_by_dtype: Dict["torch.dtype", List["torch.Tensor"]] = field(
+        init=False, default_factory=dict, repr=False
+    )
+    optimizer_tensors_by_dtype: Dict["torch.dtype", List["torch.Tensor"]] = field(
+        init=False, default_factory=dict, repr=False
+    )
+
 
 class ShardingEnv2D(ShardingEnv):
     """

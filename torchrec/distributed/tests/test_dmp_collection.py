@@ -136,6 +136,8 @@ class TestDMPCollectionContext(unittest.TestCase):
             "replica_pg",
             "modules_to_sync",
             "sharded_module",
+            "weights_by_dtype",
+            "optimizer_tensors_by_dtype",
         }
         self.assertEqual(field_names, expected_fields)
 
@@ -179,6 +181,8 @@ class TestDMPCollectionContext(unittest.TestCase):
 
         self.assertEqual(context.modules_to_sync, [])
         self.assertIsNone(context.sharded_module)
+        self.assertEqual(context.weights_by_dtype, {})
+        self.assertEqual(context.optimizer_tensors_by_dtype, {})
 
     def test_init_false_fields_can_be_set_after_construction(self) -> None:
         mock_plan = MagicMock(spec=ShardingPlan)
@@ -213,6 +217,8 @@ class TestDMPCollectionContext(unittest.TestCase):
         self.assertNotIn("sharding_pg=", repr_str)
         self.assertNotIn("replica_pg=", repr_str)
         self.assertNotIn("modules_to_sync=", repr_str)
+        self.assertNotIn("weights_by_dtype=", repr_str)
+        self.assertNotIn("optimizer_tensors_by_dtype=", repr_str)
         self.assertNotIn("sharded_module=", repr_str)
 
 
