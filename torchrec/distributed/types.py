@@ -931,29 +931,29 @@ class ShardingStrategy(Enum):
     FULLY_SHARDED = "fully_sharded"
 
 
+@dataclass
 class DMPCollectionConfig:
+    """
+    Configuration for a submodule in DMPCollection.
+
+    This dataclass holds the sharding configuration for a specific module type
+    when using 2D parallelism with DMPCollection.
+
+    Attributes:
+        module: The module type (class) to apply this configuration to.
+        plan: The sharding plan for this module's subtree.
+        sharding_group_size: Number of ranks in each sharding group.
+        node_group_size: Optional logical group size for TWRW/GRID sharding.
+        use_inter_host_allreduce: Whether to use inter-host allreduce for sync.
+        sharding_strategy: The sharding strategy to use.
+    """
+
     module: Type[nn.Module]
     plan: "ShardingPlan" = field(repr=False)  # sub-tree-specific sharding plan
     sharding_group_size: int
     node_group_size: Optional[int] = None
     use_inter_host_allreduce: bool = False
     sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT
-
-    def __init__(
-        self,
-        module: Type[nn.Module],
-        plan: "ShardingPlan",
-        sharding_group_size: int,
-        node_group_size: Optional[int] = None,
-        use_inter_host_allreduce: bool = False,
-        sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
-    ) -> None:
-        self.module = module
-        self.plan = plan
-        self.sharding_group_size = sharding_group_size
-        self.node_group_size = node_group_size
-        self.use_inter_host_allreduce = use_inter_host_allreduce
-        self.sharding_strategy = sharding_strategy
 
     def __post_init__(self) -> None:
         if isinstance(self.module, ShardedModule):
@@ -963,17 +963,22 @@ class DMPCollectionConfig:
 
 
 # for internal use in DMPCollection
+@dataclass
 class DMPCollectionContext(DMPCollectionConfig):
-    device_mesh: "DeviceMesh" = field(init=False)
-    sharding_pg: "dist.ProcessGroup" = field(init=False)
-    replica_pg: "dist.ProcessGroup" = field(init=False)
+    """
+    Internal context for DMPCollection that extends DMPCollectionConfig
+    with runtime state for process groups and modules to sync.
+
+    The additional fields are set after initialization during DMPCollection setup.
+    """
+
+    device_mesh: "DeviceMesh" = field(init=False, repr=False)
+    sharding_pg: "dist.ProcessGroup" = field(init=False, repr=False)
+    replica_pg: "dist.ProcessGroup" = field(init=False, repr=False)
     modules_to_sync: List[Tuple[nn.Module, nn.Module]] = field(
-        init=False, default_factory=list
+        init=False, default_factory=list, repr=False
     )
-    sharded_module: Optional[nn.Module] = field(init=False, default=None)
-    sharding_strategy: ShardingStrategy = field(
-        init=False, default=ShardingStrategy.DEFAULT
-    )
+    sharded_module: Optional[nn.Module] = field(init=False, default=None, repr=False)
 
 
 class ShardingEnv2D(ShardingEnv):
