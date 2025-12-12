@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 import torch
 from hypothesis import given, settings, strategies as st, Verbosity
 from parameterized import param, parameterized
+from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.sparse.jagged_tensor_validator import validate_keyed_jagged_tensor
 
@@ -236,4 +237,188 @@ class TestJaggedTensorValidator(unittest.TestCase):
     def test_valid_empty_kjt(self) -> None:
         kjt = KeyedJaggedTensor.empty()
 
-        validate_keyed_jagged_tensor(kjt)
+        result = validate_keyed_jagged_tensor(kjt)
+        self.assertTrue(result)
+
+    def test_feature_range_valid_values(self) -> None:
+        # Setup: Create KJT with values within valid range and corresponding configs
+        kjt = KeyedJaggedTensor(
+            keys=["feature1", "feature2"],
+            values=torch.tensor([0, 5, 10, 1, 2, 3]),
+            lengths=torch.tensor([3, 3]),
+        )
+        configs = [
+            EmbeddingBagConfig(
+                num_embeddings=20,
+                embedding_dim=8,
+                name="table1",
+                feature_names=["feature1", "feature2"],
+            )
+        ]
+
+        # Execute: Validate KJT with configs
+        result = validate_keyed_jagged_tensor(kjt, configs)
+
+        # Assert: Validation should return True for valid values
+        self.assertTrue(result)
+
+    def test_feature_range_boundary_values(self) -> None:
+        # Setup: Create KJT with boundary values (0 and num_embeddings-1)
+        kjt = KeyedJaggedTensor(
+            keys=["feature1"],
+            values=torch.tensor([0, 9]),
+            lengths=torch.tensor([2]),
+        )
+        configs = [
+            EmbeddingBagConfig(
+                num_embeddings=10,
+                embedding_dim=8,
+                name="table1",
+                feature_names=["feature1"],
+            )
+        ]
+
+        # Execute: Validate KJT with configs
+        result = validate_keyed_jagged_tensor(kjt, configs)
+
+        # Assert: Boundary values should be valid
+        self.assertTrue(result)
+
+    def test_feature_range_negative_value_returns_false(self) -> None:
+        # Setup: Create KJT with negative value
+        kjt = KeyedJaggedTensor(
+            keys=["feature1"],
+            values=torch.tensor([-1, 5, 10]),
+            lengths=torch.tensor([3]),
+        )
+        configs = [
+            EmbeddingBagConfig(
+                num_embeddings=20,
+                embedding_dim=8,
+                name="table1",
+                feature_names=["feature1"],
+            )
+        ]
+
+        # Execute: Validate KJT with configs
+        result = validate_keyed_jagged_tensor(kjt, configs)
+
+        # Assert: Validation should return False for out of range values
+        self.assertFalse(result)
+
+    def test_feature_range_value_exceeds_num_embeddings_returns_false(
+        self,
+    ) -> None:
+        # Setup: Create KJT with value >= num_embeddings
+        kjt = KeyedJaggedTensor(
+            keys=["feature1"],
+            values=torch.tensor([0, 5, 20]),
+            lengths=torch.tensor([3]),
+        )
+        configs = [
+            EmbeddingBagConfig(
+                num_embeddings=20,
+                embedding_dim=8,
+                name="table1",
+                feature_names=["feature1"],
+            )
+        ]
+
+        # Execute: Validate KJT with configs
+        result = validate_keyed_jagged_tensor(kjt, configs)
+
+        # Assert: Validation should return False for out of range values
+        self.assertFalse(result)
+
+    def test_feature_range_feature_not_in_config_returns_true(self) -> None:
+        # Setup: Create KJT with feature not in any config
+        kjt = KeyedJaggedTensor(
+            keys=["feature1", "feature2"],
+            values=torch.tensor([0, 5, 1, 2]),
+            lengths=torch.tensor([2, 2]),
+        )
+        configs = [
+            EmbeddingBagConfig(
+                num_embeddings=20,
+                embedding_dim=8,
+                name="table1",
+                feature_names=["feature1"],
+            )
+        ]
+
+        # Execute: Validate KJT with configs
+        result = validate_keyed_jagged_tensor(kjt, configs)
+
+        # Assert: Should return True since feature2 is just not in config (not invalid)
+        self.assertTrue(result)
+
+    def test_feature_range_multiple_tables_with_different_ranges(self) -> None:
+        # Setup: Create KJT with features from different tables with different num_embeddings
+        kjt = KeyedJaggedTensor(
+            keys=["feature1", "feature2"],
+            values=torch.tensor([0, 5, 10, 15, 25]),
+            lengths=torch.tensor([3, 2]),
+        )
+        configs = [
+            EmbeddingBagConfig(
+                num_embeddings=15,
+                embedding_dim=8,
+                name="table1",
+                feature_names=["feature1"],
+            ),
+            EmbeddingBagConfig(
+                num_embeddings=30,
+                embedding_dim=16,
+                name="table2",
+                feature_names=["feature2"],
+            ),
+        ]
+
+        # Execute: Validate KJT with configs
+        result = validate_keyed_jagged_tensor(kjt, configs)
+
+        # Assert: feature1 has max 10 < 15, feature2 has max 25 < 30 - all valid
+        self.assertTrue(result)
+
+    def test_feature_range_multiple_features_one_out_of_range(self) -> None:
+        # Setup: Create KJT with one feature in range and one out of range
+        kjt = KeyedJaggedTensor(
+            keys=["feature1", "feature2"],
+            values=torch.tensor([0, 5, 10, 15, 25]),
+            lengths=torch.tensor([3, 2]),
+        )
+        configs = [
+            EmbeddingBagConfig(
+                num_embeddings=15,
+                embedding_dim=8,
+                name="table1",
+                feature_names=["feature1"],
+            ),
+            EmbeddingBagConfig(
+                num_embeddings=20,
+                embedding_dim=16,
+                name="table2",
+                feature_names=["feature2"],
+            ),
+        ]
+
+        # Execute: Validate KJT with configs
+        result = validate_keyed_jagged_tensor(kjt, configs)
+
+        # Assert: Should return False since feature2 has value 25 >= 20
+        self.assertFalse(result)
+
+    def test_feature_range_empty_configs(self) -> None:
+        # Setup: Create KJT with no configs provided
+        kjt = KeyedJaggedTensor(
+            keys=["feature1"],
+            values=torch.tensor([0, 5, 10]),
+            lengths=torch.tensor([3]),
+        )
+        configs = []
+
+        # Execute: Validate KJT with empty configs
+        result = validate_keyed_jagged_tensor(kjt, configs)
+
+        # Assert: Should return True since no configs means no range validation
+        self.assertTrue(result)
