@@ -936,22 +936,21 @@ class DMPCollection(DistributedModelParallel):
             sharder.module_type: sharder for sharder in sharders
         }
 
-        # the args provided by the users are used for default modules
-        # default context is index 0, TODO - if cleaner way to distinguish
-        self._ctxs: List[DMPCollectionContext] = [
-            DMPCollectionContext(
-                # default context has module type None
-                module=None,  # pyre-ignore[6]
-                plan=plan,
-                sharding_group_size=sharding_group_size,
-                node_group_size=node_group_size,
-                use_inter_host_allreduce=use_inter_host_allreduce,
-            )
-        ]
+        # Create the default context for modules without submodule configs
+        self._default_ctx: DMPCollectionContext = DMPCollectionContext(
+            # default context has module type None
+            module=None,  # pyre-ignore[6]
+            plan=plan,
+            sharding_group_size=sharding_group_size,
+            node_group_size=node_group_size,
+            use_inter_host_allreduce=use_inter_host_allreduce,
+            sharding_strategy=sharding_strategy,
+        )
 
+        self._submodule_ctxs: List[DMPCollectionContext] = []
         if submodule_configs is not None:
             for submodule_config in submodule_configs:
-                self._ctxs.append(
+                self._submodule_ctxs.append(
                     DMPCollectionContext(
                         module=submodule_config.module,
                         plan=submodule_config.plan,
@@ -960,6 +959,10 @@ class DMPCollection(DistributedModelParallel):
                         sharding_strategy=submodule_config.sharding_strategy,
                     )
                 )
+
+        self._ctxs: List[DMPCollectionContext] = [
+            self._default_ctx
+        ] + self._submodule_ctxs
 
         # create process groups and remap sharding plans per module context
         for ctx in self._ctxs:
@@ -991,8 +994,8 @@ class DMPCollection(DistributedModelParallel):
                 # pyre-ignore[16]
                 ctx.sharded_module = self._sharder_map[ctx.module].sharded_module_type
 
-        consolidated_plan = self._ctxs[0].plan
-        for ctx in self._ctxs[1:]:
+        consolidated_plan = self._default_ctx.plan
+        for ctx in self._submodule_ctxs:
             for key, val in ctx.plan.plan.items():
                 consolidated_plan.plan[key] = val
 
@@ -1002,12 +1005,12 @@ class DMPCollection(DistributedModelParallel):
 
         default_env = ShardingEnv2D(
             global_pg=self._pg,
-            sharding_pg=self._ctxs[0].sharding_pg,
-            replica_pg=self._ctxs[0].replica_pg,
-            device_mesh=self._ctxs[0].device_mesh,
+            sharding_pg=self._default_ctx.sharding_pg,
+            replica_pg=self._default_ctx.replica_pg,
+            device_mesh=self._default_ctx.device_mesh,
             node_group_size=node_group_size,
-            use_inter_host_allreduce=self._ctxs[0].use_inter_host_allreduce,
-            sharding_strategy=sharding_strategy,
+            use_inter_host_allreduce=self._default_ctx.use_inter_host_allreduce,
+            sharding_strategy=self._default_ctx.sharding_strategy,
         )
 
         super().__init__(  # type: ignore[misc]
@@ -1023,6 +1026,7 @@ class DMPCollection(DistributedModelParallel):
 
         # post DMP init, we group sharded modules for parameter sync, stored in the context
         self._group_sharded_modules(self._ctxs)
+        self._cache_sync_tensors(self._ctxs)
 
     def _shard_modules_impl(
         self,
@@ -1057,7 +1061,7 @@ class DMPCollection(DistributedModelParallel):
             env = self._env
             sharder_key = type(module)
 
-            for ctx in self._ctxs[1:]:
+            for ctx in self._submodule_ctxs:
                 if ctx.module == sharder_key:
                     env = ShardingEnv2D(
                         global_pg=self._pg,
@@ -1106,50 +1110,34 @@ class DMPCollection(DistributedModelParallel):
         """
         # we sync per context to use the right all reduce process group
         for ctx in self._ctxs:
-            self._sync(
-                ctx.replica_pg,
-                ctx.modules_to_sync,
-                include_optimizer_state,
-            )
+            self._sync(ctx, include_optimizer_state)
 
     def _sync(
         self,
-        replica_pg: dist.ProcessGroup,
-        modules_to_sync: List[Tuple[nn.Module, nn.Module]],
+        ctx: DMPCollectionContext,
         include_optimizer_state: bool = True,
     ) -> None:
-        assert replica_pg is not None, "replica_pg is not initialized!"
-        all_weights_by_dtype: dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
-
-        for emb_kernel, _ in modules_to_sync:
-            for w in emb_kernel.split_embedding_weights():  # pyre-ignore[29]
-                all_weights_by_dtype[w.dtype].append(w)
+        assert ctx.replica_pg is not None, "replica_pg is not initialized!"
 
         opts = None
         if self._custom_all_reduce is None:
             opts = dist.AllreduceCoalescedOptions()
             opts.reduceOp = dist.ReduceOp.AVG
+
         self._allreduce_tensors(
-            replica_pg, all_weights_by_dtype, "## 2d_weight_sync ##", opts
+            ctx.replica_pg,
+            ctx.weights_by_dtype,
+            "## 2d_weight_sync ##",
+            opts,
         )
 
-        if include_optimizer_state:
-            optimizer_tensors_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = (
-                defaultdict(list)
+        if include_optimizer_state and ctx.optimizer_tensors_by_dtype:
+            self._allreduce_tensors(
+                ctx.replica_pg,
+                ctx.optimizer_tensors_by_dtype,
+                "## 2d_optimizer_sync ##",
+                opts,
             )
-            for emb_kernel, _ in modules_to_sync:
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-                optimizer_states = emb_kernel.get_optimizer_state()
-                for state in optimizer_states:
-                    opt_tensor = state["sum"]
-                    optimizer_tensors_by_dtype[opt_tensor.dtype].append(opt_tensor)
-            if optimizer_tensors_by_dtype:
-                self._allreduce_tensors(
-                    replica_pg,
-                    optimizer_tensors_by_dtype,
-                    "## 2d_optimizer_sync ##",
-                    opts,
-                )
 
     def _allreduce_tensors(
         self,
@@ -1310,7 +1298,14 @@ class DMPCollection(DistributedModelParallel):
         self,
         contexts: List[DMPCollectionContext],
     ) -> None:
-        # Post init DMP, save the embedding kernels, with respect to contexts
+        """
+        Group sharded modules by context for parameter synchronization.
+
+        Args:
+            contexts: List of contexts where contexts[0] is the default context
+                and contexts[1:] are submodule-specific contexts.
+        """
+        # Process submodule-specific contexts first (contexts[1:])
         for context in contexts[1:]:
             context.modules_to_sync = self._group_sharded_module(
                 context.sharded_module  # pyre-ignore[6]
@@ -1364,10 +1359,37 @@ class DMPCollection(DistributedModelParallel):
         _find_sharded_modules(self._dmp_wrapped_module, None)
         return sharded_modules
 
+    def _cache_sync_tensors(
+        self,
+        contexts: List[DMPCollectionContext],
+    ) -> None:
+        """
+        Pre-compute and cache the weight and optimizer tensor mappings by dtype.
+
+        This is called once after _group_sharded_modules() to avoid rebuilding
+        these mappings on every sync() call. The cached mappings are stored
+        in each context for use during sync operations.
+        """
+        for context in contexts:
+            weights_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
+            optimizer_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(
+                list
+            )
+            for emb_kernel, _ in context.modules_to_sync:
+                for w in emb_kernel.split_embedding_weights():  # pyre-ignore[29]
+                    weights_by_dtype[w.dtype].append(w)
+
+                for state in emb_kernel.get_optimizer_state():
+                    opt_tensor = state["sum"]
+                    optimizer_by_dtype[opt_tensor.dtype].append(opt_tensor)
+
+            context.weights_by_dtype = dict(weights_by_dtype)
+            context.optimizer_tensors_by_dtype = dict(optimizer_by_dtype)
+
     @property
     def device_mesh(self) -> DeviceMesh:
         """
         Returns the device mesh used for 2D parallelism.
         Contains two dimensions: "replicate" and "shard".
         """
-        return self._ctxs[0].device_mesh
+        return self._default_ctx.device_mesh
