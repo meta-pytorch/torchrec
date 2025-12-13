@@ -327,31 +327,80 @@ class CopyableMixin(nn.Module):
         )
 
 
+# Canonical mapping from torchrec optimizer classes to EmbOptimType.
+_OPTIMIZER_CLASS_TO_EMB_OPT_TYPE: Dict[Type[torch.optim.Optimizer], EmbOptimType] = {
+    # torch optimizers
+    torch.optim.SGD: EmbOptimType.EXACT_SGD,
+    torch.optim.Adagrad: EmbOptimType.EXACT_ADAGRAD,
+    torch.optim.Adam: EmbOptimType.ADAM,
+    # torchrec wrappers over these optims.
+    # they accept an **unused kwargs portion, that let us set FBGEMM specific args such as
+    # max gradient, etc
+    trec_optim.SGD: EmbOptimType.EXACT_SGD,
+    trec_optim.LarsSGD: EmbOptimType.LARS_SGD,
+    trec_optim.LAMB: EmbOptimType.LAMB,
+    trec_optim.PartialRowWiseLAMB: EmbOptimType.PARTIAL_ROWWISE_LAMB,
+    trec_optim.Adam: EmbOptimType.ADAM,
+    trec_optim.PartialRowWiseAdam: EmbOptimType.PARTIAL_ROWWISE_ADAM,
+    trec_optim.Adagrad: EmbOptimType.EXACT_ADAGRAD,
+    trec_optim.RowWiseAdagrad: EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+}
+
+# Inverse mapping from EmbOptimType to optimizer class.
+# When multiple optimizer classes map to the same EmbOptimType, we prefer torchrec wrappers.
+_EMB_OPT_TYPE_TO_OPTIMIZER_CLASS: Dict[EmbOptimType, Type[torch.optim.Optimizer]] = {
+    EmbOptimType.EXACT_SGD: trec_optim.SGD,
+    EmbOptimType.EXACT_ADAGRAD: trec_optim.Adagrad,
+    EmbOptimType.ADAM: trec_optim.Adam,
+    EmbOptimType.LARS_SGD: trec_optim.LarsSGD,
+    EmbOptimType.LAMB: trec_optim.LAMB,
+    EmbOptimType.PARTIAL_ROWWISE_LAMB: trec_optim.PartialRowWiseLAMB,
+    EmbOptimType.PARTIAL_ROWWISE_ADAM: trec_optim.PartialRowWiseAdam,
+    EmbOptimType.EXACT_ROWWISE_ADAGRAD: trec_optim.RowWiseAdagrad,
+}
+
+
 def optimizer_type_to_emb_opt_type(
     optimizer_class: Type[torch.optim.Optimizer],
 ) -> Optional[EmbOptimType]:
+    """
+    Convert a torch.optim.Optimizer class to its corresponding EmbOptimType.
+
+    Args:
+        optimizer_class: The optimizer class to convert.
+
+    Returns:
+        The corresponding EmbOptimType.
+
+    Raises:
+        ValueError: If the optimizer class is not in the mapping.
+    """
     # TODO add more optimizers to be in parity with ones provided by FBGEMM
     # TODO kwargs accepted by fbgemm and and canonical optimizers are different
     # may need to add special handling for them
-    lookup = {
-        torch.optim.SGD: EmbOptimType.EXACT_SGD,
-        torch.optim.Adagrad: EmbOptimType.EXACT_ADAGRAD,
-        torch.optim.Adam: EmbOptimType.ADAM,
-        # below are torchrec wrappers over these optims.
-        # they accept an **unused kwargs portion, that let us set FBGEMM specific args such as
-        # max gradient, etc
-        trec_optim.SGD: EmbOptimType.EXACT_SGD,
-        trec_optim.LarsSGD: EmbOptimType.LARS_SGD,
-        trec_optim.LAMB: EmbOptimType.LAMB,
-        trec_optim.PartialRowWiseLAMB: EmbOptimType.PARTIAL_ROWWISE_LAMB,
-        trec_optim.Adam: EmbOptimType.ADAM,
-        trec_optim.PartialRowWiseAdam: EmbOptimType.PARTIAL_ROWWISE_ADAM,
-        trec_optim.Adagrad: EmbOptimType.EXACT_ADAGRAD,
-        trec_optim.RowWiseAdagrad: EmbOptimType.EXACT_ROWWISE_ADAGRAD,
-    }
-    if optimizer_class not in lookup:
+    if optimizer_class not in _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE:
         raise ValueError(f"Cannot cast {optimizer_class} to an EmbOptimType")
-    return lookup[optimizer_class]
+    return _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE[optimizer_class]
+
+
+def emb_opt_type_to_optimizer_class(
+    emb_opt_type: Optional[EmbOptimType],
+) -> Optional[Type[torch.optim.Optimizer]]:
+    """
+    Convert EmbOptimType to torch.optim.Optimizer class for optimizer storage calculation.
+
+    This is the inverse of optimizer_type_to_emb_opt_type. When multiple optimizer classes
+    map to the same EmbOptimType, this function returns the torchrec wrapper class.
+
+    Args:
+        emb_opt_type: The EmbOptimType to convert, or None.
+
+    Returns:
+        The corresponding optimizer class, or None if emb_opt_type is None or not found.
+    """
+    if emb_opt_type is None:
+        return None
+    return _EMB_OPT_TYPE_TO_OPTIMIZER_CLASS.get(emb_opt_type)
 
 
 def merge_fused_params(
