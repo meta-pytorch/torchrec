@@ -1539,11 +1539,8 @@ class ShardedEmbeddingBagCollection(
         ctx.inverse_indices = features.inverse_indices_or_none()
 
         if self._has_uninitialized_input_dist:
-            if torch._utils_internal.justknobs_check(
-                "pytorch/torchrec:enable_kjt_validation"
-            ):
-                logger.info("Validating input features...")
-                validate_keyed_jagged_tensor(features, self._embedding_bag_configs)
+            logger.info("Validating input features...")
+            validate_keyed_jagged_tensor(features, self._embedding_bag_configs)
 
             self._create_input_dist(features.keys())
             self._has_uninitialized_input_dist = False
