@@ -44,9 +44,9 @@ from torchrec.test_utils import skip_if_asan_class
 
 
 def _test_sharding(  # noqa C901
-    tables: List[EmbeddingConfig],
     rank: int,
     world_size: int,
+    tables: List[EmbeddingConfig],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     backend: str,
     local_size: Optional[int] = None,

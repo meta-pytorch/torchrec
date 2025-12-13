@@ -31,8 +31,8 @@ from torchrec.optim.rowwise_adagrad import RowWiseAdagrad
 class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
     @staticmethod
     def _test_sharded_fused_optimizer_state_dict(
-        tables: List[EmbeddingBagConfig],
         rank: int,
+        tables: List[EmbeddingBagConfig],
         local_size: int,
         world_size: int,
         backend: str,

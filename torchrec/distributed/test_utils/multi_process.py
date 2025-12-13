@@ -13,6 +13,7 @@ import logging
 import multiprocessing
 import os
 import unittest
+from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -144,21 +145,19 @@ class MultiProcessTestBase(unittest.TestCase):
         # pyre-ignore
         **kwargs,
     ) -> None:
+        """
+        run callable in multiple processes with the same keyword arguments
+        the callable should be able to take rank and world_size as arguments
+        particularly the rank should be the first argument:
+        ```
+        def callable(rank: int, world_size: int, **kwargs):
+            ...
+        ```
+        """
         ctx = multiprocessing.get_context(self._mp_init_mode)
-        processes = []
-        for rank in range(world_size):
-            kwargs["rank"] = rank
+        with ctx.Pool(processes=world_size) as pool:
             kwargs["world_size"] = world_size
-            p = ctx.Process(
-                target=callable,
-                kwargs=kwargs,
-            )
-            p.start()
-            processes.append(p)
-
-        for p in processes:
-            p.join()
-            self.assertEqual(0, p.exitcode)
+            pool.map(partial(callable, **kwargs), range(world_size))
 
     def _run_multi_process_test_per_rank(
         self,
