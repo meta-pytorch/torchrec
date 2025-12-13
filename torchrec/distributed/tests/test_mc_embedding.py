@@ -109,10 +109,10 @@ class SparseArch(nn.Module):
 
 
 def _test_sharding_and_remapping(  # noqa C901
-    output_keys: List[str],
-    tables: List[EmbeddingConfig],
     rank: int,
     world_size: int,
+    output_keys: List[str],
+    tables: List[EmbeddingConfig],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     kjt_out_per_iter_per_rank: List[List[KeyedJaggedTensor]],
     initial_state_per_rank: List[Dict[str, torch.Tensor]],
@@ -247,10 +247,10 @@ def _test_sharding_and_remapping(  # noqa C901
 
 
 def _test_in_place_embd_weight_update(  # noqa C901
-    output_keys: List[str],
-    tables: List[EmbeddingConfig],
     rank: int,
     world_size: int,
+    output_keys: List[str],
+    tables: List[EmbeddingConfig],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     kjt_out_per_iter_per_rank: List[List[KeyedJaggedTensor]],
     initial_state_per_rank: List[Dict[str, torch.Tensor]],
@@ -349,9 +349,9 @@ def _test_in_place_embd_weight_update(  # noqa C901
 
 
 def _test_sharding_and_resharding(  # noqa C901
-    tables: List[EmbeddingConfig],
     rank: int,
     world_size: int,
+    tables: List[EmbeddingConfig],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     kjt_out_per_iter_per_rank: List[List[KeyedJaggedTensor]],
     initial_state_per_rank: List[Dict[str, torch.Tensor]],
@@ -534,9 +534,9 @@ def _test_sharding_and_resharding(  # noqa C901
 
 
 def _test_sharding_dedup(  # noqa C901
-    tables: List[EmbeddingConfig],
     rank: int,
     world_size: int,
+    tables: List[EmbeddingConfig],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     sharder: ModuleSharder[nn.Module],
     dedup_sharder: ModuleSharder[nn.Module],

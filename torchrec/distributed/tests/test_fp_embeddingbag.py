@@ -116,9 +116,9 @@ def get_unsharded_and_sharded_module(
 
 
 def _test_sharding(  # noqa C901
-    tables: List[EmbeddingBagConfig],
     rank: int,
     world_size: int,
+    tables: List[EmbeddingBagConfig],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     sharder: ModuleSharder[nn.Module],
     backend: str,
@@ -189,9 +189,9 @@ def _test_sharding(  # noqa C901
 
 
 def _test_sharding_from_meta(  # noqa C901
-    tables: List[EmbeddingBagConfig],
     rank: int,
     world_size: int,
+    tables: List[EmbeddingBagConfig],
     sharder: ModuleSharder[nn.Module],
     backend: str,
     local_size: Optional[int] = None,

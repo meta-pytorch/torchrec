@@ -193,9 +193,9 @@ class SparseArch(nn.Module):
 
 
 def _test_sharding(  # noqa C901
-    tables: List[EmbeddingBagConfig],
     rank: int,
     world_size: int,
+    tables: List[EmbeddingBagConfig],
     sharder: ModuleSharder[nn.Module],
     backend: str,
     local_size: Optional[int] = None,
@@ -253,10 +253,10 @@ def _test_sharding(  # noqa C901
 
 
 def _test_sharding_and_remapping(  # noqa C901
-    output_keys: List[str],
-    tables: List[EmbeddingBagConfig],
     rank: int,
     world_size: int,
+    output_keys: List[str],
+    tables: List[EmbeddingBagConfig],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     kjt_out_per_iter_per_rank: List[List[KeyedJaggedTensor]],
     sharder: ModuleSharder[nn.Module],
@@ -365,10 +365,10 @@ def _test_sharding_and_remapping(  # noqa C901
 
 
 def _test_in_place_embd_weight_update(  # noqa C901
-    output_keys: List[str],
-    tables: List[EmbeddingBagConfig],
     rank: int,
     world_size: int,
+    output_keys: List[str],
+    tables: List[EmbeddingBagConfig],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     kjt_out_per_iter_per_rank: List[List[KeyedJaggedTensor]],
     sharder: ModuleSharder[nn.Module],

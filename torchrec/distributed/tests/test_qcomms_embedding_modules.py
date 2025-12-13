@@ -48,10 +48,10 @@ from torchrec.test_utils import skip_if_asan_class
 
 
 def _test_sharding(
-    tables: List[EmbeddingBagConfig],
-    initial_state_dict: Dict[str, Any],
     rank: int,
     world_size: int,
+    tables: List[EmbeddingBagConfig],
+    initial_state_dict: Dict[str, Any],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     backend: str,
     parameter_sharding_plan: Dict[str, ParameterSharding],

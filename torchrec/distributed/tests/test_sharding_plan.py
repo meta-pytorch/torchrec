@@ -77,10 +77,10 @@ from torchrec.types import DataType
 
 
 def _test_sharding(
-    tables: List[EmbeddingBagConfig],
-    initial_state_dict: Dict[str, Any],
     rank: int,
     world_size: int,
+    tables: List[EmbeddingBagConfig],
+    initial_state_dict: Dict[str, Any],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     backend: str,
     module_sharding_plan: EmbeddingModuleShardingPlan,

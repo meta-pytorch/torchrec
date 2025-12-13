@@ -67,10 +67,10 @@ def _optional_equals(t1: Optional[torch.Tensor], t2: Optional[torch.Tensor]) -> 
 
 
 def _test_sharding(  # noqa C901
-    tables: List[EmbeddingBagConfig],
-    initial_state_dict: Dict[str, Any],
     rank: int,
     world_size: int,
+    tables: List[EmbeddingBagConfig],
+    initial_state_dict: Dict[str, Any],
     kjt_input_per_rank: List[KeyedJaggedTensor],
     sharder: ModuleSharder[nn.Module],
     backend: str,
