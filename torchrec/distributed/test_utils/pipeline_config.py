@@ -12,14 +12,13 @@ from typing import Dict, Type, Union
 
 import torch
 from torch import nn
-from torchrec.distributed.train_pipeline import (
+from torchrec.distributed.train_pipeline.train_pipelines import (
+    EvalPipelineSparseDist,
+    PrefetchTrainPipelineSparseDist,
     TrainPipelineBase,
     TrainPipelineFusedSparseDist,
-    TrainPipelineSparseDist,
-)
-from torchrec.distributed.train_pipeline.train_pipelines import (
-    PrefetchTrainPipelineSparseDist,
     TrainPipelineSemiSync,
+    TrainPipelineSparseDist,
 )
 
 
@@ -94,41 +93,42 @@ class PipelineConfig:
             "fused": TrainPipelineFusedSparseDist,
             "semi": TrainPipelineSemiSync,
             "prefetch": PrefetchTrainPipelineSparseDist,
+            "eval-sdd": EvalPipelineSparseDist,
         }
 
-        if self.pipeline == "semi":
-            return TrainPipelineSemiSync(
-                model=model,
-                optimizer=opt,
-                device=device,
-                start_batch=0,
-                apply_jit=self.apply_jit,
-            )
-        elif self.pipeline == "fused":
-            return TrainPipelineFusedSparseDist(
-                model=model,
-                optimizer=opt,
-                device=device,
-                emb_lookup_stream=self.emb_lookup_stream,
-                apply_jit=self.apply_jit,
-                inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
-            )
-        elif self.pipeline == "base":
-            assert self.apply_jit is False, "JIT is not supported for base pipeline"
-
-            return TrainPipelineBase(
-                model=model,
-                optimizer=opt,
-                device=device,
-                inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
-            )
-        else:
-            Pipeline = _pipeline_cls[self.pipeline]
-            # pyre-ignore[28]
-            return Pipeline(
-                model=model,
-                optimizer=opt,
-                device=device,
-                apply_jit=self.apply_jit,
-                inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
-            )
+        match self.pipeline:
+            case "base":
+                assert self.apply_jit is False, "JIT is not supported for base pipeline"
+                return TrainPipelineBase(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
+                )
+            case "fused":
+                return TrainPipelineFusedSparseDist(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    emb_lookup_stream=self.emb_lookup_stream,
+                    apply_jit=self.apply_jit,
+                    inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
+                )
+            case "semi":
+                return TrainPipelineSemiSync(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    start_batch=0,
+                    apply_jit=self.apply_jit,
+                )
+            case _:
+                Pipeline = _pipeline_cls[self.pipeline]
+                # pyre-ignore[28]
+                return Pipeline(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    apply_jit=self.apply_jit,
+                    inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
+                )

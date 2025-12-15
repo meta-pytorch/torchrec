@@ -1836,8 +1836,16 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         optimizer: torch.optim.Optimizer,
         device: torch.device,
         apply_jit: bool = False,
+        inplace_copy_batch_to_gpu: bool = False,
     ) -> None:
-        super().__init__(model, optimizer, device, True, apply_jit)
+        super().__init__(
+            model,
+            optimizer=optimizer,
+            device=device,
+            execute_all_batches=True,
+            apply_jit=apply_jit,
+            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+        )
         self._batch_loader: Optional[DataLoadingThread[In]] = None
 
     def __del__(self) -> None:
@@ -1897,6 +1905,12 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         self.dequeue_batch()
 
         return output
+
+    def reset(self) -> None:
+        super().reset()
+        if self._batch_loader is not None:
+            self._batch_loader.stop()
+            self._batch_loader = None
 
 
 class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
