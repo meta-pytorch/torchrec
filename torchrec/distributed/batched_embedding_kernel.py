@@ -1758,19 +1758,29 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
                     weight_init_max,
                 )
 
-    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
-        hash_zch_identities = self._get_hash_zch_identities(features)
-        if hash_zch_identities is None:
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+    ) -> torch.Tensor:
+        forward_args: Dict[str, Any] = {}
+        identities_and_metadata = self._get_hash_zch_identities_and_metadata(features)
+        if identities_and_metadata is not None:
+            hash_zch_identities, hash_zch_runtime_meta = identities_and_metadata
+            forward_args["hash_zch_identities"] = hash_zch_identities
+            if hash_zch_runtime_meta is not None:
+                forward_args["hash_zch_runtime_meta"] = hash_zch_runtime_meta
+
+        if len(forward_args) == 0:
             return self.emb_module(
                 indices=features.values().long(),
                 offsets=features.offsets().long(),
             )
-
-        return self.emb_module(
-            indices=features.values().long(),
-            offsets=features.offsets().long(),
-            hash_zch_identities=hash_zch_identities,
-        )
+        else:
+            return self.emb_module(
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
+                **forward_args,
+            )
 
     # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
@@ -2832,9 +2842,12 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         features: KeyedJaggedTensor,
     ) -> torch.Tensor:
         forward_args: Dict[str, Any] = {}
-        hash_zch_identities = self._get_hash_zch_identities(features)
-        if hash_zch_identities is not None:
+        identities_and_metadata = self._get_hash_zch_identities_and_metadata(features)
+        if identities_and_metadata is not None:
+            hash_zch_identities, hash_zch_runtime_meta = identities_and_metadata
             forward_args["hash_zch_identities"] = hash_zch_identities
+            if hash_zch_runtime_meta is not None:
+                forward_args["hash_zch_runtime_meta"] = hash_zch_runtime_meta
 
         weights = features.weights_or_none()
         if weights is not None and not torch.is_floating_point(weights):
