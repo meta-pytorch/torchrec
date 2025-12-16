@@ -185,33 +185,62 @@ class RawIdTracker(ModelDeltaTracker):
         states: torch.Tensor,
         emb_module: Optional[nn.Module] = None,
         raw_ids: Optional[torch.Tensor] = None,
+        runtime_meta: Optional[torch.Tensor] = None,
     ) -> None:
         per_table_ids: Dict[str, List[torch.Tensor]] = {}
         per_table_raw_ids: Dict[str, List[torch.Tensor]] = {}
+        per_table_runtime_meta: Dict[str, List[torch.Tensor]] = {}
 
-        # Skip storing invalid input or raw ids
-        if (
-            raw_ids is None
-            or (kjt.values().numel() == 0)
-            or not (raw_ids.numel() % kjt.values().numel() == 0)
-        ):
+        # Skip storing invalid input or raw ids, note that runtime_meta will only exist if raw_ids exists so we can return early
+        if raw_ids is None:
+            logger.debug("Skipping record_lookup: raw_ids is None")
             return
 
-        embeddings_2d = raw_ids.view(kjt.values().numel(), -1)
+        if kjt.values().numel() == 0:
+            logger.debug("Skipping record_lookup: kjt.values() is empty")
+            return
+
+        if not (raw_ids.numel() % kjt.values().numel() == 0):
+            logger.warning(
+                f"Skipping record_lookup. Raw_ids has invalid shape {raw_ids.shape}, expected multiple of {kjt.values().numel()}"
+            )
+            return
+
+        # Skip storing if runtime_meta is provided but has invalid shape
+        if runtime_meta is not None and not (
+            runtime_meta.numel() % kjt.values().numel() == 0
+        ):
+            logger.warning(
+                f"Skipping record_lookup. Runtime_meta has invalid shape {runtime_meta.shape}, expected multiple of {kjt.values().numel()}"
+            )
+            return
+
+        raw_ids_2d = raw_ids.view(kjt.values().numel(), -1)
+        runtime_meta_2d = None
+        # It is possible that runtime_meta is None while raw_ids is not None so we will proceed
+        if runtime_meta is not None:
+            runtime_meta_2d = runtime_meta.view(kjt.values().numel(), -1)
 
         offset: int = 0
         for key in kjt.keys():
             table_fqn = self.table_to_fqn[key]
             ids_list: List[torch.Tensor] = per_table_ids.get(table_fqn, [])
-            emb_list: List[torch.Tensor] = per_table_raw_ids.get(table_fqn, [])
+            raw_ids_list: List[torch.Tensor] = per_table_raw_ids.get(table_fqn, [])
+            runtime_meta_list: List[torch.Tensor] = per_table_runtime_meta.get(
+                table_fqn, []
+            )
 
             ids = kjt[key].values()
             ids_list.append(ids)
-            emb_list.append(embeddings_2d[offset : offset + ids.numel()])
+            raw_ids_list.append(raw_ids_2d[offset : offset + ids.numel()])
+            if runtime_meta_2d is not None:
+                runtime_meta_list.append(runtime_meta_2d[offset : offset + ids.numel()])
             offset += ids.numel()
 
             per_table_ids[table_fqn] = ids_list
-            per_table_raw_ids[table_fqn] = emb_list
+            per_table_raw_ids[table_fqn] = raw_ids_list
+            if runtime_meta_2d is not None:
+                per_table_runtime_meta[table_fqn] = runtime_meta_list
 
         for table_fqn, ids_list in per_table_ids.items():
             self.store.append(
@@ -219,6 +248,11 @@ class RawIdTracker(ModelDeltaTracker):
                 fqn=table_fqn,
                 ids=torch.cat(ids_list),
                 raw_ids=torch.cat(per_table_raw_ids[table_fqn]),
+                runtime_meta=(
+                    torch.cat(per_table_runtime_meta[table_fqn])
+                    if table_fqn in per_table_runtime_meta
+                    else None
+                ),
             )
 
     def _clean_fqn_fn(self, fqn: str) -> str:
@@ -277,8 +311,8 @@ class RawIdTracker(ModelDeltaTracker):
         self,
         tables: List[str],
         consumer: Optional[str] = None,
-    ) -> Dict[str, List[torch.Tensor]]:
-        raw_id_per_table: Dict[str, List[torch.Tensor]] = {}
+    ) -> Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]]:
+        result: Dict[str, Tuple[List[torch.Tensor], List[torch.Tensor]]] = {}
         consumer = consumer or self.DEFAULT_CONSUMER
         assert (
             consumer in self.per_consumer_batch_idx
@@ -293,17 +327,23 @@ class RawIdTracker(ModelDeltaTracker):
 
         for table in tables:
             raw_ids_list = []
+            runtime_meta_list = []
             fqn = self.table_to_fqn[table]
             if fqn in indexed_lookups:
                 for indexed_lookup in indexed_lookups[fqn]:
                     if indexed_lookup.raw_ids is not None:
                         raw_ids_list.append(indexed_lookup.raw_ids)
-                raw_id_per_table[table] = raw_ids_list
+                    if indexed_lookup.runtime_meta is not None:
+                        runtime_meta_list.append(indexed_lookup.runtime_meta)
+                if (
+                    raw_ids_list
+                ):  # if raw_ids doesn't exist runtime_meta will not exist so no need to check for runtime_meta
+                    result[table] = (raw_ids_list, runtime_meta_list)
 
         if self._delete_on_read:
             self.store.delete(up_to_idx=min(self.per_consumer_batch_idx.values()))
 
-        return raw_id_per_table
+        return result
 
     def delete(self, up_to_idx: Optional[int]) -> None:
         self.store.delete(up_to_idx)

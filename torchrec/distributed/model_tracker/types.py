@@ -35,6 +35,7 @@ class RawIndexedLookup:
     batch_idx: int
     ids: torch.Tensor
     raw_ids: Optional[torch.Tensor] = None
+    runtime_meta: Optional[torch.Tensor] = None
 
 
 @dataclass

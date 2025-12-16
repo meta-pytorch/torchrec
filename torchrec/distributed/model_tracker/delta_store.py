@@ -93,6 +93,7 @@ class DeltaStore(ABC):
         ids: torch.Tensor,
         states: Optional[torch.Tensor] = None,
         raw_ids: Optional[torch.Tensor] = None,
+        runtime_meta: Optional[torch.Tensor] = None,
     ) -> None:
         """
         Append a batch of ids and states to the store for a specific table.
@@ -165,6 +166,7 @@ class DeltaStoreTrec(DeltaStore):
         ids: torch.Tensor,
         states: Optional[torch.Tensor] = None,
         raw_ids: Optional[torch.Tensor] = None,
+        runtime_meta: Optional[torch.Tensor] = None,
     ) -> None:
         table_fqn_lookup = self.per_fqn_lookups.get(fqn, [])
         table_fqn_lookup.append(
@@ -284,10 +286,13 @@ class RawIdTrackerStore(DeltaStore):
         ids: torch.Tensor,
         states: Optional[torch.Tensor] = None,
         raw_ids: Optional[torch.Tensor] = None,
+        runtime_meta: Optional[torch.Tensor] = None,
     ) -> None:
         table_fqn_lookup = self.per_fqn_lookups.get(fqn, [])
         table_fqn_lookup.append(
-            RawIndexedLookup(batch_idx=batch_idx, ids=ids, raw_ids=raw_ids)
+            RawIndexedLookup(
+                batch_idx=batch_idx, ids=ids, raw_ids=raw_ids, runtime_meta=runtime_meta
+            )
         )
         self.per_fqn_lookups[fqn] = table_fqn_lookup
 
