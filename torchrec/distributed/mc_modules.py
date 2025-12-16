@@ -245,6 +245,7 @@ class ShardedManagedCollisionCollection(
                     torch.Tensor,
                     Optional[nn.Module],
                     Optional[torch.Tensor],
+                    Optional[torch.Tensor],
                 ],
                 None,
             ]
@@ -716,6 +717,31 @@ class ShardedManagedCollisionCollection(
             jt._values = jt.values() - self._table_to_offset[table]
         return jt_dict
 
+    def _retrieve_and_track_hash_zch_identities_and_metadata(
+        self,
+        mcm: nn.Module,
+        mc_input: Dict[str, JaggedTensor],
+        indices: torch.Tensor,
+    ) -> None:
+        if self.post_lookup_tracker_fn is None:
+            return
+        if not hasattr(mcm, "_hash_zch_identities"):
+            return
+        # _hash_zch_identities should always exist but _hash_zch_runtime_meta is optional
+        runtime_meta = None
+        if (
+            hasattr(mcm, "_hash_zch_runtime_meta")
+            and mcm._hash_zch_runtime_meta is not None
+        ):
+            runtime_meta = mcm._hash_zch_runtime_meta.index_select(dim=0, index=indices)
+        self.post_lookup_tracker_fn(
+            KeyedJaggedTensor.from_jt_dict(mc_input),
+            torch.empty(0),
+            None,
+            mcm._hash_zch_identities.index_select(dim=0, index=indices),
+            runtime_meta,
+        )
+
     def compute(
         self,
         ctx: ManagedCollisionCollectionContext,
@@ -758,19 +784,9 @@ class ShardedManagedCollisionCollection(
                     mc_input = mcm.remap(mc_input)
                     mc_input = self.global_to_local_index(mc_input)
                     output.update(mc_input)
-                    if hasattr(
-                        mcm,
-                        "_hash_zch_identities",
-                    ):
-                        if self.post_lookup_tracker_fn is not None:
-                            self.post_lookup_tracker_fn(
-                                KeyedJaggedTensor.from_jt_dict(mc_input),
-                                torch.empty(0),
-                                None,
-                                mcm._hash_zch_identities.index_select(
-                                    dim=0, index=mc_input[table].values()
-                                ),
-                            )
+                    self._retrieve_and_track_hash_zch_identities_and_metadata(
+                        mcm, mc_input, mc_input[table].values()
+                    )
                 values = torch.cat([jt.values() for jt in output.values()])
             else:
                 table: str = tables[0]
@@ -789,14 +805,9 @@ class ShardedManagedCollisionCollection(
                 mc_input = mcm.remap(mc_input)
                 mc_input = self.global_to_local_index(mc_input)
                 values = mc_input[table].values()
-                if hasattr(mcm, "_hash_zch_identities"):
-                    if self.post_lookup_tracker_fn is not None:
-                        self.post_lookup_tracker_fn(
-                            KeyedJaggedTensor.from_jt_dict(mc_input),
-                            torch.empty(0),
-                            None,
-                            mcm._hash_zch_identities.index_select(dim=0, index=values),
-                        )
+                self._retrieve_and_track_hash_zch_identities_and_metadata(
+                    mcm, mc_input, values
+                )
 
             remapped_kjts.append(
                 KeyedJaggedTensor(
@@ -894,6 +905,7 @@ class ShardedManagedCollisionCollection(
                 KeyedJaggedTensor,
                 torch.Tensor,
                 Optional[nn.Module],
+                Optional[torch.Tensor],
                 Optional[torch.Tensor],
             ],
             None,
