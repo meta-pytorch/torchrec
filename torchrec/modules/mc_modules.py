@@ -201,6 +201,9 @@ class ManagedCollisionModule(nn.Module):
         super().__init__()
         self._device = device
 
+        # adding to the base class to be compatible with HashZchManagedCollisionModule
+        self._enable_per_feature_lookups = False
+
         if skip_state_validation:
             logger.warning(
                 "Skipping validation on ManagedCollisionModule.  This module may not be Reshard-able as a result"
@@ -360,6 +363,12 @@ class ManagedCollisionCollection(nn.Module):
         self._table_name_to_config: Dict[str, BaseEmbeddingConfig] = {
             config.name: config for config in embedding_configs
         }
+        self._enable_per_feature_lookups: bool = any(
+            [
+                module._enable_per_feature_lookups
+                for table, module in managed_collision_modules.items()
+            ]
+        )
 
         for name, config in self._table_name_to_config.items():
             if name not in managed_collision_modules:

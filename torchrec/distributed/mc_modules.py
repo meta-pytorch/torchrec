@@ -250,6 +250,8 @@ class ShardedManagedCollisionCollection(
                 None,
             ]
         ] = None
+        self._per_feature_lookup: bool = module._enable_per_feature_lookups
+        logger.info(f"per_feature_lookup is {self._per_feature_lookup}")
 
     def _initialize_torch_state(self) -> None:
         self._model_parallel_mc_buffer_name_to_sharded_tensor = OrderedDict()
@@ -768,6 +770,11 @@ class ShardedManagedCollisionCollection(
                 feature_splits = features.split(splits)
                 output: Dict[str, JaggedTensor] = {}
                 for table, kjt in zip(tables, feature_splits):
+                    # TODO: Add per feature lookup support for split case when needed
+                    if self._per_feature_lookup:
+                        logger.warning(
+                            "[ZCH] per feature lookup is not supported for split case, ask for support if needed"
+                        )
                     # TODO: Dict[str, Tensor]
                     mc_input: Dict[str, JaggedTensor] = {
                         table: JaggedTensor(
@@ -790,21 +797,40 @@ class ShardedManagedCollisionCollection(
                 values = torch.cat([jt.values() for jt in output.values()])
             else:
                 table: str = tables[0]
-                mc_input: Dict[str, JaggedTensor] = {
-                    table: JaggedTensor(
-                        values=features.values(),
-                        lengths=features.lengths(),
-                        # TODO: improve this temp solution by passing real weights
-                        weights=torch.tensor(features.length_per_key()),
-                    )
-                }
-                mcm = self._managed_collision_modules[table]
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-                mc_input = mcm.profile(mc_input)
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-                mc_input = mcm.remap(mc_input)
-                mc_input = self.global_to_local_index(mc_input)
-                values = mc_input[table].values()
+                # When turn on per feature lookup, the look up is done per feature, and can control different config to the mcm.profile/mcm.remap call
+                if self._per_feature_lookup:
+                    mc_input = features.to_dict()
+                    mcm = self._managed_collision_modules[table]
+                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+                    mc_input = mcm.profile(mc_input)
+                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+                    mc_input = mcm.remap(mc_input)
+                    mc_input_unify = {
+                        table: JaggedTensor(
+                            values=torch.cat([jt.values() for jt in mc_input.values()]),
+                            lengths=torch.cat(
+                                [jt.lengths() for jt in mc_input.values()]
+                            ),
+                        )
+                    }
+                    mc_input = self.global_to_local_index(mc_input_unify)
+                    values = mc_input[table].values()
+                else:
+                    mc_input: Dict[str, JaggedTensor] = {
+                        table: JaggedTensor(
+                            values=features.values(),
+                            lengths=features.lengths(),
+                            # TODO: improve this temp solution by passing real weights
+                            weights=torch.tensor(features.length_per_key()),
+                        )
+                    }
+                    mcm = self._managed_collision_modules[table]
+                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+                    mc_input = mcm.profile(mc_input)
+                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+                    mc_input = mcm.remap(mc_input)
+                    mc_input = self.global_to_local_index(mc_input)
+                    values = mc_input[table].values()
                 self._retrieve_and_track_hash_zch_identities_and_metadata(
                     mcm, mc_input, values
                 )
