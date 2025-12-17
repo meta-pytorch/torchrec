@@ -932,12 +932,27 @@ class ShardingStrategy(Enum):
 
 
 class DMPCollectionConfig:
+    """
+    Configuration for a submodule in DMPCollection.
+
+    This class holds the sharding configuration for a specific module type
+    when using 2D parallelism with DMPCollection.
+
+    Attributes:
+        module: The module type (class) to apply this configuration to.
+        plan: The sharding plan for this module's subtree.
+        sharding_group_size: Number of ranks in each sharding group.
+        node_group_size: Optional logical group size for TWRW/GRID sharding.
+        use_inter_host_allreduce: Whether to use inter-host allreduce for sync.
+        sharding_strategy: The sharding strategy to use.
+    """
+
     module: Type[nn.Module]
-    plan: "ShardingPlan" = field(repr=False)  # sub-tree-specific sharding plan
+    plan: "ShardingPlan"
     sharding_group_size: int
-    node_group_size: Optional[int] = None
-    use_inter_host_allreduce: bool = False
-    sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT
+    node_group_size: Optional[int]
+    use_inter_host_allreduce: bool
+    sharding_strategy: ShardingStrategy
 
     def __init__(
         self,
@@ -955,25 +970,87 @@ class DMPCollectionConfig:
         self.use_inter_host_allreduce = use_inter_host_allreduce
         self.sharding_strategy = sharding_strategy
 
-    def __post_init__(self) -> None:
-        if isinstance(self.module, ShardedModule):
+        if self.module is not None and isinstance(self.module, ShardedModule):
             raise ValueError(
                 f"ShardedModule should not be passed into DMPCollectionConfig: got {type(self.module)}"
             )
 
+    def __repr__(self) -> str:
+        return (
+            f"DMPCollectionConfig(module={self.module}, "
+            f"sharding_group_size={self.sharding_group_size}, "
+            f"node_group_size={self.node_group_size}, "
+            f"use_inter_host_allreduce={self.use_inter_host_allreduce}, "
+            f"sharding_strategy={self.sharding_strategy})"
+        )
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, DMPCollectionConfig):
+            return NotImplemented
+        return (
+            self.module == other.module
+            and self.plan == other.plan
+            and self.sharding_group_size == other.sharding_group_size
+            and self.node_group_size == other.node_group_size
+            and self.use_inter_host_allreduce == other.use_inter_host_allreduce
+            and self.sharding_strategy == other.sharding_strategy
+        )
+
 
 # for internal use in DMPCollection
 class DMPCollectionContext(DMPCollectionConfig):
-    device_mesh: "DeviceMesh" = field(init=False)
-    sharding_pg: "dist.ProcessGroup" = field(init=False)
-    replica_pg: "dist.ProcessGroup" = field(init=False)
-    modules_to_sync: List[Tuple[nn.Module, nn.Module]] = field(
-        init=False, default_factory=list
-    )
-    sharded_module: Optional[nn.Module] = field(init=False, default=None)
-    sharding_strategy: ShardingStrategy = field(
-        init=False, default=ShardingStrategy.DEFAULT
-    )
+    """
+    Internal context for DMPCollection that extends DMPCollectionConfig
+    with runtime state for process groups and modules to sync.
+    """
+
+    device_mesh: "DeviceMesh"
+    sharding_pg: "dist.ProcessGroup"
+    replica_pg: "dist.ProcessGroup"
+    modules_to_sync: List[Tuple[nn.Module, nn.Module]]
+    sharded_module: Optional[nn.Module]
+    weights_by_dtype: Dict["torch.dtype", List["torch.Tensor"]]
+    optimizer_tensors_by_dtype: Dict["torch.dtype", List["torch.Tensor"]]
+
+    def __init__(
+        self,
+        module: Type[nn.Module],
+        plan: "ShardingPlan",
+        sharding_group_size: int,
+        node_group_size: Optional[int] = None,
+        use_inter_host_allreduce: bool = False,
+        sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
+        modules_to_sync: Optional[List[Tuple[nn.Module, nn.Module]]] = None,
+        sharded_module: Optional[nn.Module] = None,
+        device_mesh: Optional["DeviceMesh"] = None,
+        sharding_pg: Optional["dist.ProcessGroup"] = None,
+        replica_pg: Optional["dist.ProcessGroup"] = None,
+        weights_by_dtype: Optional[Dict["torch.dtype", List["torch.Tensor"]]] = None,
+        optimizer_tensors_by_dtype: Optional[
+            Dict["torch.dtype", List["torch.Tensor"]]
+        ] = None,
+    ) -> None:
+        super().__init__(
+            module=module,
+            plan=plan,
+            sharding_group_size=sharding_group_size,
+            node_group_size=node_group_size,
+            use_inter_host_allreduce=use_inter_host_allreduce,
+            sharding_strategy=sharding_strategy,
+        )
+        self.modules_to_sync: List[Tuple[nn.Module, nn.Module]] = (
+            modules_to_sync if modules_to_sync is not None else []
+        )
+        self.sharded_module: Optional[nn.Module] = sharded_module
+        self.device_mesh: Optional["DeviceMesh"] = device_mesh
+        self.sharding_pg: Optional["dist.ProcessGroup"] = sharding_pg
+        self.replica_pg: Optional["dist.ProcessGroup"] = replica_pg
+        self.weights_by_dtype: Dict["torch.dtype", List["torch.Tensor"]] = (
+            weights_by_dtype if weights_by_dtype is not None else {}
+        )
+        self.optimizer_tensors_by_dtype: Dict["torch.dtype", List["torch.Tensor"]] = (
+            optimizer_tensors_by_dtype if optimizer_tensors_by_dtype is not None else {}
+        )
 
 
 class ShardingEnv2D(ShardingEnv):
