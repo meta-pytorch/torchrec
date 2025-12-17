@@ -8,7 +8,6 @@
 # pyre-strict
 
 import copy
-
 import unittest
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
@@ -22,7 +21,10 @@ from torch import nn, optim
 from torch._dynamo.testing import reduce_to_scalar_loss
 from torch._dynamo.utils import counters
 from torchrec.distributed import DistributedModelParallel
-from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    EmbeddingTableConfig,
+)
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.fp_embeddingbag import (
     FeatureProcessedEmbeddingBagCollectionSharder,
@@ -31,7 +33,12 @@ from torchrec.distributed.fp_embeddingbag import (
 from torchrec.distributed.model_parallel import DMPCollection
 from torchrec.distributed.sharding_plan import (
     construct_module_sharding_plan,
+    row_wise,
     table_wise,
+)
+from torchrec.distributed.test_utils.multi_process import (
+    MultiProcessContext,
+    MultiProcessTestBase,
 )
 from torchrec.distributed.test_utils.test_model import (
     ModelInput,
@@ -78,7 +85,6 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
-
 from torchrec.optim.keyed import KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
 from torchrec.pt2.utils import kjt_for_pt2_tracing
@@ -693,6 +699,317 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
             # Forward + backward w/ pipelining
             pred_pipeline = pipeline.progress(dataloader)
             self.assertEqual(pred_pipeline.size(0), 64)
+
+
+def fp_ebc_rw_sharding_test_runner(
+    rank: int,
+    world_size: int,
+    tables: List[EmbeddingTableConfig],
+    weighted_tables: List[EmbeddingTableConfig],
+    data: List[Tuple[ModelInput, List[ModelInput]]],
+    backend: str = "nccl",
+    local_size: Optional[int] = None,
+) -> None:
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        assert ctx.pg is not None
+        sharder = cast(
+            ModuleSharder[nn.Module],
+            FeatureProcessedEmbeddingBagCollectionSharder(),
+        )
+
+        class DummyWrapper(nn.Module):
+            def __init__(self, sparse_arch):
+                super().__init__()
+                self.m = sparse_arch
+
+            def forward(self, model_input) -> Tuple[torch.Tensor, torch.Tensor]:
+                return self.m(model_input.idlist_features)
+
+        max_feature_lengths = [10, 10, 12, 12]
+        sparse_arch = DummyWrapper(
+            create_module_and_freeze(
+                tables=tables,  # pyre-ignore[6]
+                device=ctx.device,
+                use_fp_collection=False,
+                max_feature_lengths=max_feature_lengths,
+            )
+        )
+
+        # compute_kernel = EmbeddingComputeKernel.FUSED.value
+        module_sharding_plan = construct_module_sharding_plan(
+            sparse_arch.m._fp_ebc,
+            per_param_sharding={
+                "table_0": row_wise(),
+                "table_1": row_wise(),
+                "table_2": row_wise(),
+                "table_3": row_wise(),
+            },
+            world_size=2,
+            device_type=ctx.device.type,
+            sharder=sharder,
+        )
+        sharded_sparse_arch_pipeline = DistributedModelParallel(
+            module=copy.deepcopy(sparse_arch),
+            plan=ShardingPlan({"m._fp_ebc": module_sharding_plan}),
+            env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore[6]
+            sharders=[sharder],
+            device=ctx.device,
+        )
+        sharded_sparse_arch_no_pipeline = DistributedModelParallel(
+            module=copy.deepcopy(sparse_arch),
+            plan=ShardingPlan({"m._fp_ebc": module_sharding_plan}),
+            env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore[6]
+            sharders=[sharder],
+            device=ctx.device,
+        )
+
+        batches = []
+        for d in data:
+            batches.append(d[1][ctx.rank].to(ctx.device))
+        dataloader = iter(batches)
+
+        optimizer_no_pipeline = optim.SGD(
+            sharded_sparse_arch_no_pipeline.parameters(), lr=0.1
+        )
+        optimizer_pipeline = optim.SGD(
+            sharded_sparse_arch_pipeline.parameters(), lr=0.1
+        )
+
+        pipeline = TrainPipelineSparseDist(
+            sharded_sparse_arch_pipeline,
+            optimizer_pipeline,
+            ctx.device,
+        )
+
+        for batch in batches[:-2]:
+            batch = batch.to(ctx.device)
+            optimizer_no_pipeline.zero_grad()
+            loss, pred = sharded_sparse_arch_no_pipeline(batch)
+            loss.backward()
+            optimizer_no_pipeline.step()
+
+            pred_pipeline = pipeline.progress(dataloader)
+            torch.testing.assert_close(pred_pipeline.cpu(), pred.cpu())
+
+
+class TrainPipelineGPUTest(MultiProcessTestBase):
+    def setUp(self, backend: str = "nccl") -> None:
+        super().setUp()
+
+        self.pipeline_class = TrainPipelineSparseDist
+        num_features = 4
+        num_weighted_features = 4
+        self.tables = [
+            EmbeddingBagConfig(
+                num_embeddings=(i + 1) * 100,
+                embedding_dim=(i + 1) * 4,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(num_features)
+        ]
+        self.weighted_tables = [
+            EmbeddingBagConfig(
+                num_embeddings=(i + 1) * 100,
+                embedding_dim=(i + 1) * 4,
+                name="weighted_table_" + str(i),
+                feature_names=["weighted_feature_" + str(i)],
+            )
+            for i in range(num_weighted_features)
+        ]
+
+        self.backend = backend
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+
+        if self.backend == "nccl" and self.device == torch.device("cpu"):
+            self.skipTest("NCCL not supported on CPUs.")
+
+    def _generate_data(
+        self,
+        num_batches: int = 5,
+        batch_size: int = 1,
+        max_feature_lengths: Optional[List[int]] = None,
+    ) -> List[Tuple[ModelInput, List[ModelInput]]]:
+        return [
+            ModelInput.generate(
+                tables=self.tables,
+                weighted_tables=self.weighted_tables,
+                batch_size=batch_size,
+                world_size=2,
+                num_float_features=10,
+                max_feature_lengths=max_feature_lengths,
+            )
+            for i in range(num_batches)
+        ]
+
+    def test_fp_ebc_rw(self) -> None:
+        data = self._generate_data(max_feature_lengths=[10, 10, 12, 12])
+        self._run_multi_process_test(
+            callable=fp_ebc_rw_sharding_test_runner,
+            world_size=2,
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            data=data,
+        )
+
+
+def fp_ebc_jk_disabled_pipelined_test_runner(
+    rank: int,
+    world_size: int,
+    tables: List[EmbeddingBagConfig],
+    weighted_tables: List[EmbeddingBagConfig],
+    data: List[Tuple[ModelInput, List[ModelInput]]],
+    backend: str = "nccl",
+    local_size: Optional[int] = None,
+) -> None:
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        assert ctx.pg is not None
+
+        sharder = cast(
+            ModuleSharder[nn.Module],
+            FeatureProcessedEmbeddingBagCollectionSharder(),
+        )
+
+        class DummyWrapper(nn.Module):
+            def __init__(self, sparse_arch: nn.Module) -> None:
+                super().__init__()
+                self.m = sparse_arch
+
+            def forward(
+                self, model_input: ModelInput
+            ) -> Tuple[torch.Tensor, torch.Tensor]:
+                return self.m(model_input.idlist_features)
+
+        max_feature_lengths = [10, 10, 12, 12]
+        sparse_arch = DummyWrapper(
+            create_module_and_freeze(
+                tables=tables,  # pyre-ignore[6]
+                device=ctx.device,
+                use_fp_collection=False,
+                max_feature_lengths=max_feature_lengths,
+            )
+        )
+
+        module_sharding_plan = construct_module_sharding_plan(
+            sparse_arch.m._fp_ebc,
+            per_param_sharding={
+                "table_0": row_wise(),
+                "table_1": row_wise(),
+                "table_2": table_wise(rank=0),
+                "table_3": table_wise(rank=1),
+            },
+            world_size=2,
+            device_type=ctx.device.type,
+            sharder=sharder,
+        )
+
+        # Test pipelined path with JK disabled
+        # Both modify_input_for_feature_processor locations should NOT be called
+        with patch(
+            "torch._utils_internal.justknobs_check",
+            return_value=False,
+        ), patch(
+            "torchrec.distributed.fp_embeddingbag.modify_input_for_feature_processor"
+        ) as mock_modify_fp_ebc, patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=False,
+        ):
+            sharded_model_pipeline = DistributedModelParallel(
+                module=copy.deepcopy(sparse_arch),
+                plan=ShardingPlan({"m._fp_ebc": module_sharding_plan}),
+                env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore[6]
+                sharders=[sharder],
+                device=ctx.device,
+            )
+
+            optimizer_pipeline = optim.SGD(sharded_model_pipeline.parameters(), lr=0.1)
+
+            batches = [d[1][ctx.rank].to(ctx.device) for d in data]
+            dataloader = iter(batches)
+
+            pipeline = TrainPipelineSparseDist(
+                sharded_model_pipeline,
+                optimizer_pipeline,
+                ctx.device,
+            )
+
+            try:
+                for _ in range(min(3, len(batches) - 2)):
+                    _ = pipeline.progress(dataloader)
+            except StopIteration:
+                pass
+
+            mock_modify_fp_ebc.assert_not_called()
+
+
+class TestFeatureProcessorJKDisabledPipelined(MultiProcessTestBase):
+    def setUp(self, backend: str = "nccl") -> None:
+        super().setUp()
+
+        num_features = 4
+        num_weighted_features = 4
+        self.tables = [
+            EmbeddingBagConfig(
+                num_embeddings=(i + 1) * 100,
+                embedding_dim=(i + 1) * 4,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(num_features)
+        ]
+        self.weighted_tables = [
+            EmbeddingBagConfig(
+                num_embeddings=(i + 1) * 100,
+                embedding_dim=(i + 1) * 4,
+                name="weighted_table_" + str(i),
+                feature_names=["weighted_feature_" + str(i)],
+            )
+            for i in range(num_weighted_features)
+        ]
+
+        self.backend = backend
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+
+        if self.backend == "nccl" and self.device == torch.device("cpu"):
+            self.skipTest("NCCL not supported on CPUs.")
+
+    def _generate_data(
+        self,
+        num_batches: int = 5,
+        batch_size: int = 1,
+        max_feature_lengths: Optional[List[int]] = None,
+    ) -> List[Tuple[ModelInput, List[ModelInput]]]:
+        return [
+            ModelInput.generate(
+                tables=self.tables,
+                weighted_tables=self.weighted_tables,
+                batch_size=batch_size,
+                world_size=2,
+                num_float_features=10,
+                max_feature_lengths=max_feature_lengths,
+            )
+            for _ in range(num_batches)
+        ]
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_fp_ebc_jk_disabled_pipelined(self) -> None:
+        data = self._generate_data(max_feature_lengths=[10, 10, 12, 12])
+        self._run_multi_process_test(
+            callable=fp_ebc_jk_disabled_pipelined_test_runner,
+            world_size=2,
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            data=data,
+        )
 
 
 class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
