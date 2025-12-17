@@ -1009,6 +1009,8 @@ class DMPCollectionContext(DMPCollectionConfig):
     replica_pg: "dist.ProcessGroup"
     modules_to_sync: List[Tuple[nn.Module, nn.Module]]
     sharded_module: Optional[nn.Module]
+    weights_by_dtype: Dict["torch.dtype", List["torch.Tensor"]]
+    optimizer_tensors_by_dtype: Dict["torch.dtype", List["torch.Tensor"]]
 
     def __init__(
         self,
@@ -1023,6 +1025,10 @@ class DMPCollectionContext(DMPCollectionConfig):
         device_mesh: Optional["DeviceMesh"] = None,
         sharding_pg: Optional["dist.ProcessGroup"] = None,
         replica_pg: Optional["dist.ProcessGroup"] = None,
+        weights_by_dtype: Optional[Dict["torch.dtype", List["torch.Tensor"]]] = None,
+        optimizer_tensors_by_dtype: Optional[
+            Dict["torch.dtype", List["torch.Tensor"]]
+        ] = None,
     ) -> None:
         super().__init__(
             module=module,
@@ -1039,6 +1045,12 @@ class DMPCollectionContext(DMPCollectionConfig):
         self.device_mesh: Optional["DeviceMesh"] = device_mesh
         self.sharding_pg: Optional["dist.ProcessGroup"] = sharding_pg
         self.replica_pg: Optional["dist.ProcessGroup"] = replica_pg
+        self.weights_by_dtype: Dict["torch.dtype", List["torch.Tensor"]] = (
+            weights_by_dtype if weights_by_dtype is not None else {}
+        )
+        self.optimizer_tensors_by_dtype: Dict["torch.dtype", List["torch.Tensor"]] = (
+            optimizer_tensors_by_dtype if optimizer_tensors_by_dtype is not None else {}
+        )
 
 
 class ShardingEnv2D(ShardingEnv):

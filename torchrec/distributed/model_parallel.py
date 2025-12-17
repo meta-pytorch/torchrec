@@ -1023,6 +1023,7 @@ class DMPCollection(DistributedModelParallel):
 
         # post DMP init, we group sharded modules for parameter sync, stored in the context
         self._group_sharded_modules(self._ctxs)
+        self._cache_sync_tensors(self._ctxs)
 
     def _shard_modules_impl(
         self,
@@ -1106,50 +1107,34 @@ class DMPCollection(DistributedModelParallel):
         """
         # we sync per context to use the right all reduce process group
         for ctx in self._ctxs:
-            self._sync(
-                ctx.replica_pg,
-                ctx.modules_to_sync,
-                include_optimizer_state,
-            )
+            self._sync(ctx, include_optimizer_state)
 
     def _sync(
         self,
-        replica_pg: dist.ProcessGroup,
-        modules_to_sync: List[Tuple[nn.Module, nn.Module]],
+        ctx: DMPCollectionContext,
         include_optimizer_state: bool = True,
     ) -> None:
-        assert replica_pg is not None, "replica_pg is not initialized!"
-        all_weights_by_dtype: dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
-
-        for emb_kernel, _ in modules_to_sync:
-            for w in emb_kernel.split_embedding_weights():  # pyre-ignore[29]
-                all_weights_by_dtype[w.dtype].append(w)
+        assert ctx.replica_pg is not None, "replica_pg is not initialized!"
 
         opts = None
         if self._custom_all_reduce is None:
             opts = dist.AllreduceCoalescedOptions()
             opts.reduceOp = dist.ReduceOp.AVG
+
         self._allreduce_tensors(
-            replica_pg, all_weights_by_dtype, "## 2d_weight_sync ##", opts
+            ctx.replica_pg,
+            ctx.weights_by_dtype,
+            "## 2d_weight_sync ##",
+            opts,
         )
 
-        if include_optimizer_state:
-            optimizer_tensors_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = (
-                defaultdict(list)
+        if include_optimizer_state and ctx.optimizer_tensors_by_dtype:
+            self._allreduce_tensors(
+                ctx.replica_pg,
+                ctx.optimizer_tensors_by_dtype,
+                "## 2d_optimizer_sync ##",
+                opts,
             )
-            for emb_kernel, _ in modules_to_sync:
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-                optimizer_states = emb_kernel.get_optimizer_state()
-                for state in optimizer_states:
-                    opt_tensor = state["sum"]
-                    optimizer_tensors_by_dtype[opt_tensor.dtype].append(opt_tensor)
-            if optimizer_tensors_by_dtype:
-                self._allreduce_tensors(
-                    replica_pg,
-                    optimizer_tensors_by_dtype,
-                    "## 2d_optimizer_sync ##",
-                    opts,
-                )
 
     def _allreduce_tensors(
         self,
@@ -1363,6 +1348,33 @@ class DMPCollection(DistributedModelParallel):
 
         _find_sharded_modules(self._dmp_wrapped_module, None)
         return sharded_modules
+
+    def _cache_sync_tensors(
+        self,
+        contexts: List[DMPCollectionContext],
+    ) -> None:
+        """
+        Pre-compute and cache the weight and optimizer tensor mappings by dtype.
+
+        This is called once after _group_sharded_modules() to avoid rebuilding
+        these mappings on every sync() call. The cached mappings are stored
+        in each context for use during sync operations.
+        """
+        for context in contexts:
+            weights_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(list)
+            optimizer_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = defaultdict(
+                list
+            )
+            for emb_kernel, _ in context.modules_to_sync:
+                for w in emb_kernel.split_embedding_weights():  # pyre-ignore[29]
+                    weights_by_dtype[w.dtype].append(w)
+
+                for state in emb_kernel.get_optimizer_state():
+                    opt_tensor = state["sum"]
+                    optimizer_by_dtype[opt_tensor.dtype].append(opt_tensor)
+
+            context.weights_by_dtype = dict(weights_by_dtype)
+            context.optimizer_tensors_by_dtype = dict(optimizer_by_dtype)
 
     @property
     def device_mesh(self) -> DeviceMesh:
