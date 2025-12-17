@@ -936,22 +936,21 @@ class DMPCollection(DistributedModelParallel):
             sharder.module_type: sharder for sharder in sharders
         }
 
-        # the args provided by the users are used for default modules
-        # default context is index 0, TODO - if cleaner way to distinguish
-        self._ctxs: List[DMPCollectionContext] = [
-            DMPCollectionContext(
-                # default context has module type None
-                module=None,  # pyre-ignore[6]
-                plan=plan,
-                sharding_group_size=sharding_group_size,
-                node_group_size=node_group_size,
-                use_inter_host_allreduce=use_inter_host_allreduce,
-            )
-        ]
+        # Create the default context for modules without submodule configs
+        self._default_ctx: DMPCollectionContext = DMPCollectionContext(
+            # default context has module type None
+            module=None,  # pyre-ignore[6]
+            plan=plan,
+            sharding_group_size=sharding_group_size,
+            node_group_size=node_group_size,
+            use_inter_host_allreduce=use_inter_host_allreduce,
+            sharding_strategy=sharding_strategy,
+        )
 
+        self._submodule_ctxs: List[DMPCollectionContext] = []
         if submodule_configs is not None:
             for submodule_config in submodule_configs:
-                self._ctxs.append(
+                self._submodule_ctxs.append(
                     DMPCollectionContext(
                         module=submodule_config.module,
                         plan=submodule_config.plan,
@@ -960,6 +959,10 @@ class DMPCollection(DistributedModelParallel):
                         sharding_strategy=submodule_config.sharding_strategy,
                     )
                 )
+
+        self._ctxs: List[DMPCollectionContext] = [
+            self._default_ctx
+        ] + self._submodule_ctxs
 
         # create process groups and remap sharding plans per module context
         for ctx in self._ctxs:
@@ -991,8 +994,8 @@ class DMPCollection(DistributedModelParallel):
                 # pyre-ignore[16]
                 ctx.sharded_module = self._sharder_map[ctx.module].sharded_module_type
 
-        consolidated_plan = self._ctxs[0].plan
-        for ctx in self._ctxs[1:]:
+        consolidated_plan = self._default_ctx.plan
+        for ctx in self._submodule_ctxs:
             for key, val in ctx.plan.plan.items():
                 consolidated_plan.plan[key] = val
 
@@ -1002,12 +1005,12 @@ class DMPCollection(DistributedModelParallel):
 
         default_env = ShardingEnv2D(
             global_pg=self._pg,
-            sharding_pg=self._ctxs[0].sharding_pg,
-            replica_pg=self._ctxs[0].replica_pg,
-            device_mesh=self._ctxs[0].device_mesh,
+            sharding_pg=self._default_ctx.sharding_pg,
+            replica_pg=self._default_ctx.replica_pg,
+            device_mesh=self._default_ctx.device_mesh,
             node_group_size=node_group_size,
-            use_inter_host_allreduce=self._ctxs[0].use_inter_host_allreduce,
-            sharding_strategy=sharding_strategy,
+            use_inter_host_allreduce=self._default_ctx.use_inter_host_allreduce,
+            sharding_strategy=self._default_ctx.sharding_strategy,
         )
 
         super().__init__(  # type: ignore[misc]
@@ -1058,7 +1061,7 @@ class DMPCollection(DistributedModelParallel):
             env = self._env
             sharder_key = type(module)
 
-            for ctx in self._ctxs[1:]:
+            for ctx in self._submodule_ctxs:
                 if ctx.module == sharder_key:
                     env = ShardingEnv2D(
                         global_pg=self._pg,
@@ -1295,7 +1298,14 @@ class DMPCollection(DistributedModelParallel):
         self,
         contexts: List[DMPCollectionContext],
     ) -> None:
-        # Post init DMP, save the embedding kernels, with respect to contexts
+        """
+        Group sharded modules by context for parameter synchronization.
+
+        Args:
+            contexts: List of contexts where contexts[0] is the default context
+                and contexts[1:] are submodule-specific contexts.
+        """
+        # Process submodule-specific contexts first (contexts[1:])
         for context in contexts[1:]:
             context.modules_to_sync = self._group_sharded_module(
                 context.sharded_module  # pyre-ignore[6]
@@ -1382,4 +1392,4 @@ class DMPCollection(DistributedModelParallel):
         Returns the device mesh used for 2D parallelism.
         Contains two dimensions: "replicate" and "shard".
         """
-        return self._ctxs[0].device_mesh
+        return self._default_ctx.device_mesh
