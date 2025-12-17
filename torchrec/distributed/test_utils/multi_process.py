@@ -14,6 +14,7 @@ import multiprocessing
 import os
 import unittest
 from typing import Any, Callable, Dict, List, Optional
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -23,6 +24,30 @@ from torchrec.test_utils import (
     init_distributed_single_host,
     seed_and_log,
 )
+
+
+def _apply_mocks_and_run(
+    callable: Callable[..., None],
+    _mocks: Optional[List[Dict[str, Any]]] = None,
+    **kwargs: Any,
+) -> None:
+
+    active_patches = []
+    try:
+        for mock_config in _mocks or []:
+            patcher = patch(
+                mock_config["target"],
+                return_value=mock_config.get("return_value"),
+                side_effect=mock_config.get("side_effect"),
+            )
+            active_patches.append(patcher)
+            patcher.__enter__()
+
+        kwargs.pop("_mocks", None)
+        callable(**kwargs)
+    finally:
+        for patcher in active_patches:
+            patcher.__exit__(None, None, None)
 
 
 class MultiProcessContext:
@@ -111,6 +136,23 @@ class MultiProcessTestBase(unittest.TestCase):
             self._mp_init_mode: str = mp_init_mode
         logging.info(f"Using {self._mp_init_mode} for multiprocessing")
 
+        self._mocks: List[Dict[str, Any]] = []
+
+    def add_mock(
+        self,
+        target: str,
+        return_value: Any = None,
+        side_effect: Any = None,
+    ) -> None:
+
+        self._mocks.append(
+            {
+                "target": target,
+                "return_value": return_value,
+                "side_effect": side_effect,
+            }
+        )
+
     @seed_and_log
     def setUp(self) -> None:
         os.environ["MASTER_ADDR"] = str("localhost")
@@ -131,6 +173,7 @@ class MultiProcessTestBase(unittest.TestCase):
         del os.environ["NCCL_SOCKET_IFNAME"]
         if torch.cuda.is_available():
             os.unsetenv("CUBLAS_WORKSPACE_CONFIG")
+        self._mocks.clear()
         super().tearDown()
 
     def _run_multi_process_test(
@@ -149,8 +192,10 @@ class MultiProcessTestBase(unittest.TestCase):
         for rank in range(world_size):
             kwargs["rank"] = rank
             kwargs["world_size"] = world_size
+            kwargs["_mocks"] = self._mocks
             p = ctx.Process(
-                target=callable,
+                target=_apply_mocks_and_run,
+                args=(callable,),
                 kwargs=kwargs,
             )
             p.start()
@@ -176,9 +221,11 @@ class MultiProcessTestBase(unittest.TestCase):
             kwargs = {}
             kwargs["rank"] = rank
             kwargs["world_size"] = world_size
+            kwargs["_mocks"] = self._mocks
             kwargs.update(kwargs_per_rank[rank])
             p = ctx.Process(
-                target=callable,
+                target=_apply_mocks_and_run,
+                args=(callable,),
                 kwargs=kwargs,
             )
             p.start()
