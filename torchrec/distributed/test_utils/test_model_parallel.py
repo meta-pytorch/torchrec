@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import os
 import unittest
 from typing import Any, cast, Dict, List, Optional, Tuple, Type
 
@@ -28,7 +29,7 @@ from torchrec.distributed.test_utils.test_sharding import (
 )
 from torchrec.distributed.types import ModuleSharder, ShardingStrategy, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
-from torchrec.test_utils import seed_and_log, skip_if_asan_class
+from torchrec.test_utils import get_free_port, seed_and_log, skip_if_asan_class
 from torchrec.types import DataType
 
 
@@ -163,6 +164,10 @@ class ModelParallelTestShared(MultiProcessTestBase):
         lengths_dtype: torch.dtype = torch.int64,
         sharding_strategy: Optional[ShardingStrategy] = None,
     ) -> None:
+        # Refresh MASTER_PORT for each Hypothesis example to avoid port conflicts
+        # that cause flaky test failures (socket errno 99: Cannot assign requested address)
+        os.environ["MASTER_PORT"] = str(get_free_port())
+
         self._build_tables_and_groups(data_type=data_type)
         # directly run the test with single process
         if world_size == 1:
@@ -258,6 +263,10 @@ class ModelParallelTestShared(MultiProcessTestBase):
         Tests the reshard API with dynamic_sharding_test, which creates 2 identical models
         one of which is resharded, and then compares the predictions of the 2 models.
         """
+        # Refresh MASTER_PORT for each Hypothesis example to avoid port conflicts
+        # that cause flaky test failures (socket errno 99: Cannot assign requested address)
+        os.environ["MASTER_PORT"] = str(get_free_port())
+
         self._build_tables_and_groups(data_type=data_type)
         constraints = {}
         if sharding_type is not None:
