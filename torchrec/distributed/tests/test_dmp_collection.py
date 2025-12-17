@@ -163,6 +163,8 @@ class TestDMPCollectionContext(unittest.TestCase):
         self.assertIsNone(context.device_mesh)
         self.assertIsNone(context.sharding_pg)
         self.assertIsNone(context.replica_pg)
+        self.assertEqual(context.weights_by_dtype, {})
+        self.assertEqual(context.optimizer_tensors_by_dtype, {})
 
     def test_modules_to_sync_can_be_passed_to_constructor(self) -> None:
         mock_plan = MagicMock(spec=ShardingPlan)
@@ -250,6 +252,8 @@ class TestDMPCollectionContext(unittest.TestCase):
         self.assertNotIn("sharding_pg=", repr_str)
         self.assertNotIn("replica_pg=", repr_str)
         self.assertNotIn("modules_to_sync=", repr_str)
+        self.assertNotIn("weights_by_dtype=", repr_str)
+        self.assertNotIn("optimizer_tensors_by_dtype=", repr_str)
         self.assertNotIn("sharded_module=", repr_str)
 
 
