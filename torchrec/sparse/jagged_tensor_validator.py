@@ -200,6 +200,11 @@ def _validate_feature_range(
         return True
 
     valid = True
+
+    # add a corner case check for empty KJT, which will cause error in to_dict()
+    if kjt.lengths().numel() == 0:
+        return valid
+
     jtd = kjt.to_dict()
     for feature, jt in jtd.items():
         if feature not in feature_to_range_map:
