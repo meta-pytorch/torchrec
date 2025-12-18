@@ -10,7 +10,8 @@
 import copy
 import unittest
 from operator import xor
-from typing import List, Optional, Tuple
+from typing import cast, List, Optional, Tuple
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -24,11 +25,11 @@ from torchrec.distributed.fp_embeddingbag import (
 )
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.shard import _shard_modules
-
 from torchrec.distributed.sharding_plan import (
     column_wise,
     construct_module_sharding_plan,
     data_parallel,
+    row_wise,
     table_wise,
 )
 from torchrec.distributed.test_utils.multi_process import (
@@ -41,9 +42,13 @@ from torchrec.distributed.tests.test_fp_embeddingbag_utils import (
     get_configs,
     get_kjt_inputs,
 )
-from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingPlan
+from torchrec.distributed.types import (
+    ModuleSharder,
+    ShardingEnv,
+    ShardingPlan,
+    ShardingType,
+)
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import skip_if_asan_class
 
@@ -276,4 +281,112 @@ class ShardedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
             sharder=FeatureProcessedEmbeddingBagCollectionSharder(),
             backend=backend,
             use_fp_collection=use_fp_collection,
+        )
+
+
+class TestFeatureProcessorJKDisabledUnit(unittest.TestCase):
+    def test_sharding_types_excludes_row_wise_when_jk_disabled(self) -> None:
+        with patch(
+            "torch._utils_internal.justknobs_check",
+            return_value=False,
+        ):
+            sharder = FeatureProcessedEmbeddingBagCollectionSharder()
+            types = sharder.sharding_types(compute_device_type="cuda")
+
+        self.assertNotIn(ShardingType.ROW_WISE.value, types)
+        self.assertNotIn(ShardingType.TABLE_ROW_WISE.value, types)
+        self.assertNotIn(ShardingType.GRID_SHARD.value, types)
+
+        self.assertIn(ShardingType.TABLE_WISE.value, types)
+        self.assertIn(ShardingType.COLUMN_WISE.value, types)
+        self.assertIn(ShardingType.TABLE_COLUMN_WISE.value, types)
+
+    def test_sharding_types_includes_row_wise_when_jk_enabled(self) -> None:
+        with patch(
+            "torch._utils_internal.justknobs_check",
+            return_value=True,
+        ):
+            sharder = FeatureProcessedEmbeddingBagCollectionSharder()
+            types = sharder.sharding_types(compute_device_type="cuda")
+
+        self.assertIn(ShardingType.ROW_WISE.value, types)
+        self.assertIn(ShardingType.TABLE_ROW_WISE.value, types)
+        self.assertIn(ShardingType.GRID_SHARD.value, types)
+
+
+def _test_jk_disabled_non_pipelined(
+    tables: List[EmbeddingBagConfig],
+    rank: int,
+    world_size: int,
+    kjt_input_per_rank: List[KeyedJaggedTensor],
+    sharder: ModuleSharder[nn.Module],
+    backend: str,
+    local_size: Optional[int] = None,
+) -> None:
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        kjt_input_per_rank = [kjt.to(ctx.device) for kjt in kjt_input_per_rank]
+
+        sparse_arch = create_module_and_freeze(
+            tables,
+            use_fp_collection=False,
+            device=ctx.device,
+        )
+
+        module_sharding_plan = construct_module_sharding_plan(
+            sparse_arch._fp_ebc,
+            per_param_sharding={
+                "table_0": row_wise(),
+                "table_1": row_wise(),
+                "table_2": table_wise(rank=0),
+                "table_3": table_wise(rank=1),
+            },
+            local_size=ctx.local_size,
+            world_size=ctx.world_size,
+            device_type=ctx.device.type,
+            sharder=sharder,
+        )
+
+        with patch(
+            "torch._utils_internal.justknobs_check",
+            return_value=False,
+        ), patch(
+            "torchrec.distributed.fp_embeddingbag.modify_input_for_feature_processor"
+        ) as mock_modify_input:
+            sharded_model = DistributedModelParallel(
+                module=copy.deepcopy(sparse_arch),
+                plan=ShardingPlan({"_fp_ebc": module_sharding_plan}),
+                env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore[6]
+                sharders=[sharder],
+                device=ctx.device,
+            )
+
+            _ = sharded_model(kjt_input_per_rank[ctx.rank])
+
+            mock_modify_input.assert_not_called()
+
+
+@skip_if_asan_class
+class TestFeatureProcessorJKDisabledNonPipelined(MultiProcessTestBase):
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_jk_disabled_non_pipelined(self) -> None:
+        embedding_bag_config = get_configs()
+        kjt_input_per_rank = get_kjt_inputs()
+
+        self._run_multi_process_test(
+            callable=_test_jk_disabled_non_pipelined,
+            world_size=2,
+            tables=embedding_bag_config,
+            kjt_input_per_rank=kjt_input_per_rank,
+            sharder=cast(
+                ModuleSharder[nn.Module],
+                FeatureProcessedEmbeddingBagCollectionSharder(),
+            ),
+            backend=(
+                "nccl"
+                if (torch.cuda.is_available() and torch.cuda.device_count() >= 2)
+                else "gloo"
+            ),
         )
