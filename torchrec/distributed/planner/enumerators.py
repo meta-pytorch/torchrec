@@ -54,6 +54,15 @@ GUARDED_COMPUTE_KERNELS: Set[EmbeddingComputeKernel] = {
     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
 }
 
+# sharding types that require explicit user specification for feature-processed modules
+# row wise sharding uses a different pipelined configuration for feature processing
+# to guard against areas that aren't well tested, user must specify row wise sharding
+GUARDED_SHARDING_TYPES_FOR_FP_MODULES: Set[str] = {
+    ShardingType.ROW_WISE.value,
+    ShardingType.TABLE_ROW_WISE.value,
+    ShardingType.GRID_SHARD.value,
+}
+
 
 class EmbeddingEnumerator(Enumerator):
     """
@@ -186,7 +195,7 @@ class EmbeddingEnumerator(Enumerator):
                 sharding_options_per_table: List[ShardingOption] = []
 
                 for sharding_type in self._filter_sharding_types(
-                    name, sharder.sharding_types(self._compute_device)
+                    name, sharder.sharding_types(self._compute_device), sharder_key
                 ):
                     for compute_kernel in self._filter_compute_kernels(
                         name,
@@ -308,18 +317,37 @@ class EmbeddingEnumerator(Enumerator):
             estimator.estimate(sharding_options, self._sharder_map)
 
     def _filter_sharding_types(
-        self, name: str, allowed_sharding_types: List[str]
+        self, name: str, allowed_sharding_types: List[str], sharder_key: str = ""
     ) -> List[str]:
         # GRID_SHARD is only supported if specified by user in parameter constraints
+        # ROW based shardings only supported for FP modules if specified by user in parameter constraints
         if not self._constraints or not self._constraints.get(name):
-            return [
+            filtered = [
                 t for t in allowed_sharding_types if t != ShardingType.GRID_SHARD.value
             ]
+            # For feature-processed modules, row-wise sharding types require explicit
+            # user specification due to potential issues with position weighted FPs
+            if "FeatureProcessedEmbeddingBagCollection" in sharder_key:
+                filtered = [
+                    t
+                    for t in filtered
+                    if t not in GUARDED_SHARDING_TYPES_FOR_FP_MODULES
+                ]
+            return filtered
         constraints: ParameterConstraints = self._constraints[name]
         if not constraints.sharding_types:
-            return [
+            filtered = [
                 t for t in allowed_sharding_types if t != ShardingType.GRID_SHARD.value
             ]
+            # For feature-processed modules, row-wise sharding types require explicit
+            # user specification due to potential issues with position weighted FPs
+            if "FeatureProcessedEmbeddingBagCollection" in sharder_key:
+                filtered = [
+                    t
+                    for t in filtered
+                    if t not in GUARDED_SHARDING_TYPES_FOR_FP_MODULES
+                ]
+            return filtered
         constrained_sharding_types: List[str] = constraints.sharding_types
 
         filtered_sharding_types = list(

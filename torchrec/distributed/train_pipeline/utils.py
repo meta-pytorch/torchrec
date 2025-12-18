@@ -11,7 +11,6 @@ import copy
 import logging
 from collections import defaultdict
 from contextlib import AbstractContextManager
-
 from threading import Event, Thread
 from typing import (
     Any,
@@ -29,7 +28,6 @@ from typing import (
 
 import torch
 from torch.profiler import record_function
-
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
     FusedKJTListSplitsAwaitable,
@@ -169,6 +167,10 @@ def _start_data_dist(
         # and this info was done in the _rewrite_model by tracing the
         # entire model to get the arg_info_list
         args, kwargs = forward.args.build_args_kwargs(batch)
+        if torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:enable_rw_feature_processor"
+        ):
+            args, kwargs = module.preprocess_input(args, kwargs)
 
         # Start input distribution.
         module_ctx = module.create_context()
@@ -404,6 +406,8 @@ def _rewrite_model(  # noqa C901
             logger.info(f"Module '{node.target}' will be pipelined")
             child = sharded_modules[node.target]
             original_forwards.append(child.forward)
+            # Set pipelining flag on the child module
+            child.is_pipelined = True
             # pyre-ignore[8] Incompatible attribute type
             child.forward = pipelined_forward(
                 node.target,

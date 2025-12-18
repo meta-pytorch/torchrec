@@ -1115,3 +1115,71 @@ class TestEnumerators(unittest.TestCase):
             "Module: torchrec.modules.embedding_modules.EmbeddingBagCollection, sharder: CWSharder, compute device: cuda. "
             "To debug, search above for warning logs about no available sharding types/compute kernels for table: table_1",
         )
+
+    def test_filter_sharding_types_fp_ebc_no_constraints(self) -> None:
+        enumerator = EmbeddingEnumerator(
+            topology=MagicMock(),
+            batch_size=MagicMock(),
+            constraints=None,
+        )
+
+        all_sharding_types = [
+            ShardingType.DATA_PARALLEL.value,
+            ShardingType.TABLE_WISE.value,
+            ShardingType.ROW_WISE.value,
+            ShardingType.TABLE_ROW_WISE.value,
+            ShardingType.COLUMN_WISE.value,
+            ShardingType.GRID_SHARD.value,
+        ]
+
+        allowed_sharding_types = enumerator._filter_sharding_types(
+            "table_0",
+            all_sharding_types,
+            "torchrec.modules.fp_embedding_modules.FeatureProcessedEmbeddingBagCollection",
+        )
+
+        # ROW_WISE, TABLE_ROW_WISE, and GRID_SHARD should be filtered out
+        self.assertEqual(
+            set(allowed_sharding_types),
+            {
+                ShardingType.DATA_PARALLEL.value,
+                ShardingType.TABLE_WISE.value,
+                ShardingType.COLUMN_WISE.value,
+            },
+        )
+
+    def test_filter_sharding_types_fp_ebc_with_row_wise_constraint(self) -> None:
+        constraint = ParameterConstraints(
+            sharding_types=[
+                ShardingType.ROW_WISE.value,
+                ShardingType.TABLE_WISE.value,
+            ],
+        )
+        constraints = {"table_0": constraint}
+        enumerator = EmbeddingEnumerator(
+            topology=MagicMock(),
+            batch_size=MagicMock(),
+            constraints=constraints,
+        )
+
+        all_sharding_types = [
+            ShardingType.DATA_PARALLEL.value,
+            ShardingType.TABLE_WISE.value,
+            ShardingType.ROW_WISE.value,
+            ShardingType.TABLE_ROW_WISE.value,
+            ShardingType.COLUMN_WISE.value,
+        ]
+
+        allowed_sharding_types = enumerator._filter_sharding_types(
+            "table_0",
+            all_sharding_types,
+            "torchrec.modules.fp_embedding_modules.FeatureProcessedEmbeddingBagCollection",
+        )
+
+        self.assertEqual(
+            set(allowed_sharding_types),
+            {
+                ShardingType.ROW_WISE.value,
+                ShardingType.TABLE_WISE.value,
+            },
+        )
