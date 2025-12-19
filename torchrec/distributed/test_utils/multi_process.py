@@ -9,9 +9,11 @@
 
 #!/usr/bin/env python3
 
+import functools
 import logging
 import multiprocessing
 import os
+import traceback
 import unittest
 from typing import Any, Callable, Dict, List, Optional
 
@@ -145,20 +147,44 @@ class MultiProcessTestBase(unittest.TestCase):
         **kwargs,
     ) -> None:
         ctx = multiprocessing.get_context(self._mp_init_mode)
-        processes = []
-        for rank in range(world_size):
-            kwargs["rank"] = rank
-            kwargs["world_size"] = world_size
-            p = ctx.Process(
-                target=callable,
-                kwargs=kwargs,
-            )
-            p.start()
-            processes.append(p)
+        async_results = []
+        exceptions = []
+        unsuccessful_count = 0
 
-        for p in processes:
-            p.join()
-            self.assertEqual(0, p.exitcode)
+        with ctx.Pool(processes=world_size) as pool:
+
+            kwargs["world_size"] = world_size
+            for i in range(world_size):
+                kwargs["rank"] = i
+                async_result = pool.apply_async(
+                    functools.partial(callable, **kwargs),
+                    error_callback=lambda e: exceptions.append(e),
+                )
+                async_results.append(async_result)
+
+            for async_result in async_results:
+                async_result.wait()
+
+                if not async_result.successful():
+                    unsuccessful_count += 1
+
+            exception_msgs = [
+                "\n".join(
+                    traceback.format_exception(
+                        type(exception), exception, exception.__traceback__
+                    )
+                )
+                + "\n"
+                for exception in exceptions
+            ]
+
+            self.assertEqual(
+                unsuccessful_count,
+                0,
+                "Detected at least one unsuccessful run, example errors are: \n{}".format(
+                    "\n".join(exception_msgs)
+                ),
+            )
 
     def _run_multi_process_test_per_rank(
         self,
