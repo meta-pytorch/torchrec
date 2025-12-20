@@ -593,62 +593,6 @@ class TestPt2(unittest.TestCase):
             kjt_module_kjt_inputs_with_strides(kjt_for_pt2_tracing(kjt)),
         )
 
-    # pyre-ignores
-    @unittest.skipIf(
-        True or torch.cuda.device_count() <= 1,
-        "Test fails all the time, skip it for now\n Not enough GPUs available",
-    )
-    def test_sharded_quant_ebc_dynamo_export_aot_inductor(self) -> None:
-        sharded_model, input_kjts = _sharded_quant_ebc_model()
-        kjt = input_kjts[0]
-        sharded_model(kjt.values(), kjt.lengths())
-
-        model: torch.nn.Module = sharded_model
-        model.training = False
-        replace_registered_tbes_with_mock_tbes(model)
-        replace_sharded_quant_modules_tbes_with_mock_tbes(model)
-
-        example_inputs = (kjt.values(), kjt.lengths())
-
-        # pyre-ignore
-        def kjt_to_inputs(kjt):
-            return (kjt.values(), kjt.lengths())
-
-        expected_outputs = [model(*kjt_to_inputs(kjt)) for kjt in input_kjts[1:]]
-
-        device: str = "cuda"
-
-        with unittest.mock.patch(
-            "torch._dynamo.config.skip_torchrec",
-            False,
-        ):
-            tracing_values = kjt.values()
-            tracing_lengths = kjt.lengths()
-            torch._dynamo.mark_dynamic(tracing_values, 0)
-            dynamo_gm, guard = torch._dynamo.export(model, same_signature=False)(
-                tracing_values, tracing_lengths
-            )
-            dynamo_gm.print_readable()
-            dynamo_actual_outputs = [  # noqa
-                dynamo_gm(*kjt_to_inputs(kjt)) for kjt in input_kjts[1:]
-            ]
-            # TODO(ivankobzarev): Why dynamo outputs are different than expected, but aot outputs are correct.
-            # assert_close(expected_outputs, dynamo_actual_outputs)
-
-            # pyre-ignore
-            so_path: str = AOTIRunnerUtil.compile(
-                model,
-                example_inputs,
-            )
-            # pyre-ignore
-            aot_inductor_module = AOTIRunnerUtil.load(device, so_path)
-            aot_inductor_module(*example_inputs)
-
-            aot_actual_outputs = [
-                aot_inductor_module(*kjt_to_inputs(kjt)) for kjt in input_kjts[1:]
-            ]
-            assert_close(expected_outputs, aot_actual_outputs)
-
     def test_sharded_quant_ebc_non_strict_export(self) -> None:
         sharded_model, input_kjts = _sharded_quant_ebc_model(
             local_device="cpu", compute_device="cpu"
