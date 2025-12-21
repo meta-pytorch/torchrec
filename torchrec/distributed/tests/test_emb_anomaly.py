@@ -5,10 +5,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import unittest
 from typing import List, Optional
 
 import torch
-import torchrec
 
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -30,7 +30,11 @@ from torchrec.modules.debug_embedding_modules import (
     DebugEmbeddingBagCollection,
     DebugEmbeddingCollection,
 )
-from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+from torchrec.modules.embedding_configs import (
+    EmbeddingBagConfig,
+    EmbeddingConfig,
+    PoolingType,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -38,14 +42,20 @@ torch.autograd.detect_anomaly(check_nan=True)
 
 
 class TestDebugEmbedding(MultiProcessTestBase):
-    """Test to check for anomaly such as NaN in gradients. Works for Normal embeddings (not virtual tables)
-    This is because we have grads for Normal embeddings (not virtual tables)"""
+    """
+    Test to check for anomaly such as NaN in gradients.
 
+    Works for Normal embeddings (not virtual tables). This is because we have
+    grads for Normal embeddings (not virtual tables).
+    """
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2,
+        "Need at least 2 GPUs",
+    )
     def test_embedding(
         self,
     ) -> None:
-        if torch.cuda.device_count() < 2:
-            self.skipTest("Need atleast 2 GPUs")
         WORLD_SIZE = 2
         # we do not use virtual tables because they do not have grads (use_virtual_table)
         # ec_tables is to test Debug Embedding Collection model
@@ -92,11 +102,13 @@ class TestDebugEmbedding(MultiProcessTestBase):
             inputs_per_rank=inputs_per_rank,
         )
 
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2,
+        "Need at least 2 GPUs",
+    )
     def test_embedding_bag(
         self,
     ) -> None:
-        if torch.cuda.device_count() < 2:
-            self.skipTest("Need atleast 2 GPUs")
         WORLD_SIZE = 2
         # ebc_tables is to test Debug Embedding Bag Collection model
         tables = [
@@ -105,21 +117,21 @@ class TestDebugEmbedding(MultiProcessTestBase):
                 embedding_dim=64,
                 num_embeddings=8000,
                 feature_names=["feature_0", "feature_1"],
-                pooling=torchrec.PoolingType.SUM,
+                pooling=PoolingType.SUM,
             ),
             EmbeddingBagConfig(
                 name="table_1",
                 embedding_dim=64,
                 num_embeddings=8000,
                 feature_names=["feature_1", "feature_2"],
-                pooling=torchrec.PoolingType.SUM,
+                pooling=PoolingType.SUM,
             ),
             EmbeddingBagConfig(
                 name="table_2",
                 embedding_dim=64,
                 num_embeddings=8000,
                 feature_names=["feature_2", "feature_3"],
-                pooling=torchrec.PoolingType.SUM,
+                pooling=PoolingType.SUM,
             ),
         ]
         backend = "nccl"
@@ -142,11 +154,13 @@ class TestDebugEmbedding(MultiProcessTestBase):
             inputs_per_rank=inputs_per_rank,
         )
 
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2,
+        "Need at least 2 GPUs",
+    )
     def test_model(
         self,
     ) -> None:
-        if torch.cuda.device_count() < 2:
-            self.skipTest("Need atleast 2 GPUs")
         WORLD_SIZE = 2
         backend = "nccl"
         self._run_multi_process_test(
@@ -195,8 +209,7 @@ def run_debug_model(
 
         def insert_nan_grad(grad) -> torch.Tensor:
             """Hook to insert nan into the gradient"""
-            nan_grad = torch.full_like(grad, float("nan"))
-            return nan_grad
+            return torch.full_like(grad, float("nan"))
 
         features = torch.rand((B, 100), device=ctx.device)
 
@@ -212,16 +225,12 @@ def run_debug_model(
         )
         logits.register_hook(insert_nan_grad)
         loss = torch.sum(logits)
-        try:
+
+        tc = unittest.TestCase()
+        with tc.assertRaisesRegex(
+            RuntimeError, "NaN/Inf detected in gradient entering"
+        ):
             loss.backward()
-        except RuntimeError as exc:
-            message = str(exc)
-            if "NaN/Inf detected in gradient entering" not in message:
-                raise
-        else:
-            raise AssertionError(
-                "Expected RuntimeError with NaN/Inf gradient message, but backward succeeded"
-            )
 
 
 def embedding_collection(
@@ -304,27 +313,18 @@ def embedding_collection(
 
         def insert_nan_grad(grad) -> torch.Tensor:
             """Hook to insert nan into the gradient"""
-            nan_grad = torch.full_like(grad, float("nan"))
-            return nan_grad
+            return torch.full_like(grad, float("nan"))
 
         first_tensor.register_hook(insert_nan_grad)
 
         debug_loss = sum(torch.sum(v.values()) for k, v in debug_out.items())
 
         with torch.autograd.detect_anomaly():
-            try:
+            tc = unittest.TestCase()
+            with tc.assertRaisesRegex(
+                RuntimeError, "Function 'SplitWithSizesBackward0' returned nan values"
+            ):
                 debug_loss.backward()
-            except RuntimeError as exc:
-                message = str(exc)
-                if (
-                    "Function 'SplitWithSizesBackward0' returned nan values"
-                    not in message
-                ):
-                    raise
-            else:
-                raise AssertionError(
-                    "Expected RuntimeError with NaN/Inf gradient message, but backward succeeded"
-                )
 
         torch.cuda.synchronize()
 
@@ -349,25 +349,15 @@ def embedding_collection(
 
         k, first_tensor = candidates[0]
 
-        def insert_nan_grad(grad) -> torch.Tensor:
-            """Hook to insert nan into the gradient"""
-            nan_grad = torch.full_like(grad, float("nan"))
-            return nan_grad
-
         first_tensor.register_hook(insert_nan_grad)
 
         debug_loss = sum(torch.sum(v) for k, v in debug_out.items())
 
-        try:
+        tc = unittest.TestCase()
+        with tc.assertRaisesRegex(
+            RuntimeError, "NaN/Inf detected in gradient entering"
+        ):
             debug_loss.backward()
-        except RuntimeError as exc:
-            message = str(exc)
-            if "NaN/Inf detected in gradient entering" not in message:
-                raise
-        else:
-            raise AssertionError(
-                "Expected RuntimeError with NaN/Inf gradient message, but backward succeeded"
-            )
 
         torch.cuda.synchronize()
 
@@ -446,24 +436,18 @@ def embedding_bag_collection(
 
         def insert_nan_grad(grad: torch.Tensor) -> torch.Tensor:
             """Hook to insert nan into the gradient"""
-            nan_grad = torch.full_like(grad, float("nan"))
-            return nan_grad
+            return torch.full_like(grad, float("nan"))
 
         first_tensor.register_hook(insert_nan_grad)
 
         debug_loss = sum(torch.sum(v) for v in values)
 
+        tc = unittest.TestCase()
         with torch.autograd.detect_anomaly():
-            try:
+            with tc.assertRaisesRegex(
+                RuntimeError, "Function 'UnbindBackward0' returned nan values in"
+            ):
                 debug_loss.backward()
-            except RuntimeError as exc:
-                message = str(exc)
-                if "Function 'UnbindBackward0' returned nan values in" not in message:
-                    raise
-            else:
-                raise AssertionError(
-                    "Expected RuntimeError with NaN/Inf gradient message, but backward succeeded"
-                )
 
         torch.cuda.synchronize()
 
@@ -489,15 +473,9 @@ def embedding_bag_collection(
 
         debug_loss = sum(torch.sum(v) for v in values)
 
-        try:
+        with tc.assertRaisesRegex(
+            RuntimeError, "NaN/Inf detected in gradient entering"
+        ):
             debug_loss.backward()
-        except RuntimeError as exc:
-            message = str(exc)
-            if "NaN/Inf detected in gradient entering" not in message:
-                raise
-        else:
-            raise AssertionError(
-                "Expected RuntimeError with NaN/Inf gradient message, but backward succeeded"
-            )
 
         torch.cuda.synchronize()
