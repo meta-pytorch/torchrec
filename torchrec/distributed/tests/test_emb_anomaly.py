@@ -95,7 +95,7 @@ class TestDebugEmbedding(MultiProcessTestBase):
             for i in range(WORLD_SIZE)
         ]
         self._run_multi_process_test(
-            callable=embedding_collection,
+            callable=run_embedding_collection,
             world_size=WORLD_SIZE,
             tables=tables,
             backend=backend,
@@ -147,7 +147,7 @@ class TestDebugEmbedding(MultiProcessTestBase):
             for i in range(WORLD_SIZE)
         ]
         self._run_multi_process_test(
-            callable=embedding_bag_collection,
+            callable=run_embedding_bag_collection,
             world_size=WORLD_SIZE,
             tables=tables,
             backend=backend,
@@ -233,7 +233,7 @@ def run_debug_model(
             loss.backward()
 
 
-def embedding_collection(
+def run_embedding_collection(
     rank: int,
     world_size: int,
     tables: List[EmbeddingConfig],
@@ -281,7 +281,7 @@ def embedding_collection(
         )  # Returns EmbeddingCollectionAwaitable object
 
         # compute a scalar loss upon which we can call backward()
-        loss = sum(torch.sum(emb.values()) for emb in out.values())
+        loss = sum(torch.sum(jt.values()) for jt in out.values())
         loss.backward()
 
         torch.cuda.synchronize()
@@ -302,7 +302,7 @@ def embedding_collection(
         debug_out = debug_sharded_model(kjts.to(ctx.device))
 
         candidates = [
-            (k, kt.values()) for k, kt in debug_out.items() if kt.values().requires_grad
+            (k, jt.values()) for k, jt in debug_out.items() if jt.values().requires_grad
         ]
 
         assert (
@@ -340,18 +340,18 @@ def embedding_collection(
         )
         debug_out = debug_sharded_model(kjts.to(ctx.device))
 
-        candidates = [(k, kt) for k, kt in debug_out.items() if kt.requires_grad]
-        # if debug_mode = False above, the line above would throw an error
-        # AttributeError: 'JaggedTensor' object has no attribute 'requires_grad'
-        assert (
-            candidates
-        ), "No outputs require grad; ensure all tables use DENSE kernels"
+        candidates = [
+            (k, jt.values()) for k, jt in debug_out.items() if jt.values().requires_grad
+        ]
+        assert len(candidates) == len(
+            debug_out.keys()
+        ), "All jt.values() should require grad; ensure all tables use DENSE kernels"
 
         k, first_tensor = candidates[0]
 
         first_tensor.register_hook(insert_nan_grad)
 
-        debug_loss = sum(torch.sum(v) for k, v in debug_out.items())
+        debug_loss = sum(torch.sum(v.values()) for k, v in debug_out.items())
 
         tc = unittest.TestCase()
         with tc.assertRaisesRegex(
@@ -362,7 +362,7 @@ def embedding_collection(
         torch.cuda.synchronize()
 
 
-def embedding_bag_collection(
+def run_embedding_bag_collection(
     rank: int,
     world_size: int,
     tables: List[EmbeddingBagConfig],
