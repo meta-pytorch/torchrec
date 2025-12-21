@@ -307,11 +307,19 @@ class ModelParallelTestShared(MultiProcessTestBase):
 
 @skip_if_asan_class
 class ModelParallelBase(ModelParallelTestShared):
-    def setUp(self, backend: str = "nccl") -> None:
-        super().setUp(backend=backend)
+    # tests will skip if no backend specified
+    backend = ""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if cls.backend not in ("nccl", "gloo"):
+            raise unittest.SkipTest(f"No valid backend specified: {cls.backend}")
+
+    def setUp(self) -> None:
+        super().setUp(backend=self.backend)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
     # pyre-fixme[56]
@@ -667,7 +675,7 @@ class ModelParallelBase(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
     # pyre-fixme[56]
@@ -749,7 +757,7 @@ class ModelParallelBase(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
     # pyre-fixme[56]
@@ -807,7 +815,7 @@ class ModelParallelBase(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
     # pyre-fixme[56]
@@ -845,7 +853,7 @@ class ModelParallelBase(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 3,
+        torch.cuda.device_count() < 4,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     # pyre-fixme[56]
@@ -936,7 +944,7 @@ class ModelParallelBase(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        torch.cuda.device_count() < 8,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     # pyre-fixme[56]
@@ -1027,7 +1035,7 @@ class ModelParallelBase(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
     # pyre-fixme[56]

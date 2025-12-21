@@ -104,18 +104,10 @@ jobs:
           python -c "import numpy"
         echo "numpy succeeded"
         conda install -n build_binary -y pytest
-        # Read the list of tests to skip from a file, ignoring empty lines and comments
-        skip_expression=$(awk '!/^($|#)/ {printf " and not %s", $0}' ./.github/scripts/tests_to_skip.txt)
-        # Check if skip_expression is effectively empty
-        if [ -z "$skip_expression" ]; then
-          skip_expression=""
-        else
-          skip_expression=${skip_expression:5}  # Remove the leading " and "
-        fi
         conda run -n build_binary \
           python -m pytest torchrec -v -s -W ignore::pytest.PytestCollectionWarning --continue-on-collection-errors \
-          --ignore-glob=**/test_utils/ -k "$skip_expression"
-
+        --ignore-glob=**/test_utils/ \
+        -k "not _disabled_in_oss_compatibility"
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ inputs.repository }}-${{ github.event_name == 'workflow_dispatch' }}
   cancel-in-progress: true

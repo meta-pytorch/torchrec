@@ -26,7 +26,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
 class ModelParallelStateDictTestNccl(ModelParallelStateDictBase):
-    pass
+    backend = "nccl"
 
 
 class SparseArch(nn.Module):
@@ -67,6 +67,8 @@ class TwoSparseArchModel(nn.Module):
 
 
 class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
+    backend = "nccl"
+
     def test_shared_sparse_module_in_multiple_parents(self) -> None:
         """
         Test that the module ID cache correctly handles the same sparse module
