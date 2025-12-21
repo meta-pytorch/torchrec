@@ -116,26 +116,30 @@ jobs:
           python -c "import numpy"
         echo "numpy succeeded"
         conda install -n build_binary -y pytest
-        # Read the list of tests to skip from a file, ignoring empty lines and comments
-        skip_expression=$(awk '!/^($|#)/ {printf " and not %s", $0}' ./.github/scripts/tests_to_skip.txt)
-        # Check if skip_expression is effectively empty
-        if [ -z "$skip_expression" ]; then
-          skip_expression=""
-        else
-          skip_expression=${skip_expression:5}  # Remove the leading " and "
-        fi
         conda run -n build_binary \
-          python -m pytest torchrec -v -s -W ignore::pytest.PytestCollectionWarning --continue-on-collection-errors \
-          --ignore=torchrec/distributed/tests/test_comm.py --ignore=torchrec/distributed/tests/test_infer_shardings.py \
-          --ignore=torchrec/distributed/tests/test_keyed_jagged_tensor_pool.py --ignore=torchrec/distributed/tests/test_pt2_multiprocess.py \
-          --ignore=torchrec/distributed/tests/test_pt2.py --ignore=torchrec/distributed/tests/test_quant_model_parallel.py \
-          --ignore=torchrec/distributed/tests/test_quant_pruning.py --ignore=torchrec/distributed/tests/test_quant_sequence_model_parallel.py \
-          --ignore-glob='torchrec/metrics/*' --ignore-glob='torchrec/distributed/tests/test_model_parallel_gloo*' \
-          --ignore-glob='torchrec/inference/inference_legacy/tests*' --ignore-glob='*test_model_parallel_nccl*' \
-          --ignore=torchrec/distributed/tests/test_cache_prefetch.py --ignore=torchrec/distributed/tests/test_fp_embeddingbag_single_rank.py \
-          --ignore=torchrec/distributed/tests/test_infer_utils.py --ignore=torchrec/distributed/tests/test_fx_jit.py --ignore-glob=**/test_utils/ \
-          --ignore-glob='*test_train_pipeline*' --ignore=torchrec/distributed/tests/test_model_parallel_hierarchical.py \
-          -k "$skip_expression"
+          python -m pytest torchrec -v -s \
+          -W ignore::pytest.PytestCollectionWarning \
+          --continue-on-collection-errors \
+          --ignore=torchrec/distributed/tests/test_comm.py \
+          --ignore=torchrec/distributed/tests/test_infer_shardings.py \
+          --ignore=torchrec/distributed/tests/test_keyed_jagged_tensor_pool.py \
+          --ignore=torchrec/distributed/tests/test_pt2_multiprocess.py \
+          --ignore=torchrec/distributed/tests/test_pt2.py \
+          --ignore=torchrec/distributed/tests/test_quant_model_parallel.py \
+          --ignore=torchrec/distributed/tests/test_quant_pruning.py \
+          --ignore=torchrec/distributed/tests/test_quant_sequence_model_parallel.py \
+          --ignore=torchrec/distributed/tests/test_cache_prefetch.py \
+          --ignore=torchrec/distributed/tests/test_fp_embeddingbag_single_rank.py \
+          --ignore=torchrec/distributed/tests/test_infer_utils.py \
+          --ignore=torchrec/distributed/tests/test_fx_jit.py \
+          --ignore=torchrec/distributed/tests/test_model_parallel_hierarchical.py \
+          --ignore-glob=**/test_utils/ \
+          --ignore-glob='torchrec/metrics/' \
+          --ignore-glob='*test_train_pipeline*' \
+          --ignore-glob='torchrec/distributed/tests/test_model_parallel_gloo*' \
+          --ignore-glob='torchrec/inference/inference_legacy/tests*' \
+          --ignore-glob='*test_model_parallel_nccl*' \
+          -k "not _disabled_in_oss_compatibility"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ inputs.repository }}-${{ github.event_name == 'workflow_dispatch' }}
