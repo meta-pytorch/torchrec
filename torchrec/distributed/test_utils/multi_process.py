@@ -119,7 +119,9 @@ class MultiProcessTestBase(unittest.TestCase):
         os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
         os.environ["NCCL_SOCKET_IFNAME"] = "lo"
-        os.environ["NCCL_DEBUG"] = "INFO"
+        os.environ["NCCL_DEBUG"] = "TRACE"
+        os.environ["FORCED_NCCL_DEBUG"] = "TRACE"
+        os.environ["NCCL_DEBUG_SUBSYS"] = "ALL"
 
         torch.use_deterministic_algorithms(True)
         if torch.cuda.is_available():
