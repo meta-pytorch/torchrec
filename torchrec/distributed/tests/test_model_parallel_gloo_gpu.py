@@ -13,5 +13,4 @@ from torchrec.distributed.test_utils.test_model_parallel import ModelParallelBas
 
 
 class ModelParallelTestGloo(ModelParallelBase):
-    def setUp(self, backend: str = "gloo") -> None:
-        super().setUp(backend=backend)
+    backend = "gloo"

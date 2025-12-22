@@ -190,7 +190,15 @@ class InferenceModelParallelTestBase(unittest.TestCase):
 
 
 class ModelParallelSparseOnlyBase(unittest.TestCase):
-    def setUp(self, backend: str = "nccl") -> None:
+    # tests will be skipped if no backend is specified
+    backend: str = ""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if cls.backend not in ("nccl", "gloo"):
+            raise unittest.SkipTest(f"No valid backend specified: {cls.backend}")
+
+    def setUp(self) -> None:
         os.environ["RANK"] = "0"
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
@@ -198,7 +206,6 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
         os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["NCCL_SOCKET_IFNAME"] = "lo"
 
-        self.backend = backend
         if torch.cuda.is_available():
             self.device = torch.device("cuda:0")
             torch.cuda.set_device(self.device)
@@ -522,6 +529,17 @@ class ModelParallelSingleRankBase(unittest.TestCase):
 
 
 class ModelParallelStateDictBase(ModelParallelSingleRankBase):
+    # tests will be skipped if no backend is specified
+    backend: str = ""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if cls.backend not in ("nccl", "gloo"):
+            raise unittest.SkipTest(f"No valid backend specified: {cls.backend}")
+
+    def setUp(self) -> None:
+        super().setUp(backend=self.backend)
+
     def _create_tables(self) -> None:
         num_features = 4
         num_weighted_features = 2
