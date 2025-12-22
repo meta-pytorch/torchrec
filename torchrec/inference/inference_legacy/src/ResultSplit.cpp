@@ -65,7 +65,7 @@ c10::IValue splitDictOfTensors(
       TORCH_CHECK(tensor.dim() == 1);
       TORCH_CHECK(tensor.size(0) % nTotalLength == 0);
       const auto elemSize = tensor.size(0) / nTotalLength;
-      values.push_back(tensor.slice(
+      values.emplace_back(tensor.slice(
           0, nOffset * elemSize, nOffset * elemSize + nLength * elemSize));
     }
     pred.insert(key, c10::ivalue::Tuple::create(std::move(values)));
@@ -161,7 +161,7 @@ class DictOfTensorsResultSplitFunc : public ResultSplitFunc {
         auto& elem = tuple->elements()[i];
         TORCH_CHECK(elem.isTensor());
         const auto& tensor = elem.toTensor();
-        values.push_back(
+        values.emplace_back(
             tensor.to(at::Device(at::kCPU), /* non_blocking */ true));
       }
       moved.insert(key, c10::ivalue::Tuple::create(std::move(values)));
@@ -211,7 +211,7 @@ c10::IValue DictWithMaskTensorResultSplitFunc::moveToHost(c10::IValue result) {
     values.reserve(2);
     for (int i = 0; i < 2; ++i) {
       const auto& tensor = tuple->elements()[i].toTensor();
-      values.push_back(
+      values.emplace_back(
           tensor.to(at::Device(at::kCPU), /* non_blocking */ true));
     }
     moved.insert(key, c10::ivalue::Tuple::create(std::move(values)));
