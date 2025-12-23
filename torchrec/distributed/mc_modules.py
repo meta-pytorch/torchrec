@@ -742,6 +742,54 @@ class ShardedManagedCollisionCollection(
             runtime_meta,
         )
 
+    def get_lookup_value(
+        self, table: str, features: KeyedJaggedTensor
+    ) -> Dict[str, JaggedTensor]:
+
+        mcm = self._managed_collision_modules[table]
+        # only turn on include_readonly_suffix_feature when at least one feature in the table ends with the readonly suffix
+        include_readonly_suffix_feature = any(
+            1
+            for feature_name in features.keys()
+            if feature_name.lower().endswith(mcm.readable_suffix)
+        )
+
+        # When we turn on include_readonly_suffix_feature, those features will not contribute to the ZCH frequency counter, only non-readonly features will be consider for insert, eviction and stats logging
+        if mcm._enable_per_feature_lookups and include_readonly_suffix_feature:
+            # In the original lookup call, it will not distinct feature values and do remapper at one call for all features. In that way we can not define read-only feature, so here we pass in per key KJT to provide more control
+            mc_input = features.to_dict()
+            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            mc_input = mcm.profile(mc_input)
+            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            mc_input = mcm.remap(mc_input)
+            # This is for the purpose of remap the global index back to local index since the offset is key by table
+            mc_input_unify = {
+                table: JaggedTensor(
+                    values=torch.cat([jt.values() for jt in mc_input.values()]),
+                    lengths=torch.cat([jt.lengths() for jt in mc_input.values()]),
+                )
+            }
+            mc_input = self.global_to_local_index(mc_input_unify)
+        else:
+            # this is the default behavior, we will do remapper for all features at one call
+            mc_input: Dict[str, JaggedTensor] = {
+                table: JaggedTensor(
+                    values=features.values(),
+                    lengths=features.lengths(),
+                    # TODO: improve this temp solution by passing real weights, this is for eviction purpose since after we unify all feature to one key, we lost the original feature boundary information for per feature eviction
+                    weights=torch.tensor(features.length_per_key()),
+                )
+            }
+            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            mc_input = mcm.profile(mc_input)
+            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            mc_input = mcm.remap(mc_input)
+            mc_input = self.global_to_local_index(mc_input)
+        self._retrieve_and_track_hash_zch_identities_and_metadata(
+            mcm, mc_input, mc_input[table].values()
+        )
+        return mc_input
+
     def compute(
         self,
         ctx: ManagedCollisionCollectionContext,
@@ -768,47 +816,14 @@ class ShardedManagedCollisionCollection(
                 feature_splits = features.split(splits)
                 output: Dict[str, JaggedTensor] = {}
                 for table, kjt in zip(tables, feature_splits):
-                    # TODO: Dict[str, Tensor]
-                    mc_input: Dict[str, JaggedTensor] = {
-                        table: JaggedTensor(
-                            values=kjt.values(),
-                            lengths=kjt.lengths(),
-                            # TODO: improve this temp solution by passing real weights
-                            weights=torch.tensor(kjt.length_per_key()),
-                        )
-                    }
-                    mcm = self._managed_collision_modules[table]
-                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-                    mc_input = mcm.profile(mc_input)
-                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-                    mc_input = mcm.remap(mc_input)
-                    mc_input = self.global_to_local_index(mc_input)
+                    mc_input = self.get_lookup_value(table, kjt)
                     output.update(mc_input)
-                    self._retrieve_and_track_hash_zch_identities_and_metadata(
-                        mcm, mc_input, mc_input[table].values()
-                    )
+
                 values = torch.cat([jt.values() for jt in output.values()])
             else:
                 table: str = tables[0]
-                mc_input: Dict[str, JaggedTensor] = {
-                    table: JaggedTensor(
-                        values=features.values(),
-                        lengths=features.lengths(),
-                        # TODO: improve this temp solution by passing real weights
-                        weights=torch.tensor(features.length_per_key()),
-                    )
-                }
-                mcm = self._managed_collision_modules[table]
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-                mc_input = mcm.profile(mc_input)
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-                mc_input = mcm.remap(mc_input)
-                mc_input = self.global_to_local_index(mc_input)
+                mc_input = self.get_lookup_value(table, features)
                 values = mc_input[table].values()
-                self._retrieve_and_track_hash_zch_identities_and_metadata(
-                    mcm, mc_input, values
-                )
-
             remapped_kjts.append(
                 KeyedJaggedTensor(
                     keys=fns,
