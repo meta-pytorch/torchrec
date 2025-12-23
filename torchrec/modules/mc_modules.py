@@ -197,9 +197,15 @@ class ManagedCollisionModule(nn.Module):
         device: torch.device,
         output_segments: List[int],
         skip_state_validation: bool = False,
+        read_only_suffix: str = "_readonly",
+        enable_per_feature_lookups: bool = False,
     ) -> None:
         super().__init__()
         self._device = device
+
+        # adding to the base class to be compatible with HashZchManagedCollisionModule
+        self._enable_per_feature_lookups = enable_per_feature_lookups
+        self._read_only_suffix = read_only_suffix
 
         if skip_state_validation:
             logger.warning(
@@ -236,6 +242,10 @@ class ManagedCollisionModule(nn.Module):
             module.validate_state()
 
         self.register_load_state_dict_post_hook(_load_state_dict_post_hook)
+
+    @property
+    def readable_suffix(self) -> str:
+        return self._read_only_suffix
 
     @abc.abstractmethod
     def preprocess(

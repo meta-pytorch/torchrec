@@ -646,6 +646,159 @@ def _test_sharding_dedup(  # noqa C901
         # assert torch.allclose(remapped_1.lengths(), dedup_remapped_1.lengths())
 
 
+class SparseArchSingleTableWithReadonly(nn.Module):
+    def __init__(
+        self,
+        tables: List[EmbeddingConfig],
+        device: torch.device,
+        return_remapped: bool = False,
+        input_hash_size: int = 4000,
+        enable_per_feature_lookups: bool = True,
+    ) -> None:
+        super().__init__()
+        self._return_remapped = return_remapped
+
+        from torchrec.fb.modules.hash_mc_modules import HashZchManagedCollisionModule
+
+        mc_modules = {}
+        mc_modules["table_0"] = HashZchManagedCollisionModule(
+            zch_size=(tables[0].num_embeddings),
+            input_hash_size=input_hash_size,
+            device=device,
+            total_num_buckets=2,
+            read_only_suffix="_readonly",
+            enable_per_feature_lookups=enable_per_feature_lookups,
+        )
+
+        self._mc_ec: ManagedCollisionEmbeddingCollection = (
+            ManagedCollisionEmbeddingCollection(
+                EmbeddingCollection(
+                    tables=tables,
+                    device=device,
+                ),
+                ManagedCollisionCollection(
+                    managed_collision_modules=mc_modules,
+                    embedding_configs=tables,
+                ),
+                return_remapped_features=self._return_remapped,
+            )
+        )
+
+    def forward(
+        self, kjt: KeyedJaggedTensor
+    ) -> Tuple[torch.Tensor, Optional[Dict[str, JaggedTensor]]]:
+        ec_out, remapped_ids_out = self._mc_ec(kjt)
+        pred = torch.cat(
+            [ec_out[key].values() for key in ["feature_0", "feature_0_readonly"]],
+            dim=0,
+        )
+        loss = pred.mean()
+        return loss, remapped_ids_out
+
+
+def _test_readonly_feature_metadata(  # noqa C901
+    tables: List[EmbeddingConfig],
+    rank: int,
+    world_size: int,
+    kjt_input_per_rank: List[KeyedJaggedTensor],
+    sharder: ModuleSharder[nn.Module],
+    backend: str,
+    local_size: Optional[int] = None,
+    input_hash_size: int = 4000,
+) -> None:
+    """
+    Test that verifies the readonly feature behavior in HashZchManagedCollisionModule.
+
+    The test validates that:
+    1. Regular features (feature_0) can add new IDs to the ZCH identities table
+    2. Readonly features (feature_0_readonly) do not add new IDs to the table
+
+    Note: The readonly feature lookup for IDs not in the table returns -1, which would
+    cause CUDA errors during embedding lookup. So we test by comparing state changes.
+
+    Bucket assignment with input_hash_size=4000, total_num_buckets=2:
+    - IDs 0-1999 go to bucket 0 (rank 0)
+    - IDs 2000-3999 go to bucket 1 (rank 1)
+    """
+    for enable_per_feature_lookups in [True, False]:
+        with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+            kjt_input = kjt_input_per_rank[rank].to(ctx.device)
+            return_remapped: bool = True
+            sparse_arch = SparseArchSingleTableWithReadonly(
+                tables,
+                torch.device("meta"),
+                return_remapped=return_remapped,
+                input_hash_size=input_hash_size,
+                enable_per_feature_lookups=enable_per_feature_lookups,
+            )
+
+            apply_optimizer_in_backward(
+                RowWiseAdagrad,
+                [
+                    sparse_arch._mc_ec._embedding_collection.embeddings[
+                        "table_0"
+                    ].weight,
+                ],
+                {"lr": 0.01},
+            )
+            module_sharding_plan = construct_module_sharding_plan(
+                sparse_arch._mc_ec,
+                per_param_sharding={"table_0": row_wise()},
+                local_size=local_size,
+                world_size=world_size,
+                device_type="cuda" if torch.cuda.is_available() else "cpu",
+                sharder=sharder,
+            )
+
+            sharded_sparse_arch = _shard_modules(
+                module=copy.deepcopy(sparse_arch),
+                plan=ShardingPlan({"_mc_ec": module_sharding_plan}),
+                env=ShardingEnv.from_process_group(ctx.pg),
+                sharders=[sharder],
+                device=ctx.device,
+            )
+
+            assert isinstance(
+                sharded_sparse_arch._mc_ec, ShardedManagedCollisionEmbeddingCollection
+            )
+            assert isinstance(
+                sharded_sparse_arch._mc_ec._embedding_collection,
+                ShardedEmbeddingCollection,
+            )
+            assert isinstance(
+                sharded_sparse_arch._mc_ec._managed_collision_collection,
+                ShardedManagedCollisionCollection,
+            )
+
+            # First run with both features to initialize the input dists and add initial IDs
+            # The kjt_input has IDs for both feature_0 and feature_0_readonly
+            loss_init, _ = sharded_sparse_arch(kjt_input)
+
+            # Get initial identities state after first forward
+            initial_state_dict = sharded_sparse_arch.state_dict()
+            initial_identities = None
+            cpu_state_dict = {}
+            for key, sharded_tensor in initial_state_dict.items():
+                if "table_0._hash_zch_identities" in key:
+                    target_key = key
+                    initial_identities = sharded_tensor.local_shards()[0].tensor.clone()
+                    cpu_state_dict[key] = initial_identities.to("cpu")
+
+            assert initial_identities is not None
+            gather_list = [None, None] if ctx.rank == 0 else None
+            torch.distributed.gather_object(cpu_state_dict, gather_list)
+
+            # only expect 3 write elements in the initial state
+            if rank == 0:
+                write_element_cnt: int = sum(
+                    [(i[target_key] != -1).sum() for i in gather_list]
+                )
+                assert torch.equal(
+                    torch.tensor(write_element_cnt),
+                    torch.tensor(6) if enable_per_feature_lookups else torch.tensor(12),
+                ), f"identity tensor expect {6 if enable_per_feature_lookups else 12} element when enable_per_feature_lookups={enable_per_feature_lookups} , now get {write_element_cnt}"
+
+
 @skip_if_asan_class
 class ShardedMCEmbeddingCollectionParallelTest(MultiProcessTestBase):
     @unittest.skipIf(
@@ -1290,4 +1443,56 @@ class ShardedMCEmbeddingCollectionParallelTest(MultiProcessTestBase):
             sharder=ManagedCollisionEmbeddingCollectionSharder(),
             backend=backend,
             allow_in_place_embed_weight_update=allow_in_place_embed_weight_update,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    # pyre-ignore
+    @given(backend=st.sampled_from(["nccl"]))
+    @settings(deadline=None)
+    def test_sharding_zch_mc_ec_readonly_feature(self, backend: str) -> None:
+        """
+        Test that readonly features do not change MCH metadata while regular features do.
+
+        This test verifies that:
+        1. When running forward with a feature_0_readonly, the MCH metadata
+           (_mch_sorted_raw_ids and _mch_remapped_ids_mapping) should NOT change.
+        2. When running forward with feature_0 (regular feature), the MCH metadata
+           SHOULD change.
+        """
+        WORLD_SIZE = 2
+
+        embedding_config = [
+            EmbeddingConfig(
+                name="table_0",
+                feature_names=["feature_0", "feature_0_readonly"],
+                embedding_dim=8,
+                num_embeddings=1000,
+            ),
+        ]
+
+        kjt_input_per_rank = [
+            KeyedJaggedTensor.from_lengths_sync(
+                keys=["feature_0", "feature_0_readonly"],
+                values=torch.LongTensor([1000, 2000, 3000, 1001, 2001, 3001]),
+                lengths=torch.LongTensor([1, 1, 1, 1, 1, 1]),
+                weights=None,
+            ),
+            KeyedJaggedTensor.from_lengths_sync(
+                keys=["feature_0", "feature_0_readonly"],
+                values=torch.LongTensor([1002, 2002, 3002, 1003, 2003, 3003]),
+                lengths=torch.LongTensor([1, 1, 1, 1, 1, 1]),
+                weights=None,
+            ),
+        ]
+
+        self._run_multi_process_test(
+            callable=_test_readonly_feature_metadata,
+            world_size=WORLD_SIZE,
+            tables=embedding_config,
+            kjt_input_per_rank=kjt_input_per_rank,
+            sharder=ManagedCollisionEmbeddingCollectionSharder(),
+            backend=backend,
         )
