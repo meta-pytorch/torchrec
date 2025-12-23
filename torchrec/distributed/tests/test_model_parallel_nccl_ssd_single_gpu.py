@@ -10,6 +10,7 @@
 import copy
 import unittest
 from typing import cast, List, OrderedDict, Union
+from unittest.mock import Mock, patch
 
 import torch
 import torch.distributed as dist
@@ -23,6 +24,7 @@ from torchrec.distributed.batched_embedding_kernel import (
     ZeroCollisionKeyValueEmbedding,
     ZeroCollisionKeyValueEmbeddingBag,
 )
+from torchrec.distributed.embedding_lookup import logger as lookup_logger
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     ShardedEmbeddingTable,
@@ -696,14 +698,23 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             ]
         ),
         dtype=st.sampled_from([DataType.FP32, DataType.FP16]),
+        is_jk_enabled=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=6, deadline=None)
+    @settings(verbosity=Verbosity.verbose, max_examples=6, deadline=None, database=None)
+    @patch("torch._utils_internal.justknobs_check")
     def test_ssd_mixed_kernels_with_vbe(
         self,
+        mock_jk: Mock,
         sharding_type: str,
         dtype: DataType,
+        is_jk_enabled: bool,
     ) -> None:
         self._set_table_weights_precision(dtype)
+        optimizer_configs = {
+            DataType.FP32: (RowWiseAdagrad, {"lr": 0.1, "eps": 1e-8}),
+            # Increases eps for FP16 to avoid numerical instability
+            DataType.FP16: (RowWiseAdagrad, {"lr": 0.001, "eps": 0.001}),
+        }
         constraints = {
             table.name: ParameterConstraints(
                 min_partition=4,
@@ -716,31 +727,48 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             )
             for i, table in enumerate(self.tables)
         }
-        optimizer_config = (RowWiseAdagrad, {"lr": 0.001, "eps": 0.001})
         pg = dist.GroupMember.WORLD
+        mock_jk.return_value = is_jk_enabled
+        if is_jk_enabled:
+            cm = self.assertNoLogs(lookup_logger, level="INFO")
+        else:
+            cm = self.assertLogs(lookup_logger, level="INFO")
 
-        assert pg is not None, "Process group is not initialized"
-        sharding_single_rank_test_single_process(
-            pg=pg,
-            device=self.device,
-            rank=0,
-            world_size=1,
-            # pyre-fixme[6]: The intake type should be `type[TestSparseNNBase]`
-            model_class=TestSparseNN,
-            embedding_groups={},
-            tables=self.tables,
-            # pyre-fixme[6]
-            sharders=[EmbeddingBagCollectionSharder()],
-            optim=EmbOptimType.EXACT_SGD,
-            # The optimizer config here will overwrite the SGD optimizer above
-            apply_optimizer_in_backward_config={
-                "embedding_bags": optimizer_config,
-                "embeddings": optimizer_config,
-            },
-            constraints=constraints,
-            variable_batch_per_feature=True,
-            random_seed=100,
+        with cm as logs:
+            assert pg is not None, "Process group is not initialized"
+            sharding_single_rank_test_single_process(
+                pg=pg,
+                device=self.device,
+                rank=0,
+                world_size=1,
+                # pyre-fixme[6]: The intake type should be `type[TestSparseNNBase]`
+                model_class=TestSparseNN,
+                embedding_groups={},
+                tables=self.tables,
+                # pyre-fixme[6]
+                sharders=[EmbeddingBagCollectionSharder()],
+                optim=EmbOptimType.EXACT_SGD,
+                # The optimizer config here will overwrite the SGD optimizer above
+                apply_optimizer_in_backward_config={
+                    "embedding_bags": optimizer_configs[dtype],
+                    "embeddings": optimizer_configs[dtype],
+                },
+                constraints=constraints,
+                variable_batch_per_feature=True,
+                random_seed=100,
+            )
+
+        mock_jk.assert_any_call(
+            "pytorch/torchrec:killswitch_enable_preallocated_vbe_merge"
         )
+        # Should only print logs when JK is disabled. Only used for JK testing
+        # and should be cleaned up later.
+        self.assertEqual(is_jk_enabled, logs is None)
+        if logs is not None:
+            matched_logs = list(
+                filter(lambda s: "[Deprecated] Merge VBE" in s, logs.output)
+            )
+            self.assertGreater(len(matched_logs), 0)
 
     @unittest.skipIf(
         not torch.cuda.is_available(),

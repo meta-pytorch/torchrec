@@ -415,7 +415,13 @@ class QuantBatchedEmbeddingBag(
         else:
             return self._emb_module.forward(**kwargs)
 
-    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+    # TODO: T232803649 Remove unused VBE parameters from the forward signature
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+        vbe_output: Optional[torch.Tensor] = None,  # unused
+        vbe_output_offsets: Optional[torch.Tensor] = None,  # unused
+    ) -> torch.Tensor:
         # Important: _unwrap_kjt regex for FX tracing TAGing
         lengths, offsets = None, None
         if self._runtime_device.type == "cpu":
