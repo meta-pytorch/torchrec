@@ -2840,6 +2840,8 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
     def forward(
         self,
         features: KeyedJaggedTensor,
+        vbe_output: Optional[torch.Tensor] = None,
+        vbe_output_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         forward_args: Dict[str, Any] = {}
         identities_and_metadata = self._get_hash_zch_identities_and_metadata(features)
@@ -2852,17 +2854,24 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         weights = features.weights_or_none()
         if weights is not None and not torch.is_floating_point(weights):
             weights = None
-        if features.variable_stride_per_key() and isinstance(
-            self.emb_module,
-            (
-                SplitTableBatchedEmbeddingBagsCodegen,
-                DenseTableBatchedEmbeddingBagsCodegen,
-                SSDTableBatchedEmbeddingBags,
-            ),
-        ):
-            forward_args["batch_size_per_feature_per_rank"] = (
-                features.stride_per_key_per_rank()
-            )
+        if features.variable_stride_per_key():
+            if isinstance(self.emb_module, DenseTableBatchedEmbeddingBagsCodegen):
+                forward_args.update(
+                    {
+                        "batch_size_per_feature_per_rank": features.stride_per_key_per_rank()
+                    }
+                )
+            if isinstance(
+                self.emb_module,
+                (SplitTableBatchedEmbeddingBagsCodegen, SSDTableBatchedEmbeddingBags),
+            ):
+                forward_args.update(
+                    {
+                        "batch_size_per_feature_per_rank": features.stride_per_key_per_rank(),
+                        "vbe_output": vbe_output,
+                        "vbe_output_offsets": vbe_output_offsets,
+                    }
+                )
 
         if len(forward_args) == 0:
             return self.emb_module(
@@ -3454,12 +3463,19 @@ class ZeroCollisionKeyValueEmbeddingBag(
     ]:
         return self.emb_module.split_embedding_weights(no_snapshot, should_flush)
 
-    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+        vbe_output: Optional[torch.Tensor] = None,
+        vbe_output_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         # reset split weights during training
         self._split_weights_res = None
         self._optim.set_sharded_embedding_weight_ids(sharded_embedding_weight_ids=None)
 
-        return super().forward(features)
+        return super().forward(
+            features, vbe_output=vbe_output, vbe_output_offsets=vbe_output_offsets
+        )
 
 
 class BatchedFusedEmbeddingBag(

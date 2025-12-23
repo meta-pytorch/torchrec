@@ -9,6 +9,7 @@
 
 import unittest
 from typing import Any, cast, Dict, List, Optional, Tuple, Type
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn as nn
@@ -822,13 +823,21 @@ class ModelParallelBase(ModelParallelTestShared):
     @given(
         sharding_type=st.just(ShardingType.COLUMN_WISE.value),
         data_type=st.sampled_from([DataType.FP32, DataType.FP16]),
+        is_jk_enabled=st.just(True),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
+    @settings(verbosity=Verbosity.verbose, max_examples=4, deadline=None)
+    @patch("torch._utils_internal.justknobs_check")
     def test_sharding_multiple_kernels(
-        self, sharding_type: str, data_type: DataType
+        self,
+        mock_jk: Mock,
+        sharding_type: str,
+        data_type: DataType,
+        is_jk_enabled: bool,
     ) -> None:
         if self.backend == "gloo":
             self.skipTest("ProcessGroupGloo does not support reduce_scatter")
+
+        # prefetch_pipeline is neeeded to enable multiple kernels
         fused_params = {"prefetch_pipeline": True}
         constraints = {
             table_name: ParameterConstraints(
@@ -842,6 +851,8 @@ class ModelParallelBase(ModelParallelTestShared):
             )
             for i, table_name in enumerate(self.table_names)
         }
+        mock_jk.return_value = is_jk_enabled
+
         self._test_sharding(
             # pyre-ignore[6]
             sharders=[EmbeddingBagCollectionSharder(fused_params=fused_params)],

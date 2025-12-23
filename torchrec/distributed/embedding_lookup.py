@@ -41,6 +41,7 @@ from torchrec.distributed.batched_embedding_kernel import (
     KeyValueEmbeddingBag,
     ShardedBatchedFusedEmbedding,
     ShardedBatchedFusedEmbeddingBag,
+    SparseType,
     ZeroCollisionEmbeddingCache,
     ZeroCollisionKeyValueEmbedding,
     ZeroCollisionKeyValueEmbeddingBag,
@@ -706,11 +707,11 @@ class GroupedPooledEmbeddingsLookup(
 
     def _merge_variable_batch_embeddings(
         self, embeddings: List[torch.Tensor], splits: List[List[int]]
-    ) -> List[torch.Tensor]:
+    ) -> torch.Tensor:
         assert len(embeddings) > 1 and len(splits) > 1
 
         logger.info(
-            "Merge VBE embeddings from the following TBEs "
+            "[Deprecated] Merge VBE embeddings from the following TBEs "
             f"(world size: {self._world_size}):\n"
             + "\n".join(
                 [
@@ -727,65 +728,244 @@ class GroupedPooledEmbeddingsLookup(
             for n, embs in zip(self._feature_splits, split_embs)
             for emb in embs[n * rank : n * rank + n]
         ]
-        return [torch.cat(combined_embs)]
+        return torch.cat(combined_embs)
+
+    def _vbe_splits(
+        self, features_by_group: List[KeyedJaggedTensor]
+    ) -> List[List[int]]:
+        """Calculates the split of features for each TBE when VBE is enabled.
+
+        Example:
+            # Returned splits for 2 TBEs, 3 features, world size of 2
+            [
+                # TBE 0: 2 features
+                [
+                    2,    # Feature 0 @rank 0
+                    3,    # Feature 1 @rank 0
+                    1,    # Feature 0 @rank 1
+                    2,    # Feature 1 @rank 1
+                ],
+                # TBE 1: 1 feature
+                [
+                    4,    # Feature 2 @rank 0
+                    2,    # Feature 2 @rank 1
+                ],
+            ]
+        """
+        splits = []
+        for config, features in zip(self.grouped_configs, features_by_group):
+            embedding_dim_per_key = config.embedding_dims()
+            stride_per_rank_per_key = list(zip(*features.stride_per_key_per_rank()))
+            splits.append(
+                [
+                    stride * dim
+                    for stride_per_key in stride_per_rank_per_key
+                    for stride, dim in zip(stride_per_key, embedding_dim_per_key)
+                ]
+            )
+        return splits
+
+    def _vbe_output_dtype(self) -> torch.dtype:
+        fused_params = self.grouped_configs[0].fused_params or {}
+        first_dtype: SparseType = fused_params.get("output_dtype", SparseType.FP32)
+
+        for config in self.grouped_configs:
+            fused_params = config.fused_params or {}
+            dtype = fused_params.get("output_dtype", SparseType.FP32)
+            assert (
+                dtype == first_dtype
+            ), f"Mismatch output_dtype: {dtype} != {first_dtype}"
+
+        return torch.float32 if first_dtype == SparseType.FP32 else torch.float16
+
+    def _create_vbe_output_and_offsets(
+        self, vbe_splits: List[List[int]], device: torch.device
+    ) -> Tuple[torch.Tensor, List[List[List[int]]]]:
+        """Creates the output tensor and offsets for TBEs with VBE enabled.
+
+        The output tensor is a pre-allocated empty 1D tensor to store the lookup
+        results from all TBEs. The offsets are used by the TBEs to correctly
+        populate the output tensor with the lookup results.
+
+        Example:
+            # Given the following splits for 2 TBEs and a world size of 2:
+            [
+                # TBE 0: 2 features
+                [
+                    2,    # Feature 0 @rank 0
+                    3,    # Feature 1 @rank 0
+                    1,    # Feature 0 @rank 1
+                    2,    # Feature 1 @rank 1
+                ],
+                # TBE 1: 1 feature
+                [
+                    4,    # Feature 2 @rank 0
+                    2,    # Feature 2 @rank 1
+                ],
+            ]
+
+            # Output tensor should be of size 14
+            # Returned VBE offsets:
+            [
+                # TBE 0: 2 features
+                [
+                    [0, 2],  # [Feature 0, Feature 1] @rank 0
+                    [9, 10], # [Feature 0, Feature 1] @rank 1
+                ],
+                # TBE 1: 1 feature
+                [
+                    [5],     # [Feature 2] @rank 0
+                    [12],    # [Feature 2] @rank 1
+                ],
+            ]
+        """
+        # Pre-allocates 1D output tensor to avoid expensive merging
+        vbe_output = torch.empty(
+            sum([sum(split) for split in vbe_splits]),
+            dtype=self._vbe_output_dtype(),
+        ).to(device)
+
+        # Calculates the offsets for features of each TBE when placed in
+        # the 1D pre-allocated output tensor above, ordered by rank.
+        vbe_offsets = [[] for _ in range(len(self._emb_modules))]
+        current_offset = 0
+        for rank in range(self._world_size):
+            for n, offsets, split in zip(self._feature_splits, vbe_offsets, vbe_splits):
+                split_offsets = []
+                for size in split[n * rank : n * rank + n]:
+                    split_offsets.append(current_offset)
+                    current_offset += size
+
+                offsets.append(split_offsets)
+
+        return vbe_output, vbe_offsets
+
+    def _apply_fearture_processor_and_gradient_scaling(
+        self,
+        features: KeyedJaggedTensor,
+        config: GroupedEmbeddingConfig,
+    ) -> KeyedJaggedTensor:
+        if (
+            config.has_feature_processor
+            and self._feature_processor is not None
+            and isinstance(self._feature_processor, BaseGroupedFeatureProcessor)
+        ):
+            features = self._feature_processor(features)
+
+        if config.is_weighted:
+            features._weights = CommOpGradientScaling.apply(
+                features._weights, self._scale_gradient_factor
+            )
+        return features
+
+    def _forward(
+        self,
+        features_by_group: List[KeyedJaggedTensor],
+    ) -> List[torch.Tensor]:
+        embeddings: List[torch.Tensor] = []
+
+        for config, emb_op, features in zip(
+            self.grouped_configs,
+            self._emb_modules,
+            features_by_group,
+        ):
+            features = self._apply_fearture_processor_and_gradient_scaling(
+                features, config
+            )
+            lookup = emb_op(features)
+            embeddings.append(lookup)
+
+            # Model tracker optimizer state function, will only be set called
+            # when model tracker is configured to track optimizer state
+            if self.optim_state_tracker_fn is not None:
+                self.optim_state_tracker_fn(features, lookup, emb_op)
+
+        return embeddings
+
+    def _forward_with_vbe_merging(
+        self,
+        features_by_group: List[KeyedJaggedTensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Merges the TBE output when VBE is enabled and multiple TBEs are
+        involved.
+
+        If opt-in for the preallocated merge approach, an 1D empty tensor will be
+        preallocated for TBEs to handle the merging logic. Otherwise, the output
+        will be split and then merged via `torch.cat`.
+        """
+        vbe_splits = self._vbe_splits(features_by_group)
+
+        # If we do not opt-in to pre-allocate the VBE output, we need to run
+        # forward for each TBE individually and merge the results via
+        # `torch.cat`.
+        if not torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:killswitch_enable_preallocated_vbe_merge"
+        ):
+            return self._merge_variable_batch_embeddings(
+                self._forward(features_by_group), vbe_splits
+            )
+
+        vbe_output, vbe_offsets = self._create_vbe_output_and_offsets(
+            vbe_splits, device
+        )
+
+        vbe_offsets = [torch.tensor(offsets, device=device) for offsets in vbe_offsets]
+
+        for config, emb_op, features, offsets in zip(
+            self.grouped_configs,
+            self._emb_modules,
+            features_by_group,
+            vbe_offsets,
+        ):
+            features = self._apply_fearture_processor_and_gradient_scaling(
+                features, config
+            )
+
+            # With a pre-allocated output tensor, each TBE uses the output from
+            # the previous TBE as input, allowing autograd to correctly track
+            # the backward pass. TBEs should use `vbe_output_offsets` to update
+            # the preallocated tensor partially.
+            vbe_output = emb_op(
+                features,
+                vbe_output_offsets=offsets,
+                vbe_output=vbe_output,
+            )
+
+            # Model tracker optimizer state function, will only be set called
+            # when model tracker is configured to track optimizer state
+            if self.optim_state_tracker_fn is not None:
+                self.optim_state_tracker_fn(features, vbe_output, emb_op)
+
+        return vbe_output
 
     def forward(
         self,
         sparse_features: KeyedJaggedTensor,
     ) -> torch.Tensor:
-        embeddings: List[torch.Tensor] = []
-        vbe_splits = []
-        if len(self._emb_modules) > 0:
-            assert sparse_features is not None
-            features_by_group = sparse_features.split(
-                self._feature_splits,
-            )
-            for config, emb_op, features in zip(
-                self.grouped_configs, self._emb_modules, features_by_group
-            ):
-                if (
-                    config.has_feature_processor
-                    and self._feature_processor is not None
-                    and isinstance(self._feature_processor, BaseGroupedFeatureProcessor)
-                ):
-                    features = self._feature_processor(features)
-
-                if config.is_weighted:
-                    features._weights = CommOpGradientScaling.apply(
-                        features._weights, self._scale_gradient_factor
-                    )
-
-                lookup = emb_op(features)
-                embeddings.append(lookup)
-                # Model tracker optimizer state function, will only be set called
-                # when model tracker is configured to track optimizer state
-                if self.optim_state_tracker_fn is not None:
-                    self.optim_state_tracker_fn(features, lookup, emb_op)
-
-                if features.variable_stride_per_key() and len(self._emb_modules) > 1:
-                    stride_per_rank_per_key = list(
-                        zip(*features.stride_per_key_per_rank())
-                    )
-                    vbe_splits.append(
-                        [
-                            stride * dim
-                            for stride_per_rank in stride_per_rank_per_key
-                            for stride, dim in zip(
-                                stride_per_rank, config.embedding_dims()
-                            )
-                        ]
-                    )
-
-        if sparse_features.variable_stride_per_key() and len(embeddings) > 1:
-            embeddings = self._merge_variable_batch_embeddings(embeddings, vbe_splits)
+        is_vbe_enabled = sparse_features.variable_stride_per_key()
 
         dummy_embedding = (
             self._dummy_embs_tensor
-            if sparse_features.variable_stride_per_key()
+            if is_vbe_enabled
             else fx_wrap_tensor_view2d(
                 self._dummy_embs_tensor, sparse_features.stride(), 0
             )
         )
+
+        if len(self._emb_modules) == 0:
+            return dummy_embedding
+
+        features_by_group = sparse_features.split(self._feature_splits)
+
+        # If VBE is enabled and mulitple TBEs are involved, we need to merge the
+        # output
+        if is_vbe_enabled and len(self._emb_modules) > 1:
+            return self._forward_with_vbe_merging(
+                features_by_group, device=sparse_features.device()
+            )
+
+        embeddings = self._forward(features_by_group)
         return embeddings_cat_empty_rank_handle(
             embeddings,
             dummy_embedding,
