@@ -792,6 +792,8 @@ def sharding_single_rank_test_single_process(
     lengths_dtype: torch.dtype = torch.int64,
     random_seed: Optional[int] = None,
     sharding_strategy: Optional[ShardingStrategy] = None,
+    atol: Optional[float] = None,
+    rtol: Optional[float] = None,
 ) -> None:
     batch_size = random.randint(0, batch_size) if allow_zero_batch_size else batch_size
     # Generate model & inputs.
@@ -1036,7 +1038,9 @@ def sharding_single_rank_test_single_process(
                 rtol=1e-4,  # relaxed rtol due to FP16 in weights
             )
         else:
-            torch.testing.assert_close(global_pred, torch.cat(all_local_pred))
+            torch.testing.assert_close(
+                global_pred, torch.cat(all_local_pred), atol=atol, rtol=rtol
+            )
 
 
 def sharding_single_rank_test(
@@ -1073,6 +1077,8 @@ def sharding_single_rank_test(
     lengths_dtype: torch.dtype = torch.int64,
     random_seed: Optional[int] = None,
     sharding_strategy: Optional[ShardingStrategy] = None,
+    atol: Optional[float] = None,
+    rtol: Optional[float] = None,
 ) -> None:
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         assert ctx.pg is not None
@@ -1109,6 +1115,8 @@ def sharding_single_rank_test(
             lengths_dtype=lengths_dtype,
             random_seed=random_seed,
             sharding_strategy=sharding_strategy,
+            atol=atol,
+            rtol=rtol,
         )
 
 

@@ -163,6 +163,8 @@ class ModelParallelTestShared(MultiProcessTestBase):
         offsets_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
         sharding_strategy: Optional[ShardingStrategy] = None,
+        atol: Optional[float] = None,
+        rtol: Optional[float] = None,
     ) -> None:
         self._build_tables_and_groups(data_type=data_type)
         # directly run the test with single process
@@ -194,6 +196,8 @@ class ModelParallelTestShared(MultiProcessTestBase):
                 offsets_dtype=offsets_dtype,
                 lengths_dtype=lengths_dtype,
                 sharding_strategy=sharding_strategy,
+                atol=atol,
+                rtol=rtol,
             )
         else:
             self._run_multi_process_test(
@@ -223,6 +227,8 @@ class ModelParallelTestShared(MultiProcessTestBase):
                 offsets_dtype=offsets_dtype,
                 lengths_dtype=lengths_dtype,
                 sharding_strategy=sharding_strategy,
+                atol=atol,
+                rtol=rtol,
             )
 
     def _test_dynamic_sharding(
