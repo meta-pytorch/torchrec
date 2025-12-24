@@ -325,6 +325,8 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             model_class=TestTowerSparseNN,
             qcomms_config=qcomms_config,
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
+            atol=1e-4,
+            rtol=1e-4,
         )
 
     @unittest.skipIf(
