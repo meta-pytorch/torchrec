@@ -227,10 +227,9 @@ def run_debug_model(
         loss = torch.sum(logits)
 
         tc = unittest.TestCase()
-        with tc.assertRaisesRegex(
-            RuntimeError, "NaN/Inf detected in gradient entering"
-        ):
-            loss.backward()
+        with torch.autograd.detect_anomaly():
+            with tc.assertRaisesRegex(RuntimeError, "returned nan values"):
+                loss.backward()
 
 
 def run_embedding_collection(
