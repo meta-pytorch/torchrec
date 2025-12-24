@@ -1,0 +1,97 @@
+# Scheduled validation of the nightly binaries
+name: Benchmark Nightly
+
+on:
+  schedule:
+    # At 2:30 pm UTC (4:30 am PDT)
+    - cron: "30 14 * * *"
+  # Have the ability to trigger this job manually through the API
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Channel to use (nightly, release, test)"
+        default: "nightly"
+        type: choice
+        options:
+          - release
+          - nightly
+          - test
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/benchmark-nightly.yml'
+      - '.github/scripts/run_benchmarks.sh'
+  pull_request:
+    paths:
+      - '.github/workflows/benchmark-nightly.yml'
+      - '.github/scripts/run_benchmarks.sh'
+jobs:
+  pipeline_benchmark:
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda-tag: ["cu128"]
+        os:
+          - linux.g5.12xlarge.nvidia.gpu
+        python:
+          - version: "3.13"
+            tag: "py313"
+        is_pr:
+          - ${{ github.event_name == 'pull_request' }}
+        exclude:
+          - is_pr: true
+            cuda-tag: "cu126"
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: ${{ matrix.os }}
+      timeout: 60
+      script: |
+        ldd --version
+        conda create -y --name benchmark python=${{ matrix.python.version }}
+        conda info
+        python --version
+        conda run -n benchmark python --version
+        if [[ "${{ inputs.channel }}" = "release" ]]; then
+          index_url=https://download.pytorch.org/whl/${{ matrix.cuda-tag }}
+        elif [ -z "${{ inputs.channel }}" ]; then
+          index_url=https://download.pytorch.org/whl/nightly/${{ matrix.cuda-tag }}
+        else
+          index_url=https://download.pytorch.org/whl/${{ inputs.channel }}/${{ matrix.cuda-tag }}
+        fi
+        echo "index_url: $index_url"
+        conda run -n benchmark \
+          pip install torch --index-url $index_url
+        conda run -n benchmark \
+          python -c "import torch; print(torch.__version__)"
+        echo "torch succeeded"
+        conda run -n benchmark \
+          python -c "import torch.distributed"
+        echo "torch.distributed succeeded"
+        conda run -n benchmark \
+          pip install fbgemm-gpu --index-url $index_url
+        conda run -n benchmark \
+          python -c "import fbgemm_gpu; print(fbgemm_gpu.__version__)"
+        echo "fbgemm_gpu succeeded"
+        conda run -n benchmark \
+          pip install -r requirements.txt
+        conda run -n benchmark \
+          python setup.py bdist_wheel \
+          --python-tag=${{ matrix.python.tag }}
+        conda run -n benchmark \
+          python -c "import torchrec"
+        conda install -n benchmark -y pytest
+        conda run -n benchmark \
+          .github/scripts/run_benchmarks.sh
+        mv dist no-upload-dist # don't upload the dist folder
+        mkdir -p artifacts-to-be-uploaded
+        mv trace-*.json.gz memory-*.pickle artifacts-to-be-uploaded
+        ls -l artifacts-to-be-uploaded
+      upload-artifact: ${{ matrix.os }}-${{ matrix.python.tag }}-${{ matrix.cuda-tag }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ inputs.repository }}-${{ github.event_name == 'workflow_dispatch' }}
+  cancel-in-progress: true
