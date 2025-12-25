@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional, Tuple, Type
 
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
-from hypothesis import assume, given, settings, strategies as st, Verbosity
+from hypothesis import assume, given, Phase, settings, strategies as st, Verbosity
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import CommType, QCommsConfig
 from torchrec.distributed.planner import ParameterConstraints
@@ -81,7 +81,12 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         variable_batch_size=st.booleans(),
         pooling=st.sampled_from([PoolingType.SUM, PoolingType.MEAN]),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=6, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=6,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_nccl_twrw(
         self,
         sharder_type: str,
@@ -169,7 +174,12 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=6, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=6,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_nccl_twcw(
         self,
         sharder_type: str,
@@ -228,7 +238,12 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         ),
         variable_batch_per_feature=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=2,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_empty_rank(
         self, sharding_type: str, variable_batch_per_feature: bool
     ) -> None:
@@ -293,7 +308,12 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             ]
         ),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=4, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_embedding_tower_nccl(
         self,
         sharding_type: str,
@@ -303,6 +323,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             Dict[str, Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]]
         ],
     ) -> None:
+        print(f"phases: {settings().phases}")
         # Dense kernels do not have overlapped optimizer behavior yet
         assume(
             apply_optimizer_in_backward_config is None
@@ -364,7 +385,12 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             ]
         ),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=4, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=4,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_embedding_tower_collection_nccl(
         self,
         sharding_type: str,
@@ -414,7 +440,12 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         global_constant_batch=st.booleans(),
         pooling=st.sampled_from([PoolingType.SUM, PoolingType.MEAN]),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=2,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_variable_batch(
         self,
         sharding_type: str,

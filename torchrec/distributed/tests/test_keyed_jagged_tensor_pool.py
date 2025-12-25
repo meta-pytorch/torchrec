@@ -8,18 +8,16 @@
 # pyre-strict
 
 import unittest
-
 from typing import cast, Dict, List
 
 import torch
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, Phase, settings, strategies as st
 from torchrec.distributed.keyed_jagged_tensor_pool import (
     KeyedJaggedTensorPoolSharder,
     ShardedInferenceKeyedJaggedTensorPool,
     ShardedKeyedJaggedTensorPool,
 )
 from torchrec.distributed.shard import _shard_modules
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
@@ -162,7 +160,11 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
         enable_uvm=st.booleans(),
         values_dtype=st.sampled_from([torch.int32, torch.int64]),
     )
-    @settings(max_examples=4, deadline=None)
+    @settings(
+        max_examples=4,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharded_keyed_jagged_tensor_pool_rw(
         self, enable_uvm: bool, values_dtype: torch.dtype
     ) -> None:
