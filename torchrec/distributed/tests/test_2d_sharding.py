@@ -13,7 +13,7 @@ from typing import Any, cast, Dict, List, Optional, Tuple, Type
 import torch
 import torch.nn as nn
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
-from hypothesis import assume, given, settings, strategies as st, Verbosity
+from hypothesis import assume, given, Phase, settings, strategies as st, Verbosity
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import CommType, QCommsConfig
 from torchrec.distributed.planner import ParameterConstraints
@@ -103,7 +103,12 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_cw_2D(
         self,
         sharder_type: str,
@@ -195,7 +200,12 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_tw_2D(
         self,
         sharder_type: str,
@@ -288,7 +298,12 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_grid_2D(
         self,
         sharder_type: str,
@@ -400,7 +415,12 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_rw_2D(
         self,
         sharder_type: str,
@@ -492,7 +512,12 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_twrw_2D(
         self,
         sharder_type: str,
@@ -625,7 +650,12 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_ec_rw_2D(
         self,
         sharding_type: str,
@@ -688,7 +718,12 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_ec_cw_2D(
         self,
         sharding_type: str,
@@ -755,7 +790,12 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_ec_tw_2D(
         self,
         sharding_type: str,
@@ -903,7 +943,12 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding_dynamic_2D(
         self,
         sharding_type: str,
@@ -984,7 +1029,12 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_fully_sharded_dynamic_2D(
         self,
         sharding_type: str,
@@ -1067,7 +1117,12 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_partially_fully_sharded_dynamic_2D(
         self,
         sharding_type: str,
@@ -1210,7 +1265,12 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_fully_sharded_cw(
         self,
         sharder_type: str,
@@ -1302,7 +1362,12 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_fully_sharded_rw(
         self,
         sharder_type: str,
@@ -1394,7 +1459,12 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_fully_sharded_twrw(
         self,
         sharder_type: str,
@@ -1487,7 +1557,12 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_fully_sharded_tw(
         self,
         sharder_type: str,
@@ -1623,7 +1698,12 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_fully_sharded_sequence_cw(
         self,
         sharding_type: str,
@@ -1691,7 +1771,12 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_fully_sharded_sequence_rw(
         self,
         sharding_type: str,
@@ -1758,7 +1843,12 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         ),
         variable_batch_size=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=1,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_fully_sharded_sequence_tw(
         self,
         sharding_type: str,

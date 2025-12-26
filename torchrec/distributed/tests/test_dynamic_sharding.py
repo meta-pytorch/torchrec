@@ -10,17 +10,12 @@
 
 import random
 import unittest
-
 from typing import Any, Dict, List, Optional
 
 import hypothesis.strategies as st
-
 import torch
-
-from hypothesis import assume, given, settings, Verbosity
-
+from hypothesis import assume, given, Phase, settings, Verbosity
 from torch import nn, optim
-
 from torchrec import (
     distributed as trec_dist,
     EmbeddingBagCollection,
@@ -33,7 +28,6 @@ from torchrec.distributed.fbgemm_qcomm_codec import CommType, QCommsConfig
 from torchrec.distributed.sharding.dynamic_sharding import (
     output_sharding_plan_delta_single,
 )
-
 from torchrec.distributed.sharding_plan import (
     column_wise,
     construct_module_sharding_plan,
@@ -41,7 +35,6 @@ from torchrec.distributed.sharding_plan import (
     table_wise,
 )
 from torchrec.distributed.test_utils.model_input import ModelInput
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
@@ -53,7 +46,6 @@ from torchrec.distributed.test_utils.test_sharding import (
     generate_rank_placements,
     SharderType,
 )
-
 from torchrec.distributed.types import (
     EmbeddingModuleShardingPlan,
     ParameterSharding,
@@ -61,7 +53,6 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 from torchrec.modules.embedding_configs import data_type_to_dtype, EmbeddingBagConfig
-
 from torchrec.test_utils import skip_if_asan_class
 from torchrec.types import DataType
 
@@ -416,7 +407,12 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
         data_type=st.sampled_from([DataType.FP32, DataType.FP16]),
         world_size=st.sampled_from([2, 4]),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=8,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_dynamic_sharding_ebc_tw(
         self,
         num_tables: int,
@@ -461,7 +457,12 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
         world_size=st.sampled_from([3, 4]),
         embedding_dim=st.sampled_from([16]),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=8,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_dynamic_sharding_ebc_cw(
         self,
         num_tables: int,
@@ -549,7 +550,12 @@ class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
         world_size=st.sampled_from([2, 4]),
         skip_passing_resharding_fqn=st.booleans(),
     )
-    @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=8,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
     def test_sharding(
         self,
         sharder_type: str,
