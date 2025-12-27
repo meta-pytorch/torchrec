@@ -1643,12 +1643,22 @@ def _calculate_tensor_sizes(
     ]
 
 
-# If a table has turned on UVM caching (meaning clf is not None), there'll be
-# 4x of table hash size and 16x of cache slot size HBM storage cost dedicated to
-# cache aux state (note that this is not the cache content itself)
 def _calculate_cache_aux_state_sizes(
     shard_sizes: List[List[int]], clf: Optional[float]
 ) -> List[int]:
+    """
+    Calculate cache auxiliary state size for UVM caching (separate from lxu_cache_weights).
+
+    The auxiliary state consists of:
+    - cache_index_table_map: 4 bytes/row (int32), maps cache positions to table indices
+      (see fbgemm_gpu/split_table_batched_embeddings_ops_common.py:construct_cache_state)
+    - lxu_cache_state: 8 bytes/slot (int64), stores cached embedding indices
+      (see fbgemm_gpu/split_table_batched_embeddings_ops_training.py)
+    - lru_state: 8 bytes/slot (int64), stores timestamps for eviction decisions
+      (see fbgemm_gpu/src/split_embeddings_cache/lru_cache_populate.cu)
+
+    Total: hash_size * (4 + clf * 16) bytes
+    """
     if clf is None:
         return [0] * len(shard_sizes)
     return [math.ceil(size[0] * (4 + clf * 16)) for size in shard_sizes]
