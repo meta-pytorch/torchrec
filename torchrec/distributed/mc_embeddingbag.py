@@ -8,8 +8,8 @@
 
 #!/usr/bin/env python3
 
-from dataclasses import dataclass
-from typing import Any, cast, Dict, Optional, Type
+from dataclasses import dataclass, field
+from typing import Any, cast, Dict, List, Optional, Type, TypeVar
 
 import torch
 from torchrec.distributed.embedding_types import KJTList
@@ -24,17 +24,24 @@ from torchrec.distributed.mc_embedding_modules import (
 )
 from torchrec.distributed.mc_modules import ManagedCollisionCollectionSharder
 from torchrec.distributed.types import (
+    Awaitable,
+    Multistreamable,
     ParameterSharding,
     QuantizedCommCodecs,
     ShardingEnv,
 )
 from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingBagCollection
+from torchrec.modules.utils import SequenceVBEContext
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+ShrdCtx = TypeVar("ShrdCtx", bound=Multistreamable)
 
 
 @dataclass
 class ManagedCollisionEmbeddingBagCollectionContext(EmbeddingBagCollectionContext):
     evictions_per_table: Optional[Dict[str, Optional[torch.Tensor]]] = None
     remapped_kjt: Optional[KJTList] = None
+    seq_vbe_ctx: List[SequenceVBEContext] = field(default_factory=list)
 
     def record_stream(self, stream: torch.Stream) -> None:
         super().record_stream(stream)
@@ -82,6 +89,39 @@ class ShardedManagedCollisionEmbeddingBagCollection(
         self,
     ) -> ManagedCollisionEmbeddingBagCollectionContext:
         return ManagedCollisionEmbeddingBagCollectionContext(sharding_contexts=[])
+
+    def input_dist(
+        self,
+        ctx: ShrdCtx,
+        features: KeyedJaggedTensor,
+    ) -> Awaitable[Awaitable[KJTList]]:
+
+        ctx.variable_batch_per_feature = features.variable_stride_per_key()
+        ctx.inverse_indices = features.inverse_indices_or_none()
+
+        if self._managed_collision_collection._has_uninitialized_input_dists:
+            self._managed_collision_collection._create_input_dists(
+                input_feature_names=features.keys()
+            )
+            self._managed_collision_collection._has_uninitialized_input_dists = False
+
+            # pyre-ignore [16]
+            if ctx.variable_batch_per_feature:
+                if self._return_remapped_features:
+                    raise NotImplementedError(
+                        "VBE is not supported currently for return_remapped_features=True."
+                    )
+
+                # pyre-ignore
+                self._embedding_module._create_inverse_indices_permute_indices(
+                    ctx.inverse_indices  # pyre-ignore [16]
+                )
+
+        return self._managed_collision_collection.input_dist(
+            # pyre-fixme [6]
+            ctx,
+            features,
+        )
 
 
 class ManagedCollisionEmbeddingBagCollectionSharder(
