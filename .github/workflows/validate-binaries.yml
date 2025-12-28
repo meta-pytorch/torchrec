@@ -1,4 +1,4 @@
-name: Validate binaries
+name: Validate Binaries
 
 on:
   workflow_call:

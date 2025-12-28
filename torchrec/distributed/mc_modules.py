@@ -12,7 +12,7 @@ import itertools
 import logging
 import math
 from collections import defaultdict, OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Callable,
@@ -21,6 +21,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Tuple,
     Type,
     Union,
 )
@@ -81,10 +82,19 @@ class EmbeddingCollectionContext(Multistreamable):
     sharding_contexts: List[
         Union[InferSequenceShardingContext, SequenceShardingContext]
     ]
+    input_features: List[KeyedJaggedTensor] = field(default_factory=list)
+    # VBE-Attributes for EBC
+    inverse_indices: Optional[Tuple[List[str], torch.Tensor]] = None
+    variable_batch_per_feature: bool = False
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
             ctx.record_stream(stream)
+        for f in self.input_features:
+            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+            f.record_stream(stream)
+        if self.inverse_indices is not None:
+            self.inverse_indices[1].record_stream(stream)
 
 
 class ManagedCollisionCollectionContext(EmbeddingCollectionContext):
@@ -644,6 +654,7 @@ class ShardedManagedCollisionCollection(
                 ti: int = 0
                 for i, tables in enumerate(self._sharding_tables):
                     output: Dict[str, JaggedTensor] = {}
+                    stride_per_key_per_rank_list: List[List[int]] = []
                     for table in tables:
                         kjt: KeyedJaggedTensor = table_splits[ti]
                         mc_module = self._managed_collision_modules[table]
@@ -657,11 +668,13 @@ class ShardedManagedCollisionCollection(
                         # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                         mc_input = mc_module.preprocess(mc_input)
                         output.update(mc_input)
+                        stride_per_key_per_rank_list += kjt.stride_per_key_per_rank()
                         ti += 1
                     shard_kjt = KeyedJaggedTensor(
                         keys=self._sharding_features[i],
                         values=torch.cat([jt.values() for jt in output.values()]),
                         lengths=torch.cat([jt.lengths() for jt in output.values()]),
+                        stride_per_key_per_rank=stride_per_key_per_rank_list or None,
                     )
                     feature_splits.append(shard_kjt)
             else:
@@ -675,12 +688,17 @@ class ShardedManagedCollisionCollection(
                 awaitables.append(input_dist(feature_split))
                 ctx.sharding_contexts.append(
                     SequenceShardingContext(
-                        features_before_input_dist=features,
                         unbucketize_permute_tensor=(
                             input_dist.unbucketize_permute_tensor
                             if isinstance(input_dist, RwSparseFeaturesDist)
                             else None
                         ),
+                        # For VBE-Support for EBC
+                        # Split of the feature before all2all
+                        batch_size_per_feature_pre_a2a=feature_split.stride_per_key(),
+                        variable_batch_per_feature=feature_split.variable_stride_per_key(),
+                        # For VBE-Support for EC
+                        features_before_input_dist=features,
                     )
                 )
 
@@ -806,9 +824,11 @@ class ShardedManagedCollisionCollection(
             self._sharding_features,
         ):
             assert isinstance(sharding_ctx, SequenceShardingContext)
-            sharding_ctx.lengths_after_input_dist = features.lengths().view(
-                -1, features.stride()
-            )
+            if not features.variable_stride_per_key():
+                # For VBE-Support for EC, EC always pads kjt if VBE in input_dist
+                sharding_ctx.lengths_after_input_dist = features.lengths().view(
+                    -1, features.stride()
+                )
 
             values: torch.Tensor
             if len(splits) > 1:
@@ -831,6 +851,7 @@ class ShardedManagedCollisionCollection(
                     lengths=features.lengths(),
                     # original weights instead of features splits
                     weights=features.weights_or_none(),
+                    stride_per_key_per_rank=features._stride_per_key_per_rank,
                 )
             )
         return KJTList(remapped_kjts)
