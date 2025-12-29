@@ -794,7 +794,7 @@ class KJTOneToAll(nn.Module):
             # BUG: device will default to cuda if cpu specified
             self._device_type: str = (
                 device.type
-                if device is not None and device.type in {"meta", "cuda", "mtia"}
+                if device is not None and device.type in {"meta", "cuda", "mtia", torch._C._get_privateuse1_backend_name()}
                 else "cuda"
             )
         assert self._world_size == len(splits)
