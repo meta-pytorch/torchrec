@@ -273,15 +273,16 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             torch.sum(losses, dim=0).backward()
 
     def _copy_batch_to_gpu(self, cur_batch: In) -> None:
-        with record_function("## copy_batch_to_gpu ##"):
-            if self._inplace_copy_batch_to_gpu:
+        if self._inplace_copy_batch_to_gpu:
+            with record_function("## inplace_copy_batch_to_gpu ##"):
                 self._cur_batch = _to_device(
                     cur_batch,
                     self._device,
                     non_blocking=True,
                     data_copy_stream=self._memcpy_stream,
                 )
-            else:
+        else:
+            with record_function("## copy_batch_to_gpu ##"):
                 with self._stream_context(self._memcpy_stream):
                     self._cur_batch = _to_device(
                         cur_batch, self._device, non_blocking=True
