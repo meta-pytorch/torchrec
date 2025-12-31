@@ -1615,6 +1615,98 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
         )
 
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 5,
+        "Not enough GPUs, this test requires at least six GPUs",
+    )
+    # pyre-fixme[56]
+    @given(
+        sharder_type=st.sampled_from(
+            [
+                SharderType.EMBEDDING_BAG_COLLECTION.value,
+            ]
+        ),
+        kernel_type=st.sampled_from(
+            [
+                EmbeddingComputeKernel.FUSED.value,
+                EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+                EmbeddingComputeKernel.FUSED_UVM.value,
+            ],
+        ),
+        qcomms_config=st.sampled_from(
+            [
+                None,
+            ]
+        ),
+        apply_optimizer_in_backward_config=st.sampled_from(
+            [
+                {
+                    "embedding_bags": (
+                        torch.optim.SGD,
+                        {
+                            "lr": 0.01,
+                        },
+                    ),
+                },
+            ]
+        ),
+        variable_batch_size=st.booleans(),
+        pooling=st.sampled_from([PoolingType.SUM]),
+        use_inter_host_allreduce=st.booleans(),
+        custom_all_reduce=st.booleans(),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    def test_fully_sharded_cw_uneven(
+        self,
+        sharder_type: str,
+        kernel_type: str,
+        qcomms_config: Optional[QCommsConfig],
+        apply_optimizer_in_backward_config: Optional[
+            Dict[str, Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]]
+        ],
+        variable_batch_size: bool,
+        pooling: PoolingType,
+        use_inter_host_allreduce: bool,
+        custom_all_reduce: bool,
+    ) -> None:
+        if (
+            self.device == torch.device("cpu")
+            and kernel_type != EmbeddingComputeKernel.FUSED.value
+        ):
+            self.skipTest("CPU does not support uvm.")
+
+        sharding_type = ShardingType.COLUMN_WISE.value
+        assume(sharder_type == SharderType.EMBEDDING_BAG_COLLECTION.value)
+
+        self._test_sharding(
+            world_size=6,
+            world_size_2D=2,
+            sharders=[
+                cast(
+                    ModuleSharder[nn.Module],
+                    create_test_sharder(
+                        sharder_type,
+                        sharding_type,
+                        kernel_type,
+                        qcomms_config=qcomms_config,
+                        device=self.device,
+                    ),
+                ),
+            ],
+            qcomms_config=qcomms_config,
+            constraints={
+                table.name: ParameterConstraints(min_partition=4)
+                for table in self.tables
+            },
+            backend=self.backend,
+            apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
+            variable_batch_size=variable_batch_size,
+            pooling=pooling,
+            use_inter_host_allreduce=use_inter_host_allreduce,
+            custom_all_reduce=custom_all_reduce,
+            sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+        )
+
 
 @skip_if_asan_class
 class TestFullySharded2DECParallel(MultiProcessTestBase):
@@ -1866,6 +1958,74 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         self._test_sharding(
             world_size=self.WORLD_SIZE,
             world_size_2D=self.WORLD_SIZE_2D,
+            sharders=[
+                TestEmbeddingCollectionSharder(
+                    sharding_type=sharding_type,
+                    kernel_type=kernel_type,
+                    qcomms_config=qcomms_config,
+                )
+            ],
+            backend="nccl",
+            qcomms_config=qcomms_config,
+            constraints={
+                table.name: ParameterConstraints(min_partition=4)
+                for table in self.tables
+            },
+            apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
+            variable_batch_size=variable_batch_size,
+            sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 5,
+        "Not enough GPUs, this test requires at least six GPUs",
+    )
+    # pyre-fixme[56]
+    @given(
+        sharding_type=st.just(ShardingType.COLUMN_WISE.value),
+        kernel_type=st.sampled_from(
+            [
+                # EmbeddingComputeKernel.DENSE.value,
+                EmbeddingComputeKernel.FUSED.value,
+            ]
+        ),
+        qcomms_config=st.sampled_from(
+            [
+                None,
+                QCommsConfig(
+                    forward_precision=CommType.FP16, backward_precision=CommType.BF16
+                ),
+            ]
+        ),
+        apply_optimizer_in_backward_config=st.sampled_from(
+            [
+                None,
+                {
+                    "embedding_bags": (torch.optim.SGD, {"lr": 0.01}),
+                    "embeddings": (torch.optim.SGD, {"lr": 0.2}),
+                },
+            ]
+        ),
+        variable_batch_size=st.booleans(),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=1, deadline=None)
+    def test_fully_sharded_sequence_cw_uneven(
+        self,
+        sharding_type: str,
+        kernel_type: str,
+        qcomms_config: Optional[QCommsConfig],
+        apply_optimizer_in_backward_config: Optional[
+            Dict[str, Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]]
+        ],
+        variable_batch_size: bool,
+    ) -> None:
+        assume(
+            apply_optimizer_in_backward_config is None
+            or kernel_type != EmbeddingComputeKernel.DENSE.value
+        )
+        self._test_sharding(
+            world_size=6,
+            world_size_2D=2,
             sharders=[
                 TestEmbeddingCollectionSharder(
                     sharding_type=sharding_type,
