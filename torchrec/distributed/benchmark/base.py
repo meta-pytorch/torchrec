@@ -197,6 +197,43 @@ class BenchmarkResult:
             content += f"{c: <{length}}|"
         return head + "\n" + split + "\n" + content + "\n"
 
+    def prettify(self) -> str:
+        """Return a human-readable formatted string for console output."""
+        lines = [
+            "",
+            "=" * 60,
+            f"  Benchmark: {self.short_name}",
+            "=" * 60,
+            "",
+            "  Runtime:",
+            f"    GPU (P90):              {self.runtime_percentile(90, device='gpu'):.2f} ms",
+            f"    CPU (P90):              {self.runtime_percentile(90, device='cpu'):.2f} ms",
+        ]
+
+        if len(self.gpu_mem_stats) > 0:
+            lines.extend(
+                [
+                    "",
+                    "  GPU Memory:",
+                    f"    Peak Allocated (P90):   {self.max_mem_alloc_percentile(90)/1000:.2f} GB",
+                    f"    Peak Reserved (P90):    {self.max_mem_reserved_percentile(90)/1000:.2f} GB",
+                    f"    Used (P90):             {self.device_mem_used(90)/1000:.2f} GB",
+                    f"    Malloc Retries:         P50={self.mem_retries(50):.0f}  P90={self.mem_retries(90):.0f}  P100={self.mem_retries(100):.0f}",
+                ]
+            )
+
+        lines.extend(
+            [
+                "",
+                "  CPU Memory:",
+                f"    Peak RSS (P90):         {self.cpu_mem_percentile(90)/1000:.2f} GB",
+                "",
+                "=" * 60,
+            ]
+        )
+
+        return "\n".join(lines)
+
     def runtime_percentile(
         self,
         percentile: int = 50,
