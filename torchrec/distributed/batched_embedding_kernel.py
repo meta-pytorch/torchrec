@@ -2552,6 +2552,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         self._env: ShardingEnv2D = env
 
         self.weights_sharded = False
+        self._input_tensor = None
         self._element_size = self._emb_module.weights_dev.element_size()
         # pyre-ignore[8]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
@@ -2581,9 +2582,26 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         self._unsharded_param.untyped_storage().resize_(
             padded_total_size * self._element_size
         )
+        output_tensor = self._unsharded_param
+
+        # the original tensor that is tied to autograd is resized to padding num elements
+        # however, numel() will return the original size, which can cause collective mismatch
+        # we create an empty tensor that shares the same storage with the original tensor to the
+        # full padded amount. this allows us to use the tensor in all_gather without error
+        if padded_total_size != self._unsharded_param.numel():
+            output_tensor = torch.empty(
+                0,
+                dtype=self._unsharded_param.dtype,
+                device=self._unsharded_param.device,
+            )
+            output_tensor.set_(
+                self._unsharded_param.untyped_storage(),
+                0,  # storage_offset
+                (padded_total_size,),  # size
+            )
 
         dist.all_gather_into_tensor(
-            output_tensor=self._unsharded_param,
+            output_tensor=output_tensor,
             input_tensor=self._shard_buf,
             group=self._env.replica_pg,
             async_op=False,
@@ -2647,14 +2665,14 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size
 
+            self._input_tensor = self._emb_module.weights_dev.contiguous()
             if padding_size > 0:
-                input_tensor = torch.nn.functional.pad(
+                # ideally, we want to avoid padding as this has will cause a short 2x emb memory spike
+                self._input_tensor = torch.nn.functional.pad(
                     self._emb_module.weights_dev.contiguous(),
                     (0, padding_size),
                     value=0.0,
                 )
-            else:
-                input_tensor = self._emb_module.weights_dev.contiguous()
 
             if self._shard_buf is None:
                 self._shard_buf = torch.empty(
@@ -2669,12 +2687,9 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             else:
                 self._shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
 
-            # pyre-ignore[29]
-            input_tensor = self._emb_module.weights_dev.contiguous()
-
             self._async_work = dist.reduce_scatter_tensor(
                 output=self._shard_buf,
-                input=input_tensor,
+                input=self._input_tensor,
                 op=dist.ReduceOp.AVG,
                 group=self._env.replica_pg,
                 async_op=True,
@@ -2688,6 +2703,9 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
                 # pyre-ignore[29]
                 self._emb_module.weights_dev.untyped_storage().resize_(0)
                 self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
+                # padding tensor we resize to 0 and set pointer to None, no op if no padding
+                self._input_tensor.untyped_storage().resize_(0)  # pyre-ignore[29]
+                self._input_tensor = None
 
             return ReduceScatterResizeAwaitable(
                 async_work=self._async_work,
@@ -3628,6 +3646,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self._env: ShardingEnv2D = env
 
         self.weights_sharded = False
+        self._input_tensor = None
         self._element_size = self._emb_module.weights_dev.element_size()
         # pyre-ignore[8]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
@@ -3658,9 +3677,26 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self._unsharded_param.untyped_storage().resize_(
             padded_total_size * self._element_size
         )
+        output_tensor = self._unsharded_param
+
+        # the original tensor that is tied to autograd is resized to padding num elements
+        # however, numel() will return the original size, which can cause collective mismatch
+        # we create an empty tensor that shares the same storage with the original tensor to the
+        # full padded amount. this allows us to use the tensor in all_gather without error
+        if padded_total_size != self._unsharded_param.numel():
+            output_tensor = torch.empty(
+                0,
+                dtype=self._unsharded_param.dtype,
+                device=self._unsharded_param.device,
+            )
+            output_tensor.set_(
+                self._unsharded_param.untyped_storage(),
+                0,  # storage_offset
+                (padded_total_size,),  # size
+            )
 
         dist.all_gather_into_tensor(
-            output_tensor=self._unsharded_param,
+            output_tensor=output_tensor,
             input_tensor=self._shard_buf,
             group=self._env.replica_pg,
             async_op=False,
@@ -3724,14 +3760,14 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size
 
+            self._input_tensor = self._emb_module.weights_dev.contiguous()
             if padding_size > 0:
-                input_tensor = torch.nn.functional.pad(
+                # ideally, we want to avoid padding as this has will cause a short 2x emb memory spike
+                self._input_tensor = torch.nn.functional.pad(
                     self._emb_module.weights_dev.contiguous(),
                     (0, padding_size),
                     value=0.0,
                 )
-            else:
-                input_tensor = self._emb_module.weights_dev.contiguous()
 
             if self._shard_buf is None:
                 self._shard_buf = torch.empty(
@@ -3748,7 +3784,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
 
             self._async_work = dist.reduce_scatter_tensor(
                 output=self._shard_buf,
-                input=input_tensor,
+                input=self._input_tensor,
                 op=dist.ReduceOp.AVG,
                 group=self._env.replica_pg,
                 async_op=True,
@@ -3762,6 +3798,9 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
                 # pyre-ignore[29]
                 self._emb_module.weights_dev.untyped_storage().resize_(0)
                 self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
+                # padding tensor we resize to 0 and set pointer to None
+                self._input_tensor.untyped_storage().resize_(0)  # pyre-ignore[29]
+                self._input_tensor = None
 
             return ReduceScatterResizeAwaitable(
                 async_work=self._async_work,
