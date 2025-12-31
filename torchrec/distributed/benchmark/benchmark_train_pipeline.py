@@ -211,7 +211,8 @@ def runner(
         )
 
         if rank == 0:
-            print(result)
+            print(result.prettify())
+            print("\nMarkdown format:\n", result)
 
         return result
 
