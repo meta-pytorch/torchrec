@@ -18,12 +18,17 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def validate_keyed_jagged_tensor(
-    kjt: KeyedJaggedTensor, configs: Optional[List[EmbeddingBagConfig]] = None
+    kjt: KeyedJaggedTensor,
+    configs: Optional[List[EmbeddingBagConfig]] = None,
 ) -> bool:
     """
     Validates the inputs that construct a KeyedJaggedTensor.
 
     Any invalid input will result in a ValueError being thrown.
+
+    Args:
+        kjt: The KeyedJaggedTensor to validate.
+        configs: Optional list of EmbeddingBagConfig for feature range validation.
 
     Returns:
         bool: True if all validations pass (including feature range),
@@ -32,6 +37,7 @@ def validate_keyed_jagged_tensor(
     _validate_lengths_and_offsets(kjt)
     _validate_keys(kjt)
     _validate_weights(kjt)
+
     if configs is not None:
         return _validate_feature_range(kjt, configs)
     else:
@@ -158,6 +164,11 @@ def _validate_keys(kjt: KeyedJaggedTensor) -> bool:
                 raise ValueError(
                     f"lengths size must be divisible by keys size, but got {lengths_size} and {len(keys)}"
                 )
+        else:
+            if torch._utils_internal.justknobs_check(
+                "pytorch/torchrec:killswitch_enable_vbe_kjt_validation"
+            ):
+                _validate_vbe_properties(kjt, lengths_size)
     return True
 
 
@@ -176,6 +187,79 @@ def _validate_weights(kjt: KeyedJaggedTensor) -> bool:
         raise ValueError(
             f"weights size must equal to values size, but got {weights.numel()} and {kjt.values().numel()}"
         )
+    return True
+
+
+def _validate_vbe_properties(
+    kjt: KeyedJaggedTensor,
+    lengths_size: int,
+) -> bool:
+    """
+    Validates the VBE (Variable Batch Embeddings) properties of a KJT.
+
+    NOTE: This validator is for KJTs prior to input_dist. In practice,
+    `stride_per_key_per_rank` is used as the source of truth with shape
+      (num_features, 1), where the second dimension represents a single rank.
+
+    After `input_dist`, `stride_per_key_per_rank` will have shape
+    (num_features, world_size), but that is outside the scope of this validator.
+
+    For VBE KJTs (where variable_stride_per_key() is True):
+    - stride_per_key_per_rank must not be None
+    - stride_per_key_per_rank should be 2-dimensional with shape (num_features, 1)
+    - The sum of all stride values should equal len(lengths)
+
+    Args:
+        kjt: The KeyedJaggedTensor to validate.
+        lengths_size: The number of lengths in the KJT.
+
+    Returns:
+        bool: True if validation passes, False otherwise (with warning logged).
+    """
+    stride_per_key_per_rank = kjt._stride_per_key_per_rank
+    if stride_per_key_per_rank is None:
+        logger.warning(
+            "stride_per_key_per_rank cannot be None for VBE KeyedJaggedTensor"
+        )
+        return False
+
+    num_features = len(kjt.keys())
+
+    # Validate shape: (num_features, 1) for user-input KJTs (prior to input_dist)
+    # In practice, stride_per_key_per_rank is used as the source of truth for
+    # stride_per_key, with num_ranks=1 for user-provided input.
+    if stride_per_key_per_rank.dim() != 2:
+        logger.warning(
+            f"stride_per_key_per_rank must be 2-dimensional, but got {stride_per_key_per_rank.dim()} dimensions"
+        )
+        return False
+
+    if stride_per_key_per_rank.size(0) != num_features:
+        logger.warning(
+            f"stride_per_key_per_rank first dimension must equal num_features ({num_features}), "
+            f"but got {stride_per_key_per_rank.size(0)}"
+        )
+        return False
+
+    if stride_per_key_per_rank.size(1) != 1:
+        logger.warning(
+            f"stride_per_key_per_rank second dimension must be 1 for user-input KJT "
+            f"(prior to input_dist), but got {stride_per_key_per_rank.size(1)}. "
+            f"User input should only provide stride_per_key for a single KJT."
+        )
+        return False
+
+    # The initial values of stride_per_key_per_rank should only contain the
+    # stride for each key in *this rank*, so we can just verify if the sum
+    # equals to the size of lengths for this rank.
+    stride_sum = stride_per_key_per_rank.sum().item()
+    if stride_sum != lengths_size:
+        logger.warning(
+            f"Sum of stride_per_key_per_rank ({stride_sum}) must equal "
+            f"the number of lengths ({lengths_size}) for VBE KeyedJaggedTensor"
+        )
+        return False
+
     return True
 
 
