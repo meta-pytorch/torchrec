@@ -20,8 +20,11 @@ To support a new model in pipeline benchmark:
     See benchmark_pipeline_utils.py for step-by-step instructions.
 """
 
+import logging
 from dataclasses import dataclass
 from typing import List, Optional
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
@@ -211,7 +214,9 @@ def runner(
         )
 
         if rank == 0:
-            print(result)
+            logger.setLevel(logging.INFO)
+            logger.info(result.prettify())
+            logger.info("\nMarkdown format:\n%s", result)
 
         return result
 
