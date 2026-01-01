@@ -29,6 +29,11 @@ from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerColle
 from torchrec.modules.feature_processor import PositionWeightedProcessor
 from torchrec.modules.feature_processor_ import PositionWeightedModuleCollection
 from torchrec.modules.fp_embedding_modules import FeatureProcessedEmbeddingBagCollection
+from torchrec.modules.hash_mc_evictions import (
+    HashZchEvictionConfig,
+    HashZchEvictionPolicyName,
+)
+from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingBagCollection
 from torchrec.modules.mc_modules import (
     DistanceLFU_EvictionPolicy,
@@ -1551,7 +1556,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
         feature_processor_modules: Optional[Dict[str, torch.nn.Module]] = None,
         over_arch_clazz: Optional[Type[nn.Module]] = None,
         postproc_module: Optional[nn.Module] = None,
-        zch: bool = False,
+        zch_kwargs: Optional[Dict[str, Any]] = None,
         submodule_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         super().__init__(
@@ -1568,11 +1573,12 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
         self.dense = TestDenseArch(
             num_float_features, device=dense_device, **(submodule_kwargs or {})
         )
-        if zch:
+        if zch_kwargs is not None:
             self.sparse: nn.Module = TestEBCSparseArchZCH(
                 tables,  # pyre-ignore
                 weighted_tables,
                 torch.device("meta"),
+                zch_kwargs=zch_kwargs,
                 return_remapped=True,
             )
         elif isinstance(tables[0], EmbeddingConfig):
@@ -2256,32 +2262,79 @@ class TestEBCSparseArchZCH(nn.Module):
         TestEBCSparseArch()
     """
 
+    def _get_mc_module_from_tables(
+        self,
+        tables: List[EmbeddingBagConfig],
+        device: torch.device,
+        zch_kwargs: Dict[str, Any],
+    ):
+        mc_modules = {}
+        for table in tables:
+            mc_config = zch_kwargs[table.name]
+            mc_type = mc_config.mc_type
+            if mc_type == "mp-zch":
+                # Handle eviction policies by explicitly setting
+                eviction_policy_name = None
+                eviction_config = None
+                if mc_config.eviction_policy_name:
+                    eviction_policy_name = HashZchEvictionPolicyName(
+                        mc_config.eviction_policy_name
+                    )
+                    if mc_config.eviction_config is not None:
+                        eviction_config = HashZchEvictionConfig(
+                            # Set feature names from table if not provided
+                            features=mc_config.eviction_config.get(
+                                "features", table.feature_names
+                            ),
+                            single_ttl=mc_config.eviction_config.get("single_ttl"),
+                            per_feature_ttl=mc_config.eviction_config.get(
+                                "per_feature_ttl"
+                            ),
+                        )
+
+                mc_modules[table.name] = HashZchManagedCollisionModule(
+                    zch_size=table.num_embeddings,
+                    device=device,
+                    input_hash_size=mc_config.input_hash_size,
+                    total_num_buckets=mc_config.total_num_buckets,
+                    max_probe=mc_config.max_probe,
+                    eviction_policy_name=eviction_policy_name,
+                    eviction_config=eviction_config,
+                    opt_in_prob=mc_config.opt_in_prob,
+                    percent_reserved_slots=mc_config.percent_reserved_slots,
+                    disable_fallback=mc_config.disable_fallback,
+                )
+            elif mc_type == "sort-zch":
+                mc_modules[table.name] = MCHManagedCollisionModule(
+                    zch_size=table.num_embeddings,
+                    input_hash_size=mc_config.input_hash_size,
+                    device=device,
+                    # TODO: If eviction interval is set to
+                    # a low number (e.g. 2), semi-sync pipeline test will
+                    # fail with in-place modification error during
+                    # loss.backward(). This is because during semi-sync training,
+                    # we run embedding module forward after autograd graph
+                    # is constructed, but if MCH eviction happens, the
+                    # variable used in autograd will have been modified
+                    eviction_interval=1000,
+                    eviction_policy=DistanceLFU_EvictionPolicy(),
+                )
+            else:
+                raise ValueError(f"Unknown mc_type in zch_kwargs: {mc_type}")
+        return mc_modules
+
     def __init__(
         self,
         tables: List[EmbeddingBagConfig],
         weighted_tables: List[EmbeddingBagConfig],
         device: torch.device,
+        zch_kwargs: Dict[str, Any],
         return_remapped: bool = False,
     ) -> None:
         super().__init__()
         self._return_remapped = return_remapped
 
-        mc_modules = {}
-        for table in tables:
-            mc_modules[table.name] = MCHManagedCollisionModule(
-                zch_size=table.num_embeddings,
-                input_hash_size=4000,
-                device=device,
-                # TODO: If eviction interval is set to
-                # a low number (e.g. 2), semi-sync pipeline test will
-                # fail with in-place modification error during
-                # loss.backward(). This is because during semi-sync training,
-                # we run embedding module forward after autograd graph
-                # is constructed, but if MCH eviction happens, the
-                # variable used in autograd will have been modified
-                eviction_interval=1000,
-                eviction_policy=DistanceLFU_EvictionPolicy(),
-            )
+        mc_modules = self._get_mc_module_from_tables(tables, device, zch_kwargs)
 
         self.ebc: ManagedCollisionEmbeddingBagCollection = (
             ManagedCollisionEmbeddingBagCollection(
@@ -2299,16 +2352,9 @@ class TestEBCSparseArchZCH(nn.Module):
 
         self.weighted_ebc: Optional[ManagedCollisionEmbeddingBagCollection] = None
         if weighted_tables:
-            weighted_mc_modules = {}
-            for table in weighted_tables:
-                weighted_mc_modules[table.name] = MCHManagedCollisionModule(
-                    zch_size=table.num_embeddings,
-                    input_hash_size=4000,
-                    device=device,
-                    # TODO: Support MCH evictions during semi-sync
-                    eviction_interval=1000,
-                    eviction_policy=DistanceLFU_EvictionPolicy(),
-                )
+            weighted_mc_modules = self._get_mc_module_from_tables(
+                weighted_tables, device, zch_kwargs
+            )
             self.weighted_ebc: ManagedCollisionEmbeddingBagCollection = (
                 ManagedCollisionEmbeddingBagCollection(
                     EmbeddingBagCollection(
