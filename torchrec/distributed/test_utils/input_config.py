@@ -7,7 +7,7 @@
 
 # pyre-strict
 
-from dataclasses import dataclass
+from dataclasses import dataclass, MISSING
 from typing import List, Optional
 
 import torch
@@ -31,6 +31,16 @@ class ModelInputConfig:
     long_kjt_lengths: bool = True
     pin_memory: bool = True
     use_variable_batch: bool = False
+
+    def __post_init__(self):
+        assert self.num_batches is not MISSING, "--num_batches must be specified"
+        assert self.batch_size is not MISSING, "--batch_size must be specified"
+        assert (
+            self.num_float_features is not MISSING
+        ), "--num_float_features must be specified"
+        assert (
+            self.feature_pooling_avg is not MISSING
+        ), "--feature_pooling_avg must be specified"
 
     def generate_batches(
         self,
