@@ -237,7 +237,12 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._cur_batch = None
 
     def _connect(self, dataloader_iter: Iterator[In]) -> None:
-        cur_batch = next(dataloader_iter)
+        """
+        Connect the data iterator to the pipeline when first start the pipeline
+        It also fetch the first batch from the data iterator and copy batch to gpu
+        The batch is stored in self._cur_batch
+        """
+        cur_batch = self._next_batch(dataloader_iter)
         self._cur_batch = cur_batch
         if cur_batch is not None:
             if self._inplace_copy_batch_to_gpu:
@@ -255,18 +260,22 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._connected = True
 
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
-        with record_function("## next_batch ##"):
+        with record_function("## next batch from dataloader (host) ##"):
             try:
                 next_batch = next(dataloader_iter)
             except StopIteration:
                 self._data_iter_stopped = True
                 return None
-
         return next_batch
 
     def _wait_for_batch(self, cur_batch: In) -> None:
         with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cur_batch, self._memcpy_stream)
+            _wait_for_batch(
+                cur_batch,
+                self._memcpy_stream,
+                # no need to record stream when using in-place copy
+                record_stream=not self._inplace_copy_batch_to_gpu,
+            )
 
     def _backward(self, losses: torch.Tensor) -> None:
         with record_function("## backward ##"):
@@ -294,9 +303,11 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         if self._data_iter_stopped:
             raise StopIteration()
 
-        # Fetch next batch, if depleted, raise at start of next progress
-        next_batch = self._next_batch(dataloader_iter)
+        # get the current batch from previous operation
         cur_batch = self._cur_batch
+
+        # Fetch next batch from dataloader (host), aise at start of next progress if depleted
+        next_batch = self._next_batch(dataloader_iter)
 
         # for exhaustive data iter, some ranks will first depletes data,
         # but we still need progress the train pipeline for other ranks;
@@ -314,11 +325,13 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         with record_function("## forward ##"):
             (losses, output) = self._model(cur_batch)
 
+            # clear the current batch after forward pass (so current batch can be freed)
+            self._cur_batch = cur_batch = next_batch
+
         if self._model.training:
             self._backward(losses)
 
         # Copy the next batch to GPU
-        self._cur_batch = cur_batch = next_batch
         if cur_batch is not None:
             self._copy_batch_to_gpu(cur_batch)
 
