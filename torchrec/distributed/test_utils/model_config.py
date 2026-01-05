@@ -30,6 +30,7 @@ from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
 from torchrec.distributed.sharding_plan import get_default_sharders
+from torchrec.distributed.test_utils.table_config import ManagedCollisionConfig
 from torchrec.distributed.test_utils.test_model import (
     TestOverArchLarge,
     TestSparseNN,
@@ -87,7 +88,7 @@ class TestSparseNNConfig(BaseModelConfig):
     max_feature_lengths: Optional[Dict[str, int]] = None
     over_arch_clazz: Type[nn.Module] = TestOverArchLarge
     postproc_module: Optional[nn.Module] = None
-    zch: bool = False
+    mc_configs: Optional[Dict[str, ManagedCollisionConfig]] = None
     submodule_kwargs: Optional[Dict[str, Any]] = None
 
     def generate_model(
@@ -108,7 +109,7 @@ class TestSparseNNConfig(BaseModelConfig):
             over_arch_clazz=self.over_arch_clazz,
             postproc_module=self.postproc_module,
             embedding_groups=self.embedding_groups,
-            zch=self.zch,
+            zch_kwargs=kwargs["mc_configs"] if kwargs["mc_configs"] else None,
             submodule_kwargs=self.submodule_kwargs,
         )
 
