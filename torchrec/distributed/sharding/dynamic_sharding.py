@@ -919,9 +919,7 @@ def output_sharding_plans_delta(
     """
     delta_plans: Dict[str, Tuple[float, EmbeddingModuleShardingPlan]] = {}
     for key, plan in old_plan.items():
-        assert (
-            key in new_plan
-        ), f"Found mismatch between old and new plans, key: {key} not found in new plan"
+        assert key in new_plan
 
         delta_plans[key] = output_sharding_plan_delta_single(
             plan, new_plan[key], return_data_volume
