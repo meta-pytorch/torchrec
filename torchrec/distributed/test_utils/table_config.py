@@ -45,7 +45,6 @@ def _process_virtual_table_config(config_dict: Dict[str, Any]) -> None:
             "DRAM_VIRTUAL_TABLE",
             "SSD_VIRTUAL_TABLE",
         ]
-        del config_dict["location"]  # location not an attribute of EBC
 
         if config_dict["use_virtual_table"]:
             assert (
@@ -80,6 +79,43 @@ def _process_virtual_table_config(config_dict: Dict[str, Any]) -> None:
 
 
 @dataclass
+class ManagedCollisionConfig:
+    """Configuration for ManagedCollision (MC) module parameters, e.g. MP-ZCH, Sort-ZCH."""
+
+    mc_type: str = "mp-zch"
+    input_hash_size: int = 0
+
+    # MP-ZCH (HashZCH class) parameters
+    max_probe: int = 128
+    total_num_buckets: Optional[int] = None
+    output_segments: Optional[List[int]] = (None,)
+    eviction_policy_name: Optional[str] = None
+    eviction_config: Optional[Dict[str, int]] = None
+    opt_in_prob: int = -1
+    percent_reserved_slots: float = 0.0
+    disable_fallback: bool = False
+    tb_logging_frequency: int = 0
+    start_bucket: int = 0
+    end_bucket: Optional[int] = None
+
+    # Sort ZCH (MCH class) parameters
+    eviction_policy: Optional[Any] = "DistanceLFU"
+    eviction_interval: int = 1
+
+
+@dataclass
+class TableExtendedConfigs:
+    """
+    Container for table-related configurations outside of EmbeddingBagConfig.
+
+    Holds additional configs and used to pass extra table configurations
+    through the benchmark pipeline.
+    """
+
+    mc_configs: Dict[str, ManagedCollisionConfig] = field(default_factory=dict)
+
+
+@dataclass
 class EmbeddingTablesConfig:
     """
     Configuration for generating embedding tables for test and benchmark
@@ -96,6 +132,7 @@ class EmbeddingTablesConfig:
             Default is 128.
         additional_tables (List[List[Dict[str, Any]]]): Additional tables to include in the configuration.
             Default is an empty list.
+        mc_config (Dict[str, ManagedCollisionConfig]): Maps table to its ManagedCollision configuration.
     """
 
     num_unweighted_features: int = 100
@@ -105,6 +142,24 @@ class EmbeddingTablesConfig:
     table_data_type: DataType = DataType.FP32
     total_num_buckets: Optional[int] = None
     additional_tables: List[List[Dict[str, Any]]] = field(default_factory=list)
+    # ManagedCollision configs for all tables
+    mc_config: Optional[ManagedCollisionConfig] = None  # Default for all tables
+    mc_configs_per_table: Dict[str, ManagedCollisionConfig] = field(
+        default_factory=dict
+    )  # MC configs for all tables
+
+    def _get_mc_config_to_table(
+        self, table_name: str, mc_config: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Get MC config for a table. Per-table config takes priority over default."""
+        if mc_config is not None:
+            # Per-table config from additional_tables
+            self.mc_configs_per_table[table_name] = ManagedCollisionConfig(**mc_config)
+        elif self.mc_config is not None:
+            # Use global default for tables
+            self.mc_configs_per_table[table_name] = ManagedCollisionConfig(
+                **self.mc_config
+            )
 
     def convert_to_ebconf(self, kwargs: Dict[str, Any]) -> EmbeddingBagConfig:
         if "data_type" in kwargs:
@@ -114,6 +169,13 @@ class EmbeddingTablesConfig:
 
         # Process configs for KV-ZCH/ZCH v.Next
         _process_virtual_table_config(kwargs)
+
+        # Process configs for MP-ZCH
+        mc_config = kwargs.pop("mc_config", None)
+        self._get_mc_config_to_table(kwargs["name"], mc_config)
+
+        # Remove all keys that are not part of EmbeddingBagConfig
+        kwargs.pop("location", None)
 
         return EmbeddingBagConfig(**kwargs)
 
@@ -162,6 +224,10 @@ class EmbeddingTablesConfig:
             for i in range(self.num_weighted_features)
         ]
 
+        # Get default ManagedCollision configs for all tables, if provided
+        for table in unweighted_tables + weighted_tables:
+            self._get_mc_config_to_table(table.name)
+
         tables_list = []
         for idx, adts in enumerate(self.additional_tables):
             if idx == 0:
@@ -179,4 +245,5 @@ class EmbeddingTablesConfig:
             tables_list.append(weighted_tables)
         elif len(tables_list) == 1:
             tables_list.append(weighted_tables)
+
         return tables_list

@@ -51,7 +51,10 @@ from torchrec.distributed.test_utils.multi_process import (
 )
 from torchrec.distributed.test_utils.pipeline_config import PipelineConfig
 from torchrec.distributed.test_utils.sharding_config import PlannerConfig
-from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
+from torchrec.distributed.test_utils.table_config import (
+    EmbeddingTablesConfig,
+    TableExtendedConfigs,
+)
 from torchrec.distributed.train_pipeline import TrainPipeline
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -126,6 +129,7 @@ def runner(
     pipeline_config: PipelineConfig,
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
+    table_related_configs: Optional[TableExtendedConfigs] = None,
 ) -> BenchmarkResult:
     # Ensure GPUs are available and we have enough of them
     assert (
@@ -143,6 +147,9 @@ def runner(
             tables=tables,
             weighted_tables=weighted_tables,
             dense_device=ctx.device,
+            mc_configs=(
+                table_related_configs.mc_configs if table_related_configs else None
+            ),
         )
 
         # Create a planner for sharding based on the specified type
@@ -280,7 +287,11 @@ def main(
     planner_config: PlannerConfig,
 ) -> None:
     tables, weighted_tables, *_ = table_config.generate_tables()
+    table_extended_config = TableExtendedConfigs(
+        mc_configs=table_config.mc_configs_per_table,
+    )
     model_config = model_selection.create_model_config()
+
     # launch trainers
     run_multi_process_func(
         func=runner,
@@ -292,6 +303,7 @@ def main(
         pipeline_config=pipeline_config,
         input_config=input_config,
         planner_config=planner_config,
+        table_related_configs=table_extended_config,
     )
 
 
