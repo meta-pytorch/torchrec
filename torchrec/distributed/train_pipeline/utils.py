@@ -95,7 +95,9 @@ def _to_device(
         )
 
 
-def _wait_for_batch(batch: In, stream: Optional[torch.Stream]) -> None:
+def _wait_for_batch(
+    batch: In, stream: Optional[torch.Stream], record_stream: bool = True
+) -> None:
     """
     As mentioned in
     https://pytorch.org/docs/stable/generated/torch.Tensor.record_stream.html, PyTorch
@@ -111,13 +113,21 @@ def _wait_for_batch(batch: In, stream: Optional[torch.Stream]) -> None:
     if stream is None:
         return
 
+    # batch is loaded/processed in the given stream, but will be used in the current
     device = stream.device
-    torch.get_device_module(device).current_stream().wait_stream(stream)
-    cur_stream = torch.get_device_module(device).current_stream()
-    assert isinstance(
-        batch, (torch.Tensor, Multistreamable)
-    ), f"{type(batch)} must implement Multistreamable interface"
-    batch.record_stream(cur_stream)
+    curr_stream = torch.get_device_module(device).current_stream()
+
+    # current stream needs to wait for the given stream to complete
+    curr_stream.wait_stream(stream)
+
+    # record_stream is needed when the batch is created (allocated) in the given stream
+    # but used by another stream (e.g., the current stream), however, when the batch is
+    # created in the current stream (in-place copy), we don't need to call
+    if record_stream:
+        assert isinstance(
+            batch, (torch.Tensor, Multistreamable)
+        ), f"{type(batch)} must implement Multistreamable interface"
+        batch.record_stream(curr_stream)
 
 
 def _wait_for_events(
