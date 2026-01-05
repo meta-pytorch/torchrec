@@ -10,6 +10,8 @@
 import unittest
 from typing import Dict
 
+from unittest.mock import patch
+
 import torch
 from torchrec.metrics.metrics_config import DefaultTaskInfo
 from torchrec.metrics.xauc import XAUCMetric
@@ -29,22 +31,21 @@ def generate_model_output() -> Dict[str, torch._tensor.Tensor]:
 
 
 class XAUCMetricTest(unittest.TestCase):
-    def setUp(self) -> None:
-        self.xauc = XAUCMetric(
+    def test_xauc(self) -> None:
+        xauc = XAUCMetric(
             world_size=WORLD_SIZE,
             my_rank=0,
             batch_size=BATCH_SIZE,
             tasks=[DefaultTaskInfo],
         )
 
-    def test_xauc(self) -> None:
         model_output = generate_model_output()
-        self.xauc.update(
+        xauc.update(
             predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
             labels={DefaultTaskInfo.name: model_output["labels"][0]},
             weights={DefaultTaskInfo.name: model_output["weights"][0]},
         )
-        metric = self.xauc.compute()
+        metric = xauc.compute()
         actual_metric = metric[f"xauc-{DefaultTaskInfo.name}|lifetime_xauc"]
         expected_metric = model_output["expected_xauc"]
 
@@ -56,4 +57,51 @@ class XAUCMetricTest(unittest.TestCase):
             check_dtype=False,
             equal_nan=True,
             msg=f"Actual: {actual_metric}, Expected: {expected_metric}",
+        )
+
+    def test_xauc_compile(self) -> None:
+        xauc_compile = XAUCMetric(
+            world_size=WORLD_SIZE,
+            my_rank=0,
+            batch_size=BATCH_SIZE,
+            tasks=[DefaultTaskInfo],
+            enable_pt2_compile=True,
+            window_size=200,
+        )
+
+        xauc = XAUCMetric(
+            world_size=WORLD_SIZE,
+            my_rank=0,
+            batch_size=BATCH_SIZE,
+            tasks=[DefaultTaskInfo],
+            enable_pt2_compile=False,
+            window_size=200,
+        )
+
+        model_output = generate_model_output()
+        with patch.object(torch._dynamo.config, "fail_on_recompile_limit_hit", True):
+            for _ in range(10):
+                xauc_compile.update(
+                    predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
+                    labels={DefaultTaskInfo.name: model_output["labels"][0]},
+                    weights={DefaultTaskInfo.name: model_output["weights"][0]},
+                )
+                xauc.update(
+                    predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
+                    labels={DefaultTaskInfo.name: model_output["labels"][0]},
+                    weights={DefaultTaskInfo.name: model_output["weights"][0]},
+                )
+        metric_compile = xauc_compile.compute()[
+            f"xauc-{DefaultTaskInfo.name}|lifetime_xauc"
+        ]
+        metric = xauc.compute()[f"xauc-{DefaultTaskInfo.name}|lifetime_xauc"]
+
+        torch.testing.assert_close(
+            metric_compile,
+            metric,
+            atol=1e-4,
+            rtol=1e-4,
+            check_dtype=False,
+            equal_nan=True,
+            msg=f"Compiled: {metric_compile}, Expected: {metric}",
         )
