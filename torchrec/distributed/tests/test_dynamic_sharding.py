@@ -399,7 +399,7 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 3,
+        torch.cuda.device_count() < 4,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     @given(  # pyre-ignore
@@ -513,7 +513,7 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
 @skip_if_asan_class
 class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
     @given(  # Pyre-ignore
@@ -572,19 +572,19 @@ class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
         - For Table-Wise sharding: All optimizers including RowWiseAdagrad
         - For Column-Wise sharding: Only Adagrad and SGD (no RowWiseAdagrad)
         """
-        if (
-            self.device == torch.device("cpu")
-            and kernel_type != EmbeddingComputeKernel.FUSED.value
-        ):
-            self.skipTest("CPU does not support uvm.")
+        if self.device.type == "cpu":
+            assume(
+                kernel_type
+                in (
+                    EmbeddingComputeKernel.DENSE.value,
+                    EmbeddingComputeKernel.FUSED.value,
+                )
+            )
+        elif self.device.type == "cuda":
+            assume(torch.cuda.device_count() >= world_size)
 
         # Fixed to False as variable batch size with CW is more complex
         variable_batch_size = False
-
-        assume(
-            sharder_type == SharderType.EMBEDDING_BAG_COLLECTION.value
-            or not variable_batch_size
-        )
 
         # Define optimizer options based on sharding type
         if sharding_type == ShardingType.COLUMN_WISE.value:
