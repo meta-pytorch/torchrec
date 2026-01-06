@@ -1,0 +1,64 @@
+# This is a very basic MP-ZCH benchmark configuration
+#   MP-ZCH parameters have comments next to them below.
+#   Note that MP-ZCH must be enabled for all tables in the model,
+#      and MP-ZCH only works with row-wise sharding.
+RunOptions:
+  world_size: 2
+  num_batches: 20
+  num_benchmarks: 5
+  num_profiles: 1
+  sharding_type: row_wise        # MP-ZCH only works with row-wise sharding
+  profile_dir: "."
+  name: "sparse_data_dist_mpzch"
+  num_float_features: 1000
+PipelineConfig:
+  pipeline: "sparse"
+ModelInputConfig:
+  num_float_features: 1000
+  feature_pooling_avg: 30
+  use_variable_batch: False
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"   # MP-ZCH only works with test_sparse_nn
+  model_config:
+    num_float_features: 1000
+    submodule_kwargs:
+      dense_arch_out_size: 1024
+      over_arch_out_size: 4096
+      over_arch_hidden_layers: 10
+      dense_arch_hidden_sizes: [128, 128, 128]
+EmbeddingTablesConfig:
+  num_unweighted_features: 90
+  num_weighted_features: 80
+  embedding_feature_dim: 256
+  mc_config:
+    mc_type: "mp-zch"           # Either "mp-zch" or "sort-zch"
+    total_num_buckets: 10       # zch_size must be a multiple of total_num_buckets,
+                                #     and total_num_buckets must be a multiple of world size
+    max_probe: 128              # Controls amount of time kernel searches for lookup or insertion
+    input_hash_size: 0          # Maximum input hash size.
+    disable_fallback: False     # If ID lookup fails, then the IDS are removed entirely from output.
+    eviction_policy_name:       # Eviction policy names: "SINGLE_TTL_EVICTION", "PER_FEATURE_TTL_EVICTION",
+                                #   "LRU_EVICTION"
+      "SINGLE_TTL_EVICTION"
+    eviction_config:            # Eviction policy parameters
+      single_ttl: 1
+  additional_tables:
+    - - name: FP16_table
+        embedding_dim: 256
+        num_embeddings: 100_000
+        feature_names: ["additional_0_0"]
+        data_type: FP16
+        mc_config:
+          mc_type: "mp-zch"
+          total_num_buckets: 10
+          max_probe: 128
+          input_hash_size: 0
+          eviction_policy_name: "SINGLE_TTL_EVICTION"
+          eviction_config:
+            single_ttl: 1
+          disable_fallback: False
+PlannerConfig:
+  # MP-ZCH only works with row-wise sharding
+  additional_constraints:
+    FP16_table:
+      sharding_types: [row_wise]

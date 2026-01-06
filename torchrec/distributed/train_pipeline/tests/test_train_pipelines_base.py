@@ -98,13 +98,23 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
         postproc_module: Optional[nn.Module] = None,
         zch: bool = False,
     ) -> nn.Module:
+        # Create ZCH kwargs arguments if provided
+        zch_kwargs = None
+        if zch:
+            zch_kwargs = {
+                table.name: {
+                    "mc_type": "sort-zch",
+                    "input_hash_size": 4000,
+                }
+                for table in self.tables
+            }
         unsharded_model = model_type(
             tables=self.tables,
             weighted_tables=self.weighted_tables,
             dense_device=self.device,
             sparse_device=torch.device("meta"),
             postproc_module=postproc_module,
-            zch=zch,
+            zch_kwargs=zch_kwargs,
         )
         if enable_fsdp:
             unsharded_model.over.dhn_arch.linear0 = FSDP(
