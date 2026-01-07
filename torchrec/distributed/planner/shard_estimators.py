@@ -478,6 +478,49 @@ class EmbeddingPerfEstimator(ShardEstimator):
         return prefetch_bytes / hbm_to_ddr_mem_bw
 
     @classmethod
+    def _input_dist_expected_latency(
+        cls,
+        batch_sizes: List[int],
+        world_size: int,
+        local_world_size: int,
+        num_poolings: List[float],
+        input_lengths: List[float],
+        a2a_comm_data_type_size: float,
+        comms_bandwidths: GeneralizedCommsBandwidth,
+        is_weighted: bool = False,
+    ) -> float:
+        """
+        Calculates the expected latency for A2A input dist.
+
+        Args:
+            batch_sizes (int): The batch size for each input feature.
+            world_size (int): The total number of devices in the distributed setup.
+            local_world_size (int): The number of devices on a single host.
+            num_poolings (List[float]): Number of poolings per sample for each input feature.
+            input_lengths (List[float]): Average number of lookups per input feature.
+            a2a_comm_data_type_size (float): Data type size (in bytes) for forward all-to-all communication.
+            comms_bandwidths (GeneralizedCommsBandwidth): Object to query communication bandwidths.
+
+        Returns:
+            float: The expected latency (in seconds) for input distribution.
+        """
+        batch_inputs = sum(
+            [x * y * z for x, y, z in zip(input_lengths, num_poolings, batch_sizes)]
+        )
+        input_read_size = math.ceil(batch_inputs * world_size * a2a_comm_data_type_size)
+
+        if is_weighted:
+            input_read_size *= 2
+
+        comms_bw = comms_bandwidths.get_bw(
+            world_size=world_size,
+            local_world_size=local_world_size,
+            collective_type=CollectiveType.ALL_TO_ALL,
+        )
+        assert comms_bw is not None and comms_bw > 0
+        return input_read_size / comms_bw
+
+    @classmethod
     def _get_tw_sharding_perf(
         cls,
         batch_sizes: List[int],
@@ -567,6 +610,15 @@ class EmbeddingPerfEstimator(ShardEstimator):
             hbm_to_ddr_mem_bw, expected_cache_fetches, emb_dim, table_data_type_size
         )
 
+        input_dist_comms = cls._input_dist_expected_latency(
+            batch_sizes=batch_sizes,
+            world_size=world_size,
+            local_world_size=local_world_size,
+            num_poolings=num_poolings,
+            input_lengths=input_lengths,
+            a2a_comm_data_type_size=input_data_type_size,
+            comms_bandwidths=comms_bandwidths,
+        )
         # in order of model parallel execution, starting with:
         # BWD DP -> BWD MP ... FWD MP -> FWD DP
         return Perf(
@@ -575,6 +627,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
             bwd_compute=bwd_compute + bwd_grad_indice_weights_kernel,
             bwd_comms=bwd_comms,
             prefetch_compute=prefetch_compute,
+            input_dist_comms=input_dist_comms,
         )
 
     @classmethod
@@ -674,6 +727,15 @@ class EmbeddingPerfEstimator(ShardEstimator):
             emb_dim,
             table_data_type_size,
         )
+        input_dist_comms = cls._input_dist_expected_latency(
+            batch_sizes=batch_sizes,
+            world_size=world_size,
+            local_world_size=local_world_size,
+            num_poolings=num_poolings,
+            input_lengths=input_lengths,
+            a2a_comm_data_type_size=input_data_type_size,
+            comms_bandwidths=comms_bandwidths,
+        )
 
         return Perf(
             fwd_compute=fwd_compute,
@@ -681,6 +743,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
             bwd_compute=bwd_compute + bwd_grad_indice_weights_kernel,
             bwd_comms=bwd_comms + bwd_batched_copy,
             prefetch_compute=prefetch_compute,
+            input_dist_comms=input_dist_comms,
         )
 
     @classmethod
@@ -806,6 +869,15 @@ class EmbeddingPerfEstimator(ShardEstimator):
             emb_dim,
             table_data_type_size,
         )
+        input_dist_comms = cls._input_dist_expected_latency(
+            batch_sizes=batch_sizes,
+            world_size=world_size,
+            local_world_size=local_world_size,
+            num_poolings=num_poolings,
+            input_lengths=input_lengths,
+            a2a_comm_data_type_size=input_data_type_size,
+            comms_bandwidths=comms_bandwidths,
+        )
 
         return Perf(
             fwd_compute=fwd_compute,
@@ -813,6 +885,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
             bwd_compute=bwd_compute + bwd_grad_indice_weights_kernel,
             bwd_comms=bwd_comms + bwd_batched_copy,
             prefetch_compute=prefetch_compute,
+            input_dist_comms=input_dist_comms,
         )
 
     @classmethod
