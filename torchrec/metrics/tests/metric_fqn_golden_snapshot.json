@@ -26,6 +26,18 @@
     ],
     "variant": ""
   },
+  "AverageMetric_UNFUSED_TASKS_COMPUTATION": {
+    "compute_mode": "UNFUSED_TASKS_COMPUTATION",
+    "metric_class": "AverageMetric",
+    "non_persistent_buffer_fqns": [],
+    "persistent_buffer_fqns": [],
+    "state_dict_keys": [
+      "_metrics_computations.0.label_sum",
+      "_metrics_computations.0.prediction_sum",
+      "_metrics_computations.0.weighted_num_samples"
+    ],
+    "variant": ""
+  },
   "CTRMetric_UNFUSED_TASKS_COMPUTATION": {
     "compute_mode": "UNFUSED_TASKS_COMPUTATION",
     "metric_class": "CTRMetric",
