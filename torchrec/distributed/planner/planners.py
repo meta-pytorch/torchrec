@@ -55,6 +55,7 @@ from torchrec.distributed.planner.types import (
 from torchrec.distributed.planner.utils import (
     bytes_to_gb,
     reset_shard_rank,
+    sharder_name,
     storage_repr_in_gb,
 )
 from torchrec.distributed.sharding_plan import get_default_sharders, placement
@@ -133,6 +134,79 @@ def to_sharding_plan(
         )
         plan[sharding_option.path] = module_plan
     return ShardingPlan(plan)
+
+
+def validate_modules_inclusion_in_sharding_plan(
+    sharding_plan: ShardingPlan,
+    module: nn.Module,
+    sharders: List[ModuleSharder[nn.Module]],
+) -> None:
+    """
+    Validates that all shardable modules in the model are included in the sharding plan.
+
+    This function traverses through the module hierarchy to identify all shardable
+    modules (modules that have a corresponding sharder) and validates that each
+    one is present in the final sharding plan.
+
+    Args:
+        sharding_plan (ShardingPlan): The final sharding plan to validate.
+        module (nn.Module): The root module to traverse and validate.
+        sharders (List[ModuleSharder[nn.Module]]): The list of sharders used for
+            sharding. These define which module types are considered shardable.
+        excluded_modules (Optional[List[str]]): A list of module paths that are
+            intentionally excluded from the sharding plan. These modules will not
+            be flagged as missing. Defaults to None.
+
+    Raises:
+        PlannerError: If any shardable module (excluding those in excluded_modules)
+            is not found in the sharding plan.
+    """
+    # Build a map of sharder names to sharders
+    sharder_map = {sharder_name(sharder.module_type): sharder for sharder in sharders}
+
+    # Collect all shardable modules by traversing the module tree
+    expected_modules: List[str] = []
+
+    named_modules_queue = [("", module)]
+    while named_modules_queue:
+        child_path, child_module = named_modules_queue.pop()
+        sharder_key = sharder_name(type(child_module))
+        sharder = sharder_map.get(sharder_key, None)
+
+        if not sharder:
+            # Not a shardable module, continue traversing its children
+            for n, m in child_module.named_children():
+                if child_path != "":
+                    named_modules_queue.append((child_path + "." + n, m))
+                else:
+                    named_modules_queue.append((n, m))
+            continue
+
+        # This is a shardable module
+        if child_path not in expected_modules:
+            expected_modules.append(child_path)
+
+    # Get modules present in the sharding plan
+    plan_modules = set(sharding_plan.plan.keys())
+
+    # Check for missing modules
+    missing_modules: List[str] = []
+
+    for module_path in expected_modules:
+        if module_path not in plan_modules:
+            missing_modules.append(module_path)
+
+    if missing_modules:
+        msg = (
+            f"The following shardable modules are not present in the "
+            f"sharding plan: {missing_modules}. If these modules should be excluded, "
+            f"add them to the excluded_modules list."
+        )
+        logging.error(msg)
+        raise PlannerError(
+            error_type=PlannerErrorType.MISSING_MODULE_IN_PLAN,
+            message=msg,
+        )
 
 
 def validate_rank_assignment(sharding_plan: ShardingPlan, topology: Topology) -> None:
@@ -692,6 +766,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     ),
                 )
 
+            validate_modules_inclusion_in_sharding_plan(sharding_plan, module, sharders)
             validate_rank_assignment(sharding_plan, self._topology)
             return sharding_plan
         else:
@@ -1055,6 +1130,9 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                 self._best_plan = best_plan
                 sharding_plan = to_sharding_plan(
                     best_plan, self._topology_groups[group]
+                )
+                validate_modules_inclusion_in_sharding_plan(
+                    module, sharding_plan, sharders
                 )
                 validate_rank_assignment(sharding_plan, self._topology_groups[group])
                 best_plans.append(sharding_plan)
