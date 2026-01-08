@@ -37,6 +37,7 @@ import torch
 from torchrec.metrics.accuracy import AccuracyMetric
 from torchrec.metrics.auc import AUCMetric
 from torchrec.metrics.auprc import AUPRCMetric
+from torchrec.metrics.average import AverageMetric
 from torchrec.metrics.cali_free_ne import CaliFreeNEMetric
 from torchrec.metrics.calibration import CalibrationMetric
 from torchrec.metrics.calibration_with_recalibration import (
@@ -222,6 +223,7 @@ METRICS_TO_TEST: List[
     (RecallMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (TowerQPSMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (NMSEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    (AverageMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (HindsightTargetPRMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (NDCGMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (XAUCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
@@ -539,6 +541,11 @@ class MetricFQNBackwardCompatibilityTest(unittest.TestCase):
     def test_nmse_metric(self) -> None:
         self._check_metric_compatibility(
             NMSEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
+        )
+
+    def test_average_metric(self) -> None:
+        self._check_metric_compatibility(
+            AverageMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
         )
 
     def test_hindsight_target_pr_metric(self) -> None:

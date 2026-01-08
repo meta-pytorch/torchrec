@@ -51,6 +51,7 @@ class RecMetricEnum(RecMetricEnumBase):
     UNWEIGHTED_NE = "unweighted_ne"
     HINDSIGHT_TARGET_PR = "hindsight_target_pr"
     NMSE = "nmse"
+    AVERAGE = "average"
 
 
 @dataclass(unsafe_hash=True, eq=True)

@@ -93,6 +93,10 @@ class MetricName(MetricNameBase):
     NMSE = "nmse"
     NRMSE = "nrmse"
 
+    DATA_LABEL_AVERAGE = "data_label_average"
+    LABEL_AVERAGE = "label_average"
+    PREDICTION_AVERAGE = "prediction_average"
+
 
 class MetricNamespaceBase(StrValueMixin, Enum):
     pass
@@ -152,6 +156,8 @@ class MetricNamespace(MetricNamespaceBase):
     EFFECTIVE_RATE = "effective_rate"
 
     NMSE = "nmse"
+
+    AVERAGE = "average"
 
 
 class MetricPrefix(StrValueMixin, Enum):
