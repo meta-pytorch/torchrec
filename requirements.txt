@@ -13,6 +13,7 @@ tensordict
 torchmetrics==1.0.3
 torchx
 tqdm
+triton
 usort
 parameterized
 PyYAML
