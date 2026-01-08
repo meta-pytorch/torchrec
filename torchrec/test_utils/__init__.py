@@ -55,12 +55,15 @@ def get_free_port() -> int:
                 raise Exception(
                     f"Binding failed with address {address} while getting free port {e}"
                 )
-    # OSS GHA: TODO remove when enable ipv6 on GHA @omkar
+    # OSS GHA: Use SO_REUSEADDR to handle TIME_WAIT port conflicts
+    # This is safe because the port is only used for gloo/nccl rendezvous coordination,
+    # not for actual data transfer. The distributed backends establish their own connections.
     else:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind(("127.0.0.1", 0))
-                s.listen(0)
+                s.listen(1)
                 with closing(s):
                     return s.getsockname()[1]
         except Exception as e:
