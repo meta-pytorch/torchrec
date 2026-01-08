@@ -309,10 +309,23 @@ class GreedyPerfPartitioner(Partitioner):
                 assert (
                     len(sharding_option_group.sharding_options) == 1
                 ), f"Unexpected length for sharding options: {len(sharding_option_group.sharding_options)}"
-                self._device_partition(
-                    sharding_option_group.sharding_options[0],
-                    minheap_devices,
+
+                key_value = any(
+                    obj.compute_kernel == "key_value"
+                    for obj in sharding_option_group.sharding_options
                 )
+
+                is_column_wise = any(
+                    opt.sharding_type == ShardingType.COLUMN_WISE.value
+                    for opt in sharding_option_group.sharding_options
+                )
+
+                sharding_option = sharding_option_group.sharding_options[0]
+
+                if is_column_wise and key_value:
+                    self._column_wise_device_partition(sharding_option, minheap_devices)
+                else:
+                    self._device_partition(sharding_option, minheap_devices)
             else:
                 raise RuntimeError(
                     f"Unexpected sharding option group {sharding_option_group}"
@@ -328,6 +341,81 @@ class GreedyPerfPartitioner(Partitioner):
         ]
         heapq.heapify(minheap_devices)
         return minheap_devices
+
+    @classmethod
+    def _column_wise_device_partition(
+        cls,
+        sharding_option: ShardingOption,
+        minheap_devices: List[OrderedDeviceHardware],
+    ) -> None:
+        """
+        Specialized device partitioning for COLUMN_WISE sharding that ensures:
+        1. No multiple shards per rank (unique rank constraint)
+        2. Load-balanced distribution using the existing greedy approach
+        3. Efficient rank assignment with proper topology awareness
+        """
+        num_shards = sharding_option.num_shards
+        total_devices = len(minheap_devices)
+
+        if num_shards > total_devices:
+            raise PlannerError(
+                error_type=PlannerErrorType.PARTITION,
+                message=f"COLUMN_WISE sharding requires num_shards ({num_shards}) <= num_devices ({total_devices})",
+            )
+
+        used_ranks = set()
+
+        for shard in sharding_option.shards:
+            found_device = False
+
+            # Find the best available device that hasn't been used for CWS
+            available_devices = [
+                od for od in minheap_devices if od.device.rank not in used_ranks
+            ]
+
+            if not available_devices:
+                raise PlannerError(
+                    error_type=PlannerErrorType.PARTITION,
+                    message=(
+                        f"COLUMN_WISE partition failed. No available ranks for shard {shard} of table {sharding_option.name}. "
+                        f"Used ranks: {used_ranks}, total devices: {total_devices}"
+                    ),
+                )
+
+            # Sort available devices by the same criteria as the heap (load balancing)
+            available_devices.sort(
+                key=lambda od: (
+                    od.device.perf.total,
+                    od.device.rank % od.local_world_size,
+                    od.device.rank,
+                )
+            )
+
+            # Try to place shard on the least-loaded available device
+            for ordered_device in available_devices:
+                device = ordered_device.device
+                storage = cast(Storage, shard.storage)
+
+                if storage.fits_in(device.storage):
+                    # Successfully place the shard
+                    shard.rank = device.rank
+                    device.storage -= storage
+                    device.perf += cast(Perf, shard.perf)
+                    used_ranks.add(device.rank)
+                    found_device = True
+                    break
+
+            if not found_device:
+                raise PlannerError(
+                    error_type=PlannerErrorType.PARTITION,
+                    message=(
+                        f"COLUMN_WISE partition failed. Couldn't find a suitable rank for shard {shard} of table {sharding_option.name}. "
+                        f"Storage required: {shard.storage}, available devices: {len(available_devices)}"
+                    ),
+                )
+
+        # Re-heapify the devices after all changes
+        heapq.heapify(minheap_devices)
 
     @classmethod
     def _device_partition(

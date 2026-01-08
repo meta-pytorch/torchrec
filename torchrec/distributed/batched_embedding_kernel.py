@@ -2983,9 +2983,6 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         assert (
             len(config.embedding_tables) > 0
         ), "Expected to see at least one table in SSD TBE, but found 0."
-        assert (
-            len({table.embedding_dim for table in config.embedding_tables}) == 1
-        ), "Currently we expect all tables in SSD TBE to have the same embedding dimension."
         for table in config.embedding_tables:
             assert table.local_cols % 4 == 0, (
                 f"table {table.name} has local_cols={table.local_cols} "
