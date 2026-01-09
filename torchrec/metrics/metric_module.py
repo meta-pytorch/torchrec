@@ -24,6 +24,7 @@ from torch.profiler import record_function
 from torchrec.metrics.accuracy import AccuracyMetric
 from torchrec.metrics.auc import AUCMetric
 from torchrec.metrics.auprc import AUPRCMetric
+from torchrec.metrics.average import AverageMetric
 from torchrec.metrics.cali_free_ne import CaliFreeNEMetric
 from torchrec.metrics.calibration import CalibrationMetric
 from torchrec.metrics.calibration_with_recalibration import (
@@ -107,6 +108,7 @@ REC_METRICS_MAPPING: Dict[RecMetricEnumBase, Type[RecMetric]] = {
     RecMetricEnum.UNWEIGHTED_NE: UnweightedNEMetric,
     RecMetricEnum.HINDSIGHT_TARGET_PR: HindsightTargetPRMetric,
     RecMetricEnum.NMSE: NMSEMetric,
+    RecMetricEnum.AVERAGE: AverageMetric,
 }
 
 

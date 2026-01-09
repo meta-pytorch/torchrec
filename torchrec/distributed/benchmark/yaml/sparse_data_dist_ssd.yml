@@ -10,6 +10,8 @@ RunOptions:
   # export_stacks: True # enable this to export stack traces
 PipelineConfig:
   pipeline: "sparse"
+ModelInputConfig:
+  feature_pooling_avg: 10
 EmbeddingTablesConfig:
   num_unweighted_features: 100
   num_weighted_features: 100

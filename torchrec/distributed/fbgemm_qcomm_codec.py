@@ -69,6 +69,9 @@ class QCommsConfig:
     fp8_quantize_dim: Optional[int] = None
     fp8_quantize_dim_bwd: Optional[int] = None
     fp8_bwd_uses_143: Optional[bool] = False
+    fp8_output_dtype: Optional[SparseType] = (
+        None  # Deprecated: use output_dtype instead
+    )
     mx4_quantize_dim: Optional[int] = None
     mx4_quantize_dim_bwd: Optional[int] = None
     mx4_rounding_mode: Optional[RoundingMode] = None
@@ -77,6 +80,12 @@ class QCommsConfig:
     )
 
     def __post_init__(self) -> None:
+        # Backward compatibility: fp8_output_dtype was renamed to output_dtype
+        if self.fp8_output_dtype is not None:
+            if self.output_dtype is None:
+                self.output_dtype = self.fp8_output_dtype
+            logger.warning("fp8_output_dtype is deprecated, use output_dtype instead")
+
         if (
             self.forward_precision != CommType.FP8
             and self.backward_precision != CommType.FP8

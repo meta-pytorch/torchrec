@@ -432,6 +432,12 @@ def _assert_metric_results(
             test_metrics[1][task_names[0]],
             res[f"effective_rate-{task_names[0]}|window_{metric_name}"],
         )
+    elif metric_name in ("label_average", "prediction_average"):
+        # Average metrics use "average" as namespace but different metric names
+        assert torch.allclose(
+            test_metrics[1][task_names[0]],
+            res[f"average-{task_names[0]}|window_{metric_name}"],
+        )
     else:
         assert torch.allclose(
             test_metrics[1][task_names[0]],
