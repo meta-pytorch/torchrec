@@ -106,9 +106,6 @@ class CPUCommsRecMetricModule(RecMetricModule):
         Uses aggregated states.
         """
 
-        # All update() calls were done prior. Clear previous computed state.
-        # Otherwise, we get warnings that compute() was called before
-        # update() which is not the case.
         computation = cast(RecMetricComputation, computation)
         set_update_called(computation)
         computation._computed = None
@@ -157,8 +154,9 @@ class CPUCommsRecMetricModule(RecMetricModule):
 
 def set_update_called(computation: RecMetricComputation) -> None:
     """
-    Set _update_called to True for RecMetricComputation.
-    This is a workaround for torchmetrics 1.0.3+.
+    All update() calls were done prior. Clear previous computed state.
+    Otherwise, we get warnings that compute() was called before
+    update() which is not the case.
     """
     try:
         computation._update_called = True
