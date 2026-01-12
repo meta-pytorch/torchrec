@@ -805,7 +805,7 @@ def prepare_comm_ops(
 
 
 def transfer_data(
-    comms_op: Dict[CommStrategy, List[CommP2PMetadata]]
+    comms_op: Dict[CommStrategy, List[CommP2PMetadata]],
 ) -> List[Tuple[dist.Work, CommP2PMetadata]]:
     """
     Executes batched point-to-point communication operations for resharding.

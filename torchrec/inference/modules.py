@@ -51,7 +51,6 @@ from torchrec.distributed.types import (
     ShardingPlan,
     ShardingType,
 )
-
 from torchrec.modules.embedding_configs import QuantConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -60,7 +59,6 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 from torchrec.modules.fp_embedding_modules import FeatureProcessedEmbeddingBagCollection
-
 from torchrec.quant.embedding_modules import (
     EmbeddingBagCollection as QuantEmbeddingBagCollection,
     EmbeddingCollection as QuantEmbeddingCollection,

@@ -12,7 +12,6 @@
 from typing import Dict, List, Optional
 
 import torch
-
 import torch.nn as nn
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -23,7 +22,6 @@ from torchrec.distributed.sharding_plan import (
     EmbeddingCollectionSharder,
     row_wise,
 )
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,

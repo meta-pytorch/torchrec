@@ -16,7 +16,6 @@ from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_table_batched_embeddings_ops import (
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-
 from parameterized import parameterized
 from torch import nn
 from torchrec import KeyedJaggedTensor
@@ -32,7 +31,6 @@ from torchrec.distributed.model_tracker.tests.utils import (
     TestECModel,
 )
 from torchrec.distributed.model_tracker.types import DeltaTrackerConfig, TrackingMode
-
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,

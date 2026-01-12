@@ -10,7 +10,6 @@
 from typing import List
 
 import torch
-
 from torch.fx.experimental.symbolic_shapes import guard_size_oblivious
 
 USE_TORCHDYNAMO_COMPILING_PATH: bool = False

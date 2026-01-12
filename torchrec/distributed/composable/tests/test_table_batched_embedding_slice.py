@@ -11,7 +11,6 @@ import copy
 import unittest
 
 import torch
-
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     DenseTableBatchedEmbeddingBagsCodegen,
 )

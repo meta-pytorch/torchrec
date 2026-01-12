@@ -24,14 +24,11 @@ from torchrec.distributed.mc_embeddingbag import (
 )
 from torchrec.distributed.mc_modules import ShardedManagedCollisionCollection
 from torchrec.distributed.shard import _shard_modules
-
 from torchrec.distributed.sharding_plan import construct_module_sharding_plan, row_wise
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-
 from torchrec.distributed.test_utils.test_model import ModelInput
 from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingPlan
 from torchrec.modules.embedding_configs import EmbeddingBagConfig

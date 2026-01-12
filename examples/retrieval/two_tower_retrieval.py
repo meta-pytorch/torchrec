@@ -14,7 +14,6 @@ import faiss  # @manual=//faiss/python:pyfaiss_gpu
 import faiss.contrib.torch_utils  # @manual=//faiss/contrib:faiss_contrib_gpu
 import torch
 from torchrec import inference as trec_infer
-
 from torchrec.datasets.movielens import DEFAULT_RATINGS_COLUMN_NAMES
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import DistributedModelParallel

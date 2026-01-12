@@ -11,9 +11,7 @@ from typing import Iterable, List, Tuple
 
 import torch
 import torch.distributed as dist
-
 from torch.distributed._shard.sharded_tensor import Shard, ShardMetadata
-
 from torch.distributed._shard.sharded_tensor.api import ShardedTensor
 from torchrec.distributed.comm import (
     get_local_rank,

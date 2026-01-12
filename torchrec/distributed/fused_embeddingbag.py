@@ -12,7 +12,6 @@ from typing import Dict, List, Optional, Type
 import torch
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
-
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
     EmbeddingComputeKernel,

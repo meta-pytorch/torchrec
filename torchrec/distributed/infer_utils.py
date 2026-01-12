@@ -10,7 +10,6 @@
 from typing import cast, Dict, List, Optional, Set, Tuple, Type
 
 import torch
-
 from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
     IntNBitTableBatchedEmbeddingBagsCodegen,
 )
@@ -18,7 +17,6 @@ from torchrec.distributed.quant_embedding import (
     QuantEmbeddingCollection,
     ShardedQuantEmbeddingCollection,
 )
-
 from torchrec.distributed.quant_embeddingbag import (
     QuantEmbeddingBagCollection,
     ShardedQuantEmbeddingBagCollection,

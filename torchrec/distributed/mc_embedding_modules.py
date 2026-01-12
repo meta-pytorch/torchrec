@@ -16,7 +16,6 @@ from torchrec.distributed.embedding import (
     EmbeddingCollectionSharder,
     ShardedEmbeddingCollection,
 )
-
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
     EmbeddingComputeKernel,

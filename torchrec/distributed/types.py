@@ -36,7 +36,6 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     KVZCHTBEConfig,
     MultiPassPrefetchConfig,
 )
-
 from torch.autograd.profiler import record_function
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.distributed_c10d import _get_pg_default_device

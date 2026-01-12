@@ -13,10 +13,8 @@ import abc
 from typing import Dict, List, Mapping, Optional
 
 import torch
-
 from torch import distributed as dist, nn
 from torch.nn.modules.module import _IncompatibleKeys
-
 from torchrec.pt2.checks import is_non_strict_exporting
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from torchrec.types import CopyMixIn

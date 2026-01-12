@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.distributed as dist
-
 from torch import nn, optim
 from torch.optim import Optimizer
 from torchrec.distributed import DistributedModelParallel

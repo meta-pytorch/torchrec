@@ -16,7 +16,6 @@ from enum import Enum, unique
 from typing import Any, cast, Dict, List, Optional
 
 import torch
-
 from fbgemm_gpu.quantize_comm import (
     QuantizationContext,
     QuantizedCommCodec as FbgemmQuantizedCommCodec,

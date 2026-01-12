@@ -12,7 +12,6 @@ from typing import List
 from unittest.mock import MagicMock
 
 import parameterized
-
 import torch
 from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
 from torchrec.distributed.train_pipeline.tracing import (

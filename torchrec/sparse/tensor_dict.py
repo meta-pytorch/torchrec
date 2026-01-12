@@ -11,7 +11,6 @@ from typing import List, Optional
 
 import torch
 from tensordict import TensorDict
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 

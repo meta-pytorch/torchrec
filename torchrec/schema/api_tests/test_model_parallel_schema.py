@@ -13,7 +13,6 @@ from typing import Any, List, Optional
 
 import torch
 from torch import nn
-
 from torchrec.distributed.model_parallel import (
     DataParallelWrapper,
     DistributedModelParallel,

@@ -11,7 +11,6 @@ import unittest
 from typing import Dict, Optional, Type
 
 import torch
-
 from torchrec.metrics.ne import compute_cross_entropy, compute_ne
 from torchrec.metrics.rec_metric import RecComputeMode, RecMetric
 from torchrec.metrics.serving_ne import ServingNEMetric

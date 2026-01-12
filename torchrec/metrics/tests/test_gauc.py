@@ -8,7 +8,6 @@
 # pyre-strict
 
 import unittest
-
 from typing import Dict, Optional
 
 import torch

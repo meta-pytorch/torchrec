@@ -13,7 +13,6 @@ from typing import List, Optional, Tuple
 
 import torch
 from pyre_extensions import none_throws
-
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)

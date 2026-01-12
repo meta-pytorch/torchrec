@@ -15,14 +15,12 @@ from hypothesis import given, settings, strategies as st, Verbosity
 from torch import nn
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.types import ShardingEnv
-
 from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.quant.embedding_modules import (
     EmbeddingBagCollection as QuantEmbeddingBagCollection,
 )
 from torchrec.quant.utils import meta_to_cpu_placement
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
 
 

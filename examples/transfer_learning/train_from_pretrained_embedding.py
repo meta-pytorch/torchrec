@@ -16,7 +16,6 @@ from typing import cast, List, Optional
 
 import torch
 import torch.distributed as dist
-
 import torch.distributed.launcher as pet
 import torchrec
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
@@ -26,7 +25,6 @@ from torch.multiprocessing.reductions import (
     reduce_typed_storage,
     reduce_typed_storage_child,
 )
-
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology

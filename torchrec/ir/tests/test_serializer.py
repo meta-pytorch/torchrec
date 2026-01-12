@@ -17,7 +17,6 @@ import torch
 from torch import nn
 from torch.fx.passes.utils.fuser_utils import fuse_by_partitions
 from torchrec.ir.serializer import JsonSerializer
-
 from torchrec.ir.utils import (
     decapsulate_ir_modules,
     encapsulate_ir_modules,

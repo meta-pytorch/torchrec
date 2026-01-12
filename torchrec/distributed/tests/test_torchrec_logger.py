@@ -12,7 +12,6 @@ import unittest
 from unittest import mock
 
 import torch.distributed as dist
-
 from torchrec.distributed.logging_handlers import _log_handlers
 from torchrec.distributed.torchrec_logger import (
     _DEFAULT_DESTINATION,

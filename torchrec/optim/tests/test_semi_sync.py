@@ -11,7 +11,6 @@ import unittest
 from unittest.mock import Mock
 
 import torch
-
 from torchrec.optim.keyed import KeyedOptimizer
 from torchrec.optim.semi_sync import SemisyncOptimizer
 

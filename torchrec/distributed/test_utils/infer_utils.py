@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Type, Union
 
 import torch
-
 import torchrec
 from fbgemm_gpu import sparse_ops  # noqa: F401, E402
 from fbgemm_gpu.split_embedding_configs import SparseType
@@ -318,7 +317,7 @@ def model_input_to_forward_args(
 
 
 def create_cw_min_partition_constraints(
-    table_min_partition_pairs: List[Tuple[str, int]]
+    table_min_partition_pairs: List[Tuple[str, int]],
 ) -> Dict[str, ParameterConstraints]:
     return {
         name: ParameterConstraints(

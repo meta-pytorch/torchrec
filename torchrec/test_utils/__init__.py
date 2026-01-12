@@ -84,7 +84,7 @@ def is_asan_or_tsan() -> bool:
 
 
 def skip_if_asan(
-    func: Callable[TParams, TReturn]
+    func: Callable[TParams, TReturn],
 ) -> Callable[TParams, Optional[TReturn]]:
     """Skip test run if we are in ASAN mode."""
 

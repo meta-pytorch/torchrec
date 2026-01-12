@@ -38,7 +38,6 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
     get_embedding_names_by_table,
 )
-
 from torchrec.optim.fused import FusedOptimizer, FusedOptimizerModule
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizer
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor

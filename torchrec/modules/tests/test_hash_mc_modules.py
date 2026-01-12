@@ -13,7 +13,6 @@ from unittest.mock import patch
 
 import torch
 from hypothesis import given, settings, strategies as st
-
 from pyre_extensions import none_throws
 from torchrec.distributed.embedding_sharding import bucketize_kjt_before_all2all
 from torchrec.modules.embedding_configs import (

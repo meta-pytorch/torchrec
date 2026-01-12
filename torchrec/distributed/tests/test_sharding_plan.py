@@ -39,7 +39,6 @@ from torchrec.distributed.sharding_plan import (
     table_row_wise,
     table_wise,
 )
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
@@ -70,7 +69,6 @@ from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
     QuantManagedCollisionEmbeddingCollection,
 )
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import skip_if_asan_class
 from torchrec.types import DataType

@@ -9,7 +9,6 @@ import unittest
 from typing import List, Optional
 
 import torch
-
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.global_settings import set_propogate_device

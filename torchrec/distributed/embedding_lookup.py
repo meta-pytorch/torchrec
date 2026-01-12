@@ -26,7 +26,6 @@ from fbgemm_gpu.tbe.ssd.utils.partially_materialized_tensor import (
     PartiallyMaterializedTensor,
 )
 from torch import nn
-
 from torch.autograd.function import FunctionCtx
 from torch.distributed._tensor import DTensor
 from torch.nn.modules.module import _IncompatibleKeys

@@ -15,11 +15,9 @@ from unittest.mock import MagicMock, patch
 
 import hypothesis.strategies as st
 import torch
-
 from hypothesis import given, settings
 from torchrec.distributed.batched_embedding_kernel import ZeroCollisionKeyValueEmbedding
 from torchrec.distributed.embedding import EmbeddingCollectionContext
-
 from torchrec.distributed.embedding_lookup import EmbeddingComputeKernel
 from torchrec.distributed.embedding_sharding import (
     _get_compute_kernel_type,
@@ -29,7 +27,6 @@ from torchrec.distributed.embedding_sharding import (
     _set_sharding_context_post_a2a,
     group_tables,
 )
-
 from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,

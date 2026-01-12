@@ -22,7 +22,6 @@ from torchrec.distributed.embedding_types import ShardedEmbeddingTable, Sharding
 from torchrec.distributed.types import Shard, ShardedTensor, ShardedTensorMetadata
 from torchrec.modules.embedding_modules import reorder_inverse_indices
 from torchrec.modules.pruning_logger import PruningLogger, PruningLoggerDefault
-
 from torchrec.sparse.jagged_tensor import _pin_and_move, _to_offsets, KeyedJaggedTensor
 
 try:

@@ -12,7 +12,6 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
-
 from torch.utils import data as data_utils
 from torch.utils.data import Dataset
 from torch.utils.data.distributed import DistributedSampler

@@ -12,15 +12,12 @@ from typing import List
 
 import torch
 import torch.nn as nn
-
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
-
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
 from torchrec.modules.itep_modules import GenericITEPModule
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
 
 

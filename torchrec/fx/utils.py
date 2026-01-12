@@ -11,7 +11,6 @@ import inspect
 from typing import Any, Dict, List, Set
 
 import torch
-
 from torch.fx._symbolic_trace import is_fx_tracing
 
 # Not importing DistributedModelParallel here to avoid circular dependencies as DMP depends on torchrec.fx.tracer

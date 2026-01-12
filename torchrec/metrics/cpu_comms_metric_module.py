@@ -10,9 +10,7 @@ import logging
 from typing import Any, cast, Dict
 
 from torch import nn
-
 from torch.profiler import record_function
-
 from torchrec.metrics.metric_module import RecMetricModule
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
 from torchrec.metrics.rec_metric import (

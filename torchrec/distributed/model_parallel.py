@@ -41,7 +41,6 @@ from torchrec.distributed.model_tracker.types import (
     Trackers,
     UniqueRows,
 )
-
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.sharding_plan import get_default_sharders
 from torchrec.distributed.types import (
@@ -64,7 +63,6 @@ from torchrec.distributed.utils import (
     none_throws,
     sharded_model_copy,
 )
-
 from torchrec.optim.fused import FusedOptimizerModule
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizer
 

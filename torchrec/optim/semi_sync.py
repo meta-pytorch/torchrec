@@ -14,7 +14,6 @@ import torch
 import torch.distributed as dist
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.optim.optimizer import ParamsT
-
 from torchrec.optim.keyed import KeyedOptimizer
 
 logger: logging.Logger = logging.getLogger(__name__)

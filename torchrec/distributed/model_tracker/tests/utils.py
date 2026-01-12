@@ -12,7 +12,6 @@ from dataclasses import dataclass
 from typing import cast, Dict, Iterable, List, Optional, Union
 
 import torch
-
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import ParameterConstraints

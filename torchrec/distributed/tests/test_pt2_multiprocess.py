@@ -31,9 +31,7 @@ from torch.testing._internal.distributed.fake_pg import FakeStore
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import QCommsConfig
-
 from torchrec.distributed.model_parallel import DistributedModelParallel
-
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.shard_estimators import (
@@ -42,9 +40,7 @@ from torchrec.distributed.planner.shard_estimators import (
 )
 from torchrec.distributed.planner.types import ShardingPlan
 from torchrec.distributed.sharding_plan import EmbeddingBagCollectionSharder
-
 from torchrec.distributed.test_utils.infer_utils import TestModelInfo
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,

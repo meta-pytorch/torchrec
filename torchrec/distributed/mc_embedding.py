@@ -12,13 +12,11 @@
 from typing import Any, cast, Dict, List, Optional, Type
 
 import torch
-
 from torchrec.distributed.embedding import (
     EmbeddingCollectionContext,
     EmbeddingCollectionSharder,
     ShardedEmbeddingCollection,
 )
-
 from torchrec.distributed.embedding_types import KJTList
 from torchrec.distributed.mc_embedding_modules import (
     BaseManagedCollisionEmbeddingCollectionSharder,

@@ -16,7 +16,6 @@ import hypothesis.strategies as st
 import torch
 import torch.distributed as dist
 from hypothesis import given, settings
-
 from torchrec.distributed.dist_data import (
     _get_recat,
     JaggedTensorAllToAll,
@@ -33,7 +32,6 @@ from torchrec.distributed.fbgemm_qcomm_codec import (
     get_qcomm_codecs,
     QCommsConfig,
 )
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,

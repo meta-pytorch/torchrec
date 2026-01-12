@@ -13,7 +13,6 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple, Type
 
 import hypothesis.strategies as st
-
 import torch
 import torch.fx
 import torchrec

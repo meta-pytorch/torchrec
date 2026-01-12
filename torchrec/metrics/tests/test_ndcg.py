@@ -8,13 +8,11 @@
 # pyre-strict
 
 import unittest
-
 from dataclasses import replace
 from typing import Any, Dict, List
 
 import torch
 from torchrec.metrics.metrics_config import DefaultTaskInfo, RecComputeMode
-
 from torchrec.metrics.ndcg import NDCGMetric, SESSION_KEY
 from torchrec.metrics.test_utils import RecTaskInfo
 

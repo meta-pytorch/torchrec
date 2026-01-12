@@ -12,7 +12,6 @@
 import unittest
 
 import torch
-
 from torchrec.tensor_types import UInt2Tensor, UInt4Tensor
 
 

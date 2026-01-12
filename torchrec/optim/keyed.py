@@ -24,7 +24,6 @@ from typing import (
 )
 
 import torch
-
 from torch import optim
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torch.distributed.tensor import DTensor

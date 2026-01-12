@@ -23,7 +23,6 @@ from torchrec.distributed.embedding import (
     EmbeddingCollectionSharder,
     ShardedEmbeddingCollection,
 )
-
 from torchrec.distributed.shard import _shard_modules
 from torchrec.distributed.sharding_plan import (
     column_wise,
@@ -38,7 +37,6 @@ from torchrec.distributed.test_utils.multi_process import (
 from torchrec.distributed.types import ShardedTensor, ShardingEnv, ShardingPlan
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
-
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from torchrec.test_utils import skip_if_asan_class
 

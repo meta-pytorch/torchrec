@@ -9,7 +9,6 @@
 
 import argparse
 import os
-
 from typing import Callable, List, Union
 
 import torch

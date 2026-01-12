@@ -160,7 +160,7 @@ def train(
     )
 
     def dense_filter(
-        named_parameters: Iterator[Tuple[str, nn.Parameter]]
+        named_parameters: Iterator[Tuple[str, nn.Parameter]],
     ) -> Iterator[Tuple[str, nn.Parameter]]:
         for fqn, param in named_parameters:
             if "sparse" not in fqn:

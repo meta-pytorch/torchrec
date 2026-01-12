@@ -11,7 +11,6 @@ import itertools
 import unittest
 
 from hypothesis import given, settings, strategies as st
-
 from torchrec.datasets.random import RandomRecDataset
 
 

@@ -13,7 +13,6 @@ from typing import Iterable, Iterator, Tuple
 
 import torch
 from torch import nn
-
 from torch.optim.optimizer import Optimizer
 
 

@@ -11,7 +11,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import torch
-
 from parameterized import parameterized
 from torchrec.distributed.model_tracker.delta_store import (
     _compute_unique_rows,

@@ -10,19 +10,15 @@ import unittest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
-
 from torchrec import EmbeddingCollection, EmbeddingConfig, KeyedJaggedTensor
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.fused_embeddingbag import FusedEmbeddingBagCollectionSharder
 from torchrec.distributed.model_parallel import DistributedModelParallel as DMP
-
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
-
 from torchrec_dynamic_embedding.id_transformer_group import IDTransformerGroup
 from utils import init_dist, register_memory_io
 

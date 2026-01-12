@@ -12,7 +12,6 @@ import time
 from typing import Optional
 
 import torch
-
 from torchrec.modules.hash_mc_evictions import HashZchEvictionConfig
 
 

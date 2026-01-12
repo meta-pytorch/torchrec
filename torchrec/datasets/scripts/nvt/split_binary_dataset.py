@@ -6,16 +6,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import argparse
-
 import math
 import os
 import time
 from typing import Sequence
 
 import numpy as np
-
 from tqdm import tqdm
-
 from utils.criteo_constant import (
     CAT_FEATURE_COUNT,
     DEFAULT_INT_NAMES,

@@ -19,7 +19,6 @@ from torchrec.modules.embedding_configs import (
     TimestampBasedEvictionPolicy,
     VirtualTableEvictionPolicy,
 )
-
 from torchrec.types import DataType
 
 

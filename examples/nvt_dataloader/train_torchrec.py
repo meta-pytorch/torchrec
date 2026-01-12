@@ -9,7 +9,6 @@ import argparse
 import os
 import sys
 import time
-
 from typing import cast, Iterator, List, Tuple
 
 import torch
@@ -22,7 +21,6 @@ import torchrec.optim as trec_optim
 from nvt_binary_dataloader import NvtBinaryDataloader
 from pyre_extensions import none_throws
 from torchrec import EmbeddingBagCollection
-
 from torchrec.datasets.criteo import (
     DEFAULT_CAT_NAMES,
     DEFAULT_INT_NAMES,

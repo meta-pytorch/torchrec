@@ -11,7 +11,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-
 from torchrec import (
     EmbeddingCollection,
     EmbeddingConfig,

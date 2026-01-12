@@ -14,7 +14,6 @@ from typing import Tuple, Union
 from unittest.mock import MagicMock
 
 import torch
-
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.test_utils.test_model import (
     ModelInput,

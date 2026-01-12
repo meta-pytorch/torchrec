@@ -11,7 +11,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, TypeVar, Union
 
 import torch
-
 from torchrec.distributed.embedding_sharding import FusedKJTListSplitsAwaitable
 from torchrec.distributed.types import Awaitable, LazyAwaitable
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor

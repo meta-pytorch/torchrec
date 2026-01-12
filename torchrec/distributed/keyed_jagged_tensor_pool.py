@@ -21,7 +21,6 @@ from torchrec.distributed.sharding.rw_kjt_pool_sharding import (
 )
 from torchrec.distributed.sharding.rw_pool_sharding import InferRwObjectPoolInputDist
 from torchrec.distributed.tensor_sharding import ObjectPoolShardingContext
-
 from torchrec.distributed.types import (
     Awaitable,
     LazyAwaitable,

@@ -16,11 +16,9 @@ from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from fbgemm_gpu.split_table_batched_embeddings_ops import (
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.batched_embedding_kernel import BatchedFusedEmbedding
-
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.embedding_lookup import (
     BatchedFusedEmbeddingBag,
@@ -35,7 +33,6 @@ from torchrec.distributed.model_tracker.types import (
     UpdateMode,
 )
 from torchrec.distributed.utils import none_throws
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 UPDATE_MODE_MAP: Dict[TrackingMode, UpdateMode] = {

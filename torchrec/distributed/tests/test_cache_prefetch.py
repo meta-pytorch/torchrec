@@ -12,7 +12,6 @@ import unittest
 from typing import cast, List
 
 import hypothesis.strategies as st
-
 import torch
 import torch.nn as nn
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
@@ -23,7 +22,6 @@ from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.embedding_lookup import EmbeddingComputeKernel
 from torchrec.distributed.embedding_types import KJTList
 from torchrec.distributed.embeddingbag import ShardedEmbeddingBagCollection
-
 from torchrec.distributed.test_utils.emb_sharder import TestEBCSharder
 from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig

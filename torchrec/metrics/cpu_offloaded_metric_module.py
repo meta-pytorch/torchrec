@@ -26,7 +26,6 @@ from torchrec.metrics.metric_module import MetricValue, RecMetricModule
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.rec_metric import RecMetricException
-
 from torchrec.utils.percentile_logger import PercentileLogger
 from typing_extensions import override
 

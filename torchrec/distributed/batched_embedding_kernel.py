@@ -86,7 +86,6 @@ from torchrec.distributed.types import (
     TensorProperties,
 )
 from torchrec.distributed.utils import append_prefix, none_throws
-
 from torchrec.modules.embedding_configs import (
     CountBasedEvictionPolicy,
     CountTimestampMixedEvictionPolicy,

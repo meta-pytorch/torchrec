@@ -36,7 +36,6 @@ from typing import (
 import torch
 from torch import multiprocessing as mp
 from torchrec.distributed import DistributedModelParallel
-
 from torchrec.distributed.benchmark.base import (
     benchmark_model_with_warmup,
     BenchmarkResult,

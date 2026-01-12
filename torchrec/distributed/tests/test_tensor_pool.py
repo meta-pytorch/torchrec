@@ -12,7 +12,6 @@ import unittest
 import torch
 from hypothesis import given, settings, strategies as st
 from torchrec.distributed.tensor_pool import TensorPoolSharder
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,

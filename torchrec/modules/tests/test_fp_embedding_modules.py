@@ -11,7 +11,6 @@ import unittest
 from typing import cast
 
 import torch
-
 from torchrec.fx.tracer import symbolic_trace
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection

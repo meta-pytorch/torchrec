@@ -50,7 +50,6 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
-
 from torchrec.modules.embedding_modules import EmbeddingBagCollectionInterface
 
 try:

@@ -11,7 +11,6 @@ import copy
 from typing import Any, cast, Dict, Optional
 
 from torch import nn
-
 from torchrec.metrics.rec_metric import (
     RecComputeMode,
     RecMetric,

@@ -9,14 +9,12 @@
 
 import copy
 import unittest
-
 from functools import partial
 from typing import Any, Dict, List, Optional
 
 import hypothesis.strategies as st
 import torch
 import torch.nn as nn
-
 from hypothesis import assume, given, settings, Verbosity
 from torch.distributed._tensor.api import DTensor
 from torch.distributed.optim import (
@@ -32,7 +30,6 @@ from torchrec.distributed.planner import (
     ParameterConstraints,
     Topology,
 )
-
 from torchrec.distributed.shard import shard
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
@@ -52,7 +49,6 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import (
     assert_state_buffers_parameters_equal,

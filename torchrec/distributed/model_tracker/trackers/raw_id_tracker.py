@@ -13,7 +13,6 @@ from collections import Counter, OrderedDict
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
-
 from torch import nn
 from torchrec.distributed.embedding_types import (
     KeyedJaggedTensor,
@@ -25,7 +24,6 @@ from torchrec.distributed.mc_embeddingbag import (
 )
 from torchrec.distributed.mc_modules import ShardedManagedCollisionCollection
 from torchrec.distributed.model_tracker.delta_store import RawIdTrackerStore
-
 from torchrec.distributed.model_tracker.model_delta_tracker import ModelDeltaTracker
 from torchrec.distributed.model_tracker.types import UniqueRows
 

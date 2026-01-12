@@ -8,7 +8,6 @@
 # pyre-strict
 import argparse
 import os
-
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
@@ -19,7 +18,6 @@ from generative_recommenders.dlrm_v3.datasets.utils import (
     maybe_truncate_seq,
     separate_uih_candidates,
 )
-
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor

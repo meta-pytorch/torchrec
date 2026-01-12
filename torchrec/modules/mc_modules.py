@@ -14,7 +14,6 @@ from logging import getLogger, Logger
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
 
 import torch
-
 from torch import nn
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -1073,7 +1072,7 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
         self.register_buffer(
             "_mch_slots",
             torch.tensor(
-                [(self._zch_size - 1)],
+                [self._zch_size - 1],
                 dtype=torch.int64,
                 device=self.device,
             ),

@@ -9,7 +9,8 @@ import argparse
 import logging
 
 import grpc
-import predictor_pb2, predictor_pb2_grpc
+import predictor_pb2
+import predictor_pb2_grpc
 import torch
 from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
 from torchrec.datasets.random import RandomRecDataset

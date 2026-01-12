@@ -13,7 +13,6 @@ from typing import Any, Collection, List, Mapping, Optional, Set, Tuple, Union
 
 import torch
 from torch import optim
-
 from torchrec.distributed.types import ShardedTensor
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizer
 from torchrec.schema.utils import is_signature_compatible

@@ -56,7 +56,7 @@ def extract_module_or_tensor_callable(
         Callable[[], torch.nn.Module],
         torch.nn.Module,
         Callable[[torch.Tensor], torch.Tensor],
-    ]
+    ],
 ) -> Union[torch.nn.Module, Callable[[torch.Tensor], torch.Tensor]]:
     try:
         # pyre-ignore[20]: PositionalOnly call expects argument in position 0

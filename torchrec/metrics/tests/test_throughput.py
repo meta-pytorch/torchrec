@@ -15,9 +15,7 @@ from typing import Any, Dict
 from unittest.mock import Mock, patch
 
 import torch
-
 from torchrec.metrics.metrics_config import BatchSizeStage
-
 from torchrec.metrics.throughput import ThroughputMetric
 
 

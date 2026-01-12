@@ -12,14 +12,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from torch.distributed._composable.fsdp.fully_shard import FSDPModule as FSDP2
-
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.fx.immutable_collections import (
     immutable_dict as fx_immutable_dict,
     immutable_list as fx_immutable_list,
 )
 from torch.fx.node import Node
-
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
 from torchrec.distributed.train_pipeline.postproc import PipelinedPostproc
