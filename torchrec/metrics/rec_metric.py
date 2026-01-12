@@ -223,6 +223,8 @@ class RecMetricComputation(Metric, abc.ABC):
                 max_buffer_count=MAX_BUFFER_COUNT,
             )
 
+    # disable pt2 compile for this function as it would exceed the recompilation limit
+    @torch.compiler.disable
     def _aggregate_window_state(
         self, state_name: str, state: torch.Tensor, num_samples: int
     ) -> None:
