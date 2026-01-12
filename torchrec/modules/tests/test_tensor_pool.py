@@ -9,7 +9,6 @@
 import unittest
 
 import torch
-
 from torchrec.modules.tensor_pool import TensorPool
 
 

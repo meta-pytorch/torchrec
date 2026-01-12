@@ -138,6 +138,7 @@ class CPUMemoryStats:
 @dataclass
 class BenchmarkResult:
     "Class for holding results of benchmark runs"
+
     short_name: str
     gpu_elapsed_time: torch.Tensor  # milliseconds
     cpu_elapsed_time: torch.Tensor  # milliseconds

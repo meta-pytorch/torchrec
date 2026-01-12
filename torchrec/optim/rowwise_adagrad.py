@@ -14,7 +14,6 @@ from typing import Any, Dict, Iterable, List
 
 import torch
 from torch import Tensor
-
 from torch.optim.optimizer import Optimizer
 
 logger: logging.Logger = logging.getLogger(__name__)

@@ -46,7 +46,6 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingModule,
     ShardingType,
 )
-
 from torchrec.distributed.feature_score_utils import (
     create_sharding_type_to_feature_score_mapping,
     may_collect_feature_scores,

@@ -10,7 +10,6 @@
 import unittest
 
 import torch
-
 from torchrec.test_utils import skip_if_asan
 
 # @manual=//torchrec/github/examples/retrieval:two_tower_retrieval_lib

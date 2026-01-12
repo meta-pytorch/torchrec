@@ -12,7 +12,6 @@ from typing import Dict, Optional, Union
 
 import torch
 from torch import no_grad
-
 from torchrec.metrics.metrics_config import (
     RecComputeMode,
     RecTaskInfo,

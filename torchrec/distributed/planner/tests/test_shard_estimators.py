@@ -10,12 +10,10 @@
 import math
 import unittest
 from typing import cast, Dict, List, Tuple
-
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
 import torchrec.optim as trec_optim
-
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder

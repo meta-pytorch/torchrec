@@ -10,12 +10,9 @@ import logging
 from typing import Dict, List, Sequence, Tuple
 
 import torch
-
 from torch.autograd.profiler import record_function
-
 from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.embedding_types import ShardingType
-
 from torchrec.modules.embedding_configs import (
     EmbeddingConfig,
     FeatureScoreBasedEvictionPolicy,

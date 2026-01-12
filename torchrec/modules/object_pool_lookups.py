@@ -10,7 +10,6 @@ import abc
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
-
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     ComputeDevice,
     EmbeddingLocation,

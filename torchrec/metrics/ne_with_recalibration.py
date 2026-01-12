@@ -10,7 +10,6 @@
 from typing import Any, Dict, Optional, Type
 
 import torch
-
 from torchrec.metrics.metrics_namespace import MetricNamespace
 from torchrec.metrics.ne import get_ne_states, NEMetricComputation
 from torchrec.metrics.rec_metric import (

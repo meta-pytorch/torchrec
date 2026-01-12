@@ -12,7 +12,6 @@
 import unittest
 
 import hypothesis.strategies as st
-
 import torch
 from hypothesis import given, settings
 from torchrec import EmbeddingBagConfig, EmbeddingCollection, EmbeddingConfig

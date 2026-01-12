@@ -25,7 +25,6 @@ from torchrec.distributed.fbgemm_qcomm_codec import (
     get_qcomm_codecs_registry,
     QCommsConfig,
 )
-
 from torchrec.distributed.sharding_plan import (
     column_wise,
     construct_module_sharding_plan,
@@ -33,7 +32,6 @@ from torchrec.distributed.sharding_plan import (
     row_wise,
     table_wise,
 )
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
@@ -42,7 +40,6 @@ from torchrec.distributed.test_utils.test_sharding import copy_state_dict
 from torchrec.distributed.types import ModuleSharder, ParameterSharding, ShardingEnv
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import skip_if_asan_class
 

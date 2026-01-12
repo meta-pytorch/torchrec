@@ -14,7 +14,6 @@ from typing import Dict, Generic, Iterable, List, Optional, Tuple, TypeVar, Unio
 import torch
 from torch import distributed as dist
 from torch.profiler import record_function
-
 from torchrec.distributed.embedding_sharding import KJTSplitsAllToAllMeta
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (

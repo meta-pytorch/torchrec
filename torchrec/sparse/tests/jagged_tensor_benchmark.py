@@ -13,7 +13,6 @@ import timeit
 from typing import Any, Callable, Dict, List
 
 import click
-
 import torch
 from torchrec.distributed.benchmark.base import (
     benchmark_model_with_warmup,

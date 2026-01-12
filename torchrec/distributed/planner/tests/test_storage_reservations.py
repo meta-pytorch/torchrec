@@ -20,7 +20,6 @@ from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.planner.types import PlannerError, PlannerErrorType, Topology
-
 from torchrec.distributed.test_utils.test_model import TestTowerInteraction
 from torchrec.distributed.types import ModuleSharder
 from torchrec.modules.embedding_configs import EmbeddingBagConfig

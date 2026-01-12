@@ -11,7 +11,6 @@ import argparse
 import time
 
 import torch
-
 from torchrec import EmbeddingConfig, KeyedJaggedTensor
 from tqdm import tqdm
 

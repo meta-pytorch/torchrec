@@ -13,7 +13,6 @@ from dataclasses import replace
 from typing import Dict, List, Optional, Type
 
 import hypothesis.strategies as st
-
 import torch
 from hypothesis import given, settings, Verbosity
 from torchrec import inference as trec_infer

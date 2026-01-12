@@ -15,7 +15,6 @@ from collections import defaultdict
 from typing import cast, Dict, List, Optional, Tuple, Type, Union
 
 import torch
-
 from torch import nn
 from torch.export import Dim, ShapesCollection
 from torch.export.dynamic_shapes import _Dim as DIM

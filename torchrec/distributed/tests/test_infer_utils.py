@@ -13,7 +13,6 @@ import unittest
 from typing import cast
 
 import torch
-
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel, ModuleSharder
 from torchrec.distributed.infer_utils import (
     get_all_torchrec_modules,

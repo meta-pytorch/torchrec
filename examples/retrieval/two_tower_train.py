@@ -13,7 +13,6 @@ import os
 from typing import List, Optional
 
 import click
-
 import faiss  # @manual=//faiss/python:pyfaiss_gpu
 import faiss.contrib.torch_utils  # @manual=//faiss/contrib:faiss_contrib_gpu
 import torch

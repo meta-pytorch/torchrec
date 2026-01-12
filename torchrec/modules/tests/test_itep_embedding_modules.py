@@ -19,7 +19,6 @@ from torchrec import KeyedJaggedTensor
 from torchrec.distributed.embedding_types import ShardedEmbeddingTable
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
-
 from torchrec.modules.itep_embedding_modules import ITEPEmbeddingBagCollection
 from torchrec.modules.itep_modules import GenericITEPModule
 

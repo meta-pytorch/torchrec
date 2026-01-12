@@ -18,7 +18,6 @@ from torchrec.metrics.metrics_config import (
     SessionMetricDef,
 )
 from torchrec.metrics.rec_metric import RecMetricException
-
 from torchrec.metrics.recall_session import RecallSessionMetric
 
 

@@ -34,7 +34,6 @@ from torch.distributed._tensor import DeviceMesh
 from torch.distributed._tensor.placement_types import Placement
 from torch.nn.modules.module import _addindent
 from torch.nn.parallel import DistributedDataParallel
-
 from torchrec.distributed.types import (
     get_tensor_size_bytes,
     ModuleSharder,

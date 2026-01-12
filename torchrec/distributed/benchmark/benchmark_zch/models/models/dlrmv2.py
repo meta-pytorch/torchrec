@@ -8,17 +8,13 @@
 # pyre-strict
 
 import argparse
-
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from pyre_extensions import none_throws
-
 from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
-
 from torchrec.datasets.utils import Batch
-
 from torchrec.distributed.comm import get_local_size
 from torchrec.models.dlrm import DLRM, DLRMTrain
 from torchrec.modules.embedding_configs import EmbeddingBagConfig

@@ -7,8 +7,7 @@
 
 # pyre-strict
 
-"""MPZCH Raw ID Tracker
-"""
+"""MPZCH Raw ID Tracker"""
 
 from torchrec.distributed.model_tracker.trackers.raw_id_tracker import (  # noqa
     RawIdTracker,

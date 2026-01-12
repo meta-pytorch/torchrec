@@ -20,7 +20,6 @@ from torchrec.modules.embedding_configs import (
     PoolingType,
     VirtualTableEvictionPolicy,
 )
-
 from torchrec.schema.utils import is_signature_compatible
 
 

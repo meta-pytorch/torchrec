@@ -12,7 +12,6 @@ from typing import Dict, Iterable, List, Optional, Type, Union
 
 import torch
 from torch import no_grad
-
 from torchrec.metrics.auprc import _compute_auprc_helper, AUPRCMetric
 from torchrec.metrics.metrics_config import DefaultTaskInfo
 from torchrec.metrics.rec_metric import (

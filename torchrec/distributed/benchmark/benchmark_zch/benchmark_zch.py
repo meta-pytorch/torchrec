@@ -13,29 +13,22 @@ import multiprocessing
 import os
 import sys
 import time
-
 from typing import Dict, List, Optional
 
 import numpy as np
-
 import torch
 import torch.nn as nn
-
 from line_profiler import LineProfiler
-
 from torch import distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter  # @manual //caffe2:torch_tensorboard
 from torchrec.metrics.metrics_namespace import MetricPrefix
 from torchrec.metrics.rec_metric import RecMetricComputation
-
 from torchrec.test_utils import get_free_port
 from tqdm import tqdm
 
 from .arguments import parse_args
-
 from .benchmark_zch_utils import BenchmarkMCProbe, get_logger, get_module_from_instance
-
 from .data.get_dataloader import get_dataloader
 from .data.get_metric_modules import get_metric_modules
 from .data.nonzch_remapper import NonZchModRemapperModule

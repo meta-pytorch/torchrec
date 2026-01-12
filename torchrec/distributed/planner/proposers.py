@@ -15,9 +15,7 @@ from decimal import Decimal
 from typing import Callable, cast, Dict, List, Optional, Set, Tuple, TypeVar, Union
 
 import torch
-
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-
 from torchrec.distributed.planner.types import (
     Enumerator,
     Perf,

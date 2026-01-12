@@ -14,7 +14,6 @@ from typing import Any, cast, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor.api import DTensor
-
 from torchrec.optim.keyed import KeyedOptimizer, OptimizerWrapper
 
 logger: logging.Logger = logging.getLogger()

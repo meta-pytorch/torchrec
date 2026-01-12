@@ -12,7 +12,6 @@ import unittest
 from typing import List
 
 import hypothesis.strategies as st
-
 import torch
 from hypothesis import given, settings
 from torch import nn

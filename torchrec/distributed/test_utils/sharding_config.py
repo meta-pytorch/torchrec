@@ -10,9 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import KVZCHTBEConfig
-
 from torchrec.distributed.comm import get_local_size
-
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import POOLING_FACTOR

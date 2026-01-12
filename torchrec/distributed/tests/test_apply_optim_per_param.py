@@ -25,7 +25,6 @@ from torchrec.distributed.planner import (
     ParameterConstraints,
     Topology,
 )
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
@@ -44,7 +43,6 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollection,
 )
 from torchrec.optim.apply_optimizer_in_backward import apply_optimizer_in_backward
-
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import skip_if_asan_class
 

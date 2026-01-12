@@ -12,7 +12,6 @@ from typing import Dict, Type, Union
 
 import torch
 from torch import nn
-
 from torchrec.distributed.train_pipeline import (
     TrainPipelineBase,
     TrainPipelineFusedSparseDist,

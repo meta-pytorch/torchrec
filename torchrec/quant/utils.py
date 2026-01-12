@@ -21,7 +21,7 @@ from torchrec.quant.embedding_modules import (
 
 
 def populate_fx_names(
-    quant_ebc: Union[QuantEmbeddingBagCollection, ShardedQuantEmbeddingBagCollection]
+    quant_ebc: Union[QuantEmbeddingBagCollection, ShardedQuantEmbeddingBagCollection],
 ) -> None:
     """
     Assigns fx path to non registered lookup modules. This allows the Torchrec tracer to fallback to

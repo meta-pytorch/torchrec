@@ -12,7 +12,6 @@ import os
 from typing import Any, Dict, Set
 
 import numpy as np
-
 import torch
 import torch.nn as nn
 from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingCollection

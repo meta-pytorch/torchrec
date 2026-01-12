@@ -26,7 +26,6 @@ from torchrec.distributed.benchmark.base import (
     GPUMemoryStats,
 )
 from torchrec.distributed.dist_data import _get_recat
-
 from torchrec.distributed.test_utils.test_model import ModelInput
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor

@@ -9,9 +9,7 @@
 
 import abc
 import logging
-
 import operator
-
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -1639,7 +1637,7 @@ def kjt_is_equal(kjt_1: "KeyedJaggedTensor", kjt_2: "KeyedJaggedTensor") -> bool
 
 
 def _force_length_offset_computation(
-    kjt: Union["KeyedJaggedTensor", "JaggedTensor"]
+    kjt: Union["KeyedJaggedTensor", "JaggedTensor"],
 ) -> None:
     """Helper function to force length/offset computation for KJT or JT
     Mainly used for testing equality, as equal KJT's/JT's can be formed from just using lengths or offsets.

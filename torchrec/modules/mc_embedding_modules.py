@@ -12,7 +12,6 @@ from typing import cast, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
-
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,

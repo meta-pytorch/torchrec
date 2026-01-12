@@ -11,7 +11,6 @@ from typing import Any, Dict, List, Optional, Type
 
 import torch
 from torch import distributed as dist
-
 from torchrec.metrics.metrics_namespace import MetricName, MetricNamespace, MetricPrefix
 from torchrec.metrics.rec_metric import (
     MetricComputationReport,

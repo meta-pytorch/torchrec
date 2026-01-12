@@ -15,7 +15,6 @@ from torchrec.distributed.embedding_tower_sharding import (
     EmbeddingTowerCollectionSharder,
     EmbeddingTowerSharder,
 )
-
 from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionSharder,
     EmbeddingBagSharder,

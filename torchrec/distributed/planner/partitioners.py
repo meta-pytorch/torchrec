@@ -16,7 +16,6 @@ from enum import Enum
 from typing import cast, Dict, List, Optional
 
 from torchrec.distributed.planner.perf_models import NoopPerfModel
-
 from torchrec.distributed.planner.types import (
     DeviceHardware,
     PartitionByType,

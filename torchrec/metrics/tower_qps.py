@@ -15,7 +15,6 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.utils import none_throws
-
 from torchrec.metrics.metrics_config import BatchSizeStage, RecComputeMode, RecTaskInfo
 from torchrec.metrics.metrics_namespace import MetricName, MetricNamespace, MetricPrefix
 from torchrec.metrics.rec_metric import (

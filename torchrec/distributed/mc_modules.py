@@ -28,10 +28,8 @@ from typing import (
 
 import torch
 import torch.distributed as dist
-
 from torch import nn
 from torch.distributed._shard.sharded_tensor import Shard, ShardMetadata
-
 from torchrec.distributed.embedding_sharding import (
     EmbeddingSharding,
     EmbeddingShardingContext,
@@ -44,7 +42,6 @@ from torchrec.distributed.embedding_types import (
     KJTList,
     ListOfKJTList,
 )
-
 from torchrec.distributed.sharding.rw_sequence_sharding import (
     RwSequenceEmbeddingDist,
     RwSequenceEmbeddingSharding,

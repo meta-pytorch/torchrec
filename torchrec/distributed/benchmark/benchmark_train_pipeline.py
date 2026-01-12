@@ -44,7 +44,6 @@ from torchrec.distributed.test_utils.model_config import (
     ModelSelectionConfig,
 )
 from torchrec.distributed.test_utils.model_input import ModelInput
-
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     run_multi_process_func,

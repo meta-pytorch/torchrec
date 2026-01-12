@@ -21,7 +21,6 @@ from torchrec.distributed.planner.perf_models import NoopPerfModel
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
-
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     Shard,

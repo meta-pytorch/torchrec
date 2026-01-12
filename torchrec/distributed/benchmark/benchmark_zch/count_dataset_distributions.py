@@ -14,14 +14,12 @@ import sys
 from typing import List
 
 import numpy as np
-
 import torch
 from torch import distributed as dist
 from torchrec.test_utils import get_free_port
 from tqdm import tqdm
 
 from .arguments import parse_args
-
 from .data.get_dataloader import get_dataloader
 
 

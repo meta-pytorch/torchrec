@@ -7,12 +7,10 @@
 
 import argparse
 import logging
-
 import sys
 
 import grpc
 import torch
-
 from torch.utils.data import DataLoader
 from torchrec.datasets.criteo import DEFAULT_CAT_NAMES, DEFAULT_INT_NAMES
 from torchrec.datasets.random import RandomRecDataset

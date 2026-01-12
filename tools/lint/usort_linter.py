@@ -13,7 +13,6 @@ import subprocess
 from typing import List
 
 from usort import config as usort_config, usort
-
 from utils import as_posix, LintMessage, LintSeverity
 
 

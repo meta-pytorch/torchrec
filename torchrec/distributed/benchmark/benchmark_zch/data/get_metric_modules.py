@@ -13,7 +13,6 @@ from typing import Dict
 
 import torch
 import yaml
-
 from torchrec.metrics.auc import AUCMetricComputation
 from torchrec.metrics.mae import MAEMetricComputation
 from torchrec.metrics.mse import MSEMetricComputation

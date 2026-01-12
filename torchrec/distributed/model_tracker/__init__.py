@@ -9,9 +9,9 @@
 
 """Torchrec Model Tracker
 
-The model tracker module provides functionality to track and retrieve unique IDs and 
-embeddings for supported modules during training. This is useful for identifying and 
-retrieving the latest delta or unique rows for a model, which can help compute topk 
+The model tracker module provides functionality to track and retrieve unique IDs and
+embeddings for supported modules during training. This is useful for identifying and
+retrieving the latest delta or unique rows for a model, which can help compute topk
 or to stream updated embeddings from predictors to trainers during online training.
 
 Key features include:

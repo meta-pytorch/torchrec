@@ -11,9 +11,7 @@ import math
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import fbgemm_gpu  # @manual = "//deeplearning/fbgemm/fbgemm_gpu:fbgemm_gpu"
-
 import torch
-
 from torchrec.modules.hash_mc_evictions import (
     get_kernel_from_policy,
     HashZchEvictionConfig,

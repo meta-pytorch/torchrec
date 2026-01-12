@@ -20,7 +20,6 @@ from torchrec.ir.schema import (
     PositionWeightedModuleCollectionMetadata,
     PositionWeightedModuleMetadata,
 )
-
 from torchrec.ir.types import SerializerInterface
 from torchrec.ir.utils import logging, qualname
 from torchrec.modules.embedding_configs import (

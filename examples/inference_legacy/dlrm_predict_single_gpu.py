@@ -10,7 +10,6 @@ from typing import Dict
 
 import torch
 from dlrm_predict import DLRMModelConfig, DLRMPredictModule
-
 from torchrec.inference.model_packager import load_pickle_config
 from torchrec.inference.modules import PredictFactory, quantize_embeddings
 from torchrec.modules.embedding_configs import EmbeddingBagConfig

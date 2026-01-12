@@ -16,7 +16,6 @@ from torchrec.distributed.embedding_dim_bucketer import (
     EmbDimBucketer,
     EmbDimBucketerPolicy,
 )
-
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     ShardedEmbeddingTable,

@@ -13,7 +13,6 @@ from typing import Callable, List, Optional
 from unittest.mock import MagicMock
 
 import torch
-
 from torchrec.distributed.planner.types import Perf, Shard, ShardingOption, Storage
 from torchrec.distributed.planner.utils import (
     _find_imbalance_tables,

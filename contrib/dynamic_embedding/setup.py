@@ -11,7 +11,6 @@ import sys
 
 import torch
 from setuptools import find_packages
-
 from skbuild import setup
 
 extra_cmake_args = []

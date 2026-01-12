@@ -11,7 +11,6 @@ import unittest
 
 import torch
 from torchrec.distributed.utils import copy_to_device, init_parameters
-
 from torchrec.fx.tracer import symbolic_trace
 from torchrec.modules.feature_processor_ import (
     PositionWeightedModule,

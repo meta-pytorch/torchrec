@@ -11,10 +11,8 @@ from collections import OrderedDict
 from typing import Any, Dict, Iterable, Iterator, Optional, Set, Tuple, Union
 
 import torch
-
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.profiler import record_function
-
 from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
 from torchrec.distributed.train_pipeline.types import CallArgs
 from torchrec.streamable import Pipelineable
