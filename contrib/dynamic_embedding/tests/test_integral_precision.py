@@ -119,7 +119,7 @@ class TestPSPrecision(unittest.TestCase):
             ce = nn.BCELoss()(y_pred, y_true)
             return torch.mean(torch.sum(ce, dim=-1))
 
-        for i in range(100):
+        for _ in range(100):
             kjt = KeyedJaggedTensor(
                 keys=["id"],
                 values=torch.randint(0, 1000, (40,), dtype=torch.long),
