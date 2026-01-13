@@ -113,6 +113,25 @@ def ir_dynamic_batch_emb_lookup_fake(
     return [torch.empty(batch_size, dim, device=device) for dim in dims]
 
 
+@torch.library.custom_op("torchrec::ir_tbe_lookup", mutates_args={})
+def ir_tbe_lookup_impl(
+    tensors: List[Optional[torch.Tensor]], batch_size: int, dims: List[int]
+) -> List[torch.Tensor]:
+    device = get_device(tensors)
+    logger.info(f"torch.ops.torchrec.ir_tbe_lookup -> ({batch_size}, {dims}) {device}")
+    return [torch.empty(batch_size, dim, device=device) for dim in dims]
+
+
+@torch.library.register_fake("torchrec::ir_tbe_lookup")
+def ir_tbe_lookup_fake(
+    tensors: List[Optional[torch.Tensor]], batch_size: int, dims: List[int]
+) -> List[torch.Tensor]:
+    device = get_device(tensors)
+    dynamic_batch_size = torch.library.get_ctx().new_dynamic_size()
+    logger.info(f"ir_tbe_lookup_fake -> ({dynamic_batch_size}, {dims}) {device}")
+    return [torch.empty(dynamic_batch_size, dim, device=device) for dim in dims]
+
+
 def encapsulate_ir_modules(
     module: nn.Module,
     serializer: Type[SerializerInterface] = DEFAULT_SERIALIZER_CLS,
@@ -127,7 +146,8 @@ def encapsulate_ir_modules(
     preserve_fqns: List[str] = []  # fqns of the serialized modules
     children: List[str] = []  # fqns of the children that need further serialization
     # handle current module, and find the children which need further serialization
-    if qualname(module) in serializer.module_to_serializer_cls:
+    typename = qualname(module)
+    if typename in serializer.module_to_serializer_cls:
         children = serializer.encapsulate_module(module)
         preserve_fqns.append(fqn)
     else:
