@@ -79,7 +79,7 @@ class PipelineStage:
         fill_callback (Optional[Callable[[], None]])) - optional step to run after the main
             runnable during filling the pipeline
         data_exhausted_callback (Optional[Callable[[], None]])) - optional callback to run
-            when data is ehxausted
+            when data is exhausted
     """
 
     name: str
