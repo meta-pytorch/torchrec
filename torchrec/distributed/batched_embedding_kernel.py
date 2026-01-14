@@ -2574,7 +2574,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
     def _all_gather_table_weights(self) -> None:
         if not self.weights_sharded:
             return
-        self._wait_on_reduce_scatter()
+        self.ensure_reduce_scatter_complete()
         shard_size = self._shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
 
@@ -2618,25 +2618,26 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
     ) -> None:
         self._all_gather_table_weights()
 
-    def _wait_on_reduce_scatter(self) -> None:
-        """
-        Ensure the post embedding lookup reduce scatter is finished before backward.
-
-        Ideally, backward does not need to wait on RS, as we will be all gathering the shards
-        in the backward pass.
-
-        Now uses the awaitable mechanism to defer resize until needed.
-        """
-        # pyre-ignore[16]
-        self._rs_awaitable.wait()
-        self._rs_awaitable = None
-
     def get_rs_awaitable(self) -> Optional[ReduceScatterResizeAwaitable]:
         """
         Get the current reduce scatter awaitable.
         This can be used by higher-level modules to compose awaitables.
         """
         return self._rs_awaitable
+
+    def ensure_reduce_scatter_complete(self) -> None:
+        """
+        Ensure the reduce scatter and resize operation is complete.
+
+        This is a no-op if the reduce scatter is already complete or if
+        no reduce scatter is pending.
+
+        Users can call this during training to ensure the async reduce scatter
+        is finished before proceeding with other operations.
+        """
+        if self._rs_awaitable is not None:
+            self._rs_awaitable.wait()
+            self._rs_awaitable = None
 
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         embs = super().forward(features)
@@ -3665,7 +3666,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
     def _all_gather_table_weights(self) -> None:
         if not self.weights_sharded:
             return
-        self._wait_on_reduce_scatter()
+        self.ensure_reduce_scatter_complete()
 
         shard_size = self._shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
@@ -3710,25 +3711,26 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
     ) -> None:
         self._all_gather_table_weights()
 
-    def _wait_on_reduce_scatter(self) -> None:
-        """
-        Ensure the post embedding lookup reduce scatter is finished before backward.
-
-        Ideally, backward does not need to wait on RS, as we will be all gathering the shards
-        in the backward pass.
-
-        Now uses the awaitable mechanism to defer resize until needed.
-        """
-        # pyre-ignore[16]
-        self._rs_awaitable.wait()
-        self._rs_awaitable = None
-
     def get_rs_awaitable(self) -> Optional[ReduceScatterResizeAwaitable]:
         """
         Get the current reduce scatter awaitable.
         This can be used by higher-level modules to compose awaitables.
         """
         return self._rs_awaitable
+
+    def ensure_reduce_scatter_complete(self) -> None:
+        """
+        Ensure the reduce scatter and resize operation is complete.
+
+        This is a no-op if the reduce scatter is already complete or if
+        no reduce scatter is pending.
+
+        Users can call this during training to ensure the async reduce scatter
+        is finished before proceeding with other operations.
+        """
+        if self._rs_awaitable is not None:
+            self._rs_awaitable.wait()
+            self._rs_awaitable = None
 
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         embs = super().forward(features)
