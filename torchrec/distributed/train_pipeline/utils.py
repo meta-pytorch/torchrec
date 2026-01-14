@@ -222,7 +222,8 @@ def _fuse_input_dist_splits(context: TrainPipelineContext) -> None:
                 if isinstance(awaitable, KJTSplitsAllToAllMeta):
                     pg = awaitable.pg
                     break
-        names_per_pg[pg].append(name)
+        if pg is not None:
+            names_per_pg[pg].append(name)
 
     for pg, names in names_per_pg.items():
         context.fused_splits_awaitables.append(
