@@ -34,11 +34,7 @@ from torchrec.metrics.auc import (
     _state_reduction,
     AUCMetric,
 )
-from torchrec.metrics.auprc import (
-    _grouping_keys_state_reduction as auprc_grouping_keys_state_reduction,
-    _state_reduction as auprc_state_reduction,
-    AUPRCMetric,
-)
+from torchrec.metrics.auprc import AUPRCMetric
 from torchrec.metrics.average import AverageMetric
 from torchrec.metrics.cali_free_ne import CaliFreeNEMetric
 from torchrec.metrics.calibration import CalibrationMetric
@@ -73,11 +69,7 @@ from torchrec.metrics.nmse import NMSEMetric
 from torchrec.metrics.output import OutputMetric
 from torchrec.metrics.precision import PrecisionMetric
 from torchrec.metrics.precision_session import PrecisionSessionMetric
-from torchrec.metrics.rauc import (
-    _grouping_keys_state_reduction as rauc_grouping_keys_state_reduction,
-    _state_reduction as rauc_state_reduction,
-    RAUCMetric,
-)
+from torchrec.metrics.rauc import RAUCMetric
 from torchrec.metrics.rec_metric import RecMetric, RecMetricException, RecMetricList
 from torchrec.metrics.recall import RecallMetric
 from torchrec.metrics.recall_session import RecallSessionMetric
@@ -99,12 +91,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 # Requirements: Associative AND (Commutative OR post-processing makes result order-invariant)
 SAFE_CALLABLE_REDUCTIONS: frozenset[Any] = frozenset(
     {
-        _state_reduction,  # Concatenation + AUC sorts data, making final result order-invariant
+        _state_reduction,  # Concatenation + AUC/AUPRC/RAUC sorts data, making final result order-invariant
         _grouping_keys_state_reduction,  # Concatenation along dim=0 + sorting makes result order-invariant
-        auprc_state_reduction,
-        auprc_grouping_keys_state_reduction,
-        rauc_state_reduction,
-        rauc_grouping_keys_state_reduction,
         _state_reduction_sum,  # Sum on dimension 0.
         _max_reduction,  # Max is associative and commutative.
     }
@@ -382,6 +370,9 @@ class RecMetricModule(nn.Module):
                 **kwargs,
             )
 
+            if self.throughput_metric:
+                self.throughput_metric.update()
+
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
         r"""update() is called per batch, usually right after forward() to
         update the local states of metrics based on the model_output.
@@ -391,8 +382,6 @@ class RecMetricModule(nn.Module):
         """
         with record_function("## RecMetricModule:update ##"):
             self._update_rec_metrics(model_out, **kwargs)
-            if self.throughput_metric:
-                self.throughput_metric.update()
             self.trained_batches += 1
 
     def _adjust_compute_interval(self) -> None:

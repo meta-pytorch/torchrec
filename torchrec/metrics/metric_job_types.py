@@ -8,7 +8,7 @@
 # pyre-strict
 
 import concurrent
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 import torch
 from torchrec.metrics.metric_module import MetricValue
@@ -21,12 +21,11 @@ class MetricUpdateJob:
     update each metric state tensors with intermediate model outputs
     """
 
-    __slots__ = ["model_out", "transfer_completed_event", "kwargs"]
+    __slots__ = ["model_out", "kwargs"]
 
     def __init__(
         self,
         model_out: Dict[str, torch.Tensor],
-        transfer_completed_event: Optional[torch.cuda.Event],
         kwargs: Dict[str, Any],
     ) -> None:
         """
@@ -37,9 +36,6 @@ class MetricUpdateJob:
         """
 
         self.model_out: Dict[str, torch.Tensor] = model_out
-        self.transfer_completed_event: Optional[torch.cuda.Event] = (
-            transfer_completed_event
-        )
         self.kwargs: Dict[str, Any] = kwargs
 
 
