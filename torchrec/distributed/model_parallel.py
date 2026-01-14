@@ -1180,6 +1180,34 @@ class DMPCollection(DistributedModelParallel):
             )
         self._custom_all_reduce = reduce_hook
 
+    def ensure_reduce_scatter_complete(self) -> None:
+        """
+        Ensure all reduce scatter and resize operations are complete for FULLY_SHARDED modules.
+
+        This method can be called during a training step to guarantee that all pending
+        async reduce scatter operations have finished and weight tensors have been resized.
+
+        This is a no-op if:
+        - No modules are using FULLY_SHARDED strategy
+        - All reduce scatter operations are already complete
+
+        Example usage in training loop::
+
+            model = DMPCollection(...)
+            for batch in dataloader:
+                output = model(batch)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                model.sync()
+                # Optionally ensure reduce scatter is complete before next iteration
+                model.ensure_reduce_scatter_complete()
+        """
+        for ctx in self._ctxs:
+            if ctx.sharding_strategy == ShardingStrategy.FULLY_SHARDED:
+                for _, sharded_module in ctx.modules_to_sync:
+                    sharded_module.ensure_reduce_scatter_complete()
+
     def _create_process_groups(
         self,
         global_rank: int,

@@ -265,5 +265,77 @@ class TestShardingStrategy(unittest.TestCase):
         self.assertEqual(ShardingStrategy.FULLY_SHARDED.value, "fully_sharded")
 
 
+class TestEnsureReduceScatterComplete(unittest.TestCase):
+    """Tests for the ensure_reduce_scatter_complete() method."""
+
+    def test_ensure_reduce_scatter_complete_with_no_awaitable(self) -> None:
+        """Test that ensure_reduce_scatter_complete is a no-op when _rs_awaitable is None."""
+        mock_module = MagicMock()
+        mock_module._rs_awaitable = None
+
+        if mock_module._rs_awaitable is not None:
+            mock_module._rs_awaitable.wait()
+            mock_module._rs_awaitable = None
+
+        self.assertIsNone(mock_module._rs_awaitable)
+
+    def test_ensure_reduce_scatter_complete_with_awaitable(self) -> None:
+        """Test that ensure_reduce_scatter_complete waits and clears the awaitable."""
+        mock_awaitable = MagicMock()
+        mock_module = MagicMock()
+        mock_module._rs_awaitable = mock_awaitable
+
+        if mock_module._rs_awaitable is not None:
+            mock_module._rs_awaitable.wait()
+            mock_module._rs_awaitable = None
+
+        mock_awaitable.wait.assert_called_once()
+        self.assertIsNone(mock_module._rs_awaitable)
+
+    def test_dmp_collection_ensure_reduce_scatter_complete_iterates_modules(
+        self,
+    ) -> None:
+        mock_child1 = MagicMock()
+        mock_child1.ensure_reduce_scatter_complete = MagicMock()
+
+        mock_child2 = MagicMock()
+        mock_child2.ensure_reduce_scatter_complete = MagicMock()
+
+        mock_child3 = MagicMock(spec=["forward"])
+
+        mock_dmp = MagicMock()
+        mock_dmp.modules = MagicMock(
+            return_value=[mock_dmp, mock_child1, mock_child2, mock_child3]
+        )
+
+        for module in mock_dmp.modules():
+            if (
+                hasattr(module, "ensure_reduce_scatter_complete")
+                and module is not mock_dmp
+            ):
+                module.ensure_reduce_scatter_complete()
+
+        mock_child1.ensure_reduce_scatter_complete.assert_called_once()
+        mock_child2.ensure_reduce_scatter_complete.assert_called_once()
+
+    def test_ensure_reduce_scatter_complete_is_idempotent(self) -> None:
+        """Test that calling ensure_reduce_scatter_complete multiple times is safe."""
+        mock_awaitable = MagicMock()
+        mock_module = MagicMock()
+        mock_module._rs_awaitable = mock_awaitable
+
+        if mock_module._rs_awaitable is not None:
+            mock_module._rs_awaitable.wait()
+            mock_module._rs_awaitable = None
+
+        mock_awaitable.wait.assert_called_once()
+
+        if mock_module._rs_awaitable is not None:
+            mock_module._rs_awaitable.wait()
+            mock_module._rs_awaitable = None
+
+        mock_awaitable.wait.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
