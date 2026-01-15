@@ -1083,6 +1083,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
             variable_batch_size=variable_batch_size,
             submodule_configs=[ec_submodule_config],
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="ebc",
         )
 
     @unittest.skipIf(
@@ -1191,6 +1192,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         variable_batch_per_feature: bool = False,
         submodule_configs: Optional[List[DMPCollectionConfig]] = None,
         sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
+        rs_awaitable_hook_module: Optional[str] = None,
     ) -> None:
         self._run_multi_process_test(
             callable=sharding_single_rank_test,
@@ -1211,6 +1213,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
             global_constant_batch=True,
             submodule_configs=submodule_configs,
             sharding_strategy=sharding_strategy,
+            rs_awaitable_hook_module=rs_awaitable_hook_module,
         )
 
 
@@ -1320,6 +1323,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=custom_all_reduce,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
         )
 
     @unittest.skipIf(
@@ -1417,6 +1421,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=custom_all_reduce,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
         )
 
     @unittest.skipIf(
@@ -1515,6 +1520,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=custom_all_reduce,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
         )
 
     @unittest.skipIf(
@@ -1613,6 +1619,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=custom_all_reduce,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
         )
 
     @unittest.skipIf(
@@ -1705,6 +1712,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=custom_all_reduce,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
         )
 
 
@@ -1829,6 +1837,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
             variable_batch_size=variable_batch_size,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
         )
 
     @unittest.skipIf(
@@ -1902,6 +1911,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
             variable_batch_size=variable_batch_size,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
         )
 
     @unittest.skipIf(
@@ -1974,6 +1984,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
             variable_batch_size=variable_batch_size,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
         )
 
     @unittest.skipIf(
@@ -2042,6 +2053,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
             variable_batch_size=variable_batch_size,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
         )
 
     def _test_sharding(
@@ -2061,6 +2073,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         variable_batch_size: bool = False,
         variable_batch_per_feature: bool = False,
         sharding_strategy: Optional[ShardingStrategy] = None,
+        rs_awaitable_hook_module: Optional[str] = None,
     ) -> None:
         self._run_multi_process_test(
             callable=sharding_single_rank_test,
@@ -2080,4 +2093,5 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
             variable_batch_per_feature=variable_batch_per_feature,
             global_constant_batch=True,
             sharding_strategy=sharding_strategy,
+            rs_awaitable_hook_module=rs_awaitable_hook_module,
         )
