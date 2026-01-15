@@ -792,6 +792,7 @@ def sharding_single_rank_test_single_process(
     lengths_dtype: torch.dtype = torch.int64,
     random_seed: Optional[int] = None,
     sharding_strategy: Optional[ShardingStrategy] = None,
+    rs_awaitable_hook_module: Optional[str] = None,
     atol: Optional[float] = None,
     rtol: Optional[float] = None,
 ) -> None:
@@ -961,6 +962,7 @@ def sharding_single_rank_test_single_process(
             custom_all_reduce=all_reduce_func,
             submodule_configs=submodule_configs,
             sharding_strategy=sharding_strategy,
+            rs_awaitable_hook_module=rs_awaitable_hook_module,
         )
     else:
         local_model = DistributedModelParallel(
@@ -1077,6 +1079,7 @@ def sharding_single_rank_test(
     lengths_dtype: torch.dtype = torch.int64,
     random_seed: Optional[int] = None,
     sharding_strategy: Optional[ShardingStrategy] = None,
+    rs_awaitable_hook_module: Optional[str] = None,
     atol: Optional[float] = None,
     rtol: Optional[float] = None,
 ) -> None:
@@ -1115,6 +1118,7 @@ def sharding_single_rank_test(
             lengths_dtype=lengths_dtype,
             random_seed=random_seed,
             sharding_strategy=sharding_strategy,
+            rs_awaitable_hook_module=rs_awaitable_hook_module,
             atol=atol,
             rtol=rtol,
         )

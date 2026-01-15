@@ -165,6 +165,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
         sharding_strategy: Optional[ShardingStrategy] = None,
         atol: Optional[float] = None,
         rtol: Optional[float] = None,
+        rs_awaitable_hook_module: Optional[str] = None,
     ) -> None:
         self._build_tables_and_groups(data_type=data_type)
         # directly run the test with single process
@@ -198,6 +199,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
                 sharding_strategy=sharding_strategy,
                 atol=atol,
                 rtol=rtol,
+                rs_awaitable_hook_module=rs_awaitable_hook_module,
             )
         else:
             self._run_multi_process_test(
@@ -229,6 +231,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
                 sharding_strategy=sharding_strategy,
                 atol=atol,
                 rtol=rtol,
+                rs_awaitable_hook_module=rs_awaitable_hook_module,
             )
 
     def _test_dynamic_sharding(
