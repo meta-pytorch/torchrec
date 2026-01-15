@@ -914,6 +914,7 @@ class DMPCollection(DistributedModelParallel):
         use_inter_host_allreduce: bool = False,
         custom_all_reduce: Optional[Callable[[List[torch.Tensor]], None]] = None,
         submodule_configs: Optional[List[DMPCollectionConfig]] = None,
+        rs_awaitable_hook_module: Optional[str] = None,
     ) -> None:
         assert (
             device.type == "cuda" or device.type == "mtia"
@@ -1020,6 +1021,13 @@ class DMPCollection(DistributedModelParallel):
         # post DMP init, we group sharded modules for parameter sync, stored in the context
         self._group_sharded_modules(self._ctxs)
         self._cache_sync_tensors(self._ctxs)
+        # for FULLY_SHARDED, we need to group sharded modules for parameter sync
+        if sharding_strategy == ShardingStrategy.FULLY_SHARDED:
+            assert rs_awaitable_hook_module is not None, (
+                "rs_awaitable_hook_module must be provided when using "
+                "ShardingStrategy.FULLY_SHARDED to register the reduce-scatter awaitable hook."
+            )
+            self._register_sparse_arch_forward_hook(rs_awaitable_hook_module)
 
     def _shard_modules_impl(
         self,
@@ -1207,6 +1215,36 @@ class DMPCollection(DistributedModelParallel):
             if ctx.sharding_strategy == ShardingStrategy.FULLY_SHARDED:
                 for _, sharded_module in ctx.modules_to_sync:
                     sharded_module.ensure_reduce_scatter_complete()
+
+    def _register_sparse_arch_forward_hook(self, rs_awaitable_hook_module) -> None:
+        """
+        Registers a forward hook on a specified first-level submodule to ensure that
+        reduce-scatter and subsequent weight resize operations are completed when using
+        FULLY_SHARDED mode. The hook is attached to the module named by
+        rs_awaitable_hook_module and runs immediately before that module’s forward pass.
+
+        We need to select module before peak memory so that we can ensure that we release table weights memory before peak memory.
+        The module selected is case by case. By default, we select sparse_arch module.
+
+        Note: The exact hook placement could be made configurable in the future.
+        """
+
+        def _hook(_module: nn.Module, _inputs: Tuple[Any, ...], _output: Any) -> None:
+            self.ensure_reduce_scatter_complete()
+
+        # Only check first-level children for rs_awaitable_hook_module
+        target: Optional[nn.Module] = None
+        for name, child in self.module.named_children():
+            if name == rs_awaitable_hook_module:
+                target = child
+                break
+        assert target is not None and isinstance(
+            target, nn.Module
+        ), f"[TorchRec 2D Parallel] First-level submodule {rs_awaitable_hook_module} not found; forward hook not registered."
+        target.register_forward_hook(_hook)
+        logger.info(
+            f"[TorchRec 2D Parallel] Registered reduce-scatter awaitable hook on submodule: {rs_awaitable_hook_module}"
+        )
 
     def _create_process_groups(
         self,
