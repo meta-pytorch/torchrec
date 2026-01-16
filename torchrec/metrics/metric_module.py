@@ -21,8 +21,19 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DeviceMesh
 from torch.profiler import record_function
+from torchmetrics.utilities.data import (
+    dim_zero_cat,
+    dim_zero_max,
+    dim_zero_mean,
+    dim_zero_min,
+    dim_zero_sum,
+)
 from torchrec.metrics.accuracy import AccuracyMetric
-from torchrec.metrics.auc import AUCMetric
+from torchrec.metrics.auc import (
+    _grouping_keys_state_reduction,
+    _state_reduction,
+    AUCMetric,
+)
 from torchrec.metrics.auprc import AUPRCMetric
 from torchrec.metrics.average import AverageMetric
 from torchrec.metrics.cali_free_ne import CaliFreeNEMetric
@@ -63,18 +74,79 @@ from torchrec.metrics.rec_metric import RecMetric, RecMetricException, RecMetric
 from torchrec.metrics.recall import RecallMetric
 from torchrec.metrics.recall_session import RecallSessionMetric
 from torchrec.metrics.scalar import ScalarMetric
-from torchrec.metrics.segmented_ne import SegmentedNEMetric
+from torchrec.metrics.segmented_ne import _state_reduction_sum, SegmentedNEMetric
 from torchrec.metrics.serving_calibration import ServingCalibrationMetric
 from torchrec.metrics.serving_ne import ServingNEMetric
 from torchrec.metrics.tensor_weighted_avg import TensorWeightedAvgMetric
 from torchrec.metrics.throughput import ThroughputMetric
-from torchrec.metrics.tower_qps import TowerQPSMetric
+from torchrec.metrics.tower_qps import _max_reduction, TowerQPSMetric
 from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
 from torchrec.metrics.xauc import XAUCMetric
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+# TorchRec-specific custom reduction functions.
+# These work correctly with local+global reduction pattern.
+# Requirements: Associative AND (Commutative OR post-processing makes result order-invariant)
+SAFE_CALLABLE_REDUCTIONS: frozenset[Any] = frozenset(
+    {
+        _state_reduction,  # Concatenation + AUC/AUPRC/RAUC sorts data, making final result order-invariant
+        _grouping_keys_state_reduction,  # Concatenation along dim=0 + sorting makes result order-invariant
+        _state_reduction_sum,  # Sum on dimension 0.
+        _max_reduction,  # Max is associative and commutative.
+    }
+)
+
+# torchmetrics.Metric built-in reduction functions.
+# All dim_zero_* functions are both associative and commutative (dim_zero_cat is not commutative
+# but torchmetrics.Metric also reduce before sync_dist to reduce number of collectives).
+TORCHMETRICS_REDUCTIONS: frozenset[Any] = frozenset(
+    {
+        dim_zero_sum,
+        dim_zero_mean,
+        dim_zero_max,
+        dim_zero_min,
+        dim_zero_cat,
+    }
+)
+
+
+def _validate_reduction_function(
+    reduction_fn: Union[str, Any, None],
+    state_name: str,
+    metric_namespace: str,
+) -> None:
+    """
+    Validate that a reduction function is safe for local+global reduction pattern.
+
+    Only validates custom reduction functions. TorchMetrics built-in functions
+    (dim_zero_*) are skipped as they're safe by construction (all are associative & commutative).
+
+    Mathematical Requirements:
+    1. **Associativity**: f([f([a,b]), f([c,d])]) = f([a,b,c,d])
+       - Required so local reduction + global reduction = direct reduction
+
+    2. **Commutativity**: f([a, b]) = f([b, a])
+       - Required so rank ordering doesn't affect the result
+       - OR the metric's computation must make the final result order-invariant
+         (e.g., AUC concatenates in rank order but sorts before computing, making final result order-invariant)
+    """
+    # Skip validation for None and torchmetrics.Metric built-in functions (safe by construction)
+    if reduction_fn is None or reduction_fn in TORCHMETRICS_REDUCTIONS:
+        return
+
+    # Validate custom callable reductions
+    if callable(reduction_fn):
+        if reduction_fn not in SAFE_CALLABLE_REDUCTIONS:
+            raise RecMetricException(
+                f"Unknown custom reduction '{reduction_fn}' for state '{state_name}' in '{metric_namespace}'. "
+                f"Must be associative: f([f([a,b]), f([c,d])]) == f([a,b,c,d]) "
+                f"AND commutative: f([a,b]) == f([b,a]) (or metric makes result order-invariant). "
+                f"Known safe custom reductions: {[f for f in SAFE_CALLABLE_REDUCTIONS if f not in TORCHMETRICS_REDUCTIONS]}. "
+                f"Add to SAFE_CALLABLE_REDUCTIONS if verified safe."
+            )
+
 
 REC_METRICS_MAPPING: Dict[RecMetricEnumBase, Type[RecMetric]] = {
     RecMetricEnum.NE: NEMetric,
@@ -119,6 +191,14 @@ MODEL_METRIC_LABEL: str = "model"
 
 
 MetricValue = Union[torch.Tensor, float]
+MetricsResult = Dict[str, MetricValue]
+MetricsFuture = concurrent.futures.Future[MetricsResult]
+MetricsOutput = Union[MetricsResult, MetricsFuture]
+
+# Looser types for publishing metrics with additional metadata
+PublishableMetrics = Dict[str, Any]
+PublishableMetricsFuture = concurrent.futures.Future[PublishableMetrics]
+PublishableMetricsOutput = Union[PublishableMetrics, PublishableMetricsFuture]
 
 
 class StateMetric(abc.ABC):
@@ -127,7 +207,7 @@ class StateMetric(abc.ABC):
     """
 
     @abc.abstractmethod
-    def get_metrics(self) -> Dict[str, MetricValue]:
+    def get_metrics(self) -> MetricsResult:
         pass
 
 
@@ -210,6 +290,8 @@ class RecMetricModule(nn.Module):
         self.oom_count = 0
         self.compute_count = 0
 
+        self._validate_all_reduction_functions()
+
         self.compute_interval_steps = compute_interval_steps
         self.min_compute_interval = min_compute_interval
         self.max_compute_interval = max_compute_interval
@@ -231,6 +313,23 @@ class RecMetricModule(nn.Module):
         self.last_compute_time = -1.0
 
         self._register_load_state_dict_pre_hook(self.load_state_dict_hook)
+
+    def _validate_all_reduction_functions(self) -> None:
+        """
+        Validate all reduction functions in rec_metrics during initialization.
+        This ensures that all reduction functions are safe for the local+global reduction pattern.
+        """
+        for metric in self.rec_metrics.rec_metrics:
+            for computation in metric._metrics_computations:  # pyre-ignore[16]
+                for (
+                    state_name,
+                    reduction_fn,
+                ) in computation._reductions.items():  # pyre-ignore[16]
+                    _validate_reduction_function(
+                        reduction_fn,
+                        state_name,
+                        metric._namespace.value,  # pyre-ignore[16]
+                    )
 
     def load_state_dict_hook(
         self,
@@ -271,6 +370,9 @@ class RecMetricModule(nn.Module):
                 **kwargs,
             )
 
+            if self.throughput_metric:
+                self.throughput_metric.update()
+
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
         r"""update() is called per batch, usually right after forward() to
         update the local states of metrics based on the model_output.
@@ -280,8 +382,6 @@ class RecMetricModule(nn.Module):
         """
         with record_function("## RecMetricModule:update ##"):
             self._update_rec_metrics(model_out, **kwargs)
-            if self.throughput_metric:
-                self.throughput_metric.update()
             self.trained_batches += 1
 
     def _adjust_compute_interval(self) -> None:
@@ -337,12 +437,12 @@ class RecMetricModule(nn.Module):
     def should_compute(self) -> bool:
         return self.trained_batches % self.compute_interval_steps == 0
 
-    def compute(self) -> Dict[str, MetricValue]:
+    def compute(self) -> MetricsResult:
         r"""compute() is called when the global metrics are required, usually
         right before logging the metrics results to the data sink.
         """
         self.compute_count += 1
-        ret: Dict[str, MetricValue] = {}
+        ret: MetricsResult = {}
         with record_function("## RecMetricModule:compute ##"):
             if self.rec_metrics:
                 self._adjust_compute_interval()
@@ -359,11 +459,11 @@ class RecMetricModule(nn.Module):
                     )
         return ret
 
-    def local_compute(self) -> Dict[str, MetricValue]:
+    def local_compute(self) -> MetricsResult:
         r"""local_compute() is called when per-trainer metrics are required. It's
         can be used for debugging. Currently only rec_metrics is supported.
         """
-        ret: Dict[str, MetricValue] = {}
+        ret: MetricsResult = {}
         if self.rec_metrics:
             ret.update(self.rec_metrics.local_compute())
         return ret
@@ -400,22 +500,24 @@ class RecMetricModule(nn.Module):
             # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `items`.
             for state_name, reduction_fn in computation._reductions.items():
-                tensor_or_list: Union[List[torch.Tensor], torch.Tensor] = getattr(
-                    computation, state_name
-                )
+                with record_function(f"## RecMetricModule: {state_name} all gather ##"):
+                    tensor_or_list: Union[List[torch.Tensor], torch.Tensor] = getattr(
+                        computation, state_name
+                    )
 
-                if isinstance(tensor_or_list, list):
-                    gathered = _all_gather_tensor_list(
-                        tensor_or_list, world_size, process_group
-                    )
-                else:
-                    gathered = torch.stack(
-                        _all_gather_tensor(tensor_or_list, world_size, process_group)
-                    )
-                reduced = (
-                    reduction_fn(gathered) if reduction_fn is not None else gathered
-                )
-                result[task.name][state_name] = reduced
+                    if isinstance(tensor_or_list, list):
+                        local_reduced = reduction_fn(tensor_or_list)
+                        gathered = _all_gather_tensor_list(
+                            local_reduced, world_size, process_group
+                        )
+                    else:
+                        gathered = torch.stack(
+                            _all_gather_tensor(
+                                tensor_or_list, world_size, process_group
+                            )
+                        )
+                    global_reduced = reduction_fn(gathered)
+                    result[task.name][state_name] = global_reduced
 
         return result
 
@@ -464,7 +566,8 @@ class RecMetricModule(nn.Module):
         # throughput metric requires special handling, since it's not a RecMetric
         throughput_metric = self.throughput_metric
         if throughput_metric is not None:
-            aggregated_states[throughput_metric._namespace.value] = (
+            # Merge in case there are rec metric namespaces that overlap with throughput metric namespace
+            aggregated_states.setdefault(throughput_metric._namespace.value, {}).update(
                 self._get_throughput_metric_states(throughput_metric)
             )
 
@@ -514,9 +617,7 @@ class RecMetricModule(nn.Module):
     def shutdown(self) -> None:
         logger.info("Initiating graceful shutdown...")
 
-    def async_compute(
-        self, future: concurrent.futures.Future[Dict[str, MetricValue]]
-    ) -> None:
+    def async_compute(self) -> MetricsFuture:
         raise RecMetricException("async_compute is not supported in RecMetricModule")
 
 
@@ -660,8 +761,23 @@ def _all_gather_tensor_list(
     world_size: int,
     pg: Union[dist.ProcessGroup, DeviceMesh],
 ) -> List[torch.Tensor]:
-    """All-gather every tensor in a list and flatten the result."""
-    gathered: List[torch.Tensor] = []  # pragma: no cover
+    """
+    All-gather every tensor in a list and flatten the result.
+
+    Note: In the current implementation with local reduction in _get_metric_states,
+    this function should only receive a list with at most 1 tensor after local reduction.
+    """
+    if not tensors:
+        return []
+
+    # After local reduction in _get_metric_states, tensors should contain at most 1 element
+    if len(tensors) > 1:
+        raise ValueError(
+            f"_all_gather_tensor_list expected at most 1 tensor after local reduction, "
+            f"but received {len(tensors)} tensors. This indicates a bug in _get_metric_states."
+        )
+
+    gathered: List[torch.Tensor] = []
     for t in tensors:
         gathered.extend(_all_gather_tensor(t, world_size, pg))
     return gathered

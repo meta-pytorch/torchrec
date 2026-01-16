@@ -22,7 +22,7 @@ from torchrec.metrics.metric_job_types import (
     MetricUpdateJob,
     SynchronizationMarker,
 )
-from torchrec.metrics.metric_module import MetricValue, RecMetricModule
+from torchrec.metrics.metric_module import MetricsFuture, MetricsResult, RecMetricModule
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.rec_metric import RecMetricException
@@ -61,6 +61,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
     def __init__(
         self,
+        device: torch.device,
         update_queue_size: int = 100,
         compute_queue_size: int = 100,
         *args: Any,
@@ -68,12 +69,19 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
     ) -> None:
         """
         Args:
-            All arguments are the same as RecMetricModule except for
-            - update_queue_size: Maximum size of the update queue. Default is 100.
-            - compute_queue_size: Maximum size of the update queue. Default is 100.
+            batch_size: batch size used by this trainer.
+            world_size: the number of trainers.
+            device: the device where the model is located (used to determine whether to perform GPU to CPU transfers).
+            update_queue_size: Maximum size of the update queue. Default is 100.
+            compute_queue_size: Maximum size of the update queue. Default is 100.
+            *args: Additional positional arguments passed to RecMetricModule.
+            **kwargs: Additional keyword arguments passed to RecMetricModule.
         """
         super().__init__(*args, **kwargs)
-        self._shutdown_event = threading.Event()
+        self._device = device
+        self._shutdown_event: threading.Event = threading.Event()
+        self._captured_exception_event: threading.Event = threading.Event()
+        self._captured_exception: Optional[Exception] = None
 
         self.update_queue: queue.Queue[
             Union[MetricUpdateJob, SynchronizationMarker]
@@ -97,6 +105,9 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         self.update_thread.start()
         self.compute_thread.start()
 
+        self.update_job_time_logger: PercentileLogger = PercentileLogger(
+            metric_name="update_job_time_ms", log_interval=1000
+        )
         self.update_queue_size_logger: PercentileLogger = PercentileLogger(
             metric_name="update_queue_size", log_interval=1000
         )
@@ -131,12 +142,14 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         if self._shutdown_event.is_set():
             raise RecMetricException("metric processor thread is shut down.")
 
+        if self._captured_exception_event.is_set():
+            assert self._captured_exception is not None
+            raise self._captured_exception
+
         try:
-            cpu_model_out, transfer_completed_event = self._transfer_to_cpu(model_out)
             self.update_queue.put_nowait(
                 MetricUpdateJob(
-                    model_out=cpu_model_out,
-                    transfer_completed_event=transfer_completed_event,
+                    model_out=model_out,
                     kwargs=kwargs,
                 )
             )
@@ -190,31 +203,33 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         """
 
         with record_function("## CPUOffloadedRecMetricModule:update ##"):
-            try:
-                metric_update_job.transfer_completed_event.synchronize()
-                labels, predictions, weights, required_inputs = (
-                    parse_task_model_outputs(
-                        self.rec_tasks,
-                        metric_update_job.model_out,
-                        self.get_required_inputs(),
-                    )
-                )
-                if required_inputs:
-                    metric_update_job.kwargs["required_inputs"] = required_inputs
+            start_ms = time.time()
+            cpu_model_out, transfer_completed_event = (
+                self._transfer_to_cpu(metric_update_job.model_out)
+                if self._device == torch.device("cuda")
+                else (metric_update_job.model_out, None)
+            )
+            if transfer_completed_event is not None:
+                transfer_completed_event.synchronize()
+            labels, predictions, weights, required_inputs = parse_task_model_outputs(
+                self.rec_tasks,
+                cpu_model_out,
+                self.get_required_inputs(),
+            )
+            if required_inputs:
+                metric_update_job.kwargs["required_inputs"] = required_inputs
 
-                self.rec_metrics.update(
-                    predictions=predictions,
-                    labels=labels,
-                    weights=weights,
-                    **metric_update_job.kwargs,
-                )
+            self.rec_metrics.update(
+                predictions=predictions,
+                labels=labels,
+                weights=weights,
+                **metric_update_job.kwargs,
+            )
 
-                if self.throughput_metric:
-                    self.throughput_metric.update()
+            if self.throughput_metric:
+                self.throughput_metric.update()
 
-            except Exception as e:
-                logger.exception("Error processing metric update: %s", e)
-                raise e
+            self.update_job_time_logger.add((time.time() - start_ms) * 1000)
 
     @override
     def shutdown(self) -> None:
@@ -230,6 +245,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         if self.compute_thread.is_alive():
             self.compute_thread.join(timeout=30.0)
 
+        self.update_job_time_logger.log_percentiles()
         self.update_queue_size_logger.log_percentiles()
         self.compute_queue_size_logger.log_percentiles()
         self.compute_job_time_logger.log_percentiles()
@@ -247,30 +263,34 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         logger.info("CPUOffloadedRecMetricModule has been successfully shutdown.")
 
     @override
-    def compute(self) -> Dict[str, MetricValue]:
+    def compute(self) -> MetricsResult:
         raise RecMetricException(
-            "compute() is not supported in CPUOffloadedRecMetricModule. Use async_compute() instead."
+            "CPUOffloadedRecMetricModule does not support compute(). Use async_compute() instead."
         )
 
     @override
-    def async_compute(
-        self, future: concurrent.futures.Future[Dict[str, MetricValue]]
-    ) -> None:
+    def async_compute(self) -> MetricsFuture:
         """
         Entry point for asynchronous metric compute. It enqueues a synchronization marker
         to the update queue.
 
-        Args:
+        Returns:
             future: Pre-created future where the computed metrics will be set.
         """
+        metrics_future = concurrent.futures.Future()
         if self._shutdown_event.is_set():
-            future.set_exception(
+            metrics_future.set_exception(
                 RecMetricException("metric processor thread is shut down.")
             )
-            return
+            return metrics_future
 
-        self.update_queue.put_nowait(SynchronizationMarker(future))
+        if self._captured_exception_event.is_set():
+            assert self._captured_exception is not None
+            raise self._captured_exception
+
+        self.update_queue.put_nowait(SynchronizationMarker(metrics_future))
         self.update_queue_size_logger.add(self.update_queue.qsize())
+        return metrics_future
 
     def _process_synchronization_marker(
         self, synchronization_marker: SynchronizationMarker
@@ -303,7 +323,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
     def _process_metric_compute_job(
         self, metric_compute_job: MetricComputeJob
-    ) -> Dict[str, MetricValue]:
+    ) -> MetricsResult:
         """
         Process a metric compute job:
         1. Comms module performs all gather
@@ -354,6 +374,8 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 self._do_work(self.update_queue)
             except Exception as e:
                 logger.exception(f"Exception in update loop: {e}")
+                self._captured_exception_event.set()
+                self._captured_exception = e
                 raise e
 
         remaining = self._flush_remaining_work(self.update_queue)
@@ -371,6 +393,8 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 self._do_work(self.compute_queue)
             except Exception as e:
                 logger.exception(f"Exception in compute loop: {e}")
+                self._captured_exception_event.set()
+                self._captured_exception = e
                 raise e
 
         remaining = self._flush_remaining_work(self.compute_queue)

@@ -8,12 +8,12 @@
 # pyre-strict
 
 import logging
-from functools import partial
 from typing import Any, cast, Dict, List, Optional, Type
 
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torchrec.metrics.auc import _grouping_keys_state_reduction, _state_reduction
 from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
 from torchrec.metrics.metrics_namespace import MetricName, MetricNamespace, MetricPrefix
 from torchrec.metrics.rec_metric import (
@@ -155,14 +155,6 @@ def compute_auprc_per_group(
         )
         auprcs.append(avg_auprc)
     return torch.cat(auprcs)
-
-
-def _state_reduction(state: List[torch.Tensor], dim: int = 1) -> List[torch.Tensor]:
-    return [torch.cat(state, dim=dim)]
-
-
-# pyre-ignore
-_grouping_keys_state_reduction = partial(_state_reduction, dim=0)
 
 
 class AUPRCMetricComputation(RecMetricComputation):
