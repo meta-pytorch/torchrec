@@ -867,6 +867,21 @@ class DMPCollection(DistributedModelParallel):
             init_data_parallel (bool): Whether to initialize data parallelism.
             init_parameters (bool): Whether to initialize parameters.
             data_parallel_wrapper (Optional[DataParallelWrapper]): The data parallel wrapper to use.
+            use_inter_host_allreduce (bool): If True, construct sharding and replica groups to force
+                inter-host all-reduce communication by assigning continuous rank ranges per shard group.
+                If False, use alternating ranks to prefer intra-host all-reduce where possible.
+            custom_all_reduce (Optional[Callable[[List[torch.Tensor]], None]]): Custom all-reduce
+                function to override the default dist.allreduce_coalesced behavior during sync().
+                The callable must perform the collective across the appropriate process group and
+                handle stream synchronization.
+            submodule_configs (Optional[List[DMPCollectionConfig]]): Optional per-submodule configuration
+                list allowing different sharding plans and strategies for specific submodules within
+                the model.
+            rs_awaitable_hook_module (Optional[str]): Name of a first-level child submodule on which to
+                register a forward hook that ensures reduce-scatter completion and weight resize when
+                using FULLY_SHARDED strategy. Useful to avoid peak memory pressure prior to the selected
+                module's forward pass.
+
 
     Example::
 
@@ -1021,12 +1036,10 @@ class DMPCollection(DistributedModelParallel):
         # post DMP init, we group sharded modules for parameter sync, stored in the context
         self._group_sharded_modules(self._ctxs)
         self._cache_sync_tensors(self._ctxs)
-        # for FULLY_SHARDED, we need to group sharded modules for parameter sync
-        if sharding_strategy == ShardingStrategy.FULLY_SHARDED:
-            assert rs_awaitable_hook_module is not None, (
-                "rs_awaitable_hook_module must be provided when using "
-                "ShardingStrategy.FULLY_SHARDED to register the reduce-scatter awaitable hook."
-            )
+        if (
+            sharding_strategy == ShardingStrategy.FULLY_SHARDED
+            and rs_awaitable_hook_module is not None
+        ):
             self._register_sparse_arch_forward_hook(rs_awaitable_hook_module)
 
     def _shard_modules_impl(
