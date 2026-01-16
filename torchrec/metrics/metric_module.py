@@ -49,6 +49,7 @@ from torchrec.metrics.metrics_namespace import (
 )
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.mse import MSEMetric
+from torchrec.metrics.multi_label_precision import MultiLabelPrecisionMetric
 from torchrec.metrics.multiclass_recall import MulticlassRecallMetric
 from torchrec.metrics.ndcg import NDCGMetric
 from torchrec.metrics.ne import NEMetric
@@ -109,6 +110,7 @@ REC_METRICS_MAPPING: Dict[RecMetricEnumBase, Type[RecMetric]] = {
     RecMetricEnum.HINDSIGHT_TARGET_PR: HindsightTargetPRMetric,
     RecMetricEnum.NMSE: NMSEMetric,
     RecMetricEnum.AVERAGE: AverageMetric,
+    RecMetricEnum.MULTI_LABEL_PRECISION: MultiLabelPrecisionMetric,
 }
 
 

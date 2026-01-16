@@ -141,6 +141,17 @@
     ],
     "variant": ""
   },
+  "MultiLabelPrecisionMetric_UNFUSED_TASKS_COMPUTATION": {
+    "compute_mode": "UNFUSED_TASKS_COMPUTATION",
+    "metric_class": "MultiLabelPrecisionMetric",
+    "non_persistent_buffer_fqns": [],
+    "persistent_buffer_fqns": [],
+    "state_dict_keys": [
+      "_metrics_computations.0.false_pos_sum_label_0",
+      "_metrics_computations.0.true_pos_sum_label_0"
+    ],
+    "variant": ""
+  },
   "NDCGMetric_UNFUSED_TASKS_COMPUTATION": {
     "compute_mode": "UNFUSED_TASKS_COMPUTATION",
     "metric_class": "NDCGMetric",

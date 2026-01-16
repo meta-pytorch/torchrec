@@ -384,6 +384,8 @@ class MetricModuleTest(unittest.TestCase):
             "rec_metrics.rec_metrics.31._metrics_computations.0.prediction_sum",
             "rec_metrics.rec_metrics.31._metrics_computations.0.label_sum",
             "rec_metrics.rec_metrics.31._metrics_computations.0.weighted_num_samples",
+            "rec_metrics.rec_metrics.32._metrics_computations.0.false_pos_sum_label_0",
+            "rec_metrics.rec_metrics.32._metrics_computations.0.true_pos_sum_label_0",
             "throughput_metric.total_examples",
             "throughput_metric.warmup_examples",
             "throughput_metric.time_lapse_after_warmup",

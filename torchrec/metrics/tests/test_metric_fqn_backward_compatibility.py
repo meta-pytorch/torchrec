@@ -50,6 +50,7 @@ from torchrec.metrics.mae import MAEMetric
 from torchrec.metrics.metric_module import RecMetricModule
 from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
 from torchrec.metrics.mse import MSEMetric
+from torchrec.metrics.multi_label_precision import MultiLabelPrecisionMetric
 from torchrec.metrics.multiclass_recall import MulticlassRecallMetric
 from torchrec.metrics.ndcg import NDCGMetric
 from torchrec.metrics.ne import NEMetric
@@ -228,6 +229,12 @@ METRICS_TO_TEST: List[
     (NDCGMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (XAUCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (ScalarMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    (
+        MultiLabelPrecisionMetric,
+        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        {"num_labels": 1},
+        [""],
+    ),
     # Metrics with non-persistent state (AUC family)
     (AUCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (AUPRCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
@@ -641,6 +648,13 @@ class MetricFQNBackwardCompatibilityTest(unittest.TestCase):
             MulticlassRecallMetric,
             RecComputeMode.UNFUSED_TASKS_COMPUTATION,
             number_of_classes=3,
+        )
+
+    def test_multi_label_precision_metric(self) -> None:
+        self._check_metric_compatibility(
+            MultiLabelPrecisionMetric,
+            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            num_labels=1,
         )
 
     def test_segmented_ne_metric(self) -> None:
