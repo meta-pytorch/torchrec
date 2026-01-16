@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+from typing import Dict, Tuple
 from unittest.mock import patch
 
 import torch
@@ -59,7 +60,7 @@ class TwoSparseArchModel(nn.Module):
 
     def forward(
         self, features: KeyedJaggedTensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         ebc1_out, ec1_out = self.sparse1(features)
         ebc2_out, ec2_out = self.sparse2(features)
 
@@ -76,6 +77,14 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
         when a single EmbeddingBagCollection and EmbeddingCollection are shared
         across two different parent sparse architectures.
         """
+
+        def mock_init_dmp(
+            self_dmp: DistributedModelParallel, module: nn.Module
+        ) -> nn.Module:
+            """Override _init_dmp to always set module_id_cache to None"""
+            # Call _shard_modules_impl with module_id_cache=None (caching disabled)
+            module_id_cache: Dict[int, ShardedModule] = {}
+            return self_dmp._shard_modules_impl(module, module_id_cache=module_id_cache)
 
         # Setup: Create shared embedding modules that will be reused
         ebc = EmbeddingBagCollection(
@@ -107,7 +116,12 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
         model = TwoSparseArchModel(sparse1, sparse2)
 
         # Execute: Shard the model with DistributedModelParallel
-        dmp = DistributedModelParallel(model, device=self.device)
+        with patch.object(
+            DistributedModelParallel,
+            "_init_dmp",
+            mock_init_dmp,
+        ):
+            dmp = DistributedModelParallel(model, device=self.device)
 
         # Assert: Verify that the shared modules are properly handled
         self.assertIsNotNone(dmp.module)
@@ -223,4 +237,59 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
             wrapped_module.sparse2.ec,
             ShardedModule,
             "ec2 should be sharded",
+        )
+
+    def test_shared_sparse_module_optimizer_dedup(self) -> None:
+        """
+        Test that the module ID cache in _fused_optim_impl correctly handles
+        the same sparse module being used in multiple parent modules.
+
+        This validates that:
+        1. The optimizer is only collected once for shared modules
+        2. No duplicate param keys exist in the CombinedOptimizer
+        """
+
+        # Setup: Create shared embedding modules that will be reused
+        ebc = EmbeddingBagCollection(
+            device=torch.device("meta"),
+            tables=[
+                EmbeddingBagConfig(
+                    name="ebc_table",
+                    embedding_dim=64,
+                    num_embeddings=100,
+                    feature_names=["ebc_feature"],
+                ),
+            ],
+        )
+        ec = EmbeddingCollection(
+            device=torch.device("meta"),
+            tables=[
+                EmbeddingConfig(
+                    name="ec_table",
+                    embedding_dim=32,
+                    num_embeddings=50,
+                    feature_names=["ec_feature"],
+                ),
+            ],
+        )
+
+        # Create the model with shared modules
+        sparse1 = SparseArch(ebc, ec)
+        sparse2 = SparseArch(ebc, ec)
+        model = TwoSparseArchModel(sparse1, sparse2)
+
+        # Execute: Shard the model with DistributedModelParallel
+        # This should NOT raise ValueError due to duplicate param keys
+        dmp = DistributedModelParallel(model, device=self.device)
+
+        # Assert: Verify optimizer has no duplicate params
+        fused_optim = dmp.fused_optimizer
+        params = fused_optim.params
+
+        # Check that param tensors are unique (no duplicates)
+        param_ids = [id(p) for p in params.values()]
+        self.assertEqual(
+            len(param_ids),
+            len(set(param_ids)),
+            "fused_optimizer.params should not have duplicate parameter objects",
         )
