@@ -7,8 +7,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta content="Learn how to set up TorchRec, review system and version compatibility with PyTorch and FBGEMM, install via stable/nightly/source options, and run a simple EmbeddingBagCollection example." name="description" />
+<meta content="TorchRec, PyTorch, FBGEMM, recommender systems, installation, CUDA, CPU, setup, EmbeddingBagCollection, KeyedJaggedTensor, JaggedTensor" name="keywords" />
 
-    <title>Setting up TorchRec &#8212; TorchRec 1.0.0 documentation</title>
+    <title>Setup &#8212; TorchRec 1.0.0 documentation</title>
   
   
   
@@ -47,7 +49,7 @@
     <script>DOCUMENTATION_OPTIONS.pagename = 'setup-torchrec';</script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="next" title="Data Types" href="datatypes-api-reference.html" />
+    <link rel="next" title="API reference" href="api.html" />
     <link rel="prev" title="TorchRec Concepts" href="concepts.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -282,75 +284,25 @@
   <ul class="bd-navbar-elements navbar-nav">
     
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="overview.html">
-    TorchRec Overview
-  </a>
-</li>
-
-
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="high-level-arch.html">
-    TorchRec High Level Architecture
-  </a>
-</li>
-
-
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="concepts.html">
-    TorchRec Concepts
+  <a class="nav-link nav-internal" href="intro.html">
+    Intro
   </a>
 </li>
 
 
 <li class="nav-item current active">
   <a class="nav-link nav-internal" href="#">
-    Setting up TorchRec
+    Setup
   </a>
 </li>
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="datatypes-api-reference.html">
-    Data Types
+  <a class="nav-link nav-internal" href="api.html">
+    API reference
   </a>
 </li>
 
-            <li class="nav-item dropdown">
-                <button class="btn dropdown-toggle nav-item" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-controls="pst-nav-more-links">
-                    More
-                </button>
-                <ul id="pst-nav-more-links" class="dropdown-menu">
-                    
-<li class=" ">
-  <a class="nav-link dropdown-item nav-internal" href="modules-api-reference.html">
-    Modules
-  </a>
-</li>
-
-
-<li class=" ">
-  <a class="nav-link dropdown-item nav-internal" href="planner-api-reference.html">
-    Planner
-  </a>
-</li>
-
-
-<li class=" ">
-  <a class="nav-link dropdown-item nav-internal" href="model-parallel-api-reference.html">
-    Model Parallel
-  </a>
-</li>
-
-
-<li class=" ">
-  <a class="nav-link dropdown-item nav-internal" href="inference-api-reference.html">
-    Inference
-  </a>
-</li>
-
-                </ul>
-            </li>
-            
   </ul>
 </nav></div>
       
@@ -481,64 +433,22 @@ document.write(`
   <ul class="bd-navbar-elements navbar-nav">
     
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="overview.html">
-    TorchRec Overview
-  </a>
-</li>
-
-
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="high-level-arch.html">
-    TorchRec High Level Architecture
-  </a>
-</li>
-
-
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="concepts.html">
-    TorchRec Concepts
+  <a class="nav-link nav-internal" href="intro.html">
+    Intro
   </a>
 </li>
 
 
 <li class="nav-item current active">
   <a class="nav-link nav-internal" href="#">
-    Setting up TorchRec
+    Setup
   </a>
 </li>
 
 
 <li class="nav-item ">
-  <a class="nav-link nav-internal" href="datatypes-api-reference.html">
-    Data Types
-  </a>
-</li>
-
-
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="modules-api-reference.html">
-    Modules
-  </a>
-</li>
-
-
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="planner-api-reference.html">
-    Planner
-  </a>
-</li>
-
-
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="model-parallel-api-reference.html">
-    Model Parallel
-  </a>
-</li>
-
-
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="inference-api-reference.html">
-    Inference
+  <a class="nav-link nav-internal" href="api.html">
+    API reference
   </a>
 </li>
 
@@ -681,7 +591,7 @@ document.write(`
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page">Setting up TorchRec</li>
+    <li class="breadcrumb-item active" aria-current="page">Setup</li>
   </ul>
 </nav>
 </div>
@@ -723,7 +633,7 @@ document.write(`
     <div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList">
       
       <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
-        <meta itemprop="name" content="Setting up TorchRec">
+        <meta itemprop="name" content="Setup">
         <meta itemprop="position" content="1">
       </div>
     </div>
@@ -737,8 +647,8 @@ document.write(`
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="setting-up-torchrec">
-<h1>Setting up TorchRec<a class="headerlink" href="#setting-up-torchrec" title="Link to this heading">#</a></h1>
+  <section id="setup">
+<h1>Setup<a class="headerlink" href="#setup" title="Link to this heading">#</a></h1>
 <p>In this section, we will:</p>
 <ul class="simple">
 <li><p>Understand requirements for using TorchRec</p></li>
@@ -930,11 +840,11 @@ Congrats! You have correctly installed and ran your first TorchRec program!</p>
       </div>
     </a>
     <a class="right-next"
-       href="datatypes-api-reference.html"
+       href="api.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Data Types</p>
+        <p class="prev-next-title">API reference</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -969,11 +879,11 @@ Congrats! You have correctly installed and ran your first TorchRec program!</p>
       </div>
     </a>
     <a class="right-next"
-       href="datatypes-api-reference.html"
+       href="api.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Data Types</p>
+        <p class="prev-next-title">API reference</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1139,11 +1049,11 @@ Congrats! You have correctly installed and ran your first TorchRec program!</p>
     {
        "@context": "https://schema.org",
        "@type": "Article",
-       "name": "Setting up TorchRec",
-       "headline": "Setting up TorchRec",
+       "name": "Setup",
+       "headline": "Setup",
        "description": "PyTorch Documentation. Explore PyTorch, an open-source machine learning library that accelerates the path from research prototyping to production deployment. Discover tutorials, API references, and guides to help you build and deploy deep learning models efficiently.",
        "url": "/setup-torchrec.html",
-       "articleBody": "Setting up TorchRec# In this section, we will: Understand requirements for using TorchRec Set up an environment to integrate TorchRec Run basic TorchRec code System Requirements# TorchRec is routinely tested on AWS Linux only and should work in similar environments. Below demonstrates the compatability matrix that is currently tested: Python Version 3.9, 3.10, 3.11, 3.12 Compute Platform CPU, CUDA 11.8, CUDA 12.1, CUDA 12.4 Aside from those requirements, TorchRec\u2019s core dependencies are PyTorch and FBGEMM. If your system is compatible with both libraries generally, then it should be sufficient for TorchRec. PyTorch requirements FBGEMM requirements Version Compatability# TorchRec and FBGEMM have matching version numbers that are tested together upon release: TorchRec 1.0 is compatible with FBGEMM 1.0 TorchRec 0.8 is compatible with FBGEMM 0.8 TorchRec 0.8 may not be compatible with FBGEMM 0.7 Furthermore, TorchRec and FBGEMM are released only when a new PyTorch release happens. Therefore, specific versions of TorchRec and FBGEMM should correspond to a specific PyTorch version: TorchRec 1.0 is compatible with PyTorch 2.5 TorchRec 0.8 is compatible with PyTorch 2.4 TorchRec 0.8 may not be compatible with PyTorch 2.3 Installation# Below we show installations for CUDA 12.1 as an example. For CPU, CUDA 11.8, or CUDA 12.4, swap cu121 for cpu, cu118, or cu124 respectively. Stable via pytorch.org pip install torch --index-url https://download.pytorch.org/whl/cu121 pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/cu121 pip install torchmetrics==1.0.3 pip install torchrec --index-url https://download.pytorch.org/whl/cu121 Stable via PyPI (Only for CUDA 12.4) pip install torch pip install fbgemm-gpu pip install torchrec Nightly pip install torch --index-url https://download.pytorch.org/whl/nightly/cu121 pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/nightly/cu121 pip install torchmetrics==1.0.3 pip install torchrec --index-url https://download.pytorch.org/whl/nightly/cu121 Building From Source You also have the ability to build TorchRec from source to develop with the latest changes in TorchRec. To build from source, check out this reference. Run a Simple TorchRec Example# Now that we have TorchRec properly set up, let\u2019s run some TorchRec code! Below, we\u2019ll run a simple forward pass with TorchRec data types: KeyedJaggedTensor and EmbeddingBagCollection: import torch import torchrec from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor ebc = torchrec.EmbeddingBagCollection( device=\"cpu\", tables=[ torchrec.EmbeddingBagConfig( name=\"product_table\", embedding_dim=16, num_embeddings=4096, feature_names=[\"product\"], pooling=torchrec.PoolingType.SUM, ), torchrec.EmbeddingBagConfig( name=\"user_table\", embedding_dim=16, num_embeddings=4096, feature_names=[\"user\"], pooling=torchrec.PoolingType.SUM, ) ] ) product_jt = JaggedTensor( values=torch.tensor([1, 2, 1, 5]), lengths=torch.tensor([3, 1]) ) user_jt = JaggedTensor(values=torch.tensor([2, 3, 4, 1]), lengths=torch.tensor([2, 2])) # Q1: How many batches are there, and which values are in the first batch for product_jt and user_jt? kjt = KeyedJaggedTensor.from_jt_dict({\"product\": product_jt, \"user\": user_jt}) print(\"Call EmbeddingBagCollection Forward: \", ebc(kjt)) Save the above code to a file named torchrec_example.py. Then, you should be able to execute it from your terminal with: python torchrec_example.py You should see the output KeyedTensor with the resulting embeddings. Congrats! You have correctly installed and ran your first TorchRec program!",
+       "articleBody": "Setup# In this section, we will: Understand requirements for using TorchRec Set up an environment to integrate TorchRec Run basic TorchRec code System Requirements# TorchRec is routinely tested on AWS Linux only and should work in similar environments. Below demonstrates the compatability matrix that is currently tested: Python Version 3.9, 3.10, 3.11, 3.12 Compute Platform CPU, CUDA 11.8, CUDA 12.1, CUDA 12.4 Aside from those requirements, TorchRec\u2019s core dependencies are PyTorch and FBGEMM. If your system is compatible with both libraries generally, then it should be sufficient for TorchRec. PyTorch requirements FBGEMM requirements Version Compatability# TorchRec and FBGEMM have matching version numbers that are tested together upon release: TorchRec 1.0 is compatible with FBGEMM 1.0 TorchRec 0.8 is compatible with FBGEMM 0.8 TorchRec 0.8 may not be compatible with FBGEMM 0.7 Furthermore, TorchRec and FBGEMM are released only when a new PyTorch release happens. Therefore, specific versions of TorchRec and FBGEMM should correspond to a specific PyTorch version: TorchRec 1.0 is compatible with PyTorch 2.5 TorchRec 0.8 is compatible with PyTorch 2.4 TorchRec 0.8 may not be compatible with PyTorch 2.3 Installation# Below we show installations for CUDA 12.1 as an example. For CPU, CUDA 11.8, or CUDA 12.4, swap cu121 for cpu, cu118, or cu124 respectively. Stable via pytorch.org pip install torch --index-url https://download.pytorch.org/whl/cu121 pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/cu121 pip install torchmetrics==1.0.3 pip install torchrec --index-url https://download.pytorch.org/whl/cu121 Stable via PyPI (Only for CUDA 12.4) pip install torch pip install fbgemm-gpu pip install torchrec Nightly pip install torch --index-url https://download.pytorch.org/whl/nightly/cu121 pip install fbgemm-gpu --index-url https://download.pytorch.org/whl/nightly/cu121 pip install torchmetrics==1.0.3 pip install torchrec --index-url https://download.pytorch.org/whl/nightly/cu121 Building From Source You also have the ability to build TorchRec from source to develop with the latest changes in TorchRec. To build from source, check out this reference. Run a Simple TorchRec Example# Now that we have TorchRec properly set up, let\u2019s run some TorchRec code! Below, we\u2019ll run a simple forward pass with TorchRec data types: KeyedJaggedTensor and EmbeddingBagCollection: import torch import torchrec from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor ebc = torchrec.EmbeddingBagCollection( device=\"cpu\", tables=[ torchrec.EmbeddingBagConfig( name=\"product_table\", embedding_dim=16, num_embeddings=4096, feature_names=[\"product\"], pooling=torchrec.PoolingType.SUM, ), torchrec.EmbeddingBagConfig( name=\"user_table\", embedding_dim=16, num_embeddings=4096, feature_names=[\"user\"], pooling=torchrec.PoolingType.SUM, ) ] ) product_jt = JaggedTensor( values=torch.tensor([1, 2, 1, 5]), lengths=torch.tensor([3, 1]) ) user_jt = JaggedTensor(values=torch.tensor([2, 3, 4, 1]), lengths=torch.tensor([2, 2])) # Q1: How many batches are there, and which values are in the first batch for product_jt and user_jt? kjt = KeyedJaggedTensor.from_jt_dict({\"product\": product_jt, \"user\": user_jt}) print(\"Call EmbeddingBagCollection Forward: \", ebc(kjt)) Save the above code to a file named torchrec_example.py. Then, you should be able to execute it from your terminal with: python torchrec_example.py You should see the output KeyedTensor with the resulting embeddings. Congrats! You have correctly installed and ran your first TorchRec program!",
        "author": {
          "@type": "Organization",
          "name": "PyTorch Contributors",

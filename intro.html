@@ -7,8 +7,10 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta content="TorchRec is a PyTorch domain library for scalable recommendation systems with embeddings, sharding, distributed training, and production inference." name="description" />
+<meta content="TorchRec, PyTorch, recommendation systems, embeddings, sharding, distributed training, jagged tensors, FSDP, inference, RecSys" name="keywords" />
 
-    <title>Inference &#8212; TorchRec 1.0.0 documentation</title>
+    <title>Intro &#8212; TorchRec 1.0.0 documentation</title>
   
   
   
@@ -44,10 +46,11 @@
     <script src="_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="_static/copybutton.js?v=f281be69"></script>
     <script src="_static/design-tabs.js?v=f930bc37"></script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'inference-api-reference';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'intro';</script>
     <link rel="index" title="Index" href="genindex.html" />
     <link rel="search" title="Search" href="search.html" />
-    <link rel="prev" title="Model Parallel" href="model-parallel-api-reference.html" />
+    <link rel="next" title="TorchRec Overview" href="overview.html" />
+    <link rel="prev" title="Welcome to the TorchRec documentation!" href="index.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -280,8 +283,8 @@
 <nav>
   <ul class="bd-navbar-elements navbar-nav">
     
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="intro.html">
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="#">
     Intro
   </a>
 </li>
@@ -294,7 +297,7 @@
 </li>
 
 
-<li class="nav-item current active">
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="api.html">
     API reference
   </a>
@@ -429,8 +432,8 @@ document.write(`
 <nav>
   <ul class="bd-navbar-elements navbar-nav">
     
-<li class="nav-item ">
-  <a class="nav-link nav-internal" href="intro.html">
+<li class="nav-item current active">
+  <a class="nav-link nav-internal" href="#">
     Intro
   </a>
 </li>
@@ -443,7 +446,7 @@ document.write(`
 </li>
 
 
-<li class="nav-item current active">
+<li class="nav-item ">
   <a class="nav-link nav-internal" href="api.html">
     API reference
   </a>
@@ -552,12 +555,10 @@ document.write(`
 <nav class="bd-docs-nav bd-links"
      aria-label="Section Navigation">
   <p class="bd-links__title" role="heading" aria-level="1">Section Navigation</p>
-  <div class="bd-toc-item navbar-nav"><ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="datatypes-api-reference.html">Data Types</a></li>
-<li class="toctree-l1"><a class="reference internal" href="modules-api-reference.html">Modules</a></li>
-<li class="toctree-l1"><a class="reference internal" href="planner-api-reference.html">Planner</a></li>
-<li class="toctree-l1"><a class="reference internal" href="model-parallel-api-reference.html">Model Parallel</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Inference</a></li>
+  <div class="bd-toc-item navbar-nav"><ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">TorchRec Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="high-level-arch.html">TorchRec High Level Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="concepts.html">TorchRec Concepts</a></li>
 </ul>
 </div>
 </nav></div>
@@ -595,10 +596,7 @@ document.write(`
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    
-    <li class="breadcrumb-item"><a href="api.html" class="nav-link">API reference</a></li>
-    
-    <li class="breadcrumb-item active" aria-current="page">Inference</li>
+    <li class="breadcrumb-item active" aria-current="page">Intro</li>
   </ul>
 </nav>
 </div>
@@ -640,14 +638,8 @@ document.write(`
     <div style="display:none;" itemscope itemtype="https://schema.org/BreadcrumbList">
       
       <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
-        <link itemprop="item" href="api.html">
-        <meta itemprop="name" content="API reference">
+        <meta itemprop="name" content="Intro">
         <meta itemprop="position" content="1">
-      </div>
-      
-      <div itemprop="itemListElement" itemscope itemtype="https://schema.org/ListItem">
-        <meta itemprop="name" content="Inference">
-        <meta itemprop="position" content="2">
       </div>
     </div>
 
@@ -660,102 +652,40 @@ document.write(`
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="inference">
-<h1>Inference<a class="headerlink" href="#inference" title="Link to this heading">#</a></h1>
-<p>TorchRec provides easy-to-use APIs for transforming an authored TorchRec model
-into an optimized inference model for distributed inference, via eager module swaps.</p>
-<p>This transforms TorchRec modules like <code class="docutils literal notranslate"><span class="pre">EmbeddingBagCollection</span></code> in the model to
-a quantized, sharded version that can be compiled using torch.fx and TorchScript
-for inference in a C++ environment.</p>
-<p>The intended use is calling <code class="docutils literal notranslate"><span class="pre">quantize_inference_model</span></code> on the model followed by
-<code class="docutils literal notranslate"><span class="pre">shard_quant_model</span></code>.</p>
-<dl class="py function" id="module-torchrec.inference.modules">
-<dt class="sig sig-object py" id="torchrec.inference.modules.quantize_inference_model">
-<span class="sig-prename descclassname"><span class="pre">torchrec.inference.modules.</span></span><span class="sig-name descname"><span class="pre">quantize_inference_model</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Module</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">quantization_mapping</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">Type</span><span class="p"><span class="pre">[</span></span><span class="pre">Module</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">per_table_weight_dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">dtype</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">fp_weight_dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dtype</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">torch.int8</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">quantization_dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dtype</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">torch.int8</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">output_dtype</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">dtype</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">torch.float32</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">Module</span></span></span><a class="headerlink" href="#torchrec.inference.modules.quantize_inference_model" title="Link to this definition">#</a></dt>
-<dd><p>Quantize the model, module swapping TorchRec train modules with its
-quantized counterpart, (e.g. EmbeddingBagCollection -&gt; QuantEmbeddingBagCollection).</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>model</strong> (<em>torch.nn.Module</em>) – the model to be quantized</p></li>
-<li><p><strong>quantization_mapping</strong> (<em>Optional</em><em>[</em><em>Dict</em><em>[</em><em>str</em><em>, </em><em>Type</em><em>[</em><em>torch.nn.Module</em><em>]</em><em>]</em><em>]</em>) – a mapping from
-the original module type to the quantized module type. If not provided, the default mapping will be used:
-(EmbeddingBagCollection -&gt; QuantEmbeddingBagCollection, EmbeddingCollection -&gt; QuantEmbeddingCollection).</p></li>
-<li><p><strong>per_table_weight_dtype</strong> (<em>Optional</em><em>[</em><em>Dict</em><em>[</em><em>str</em><em>, </em><em>torch.dtype</em><em>]</em><em>]</em>) – a mapping from table name to weight dtype.
-If not provided, the default quantization dtype will be used (int8).</p></li>
-<li><p><strong>fp_weight_dtype</strong> (<em>torch.dtype</em>) – the desired quantized dtype for feature processor weights in
-FeatureProcessedEmbeddingBagCollection if used. Default is int8.</p></li>
+  <section id="intro">
+<h1>Intro<a class="headerlink" href="#intro" title="Link to this heading">#</a></h1>
+<p>TorchRec is a PyTorch domain library for building and scaling recommendation systems. It provides composable building blocks for industry-scale RecSys workloads, with a focus on sparse features, embedding tables, sharding, distributed training, and inference.</p>
+<p>Key capabilities of TorchRec include:
+- <strong>Embedding modules:</strong> High-performance embedding bags and tables optimized for sparse categorical features.
+- <strong>Sharding and parallelism:</strong> Built-in support for model, table, and row-wise sharding across GPUs and nodes.
+- <strong>Distributed training:</strong> Integrations with PyTorch Distributed and FSDP to train massive models efficiently.
+- <strong>Feature processing:</strong> Utilities for jagged tensors, pooling, and common RecSys data structures.</p>
+<div class="toctree-wrapper compound">
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="overview.html">TorchRec Overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="overview.html#why-torchrec">Why TorchRec?</a></li>
 </ul>
-</dd>
-<dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>the quantized model</p>
-</dd>
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>torch.nn.Module</p>
-</dd>
-</dl>
-<p>Example:</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">ebc</span> <span class="o">=</span> <span class="n">EmbeddingBagCollection</span><span class="p">(</span><span class="n">tables</span><span class="o">=</span><span class="n">eb_configs</span><span class="p">,</span> <span class="n">device</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">device</span><span class="p">(</span><span class="s2">&quot;meta&quot;</span><span class="p">))</span>
-
-<span class="n">module</span> <span class="o">=</span> <span class="n">DLRMPredictModule</span><span class="p">(</span>
-    <span class="n">embedding_bag_collection</span><span class="o">=</span><span class="n">ebc</span><span class="p">,</span>
-    <span class="n">dense_in_features</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">dense_in_features</span><span class="p">,</span>
-    <span class="n">dense_arch_layer_sizes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">dense_arch_layer_sizes</span><span class="p">,</span>
-    <span class="n">over_arch_layer_sizes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">over_arch_layer_sizes</span><span class="p">,</span>
-    <span class="n">id_list_features_keys</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">model_config</span><span class="o">.</span><span class="n">id_list_features_keys</span><span class="p">,</span>
-    <span class="n">dense_device</span><span class="o">=</span><span class="n">device</span><span class="p">,</span>
-<span class="p">)</span>
-
-<span class="n">quant_model</span> <span class="o">=</span> <span class="n">quantize_inference_model</span><span class="p">(</span><span class="n">module</span><span class="p">)</span>
-</pre></div>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="high-level-arch.html">TorchRec High Level Architecture</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="high-level-arch.html#torchrec-s-parallelism-strategy-model-parallelism">TorchRec’s Parallelism Strategy: Model Parallelism</a></li>
+<li class="toctree-l2"><a class="reference internal" href="high-level-arch.html#embedding-tables">Embedding Tables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="high-level-arch.html#see-also">See also</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="concepts.html">TorchRec Concepts</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="concepts.html#jaggedtensor">JaggedTensor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="concepts.html#keyedjaggedtensor">KeyedJaggedTensor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="concepts.html#planner">Planner</a></li>
+<li class="toctree-l2"><a class="reference internal" href="concepts.html#sharding-of-embeddingtables">Sharding of EmbeddingTables</a></li>
+<li class="toctree-l2"><a class="reference internal" href="concepts.html#distributed-training-with-torchrec-sharded-modules">Distributed Training with TorchRec Sharded Modules</a></li>
+<li class="toctree-l2"><a class="reference internal" href="concepts.html#distributedmodelparallel">DistributedModelParallel</a></li>
+<li class="toctree-l2"><a class="reference internal" href="concepts.html#optimizer">Optimizer</a></li>
+<li class="toctree-l2"><a class="reference internal" href="concepts.html#inference">Inference</a></li>
+<li class="toctree-l2"><a class="reference internal" href="concepts.html#see-also">See Also</a></li>
+</ul>
+</li>
+</ul>
 </div>
-</dd></dl>
-
-<dl class="py function">
-<dt class="sig sig-object py" id="torchrec.inference.modules.shard_quant_model">
-<span class="sig-prename descclassname"><span class="pre">torchrec.inference.modules.</span></span><span class="sig-name descname"><span class="pre">shard_quant_model</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Module</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">world_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">1</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">compute_device</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'cuda'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sharding_device</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">str</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">'meta'</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sharders</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">List</span><span class="p"><span class="pre">[</span></span><span class="pre">ModuleSharder</span><span class="p"><span class="pre">[</span></span><span class="pre">Module</span><span class="p"><span class="pre">]</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">device_memory_size</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">constraints</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Dict</span><span class="p"><span class="pre">[</span></span><span class="pre">str</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="pre">ParameterConstraints</span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">ddr_cap</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sharding_plan</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><a class="reference internal" href="planner-api-reference.html#torchrec.distributed.types.ShardingPlan" title="torchrec.distributed.types.ShardingPlan"><span class="pre">ShardingPlan</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span> <span class="sig-return"><span class="sig-return-icon">&#x2192;</span> <span class="sig-return-typehint"><span class="pre">Tuple</span><span class="p"><span class="pre">[</span></span><span class="pre">Module</span><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference internal" href="planner-api-reference.html#torchrec.distributed.types.ShardingPlan" title="torchrec.distributed.types.ShardingPlan"><span class="pre">ShardingPlan</span></a><span class="p"><span class="pre">]</span></span></span></span><a class="headerlink" href="#torchrec.inference.modules.shard_quant_model" title="Link to this definition">#</a></dt>
-<dd><p>Shard a quantized TorchRec model, used for generating the most optimal model for inference and
-necessary for distributed inference.</p>
-<dl class="field-list simple">
-<dt class="field-odd">Parameters<span class="colon">:</span></dt>
-<dd class="field-odd"><ul class="simple">
-<li><p><strong>model</strong> (<em>torch.nn.Module</em>) – the quantized model to be sharded</p></li>
-<li><p><strong>world_size</strong> (<em>int</em>) – the number of devices to shard the model, default to 1</p></li>
-<li><p><strong>compute_device</strong> (<em>str</em>) – the device to run the model, default to “cuda”</p></li>
-<li><p><strong>sharding_device</strong> (<em>str</em>) – the device to run the sharding, default to “meta”</p></li>
-<li><p><strong>sharders</strong> (<em>Optional</em><em>[</em><em>List</em><em>[</em><em>ModuleSharder</em><em>[</em><em>torch.nn.Module</em><em>]</em><em>]</em><em>]</em>) – sharders to use for sharding
-quantized model, default to QuantEmbeddingBagCollectionSharder, QuantEmbeddingCollectionSharder,
-QuantFeatureProcessedEmbeddingBagCollectionSharder.</p></li>
-<li><p><strong>device_memory_size</strong> (<em>Optional</em><em>[</em><em>int</em><em>]</em>) – the memory limit for cuda devices, default to None</p></li>
-<li><p><strong>constraints</strong> (<em>Optional</em><em>[</em><em>Dict</em><em>[</em><em>str</em><em>, </em><em>ParameterConstraints</em><em>]</em><em>]</em>) – constraints to use for sharding, default to None
-which will then implement default constraints with QuantEmbeddingBagCollection being sharded TableWise</p></li>
-</ul>
-</dd>
-<dt class="field-even">Returns<span class="colon">:</span></dt>
-<dd class="field-even"><p>the sharded model and the sharding plan</p>
-</dd>
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>Tuple[torch.nn.Module, <a class="reference internal" href="planner-api-reference.html#torchrec.distributed.types.ShardingPlan" title="torchrec.distributed.types.ShardingPlan">ShardingPlan</a>]</p>
-</dd>
-</dl>
-<dl>
-<dt>Example::</dt><dd><p>ebc = EmbeddingBagCollection(tables=eb_configs, device=torch.device(“meta”))</p>
-<dl class="simple">
-<dt>module = DLRMPredictModule(</dt><dd><p>embedding_bag_collection=ebc,
-dense_in_features=self.model_config.dense_in_features,
-dense_arch_layer_sizes=self.model_config.dense_arch_layer_sizes,
-over_arch_layer_sizes=self.model_config.over_arch_layer_sizes,
-id_list_features_keys=self.model_config.id_list_features_keys,
-dense_device=device,</p>
-</dd>
-</dl>
-<p>)</p>
-<p>quant_model = quantize_inference_model(module)
-sharded_model, _ = shard_quant_model(quant_model)</p>
-</dd>
-</dl>
-</dd></dl>
-
 </section>
 
 
@@ -801,13 +731,22 @@ sharded_model, _ = shard_quant_model(quant_model)</p>
 
 <div class="prev-next-area">
     <a class="left-prev"
-       href="model-parallel-api-reference.html"
+       href="index.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Model Parallel</p>
+        <p class="prev-next-title">Welcome to the TorchRec documentation!</p>
       </div>
+    </a>
+    <a class="right-next"
+       href="overview.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">TorchRec Overview</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
     </a>
 </div>
 
@@ -831,13 +770,22 @@ sharded_model, _ = shard_quant_model(quant_model)</p>
                   
 <div class="prev-next-area">
     <a class="left-prev"
-       href="model-parallel-api-reference.html"
+       href="index.html"
        title="previous page">
       <i class="fa-solid fa-angle-left"></i>
       <div class="prev-next-info">
         <p class="prev-next-subtitle">previous</p>
-        <p class="prev-next-title">Model Parallel</p>
+        <p class="prev-next-title">Welcome to the TorchRec documentation!</p>
       </div>
+    </a>
+    <a class="right-next"
+       href="overview.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">TorchRec Overview</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
     </a>
 </div>
                 </footer>
@@ -850,23 +798,10 @@ sharded_model, _ = shard_quant_model(quant_model)</p>
 <div class="sidebar-secondary-items sidebar-secondary__inner">
     
        <div class="sidebar-secondary-item">
-<div
-    id="pst-page-navigation-heading-2"
-    class="page-toc tocsection onthispage">
-    <i class="fa-solid fa-list"></i> On this page
-  </div>
-  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
-    <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#torchrec.inference.modules.quantize_inference_model"><code class="docutils literal notranslate"><span class="pre">quantize_inference_model()</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#torchrec.inference.modules.shard_quant_model"><code class="docutils literal notranslate"><span class="pre">shard_quant_model()</span></code></a></li>
-</ul>
-  </nav></div>
-    
-       <div class="sidebar-secondary-item">
 
   
   <div class="tocsection editthispage">
-    <a href="https://github.com/meta-pytorch/torchrec/edit/main/docs/source/inference-api-reference.rst">
+    <a href="https://github.com/meta-pytorch/torchrec/edit/main/docs/source/intro.rst">
       <i class="fa-solid fa-pencil"></i>
       
       
@@ -880,7 +815,7 @@ sharded_model, _ = shard_quant_model(quant_model)</p>
     
        <div class="sidebar-secondary-item">
     <div class="tocsection sourcelink">
-      <a href="_sources/inference-api-reference.rst.txt">
+      <a href="_sources/intro.rst.txt">
         <i class="fa-solid fa-file-lines"></i> Show Source
       </a>
     </div>
@@ -999,11 +934,11 @@ sharded_model, _ = shard_quant_model(quant_model)</p>
     {
        "@context": "https://schema.org",
        "@type": "Article",
-       "name": "Inference",
-       "headline": "Inference",
+       "name": "Intro",
+       "headline": "Intro",
        "description": "PyTorch Documentation. Explore PyTorch, an open-source machine learning library that accelerates the path from research prototyping to production deployment. Discover tutorials, API references, and guides to help you build and deploy deep learning models efficiently.",
-       "url": "/inference-api-reference.html",
-       "articleBody": "Inference# TorchRec provides easy-to-use APIs for transforming an authored TorchRec model into an optimized inference model for distributed inference, via eager module swaps. This transforms TorchRec modules like EmbeddingBagCollection in the model to a quantized, sharded version that can be compiled using torch.fx and TorchScript for inference in a C++ environment. The intended use is calling quantize_inference_model on the model followed by shard_quant_model. torchrec.inference.modules.quantize_inference_model(model: Module, quantization_mapping: Dict[str, Type[Module]] | None = None, per_table_weight_dtype: Dict[str, dtype] | None = None, fp_weight_dtype: dtype = torch.int8, quantization_dtype: dtype = torch.int8, output_dtype: dtype = torch.float32) \u2192 Module# Quantize the model, module swapping TorchRec train modules with its quantized counterpart, (e.g. EmbeddingBagCollection -\u003e QuantEmbeddingBagCollection). Parameters: model (torch.nn.Module) \u2013 the model to be quantized quantization_mapping (Optional[Dict[str, Type[torch.nn.Module]]]) \u2013 a mapping from the original module type to the quantized module type. If not provided, the default mapping will be used: (EmbeddingBagCollection -\u003e QuantEmbeddingBagCollection, EmbeddingCollection -\u003e QuantEmbeddingCollection). per_table_weight_dtype (Optional[Dict[str, torch.dtype]]) \u2013 a mapping from table name to weight dtype. If not provided, the default quantization dtype will be used (int8). fp_weight_dtype (torch.dtype) \u2013 the desired quantized dtype for feature processor weights in FeatureProcessedEmbeddingBagCollection if used. Default is int8. Returns: the quantized model Return type: torch.nn.Module Example: ebc = EmbeddingBagCollection(tables=eb_configs, device=torch.device(\"meta\")) module = DLRMPredictModule( embedding_bag_collection=ebc, dense_in_features=self.model_config.dense_in_features, dense_arch_layer_sizes=self.model_config.dense_arch_layer_sizes, over_arch_layer_sizes=self.model_config.over_arch_layer_sizes, id_list_features_keys=self.model_config.id_list_features_keys, dense_device=device, ) quant_model = quantize_inference_model(module) torchrec.inference.modules.shard_quant_model(model: Module, world_size: int = 1, compute_device: str = \u0027cuda\u0027, sharding_device: str = \u0027meta\u0027, sharders: List[ModuleSharder[Module]] | None = None, device_memory_size: int | None = None, constraints: Dict[str, ParameterConstraints] | None = None, ddr_cap: int | None = None, sharding_plan: ShardingPlan | None = None) \u2192 Tuple[Module, ShardingPlan]# Shard a quantized TorchRec model, used for generating the most optimal model for inference and necessary for distributed inference. Parameters: model (torch.nn.Module) \u2013 the quantized model to be sharded world_size (int) \u2013 the number of devices to shard the model, default to 1 compute_device (str) \u2013 the device to run the model, default to \u201ccuda\u201d sharding_device (str) \u2013 the device to run the sharding, default to \u201cmeta\u201d sharders (Optional[List[ModuleSharder[torch.nn.Module]]]) \u2013 sharders to use for sharding quantized model, default to QuantEmbeddingBagCollectionSharder, QuantEmbeddingCollectionSharder, QuantFeatureProcessedEmbeddingBagCollectionSharder. device_memory_size (Optional[int]) \u2013 the memory limit for cuda devices, default to None constraints (Optional[Dict[str, ParameterConstraints]]) \u2013 constraints to use for sharding, default to None which will then implement default constraints with QuantEmbeddingBagCollection being sharded TableWise Returns: the sharded model and the sharding plan Return type: Tuple[torch.nn.Module, ShardingPlan] Example::ebc = EmbeddingBagCollection(tables=eb_configs, device=torch.device(\u201cmeta\u201d)) module = DLRMPredictModule(embedding_bag_collection=ebc, dense_in_features=self.model_config.dense_in_features, dense_arch_layer_sizes=self.model_config.dense_arch_layer_sizes, over_arch_layer_sizes=self.model_config.over_arch_layer_sizes, id_list_features_keys=self.model_config.id_list_features_keys, dense_device=device, ) quant_model = quantize_inference_model(module) sharded_model, _ = shard_quant_model(quant_model)",
+       "url": "/intro.html",
+       "articleBody": "Intro# TorchRec is a PyTorch domain library for building and scaling recommendation systems. It provides composable building blocks for industry-scale RecSys workloads, with a focus on sparse features, embedding tables, sharding, distributed training, and inference. Key capabilities of TorchRec include: - Embedding modules: High-performance embedding bags and tables optimized for sparse categorical features. - Sharding and parallelism: Built-in support for model, table, and row-wise sharding across GPUs and nodes. - Distributed training: Integrations with PyTorch Distributed and FSDP to train massive models efficiently. - Feature processing: Utilities for jagged tensors, pooling, and common RecSys data structures. TorchRec Overview Why TorchRec? TorchRec High Level Architecture TorchRec\u2019s Parallelism Strategy: Model Parallelism Embedding Tables See also TorchRec Concepts JaggedTensor KeyedJaggedTensor Planner Sharding of EmbeddingTables Distributed Training with TorchRec Sharded Modules DistributedModelParallel Optimizer Inference See Also",
        "author": {
          "@type": "Organization",
          "name": "PyTorch Contributors",
@@ -1012,7 +947,7 @@ sharded_model, _ = shard_quant_model(quant_model)</p>
        "image": "https://pytorch.org/docs/stable/_static/img/pytorch_seo.png",
        "mainEntityOfPage": {
          "@type": "WebPage",
-         "@id": "/inference-api-reference.html"
+         "@id": "/intro.html"
        },
        "datePublished": "2023-01-01T00:00:00Z",
        "dateModified": "2023-01-01T00:00:00Z"

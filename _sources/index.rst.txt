@@ -4,8 +4,8 @@
    contain the root `toctree` directive.
 
 .. meta::
-   :description: TorchRec documentation homepage
-   :keywords: recommendation systems, sharding, distributed training
+   :description: TorchRec — PyTorch library for large-scale recommendation systems with embedding sharding, distributed training, and high-performance inference
+   :keywords: TorchRec, PyTorch, recommendation systems, sharding, distributed training
 
 Welcome to the TorchRec documentation!
 ======================================
@@ -26,7 +26,6 @@ Topics in this section will help you get started with TorchRec.
 
      .. grid-item-card:: :octicon:`file-code;1em`
         TorchRec Overview
-        :img-top: _static/img/card-background.svg
         :link: overview.html
         :link-type: url
 
@@ -34,7 +33,6 @@ Topics in this section will help you get started with TorchRec.
 
      .. grid-item-card:: :octicon:`file-code;1em`
         Set up TorchRec
-        :img-top: _static/img/card-background.svg
         :link: setup-torchrec.html
         :link-type: url
 
@@ -43,7 +41,6 @@ Topics in this section will help you get started with TorchRec.
 
      .. grid-item-card:: :octicon:`file-code;1em`
         Getting Started with TorchRec Tutorial
-        :img-top: _static/img/card-background.svg
         :link: https://colab.research.google.com/github/pytorch/torchrec/blob/main/Torchrec_Introduction.ipynb
         :link-type: url
 
@@ -72,40 +69,20 @@ how you can contribute:
    documentation, your contributions are always welcome! Please make sure to
    review our `CONTRIBUTING.md <https://github.com/pytorch/torchrec/blob/main/CONTRIBUTING.md>`__
 
-|
-|
+.. toctree::
+   :maxdepth: 1
+   :hidden:
 
-.. container:: center-content
-
-   .. button-link:: https://github.com/pytorch/torchrec
-      :color: info
-
-      :octicon:`mark-github` Go to TorchRec Repo
-
+   intro
 
 .. toctree::
    :maxdepth: 1
-   :caption: Introduction
    :hidden:
 
-   overview.rst
-   high-level-arch.rst
-   concepts.rst
-
-.. toctree::
-   :maxdepth: 1
-   :caption: Getting Started
-   :hidden:
-
-   setup-torchrec.rst
+   setup-torchrec
 
 .. toctree::
    :maxdepth: 2
-   :caption: API References
    :hidden:
 
-   datatypes-api-reference.rst
-   modules-api-reference.rst
-   planner-api-reference.rst
-   model-parallel-api-reference.rst
-   inference-api-reference.rst
+   api
