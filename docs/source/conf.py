@@ -20,7 +20,7 @@
 import os
 import sys
 
-import pytorch_sphinx_theme
+import pytorch_sphinx_theme2
 
 current_dir = os.path.dirname(__file__)
 target_dir = os.path.abspath(os.path.join(current_dir, "../.."))
@@ -74,24 +74,61 @@ exclude_patterns = []
 # a list of builtin themes.
 #
 # html_theme = 'alabaster'
-html_theme = "pytorch_sphinx_theme"
-html_theme_path = [pytorch_sphinx_theme.get_html_theme_path()]
+html_theme = "pytorch_sphinx_theme2"
+html_theme_path = [pytorch_sphinx_theme2.get_html_theme_path()]
 
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
-#
+
+theme_variables = pytorch_sphinx_theme2.get_theme_variables()
+
 html_theme_options = {
-    "pytorch_project": "torchrec",
-    "display_version": True,
-    "logo_only": True,
-    "collapse_navigation": False,
-    "includehidden": True,
+    "navigation_with_keys": False,
+    "show_lf_header": False,
+    "show_lf_footer": False,
+    "logo": {"text": "Home"},
+    "analytics_id": "GTM-NPLPKN5G",
+    "canonical_url": "https://meta-pytorch.org/torchrec",
+    "icon_links": [
+        {
+            "name": "X",
+            "url": "https://x.com/PyTorch",
+            "icon": "fa-brands fa-x-twitter",
+        },
+        {
+            "name": "GitHub",
+            "url": "https://github.com/meta-pytorch/torchrec",
+            "icon": "fa-brands fa-github",
+        },
+        {
+            "name": "Discourse",
+            "url": "https://dev-discuss.pytorch.org/",
+            "icon": "fa-brands fa-discourse",
+        },
+        {
+            "name": "PyPi",
+            "url": "https://pypi.org/project/torchrec/",
+            "icon": "fa-brands fa-python",
+        },
+    ],
+    "use_edit_page_button": True,
+    "navbar_center": "navbar-nav",
 }
 
-# Add any paths that contain custom static files (such as style sheets) here,
-# relative to this directory. They are copied after the builtin static files,
-# so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ["_static"]
+html_context = {
+    "theme_variables": theme_variables,
+    "display_github": True,
+    "github_url": "https://github.com",
+    "github_user": "meta-pytorch",
+    "github_repo": "torchrec",
+    "feedback_url": "https://github.com/meta-pytorch/torchrec",
+    "github_version": "main",
+    "doc_path": "docs/source",
+}
 
-html_css_files = ["css/custom.css"]
+
+templates_path = [
+    "_templates",
+    os.path.join(os.path.dirname(pytorch_sphinx_theme2.__file__), "templates"),
+]
