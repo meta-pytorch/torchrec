@@ -2,6 +2,12 @@ name: Build Linux Wheels
 
 on:
   pull_request:
+    paths-ignore:
+      - "docs/*"
+      - "third_party/*"
+      - .gitignore
+      - "*.md"
+      - ".github/workflows/[cdprvu]*.yml"
   push:
     branches:
       - nightly

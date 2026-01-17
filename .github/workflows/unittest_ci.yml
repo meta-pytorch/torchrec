@@ -14,12 +14,16 @@ on:
       - "third_party/*"
       - .gitignore
       - "*.md"
+      - ".github/workflows/[bcdprv]*.yml"
+      - ".github/workflows/unittest_ci_cpu.yml"
   pull_request:
     paths-ignore:
       - "docs/*"
       - "third_party/*"
       - .gitignore
       - "*.md"
+      - ".github/workflows/[bcdprv]*.yml"
+      - ".github/workflows/unittest_ci_cpu.yml"
   workflow_dispatch:
     inputs:
       channel:
