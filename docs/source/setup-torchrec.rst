@@ -1,7 +1,10 @@
+.. meta::
+   :description: Learn how to set up TorchRec, review system and version compatibility with PyTorch and FBGEMM, install via stable/nightly/source options, and run a simple EmbeddingBagCollection example.
+   :keywords: TorchRec, PyTorch, FBGEMM, recommender systems, installation, CUDA, CPU, setup, EmbeddingBagCollection, KeyedJaggedTensor, JaggedTensor
 
-===================
-Setting up TorchRec
-===================
+
+Setup
+=====
 
 In this section, we will:
 
