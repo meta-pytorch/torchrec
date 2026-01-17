@@ -383,7 +383,12 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         return copy_dmp
 
     def _init_dmp(self, module: nn.Module) -> nn.Module:
-        module_id_cache: Dict[int, ShardedModule] = {}
+        if torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:enable_module_id_cache_for_dmp_shard_modules"
+        ):
+            module_id_cache: Dict[int, ShardedModule] = {}
+        else:
+            module_id_cache = None
         return self._shard_modules_impl(module, module_id_cache=module_id_cache)
 
     def _init_delta_tracker(
@@ -409,16 +414,37 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         )
 
     def _init_optim(self, module: nn.Module) -> CombinedOptimizer:
+        if torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:enable_module_id_cache_for_dmp_shard_modules"
+        ):
+            module_id_cache: Dict[int, KeyedOptimizer] = {}
+        else:
+            module_id_cache = None
         # pyre-ignore [6]
-        return CombinedOptimizer(self._fused_optim_impl(module, []))
+        return CombinedOptimizer(
+            self._fused_optim_impl(module, [], module_id_cache=module_id_cache)
+        )
 
     def _fused_optim_impl(
         self,
         module: nn.Module,
         fused_optims: List[Tuple[str, KeyedOptimizer]],
         path: str = "",
+        module_id_cache: Optional[Dict[str, KeyedOptimizer]] = None,
     ) -> List[Tuple[str, KeyedOptimizer]]:
         if isinstance(module, FusedOptimizerModule):
+            if module_id_cache is not None:
+                module_id = id(module)
+                if module_id in module_id_cache:
+                    # This module's optimizer was already added at a different path.
+                    # Skip adding it again to avoid duplicate optimizer state in
+                    # CombinedOptimizer, which would cause save/load asymmetry.
+                    logger.error(
+                        f"Module {path} optimizer already collected "
+                        f"(module ID {module_id} at different path)"
+                    )
+                    return fused_optims
+                module_id_cache[module_id] = module.fused_optimizer
             fused_optims.append((path, module.fused_optimizer))
             return fused_optims
 
@@ -427,6 +453,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
                 child,
                 fused_optims,
                 path + "." + name if path else name,
+                module_id_cache,
             )
         return fused_optims
 

@@ -2072,7 +2072,7 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
         self._stage_outputs[batch_offset] = new_result
         if self._debug_mode:
             logger.info(
-                f"Finshed ## Pipeline Stage {stage_idx} : {stage.name} for batch {batch_offset + self._num_steps} ##",
+                f"Finished ## Pipeline Stage {stage_idx} : {stage.name} for batch {batch_offset + self._num_steps} ##",
             )
 
         if fill and (fill_callback := stage.fill_callback) is not None:
