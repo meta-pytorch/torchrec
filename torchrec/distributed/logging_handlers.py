@@ -6,10 +6,15 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+from collections import defaultdict
 
 
 __all__: list[str] = []
 
-_log_handlers: dict[str, logging.Handler] = {
-    "default": logging.NullHandler(),
-}
+_NoFilterLogger = "_NoFilterLogger"
+SingleRankStaticLogger = "SingleRankStaticLogger"
+AllRankStaticLogger = "AllRankStaticLogger"
+CappedLogger = "CappedLogger"
+MethodLogger = "MethodLogger"
+
+_log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)

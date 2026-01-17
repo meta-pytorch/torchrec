@@ -7,20 +7,29 @@
 
 # pyre-strict
 
+import logging
 import unittest
 from typing import Any
 from unittest import mock
 
-from torchrec.distributed.logger import _get_input_from_func, _torchrec_method_logger
+import torch.distributed as dist
+from torchrec.distributed.logger import (
+    _get_input_from_func,
+    _get_logging_handler,
+    _get_msg_dict,
+    _get_or_create_logger,
+    _torchrec_method_logger,
+)
+from torchrec.distributed.logging_handlers import _log_handlers, SingleRankStaticLogger
 
 
-class TestLogger(unittest.TestCase):
+class TestMethodLogger(unittest.TestCase):
     def setUp(self) -> None:
         super().setUp()
 
-        # Mock torchrec_logger._get_msg_dict
+        # Mock logger._get_msg_dict
         self.get_msg_dict_patcher = mock.patch(
-            "torchrec.distributed.torchrec_logger._get_msg_dict"
+            "torchrec.distributed.logger._get_msg_dict"
         )
         self.mock_get_msg_dict = self.get_msg_dict_patcher.start()
 
@@ -30,8 +39,8 @@ class TestLogger(unittest.TestCase):
 
         self.mock_get_msg_dict.side_effect = mock_get_msg_dict_impl
 
-        # Mock _torchrec_logger
-        self.logger_patcher = mock.patch("torchrec.distributed.logger._torchrec_logger")
+        # Mock method_logger
+        self.logger_patcher = mock.patch("torchrec.distributed.logger.method_logger")
         self.mock_logger = self.logger_patcher.start()
 
     def tearDown(self) -> None:
@@ -110,8 +119,8 @@ class TestLogger(unittest.TestCase):
         self.mock_get_msg_dict.assert_called_once_with("mock_func", key="value")
 
         # Verify that the logger was called with the correct message
-        self.mock_logger.debug.assert_called_once()
-        msg_dict = self.mock_logger.debug.call_args[0][0]
+        self.mock_logger.info.assert_called_once()
+        msg_dict = self.mock_logger.info.call_args[0][0]
         self.assertEqual(msg_dict["output"], "result")
 
     def test_torchrec_method_logger_exception(self) -> None:
@@ -154,8 +163,8 @@ class TestLogger(unittest.TestCase):
         self.mock_get_msg_dict.assert_called_once_with("mock_func", key="value")
 
         # Verify that the logger was called with the correct message
-        self.mock_logger.debug.assert_called_once()
-        msg_dict = self.mock_logger.debug.call_args[0][0]
+        self.mock_logger.info.assert_called_once()
+        msg_dict = self.mock_logger.info.call_args[0][0]
         self.assertEqual(msg_dict["output"], "result")
 
     def test_torchrec_method_logger_constructor_with_args(self) -> None:
@@ -170,8 +179,8 @@ class TestLogger(unittest.TestCase):
         _ = TestClass(42, "hello")
 
         # Verify that the logger was called
-        self.mock_logger.debug.assert_called_once()
-        msg_dict = self.mock_logger.debug.call_args[0][0]
+        self.mock_logger.info.assert_called_once()
+        msg_dict = self.mock_logger.info.call_args[0][0]
         # Verify that class name was prepended to function name
         self.assertEqual(msg_dict["func_name"], "TestClass.__init__")
         # Verify the input contains the arguments
@@ -194,8 +203,8 @@ class TestLogger(unittest.TestCase):
         _ = TestClass(42, "hello", "extra", key="value")
 
         # Verify that the logger was called
-        self.mock_logger.debug.assert_called_once()
-        msg_dict = self.mock_logger.debug.call_args[0][0]
+        self.mock_logger.info.assert_called_once()
+        msg_dict = self.mock_logger.info.call_args[0][0]
         # Verify that class name was prepended to function name
         self.assertEqual(msg_dict["func_name"], "TestClass.__init__")
         # Verify the input contains the arguments
@@ -210,5 +219,103 @@ class TestLogger(unittest.TestCase):
         self.assertIn("value", msg_dict["input"])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestLoggerUtils(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # Save the original _log_handlers to restore it after tests
+        self.original_log_handlers = _log_handlers.copy()
+
+        # Create a mock logging handler
+        self.mock_handler = mock.MagicMock(spec=logging.Handler)
+        _log_handlers[SingleRankStaticLogger] = self.mock_handler
+
+    def tearDown(self) -> None:
+        # Restore the original _log_handlers
+        _log_handlers.clear()
+        _log_handlers.update(self.original_log_handlers)
+        super().tearDown()
+
+    def test_get_logging_handler(self) -> None:
+        """Test _get_logging_handler function."""
+        # Test with SingleRankStaticLogger destination
+        handler = _get_logging_handler(SingleRankStaticLogger)
+        self.assertEqual(handler, self.mock_handler)
+
+        # Test with custom destination
+        custom_dest = "custom_dest"
+        custom_handler = mock.MagicMock(spec=logging.Handler)
+        _log_handlers[custom_dest] = custom_handler
+
+        handler = _get_logging_handler(custom_dest)
+        self.assertEqual(handler, custom_handler)
+
+    @mock.patch("logging.getLogger")
+    def test_get_or_create_logger(self, mock_get_logger: mock.MagicMock) -> None:
+        """Test _get_or_create_logger function."""
+        mock_logger = mock.MagicMock(spec=logging.Logger)
+        mock_get_logger.return_value = mock_logger
+
+        # Test with SingleRankStaticLogger destination
+        logger = _get_or_create_logger(SingleRankStaticLogger)
+
+        # Verify logger was created with the correct name
+        logger_name = f"{SingleRankStaticLogger}-{self.mock_handler.__class__.__name__}"
+        mock_get_logger.assert_called_once_with(logger_name)
+
+        # Verify logger was configured correctly
+        mock_logger.setLevel.assert_called_once_with(logging.DEBUG)
+        mock_logger.addHandler.assert_called_once_with(self.mock_handler)
+        self.assertFalse(mock_logger.propagate)
+
+        # Verify formatter was set on the handler
+        self.mock_handler.setFormatter.assert_called_once()
+        formatter = self.mock_handler.setFormatter.call_args[0][0]
+        self.assertIsInstance(formatter, logging.Formatter)
+
+        # Verify logger is returned
+        self.assertEqual(logger, mock_logger)
+
+    def test_get_msg_dict_without_dist(self) -> None:
+        """Test _get_msg_dict function without dist initialized."""
+        # Mock dist.is_initialized to return False
+        with mock.patch.object(dist, "is_initialized", return_value=False):
+            msg_dict = _get_msg_dict("test_func", kwarg1="val1")
+
+            # Verify msg_dict contains only func_name
+            self.assertEqual(len(msg_dict), 1)
+            self.assertEqual(msg_dict["func_name"], "test_func")
+
+    def test_get_msg_dict_with_dist(self) -> None:
+        """Test _get_msg_dict function with dist initialized."""
+        # Mock dist functions
+        with mock.patch.object(dist, "is_initialized", return_value=True):
+            with mock.patch.object(dist, "get_world_size", return_value=4):
+                with mock.patch.object(dist, "get_rank", return_value=2):
+                    # Test with group in kwargs
+                    mock_group = mock.MagicMock()
+                    msg_dict = _get_msg_dict("test_func", group=mock_group)
+
+                    # Verify msg_dict contains all expected keys
+                    self.assertEqual(len(msg_dict), 4)
+                    self.assertEqual(msg_dict["func_name"], "test_func")
+                    self.assertEqual(msg_dict["group"], str(mock_group))
+                    self.assertEqual(msg_dict["world_size"], "4")
+                    self.assertEqual(msg_dict["rank"], "2")
+
+    def test_get_msg_dict_with_process_group(self) -> None:
+        """Test _get_msg_dict function with process_group in kwargs."""
+        # Mock dist functions
+        with mock.patch.object(dist, "is_initialized", return_value=True):
+            with mock.patch.object(dist, "get_world_size", return_value=8):
+                with mock.patch.object(dist, "get_rank", return_value=3):
+                    # Test with process_group in kwargs
+                    mock_process_group = mock.MagicMock()
+                    msg_dict = _get_msg_dict(
+                        "test_func", process_group=mock_process_group
+                    )
+
+                    # Verify msg_dict contains all expected keys
+                    self.assertEqual(msg_dict["func_name"], "test_func")
+                    self.assertEqual(msg_dict["group"], str(mock_process_group))
+                    self.assertEqual(msg_dict["world_size"], "8")
+                    self.assertEqual(msg_dict["rank"], "3")
