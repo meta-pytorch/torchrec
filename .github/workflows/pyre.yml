@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+    paths-ignore:
+      - "docs/*"
+      - "third_party/*"
+      - "*.md"
+      - .gitignore
+      - ".github/workflows/[bcdrvu]*.yml"
 
 jobs:
   pyre-check:
