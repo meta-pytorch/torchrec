@@ -75,6 +75,10 @@ class MultiProcessContext:
         if self.local_size is not None:
             os.environ["LOCAL_RANK"] = str(self.rank % self.local_size)
 
+        if "MASTER_ADDR" not in os.environ:
+            print(f"multi_process: {os.environ}")
+            os.environ["MASTER_ADDR"] = str("localhost")
+
         self.pg = init_distributed_single_host(
             rank=self.rank,
             world_size=self.world_size,
@@ -148,6 +152,10 @@ class MultiProcessTestBase(unittest.TestCase):
         # pyre-ignore
         **kwargs,
     ) -> None:
+        print(f"_run_multi_process_test: {self._mp_init_mode}")
+        if "MASTER_ADDR" not in os.environ:
+            print(f"multi_process: {os.environ}")
+            os.environ["MASTER_ADDR"] = str("localhost")
         ctx = multiprocessing.get_context(self._mp_init_mode)
         async_results = []
         exceptions = []

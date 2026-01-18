@@ -6,6 +6,9 @@ on:
       - main
   workflow_dispatch:
   pull_request:
+    paths-ignore:
+      - .gitignore
+      - ".github/workflows/[bcprvu]*.yml"
 
 jobs:
   build_docs_job:
@@ -17,8 +20,8 @@ jobs:
       matrix:
         include:
          - os: linux.24_04.4x
-           python-version: 3.12
-           python-tag: "py312"
+           python-version: 3.14
+           python-tag: "py314"
     steps:
     - name: Check ldd --version
       run: ldd --version
