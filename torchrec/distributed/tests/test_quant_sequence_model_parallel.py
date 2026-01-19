@@ -34,7 +34,7 @@ from torchrec.quant.embedding_modules import (
     EmbeddingCollection as QuantEmbeddingCollection,
     quant_prep_enable_quant_state_dict_split_scale_bias_for_types,
 )
-from torchrec.test_utils import seed_and_log, skip_if_asan_class
+from torchrec.test_utils import skip_if_asan_class
 
 
 def _quantize(
@@ -113,7 +113,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             quant_state_dict_split_scale_bias=quant_state_dict_split_scale_bias,
         )
 
-    @seed_and_log
     def setUp(self) -> None:
         super().setUp()
 

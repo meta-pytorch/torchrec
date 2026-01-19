@@ -29,7 +29,7 @@ from torchrec.distributed.tests.test_sequence_model import (
 )
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
-from torchrec.test_utils import seed_and_log, skip_if_asan_class
+from torchrec.test_utils import skip_if_asan_class
 
 
 @skip_if_asan_class
@@ -92,7 +92,6 @@ class SequenceModelParallelHierarchicalTest(MultiProcessTestBase):
         )
 
     # TODO: consolidate the following methods with https://fburl.com/code/62zg0kel
-    @seed_and_log
     def setUp(self) -> None:
         super().setUp()
 

@@ -29,12 +29,11 @@ from torchrec.distributed.test_utils.test_sharding import (
 )
 from torchrec.distributed.types import ModuleSharder, ShardingStrategy, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
-from torchrec.test_utils import seed_and_log, skip_if_asan_class
+from torchrec.test_utils import skip_if_asan_class
 from torchrec.types import DataType
 
 
 class ModelParallelTestShared(MultiProcessTestBase):
-    @seed_and_log
     def setUp(self, backend: str = "nccl") -> None:
         super().setUp()
 

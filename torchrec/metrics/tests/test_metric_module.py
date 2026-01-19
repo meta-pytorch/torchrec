@@ -1038,7 +1038,6 @@ class MetricsConfigPostInitTest(unittest.TestCase):
 @skip_if_asan_class
 class MetricModuleDistributedTest(MultiProcessTestBase):
 
-    @seed_and_log
     def setUp(self, backend: str = "nccl") -> None:
         super().setUp()
         self.backend = backend
