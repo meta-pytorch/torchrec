@@ -32,7 +32,7 @@ from torchrec.metrics.test_utils.mock_metrics import (
     MockRecMetric,
 )
 from torchrec.metrics.throughput import ThroughputMetric
-from torchrec.test_utils import get_free_port, seed_and_log, skip_if_asan_class
+from torchrec.test_utils import get_free_port, skip_if_asan_class
 
 
 def wait_until_true(
@@ -440,7 +440,6 @@ class CPUOffloadedMetricModuleDistributedTest(MultiProcessTestBase):
     metric_module.update()/compute() path.
     """
 
-    @seed_and_log
     def setUp(self) -> None:
         super().setUp()
 

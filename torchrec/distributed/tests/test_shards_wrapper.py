@@ -17,7 +17,7 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-from torchrec.test_utils import seed_and_log, skip_if_asan_class
+from torchrec.test_utils import skip_if_asan_class
 
 
 def all_gather_into_tensor(
@@ -96,7 +96,6 @@ def all_gather_object(
 
 @skip_if_asan_class
 class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
-    @seed_and_log
     def setUp(self, backend: str = "nccl") -> None:
         super().setUp()
 

@@ -33,7 +33,7 @@ from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-from torchrec.test_utils import seed_and_log, skip_if_asan_class
+from torchrec.test_utils import skip_if_asan_class
 
 
 @skip_if_asan_class
@@ -308,7 +308,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
             variable_batch_size=True,
         )
 
-    @seed_and_log
     def setUp(self) -> None:
         super().setUp()
 
