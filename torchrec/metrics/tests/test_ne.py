@@ -104,6 +104,12 @@ class TestLoglossMetric(TestMetric):
         )
 
 
+_logloss_metric_test_helper: Callable[..., None] = partial(
+    metric_test_helper, include_logloss=True
+)
+update_wrapper(_logloss_metric_test_helper, metric_test_helper)
+
+
 class NEMetricTest(unittest.TestCase):
     target_clazz: Type[RecMetric] = NEMetric
     target_compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION
@@ -208,11 +214,6 @@ class NEMetricTest(unittest.TestCase):
         self.assertTrue(torch.all(~ne.isnan()))
         self.assertTrue(torch.equal(ne.eq(eta), torch.tensor([False, True, False])))
 
-    _logloss_metric_test_helper: Callable[..., None] = partial(
-        metric_test_helper, include_logloss=True
-    )
-    update_wrapper(_logloss_metric_test_helper, metric_test_helper)
-
     def test_logloss_unfused(self) -> None:
         rec_metric_value_test_launcher(
             target_clazz=NEMetric,
@@ -224,7 +225,7 @@ class NEMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._logloss_metric_test_helper,
+            entry_point=_logloss_metric_test_helper,
         )
 
     def test_logloss_fused_tasks(self) -> None:
@@ -238,7 +239,7 @@ class NEMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._logloss_metric_test_helper,
+            entry_point=_logloss_metric_test_helper,
         )
 
     def test_logloss_fused_tasks_and_states(self) -> None:
@@ -252,7 +253,7 @@ class NEMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._logloss_metric_test_helper,
+            entry_point=_logloss_metric_test_helper,
         )
 
     def test_logloss_update_fused(self) -> None:
@@ -266,7 +267,7 @@ class NEMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._logloss_metric_test_helper,
+            entry_point=_logloss_metric_test_helper,
         )
 
         rec_metric_value_test_launcher(
@@ -279,7 +280,7 @@ class NEMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._logloss_metric_test_helper,
+            entry_point=_logloss_metric_test_helper,
             batch_window_size=10,
         )
 

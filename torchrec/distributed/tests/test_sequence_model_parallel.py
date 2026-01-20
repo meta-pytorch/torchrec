@@ -8,6 +8,7 @@
 # pyre-strict
 
 
+import sys
 import unittest
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -15,10 +16,7 @@ import hypothesis.strategies as st
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from hypothesis import assume, given, settings, Verbosity
-from torchrec.distributed.embedding import (
-    EmbeddingCollectionContext,
-    ShardedEmbeddingCollection,
-)
+from torchrec.distributed.embedding import EmbeddingCollectionContext
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import CommType, QCommsConfig
 from torchrec.distributed.planner import ParameterConstraints
@@ -31,7 +29,6 @@ from torchrec.distributed.tests.test_sequence_model import (
 )
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
-from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import skip_if_asan_class
 
@@ -530,8 +527,14 @@ class DedupIndicesWeightAccumulationTest(unittest.TestCase):
 @skip_if_asan_class
 class TDSequenceModelParallelTest(SequenceModelParallelTest):
 
+    def setUp(self) -> None:
+        super().setUp()
+        if sys.version_info >= (3, 14):
+            # TODO: check TensorDict for py314: https://github.com/pytorch/tensordict/releases
+            self.skipTest("TensorDict is not supported in python3.14")
+
     def test_sharding_variable_batch(self) -> None:
-        pass
+        self.skipTest("TensorDict doesn't support variable batch size yet")
 
     def _test_sharding(
         self,

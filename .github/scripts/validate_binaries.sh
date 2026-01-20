@@ -9,9 +9,7 @@
 export PYTORCH_CUDA_PKG=""
 export CONDA_ENV="build_binary"
 
-if [[ ${MATRIX_PYTHON_VERSION} = '3.14' ]]; then
-    exit 0 # fbgemm doesn't support python 3.14 so far
-elif [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
+if [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
     exit 0 # fbgemm doesn't support python 3.14 so far
     # use conda-forge to install python3.14t
     conda create -y -n "${CONDA_ENV}" python="3.14" python-freethreading -c conda-forge
