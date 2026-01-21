@@ -200,8 +200,10 @@ def _compute_total_norm(
     """
 
     ## compute the norm |W|^p corresponding to all sharded params W
-    sharded_grad_norm: torch.Tensor = torch.tensor(0.0, pin_memory=True)
+
     combine_norm_operator = torch.maximum if norm_type == torch.inf else torch.add
+    initial_value = float("-inf") if norm_type == torch.inf else 0.0
+    sharded_grad_norm: torch.Tensor = torch.tensor(initial_value)
 
     # We need to move sharded_grad_norm to the same device as the first shard so that we can do addition (or take max)
     # this is specifically for the case where sharded_grad_norm is 0, and replicate_grad_norm is not,
@@ -225,7 +227,7 @@ def _compute_total_norm(
             grad_list=replicate_grads, max_norm=max_grad_norm, norm_type=norm_type
         )
         if replicate_grads
-        else torch.tensor(0.0)
+        else torch.tensor(initial_value)
     ).to(sharded_grad_norm.device, non_blocking=True)
 
     # In the p-norm case, we are given norms |W_sharded|^p and |W_replicate|^p. To compute the total norm, we need to
