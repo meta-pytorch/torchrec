@@ -867,6 +867,19 @@ class DMPCollection(DistributedModelParallel):
     The current implementation shards the model such that, for a given shard, its replicated shards lie on the ranks within the node.
     This significantly improves the performance of the all-reduce communication (parameter sync) by utilizing intra-node bandwidth.
 
+    Collective Communications:
+        The collective communications depend on the ShardingStrategy:
+
+        ShardingStrategy.DEFAULT / ShardingStrategy.PER_MODULE:
+            - sync(): allreduce_coalesced (ReduceOp.AVG) on replica_pg for weights
+            - sync(): allreduce_coalesced (ReduceOp.AVG) on replica_pg for optimizer states
+
+        ShardingStrategy.FULLY_SHARDED:
+            - Forward pass: reduce_scatter_tensor (ReduceOp.AVG, async) on replica_pg for weights
+            - Backward pass: all_gather_into_tensor on replica_pg for weights
+            - Note: sync() is typically not called for FULLY_SHARDED since weight sync happens
+              automatically via reduce_scatter/all_gather per iteration
+
     Example Use Case:
         Consider a setup with 2 nodes, each with 4 GPUs. The sharding groups could be:
             - Group 0, DMP 0: [0, 2, 4, 6]
@@ -1158,6 +1171,14 @@ class DMPCollection(DistributedModelParallel):
         ctx: DMPCollectionContext,
         include_optimizer_state: bool = True,
     ) -> None:
+        """
+        Sync weights and optimizer states for a given context.
+
+        Collective Communications:
+            - allreduce_coalesced (ReduceOp.AVG) on replica_pg for weights
+            - allreduce_coalesced (ReduceOp.AVG) on replica_pg for optimizer states
+              (if include_optimizer_state is True)
+        """
         assert ctx.replica_pg is not None, "replica_pg is not initialized!"
 
         opts = None
@@ -1188,8 +1209,11 @@ class DMPCollection(DistributedModelParallel):
         opts: Optional[dist.AllreduceCoalescedOptions] = None,
     ) -> None:
         """
-        Helper to perform all reduce on given tensors, uses custom all reduce function if provided
+        Helper to perform all reduce on given tensors, uses custom all reduce function if provided.
         We perform all reduce per tensor dtype per collective constraints.
+
+        Collective Communication:
+            - allreduce_coalesced on the provided process group (pg)
         """
 
         custom_all_reduce = self._custom_all_reduce
@@ -1234,6 +1258,10 @@ class DMPCollection(DistributedModelParallel):
 
         This method can be called during a training step to guarantee that all pending
         async reduce scatter operations have finished and weight tensors have been resized.
+
+        Collective Communication:
+            Waits for completion of async reduce_scatter_tensor operations launched
+            during the forward pass for FULLY_SHARDED strategy modules.
 
         This is a no-op if:
         - No modules are using FULLY_SHARDED strategy

@@ -55,6 +55,7 @@ from fbgemm_gpu.tbe.ssd.utils.partially_materialized_tensor import (
     PartiallyMaterializedTensor,
 )
 from torch import nn
+from torch.autograd.profiler import record_function
 from torch.distributed._tensor import DTensor, Replicate, Shard as DTensorShard
 from torchrec.distributed.comm import get_local_rank, get_node_group_size
 from torchrec.distributed.composable.table_batched_embedding_slice import (
@@ -2531,9 +2532,15 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
 
 class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
     """
-    Hybird Sharded Version of BatchedFusedEmbedding.
+    Fully Sharded Version of BatchedFusedEmbedding.
 
-    This is used with DMPCollection when ShardingStrategy.HYBRID is enabled.
+    This is used with DMPCollection when ShardingStrategy.FULLY_SHARDED is enabled.
+
+    Collective Communications:
+        - Forward pass: Launches async reduce_scatter on weights via replica_pg
+          to average weights across sharding groups.
+        - Backward pass: Performs all_gather on weights via replica_pg to restore
+          full weights before gradient computation.
     """
 
     def __init__(
@@ -2572,6 +2579,15 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         )
 
     def _all_gather_table_weights(self) -> None:
+        """
+        All-gather embedding weights from sharded state back to full weights.
+
+        Collective Communication:
+            - all_gather_into_tensor on replica_pg (synchronous)
+
+        This is called during the backward pass (via backward hook) to restore
+        full embedding weights before gradient computation.
+        """
         if not self.weights_sharded:
             return
         self.ensure_reduce_scatter_complete()
@@ -2599,12 +2615,13 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
                 (padded_total_size,),  # size
             )
 
-        dist.all_gather_into_tensor(
-            output_tensor=output_tensor,
-            input_tensor=self._shard_buf,
-            group=self._env.replica_pg,
-            async_op=False,
-        )
+        with record_function("## 2d_allgather_fully_sharded ##"):
+            dist.all_gather_into_tensor(
+                output_tensor=output_tensor,
+                input_tensor=self._shard_buf,
+                group=self._env.replica_pg,
+                async_op=False,
+            )
         # pyre-ignore[16]
         self._emb_module.weights_dev = self._unsharded_param[
             : self._original_shape.numel()
@@ -2651,6 +2668,9 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         Launch async reduce scatter but defer the resize operation.
         Returns an awaitable that will perform resize on wait().
 
+        Collective Communication:
+            - reduce_scatter_tensor with ReduceOp.AVG on replica_pg (async)
+
         This allows the resize operation to be deferred until the result is actually needed,
         maximizing overlap between async communication and computation.
         """
@@ -2687,13 +2707,14 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             else:
                 self._shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
 
-            self._async_work = dist.reduce_scatter_tensor(
-                output=self._shard_buf,
-                input=self._input_tensor,
-                op=dist.ReduceOp.AVG,
-                group=self._env.replica_pg,
-                async_op=True,
-            )
+            with record_function("## 2d_reduce_scatter_fully_sharded ##"):
+                self._async_work = dist.reduce_scatter_tensor(
+                    output=self._shard_buf,
+                    input=self._input_tensor,
+                    op=dist.ReduceOp.AVG,
+                    group=self._env.replica_pg,
+                    async_op=True,
+                )
 
             self._async_event = torch.cuda.Event(enable_timing=False, blocking=False)
             # pyre-ignore[16]
@@ -3623,9 +3644,15 @@ class BatchedFusedEmbeddingBag(
 
 class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
     """
-    Hybird Sharded Version of BatchedFusedEmbeddingBag.
+    Fully Sharded Version of BatchedFusedEmbeddingBag.
 
-    This is used with DMPCollection when ShardingStrategy.HYBRID is enabled.
+    This is used with DMPCollection when ShardingStrategy.FULLY_SHARDED is enabled.
+
+    Collective Communications:
+        - Forward pass: Launches async reduce_scatter on weights via replica_pg
+          to average weights across sharding groups.
+        - Backward pass: Performs all_gather on weights via replica_pg to restore
+          full weights before gradient computation.
     """
 
     def __init__(
@@ -3664,6 +3691,15 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         )
 
     def _all_gather_table_weights(self) -> None:
+        """
+        All-gather embedding weights from sharded state back to full weights.
+
+        Collective Communication:
+            - all_gather_into_tensor on replica_pg (synchronous)
+
+        This is called during the backward pass (via backward hook) to restore
+        full embedding weights before gradient computation.
+        """
         if not self.weights_sharded:
             return
         self.ensure_reduce_scatter_complete()
@@ -3692,12 +3728,13 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
                 (padded_total_size,),  # size
             )
 
-        dist.all_gather_into_tensor(
-            output_tensor=output_tensor,
-            input_tensor=self._shard_buf,
-            group=self._env.replica_pg,
-            async_op=False,
-        )
+        with record_function("## 2d_allgather_fully_sharded ##"):
+            dist.all_gather_into_tensor(
+                output_tensor=output_tensor,
+                input_tensor=self._shard_buf,
+                group=self._env.replica_pg,
+                async_op=False,
+            )
         # pyre-ignore[16]
         self._emb_module.weights_dev = self._unsharded_param[
             : self._original_shape.numel()
@@ -3744,6 +3781,9 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         Launch async reduce scatter but defer the resize operation.
         Returns an awaitable that will perform resize on wait().
 
+        Collective Communication:
+            - reduce_scatter_tensor with ReduceOp.AVG on replica_pg (async)
+
         This allows the resize operation to be deferred until the result is actually needed,
         maximizing overlap between async communication and computation.
         """
@@ -3780,13 +3820,14 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             else:
                 self._shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
 
-            self._async_work = dist.reduce_scatter_tensor(
-                output=self._shard_buf,
-                input=self._input_tensor,
-                op=dist.ReduceOp.AVG,
-                group=self._env.replica_pg,
-                async_op=True,
-            )
+            with record_function("## 2d_reduce_scatter_fully_sharded ##"):
+                self._async_work = dist.reduce_scatter_tensor(
+                    output=self._shard_buf,
+                    input=self._input_tensor,
+                    op=dist.ReduceOp.AVG,
+                    group=self._env.replica_pg,
+                    async_op=True,
+                )
 
             self._async_event = torch.cuda.Event(enable_timing=False, blocking=False)
             # pyre-ignore[16]
