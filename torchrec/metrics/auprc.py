@@ -165,6 +165,10 @@ def _state_reduction(state: List[torch.Tensor], dim: int = 1) -> List[torch.Tens
 _grouping_keys_state_reduction = partial(_state_reduction, dim=0)
 
 
+LIFETIME_WEIGHTED_AUPRC = "lifetime_weighted_auprc"
+LIFETIME_WEIGHT = "lifetime_weight"
+
+
 class AUPRCMetricComputation(RecMetricComputation):
     r"""
     This class implements the RecMetricComputation for AUPRC, i.e. Area Under the Curve.
@@ -220,6 +224,11 @@ class AUPRCMetricComputation(RecMetricComputation):
                 dist_reduce_fx=_grouping_keys_state_reduction,
                 persistent=False,
             )
+        # Lifetime accumulators for weighted averaging of window AUPRC values
+        self._lifetime_weighted_auprc: torch.Tensor = torch.tensor(
+            0.0, dtype=torch.float64
+        )
+        self._lifetime_weight: torch.Tensor = torch.tensor(0.0, dtype=torch.float64)
         self._init_states()
 
     # The states values are set to empty lists in __init__() and reset(), and then we
@@ -305,17 +314,50 @@ class AUPRCMetricComputation(RecMetricComputation):
             )
 
     def _compute(self) -> List[MetricComputationReport]:
+        # Compute window AUPRC
+        window_auprc = compute_auprc(
+            self._n_tasks,
+            cast(torch.Tensor, getattr(self, PREDICTIONS)[0]),
+            cast(torch.Tensor, getattr(self, LABELS)[0]),
+            cast(torch.Tensor, getattr(self, WEIGHTS)[0]),
+        )
+
+        # Get total weight for this window
+        window_weight = cast(torch.Tensor, getattr(self, WEIGHTS)[0]).sum()
+
+        # Accumulate lifetime stats using weighted averaging
+        # Move tensors to same device if needed
+        device = window_auprc.device
+        self._lifetime_weighted_auprc = self._lifetime_weighted_auprc.to(device)
+        self._lifetime_weight = self._lifetime_weight.to(device)
+
+        # For multi-task, compute weighted average across tasks
+        weighted_auprc_sum = (window_auprc * window_weight).sum()
+        self._lifetime_weighted_auprc = (
+            self._lifetime_weighted_auprc + weighted_auprc_sum
+        )
+        self._lifetime_weight = self._lifetime_weight + window_weight * self._n_tasks
+
+        # Compute lifetime AUPRC
+        lifetime_auprc = torch.where(
+            self._lifetime_weight > 0,
+            self._lifetime_weighted_auprc / self._lifetime_weight,
+            torch.tensor(0.5, device=device, dtype=torch.float64),
+        )
+        # Expand to match n_tasks shape
+        lifetime_auprc_per_task = lifetime_auprc.expand(self._n_tasks)
+
         reports = [
             MetricComputationReport(
                 name=MetricName.AUPRC,
                 metric_prefix=MetricPrefix.WINDOW,
-                value=compute_auprc(
-                    self._n_tasks,
-                    cast(torch.Tensor, getattr(self, PREDICTIONS)[0]),
-                    cast(torch.Tensor, getattr(self, LABELS)[0]),
-                    cast(torch.Tensor, getattr(self, WEIGHTS)[0]),
-                ),
-            )
+                value=window_auprc,
+            ),
+            MetricComputationReport(
+                name=MetricName.AUPRC,
+                metric_prefix=MetricPrefix.LIFETIME,
+                value=lifetime_auprc_per_task,
+            ),
         ]
         if self._grouped_auprc:
             reports.append(
