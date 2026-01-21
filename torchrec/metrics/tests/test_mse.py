@@ -99,6 +99,12 @@ class TestRSquaredMetric(TestMetric):
         )
 
 
+_r_squared_metric_test_helper: Callable[..., None] = partial(
+    metric_test_helper, include_r_squared=True
+)
+update_wrapper(_r_squared_metric_test_helper, metric_test_helper)
+
+
 class MSEMetricTest(unittest.TestCase):
     clazz: Type[RecMetric] = MSEMetric
     task_name: str = "mse"
@@ -189,11 +195,6 @@ class MSEMetricTest(unittest.TestCase):
             entry_point=metric_test_helper,
         )
 
-    _r_squared_metric_test_helper: Callable[..., None] = partial(
-        metric_test_helper, include_r_squared=True
-    )
-    update_wrapper(_r_squared_metric_test_helper, metric_test_helper)
-
     def test_r_squared_unfused(self) -> None:
         rec_metric_value_test_launcher(
             target_clazz=MSEMetric,
@@ -205,7 +206,7 @@ class MSEMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._r_squared_metric_test_helper,
+            entry_point=_r_squared_metric_test_helper,
         )
 
     def test_r_squared_fused_tasks(self) -> None:
@@ -219,7 +220,7 @@ class MSEMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._r_squared_metric_test_helper,
+            entry_point=_r_squared_metric_test_helper,
         )
 
     def test_r_squared_fused_tasks_and_states(self) -> None:
@@ -233,7 +234,7 @@ class MSEMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._r_squared_metric_test_helper,
+            entry_point=_r_squared_metric_test_helper,
         )
 
 

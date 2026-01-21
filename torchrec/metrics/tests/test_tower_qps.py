@@ -161,6 +161,14 @@ class TestTowerQPSMetric(TestMetric):
         )
 
 
+_test_tower_qps: Callable[..., None] = partial(
+    metric_test_helper,
+    is_time_dependent=True,
+    time_dependent_metric={TowerQPSMetric: "torchrec.metrics.tower_qps"},
+)
+update_wrapper(_test_tower_qps, metric_test_helper)
+
+
 class TowerQPSMetricTest(unittest.TestCase):
     def setUp(self) -> None:
         self.world_size = 1
@@ -168,13 +176,6 @@ class TowerQPSMetricTest(unittest.TestCase):
 
     target_clazz: Type[RecMetric] = TowerQPSMetric
     task_names: str = "qps"
-
-    _test_tower_qps: Callable[..., None] = partial(
-        metric_test_helper,
-        is_time_dependent=True,
-        time_dependent_metric={TowerQPSMetric: "torchrec.metrics.tower_qps"},
-    )
-    update_wrapper(_test_tower_qps, metric_test_helper)
 
     def test_tower_qps_during_warmup_unfused(self) -> None:
         rec_metric_value_test_launcher(
@@ -187,7 +188,7 @@ class TowerQPSMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._test_tower_qps,
+            entry_point=_test_tower_qps,
         )
 
     def test_tower_qps_unfused(self) -> None:
@@ -201,7 +202,7 @@ class TowerQPSMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._test_tower_qps,
+            entry_point=_test_tower_qps,
             test_nsteps=DURING_WARMUP_NSTEPS,
         )
 
@@ -216,7 +217,7 @@ class TowerQPSMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._test_tower_qps,
+            entry_point=_test_tower_qps,
             test_nsteps=AFTER_WARMUP_NSTEPS,
         )
 
@@ -231,7 +232,7 @@ class TowerQPSMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=False,
             world_size=WORLD_SIZE,
-            entry_point=self._test_tower_qps,
+            entry_point=_test_tower_qps,
             test_nsteps=AFTER_WARMUP_NSTEPS,
         )
 
@@ -246,7 +247,7 @@ class TowerQPSMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=True,
             world_size=WORLD_SIZE,
-            entry_point=self._test_tower_qps,
+            entry_point=_test_tower_qps,
             test_nsteps=AFTER_WARMUP_NSTEPS,
         )
 
@@ -261,7 +262,7 @@ class TowerQPSMetricTest(unittest.TestCase):
             compute_on_all_ranks=False,
             should_validate_update=True,
             world_size=WORLD_SIZE,
-            entry_point=self._test_tower_qps,
+            entry_point=_test_tower_qps,
             test_nsteps=AFTER_WARMUP_NSTEPS,
         )
 

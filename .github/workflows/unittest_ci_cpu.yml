@@ -16,6 +16,8 @@ on:
       - "*.md"
       - ".github/workflows/[bcdprv]*.yml"
       - ".github/workflows/unittest_ci.yml"
+      - '.github/scripts/*.sh'
+      - '.github/scripts/*.py'
   pull_request:
     paths-ignore:
       - "docs/*"
@@ -24,6 +26,8 @@ on:
       - "*.md"
       - ".github/workflows/[bcdprv]*.yml"
       - ".github/workflows/unittest_ci.yml"
+      - '.github/scripts/*.sh'
+      - '.github/scripts/*.py'
   workflow_dispatch:
     inputs:
       channel:
@@ -51,6 +55,8 @@ jobs:
             tag: "py312"
           - version: "3.13"
             tag: "py313"
+          - version: "3.14"
+            tag: "py314"
         is_pr:
           - ${{ github.event_name == 'pull_request' }}
         exclude:
@@ -63,6 +69,9 @@ jobs:
           - is_pr: true
             python:
               version: "3.12"
+          - is_pr: true
+            python:
+              version: "3.13"
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     permissions:
       id-token: write
