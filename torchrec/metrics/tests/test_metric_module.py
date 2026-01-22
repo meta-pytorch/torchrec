@@ -847,7 +847,7 @@ class MetricModuleTest(unittest.TestCase):
             RecMetricException,
             "async_compute is not supported in RecMetricModule",
         ):
-            metric_module.async_compute(concurrent.futures.Future())
+            metric_module.async_compute()
 
     def test_load_state_dict_with_trained_batches_key(self) -> None:
         metric_module = generate_metric_module(
