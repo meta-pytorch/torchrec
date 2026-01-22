@@ -16,6 +16,8 @@ import hypothesis.strategies as st
 import torch
 import torch.nn as nn
 from hypothesis import assume, given, settings, Verbosity
+from torch.distributed._shard.metadata import ShardMetadata
+from torch.distributed._shard.sharding_spec.api import EnumerableShardingSpec
 from torch.distributed._tensor.api import DTensor
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
@@ -262,6 +264,188 @@ class TestEmbeddingBagCollectionSharder(EmbeddingBagCollectionSharder):
 
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [self._sharding_type]
+
+
+class LookupOrderByShardTypeTest(unittest.TestCase):
+    """Tests for _sharded_module_order_overwrite functionality in ShardedEmbeddingBagCollection."""
+
+    def _create_sharding_spec(
+        self, sharding_type: str, num_embeddings: int, embedding_dim: int
+    ):
+        """
+        Create a mock sharding spec with proper shards for the given sharding type.
+        Different sharding types have different requirements.
+        """
+
+        if sharding_type == ShardingType.DATA_PARALLEL.value:
+            return None
+
+        shards = [
+            ShardMetadata(
+                shard_offsets=[0, 0],
+                shard_sizes=[num_embeddings, embedding_dim],
+                placement="rank:0/cpu",
+            )
+        ]
+        return EnumerableShardingSpec(shards=shards)
+
+    def _create_ebc_and_sharding_plan(
+        self,
+        sharding_types: List[str],
+    ) -> tuple:
+        """
+        Helper to create an EmbeddingBagCollection and parameter sharding plan
+        with multiple tables assigned to different sharding types.
+        """
+        from torchrec.distributed.types import ParameterSharding
+
+        num_embeddings = 100
+        embedding_dim = 16
+        tables = []
+        table_name_to_parameter_sharding: Dict[str, ParameterSharding] = {}
+
+        for i, sharding_type in enumerate(sharding_types):
+            table_name = f"table_{i}"
+            tables.append(
+                EmbeddingBagConfig(
+                    num_embeddings=num_embeddings,
+                    embedding_dim=embedding_dim,
+                    name=table_name,
+                    feature_names=[f"feature_{i}"],
+                )
+            )
+            table_name_to_parameter_sharding[table_name] = ParameterSharding(
+                sharding_type=sharding_type,
+                compute_kernel="fused",
+                ranks=[0],
+                sharding_spec=self._create_sharding_spec(
+                    sharding_type, num_embeddings, embedding_dim
+                ),
+            )
+
+        ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
+        return ebc, table_name_to_parameter_sharding
+
+    def _create_mock_sharding_env(self) -> ShardingEnv:
+        """Create a mock ShardingEnv for testing."""
+        return ShardingEnv(
+            world_size=1,
+            rank=0,
+            pg=None,
+        )
+
+    @unittest.mock.patch.object(
+        ShardedEmbeddingBagCollection, "_create_lookups", lambda self: None
+    )
+    @unittest.mock.patch.object(
+        ShardedEmbeddingBagCollection, "_create_output_dist", lambda self: None
+    )
+    def test_sharding_types_ordered_by_lookup_order(self) -> None:
+        """
+        Test that _sharding_types are ordered according to sharded_module_order_overwrite.
+        """
+        custom_order = [
+            ShardingType.COLUMN_WISE.value,
+            ShardingType.ROW_WISE.value,
+            ShardingType.TABLE_WISE.value,
+        ]
+
+        ebc, table_name_to_parameter_sharding = self._create_ebc_and_sharding_plan(
+            [
+                ShardingType.TABLE_WISE.value,
+                ShardingType.COLUMN_WISE.value,
+                ShardingType.ROW_WISE.value,
+            ]
+        )
+        env = self._create_mock_sharding_env()
+
+        sharded_ebc = ShardedEmbeddingBagCollection(
+            module=ebc,
+            table_name_to_parameter_sharding=table_name_to_parameter_sharding,
+            env=env,
+            device=torch.device("meta"),
+            sharded_module_order_overwrite=custom_order,
+        )
+
+        self.assertEqual(
+            sharded_ebc._sharding_types,
+            [
+                ShardingType.COLUMN_WISE.value,
+                ShardingType.ROW_WISE.value,
+                ShardingType.TABLE_WISE.value,
+            ],
+        )
+
+    @unittest.mock.patch.object(
+        ShardedEmbeddingBagCollection, "_create_lookups", lambda self: None
+    )
+    @unittest.mock.patch.object(
+        ShardedEmbeddingBagCollection, "_create_output_dist", lambda self: None
+    )
+    def test_sharding_types_not_in_lookup_order_appended(self) -> None:
+        """
+        Test that sharding types not in sharded_module_order_overwrite are appended
+        after the ordered ones.
+        """
+        custom_order = [
+            ShardingType.COLUMN_WISE.value,
+        ]
+
+        ebc, table_name_to_parameter_sharding = self._create_ebc_and_sharding_plan(
+            [
+                ShardingType.TABLE_WISE.value,
+                ShardingType.COLUMN_WISE.value,
+                ShardingType.ROW_WISE.value,
+            ]
+        )
+        env = self._create_mock_sharding_env()
+
+        sharded_ebc = ShardedEmbeddingBagCollection(
+            module=ebc,
+            table_name_to_parameter_sharding=table_name_to_parameter_sharding,
+            env=env,
+            device=torch.device("meta"),
+            sharded_module_order_overwrite=custom_order,
+        )
+
+        # COLUMN_WISE should be first since it's in the lookup order
+        self.assertEqual(sharded_ebc._sharding_types[0], ShardingType.COLUMN_WISE.value)
+        # Other types should be present
+        self.assertIn(ShardingType.TABLE_WISE.value, sharded_ebc._sharding_types)
+        self.assertIn(ShardingType.ROW_WISE.value, sharded_ebc._sharding_types)
+
+    @unittest.mock.patch.object(
+        ShardedEmbeddingBagCollection, "_create_lookups", lambda self: None
+    )
+    @unittest.mock.patch.object(
+        ShardedEmbeddingBagCollection, "_create_output_dist", lambda self: None
+    )
+    def test_lookup_order_with_unused_sharding_types(self) -> None:
+        """
+        Test that sharding types in lookup_order that are not used are skipped.
+        """
+        custom_order = [
+            ShardingType.GRID_SHARD.value,
+            ShardingType.COLUMN_WISE.value,
+            ShardingType.TABLE_ROW_WISE.value,
+            ShardingType.TABLE_WISE.value,
+        ]
+
+        ebc, table_name_to_parameter_sharding = self._create_ebc_and_sharding_plan(
+            [ShardingType.COLUMN_WISE.value]
+        )
+        env = self._create_mock_sharding_env()
+
+        sharded_ebc = ShardedEmbeddingBagCollection(
+            module=ebc,
+            table_name_to_parameter_sharding=table_name_to_parameter_sharding,
+            env=env,
+            device=torch.device("meta"),
+            sharded_module_order_overwrite=custom_order,
+        )
+
+        # Only COLUMN_WISE should be in _sharding_types
+        self.assertEqual(sharded_ebc._sharding_types, [ShardingType.COLUMN_WISE.value])
 
 
 @skip_if_asan_class

@@ -492,9 +492,16 @@ class ShardedEmbeddingBagCollection(
         device: Optional[torch.device] = None,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
         module_fqn: Optional[str] = None,
+        sharded_module_order_overwrite: Optional[List[str]] = None,
     ) -> None:
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
         self._module_fqn = module_fqn
+        # Normalize to lowercase for case-insensitive matching
+        self._sharded_module_order_overwrite = (
+            [s.lower() for s in sharded_module_order_overwrite]
+            if sharded_module_order_overwrite is not None
+            else None
+        )
         self._embedding_bag_configs: List[EmbeddingBagConfig] = (
             module.embedding_bag_configs()
         )
@@ -534,9 +541,33 @@ class ShardedEmbeddingBagCollection(
                 fused_params,
             )
         )
-        self._sharding_types: List[str] = list(
-            self.sharding_type_to_sharding_infos.keys()
-        )
+
+        ordered_sharding_items: List[Tuple[str, List[EmbeddingShardingInfo]]] = []
+        if self._sharded_module_order_overwrite is not None:
+            for sharding_type in self._sharded_module_order_overwrite:
+                if sharding_type in self.sharding_type_to_sharding_infos:
+                    ordered_sharding_items.append(
+                        (
+                            sharding_type,
+                            self.sharding_type_to_sharding_infos[sharding_type],
+                        )
+                    )
+            # capture any sharding types not in look up order config
+            for (
+                sharding_type,
+                sharding_infos,
+            ) in self.sharding_type_to_sharding_infos.items():
+                if sharding_type not in self._sharded_module_order_overwrite:
+                    ordered_sharding_items.append((sharding_type, sharding_infos))
+        else:
+            for (
+                sharding_type,
+                sharding_infos,
+            ) in self.sharding_type_to_sharding_infos.items():
+                ordered_sharding_items.append((sharding_type, sharding_infos))
+
+        self._sharding_types: List[str] = [item[0] for item in ordered_sharding_items]
+
         self._embedding_shardings: List[
             EmbeddingSharding[
                 EmbeddingShardingContext,
@@ -546,13 +577,13 @@ class ShardedEmbeddingBagCollection(
             ]
         ] = [
             self.create_embedding_bag_sharding(
-                embedding_configs,
+                embedding_configs,  # This is the whole List[EmbeddingShardingInfo]
                 env,
                 device,
                 permute_embeddings=True,
                 qcomm_codecs_registry=self.qcomm_codecs_registry,
             )
-            for embedding_configs in self.sharding_type_to_sharding_infos.values()
+            for _, embedding_configs in ordered_sharding_items  # Iterating over tuples
         ]
 
         self._is_weighted: bool = module.is_weighted()
@@ -1972,6 +2003,7 @@ class EmbeddingBagCollectionSharder(BaseEmbeddingSharder[EmbeddingBagCollection]
             device=device,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
             module_fqn=module_fqn,
+            sharded_module_order_overwrite=self._sharded_module_order_overwrite,
         )
 
     def shardable_parameters(
