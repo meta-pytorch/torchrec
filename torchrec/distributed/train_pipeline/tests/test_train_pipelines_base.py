@@ -18,6 +18,7 @@ from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.optim import Optimizer
 from torchrec.distributed import DistributedModelParallel
+from torchrec.distributed.model_parallel import DataParallelWrapper
 from torchrec.distributed.test_utils.emb_sharder import (
     TestEBCSharder,
     TestEBCSharderMCH,
@@ -96,6 +97,7 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
         model_type: Type[nn.Module] = TestSparseNN,
         enable_fsdp: bool = False,
         postproc_module: Optional[nn.Module] = None,
+        max_feature_lengths: Optional[Dict[str, int]] = None,
         zch: bool = False,
     ) -> nn.Module:
         # Create ZCH kwargs arguments if provided
@@ -114,6 +116,7 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
             dense_device=self.device,
             sparse_device=torch.device("meta"),
             postproc_module=postproc_module,
+            max_feature_lengths=max_feature_lengths,
             zch_kwargs=zch_kwargs,
         )
         if enable_fsdp:
@@ -141,6 +144,7 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
         sharding_type: str,
         kernel_type: str,
         fused_params: Optional[Dict[str, Any]] = None,
+        data_parallel_wrapper: Optional[DataParallelWrapper] = None,
     ) -> Tuple[nn.Module, Optimizer]:
         sharder = TestEBCSharder(
             sharding_type=sharding_type,
@@ -167,6 +171,7 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
                     mc_sharder,
                 ),
             ],
+            data_parallel_wrapper=data_parallel_wrapper,
         )
         # default fused optimizer is SGD w/ lr=0.1; we need to drop params
         fused_named_parameters: List[str] = [
