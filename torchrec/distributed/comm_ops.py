@@ -157,7 +157,8 @@ class Request(Awaitable[W]):
         """
 
         ret = self.wait_function.apply(self.pg, self, self.dummy_tensor)
-        if isinstance(ret, torch.Tensor) and ret.device.type == "cuda":
+        if isinstance(ret, torch.Tensor) and (ret.device.type == "cuda" or
+                                              ret.device.type == torch._C._get_privateuse1_backend_name()):
             ret.record_stream(torch.get_device_module(ret.device).current_stream())
         self.req = None
         self.tensor = None

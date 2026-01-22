@@ -2433,6 +2433,11 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
                 # Set EmbeddingLocation.HOST to make embedding op in FBGEMM choose CPU path.
                 # But the tensor will still be created on MTIA with device type "mtia".
                 managed.append(EmbeddingLocation.HOST)
+            elif device is not None and device.type == torch._C._get_privateuse1_backend_name():
+                compute_devices.append(ComputeDevice.PRIVATEUSE1)
+                managed.append(
+                    compute_kernel_to_embedding_location(table.compute_kernel)
+                )
             else:
                 compute_devices.append(ComputeDevice.CPU)
                 managed.append(EmbeddingLocation.HOST)
@@ -2752,6 +2757,7 @@ class BatchedDenseEmbedding(BaseBatchedEmbedding[torch.Tensor]):
             device is None
             or device.type == "cpu"
             or (not (torch.cuda.is_available() or torch.mtia.is_available()))
+            or (not (torch.get_device_module(device) and torch.get_device_module(device).is_available()))
         )
         self._emb_module: DenseTableBatchedEmbeddingBagsCodegen = (
             DenseTableBatchedEmbeddingBagsCodegen(
@@ -3544,6 +3550,11 @@ class BatchedFusedEmbeddingBag(
                 # Set EmbeddingLocation.HOST to make embedding op in FBGEMM choose CPU path.
                 # But the tensor will still be created on MTIA with device type "mtia".
                 managed.append(EmbeddingLocation.HOST)
+            elif device is not None and device.type == torch._C._get_privateuse1_backend_name():
+                compute_devices.append(ComputeDevice.PRIVATEUSE1)
+                managed.append(
+                    compute_kernel_to_embedding_location(table.compute_kernel)
+                )
             else:
                 compute_devices.append(ComputeDevice.CPU)
                 managed.append(EmbeddingLocation.HOST)
@@ -3866,6 +3877,7 @@ class BatchedDenseEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
             device is None
             or device.type == "cpu"
             or (not (torch.cuda.is_available() or torch.mtia.is_available()))
+            or (not (torch.get_device_module(device) and torch.get_device_module(device).is_available()))
         )
         self._emb_module: DenseTableBatchedEmbeddingBagsCodegen = (
             DenseTableBatchedEmbeddingBagsCodegen(
