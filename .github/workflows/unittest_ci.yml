@@ -56,8 +56,14 @@ jobs:
             tag: "py312"
           - version: "3.13"
             tag: "py313"
+          - version: "3.13"
+            tag: "py313"
+            free_threaded: true
           - version: "3.14"
             tag: "py314"
+          - version: "3.14"
+            tag: "py314"
+            free_threaded: true
         is_pr:
           - ${{ github.event_name == 'pull_request' }}
         exclude:
@@ -90,7 +96,13 @@ jobs:
       timeout: 60
       script: |
         ldd --version
-        conda create -y --name build_binary python=${{ matrix.python.version }}
+        if [[ "${{ matrix.python.free_threaded }}" == "true" ]]; then
+          conda create -y --name build_binary python-freethreading=${{ matrix.python.version }}
+        else
+          conda create -y --name build_binary python=${{ matrix.python.version }}
+        fi
+        conda run -n build_binary \
+          python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}')"
         conda info
         python --version
         conda run -n build_binary python --version
@@ -125,7 +137,8 @@ jobs:
         conda run -n build_binary \
           python -c "import numpy"
         echo "numpy succeeded"
-        conda install -n build_binary -y pytest
+        conda run -n build_binary \
+          pip install pytest
         conda run -n build_binary \
           python -m pytest torchrec -v -s \
           -W ignore::pytest.PytestCollectionWarning \
