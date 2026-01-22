@@ -79,6 +79,7 @@ class MetricName(MetricNameBase):
 
     SERVING_NE = "serving_ne"
     SERVING_CALIBRATION = "serving_calibration"
+    SERVING_AE_LOSS = "serving_ae_loss"
     TENSOR_WEIGHTED_AVG = "tensor_weighted_avg"
 
     CALI_FREE_NE = "cali_free_ne"
@@ -141,6 +142,7 @@ class MetricNamespace(MetricNamespaceBase):
 
     SERVING_NE = "serving_ne"
     SERVING_CALIBRATION = "serving_calibration"
+    SERVING_AE_LOSS = "serving_ae_loss"
 
     OUTPUT = "output"
     TENSOR_WEIGHTED_AVG = "tensor_weighted_avg"
