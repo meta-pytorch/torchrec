@@ -35,6 +35,10 @@ jobs:
             python-version: '3.13'
             python-tag: "py313"
             cuda-tag: "cu126"
+          - os: linux.2xlarge
+            python-version: '3.14'
+            python-tag: "py314"
+            cuda-tag: "cu126"
     steps:
       # Checkout the repository to the GitHub Actions runner
       - name: Check ldd --version
@@ -115,6 +119,7 @@ jobs:
           - "3.11"
           - "3.12"
           - "3.13"
+          - "3.14"
         cuda-tag:
           - "cu126"
     needs: build_on_cpu
