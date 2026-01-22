@@ -511,11 +511,13 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
         self,
         fused_params: Optional[Dict[str, Any]] = None,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
+        sharded_module_order_overwrite: Optional[List[str]] = None,
     ) -> None:
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
 
         # TODO remove after decoupling
         self._fused_params = fused_params
+        self._sharded_module_order_overwrite = sharded_module_order_overwrite
 
     def sharding_types(self, compute_device_type: str) -> List[str]:
 
