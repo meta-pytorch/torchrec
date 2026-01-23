@@ -15,7 +15,7 @@ if [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
     conda run -n "${CONDA_ENV}" python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}')"
 elif [[ ${MATRIX_PYTHON_VERSION} = '3.13t' ]]; then
     # use conda-forge to install python3.13t
-    conda create -y -n "${CONDA_ENV}" python-freethreading=3.13
+    conda create -y -n "${CONDA_ENV}" python="3.13" python-freethreading -c conda-forge
     conda run -n "${CONDA_ENV}" python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}')"
 else
     conda create -y -n "${CONDA_ENV}" python="${MATRIX_PYTHON_VERSION}"
@@ -88,14 +88,11 @@ conda run -n "${CONDA_ENV}" pip install torch --index-url "$PYTORCH_URL"
 # install fbgemm
 conda run -n "${CONDA_ENV}" pip install fbgemm-gpu --index-url "$PYTORCH_URL"
 
-# install tensordict from pypi
-conda run -n "${CONDA_ENV}" pip install tensordict==0.8.1
+# install other requirements
+conda run -n "${CONDA_ENV}" pip install -r requirements.txt
 
 # install torchrec
 conda run -n "${CONDA_ENV}" pip install torchrec --index-url "$PYTORCH_URL"
-
-# install other requirements
-conda run -n "${CONDA_ENV}" pip install -r requirements.txt
 
 # Run small import test
 conda run -n "${CONDA_ENV}" python -c "import torch; import fbgemm_gpu; import torchrec"
@@ -134,11 +131,12 @@ else
     fi
 fi
 
-if [[ ${MATRIX_PYTHON_VERSION} = '3.13t' ]]; then
-    conda create -y -n "${CONDA_ENV}" python-freethreading="3.13"
-    conda run -n "${CONDA_ENV}" python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}')"
-elif [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
-    conda create -y -n "${CONDA_ENV}" python-freethreading="3.14"
+if [[ ${MATRIX_PYTHON_VERSION} = '3.14' ]]; then
+    # conda currently doesn't support 3.14 unless using the forge channel
+    conda create -y -n "${CONDA_ENV}" python="3.14" -c conda-forge
+elif [[ ${MATRIX_PYTHON_VERSION} = '3.13t' ]]; then
+    # use conda-forge to install python3.13t
+    conda create -y -n "${CONDA_ENV}" python="3.13" python-freethreading -c conda-forge
     conda run -n "${CONDA_ENV}" python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}')"
 else
     conda create -y -n "${CONDA_ENV}" python="${MATRIX_PYTHON_VERSION}"
