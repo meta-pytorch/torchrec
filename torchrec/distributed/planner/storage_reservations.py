@@ -83,6 +83,19 @@ def _reserve_dense_storage(
     return dense_tensor_storage
 
 
+def _get_kjt_storage(
+    topology: Topology,
+    batch_inputs: List[float],
+    input_data_type_size: int,
+    multiplier: int,
+) -> Storage:
+    kjt_size = math.ceil(sum(batch_inputs) * float(input_data_type_size)) * multiplier
+    return Storage(
+        hbm=kjt_size if topology.compute_device in {"cuda", "mtia"} else 0,
+        ddr=kjt_size if topology.compute_device == "cpu" else 0,
+    )
+
+
 def _reserve_kjt_storage(
     topology: Topology,
     batch_size: int,
@@ -90,11 +103,8 @@ def _reserve_kjt_storage(
     input_data_type_size: int,
     multiplier: int,
 ) -> Storage:
-    kjt_size = math.ceil(sum(batch_inputs) * float(input_data_type_size)) * multiplier
-
-    kjt_storage = Storage(
-        hbm=kjt_size if topology.compute_device in {"cuda", "mtia"} else 0,
-        ddr=kjt_size if topology.compute_device == "cpu" else 0,
+    kjt_storage = _get_kjt_storage(
+        topology, batch_inputs, input_data_type_size, multiplier
     )
 
     for device in topology.devices:
@@ -164,6 +174,7 @@ class FixedPercentageStorageReservation(StorageReservation):
         assert percentage >= 0 and percentage <= 1
         self._percentage: float = percentage
         self._last_reserved_topology: Optional[Topology] = None
+        self._kjt_storage: Optional[Storage] = None
 
     def reserve(
         self,
@@ -176,6 +187,17 @@ class FixedPercentageStorageReservation(StorageReservation):
         reserved_topology = copy.deepcopy(topology)
         _reserve_storage_percentage(reserved_topology, self._percentage)
         self._last_reserved_topology = reserved_topology
+        # save the estimated kjt size (no memory reservation)
+        batch_inputs, _ = _get_batch_inputs_and_shardable_parameters(
+            module, sharders, batch_size, constraints
+        )
+        self._kjt_storage = _get_kjt_storage(
+            topology=topology,
+            batch_inputs=batch_inputs,
+            input_data_type_size=BIGINT_DTYPE,
+            # 2 pipelined batches each with 10 internal copies
+            multiplier=20,
+        )
         return reserved_topology
 
     @property

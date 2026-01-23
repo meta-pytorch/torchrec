@@ -15,8 +15,12 @@ from torchrec.distributed.embedding_tower_sharding import (
     EmbeddingTowerCollectionSharder,
 )
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.planner.constants import BIGINT_DTYPE
 from torchrec.distributed.planner.storage_reservations import (
+    _get_batch_inputs_and_shardable_parameters,
+    _get_kjt_storage,
     _get_module_size,
+    FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.planner.types import PlannerError, PlannerErrorType, Topology
@@ -208,3 +212,269 @@ class TestHeuristicalStorageReservation(unittest.TestCase):
             # pyre-ignore
             heuristical_storage_reservation._dense_storage.hbm,
         )
+
+
+class TestGetKjtStorage(unittest.TestCase):
+    def test_get_kjt_storage_cuda(self) -> None:
+        """Test _get_kjt_storage with CUDA topology returns storage with HBM."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        topology = Topology(world_size=2, compute_device="cuda")
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+
+        batch_inputs, _ = _get_batch_inputs_and_shardable_parameters(
+            model, sharders, batch_size=10
+        )
+        kjt_storage = _get_kjt_storage(
+            topology=topology,
+            batch_inputs=batch_inputs,
+            input_data_type_size=BIGINT_DTYPE,
+            multiplier=20,
+        )
+
+        self.assertGreater(kjt_storage.hbm, 0)
+        self.assertEqual(kjt_storage.ddr, 0)
+
+    def test_get_kjt_storage_cpu(self) -> None:
+        """Test _get_kjt_storage with CPU topology returns storage with DDR."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        topology = Topology(world_size=2, compute_device="cpu")
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+
+        batch_inputs, _ = _get_batch_inputs_and_shardable_parameters(
+            model, sharders, batch_size=10
+        )
+        kjt_storage = _get_kjt_storage(
+            topology=topology,
+            batch_inputs=batch_inputs,
+            input_data_type_size=BIGINT_DTYPE,
+            multiplier=20,
+        )
+
+        self.assertEqual(kjt_storage.hbm, 0)
+        self.assertGreater(kjt_storage.ddr, 0)
+
+    def test_get_kjt_storage_mtia(self) -> None:
+        """Test _get_kjt_storage with MTIA topology returns storage with HBM."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        topology = Topology(world_size=2, compute_device="mtia")
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+
+        batch_inputs, _ = _get_batch_inputs_and_shardable_parameters(
+            model, sharders, batch_size=10
+        )
+        kjt_storage = _get_kjt_storage(
+            topology=topology,
+            batch_inputs=batch_inputs,
+            input_data_type_size=BIGINT_DTYPE,
+            multiplier=20,
+        )
+
+        self.assertGreater(kjt_storage.hbm, 0)
+        self.assertEqual(kjt_storage.ddr, 0)
+
+    def test_get_kjt_storage_multiple_tables(self) -> None:
+        """Test _get_kjt_storage with multiple tables computes aggregate size."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name=f"table_{idx}",
+                feature_names=[f"feature_{idx}"],
+            )
+            for idx in range(3)
+        ]
+
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        topology = Topology(world_size=2, compute_device="cuda")
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+
+        batch_inputs, _ = _get_batch_inputs_and_shardable_parameters(
+            model, sharders, batch_size=10
+        )
+        kjt_storage = _get_kjt_storage(
+            topology=topology,
+            batch_inputs=batch_inputs,
+            input_data_type_size=BIGINT_DTYPE,
+            multiplier=20,
+        )
+
+        self.assertGreater(kjt_storage.hbm, 0)
+
+    def test_get_kjt_storage_custom_multiplier(self) -> None:
+        """Test _get_kjt_storage with custom multiplier."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        topology = Topology(world_size=2, compute_device="cuda")
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+
+        batch_inputs, _ = _get_batch_inputs_and_shardable_parameters(
+            model, sharders, batch_size=10
+        )
+
+        kjt_storage_default = _get_kjt_storage(
+            topology=topology,
+            batch_inputs=batch_inputs,
+            input_data_type_size=BIGINT_DTYPE,
+            multiplier=20,
+        )
+
+        kjt_storage_half = _get_kjt_storage(
+            topology=topology,
+            batch_inputs=batch_inputs,
+            input_data_type_size=BIGINT_DTYPE,
+            multiplier=10,
+        )
+
+        self.assertEqual(kjt_storage_default.hbm, kjt_storage_half.hbm * 2)
+
+
+class TestFixedPercentageStorageReservation(unittest.TestCase):
+    def test_fixed_percentage_reserves_kjt_storage(self) -> None:
+        """Test that FixedPercentageStorageReservation computes and saves _kjt_storage."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        topology = Topology(world_size=2, compute_device="cuda")
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+
+        fixed_storage_reservation = FixedPercentageStorageReservation(percentage=0.25)
+
+        self.assertIsNone(fixed_storage_reservation._kjt_storage)
+
+        fixed_storage_reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        self.assertIsNotNone(fixed_storage_reservation._kjt_storage)
+        # pyre-ignore
+        self.assertGreater(fixed_storage_reservation._kjt_storage.hbm, 0)
+        # pyre-ignore
+        self.assertEqual(fixed_storage_reservation._kjt_storage.ddr, 0)
+
+    def test_fixed_percentage_reserves_kjt_storage_cpu(self) -> None:
+        """Test that FixedPercentageStorageReservation saves _kjt_storage for CPU."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        topology = Topology(world_size=2, compute_device="cpu")
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+
+        fixed_storage_reservation = FixedPercentageStorageReservation(percentage=0.25)
+
+        fixed_storage_reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        self.assertIsNotNone(fixed_storage_reservation._kjt_storage)
+        # pyre-ignore
+        self.assertEqual(fixed_storage_reservation._kjt_storage.hbm, 0)
+        # pyre-ignore
+        self.assertGreater(fixed_storage_reservation._kjt_storage.ddr, 0)
+
+    def test_fixed_percentage_kjt_storage_not_reserved_from_topology(self) -> None:
+        """Test that _kjt_storage is saved but NOT reserved from the topology."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        topology = Topology(
+            world_size=2, compute_device="cuda", hbm_cap=10 * 1024 * 1024 * 1024
+        )
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+
+        fixed_storage_reservation = FixedPercentageStorageReservation(percentage=0.25)
+
+        reserved_topology = fixed_storage_reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        expected_hbm = int((1 - 0.25) * topology.devices[0].storage.hbm)
+        self.assertEqual(reserved_topology.devices[0].storage.hbm, expected_hbm)
