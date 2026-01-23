@@ -1489,7 +1489,7 @@ class ShardedEmbeddingCollection(
     ) -> Awaitable[Awaitable[KJTList]]:
         need_permute: bool = True
         if isinstance(features, TensorDict):
-            feature_keys = list(features.keys())  # pyre-ignore[6]
+            feature_keys = list(features.keys())
             if self._features_order:
                 feature_keys = [feature_keys[i] for i in self._features_order]
                 need_permute = False

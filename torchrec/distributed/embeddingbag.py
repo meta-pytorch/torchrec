@@ -1561,7 +1561,7 @@ class ShardedEmbeddingBagCollection(
         in advance
         """
         if isinstance(features, TensorDict):
-            feature_keys = list(features.keys())  # pyre-ignore[6]
+            feature_keys = list(features.keys())
             if len(self._features_order) > 0:
                 feature_keys = [feature_keys[i] for i in self._features_order]
                 self._has_features_permute = False  # feature_keys are in order
