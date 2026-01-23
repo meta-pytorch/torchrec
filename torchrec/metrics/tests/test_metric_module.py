@@ -7,7 +7,6 @@
 
 # pyre-strict
 
-import concurrent
 import copy
 import dataclasses
 import logging
@@ -27,7 +26,7 @@ from torchrec.distributed.test_utils.multi_process import (
 from torchrec.metrics.auc import AUCMetric
 from torchrec.metrics.metric_module import (
     generate_metric_module,
-    MetricValue,
+    MetricsResult,
     RecMetricModule,
     StateMetric,
     StateMetricEnum,
@@ -55,7 +54,7 @@ class MockOptimizer(StateMetric):
     def __init__(self) -> None:
         self.get_metrics_call = 0
 
-    def get_metrics(self) -> Dict[str, MetricValue]:
+    def get_metrics(self) -> MetricsResult:
         self.get_metrics_call += 1
         return {"learning_rate": torch.tensor(1.0)}
 
@@ -849,7 +848,7 @@ class MetricModuleTest(unittest.TestCase):
             RecMetricException,
             "async_compute is not supported in RecMetricModule",
         ):
-            metric_module.async_compute(concurrent.futures.Future())
+            metric_module.async_compute()
 
     def test_load_state_dict_with_trained_batches_key(self) -> None:
         metric_module = generate_metric_module(
