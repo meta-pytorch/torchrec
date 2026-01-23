@@ -8,12 +8,12 @@
 # pyre-strict
 
 import logging
-from functools import partial
 from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
 from torchmetrics.utilities.distributed import gather_all_tensors
+from torchrec.metrics.auc import _grouping_keys_state_reduction, _state_reduction
 from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
 from torchrec.metrics.metrics_namespace import MetricName, MetricNamespace, MetricPrefix
 from torchrec.metrics.rec_metric import (
@@ -199,14 +199,6 @@ def compute_rauc_per_group(
         )
         raucs.append(avg_rauc)
     return torch.cat(raucs)
-
-
-def _state_reduction(state: List[torch.Tensor], dim: int = 1) -> List[torch.Tensor]:
-    return [torch.cat(state, dim=dim)]
-
-
-# pyre-ignore
-_grouping_keys_state_reduction = partial(_state_reduction, dim=0)
 
 
 class RAUCMetricComputation(RecMetricComputation):
