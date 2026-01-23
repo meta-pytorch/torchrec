@@ -71,6 +71,7 @@ from torchrec.distributed.train_pipeline.train_pipelines import (
     PrefetchTrainPipelineSparseDist,
     StagedTrainPipeline,
     TrainPipelineBase,
+    TrainPipelineFusedSparseDist,
     TrainPipelinePT2,
     TrainPipelineSemiSync,
     TrainPipelineSparseDist,
@@ -1700,6 +1701,85 @@ class PrefetchTrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
                 self.assertTrue(torch.equal(pred, pred_pipeline))
             else:
                 torch.testing.assert_close(pred, pred_pipeline)
+
+
+class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    @settings(max_examples=4, deadline=None)
+    # pyre-ignore[56]
+    @given(
+        enqueue_batch_after_forward=st.booleans(),
+        embedding_lookup_after_data_dist=st.booleans(),
+        sharding_type=st.sampled_from(
+            [
+                ShardingType.TABLE_WISE.value,
+                ShardingType.ROW_WISE.value,
+            ]
+        ),
+        kernel_type=st.sampled_from(
+            [
+                EmbeddingComputeKernel.FUSED.value,
+            ]
+        ),
+    )
+    def test_equal_to_non_pipelined(
+        self,
+        enqueue_batch_after_forward: bool,
+        embedding_lookup_after_data_dist: bool,
+        sharding_type: str,
+        kernel_type: str,
+    ) -> None:
+        """
+        Tests TrainPipelineFusedSparseDist with various parameter combinations
+        produces same results as non-pipelined execution.
+        """
+        data = self._generate_data(
+            num_batches=12,
+            batch_size=32,
+        )
+        dataloader = iter(data)
+
+        fused_params = {
+            "stochastic_rounding": False,
+        }
+
+        model = self._setup_model()
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type, fused_params
+        )
+
+        (
+            sharded_model_pipelined,
+            optim_pipelined,
+        ) = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type, fused_params
+        )
+        copy_state_dict(
+            sharded_model.state_dict(), sharded_model_pipelined.state_dict()
+        )
+
+        pipeline = TrainPipelineFusedSparseDist(
+            model=sharded_model_pipelined,
+            optimizer=optim_pipelined,
+            device=self.device,
+            execute_all_batches=True,
+            enqueue_batch_after_forward=enqueue_batch_after_forward,
+            embedding_lookup_after_data_dist=embedding_lookup_after_data_dist,
+        )
+
+        for batch in data[:-2]:
+            batch = batch.to(self.device)
+            optim.zero_grad()
+            loss, pred = sharded_model(batch)
+            loss.backward()
+            optim.step()
+
+            pred_pipeline = pipeline.progress(dataloader)
+
+            torch.testing.assert_close(pred, pred_pipeline)
 
 
 class DataLoadingThreadTest(unittest.TestCase):

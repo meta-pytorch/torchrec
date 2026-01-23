@@ -1080,6 +1080,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         emb_lookup_stream: str = "data_dist",  # new, current, data_dist (default)
         embedding_lookup_after_data_dist: bool = False,
         inplace_copy_batch_to_gpu: bool = False,
+        enqueue_batch_after_forward: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1091,6 +1092,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             pipeline_postproc=pipeline_postproc,
             custom_model_fwd=custom_model_fwd,
             inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+            enqueue_batch_after_forward=enqueue_batch_after_forward,
         )
         self._embedding_lookup_after_data_dist = embedding_lookup_after_data_dist
 
@@ -1181,8 +1183,10 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             # invoke splits all_to_all comms (first part of input_dist)
             self.start_sparse_data_dist(self.batches[1], self.contexts[1])
 
-        # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
-        self.enqueue_batch(dataloader_iter)
+        if not self._enqueue_batch_after_forward:
+            # batch i+2: load data and copy to gpu, the dataload iter will
+            # first exhaust here.
+            self.enqueue_batch(dataloader_iter)
 
         if self._embedding_lookup_after_data_dist:
             # pyre-ignore [6]
@@ -1191,6 +1195,14 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         # forward
         with record_function(f"## forward {self.contexts[0].index} ##"):
             losses, output = self._model_fwd(self.batches[0])
+
+        if self._enqueue_batch_after_forward:
+            # batch i+2: load data and copy to gpu, the dataload iter will
+            # first exhaust here.
+            # Start this step after the forward of batch i, so that the H2D
+            # copy doesn't compete for pcie bandwidth with embedding lookup
+            # from UVM/UVM_CACHING.
+            self.enqueue_batch(dataloader_iter)
 
         if len(self.batches) >= 2:
             # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
