@@ -169,16 +169,7 @@ class SparseArch(nn.Module):
                 ),
                 is_inference=is_inference,
             )
-        else:
-            mc_modules["table_0"] = MCHManagedCollisionModule(
-                zch_size=tables[0].num_embeddings,
-                input_hash_size=4000,
-                device=device,
-                eviction_interval=2,
-                eviction_policy=DistanceLFU_EvictionPolicy(),
-            )
 
-        if use_mpzch:
             mc_modules["table_1"] = HashZchManagedCollisionModule(
                 zch_size=(tables[1].num_embeddings),
                 device=device,
@@ -192,6 +183,14 @@ class SparseArch(nn.Module):
                 is_inference=is_inference,
             )
         else:
+            mc_modules["table_0"] = MCHManagedCollisionModule(
+                zch_size=tables[0].num_embeddings,
+                input_hash_size=4000,
+                device=device,
+                eviction_interval=2,
+                eviction_policy=DistanceLFU_EvictionPolicy(),
+            )
+
             mc_modules["table_1"] = MCHManagedCollisionModule(
                 zch_size=tables[1].num_embeddings,
                 device=device,
