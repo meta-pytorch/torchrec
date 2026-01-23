@@ -53,6 +53,7 @@ class RecMetricEnum(RecMetricEnumBase):
     HINDSIGHT_TARGET_PR = "hindsight_target_pr"
     NMSE = "nmse"
     AVERAGE = "average"
+    MULTI_LABEL_PRECISION = "multi_label_precision"
 
 
 @dataclass(unsafe_hash=True, eq=True)

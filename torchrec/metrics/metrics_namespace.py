@@ -63,6 +63,7 @@ class MetricName(MetricNameBase):
     RECALL_SESSION_LEVEL = "recall_session_level"
     PRECISION_SESSION_LEVEL = "precision_session_level"
     MULTICLASS_RECALL = "multiclass_recall"
+    MULTI_LABEL_PRECISION = "multi_label_precision"
     WEIGHTED_AVG = "weighted_avg"
     TOWER_QPS = "qps"
     ACCURACY = "accuracy"
@@ -126,6 +127,7 @@ class MetricNamespace(MetricNamespaceBase):
     MODEL_CONFIGURATOR = "model_configurator"
 
     MULTICLASS_RECALL = "multiclass_recall"
+    MULTI_LABEL_PRECISION = "multi_label_precision"
 
     WEIGHTED_AVG = "weighted_avg"
     RECALL_SESSION_LEVEL = "recall_session_level"
