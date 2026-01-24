@@ -1519,7 +1519,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
         with record_function(f"## start_embedding_lookup {context.index} ##"):
             current_stream = torch.get_device_module(self._device).current_stream()
             _wait_for_events(batch, context, current_stream)
-            for i, module in enumerate(self._pipelined_modules):
+            for module in self._pipelined_modules:
                 _start_embedding_lookup(
                     module,
                     context,

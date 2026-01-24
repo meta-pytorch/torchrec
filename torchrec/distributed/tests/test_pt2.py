@@ -56,8 +56,6 @@ from torchrec.distributed.test_utils.infer_utils import (
     create_test_model_ebc_only,
     KJTInputExportWrapper,
     prep_inputs,
-    replace_registered_tbes_with_mock_tbes,
-    replace_sharded_quant_modules_tbes_with_mock_tbes,
     TestQuantEBCSharder,
 )
 from torchrec.distributed.types import BoundsCheckMode, ShardingEnv, ShardingType
