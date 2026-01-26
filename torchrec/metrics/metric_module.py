@@ -121,6 +121,14 @@ MODEL_METRIC_LABEL: str = "model"
 
 
 MetricValue = Union[torch.Tensor, float]
+MetricsResult = Dict[str, MetricValue]
+MetricsFuture = concurrent.futures.Future[MetricsResult]
+MetricsOutput = Union[MetricsResult, MetricsFuture]
+
+# Looser types for publishing metrics with additional metadata
+PublishableMetrics = Dict[str, Any]
+PublishableMetricsFuture = concurrent.futures.Future[PublishableMetrics]
+PublishableMetricsOutput = Union[PublishableMetrics, PublishableMetricsFuture]
 
 
 class StateMetric(abc.ABC):
@@ -129,7 +137,7 @@ class StateMetric(abc.ABC):
     """
 
     @abc.abstractmethod
-    def get_metrics(self) -> Dict[str, MetricValue]:
+    def get_metrics(self) -> MetricsResult:
         pass
 
 
@@ -339,12 +347,12 @@ class RecMetricModule(nn.Module):
     def should_compute(self) -> bool:
         return self.trained_batches % self.compute_interval_steps == 0
 
-    def compute(self) -> Dict[str, MetricValue]:
+    def compute(self) -> MetricsResult:
         r"""compute() is called when the global metrics are required, usually
         right before logging the metrics results to the data sink.
         """
         self.compute_count += 1
-        ret: Dict[str, MetricValue] = {}
+        ret: MetricsResult = {}
         with record_function("## RecMetricModule:compute ##"):
             if self.rec_metrics:
                 self._adjust_compute_interval()
@@ -361,11 +369,11 @@ class RecMetricModule(nn.Module):
                     )
         return ret
 
-    def local_compute(self) -> Dict[str, MetricValue]:
+    def local_compute(self) -> MetricsResult:
         r"""local_compute() is called when per-trainer metrics are required. It's
         can be used for debugging. Currently only rec_metrics is supported.
         """
-        ret: Dict[str, MetricValue] = {}
+        ret: MetricsResult = {}
         if self.rec_metrics:
             ret.update(self.rec_metrics.local_compute())
         return ret
@@ -516,9 +524,7 @@ class RecMetricModule(nn.Module):
     def shutdown(self) -> None:
         logger.info("Initiating graceful shutdown...")
 
-    def async_compute(
-        self, future: concurrent.futures.Future[Dict[str, MetricValue]]
-    ) -> None:
+    def async_compute(self) -> MetricsFuture:
         raise RecMetricException("async_compute is not supported in RecMetricModule")
 
 
