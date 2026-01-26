@@ -1047,6 +1047,21 @@ class ShardedMCCRemapper(nn.Module):
             table: offset[0] for table, offset in shard_metadata.items()
         }
 
+        # Build feature-to-offset mapping.
+        # Features are grouped by table in order: the first _table_feature_splits[0]
+        # features in _fns belong to the first table in zchs, the next
+        # _table_feature_splits[1] features belong to the second table, etc.
+        # This mapping allows downstream code to add table offsets to remapped
+        # feature values when returning remapped features for debugging/analysis.
+        self._feature_to_offset: Dict[str, int] = {}
+        idx = 0
+        for i, table in enumerate(self.zchs.keys()):
+            offset = self._table_to_offset[table]
+            for _ in range(self._table_feature_splits[i]):
+                feature_name = self._fns[idx]
+                self._feature_to_offset[feature_name] = offset
+                idx += 1
+
     def forward(self, features: KeyedJaggedTensor) -> KeyedJaggedTensor:
         # features per shard split by tables
         feature_splits = features.split(self._table_feature_splits)
@@ -1443,7 +1458,56 @@ class ShardedQuantManagedCollisionCollection(
         ctx: ManagedCollisionCollectionContext,
         output: KJTList,
     ) -> KeyedJaggedTensor:
-        raise NotImplementedError()
+        # For quant/inference, return the remapped features directly
+        # without using awaitables (unlike the training version)
+        if len(output) == 0:
+            return KeyedJaggedTensor.empty()
+
+        if len(output) == 1:
+            return output[0]
+
+        # Multiple ranks - combine values and unbucketize to align with input KJT
+        # Use self._feature_names instead of output[0].keys() for torch.fx tracing
+        # compatibility (Proxy objects cannot be iterated)
+        keys: List[str] = self._feature_names
+
+        # Concatenate values from all ranks
+        all_values: List[torch.Tensor] = [kjt.values() for kjt in output]
+        combined_values = torch.cat(all_values) if all_values else torch.empty(0)
+
+        # Get unbucketize tensor from sharding context to reorder values
+        # back to original input order
+        unbucketize_tensor: Optional[torch.Tensor] = None
+        original_lengths: Optional[torch.Tensor] = None
+        if ctx.sharding_contexts:
+            sharding_ctx = ctx.sharding_contexts[0]
+            if hasattr(sharding_ctx, "unbucketize_permute_tensor"):
+                unbucketize_tensor = sharding_ctx.unbucketize_permute_tensor
+            if hasattr(sharding_ctx, "features_before_input_dist"):
+                features_before = sharding_ctx.features_before_input_dist
+                if features_before is not None:
+                    original_lengths = features_before.lengths()
+
+        if unbucketize_tensor is not None:
+            # Reorder values back to original input order
+            combined_values = combined_values.index_select(0, unbucketize_tensor)
+
+        # Use original lengths if available, otherwise concatenate
+        if original_lengths is not None:
+            lengths = original_lengths
+        else:
+            all_lengths: List[torch.Tensor] = [kjt.lengths() for kjt in output]
+            lengths = (
+                torch.cat(all_lengths)
+                if all_lengths
+                else torch.empty(0, dtype=torch.int32)
+            )
+
+        return KeyedJaggedTensor(
+            keys=keys,
+            values=combined_values,
+            lengths=lengths,
+        )
 
     def create_context(self) -> ManagedCollisionCollectionContext:
         return ManagedCollisionCollectionContext(sharding_contexts=[])
