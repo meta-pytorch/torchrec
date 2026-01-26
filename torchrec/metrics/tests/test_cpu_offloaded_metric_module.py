@@ -7,13 +7,12 @@
 
 # pyre-strict
 
-import concurrent.futures
 import os
 import queue
 import threading
 import time
 import unittest
-from typing import Callable, cast, Dict
+from typing import Callable, cast
 from unittest.mock import patch
 
 import torch
@@ -23,7 +22,7 @@ from torchrec.metrics.cpu_offloaded_metric_module import (
     CPUOffloadedRecMetricModule,
     MetricUpdateJob,
 )
-from torchrec.metrics.metric_module import MetricValue, RecMetricModule
+from torchrec.metrics.metric_module import RecMetricModule
 from torchrec.metrics.rec_metric import RecMetricException, RecMetricList
 from torchrec.metrics.test_utils import gen_test_tasks
 from torchrec.metrics.test_utils.mock_metrics import (
@@ -73,6 +72,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         dist.init_process_group("gloo")
         self.cpu_module: CPUOffloadedRecMetricModule = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
             batch_size=self.batch_size,
             world_size=self.world_size,
             rec_tasks=self.tasks,
@@ -85,7 +85,8 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
         if hasattr(self, "cpu_module"):
             try:
                 self.cpu_module.shutdown()
@@ -153,6 +154,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     )
     def test_update_rec_metrics_queue_full(self) -> None:
         cpu_module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cuda"),
             batch_size=self.batch_size,
             world_size=self.world_size,
             rec_tasks=self.tasks,
@@ -191,7 +193,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_sync_compute_raises_exception(self) -> None:
         self.assertRaisesRegex(
             RecMetricException,
-            "compute\\(\\) is not supported in CPUOffloadedRecMetricModule.",
+            "CPUOffloadedRecMetricModule does not support compute\\(\\). Use async_compute\\(\\) instead.",
             self.cpu_module.compute,
         )
 
@@ -207,10 +209,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         Note that the comms module's metrics are actually the ones that are computed.
         """
-        future: concurrent.futures.Future[Dict[str, MetricValue]] = (
-            concurrent.futures.Future()
-        )
-
         model_out = {
             "task1-prediction": torch.tensor([0.5]),
             "task1-label": torch.tensor([0.7]),
@@ -220,7 +218,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         for _ in range(10):
             self.cpu_module.update(model_out)
 
-        self.cpu_module.async_compute(future)
+        self.cpu_module.async_compute()
 
         comms_mock_metric = cast(
             MockRecMetric, self.cpu_module.comms_module.rec_metrics.rec_metrics[0]
@@ -234,10 +232,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_async_compute_after_shutdown(self) -> None:
         self.cpu_module.shutdown()
 
-        future: concurrent.futures.Future[Dict[str, MetricValue]] = (
-            concurrent.futures.Future()
-        )
-        self.cpu_module.async_compute(future)
+        future = self.cpu_module.async_compute()
 
         self.assertRaisesRegex(
             RecMetricException, "metric processor thread is shut down.", future.result
@@ -275,13 +270,91 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             "task1-weight": torch.tensor([1.0]),
         }
         self.cpu_module.update(model_out)
-        self.cpu_module.async_compute(concurrent.futures.Future())
+        self.cpu_module.async_compute()
 
         self.cpu_module.wait_until_queue_is_empty(self.cpu_module.update_queue)
         self.cpu_module.wait_until_queue_is_empty(self.cpu_module.compute_queue)
 
         self.assertTrue(self.cpu_module.update_queue.empty())
         self.assertTrue(self.cpu_module.compute_queue.empty())
+
+    def test_update_thread_exception_captured(self) -> None:
+        """
+        Test that exceptions in update thread are:
+        1. Captured in _captured_exception
+        2. Cause the update thread to terminate
+        3. Main thread raises it on the next update() call
+        """
+        test_exception = RuntimeError("Test exception from update thread")
+
+        with patch.object(
+            self.cpu_module,
+            "_process_metric_update_job",
+            side_effect=test_exception,
+        ):
+            model_out = {
+                "task1-prediction": torch.tensor([0.5]),
+                "task1-label": torch.tensor([0.7]),
+                "task1-weight": torch.tensor([1.0]),
+            }
+
+            self.cpu_module.update(model_out)
+
+            # Wait for exception to be captured
+            captured = self.cpu_module._captured_exception_event.wait(timeout=5.0)
+
+            self.assertTrue(captured, "Exception event should be set")
+            self.assertIsNotNone(self.cpu_module._captured_exception)
+            self.assertIsInstance(self.cpu_module._captured_exception, RuntimeError)
+            self.assertEqual(
+                str(self.cpu_module._captured_exception),
+                "Test exception from update thread",
+            )
+
+            self.cpu_module.update_thread.join(timeout=5.0)
+            self.assertFalse(
+                self.cpu_module.update_thread.is_alive(),
+                "Update thread should have terminated after exception",
+            )
+
+            with self.assertRaises(RuntimeError):
+                self.cpu_module.update(model_out)
+
+    def test_compute_thread_exception_captured(self) -> None:
+        """
+        Test that exceptions in compute thread are:
+        1. Captured in _captured_exception
+        2. Cause the compute thread to terminate
+        3. Main thread raises it on the next compute() call
+        """
+        test_exception = RuntimeError("Test exception from compute thread")
+
+        with patch.object(
+            self.cpu_module,
+            "_process_metric_compute_job",
+            side_effect=test_exception,
+        ):
+            self.cpu_module.async_compute()
+
+            # Wait for exception to be captured
+            captured = self.cpu_module._captured_exception_event.wait(timeout=5.0)
+
+            self.assertTrue(captured, "Exception event should be set")
+            self.assertIsNotNone(self.cpu_module._captured_exception)
+            self.assertIsInstance(self.cpu_module._captured_exception, RuntimeError)
+            self.assertEqual(
+                str(self.cpu_module._captured_exception),
+                "Test exception from compute thread",
+            )
+
+            self.cpu_module.compute_thread.join(timeout=5.0)
+            self.assertFalse(
+                self.cpu_module.compute_thread.is_alive(),
+                "compute thread should have terminated after exception",
+            )
+
+            with self.assertRaises(RuntimeError):
+                self.cpu_module.async_compute()
 
     # pyre-ignore[56]
     @unittest.skipIf(
@@ -311,13 +384,14 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             },
         )
         offloaded_module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cuda"),
             batch_size=self.batch_size,
             world_size=self.world_size,
             rec_tasks=self.tasks,
             rec_metrics=RecMetricList([offloaded_metric]),
         )
 
-        # Update comms module with new state tensors. Offloaded module is untouched.
+        # Update comms module with new state tensors
         comms_metric = cast(
             MockRecMetric, offloaded_module.comms_module.rec_metrics.rec_metrics[0]
         )
@@ -377,6 +451,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             },
         )
         offloaded_module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cuda"),
             batch_size=self.batch_size,
             world_size=self.world_size,
             rec_tasks=self.tasks,
@@ -405,11 +480,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             },
         )
 
-    # pyre-ignore[56]
-    @unittest.skipIf(
-        torch.cuda.device_count() < 1,
-        "Not enough GPUs, this test requires at least one GPU",
-    )
     def test_flush_remaining_work(self) -> None:
         """Test _flush_remaining_work() processes all items in queue during shutdown."""
         test_queue = queue.Queue()
@@ -419,7 +489,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "task1-label": torch.tensor([0.7]),
                 "task1-weight": torch.tensor([1.0]),
             },
-            transfer_completed_event=torch.cuda.Event(),
             kwargs={},
         )
 
@@ -430,6 +499,114 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         self.assertEqual(items_processed, 2)
         self.assertTrue(test_queue.empty())
+
+    def _run_dtoh_transfer_test(self, use_cuda: bool) -> None:
+        """
+        Helper to test DtoH transfer behavior based on device type.
+
+        When use_cuda=True:
+          - Module is initialized with device=cuda
+          - _transfer_to_cpu should be called from the 'metric_update' thread
+          - Input tensors start on GPU, end up on CPU
+
+        When use_cuda=False:
+          - Module is initialized with device=cpu
+          - _transfer_to_cpu should NOT be called
+          - Input tensors stay on CPU
+        """
+        offloaded_metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=self.my_rank,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            initial_states=self.initial_states,
+        )
+
+        device = torch.device("cuda") if use_cuda else torch.device("cpu")
+        offloaded_module = CPUOffloadedRecMetricModule(
+            model_out_device=device,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([offloaded_metric]),
+        )
+
+        # Track _transfer_to_cpu calls and which thread made the call
+        transfer_call_info: list = []
+        original_transfer_to_cpu = offloaded_module._transfer_to_cpu
+
+        def tracking_transfer_to_cpu(model_out: dict) -> tuple:
+            transfer_call_info.append(threading.current_thread().name)
+            return original_transfer_to_cpu(model_out)
+
+        # Create tensors on the appropriate device
+        model_out = {
+            "task1-prediction": torch.tensor([0.5, 0.7]),
+            "task1-label": torch.tensor([0.0, 1.0]),
+            "task1-weight": torch.tensor([1.0, 1.0]),
+        }
+        if use_cuda:
+            model_out = {k: v.to("cuda:0") for k, v in model_out.items()}
+            for tensor in model_out.values():
+                self.assertEqual(tensor.device.type, "cuda")
+
+        with patch.object(
+            offloaded_module,
+            "_transfer_to_cpu",
+            side_effect=tracking_transfer_to_cpu,
+        ):
+            offloaded_module.update(model_out)
+            wait_until_true(offloaded_metric.update_called)
+
+        if use_cuda:
+            # For CUDA: verify _transfer_to_cpu was called from the update thread
+            self.assertEqual(
+                len(transfer_call_info),
+                1,
+                "_transfer_to_cpu should be called exactly once for CUDA device",
+            )
+            self.assertEqual(
+                transfer_call_info[0],
+                "metric_update",
+                f"DtoH transfer should happen in 'metric_update' thread, "
+                f"but was called from '{transfer_call_info[0]}'",
+            )
+        else:
+            # For CPU: verify _transfer_to_cpu was NOT called
+            self.assertEqual(
+                len(transfer_call_info),
+                0,
+                "_transfer_to_cpu should NOT be called when device is CPU",
+            )
+
+        # Verify tensors received by the mock metric are on CPU
+        self.assertTrue(offloaded_metric.predictions_update_calls is not None)
+        for predictions in offloaded_metric.predictions_update_calls:
+            for task_name, tensor in predictions.items():
+                self.assertEqual(
+                    tensor.device.type,
+                    "cpu",
+                    f"Tensor for {task_name} should be on CPU",
+                )
+
+        offloaded_module.shutdown()
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_dtoh_transfer_in_update_thread_for_cuda_device(self) -> None:
+        """
+        Test that DtoH transfer happens in the update thread when device=cuda.
+        """
+        self._run_dtoh_transfer_test(use_cuda=True)
+
+    def test_no_dtoh_transfer_for_cpu_device(self) -> None:
+        """
+        Test that _transfer_to_cpu is NOT called when device=cpu.
+        """
+        self._run_dtoh_transfer_test(use_cuda=False)
 
 
 @skip_if_asan_class
@@ -532,8 +709,8 @@ def _compare_metric_results_worker(
         rec_metrics=RecMetricList([standard_metric]),
     ).to(device)
 
-    # Create CPUOffloadedRecMetricModule (automatically stays on CPU)
     cpu_offloaded_module = CPUOffloadedRecMetricModule(
+        model_out_device=torch.device("cuda"),
         batch_size=batch_size,
         world_size=world_size,
         rec_tasks=tasks,
@@ -575,10 +752,7 @@ def _compare_metric_results_worker(
 
     standard_results = standard_module.compute()
 
-    future: concurrent.futures.Future[Dict[str, MetricValue]] = (
-        concurrent.futures.Future()
-    )
-    cpu_offloaded_module.async_compute(future)
+    future = cpu_offloaded_module.async_compute()
 
     # Wait for async compute to finish. Compare the input to each update()
     offloaded_results = future.result(timeout=10.0)
