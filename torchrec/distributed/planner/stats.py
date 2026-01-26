@@ -612,7 +612,14 @@ class EmbeddingStats(Stats):
         self._stats_table.append(f"#    {usable_memory : <{self._width-6}}#")
         self._stats_table.append(f"#    {usable_hbm_percentage : <{self._width-6}}#")
 
-        if isinstance(storage_reservation, HeuristicalStorageReservation):
+        if isinstance(
+            storage_reservation,
+            (
+                HeuristicalStorageReservation,
+                InferenceStorageReservation,
+                FixedPercentageStorageReservation,
+            ),
+        ):
             dense_hbm = round(bytes_to_gb(dense_storage.hbm), 3)
             dense_ddr = round(bytes_to_gb(dense_storage.ddr), 3)
             dense_storage_text = f"HBM: {dense_hbm} GB, DDR: {dense_ddr} GB"
@@ -981,7 +988,11 @@ def _compute_storage(
         storage_reservation._kjt_storage
         if isinstance(
             storage_reservation,
-            (HeuristicalStorageReservation, InferenceStorageReservation),
+            (
+                HeuristicalStorageReservation,
+                InferenceStorageReservation,
+                FixedPercentageStorageReservation,
+            ),
         )
         and storage_reservation._kjt_storage
         else Storage(0, 0)
