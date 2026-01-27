@@ -286,7 +286,7 @@ class Topology:
         hbm_cap: Optional[int] = None,
         ddr_cap: Optional[int] = None,
         local_world_size: Optional[int] = None,
-        intra_node_size: Optional[int] = None,
+        pod_size: Optional[int] = None,
         hbm_mem_bw: float = HBM_MEM_BW,
         ddr_mem_bw: float = DDR_MEM_BW,
         hbm_to_ddr_mem_bw: float = HBM_TO_DDR_MEM_BW,
@@ -311,6 +311,10 @@ class Topology:
             "cuda",
             "mtia",
         ], f"unsupported compute device {compute_device}"
+        if pod_size and pod_size > world_size:
+            raise ValueError(
+                f"pod_size={pod_size} cannot be greater than world_size={world_size}"
+            )
 
         self._compute_device = compute_device
         self._world_size = world_size
@@ -347,8 +351,15 @@ class Topology:
         self._local_world_size: int = (
             local_world_size if local_world_size else world_size
         )
-        self._local_world_size = 8
-        self._intra_node_size: int = intra_node_size
+        self._pod_size: int = pod_size
+        # Maximum group size with fast comms (e.g. NVLink), e.g. 8 for ZIONEX, 72 for GB200 Catalina
+        #  if pod_size isn't given, then assumes local_world_size is maximum group size
+        self._intra_group_size: int = (
+            pod_size * self._local_world_size
+            if pod_size is not None
+            else self._local_world_size
+        )
+
         self._hbm_mem_bw = hbm_mem_bw
         self._ddr_mem_bw = ddr_mem_bw
         self._hbm_to_ddr_mem_bw = hbm_to_ddr_mem_bw
@@ -383,6 +394,11 @@ class Topology:
     @property
     def local_world_size(self) -> int:
         return self._local_world_size
+
+    @property
+    def intra_group_size(self) -> int:
+        # The largest set of nodes connected with high intra-node bandwidth (e.g. NVLink)
+        return self._intra_group_size
 
     @property
     def hbm_mem_bw(self) -> float:
@@ -427,6 +443,7 @@ class Topology:
         for idx, device in enumerate(self._devices):
             topology_repr += f"\tdevice {idx} {device}\n"
         topology_repr += f"local_world_size={self._local_world_size} \n"
+        topology_repr += f"intra_group_size={self._intra_group_size} \n"
         topology_repr += str(self._comms_bandwidths) + "\n"
         return topology_repr
 
@@ -452,6 +469,7 @@ class Topology:
             hbms,
             ddrs,
             self._local_world_size,
+            self._intra_group_size,
             self._hbm_mem_bw,
             self._ddr_mem_bw,
             self._hbm_to_ddr_mem_bw,
