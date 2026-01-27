@@ -35,6 +35,7 @@ from torchrec.distributed.embedding_sharding import (
     KJTSplitsAllToAllMeta,
 )
 from torchrec.distributed.embedding_types import KJTList
+from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
@@ -429,6 +430,9 @@ def _rewrite_model(  # noqa C901
             pipelined_forwards.append(child)
         else:
             logger.warning(
+                f"Module '{node.target}' will NOT be pipelined, due to input modifications"
+            )
+            one_time_rank0_logger.warning(
                 f"Module '{node.target}' will NOT be pipelined, due to input modifications"
             )
             non_pipelined_sharded_modules.append(node.target)
