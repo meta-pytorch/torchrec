@@ -286,6 +286,7 @@ class Topology:
         hbm_cap: Optional[int] = None,
         ddr_cap: Optional[int] = None,
         local_world_size: Optional[int] = None,
+        intra_node_size: Optional[int] = None,
         hbm_mem_bw: float = HBM_MEM_BW,
         ddr_mem_bw: float = DDR_MEM_BW,
         hbm_to_ddr_mem_bw: float = HBM_TO_DDR_MEM_BW,
@@ -346,6 +347,8 @@ class Topology:
         self._local_world_size: int = (
             local_world_size if local_world_size else world_size
         )
+        self._local_world_size = 8
+        self._intra_node_size: int = intra_node_size
         self._hbm_mem_bw = hbm_mem_bw
         self._ddr_mem_bw = ddr_mem_bw
         self._hbm_to_ddr_mem_bw = hbm_to_ddr_mem_bw
