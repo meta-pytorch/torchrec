@@ -18,6 +18,7 @@ from torch.fx.immutable_collections import (
     immutable_list as fx_immutable_list,
 )
 from torch.fx.node import Node
+from torchrec.distributed.logger import static_logger
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
 from torchrec.distributed.train_pipeline.postproc import PipelinedPostproc
@@ -512,6 +513,29 @@ def _get_leaf_module_names(model: torch.nn.Module) -> List[str]:
     This is a shallow FX trace that only goes the minimum depth required to pipeline.
     Any sub-module who does not contain a ShardedModule would be considered as a leaf
     module unless explicitly tagged as `_is_pytorch_fx_traceable = True`.
+
+    disclaimer:
+        the algorithm is based on "named_modules()" API from torch.nn.Module, there
+    could be corner cases that a returned "leaf_module" is not actually called in the
+    forward pass. for example the umbrella_module would be considered as the top-level
+    leaf module but it actually won't appear in a fx-traced graph.
+
+    ```
+        # the main_model's hierarchy looks like below:
+        main_model
+            - sharded_module
+            - umbrella_module
+                - actual_leaf_module_1
+                - actual_leaf_module_2
+
+        # and the main_model's forward is something like:
+        def forward(self, x1, x2, x3):
+            emb1 = self.sharded_module(x1)
+            emb2 = self.umbrella_module.actual_leaf_module_1(x2)
+            emb3 = self.umbrella_module.actual_leaf_module_2(x3)
+            return emb1 + emb2 + emb3
+    ```
+
     """
 
     def _get_leaf_module_names_helper(
@@ -571,9 +595,24 @@ class Tracer(torch.fx.Tracer):
     # remove this line.
     proxy_buffer_attributes = False
 
-    def __init__(self, leaf_modules: Optional[List[str]] = None) -> None:
+    def __init__(
+        self, leaf_modules: Optional[List[str]] = None, extend_leaf_fqn: bool = False
+    ) -> None:
+        """
+        Initializes the Tracer for FX tracing with custom leaf module handling.
+
+        Args:
+            leaf_modules: Optional list of fully qualified names (FQNs) of modules to treat
+                as leaf modules during tracing. If None, defaults to an empty list.
+            extend_leaf_fqn: If True, treats any module whose FQN starts with a leaf module
+                FQN as a leaf module (includes submodules). If False, only exact matches
+                are considered leaf modules. Defaults to False.
+        """
         super().__init__()
         self._leaf_modules: List[str] = leaf_modules if leaf_modules is not None else []
+        self._extend_leaf_fqn = extend_leaf_fqn
+        if self._extend_leaf_fqn:
+            static_logger.info("use extended leaf module fqn in pipeline tracer")
 
     def is_leaf_module(self, m: torch.nn.Module, module_qualified_name: str) -> bool:
         if (
@@ -583,4 +622,25 @@ class Tracer(torch.fx.Tracer):
             or isinstance(m, FSDP2)
         ):
             return True
+        if self._extend_leaf_fqn:
+            if self.is_extended_leaf_modules(m, module_qualified_name):
+                return True
         return super().is_leaf_module(m, module_qualified_name)
+
+    def is_extended_leaf_modules(
+        self, m: torch.nn.Module, module_qualified_name: str
+    ) -> bool:
+        for leaf_module in self._leaf_modules:
+            if module_qualified_name.startswith(leaf_module):
+                # in a corner case that the fqn == 'main_model.leaf_module.submod'
+                # we should consider this fqn also a leaf_module
+                if (
+                    module_qualified_name != leaf_module
+                    and module_qualified_name[len(leaf_module)] == "."
+                ):
+                    static_logger.warning(
+                        f"extended leaf modules: module '{module_qualified_name}'"
+                        f" is a sub-module of '{leaf_module}'"
+                    )
+                    return True
+        return False
