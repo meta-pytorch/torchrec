@@ -115,12 +115,61 @@ def get_num_groups(world_size: Optional[int] = None) -> int:
     return world_size // get_local_size(world_size)
 
 
+def get_topology_domain_multiple() -> Optional[int]:
+    topology_domain_multiple = _env2int(
+        [
+            "TOPOLOGY_DOMAIN_MULTIPLE",
+        ],
+        -1,
+    )
+    if topology_domain_multiple == -1:
+        return None
+    return topology_domain_multiple
+
+
+def get_topology_group_world_size(world_size: Optional[int] = None) -> int:
+    """
+    Gets topology group world size, total number of processes linked within a topology group
+
+    This is the largest number of processes linked together by high-bandwidth communication.
+    If it isn't specified, it falls back to LOCAL_WORLD_SIZE
+    """
+    topology_domain_multiple = get_topology_domain_multiple()
+    local_world_size = get_local_size(world_size)
+
+    if topology_domain_multiple is None:
+        logger.warn(
+            "Could not determine TOPOLOGY_DOMAIN_MULTIPLE from environment,"
+            " utilizing LOCAL_WORLD_SIZE instead."
+        )
+        return local_world_size
+
+    # Total number of gpu = topology_domain_mult * number_gpu_per_domain
+    return topology_domain_multiple * local_world_size
+
+
 def intra_and_cross_node_pg(
     device: Optional[torch.device] = None,
     backend: Optional[str] = None,
 ) -> Tuple[Optional[dist.ProcessGroup], Optional[dist.ProcessGroup]]:
     """
     Creates sub process groups (intra and cross node)
+
+    e.g. world_size = 12 need to split into groups of size `local_size = 6`
+    process groups = [0, 1, 2, ... 11]
+
+    intra-group:
+        [0] -> [0, 1, .., 5]
+        [1] -> [0, 1, .., 5]
+        ...
+        [6] -> [6, ..., 11]
+        ...
+        [11] -> [6, ..., 11]
+    cross-group:
+        [0] -> [[0, 6]]
+        [1] -> [[1, 7]]
+        ...
+        [5] -> [[5, 11]]
     """
     if device is not None and device.type == "meta":
         return None, None
@@ -130,10 +179,12 @@ def intra_and_cross_node_pg(
 
     my_size = dist.get_world_size()
     my_rank = dist.get_rank()
-    my_local_rank = get_local_rank(my_size, my_rank)
-    local_size = get_local_size(my_size)
-    my_group_rank = get_group_rank(my_size, my_rank)
-    group_count = get_num_groups(my_size)
+    local_size = get_topology_group_world_size(my_size)
+    # TODO: Alireza look into incorporating topology group WS in
+    #       get_group_rank, get_num_groups, get_local_rank
+    my_group_rank = my_rank // local_size
+    group_count = my_size // local_size
+    my_local_rank = my_rank % local_size  # Not the same as the actual local_rank
     if backend is None:
         backend = dist.get_backend()
 
