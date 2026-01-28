@@ -15,6 +15,7 @@ from time import perf_counter
 from typing import Callable, cast, Dict, List, Optional, Tuple, Union
 
 import torch.distributed as dist
+from ai_infra.ai_to.emo_logger import DecisionCategory, log_emo_decision
 from torch import nn
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.comm import get_local_size
@@ -547,6 +548,20 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             module=module,
             sharders=sharders,
             constraints=self._constraints,
+        )
+        global_storage_capacity = reduce(
+            lambda x, y: x + y,
+            [device.storage for device in self._topology.devices],
+        )
+        storage_policy = self._storage_reservation.__class__.__name__
+        storage_percentage = getattr(self._storage_reservation, "_percentage", None)
+        log_emo_decision(
+            DecisionCategory.PROPOSER,
+            logging.INFO,
+            f"Storage reservation applied: policy={storage_policy}, percentage={storage_percentage}, global_hbm_available_gb={round(bytes_to_gb(global_storage_capacity.hbm), 3)}",
+            storage_policy=storage_policy,
+            storage_percentage=storage_percentage,
+            global_hbm_available_gb=round(bytes_to_gb(global_storage_capacity.hbm), 3),
         )
 
         search_space = self._enumerator.enumerate(
