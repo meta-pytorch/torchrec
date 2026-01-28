@@ -13,6 +13,7 @@ from typing import Dict, Type, Union
 import torch
 from torch import nn
 from torchrec.distributed.train_pipeline.train_pipelines import (
+    EvalPipelineFusedSparseDist,
     EvalPipelineSparseDist,
     PrefetchTrainPipelineSparseDist,
     TrainPipelineBase,
@@ -94,6 +95,7 @@ class PipelineConfig:
             "semi": TrainPipelineSemiSync,
             "prefetch": PrefetchTrainPipelineSparseDist,
             "eval-sdd": EvalPipelineSparseDist,
+            "eval-fused": EvalPipelineFusedSparseDist,
         }
 
         match self.pipeline:
