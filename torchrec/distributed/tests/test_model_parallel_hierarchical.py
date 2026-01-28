@@ -60,6 +60,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
                 EmbeddingComputeKernel.FUSED.value,
             ]
         ),
+        topology_domain=st.sampled_from([None, 1]),
         local_size=st.sampled_from([2]),
         qcomms_config=st.sampled_from(
             [
@@ -92,6 +93,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         sharder_type: str,
         sharding_type: str,
         kernel_type: str,
+        topology_domain: int,
         local_size: int,
         qcomms_config: Optional[QCommsConfig],
         apply_optimizer_in_backward_config: Optional[
@@ -111,6 +113,10 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         )
         # Make sure detail debug will work with non-even collective
         os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+        world_size = 4
+        if topology_domain:
+            # Need this to test topology group for TWRW
+            os.environ["TOPOLOGY_DOMAIN_MULTIPLE"] = str(topology_domain)
 
         self._test_sharding(
             # pyre-ignore[6]
@@ -123,8 +129,9 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
                     device=torch.device("cuda"),
                 ),
             ],
+            pod_size=topology_domain,
             backend="nccl",
-            world_size=4,
+            world_size=world_size,
             local_size=local_size,
             qcomms_config=qcomms_config,
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
