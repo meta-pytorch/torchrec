@@ -42,6 +42,9 @@ WEIGHTED_FEATURE_BWD_COMPUTE_MULTIPLIER: float = 1  # empirical studies
 WEIGHTED_KERNEL_MULTIPLIER: float = 1.1  # empirical studies
 DP_ELEMENTWISE_KERNELS_PERF_FACTOR: float = 9.22  # empirical studies
 
+# For rounding memory hashing to nearest 100GB (10^11 bytes):
+HUNDRED_GB = 100 * 1024**3  # 107,374,182,400
+
 
 def kernel_bw_lookup(
     compute_device: str,
