@@ -22,6 +22,7 @@ from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.planner.types import (
+    hash_planner_context_inputs,
     ParameterConstraints,
     Shard,
     ShardingOption,
@@ -415,6 +416,175 @@ def _test_hashing_consistency(
 
         h = planner1.hash_planner_context_inputs()
         return_hash_dict[str(rank)] = h
+
+
+class TestHashPlannerContextInputsRounding(unittest.TestCase):
+    """Tests for device memory rounding in hash_planner_context_inputs."""
+
+    def _create_mock_enumerator(self) -> MagicMock:
+        """Create a mock enumerator with search space."""
+        enumerator = MagicMock()
+        enumerator.last_stored_search_space = [
+            MagicMock(
+                fqn="table_0",
+                sharding_type=ShardingType.TABLE_WISE.value,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                shards=(),
+                cache_params=None,
+            )
+        ]
+        return enumerator
+
+    def _create_mock_storage_reservation(self) -> MagicMock:
+        """Create a mock storage reservation."""
+        storage_reservation = MagicMock()
+        storage_reservation._last_reserved_topology = "mock_topology"
+        return storage_reservation
+
+    def test_rounding_produces_same_hash_for_small_memory_differences(self) -> None:
+        """Test that small memory differences (within 1% tolerance) produce the same hash."""
+        # Setup: create two topologies with slightly different memory values
+        hbm_base = 1024 * 1024 * 1024  # 1 GB
+        # Small difference that should round to the same value
+        hbm_slightly_different = hbm_base + 1000  # 1000 bytes difference
+
+        topology1 = Topology(
+            world_size=2,
+            compute_device="cuda",
+            hbm_cap=hbm_base,
+            local_world_size=2,
+        )
+
+        topology2 = Topology(
+            world_size=2,
+            compute_device="cuda",
+            hbm_cap=hbm_slightly_different,
+            local_world_size=2,
+        )
+
+        enumerator = self._create_mock_enumerator()
+        storage_reservation = self._create_mock_storage_reservation()
+        batch_size = 128
+
+        # Execute: compute hashes for both topologies
+        hash1 = hash_planner_context_inputs(
+            topology=topology1,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+
+        hash2 = hash_planner_context_inputs(
+            topology=topology2,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+
+        # Assert: hashes should be equal due to rounding
+        self.assertEqual(
+            hash1,
+            hash2,
+            "Hashes should be equal for topologies with small memory differences",
+        )
+
+    def test_rounding_produces_different_hash_for_large_memory_differences(
+        self,
+    ) -> None:
+        """Test that large memory differences produce different hashes."""
+        # Setup: create two topologies with significantly different memory values
+        hbm_base = 1024 * 1024 * 1024  # 1 GB
+        hbm_significantly_different = hbm_base * 100
+
+        topology1 = Topology(
+            world_size=2,
+            compute_device="cuda",
+            hbm_cap=hbm_base,
+            local_world_size=2,
+        )
+
+        topology2 = Topology(
+            world_size=2,
+            compute_device="cuda",
+            hbm_cap=hbm_significantly_different,
+            local_world_size=2,
+        )
+
+        enumerator = self._create_mock_enumerator()
+        storage_reservation = self._create_mock_storage_reservation()
+        batch_size = 128
+
+        # Execute: compute hashes for both topologies
+        hash1 = hash_planner_context_inputs(
+            topology=topology1,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+
+        hash2 = hash_planner_context_inputs(
+            topology=topology2,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+
+        # Assert: hashes should be different due to significant memory difference
+        self.assertNotEqual(
+            hash1,
+            hash2,
+            "Hashes should be different for topologies with large memory differences",
+        )
+
+    def test_rounding_consistency_across_devices(self) -> None:
+        """Test that rounding is applied consistently across multiple devices."""
+        # Setup: create topologies with multiple devices having small memory variations
+        enumerator = self._create_mock_enumerator()
+        storage_reservation = self._create_mock_storage_reservation()
+        batch_size = 128
+
+        # Create two topologies with slightly different memory for all devices
+        topology1 = Topology(
+            world_size=4,
+            compute_device="cuda",
+            hbm_cap=1024 * 1024 * 1024,
+            local_world_size=4,
+        )
+
+        topology2 = Topology(
+            world_size=4,
+            compute_device="cuda",
+            hbm_cap=1024 * 1024 * 1024 + 500,  # Small difference
+            local_world_size=4,
+        )
+
+        # Execute: compute hashes for both topologies
+        hash1 = hash_planner_context_inputs(
+            topology=topology1,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+
+        hash2 = hash_planner_context_inputs(
+            topology=topology2,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+
+        # Assert: hashes should be equal due to rounding
+        self.assertEqual(
+            hash1,
+            hash2,
+            "Hashes should be equal for multi-device topologies with small memory differences",
+        )
 
 
 class TestConsistentHashingBetweenProcesses(MultiProcessTestBase):
