@@ -1220,6 +1220,139 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         return output
 
 
+class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        execute_all_batches: bool = True,
+        apply_jit: bool = False,
+        context_type: Type[TrainPipelineContext] = TrainPipelineContext,
+        # keep for backward compatibility
+        pipeline_postproc: bool = False,
+        custom_model_fwd: Optional[
+            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
+        ] = None,
+        dmp_collection_sync_interval_batches: Optional[int] = 1,
+        enqueue_batch_after_forward: bool = False,
+        inplace_copy_batch_to_gpu: bool = False,
+    ) -> None:
+        super().__init__(
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            execute_all_batches=execute_all_batches,
+            apply_jit=apply_jit,
+            context_type=context_type,
+            pipeline_postproc=pipeline_postproc,
+            custom_model_fwd=custom_model_fwd,
+            dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
+            enqueue_batch_after_forward=enqueue_batch_after_forward,
+            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+        )
+        self._data_dist_stream: Optional[torch.Stream] = None
+
+    def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
+        """
+        This function is called in self.progress (one of the main APIs for running train pipeline)
+        Here we assume the max pipelined len(batches) == 2 (capacity), which will be the most common
+        scenario during the full training job, when this function is effectively doing nothing.
+        There would only be two other scenarios:
+        len(batches) == 0:
+            initialize the pipeline, fill in two batches, start input_dist for the first batch.
+        len(batches) == 1:
+            dataloader_iter stops, the last batch, do nothing
+        """
+
+        # pipeline is already filled with max capacity (2)
+        if len(self.batches) >= 1:
+            return
+
+        # executes last batch in pipeline, when there is only one batch in the pipeline
+        # TODO: this _execute_all_batches doesn't really work here D43546239. it will
+        # just throw an exception at copy_to_gpu when the dataloader is exhausted
+        if self.batches and self._execute_all_batches:
+            return
+
+        # batch i, data (batch) and context
+        if not self.enqueue_batch(dataloader_iter):
+            return
+
+    def _wait_for_batch(self) -> None:
+        batch_id = self.contexts[0].index if len(self.contexts) > 0 else "?"
+        with record_function(f"## wait_for_batch {batch_id} ##"):
+            _wait_for_batch(cast(In, self.batches[0]), self._memcpy_stream)
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        """
+        For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
+            batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt (expecting input_dist)
+            batches[1]: next batch, for input_dist (expecting copied to device)
+            batches[2]: i+2 batch, for copy_batch_to_gpu (expecting non-exhausted dataloader iter)
+        """
+        # attach the model just in case the user forgets to call it, especially when the user
+        # pauses the pipeline.progress and detach the model for other purpose.
+        if not self._model_attached:
+            self.attach(self._model)
+
+        # fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
+        self.fill_pipeline(dataloader_iter)
+
+        # here is the expected stop after exhausting all batches
+        if not self.batches:
+            raise StopIteration
+
+        # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
+        # self._set_module_context(self.contexts[0])
+
+        if self._model.training:
+            with record_function("## zero_grad ##"):
+                self._optimizer.zero_grad()
+
+        # wait for batches[0] being available on device, this should always be completed since
+        # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
+        self._wait_for_batch()
+
+        if len(self.batches) >= 1:
+            # self.start_sparse_data_dist(self.batches[0], self.contexts[0])
+            self._init_pipelined_modules(
+                self.batches[0],  # pyre-ignore [6]
+                self.contexts[0],
+                self._pipelined_forward_type,
+            )
+            self.wait_sparse_data_dist(self.contexts[0])
+
+        # forward
+        with record_function("## forward ##"):
+            losses, output = self._model_fwd(self.batches[0])
+
+        if self._model.training:
+            # backward
+            self._backward(losses)
+
+            self.sync_embeddings(
+                self._model,
+                self._dmp_collection_sync_interval_batches,
+                self.contexts[0],
+            )
+
+        is_new_batch_loaded = self.enqueue_batch(dataloader_iter)
+
+        current_batch_idx = int(is_new_batch_loaded)
+        if self._model.training:
+            # update. Note the contexts need to be increment by 1 due to batch
+            # enqueue
+            with record_function(
+                f"## optimizer {self.contexts[current_batch_idx].index} ##"
+            ):
+                self._optimizer.step()
+
+        self.dequeue_batch()
+
+        return output
+
+
 class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
     """
     Novel method for RecSys model training by leveraging "Semi-Synchronous" training,
