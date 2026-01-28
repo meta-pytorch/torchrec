@@ -64,6 +64,8 @@ from torch import distributed as dist
 from torchrec.distributed.logging_handlers import (
     _log_handlers,
     AllRankStaticLogger,
+    Cap01Logger,
+    Cap1Logger,
     CappedLogger,
     MethodLogger,
     SingleRankStaticLogger,
@@ -89,7 +91,9 @@ def _get_or_create_logger(destination: str) -> logging.Logger:
             a key in the `_log_handlers` dictionary. Common values include:
             - SingleRankStaticLogger: Logs only from rank 0
             - AllRankStaticLogger: Logs from all ranks
-            - CappedLogger: Logs with per-location rate limiting
+            - CappedLogger: Logs with per-location rate limiting (10 times per location per rank)
+            - Cap1Logger: Logs with per-location rate limiting (1 time per location per rank)
+            - Cap01Logger: Logs with per-location rate limiting (1 time per location on rank 0 only)
             - MethodLogger: Logs method inputs/outputs
 
     Returns:
@@ -137,6 +141,8 @@ method_logger = _get_or_create_logger(MethodLogger)
 static_logger = _get_or_create_logger(SingleRankStaticLogger)
 all_rank_logger = _get_or_create_logger(AllRankStaticLogger)
 capped_logger = _get_or_create_logger(CappedLogger)
+one_time_logger = _get_or_create_logger(Cap1Logger)
+one_time_rank0_logger = _get_or_create_logger(Cap01Logger)
 
 
 # =============================================================================

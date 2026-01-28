@@ -15,6 +15,8 @@ UnfilteredLogger = "UnfilteredLogger"
 SingleRankStaticLogger = "SingleRankStaticLogger"
 AllRankStaticLogger = "AllRankStaticLogger"
 CappedLogger = "CappedLogger"
+Cap1Logger = "Cap1Logger"
+Cap01Logger = "Cap01Logger"
 MethodLogger = "MethodLogger"
 
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
