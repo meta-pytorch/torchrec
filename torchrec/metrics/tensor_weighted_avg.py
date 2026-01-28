@@ -73,9 +73,6 @@ class TensorWeightedAvgMetricComputation(RecMetricComputation):
             [task.weighted for task in self.tasks]
         ).unsqueeze(dim=-1)
 
-        if torch.cuda.is_available():
-            self.weighted_mask = self.weighted_mask.cuda()
-
     def update(
         self,
         *,
@@ -114,6 +111,7 @@ class TensorWeightedAvgMetricComputation(RecMetricComputation):
 
         num_samples = labels.shape[0]
         weights = cast(torch.Tensor, weights)
+        self.weighted_mask = self.weighted_mask.to(target_tensor.device)
 
         # Vectorized computation using masks
         weighted_values = torch.where(
