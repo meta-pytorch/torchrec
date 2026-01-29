@@ -115,6 +115,7 @@ class RunOptions(BenchFuncConfig):
     sparse_momentum: Optional[float] = None
     sparse_weight_decay: Optional[float] = None
     export_stacks: bool = False
+    debug_mode: bool = False
 
 
 # single-rank runner
@@ -285,6 +286,11 @@ def main(
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
 ) -> None:
+    if run_option.debug_mode:
+        from fbvscode import attach_debugger
+
+        attach_debugger()
+
     tables, weighted_tables, *_ = table_config.generate_tables()
     table_extended_config = TableExtendedConfigs(
         mc_configs=table_config.mc_configs_per_table,
