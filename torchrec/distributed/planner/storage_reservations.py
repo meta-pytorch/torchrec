@@ -171,7 +171,9 @@ def _get_batch_inputs_and_shardable_parameters(
 
 class FixedPercentageStorageReservation(StorageReservation):
     def __init__(self, percentage: float) -> None:
-        assert percentage >= 0 and percentage <= 1
+        assert (
+            percentage >= 0 and percentage <= 1
+        ), f"reserved dense storage percentage must be between 0 and 1, got {percentage}"
         self._percentage: float = percentage
         self._last_reserved_topology: Optional[Topology] = None
         self._kjt_storage: Optional[Storage] = None
