@@ -25,6 +25,7 @@ from torchrec.distributed.planner.constants import (
     HBM_CAP,
     HBM_MEM_BW,
     HBM_TO_DDR_MEM_BW,
+    HUNDRED_GB,
     INTRA_NODE_BANDWIDTH,
     POOLING_FACTOR,
     WEIGHTED_FEATURE_BWD_COMPUTE_MULTIPLIER,
@@ -40,9 +41,8 @@ from torchrec.modules.embedding_configs import DataType
 from torchrec.modules.embedding_modules import EmbeddingCollectionInterface
 from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingCollection
 
+
 # ---- Perf ---- #
-
-
 @dataclass(repr=True, eq=True)
 class Perf:
     """
@@ -1114,8 +1114,31 @@ def hash_planner_context_inputs(
         storage_reservation._last_reserved_topology is not None  # pyre-ignore
     ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
 
+    # Round device memory to 1% to avoid hash mismatches due to minor driver version differences which does not impact the behavior of planner
+    rounded_devices = []
+    for device in topology.devices:
+        rounded_hbm = round_to_nearest(device.storage.hbm, HUNDRED_GB)
+        rounded_ddr = round_to_nearest(device.storage.ddr, HUNDRED_GB)
+        rounded_devices.append((device.rank, rounded_hbm, rounded_ddr))
+
+    topology_hash_components = [
+        topology.world_size,
+        topology.compute_device,
+        rounded_devices,
+        topology.local_world_size,
+        topology.hbm_mem_bw,
+        topology.ddr_mem_bw,
+        topology.hbm_to_ddr_mem_bw,
+        topology.comms_bandwidths.intra_host_bw,
+        topology.comms_bandwidths.inter_host_bw,
+        topology.bwd_compute_multiplier,
+        topology.weighted_feature_bwd_compute_multiplier,
+        topology.uneven_sharding_perf_multiplier,
+    ]
+    hashed_topology = hash_function(topology_hash_components)
+
     hashable_list = [
-        topology,
+        hashed_topology,
         batch_size,
         [
             [
@@ -1129,7 +1152,11 @@ def hash_planner_context_inputs(
         ],
         storage_reservation_policy,
         storage_reservation._last_reserved_topology,
-        constraints.items() if constraints else None,
+        (
+            tuple((k, v.__hash__()) for k, v in sorted(constraints.items()))
+            if constraints
+            else None
+        ),
     ]
     return hash_function(hashable_list)
 
@@ -1171,6 +1198,15 @@ def hash_planner_context_inputs_str(
         ],
         storage_reservation_policy,
         storage_reservation._last_reserved_topology,
-        constraints.items() if constraints else None,
+        (
+            tuple((k, v.__hash__()) for k, v in sorted(constraints.items()))
+            if constraints
+            else None
+        ),
     ]
     return hash_function(hashable_list)
+
+
+def round_to_nearest(x: int, unit: int) -> int:
+    """Round to nearest unit (e.g., 100GB)."""
+    return round(x / unit) * unit

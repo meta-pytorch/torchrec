@@ -1076,6 +1076,9 @@ class MetricCoverageTest(unittest.TestCase):
         # e.g., "SomeMetric": "deprecated, will be removed in next release",
     }
 
+    @unittest.skipIf(
+        sys.version < "3.11", "concurrent.futures._base.Future is type but not a class"
+    )
     def test_all_recmetrics_are_covered(self) -> None:
         import importlib
         import pkgutil
