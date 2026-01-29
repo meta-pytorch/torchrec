@@ -8,6 +8,7 @@
 # pyre-strict
 
 import unittest
+from copy import deepcopy
 from typing import cast, Dict, Optional
 from unittest.mock import MagicMock
 
@@ -297,23 +298,7 @@ class TestParameterConstraintsHash(unittest.TestCase):
             key_value_params=KeyValueParams(),
         )
 
-        pc2 = ParameterConstraints(
-            sharding_types=["type1", "type2"],
-            compute_kernels=["kernel1"],
-            min_partition=4,
-            pooling_factors=[1.0, 2.0],
-            num_poolings=[1.0],
-            batch_sizes=[32],
-            is_weighted=True,
-            cache_params=CacheParams(),
-            enforce_hbm=True,
-            stochastic_rounding=False,
-            bounds_check_mode=BoundsCheckMode(1),
-            feature_names=["feature1", "feature2"],
-            output_dtype=DataType.FP32,
-            device_group="cuda",
-            key_value_params=KeyValueParams(),
-        )
+        pc2 = deepcopy(pc1)
 
         self.assertEqual(
             hash(pc1), hash(pc2), "Hashes should be equal for identical instances"
@@ -359,6 +344,139 @@ class TestParameterConstraintsHash(unittest.TestCase):
 
         self.assertNotEqual(
             hash(pc1), hash(pc2), "Hashes should be different for different instances"
+        )
+
+    def test_hash_equality_with_non_none_cache_and_key_value_params(self) -> None:
+        # Create two identical instances with non-None cache_params and key_value_params
+        cache_params1 = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            reserved_memory=1024.0,
+            precision=DataType.FP16,
+            prefetch_pipeline=True,
+        )
+        key_value_params1 = KeyValueParams(
+            ssd_storage_directory="/tmp/ssd_storage",
+            ssd_rocksdb_write_buffer_size=1024,
+            ssd_rocksdb_shards=4,
+            l2_cache_size=8,
+        )
+
+        pc1 = ParameterConstraints(
+            sharding_types=["type1", "type2"],
+            compute_kernels=["kernel1"],
+            min_partition=4,
+            pooling_factors=[1.0, 2.0],
+            num_poolings=[1.0],
+            batch_sizes=[32],
+            is_weighted=True,
+            cache_params=cache_params1,
+            enforce_hbm=True,
+            stochastic_rounding=False,
+            bounds_check_mode=BoundsCheckMode(1),
+            feature_names=["feature1", "feature2"],
+            output_dtype=DataType.FP32,
+            device_group="cuda",
+            key_value_params=key_value_params1,
+        )
+
+        cache_params2 = deepcopy(cache_params1)
+        key_value_params2 = deepcopy(key_value_params1)
+
+        pc2 = ParameterConstraints(
+            sharding_types=["type1", "type2"],
+            compute_kernels=["kernel1"],
+            min_partition=4,
+            pooling_factors=[1.0, 2.0],
+            num_poolings=[1.0],
+            batch_sizes=[32],
+            is_weighted=True,
+            cache_params=cache_params2,
+            enforce_hbm=True,
+            stochastic_rounding=False,
+            bounds_check_mode=BoundsCheckMode(1),
+            feature_names=["feature1", "feature2"],
+            output_dtype=DataType.FP32,
+            device_group="cuda",
+            key_value_params=key_value_params2,
+        )
+
+        self.assertEqual(
+            hash(pc1),
+            hash(pc2),
+            "Hashes should be equal for identical instances with non-None cache_params and key_value_params",
+        )
+
+    def test_hash_inequality_with_non_none_cache_and_key_value_params(self) -> None:
+        # Create two different instances with different non-None cache_params and key_value_params
+        cache_params1 = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            reserved_memory=1024.0,
+            precision=DataType.FP16,
+            prefetch_pipeline=True,
+        )
+        key_value_params1 = KeyValueParams(
+            ssd_storage_directory="/tmp/ssd_storage",
+            ssd_rocksdb_write_buffer_size=1024,
+            ssd_rocksdb_shards=4,
+            l2_cache_size=8,
+        )
+
+        pc1 = ParameterConstraints(
+            sharding_types=["type1"],
+            compute_kernels=["kernel1"],
+            min_partition=4,
+            pooling_factors=[1.0],
+            num_poolings=[1.0],
+            batch_sizes=[32],
+            is_weighted=True,
+            cache_params=cache_params1,
+            enforce_hbm=True,
+            stochastic_rounding=False,
+            bounds_check_mode=BoundsCheckMode(1),
+            feature_names=["feature1"],
+            output_dtype=DataType.FP32,
+            device_group="cuda",
+            key_value_params=key_value_params1,
+        )
+
+        cache_params2 = CacheParams(
+            algorithm=CacheAlgorithm.LFU,
+            load_factor=0.8,
+            reserved_memory=2048.0,
+            precision=DataType.FP32,
+            prefetch_pipeline=False,
+        )
+        key_value_params2 = KeyValueParams(
+            ssd_storage_directory="/tmp/different_storage",
+            ssd_rocksdb_write_buffer_size=2048,
+            ssd_rocksdb_shards=8,
+            l2_cache_size=16,
+        )
+
+        pc2 = ParameterConstraints(
+            sharding_types=["type2"],
+            compute_kernels=["kernel2"],
+            min_partition=8,
+            pooling_factors=[2.0],
+            num_poolings=[2.0],
+            batch_sizes=[64],
+            is_weighted=False,
+            cache_params=cache_params2,
+            enforce_hbm=False,
+            stochastic_rounding=True,
+            bounds_check_mode=BoundsCheckMode(1),
+            feature_names=["feature2"],
+            output_dtype=DataType.FP16,
+            device_group="cpu",
+            key_value_params=key_value_params2,
+        )
+
+        self.assertNotEqual(
+            hash(pc1),
+            hash(pc2),
+            "Hashes should be different for different instances with non-None cache_params and key_value_params",
         )
 
 
@@ -584,6 +702,366 @@ class TestHashPlannerContextInputsRounding(unittest.TestCase):
             hash1,
             hash2,
             "Hashes should be equal for multi-device topologies with small memory differences",
+        )
+
+
+class TestHashPlannerContextInputsWithConstraints(unittest.TestCase):
+    """Tests for hash_planner_context_inputs with ParameterConstraints."""
+
+    def _create_mock_enumerator(self) -> MagicMock:
+        """Create a mock enumerator with search space."""
+        enumerator = MagicMock()
+        enumerator.last_stored_search_space = [
+            MagicMock(
+                fqn="table_0",
+                sharding_type=ShardingType.TABLE_WISE.value,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                shards=(),
+                cache_params=None,
+                key_value_params=None,
+            )
+        ]
+        return enumerator
+
+    def _create_mock_storage_reservation(self) -> MagicMock:
+        """Create a mock storage reservation."""
+        storage_reservation = MagicMock()
+        storage_reservation._last_reserved_topology = "mock_topology"
+        return storage_reservation
+
+    def _create_topology(self) -> Topology:
+        """Create a standard topology for tests."""
+        return Topology(
+            world_size=2,
+            compute_device="cuda",
+            hbm_cap=1024 * 1024 * 1024,
+            local_world_size=2,
+        )
+
+    def test_hash_equality_with_identical_constraints(self) -> None:
+        """Test that identical constraints produce the same hash."""
+        # Setup: create two identical constraints
+        cache_params1 = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            reserved_memory=1024.0,
+            precision=DataType.FP16,
+            prefetch_pipeline=True,
+        )
+        key_value_params1 = KeyValueParams(
+            ssd_storage_directory="/tmp/ssd_storage",
+            ssd_rocksdb_write_buffer_size=1024,
+            ssd_rocksdb_shards=4,
+            l2_cache_size=8,
+        )
+        constraints1 = {
+            "table_0": ParameterConstraints(
+                sharding_types=["table_wise"],
+                compute_kernels=["fused"],
+                cache_params=cache_params1,
+                key_value_params=key_value_params1,
+            )
+        }
+
+        cache_params2 = deepcopy(cache_params1)
+        key_value_params2 = deepcopy(key_value_params1)
+        constraints2 = {
+            "table_0": ParameterConstraints(
+                sharding_types=["table_wise"],
+                compute_kernels=["fused"],
+                cache_params=cache_params2,
+                key_value_params=key_value_params2,
+            )
+        }
+
+        enumerator = self._create_mock_enumerator()
+        storage_reservation = self._create_mock_storage_reservation()
+        topology = self._create_topology()
+        batch_size = 128
+
+        # Execute: compute hashes with identical constraints
+        hash1 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=constraints1,
+        )
+        hash2 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=constraints2,
+        )
+
+        # Assert: hashes should be equal
+        self.assertEqual(
+            hash1,
+            hash2,
+            "Hashes should be equal for identical constraints with cache_params and key_value_params",
+        )
+
+    def test_hash_inequality_with_different_constraints_cache_params(self) -> None:
+        """Test that different cache_params in constraints produce different hashes."""
+        # Setup: create two constraints with different cache_params
+        cache_params1 = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            reserved_memory=1024.0,
+            precision=DataType.FP16,
+            prefetch_pipeline=True,
+        )
+        constraints1 = {
+            "table_0": ParameterConstraints(
+                sharding_types=["table_wise"],
+                compute_kernels=["fused"],
+                cache_params=cache_params1,
+                key_value_params=None,
+            )
+        }
+
+        cache_params2 = CacheParams(
+            algorithm=CacheAlgorithm.LFU,
+            load_factor=0.8,
+            reserved_memory=2048.0,
+            precision=DataType.FP32,
+            prefetch_pipeline=False,
+        )
+        constraints2 = {
+            "table_0": ParameterConstraints(
+                sharding_types=["table_wise"],
+                compute_kernels=["fused"],
+                cache_params=cache_params2,
+                key_value_params=None,
+            )
+        }
+
+        enumerator = self._create_mock_enumerator()
+        storage_reservation = self._create_mock_storage_reservation()
+        topology = self._create_topology()
+        batch_size = 128
+
+        # Execute: compute hashes with different cache_params
+        hash1 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=constraints1,
+        )
+        hash2 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=constraints2,
+        )
+
+        # Assert: hashes should be different
+        self.assertNotEqual(
+            hash1,
+            hash2,
+            "Hashes should be different for constraints with different cache_params",
+        )
+
+    def test_hash_inequality_with_different_constraints_kv_params(self) -> None:
+        """Test that different key_value_params in constraints produce different hashes."""
+        # Setup: create two constraints with different key_value_params
+        key_value_params1 = KeyValueParams(
+            ssd_storage_directory="/tmp/ssd_storage",
+            ssd_rocksdb_write_buffer_size=1024,
+            ssd_rocksdb_shards=4,
+            l2_cache_size=8,
+        )
+        constraints1 = {
+            "table_0": ParameterConstraints(
+                sharding_types=["table_wise"],
+                compute_kernels=["fused"],
+                cache_params=None,
+                key_value_params=key_value_params1,
+            )
+        }
+
+        key_value_params2 = KeyValueParams(
+            ssd_storage_directory="/tmp/different_storage",
+            ssd_rocksdb_write_buffer_size=2048,
+            ssd_rocksdb_shards=8,
+            l2_cache_size=16,
+        )
+        constraints2 = {
+            "table_0": ParameterConstraints(
+                sharding_types=["table_wise"],
+                compute_kernels=["fused"],
+                cache_params=None,
+                key_value_params=key_value_params2,
+            )
+        }
+
+        enumerator = self._create_mock_enumerator()
+        storage_reservation = self._create_mock_storage_reservation()
+        topology = self._create_topology()
+        batch_size = 128
+
+        # Execute: compute hashes with different key_value_params
+        hash1 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=constraints1,
+        )
+        hash2 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=constraints2,
+        )
+
+        # Assert: hashes should be different
+        self.assertNotEqual(
+            hash1,
+            hash2,
+            "Hashes should be different for constraints with different key_value_params",
+        )
+
+    def test_hash_inequality_constraints_none_vs_non_none(self) -> None:
+        """Test that None constraints vs non-None constraints produce different hashes."""
+        # Setup: create constraints with non-None values
+        cache_params = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            reserved_memory=1024.0,
+            precision=DataType.FP16,
+            prefetch_pipeline=True,
+        )
+        constraints_non_none = {
+            "table_0": ParameterConstraints(
+                sharding_types=["table_wise"],
+                compute_kernels=["fused"],
+                cache_params=cache_params,
+                key_value_params=None,
+            )
+        }
+
+        enumerator = self._create_mock_enumerator()
+        storage_reservation = self._create_mock_storage_reservation()
+        topology = self._create_topology()
+        batch_size = 128
+
+        # Execute: compute hashes with None vs non-None constraints
+        hash_none = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+        hash_non_none = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=constraints_non_none,
+        )
+
+        # Assert: hashes should be different
+        self.assertNotEqual(
+            hash_none,
+            hash_non_none,
+            "Hashes should be different for None vs non-None constraints",
+        )
+
+    def test_hash_consistency_with_multiple_tables_in_constraints(self) -> None:
+        """Test hash consistency when constraints contain multiple tables with various param combinations."""
+        # Setup: create constraints with multiple tables
+        cache_params = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            reserved_memory=1024.0,
+            precision=DataType.FP16,
+            prefetch_pipeline=True,
+        )
+        key_value_params = KeyValueParams(
+            ssd_storage_directory="/tmp/ssd_storage",
+            ssd_rocksdb_write_buffer_size=1024,
+            ssd_rocksdb_shards=4,
+            l2_cache_size=8,
+        )
+
+        constraints1 = {
+            "table_0": ParameterConstraints(
+                sharding_types=["table_wise"],
+                compute_kernels=["fused"],
+                cache_params=cache_params,
+                key_value_params=None,
+            ),
+            "table_1": ParameterConstraints(
+                sharding_types=["row_wise"],
+                compute_kernels=["fused"],
+                cache_params=None,
+                key_value_params=key_value_params,
+            ),
+            "table_2": ParameterConstraints(
+                sharding_types=["column_wise"],
+                compute_kernels=["fused"],
+                cache_params=cache_params,
+                key_value_params=key_value_params,
+            ),
+        }
+
+        # Create identical constraints
+        cache_params2 = deepcopy(cache_params)
+        key_value_params2 = deepcopy(key_value_params)
+
+        constraints2 = {
+            "table_0": ParameterConstraints(
+                sharding_types=["table_wise"],
+                compute_kernels=["fused"],
+                cache_params=cache_params2,
+                key_value_params=None,
+            ),
+            "table_1": ParameterConstraints(
+                sharding_types=["row_wise"],
+                compute_kernels=["fused"],
+                cache_params=None,
+                key_value_params=key_value_params2,
+            ),
+            "table_2": ParameterConstraints(
+                sharding_types=["column_wise"],
+                compute_kernels=["fused"],
+                cache_params=cache_params2,
+                key_value_params=key_value_params2,
+            ),
+        }
+
+        enumerator = self._create_mock_enumerator()
+        storage_reservation = self._create_mock_storage_reservation()
+        topology = self._create_topology()
+        batch_size = 128
+
+        # Execute: compute hashes with identical multi-table constraints
+        hash1 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=constraints1,
+        )
+        hash2 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=batch_size,
+            enumerator=enumerator,
+            storage_reservation=storage_reservation,
+            constraints=constraints2,
+        )
+
+        # Assert: hashes should be equal for identical constraints
+        self.assertEqual(
+            hash1,
+            hash2,
+            "Hashes should be equal for identical multi-table constraints",
         )
 
 

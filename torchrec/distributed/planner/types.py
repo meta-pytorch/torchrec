@@ -1152,7 +1152,11 @@ def hash_planner_context_inputs(
         ],
         storage_reservation_policy,
         storage_reservation._last_reserved_topology,
-        constraints.items() if constraints else None,
+        (
+            tuple((k, v.__hash__()) for k, v in sorted(constraints.items()))
+            if constraints
+            else None
+        ),
     ]
     return hash_function(hashable_list)
 
@@ -1194,7 +1198,11 @@ def hash_planner_context_inputs_str(
         ],
         storage_reservation_policy,
         storage_reservation._last_reserved_topology,
-        constraints.items() if constraints else None,
+        (
+            tuple((k, v.__hash__()) for k, v in sorted(constraints.items()))
+            if constraints
+            else None
+        ),
     ]
     return hash_function(hashable_list)
 
