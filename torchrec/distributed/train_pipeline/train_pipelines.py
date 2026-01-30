@@ -32,6 +32,7 @@ from typing import (
 import torch
 from torch.autograd.profiler import record_function
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
+from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
@@ -215,6 +216,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             if device.type in ["cuda", "mtia"]
             else None
         )
+        self._batch_count = 0
         self._inplace_copy_batch_to_gpu = inplace_copy_batch_to_gpu
         logger.info(
             f"train_pipeline uses inplace_copy_batch_to_gpu: {inplace_copy_batch_to_gpu}"
@@ -260,7 +262,9 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._connected = True
 
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
-        with record_function("## next batch from dataloader (host) ##"):
+        with record_function(
+            f"## load batch {self._batch_count} from dataloader (host) ##"
+        ):
             try:
                 next_batch = next(dataloader_iter)
             except StopIteration:
@@ -301,7 +305,11 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         if not self._connected:
             self._connect(dataloader_iter)
         if self._data_iter_stopped:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration()
+        self._batch_count += 1
 
         # get the current batch from previous operation
         cur_batch = self._cur_batch
@@ -506,6 +514,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._apply_jit = apply_jit
         self._enqueue_batch_after_forward = enqueue_batch_after_forward
         self._inplace_copy_batch_to_gpu = inplace_copy_batch_to_gpu
+        self._batch_count = 0
 
         logger.info(
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
@@ -653,6 +662,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             batch, context = self.copy_batch_to_gpu(dataloader_iter)
         if batch is None:
             return False
+        self._batch_count += 1
         self.batches.append(batch)
         # pyre-ignore [6]
         self.contexts.append(context)
@@ -740,6 +750,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
 
         # here is the expected stop after exhausting all batches
         if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
@@ -1161,6 +1174,9 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
         # here is the expected stop after exhausting all batches
         if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
@@ -1356,6 +1372,9 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
 
         self.fill_pipeline(dataloader_iter)
         if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         if len(self.batches) >= 3:
@@ -1878,6 +1897,9 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             self.contexts.append(self._create_context())
 
         if len(self.batches) == 0:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         with record_function("## wait_for_batch ##"):
@@ -2287,6 +2309,9 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
 
         self.fill_pipeline(dataloader_iter)
         if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
