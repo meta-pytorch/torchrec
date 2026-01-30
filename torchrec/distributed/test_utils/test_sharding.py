@@ -770,6 +770,7 @@ def sharding_single_rank_test_single_process(
     weighted_tables: Optional[List[EmbeddingTableConfig]] = None,
     constraints: Optional[Dict[str, ParameterConstraints]] = None,
     local_size: Optional[int] = None,
+    pod_size: Optional[int] = None,
     qcomms_config: Optional[QCommsConfig] = None,
     apply_optimizer_in_backward_config: Optional[
         Dict[str, Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]]
@@ -869,11 +870,11 @@ def sharding_single_rank_test_single_process(
             world_size=world_size_2D if world_size_2D else world_size,
             compute_device=device.type,
             local_world_size=node_group_size if node_group_size else local_size,
+            pod_size=pod_size,
         ),
         constraints=constraints,
     )
     plan: ShardingPlan = planner.collective_plan(local_model, sharders, pg)
-
     if submodule_configs is not None:
         # Dynamic 2D parallel, create a new plan for each submodule
         for config in submodule_configs:
@@ -1057,6 +1058,7 @@ def sharding_single_rank_test(
     weighted_tables: Optional[List[EmbeddingTableConfig]] = None,
     constraints: Optional[Dict[str, ParameterConstraints]] = None,
     local_size: Optional[int] = None,
+    pod_size: Optional[int] = None,
     qcomms_config: Optional[QCommsConfig] = None,
     apply_optimizer_in_backward_config: Optional[
         Dict[str, Tuple[Type[torch.optim.Optimizer], Dict[str, Any]]]
@@ -1098,6 +1100,7 @@ def sharding_single_rank_test(
             weighted_tables=weighted_tables,
             constraints=constraints,
             local_size=local_size,
+            pod_size=pod_size,
             qcomms_config=qcomms_config,
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
             variable_batch_size=variable_batch_size,
