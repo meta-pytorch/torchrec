@@ -503,6 +503,7 @@ class DataLoadingThread(Thread, Generic[In]):
         to_device_non_blocking: bool,
         memcpy_stream_priority: int = 0,
         memcpy_stream: Optional[torch.Stream] = None,
+        inplace_copy_batch_to_gpu: bool = False,
     ) -> None:
         super().__init__(name="DataLoadingThread")
         self._stop: bool = False
@@ -522,6 +523,7 @@ class DataLoadingThread(Thread, Generic[In]):
         self._to_device_non_blocking = to_device_non_blocking
         self._buffered: Optional[In] = None
         self._buffer_empty_event.set()
+        self._inplace_copy_batch_to_gpu = inplace_copy_batch_to_gpu
 
     def run(self) -> None:
         if self._device.type == "cuda" and torch.cuda.is_available():
@@ -544,16 +546,31 @@ class DataLoadingThread(Thread, Generic[In]):
                     self._stop = True
                     self._buffer_filled_event.set()
                     return
-            with record_function("## copy_batch_to_gpu ##"):
-                with torch.get_device_module(self._device).stream(self._memcpy_stream):
+            if self._inplace_copy_batch_to_gpu:
+                with record_function(f"## inplace_copy_batch_to_gpu ##"):
                     self._buffered = cast(
                         In,
                         batch.to(
-                            self._device, non_blocking=self._to_device_non_blocking
+                            self._device,
+                            non_blocking=self._to_device_non_blocking,
+                            data_copy_stream=self._memcpy_stream,
                         ),
                     )
-                self._buffer_empty_event.clear()
-                self._buffer_filled_event.set()
+                    self._buffer_empty_event.clear()
+                    self._buffer_filled_event.set()
+            else:
+                with record_function("## copy_batch_to_gpu ##"):
+                    with torch.get_device_module(self._device).stream(
+                        self._memcpy_stream
+                    ):
+                        self._buffered = cast(
+                            In,
+                            batch.to(
+                                self._device, non_blocking=self._to_device_non_blocking
+                            ),
+                        )
+                    self._buffer_empty_event.clear()
+                    self._buffer_filled_event.set()
 
     def stop(self) -> None:
         logger.info("Stopping data loading thread...")
