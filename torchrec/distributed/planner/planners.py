@@ -69,6 +69,7 @@ from torchrec.distributed.types import (
     ShardMetadata,
 )
 from torchrec.distributed.utils import get_device_type, none_throws
+from torchrec.utils.emo_logger import DecisionCategory, log_emo_decision
 
 try:
     # This is a safety measure against torch package issues for when
@@ -547,6 +548,20 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             module=module,
             sharders=sharders,
             constraints=self._constraints,
+        )
+        global_storage_capacity = reduce(
+            lambda x, y: x + y,
+            [device.storage for device in self._topology.devices],
+        )
+        storage_policy = self._storage_reservation.__class__.__name__
+        storage_percentage = getattr(self._storage_reservation, "_percentage", None)
+        log_emo_decision(
+            DecisionCategory.PROPOSER,
+            logging.INFO,
+            f"Storage reservation applied: policy={storage_policy}, percentage={storage_percentage}, global_hbm_available={round(bytes_to_gb(global_storage_capacity.hbm), 3)}GB",
+            storage_policy=storage_policy,
+            storage_percentage=storage_percentage,
+            global_hbm_available_gb=round(bytes_to_gb(global_storage_capacity.hbm), 3),
         )
 
         search_space = self._enumerator.enumerate(
