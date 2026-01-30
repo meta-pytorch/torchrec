@@ -341,6 +341,7 @@ class ModelInput(Pipelineable):
         lengths_dtype: torch.dtype = torch.int64,
         all_zeros: bool = False,
         pin_memory: bool = False,  # pin_memory is needed for training job qps benchmark
+        zipf_alpha: Optional[float] = None,  # If set, use Zipf distribution for indices
     ) -> "ModelInput":
         """
         Returns a single batch of `ModelInput`
@@ -369,6 +370,7 @@ class ModelInput(Pipelineable):
                 offsets_dtype=offsets_dtype,
                 lengths_dtype=lengths_dtype,
                 all_zeros=all_zeros,
+                zipf_alpha=zipf_alpha,
             )
             if tables is not None and len(tables) > 0
             else None
@@ -387,6 +389,7 @@ class ModelInput(Pipelineable):
                 offsets_dtype=offsets_dtype,
                 lengths_dtype=lengths_dtype,
                 all_zeros=all_zeros,
+                zipf_alpha=zipf_alpha,
             )
             if weighted_tables is not None and len(weighted_tables) > 0
             else None
@@ -411,6 +414,50 @@ class ModelInput(Pipelineable):
         )
 
     @staticmethod
+    def _generate_zipf_indices(
+        zipf_alpha: float,
+        num_indices: int,
+        num_embeddings: int,
+        dtype: torch.dtype,
+        device: Optional[torch.device],
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Generate indices following a Zipf distribution.
+
+        Uses lazy import of numpy. Falls back to uniform random if numpy
+        is not available.
+
+        Args:
+            zipf_alpha: Shape parameter for Zipf distribution (must be > 1)
+            num_indices: Number of indices to generate
+            num_embeddings: Maximum embedding index (exclusive)
+            dtype: Data type for the output tensor
+            device: Device for the output tensor
+            seed: Optional seed for numpy random state (for reproducibility)
+
+        Returns:
+            Tensor of indices following Zipf distribution, clipped to [0, num_embeddings)
+        """
+        try:
+            import numpy as np
+
+            if seed is not None:
+                np.random.seed(seed)
+            zipf_samples = np.random.zipf(zipf_alpha, num_indices)
+            indices_np = np.clip(zipf_samples - 1, 0, num_embeddings - 1)
+            return torch.tensor(indices_np, dtype=dtype, device=device)
+        except ImportError:
+            # numpy not available, fall back to uniform random distribution
+            return torch.randint(
+                0,
+                num_embeddings,
+                (num_indices,),
+                dtype=dtype,
+                device=device,
+            )
+
+    @staticmethod
     def _create_features_lengths_indices(
         batch_size: int,
         tables: Union[
@@ -423,6 +470,7 @@ class ModelInput(Pipelineable):
         indices_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
         all_zeros: bool = False,
+        zipf_alpha: Optional[float] = None,
     ) -> Tuple[List[str], List[torch.Tensor], List[torch.Tensor]]:
         """
         Create keys, lengths, and indices for a KeyedJaggedTensor from embedding table configs.
@@ -474,21 +522,28 @@ class ModelInput(Pipelineable):
 
             # indices
             num_indices = cast(int, torch.sum(_lengths).item())
-            _indices = (
-                torch.zeros(
+            if all_zeros:
+                _indices = torch.zeros(
                     (num_indices,),
                     dtype=indices_dtype,
                     device=device,
                 )
-                if all_zeros
-                else torch.randint(
+            elif zipf_alpha is not None:
+                _indices = ModelInput._generate_zipf_indices(
+                    zipf_alpha=zipf_alpha,
+                    num_indices=num_indices,
+                    num_embeddings=num_embeddings,
+                    dtype=indices_dtype,
+                    device=device,
+                )
+            else:
+                _indices = torch.randint(
                     0,
                     num_embeddings,
                     (num_indices,),
                     dtype=indices_dtype,
                     device=device,
                 )
-            )
             indices_per_feature.append(_indices)
         return features, lengths_per_feature, indices_per_feature
 
@@ -561,6 +616,7 @@ class ModelInput(Pipelineable):
         offsets_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
         all_zeros: bool = False,
+        zipf_alpha: Optional[float] = None,
     ) -> KeyedJaggedTensor:
         features, lengths_per_feature, indices_per_feature = (
             ModelInput._create_features_lengths_indices(
@@ -573,6 +629,7 @@ class ModelInput(Pipelineable):
                 indices_dtype=indices_dtype,
                 lengths_dtype=lengths_dtype,
                 all_zeros=all_zeros,
+                zipf_alpha=zipf_alpha,
             )
         )
         return ModelInput._assemble_kjt(

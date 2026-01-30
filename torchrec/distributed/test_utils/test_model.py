@@ -83,6 +83,7 @@ class ModelInput(Pipelineable):
         offsets_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
         random_seed: Optional[int] = None,
+        zipf_alpha: Optional[float] = None,  # If set, use Zipf distribution for indices
     ) -> Tuple["ModelInput", List["ModelInput"]]:
         """
         Returns a global (single-rank training) batch
@@ -198,13 +199,22 @@ class ModelInput(Pipelineable):
             num_indices = cast(int, torch.sum(lengths).item())
 
             if randomize_indices:
-                indices = torch.randint(
-                    0,
-                    ind_range,
-                    (num_indices,),
-                    dtype=indices_dtype,
-                    device=device,
-                )
+                if zipf_alpha is not None:
+                    indices = ModelInput._generate_zipf_indices(
+                        zipf_alpha=zipf_alpha,
+                        num_indices=num_indices,
+                        num_embeddings=ind_range,
+                        dtype=indices_dtype,
+                        device=device,
+                    )
+                else:
+                    indices = torch.randint(
+                        0,
+                        ind_range,
+                        (num_indices,),
+                        dtype=indices_dtype,
+                        device=device,
+                    )
             else:
                 indices = torch.zeros(
                     (num_indices,),
@@ -247,14 +257,23 @@ class ModelInput(Pipelineable):
             num_indices = cast(int, torch.sum(lengths).item())
 
             if randomize_indices:
-                indices = torch.randint(
-                    0,
-                    # pyre-ignore [6]
-                    ind_range,
-                    (num_indices,),
-                    dtype=indices_dtype,
-                    device=device,
-                )
+                if zipf_alpha is not None:
+                    indices = ModelInput._generate_zipf_indices(
+                        zipf_alpha=zipf_alpha,
+                        num_indices=num_indices,
+                        num_embeddings=ind_range,
+                        dtype=indices_dtype,
+                        device=device,
+                    )
+                else:
+                    indices = torch.randint(
+                        0,
+                        # pyre-ignore [6]
+                        ind_range,
+                        (num_indices,),
+                        dtype=indices_dtype,
+                        device=device,
+                    )
             else:
                 indices = torch.zeros(
                     (num_indices,),
@@ -441,6 +460,42 @@ class ModelInput(Pipelineable):
             ),
             local_inputs,
         )
+
+    @staticmethod
+    def _generate_zipf_indices(
+        zipf_alpha: float,
+        num_indices: int,
+        num_embeddings: int,
+        dtype: torch.dtype,
+        device: Optional[torch.device],
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Generate indices following a Zipf distribution.
+
+        Uses lazy import of numpy. Falls back to uniform random if numpy
+        is not available.
+
+        Args:
+            seed: Optional seed for numpy random state (for reproducibility)
+        """
+        try:
+            import numpy as np
+
+            if seed is not None:
+                np.random.seed(seed)
+            zipf_samples = np.random.zipf(zipf_alpha, num_indices)
+            indices_np = np.clip(zipf_samples - 1, 0, num_embeddings - 1)
+            return torch.tensor(indices_np, dtype=dtype, device=device)
+        except ImportError:
+            # numpy not available, fall back to uniform random distribution
+            return torch.randint(
+                0,
+                num_embeddings,
+                (num_indices,),
+                dtype=dtype,
+                device=device,
+            )
 
     @staticmethod
     def _generate_variable_batch_local_features(
