@@ -64,6 +64,7 @@ class TrainPipelineContext:
     version: int = (
         0  # 1 is current version, 0 is deprecated but supported for backward compatibility
     )
+    is_training: bool = True
 
 
 @dataclass
