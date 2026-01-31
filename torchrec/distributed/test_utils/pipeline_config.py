@@ -20,6 +20,7 @@ from torchrec.distributed.train_pipeline import (
 from torchrec.distributed.train_pipeline.train_pipelines import (
     PrefetchTrainPipelineSparseDist,
     TrainPipelineSemiSync,
+    TrainPipelineSparseDistLite,
 )
 
 
@@ -90,6 +91,7 @@ class PipelineConfig:
             str, Type[Union[TrainPipelineBase, TrainPipelineSparseDist]]
         ] = {
             "base": TrainPipelineBase,
+            "sparse_lite": TrainPipelineSparseDistLite,
             "sparse": TrainPipelineSparseDist,
             "fused": TrainPipelineFusedSparseDist,
             "semi": TrainPipelineSemiSync,
