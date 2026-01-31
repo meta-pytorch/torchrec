@@ -51,7 +51,6 @@ from torchrec.modules.fp_embedding_modules import (
     apply_feature_processors_to_kjt,
     FeatureProcessedEmbeddingBagCollection,
 )
-from torchrec.pt2.utils import pt2_compatible_justknobs_check
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor, KeyedTensor
 
 _T = TypeVar("_T")
@@ -123,7 +122,7 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
     def input_dist(
         self, ctx: EmbeddingBagCollectionContext, features: KeyedJaggedTensor
     ) -> Awaitable[Awaitable[KJTList]]:
-        if pt2_compatible_justknobs_check(
+        if torch._utils_internal.justknobs_check(
             "pytorch/torchrec:enable_rw_feature_processor"
         ):
             if not self.is_pipelined and self._row_wise_sharded:
@@ -286,7 +285,7 @@ class FeatureProcessedEmbeddingBagCollectionSharder(
             ShardingType.TABLE_COLUMN_WISE.value,
         ]
 
-        if pt2_compatible_justknobs_check(
+        if torch._utils_internal.justknobs_check(
             "pytorch/torchrec:enable_rw_feature_processor"
         ):
             types.extend(
