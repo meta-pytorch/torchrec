@@ -32,6 +32,7 @@ from typing import (
 import torch
 from torch.autograd.profiler import record_function
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
+from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
@@ -215,6 +216,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             if device.type in ["cuda", "mtia"]
             else None
         )
+        self._batch_count = 0
         self._inplace_copy_batch_to_gpu = inplace_copy_batch_to_gpu
         logger.info(
             f"train_pipeline uses inplace_copy_batch_to_gpu: {inplace_copy_batch_to_gpu}"
@@ -260,7 +262,9 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._connected = True
 
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
-        with record_function("## next batch from dataloader (host) ##"):
+        with record_function(
+            f"## load batch {self._batch_count} from dataloader (host) ##"
+        ):
             try:
                 next_batch = next(dataloader_iter)
             except StopIteration:
@@ -301,7 +305,11 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         if not self._connected:
             self._connect(dataloader_iter)
         if self._data_iter_stopped:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration()
+        self._batch_count += 1
 
         # get the current batch from previous operation
         cur_batch = self._cur_batch
@@ -506,6 +514,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._apply_jit = apply_jit
         self._enqueue_batch_after_forward = enqueue_batch_after_forward
         self._inplace_copy_batch_to_gpu = inplace_copy_batch_to_gpu
+        self._batch_count = 0
 
         logger.info(
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
@@ -653,6 +662,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             batch, context = self.copy_batch_to_gpu(dataloader_iter)
         if batch is None:
             return False
+        self._batch_count += 1
         self.batches.append(batch)
         # pyre-ignore [6]
         self.contexts.append(context)
@@ -740,6 +750,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
 
         # here is the expected stop after exhausting all batches
         if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
@@ -1022,6 +1035,176 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._batch_ip1 = self._copy_batch_to_gpu(dataloader_iter)
 
 
+class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
+    """
+    Memory-efficient 2-stage pipelined training with minimal memory overhead.
+
+    This pipeline extends TrainPipelineSparseDist by trading off some throughput
+    improvement for significantly reduced memory overhead. It maintains only one
+    batch in flight for data transfer, making it ideal for memory-constrained
+    deployments where the full SDD pipeline's memory cost is prohibitive.
+
+    Pipeline Architecture:
+        The pipeline maintains 1 batch in flight (vs 2 for full SDD):
+
+        Stage 1 (Batch i+1): Device Transfer
+            - Stream: memcpy CUDA stream
+            - Operation: Copy batch from CPU to GPU memory
+            - Overlap: Runs concurrently with forward/backward of batch i
+
+        Stage 2 (Batch i): Input Distribution + Forward/Backward/Optimizer
+            - Stream: default CUDA stream
+            - Operation: start_sparse_data_dist -> wait_sparse_data_dist ->
+                         forward -> backward -> optimizer step
+            - Note: Input distribution stays in critical path (not overlapped)
+
+    Requirements:
+        - Input model must be symbolically traceable except for ShardedModule and
+          DistributedDataParallel modules
+
+    Performance Characteristics:
+        - Best suited for memory-constrained environments where full SDD is impractical
+        - Achieves ~4-5% QPS improvement over TrainPipelineBase
+        - Memory overhead: ~1 batch size (1 batch in flight for transfer)
+        - Lower throughput than full SDD but much lower memory cost
+
+    Args:
+        model (torch.nn.Module): Model to pipeline. Must contain ShardedModule instances
+            for sparse features.
+        optimizer (torch.optim.Optimizer): Optimizer to use for parameter updates.
+        device (torch.device): Device where all pipeline stages will execute (typically
+            CUDA device).
+        apply_jit (bool): If True, applies torch.jit.script to non-pipelined (unsharded)
+            modules for additional optimization. Default: False.
+        context_type (Type[TrainPipelineContext]): Context type to use for pipeline
+            contexts. Default: TrainPipelineContext.
+        pipeline_postproc (bool): If True, enables pipelining of post-processing
+            operations. Default: False.
+        custom_model_fwd (Optional[Callable]): Custom forward function to use instead
+            of model's default forward. Should return (losses, output) tuple.
+        inplace_copy_batch_to_gpu (bool): If True, performs in-place device transfer
+            to reduce memory allocations. Default: False.
+
+    Example:
+        >>> model = MyShardedModel()
+        >>> optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        >>> pipeline = TrainPipelineSparseDistLite(
+        ...     model=model,
+        ...     optimizer=optimizer,
+        ...     device=torch.device("cuda:0"),
+        ... )
+        >>> for _ in range(num_batches):
+        ...     output = pipeline.progress(dataloader_iter)
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        apply_jit: bool = False,
+        context_type: Type[TrainPipelineContext] = TrainPipelineContext,
+        pipeline_postproc: bool = False,
+        custom_model_fwd: Optional[
+            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
+        ] = None,
+        inplace_copy_batch_to_gpu: bool = False,
+    ) -> None:
+        super().__init__(
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            execute_all_batches=True,
+            apply_jit=apply_jit,
+            context_type=context_type,
+            pipeline_postproc=pipeline_postproc,
+            custom_model_fwd=custom_model_fwd,
+            dmp_collection_sync_interval_batches=None,
+            enqueue_batch_after_forward=False,
+            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+        )
+
+        # SDD Lite only uses memcpy stream for H2D copy.
+        # When invoking self._stream_context() in start_sparse_data_dist and
+        # wait_sparse_data_dist, the stream will be set to the default stream.
+        self._data_dist_stream = None
+
+    def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
+        """
+        Fill the pipeline with a single batch (vs 2 batches in full SDD).
+        SDD Lite maintains only 1 batch in flight to reduce memory overhead.
+        """
+        # Pipeline is already filled with max capacity (1 for Lite)
+        if len(self.batches) >= 1:
+            return
+
+        # batch i: load data and create context
+        if not self.enqueue_batch(dataloader_iter):
+            logger.info("fill_pipeline: failed to load batch i")
+            return
+
+    def _wait_for_batch(self) -> None:
+        """
+        Wait for batch to be available on device.
+        SDD Lite uses memcpy_stream (no dedicated data_dist_stream).
+        """
+        batch_id = self.contexts[0].index if len(self.contexts) > 0 else "?"
+        with record_function(f"## wait_for_batch {batch_id} ##"):
+            _wait_for_batch(cast(In, self.batches[0]), self._memcpy_stream)
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        self._state = PipelineState.IDLE
+
+        if not self._model_attached:
+            self.attach(self._model)
+
+        self.fill_pipeline(dataloader_iter)
+
+        if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
+            raise StopIteration
+
+        # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
+        self._set_module_context(self.contexts[0])
+
+        if self._model.training:
+            with record_function("## zero_grad ##"):
+                self._optimizer.zero_grad()
+
+        # Wait for batch to be on device
+        self._wait_for_batch()
+
+        # Input dist in critical path (key difference from full SDD)
+        self._init_pipelined_modules(
+            self.batches[0],
+            self.contexts[0],
+            self._pipelined_forward_type,
+        )
+        self.wait_sparse_data_dist(self.contexts[0])
+
+        # Forward
+        with record_function(f"## forward {self.contexts[0].index} ##"):
+            self._state = PipelineState.CALL_FWD
+            losses, output = self._model_fwd(self.batches[0])
+
+        if self._model.training:
+            # Backward
+            self._state = PipelineState.CALL_BWD
+            self._backward(losses)
+
+        self.enqueue_batch(dataloader_iter)
+
+        if self._model.training:
+            with record_function(f"## optimizer {self.contexts[0].index} ##"):
+                self._optimizer.step()
+
+        self.dequeue_batch()
+
+        return output
+
+
 class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
     """
     This pipeline modifies TrainPipelineSparseDist by running embedding lookup in a
@@ -1161,6 +1344,9 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
         # here is the expected stop after exhausting all batches
         if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
@@ -1356,6 +1542,9 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
 
         self.fill_pipeline(dataloader_iter)
         if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         if len(self.batches) >= 3:
@@ -1878,6 +2067,9 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             self.contexts.append(self._create_context())
 
         if len(self.batches) == 0:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         with record_function("## wait_for_batch ##"):
@@ -2287,6 +2479,9 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
 
         self.fill_pipeline(dataloader_iter)
         if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
         # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)

@@ -76,6 +76,7 @@ from torchrec.distributed.train_pipeline.train_pipelines import (
     TrainPipelineSemiSync,
     TrainPipelineSparseDist,
     TrainPipelineSparseDistCompAutograd,
+    TrainPipelineSparseDistLite,
 )
 from torchrec.distributed.train_pipeline.utils import DataLoadingThread, get_h2d_func
 from torchrec.distributed.types import (
@@ -1771,6 +1772,78 @@ class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
         )
 
         for batch in data[:-2]:
+            batch = batch.to(self.device)
+            optim.zero_grad()
+            loss, pred = sharded_model(batch)
+            loss.backward()
+            optim.step()
+
+            pred_pipeline = pipeline.progress(dataloader)
+
+            torch.testing.assert_close(pred, pred_pipeline)
+
+
+class TrainPipelineSparseDistLiteTest(TrainPipelineSparseDistTestBase):
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    @settings(max_examples=4, deadline=None)
+    # pyre-ignore[56]
+    @given(
+        sharding_type=st.sampled_from(
+            [
+                ShardingType.TABLE_WISE.value,
+                ShardingType.ROW_WISE.value,
+            ]
+        ),
+        kernel_type=st.sampled_from(
+            [
+                EmbeddingComputeKernel.FUSED.value,
+            ]
+        ),
+    )
+    def test_equal_to_non_pipelined(
+        self,
+        sharding_type: str,
+        kernel_type: str,
+    ) -> None:
+        """
+        Tests TrainPipelineSparseDistLite with various parameter combinations
+        produces same results as non-pipelined execution.
+        """
+        data = self._generate_data(
+            num_batches=12,
+            batch_size=32,
+        )
+        dataloader = iter(data)
+
+        fused_params = {
+            "stochastic_rounding": False,
+        }
+
+        model = self._setup_model()
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type, fused_params
+        )
+
+        (
+            sharded_model_pipelined,
+            optim_pipelined,
+        ) = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type, fused_params
+        )
+        copy_state_dict(
+            sharded_model.state_dict(), sharded_model_pipelined.state_dict()
+        )
+
+        pipeline = TrainPipelineSparseDistLite(
+            model=sharded_model_pipelined,
+            optimizer=optim_pipelined,
+            device=self.device,
+        )
+
+        for batch in data[:-1]:
             batch = batch.to(self.device)
             optim.zero_grad()
             loss, pred = sharded_model(batch)
