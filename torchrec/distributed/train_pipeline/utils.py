@@ -61,7 +61,6 @@ from torchrec.distributed.train_pipeline.tracing import (
 )
 from torchrec.distributed.train_pipeline.types import CallArgs  # noqa
 from torchrec.distributed.types import Awaitable
-from torchrec.pt2.utils import pt2_compatible_justknobs_check
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable, Pipelineable
 
@@ -179,7 +178,7 @@ def _start_data_dist(
         # and this info was done in the _rewrite_model by tracing the
         # entire model to get the arg_info_list
         args, kwargs = forward.args.build_args_kwargs(batch)
-        if pt2_compatible_justknobs_check(
+        if torch._utils_internal.justknobs_check(
             "pytorch/torchrec:enable_rw_feature_processor"
         ):
             args, kwargs = module.preprocess_input(args, kwargs)

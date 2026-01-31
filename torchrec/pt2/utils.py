@@ -25,11 +25,6 @@ convert_to_vb - If True recreates KJT as Variable Batch.
 """
 
 
-@torch._dynamo.assume_constant_result
-def pt2_compatible_justknobs_check(name: str, default: bool = True) -> bool:
-    return torch._utils_internal.justknobs_check(name, default=default)
-
-
 def kjt_for_pt2_tracing(
     kjt: KeyedJaggedTensor,
     convert_to_vb: bool = False,
