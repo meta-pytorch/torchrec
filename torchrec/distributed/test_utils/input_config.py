@@ -31,6 +31,7 @@ class ModelInputConfig:
     long_kjt_lengths: bool = True
     pin_memory: bool = True
     use_variable_batch: bool = False
+    zipf_alpha: Optional[float] = None  # If set, use Zipf distribution for indices
 
     def __post_init__(self):
         assert self.num_batches is not MISSING, "--num_batches must be specified"
@@ -94,6 +95,7 @@ class ModelInputConfig:
                 offsets_dtype=(torch.int64 if self.long_kjt_offsets else torch.int32),
                 lengths_dtype=(torch.int64 if self.long_kjt_lengths else torch.int32),
                 pin_memory=self.pin_memory,
+                zipf_alpha=self.zipf_alpha,
             )
             for _ in range(self.num_batches)
         ]
