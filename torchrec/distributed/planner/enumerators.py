@@ -88,7 +88,7 @@ class EmbeddingEnumerator(Enumerator):
     ) -> None:
         self._compute_device: str = topology.compute_device
         self._world_size: int = topology.world_size
-        self._local_world_size: int = topology.local_world_size
+        self._local_world_size: int = topology.intra_group_size
         self._batch_size: int = batch_size
         self._constraints = constraints
         self._sharder_map: Dict[str, ModuleSharder[nn.Module]] = {}
