@@ -17,7 +17,6 @@ import torch.distributed as dist
 from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.types import (
     EmbeddingModuleShardingPlan,
-    ModuleShardingPlan,
     ParameterSharding,
     ShardedModule,
     ShardedTensor,
