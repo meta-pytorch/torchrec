@@ -140,6 +140,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
         backend: str = "gloo",
         world_size: int = 2,
         local_size: Optional[int] = None,
+        pod_size: Optional[int] = None,
         world_size_2D: Optional[int] = None,
         node_group_size: Optional[int] = None,
         constraints: Optional[Dict[str, ParameterConstraints]] = None,
@@ -173,6 +174,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
                 rank=0,
                 world_size=world_size,
                 local_size=local_size,
+                pod_size=pod_size,
                 world_size_2D=world_size_2D,
                 node_group_size=node_group_size,
                 model_class=model_class,  # pyre-ignore[6]
@@ -205,6 +207,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
                 callable=sharding_single_rank_test,
                 world_size=world_size,
                 local_size=local_size,
+                pod_size=pod_size,
                 world_size_2D=world_size_2D,
                 node_group_size=node_group_size,
                 model_class=model_class,

@@ -434,8 +434,11 @@ class KeyedOptimizerWrapper(KeyedOptimizer):
         self,
         params: Mapping[str, Union[torch.Tensor, ShardedTensor]],
         optim_factory: OptimizerFactory,
+        pass_params_dict: bool = False,
     ) -> None:
-        self._optimizer: optim.Optimizer = optim_factory(list(params.values()))
+
+        pass_params = params if pass_params_dict else list(params.values())
+        self._optimizer: optim.Optimizer = optim_factory(pass_params)
         super().__init__(params, self._optimizer.state, self._optimizer.param_groups)
 
     def zero_grad(self, set_to_none: bool = False) -> None:

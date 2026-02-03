@@ -302,6 +302,7 @@ class GreedyPerfPartitioner(Partitioner):
                 == PartitionByType.DEVICE.value
             ):
                 if minheap_devices is None:
+                    # use local world size cause it needs to relate to host's DDR limit
                     minheap_devices = self._establish_minheap(
                         devices, storage_constraint.local_world_size
                     )
@@ -652,11 +653,11 @@ class GreedyPerfPartitioner(Partitioner):
     def _get_host_level_devices(
         topology: Topology, all_devices: List[DeviceHardware]
     ) -> List[List[DeviceHardware]]:
-        num_hosts: int = topology.world_size // topology.local_world_size
+        num_hosts: int = topology.world_size // topology.intra_group_size
         host_level_devices: List[List[DeviceHardware]] = []
         for i in range(num_hosts):
             devices_in_host = all_devices[
-                i * topology.local_world_size : (i + 1) * topology.local_world_size
+                i * topology.intra_group_size : (i + 1) * topology.intra_group_size
             ]
             host_level_devices.append(devices_in_host)
         return host_level_devices
