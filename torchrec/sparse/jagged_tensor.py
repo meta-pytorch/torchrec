@@ -599,6 +599,22 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         self._lengths: Optional[torch.Tensor] = lengths
         self._offsets: Optional[torch.Tensor] = offsets
 
+    def size_in_bytes(self) -> int:
+        """
+        Returns the size of the JaggedTensor in bytes.
+        """
+        size = self._values.element_size() * self._values.numel()
+        weights = self._weights
+        if weights is not None:
+            size += weights.element_size() * weights.numel()
+        lengths = self._lengths
+        if lengths is not None:
+            size += lengths.element_size() * lengths.numel()
+        offsets = self._offsets
+        if offsets is not None:
+            size += offsets.element_size() * offsets.numel()
+        return size
+
     @staticmethod
     def empty(
         is_weighted: bool = False,
@@ -1852,6 +1868,27 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             _assert_tensor_has_no_elements_or_has_integers(offsets, "offsets")
             _assert_tensor_has_no_elements_or_has_integers(lengths, "lengths")
             self._init_pt2_checks()
+
+    def size_in_bytes(self) -> int:
+        """
+        Returns the size of the KeyedJaggedTensor in bytes.
+        """
+        size = self._values.element_size() * self._values.numel()
+        weights = self._weights
+        if weights is not None:
+            size += weights.element_size() * weights.numel()
+        lengths = self._lengths
+        if lengths is not None:
+            size += lengths.element_size() * lengths.numel()
+        offsets = self._offsets
+        if offsets is not None:
+            size += offsets.element_size() * offsets.numel()
+        stride_per_key_per_rank = self._stride_per_key_per_rank
+        if stride_per_key_per_rank is not None:
+            size += (
+                stride_per_key_per_rank.element_size() * stride_per_key_per_rank.numel()
+            )
+        return size
 
     def _init_pt2_checks(self) -> None:
         if torch.jit.is_scripting() or not is_torchdynamo_compiling():
@@ -3330,6 +3367,12 @@ class KeyedTensor(Pipelineable, metaclass=JaggedTensorMeta):
 
         self._offset_per_key: Optional[List[int]] = offset_per_key
         self._index_per_key: Optional[Dict[str, int]] = index_per_key
+
+    def size_in_bytes(self) -> int:
+        """
+        Returns the size of the KeyedTensor in bytes.
+        """
+        return self._values.element_size() * self._values.numel()
 
     @staticmethod
     def from_tensor_list(
