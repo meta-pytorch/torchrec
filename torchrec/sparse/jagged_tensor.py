@@ -1185,39 +1185,43 @@ def _maybe_compute_length_per_key(
     offsets: Optional[torch.Tensor],
     values: Optional[torch.Tensor],
 ) -> List[int]:
-    if length_per_key is None:
-        if (
-            len(keys)
-            and values is not None
-            and values.is_meta
-            and not is_non_strict_exporting()
-        ):
-            # create dummy lengths per key when on meta device
-            total_length = values.numel()
-            _length = [total_length // len(keys)] * len(keys)
-            _length[0] += total_length % len(keys)
-        elif len(keys) and lengths is not None:
-            _length: List[int] = (
-                _length_per_key_from_stride_per_key(lengths, stride_per_key)
-                if variable_stride_per_key
-                else (
-                    torch.sum(
-                        pt2_check_size_nonzero(lengths.view(len(keys), stride)), dim=1
-                    ).tolist()
-                    if pt2_guard_size_oblivious(lengths.numel() != 0)
-                    else [0] * len(keys)
-                )
+    if length_per_key is not None:
+        return length_per_key
+
+    if (
+        len(keys)
+        and values is not None
+        and values.is_meta
+        and not is_non_strict_exporting()
+    ):
+        # create dummy lengths per key when on meta device
+        total_length = values.numel()
+        _length = [total_length // len(keys)] * len(keys)
+        _length[0] += total_length % len(keys)
+
+    elif len(keys) and lengths is not None:
+        _length: List[int] = (
+            _length_per_key_from_stride_per_key(lengths, stride_per_key)
+            if variable_stride_per_key
+            else (
+                torch.sum(
+                    pt2_check_size_nonzero(lengths.view(len(keys), stride)), dim=1
+                ).tolist()
+                if pt2_guard_size_oblivious(lengths.numel() != 0)
+                else [0] * len(keys)
             )
-        elif len(keys) and offsets is not None and len(offsets) > 0:
-            _length: List[int] = (
-                _length_per_key_from_stride_per_key(torch.diff(offsets), stride_per_key)
-                if variable_stride_per_key
-                else torch.sum(torch.diff(offsets).view(-1, stride), dim=1).tolist()
-            )
-        else:
-            _length: List[int] = []
-        length_per_key = _length
-        pt2_checks_all_is_size(length_per_key)
+        )
+    elif len(keys) and offsets is not None and len(offsets) > 0:
+        _length: List[int] = (
+            _length_per_key_from_stride_per_key(torch.diff(offsets), stride_per_key)
+            if variable_stride_per_key
+            else torch.sum(torch.diff(offsets).view(-1, stride), dim=1).tolist()
+        )
+    else:
+        _length: List[int] = []
+
+    length_per_key = _length
+    pt2_checks_all_is_size(length_per_key)
 
     return length_per_key
 
@@ -3049,7 +3053,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                 - cumsum_lengths[strides_cumsum_to_minus_1]
             )
 
-            with record_function("## all2all_data:recat_values ##"):
+            with record_function("## dist_init:recat_values vb ##"):
                 if recat is not None:
                     lengths, _ = _permute_tensor_by_segments(
                         lengths,
@@ -3083,7 +3087,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             return kjt.sync()
         else:
             assert stride_per_rank is not None
-            with record_function("## all2all_data:recat_values ##"):
+            with record_function("## dist_init:recat_values ##"):
                 if recat is not None:
                     stride = stride_per_rank[0]
 

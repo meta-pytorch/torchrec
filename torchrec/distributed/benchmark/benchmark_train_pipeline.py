@@ -130,11 +130,17 @@ def runner(
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
     table_related_configs: Optional[TableExtendedConfigs] = None,
+    debug_mode: bool = False,
 ) -> BenchmarkResult:
     # Ensure GPUs are available and we have enough of them
     assert (
         torch.cuda.is_available() and torch.cuda.device_count() >= world_size
     ), "CUDA not available or insufficient GPUs for the requested world_size"
+
+    if debug_mode:
+        from fbvscode import attach_debugger
+
+        attach_debugger()
 
     run_option.set_log_level()
     with MultiProcessContext(
@@ -309,6 +315,7 @@ def main(
         input_config=input_config,
         planner_config=planner_config,
         table_related_configs=table_extended_config,
+        debug_mode=run_option.debug_mode,
     )
 
 
