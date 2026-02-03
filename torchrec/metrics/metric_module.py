@@ -20,6 +20,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DeviceMesh
+from torch.monitor import _WaitCounter
 from torch.profiler import record_function
 from torchrec.metrics.accuracy import AccuracyMetric
 from torchrec.metrics.auc import AUCMetric
@@ -73,7 +74,6 @@ from torchrec.metrics.tower_qps import TowerQPSMetric
 from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
 from torchrec.metrics.xauc import XAUCMetric
-
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -353,21 +353,22 @@ class RecMetricModule(nn.Module):
         """
         self.compute_count += 1
         ret: MetricsResult = {}
-        with record_function("## RecMetricModule:compute ##"):
-            if self.rec_metrics:
-                self._adjust_compute_interval()
-                ret.update(self.rec_metrics.compute())
-            if self.throughput_metric:
-                ret.update(self.throughput_metric.compute())
-            if self.state_metrics:
-                for namespace, component in self.state_metrics.items():
-                    ret.update(
-                        {
-                            f"{compose_customized_metric_key(namespace, metric_name)}": metric_value
-                            for metric_name, metric_value in component.get_metrics().items()
-                        }
-                    )
-        return ret
+        with _WaitCounter("pytorch.wait_counter.rec_metrics.compute_job").guard():
+            with record_function("## RecMetricModule:compute ##"):
+                if self.rec_metrics:
+                    self._adjust_compute_interval()
+                    ret.update(self.rec_metrics.compute())
+                if self.throughput_metric:
+                    ret.update(self.throughput_metric.compute())
+                if self.state_metrics:
+                    for namespace, component in self.state_metrics.items():
+                        ret.update(
+                            {
+                                f"{compose_customized_metric_key(namespace, metric_name)}": metric_value
+                                for metric_name, metric_value in component.get_metrics().items()
+                            }
+                        )
+            return ret
 
     def local_compute(self) -> MetricsResult:
         r"""local_compute() is called when per-trainer metrics are required. It's
