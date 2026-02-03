@@ -9,6 +9,7 @@ RunOptions:
   profile_dir: "."
   name: "sparse_data_dist_base"
   # export_stacks: True # enable this to export stack traces
+  loglevel: "info"
 PipelineConfig:
   pipeline: "sparse"
 ModelInputConfig:
