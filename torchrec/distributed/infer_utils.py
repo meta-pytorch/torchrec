@@ -62,7 +62,7 @@ def get_tbe_specs_from_sharded_module(
                     spec[1],
                     spec[2],
                     str(spec[3]),
-                    str(spec[4]),
+                    f"{type(spec[4]).__name__}.{spec[4].name}",
                 )
             )
     return tbe_specs
