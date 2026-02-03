@@ -990,3 +990,22 @@ class TestPt2(unittest.TestCase):
             compile_weights_diff = get_weights(m_compile) - orig_compile_weights
 
             assert_close(eager_weights_diff, compile_weights_diff)
+
+    def test_justknobs_check(self) -> None:
+        with unittest.mock.patch(
+            "torch._dynamo.config.skip_torchrec",
+            False,
+        ):
+
+            def fn(x, y):
+                if torch._utils_internal.justknobs_check("test", True):
+                    return x + y
+                else:
+                    return x - y
+
+            x = torch.randn(2, 2, device="cpu", dtype=torch.float32)
+            y = torch.randn(2, 2, device="cpu", dtype=torch.float32)
+            eager_out = fn(x, y)
+            compiled_fn = torch.compile(fn, backend="aot_eager", fullgraph=True)
+            compiled_out = compiled_fn(x, y)
+            assert_close(eager_out, compiled_out)
