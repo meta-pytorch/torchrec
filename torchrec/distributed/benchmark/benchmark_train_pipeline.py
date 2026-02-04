@@ -137,6 +137,7 @@ def runner(
         torch.cuda.is_available() and torch.cuda.device_count() >= world_size
     ), "CUDA not available or insufficient GPUs for the requested world_size"
 
+    # debug mode only works with vscode for now.
     if debug_mode:
         from fbvscode import attach_debugger
 
