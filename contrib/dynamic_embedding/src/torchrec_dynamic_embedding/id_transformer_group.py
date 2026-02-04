@@ -56,8 +56,9 @@ class IDTransformerGroup:
             configs_dict: a dictionary that maps the module path of the sharded module to its embedding
                 configs or embeddingbag configs. The plan of `module` should contain the module path
                 in `configs_dict`.
-            eviction_config: configuration for eviction policy. Default is `{"type": "mixed_lru_lfu"}`
+            eviction_config: configuration for eviction policy. Default is `{"type": "mixed_lru_lfu", "ratio": 0.5}`
             transform_config: configuration for the transformer. Default is `{"type": "naive"}`
+            ps_config: configuration for the ps. Default is `{"chunk_size": 8 * 1024 * 1024}
             parallel: Whether the IDTransformerCollections will run parallel. When set to True,
                 IDTransformerGroup will start a thread for each IDTransformerCollection.
 
