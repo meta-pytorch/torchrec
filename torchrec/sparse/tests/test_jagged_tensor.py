@@ -968,3 +968,45 @@ class TestJaggedTensorTracing(unittest.TestCase):
         ref_out = m(8)
         traced_out = gm(8)
         self.assertEqual(ref_out, traced_out)
+
+    def test_size_in_bytes(self) -> None:
+        # Test with values only (float32 = 4 bytes per element)
+        values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        lengths = torch.IntTensor([1, 0, 2, 3])
+        jt = JaggedTensor(values=values, lengths=lengths)
+
+        # Expected: 6 float32 values (24 bytes) + 4 int32 lengths (16 bytes)
+        expected_size = 6 * 4 + 4 * 4
+        self.assertEqual(jt.size_in_bytes(), expected_size)
+
+    def test_size_in_bytes_with_weights(self) -> None:
+        # Test with values and weights (both float32 = 4 bytes per element)
+        values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        weights = torch.Tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+        lengths = torch.IntTensor([1, 0, 2, 3])
+        jt = JaggedTensor(values=values, lengths=lengths, weights=weights)
+
+        # Expected: 6 float32 values (24 bytes) + 6 float32 weights (24 bytes) + 4 int32 lengths (16 bytes)
+        expected_size = 6 * 4 + 6 * 4 + 4 * 4
+        self.assertEqual(jt.size_in_bytes(), expected_size)
+
+    def test_size_in_bytes_with_offsets(self) -> None:
+        # Test with offsets instead of lengths
+        values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+        offsets = torch.IntTensor([0, 1, 1, 3, 6])
+        jt = JaggedTensor(values=values, offsets=offsets)
+
+        # Expected: 6 float32 values (24 bytes) + 5 int32 offsets (20 bytes)
+        expected_size = 6 * 4 + 5 * 4
+        self.assertEqual(jt.size_in_bytes(), expected_size)
+
+    def test_size_in_bytes_different_dtypes(self) -> None:
+        # Test with different dtypes (float64 = 8 bytes per element)
+        values = torch.DoubleTensor([1.0, 2.0, 3.0, 4.0])
+        lengths = torch.LongTensor([1, 3])
+
+        jt = JaggedTensor(values=values, lengths=lengths)
+
+        # Expected: 4 float64 values (32 bytes) + 2 int64 lengths (16 bytes)
+        expected_size = 4 * 8 + 2 * 8
+        self.assertEqual(jt.size_in_bytes(), expected_size)
