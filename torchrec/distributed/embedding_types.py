@@ -90,6 +90,7 @@ class EmbeddingComputeKernel(Enum):
     DRAM_VIRTUAL_TABLE = (
         "dram_virtual_table"  # dram as kv backend storage for virtual table
     )
+    FUSED_TRITON = "fused_triton"
 
 
 def compute_kernel_to_embedding_location(
