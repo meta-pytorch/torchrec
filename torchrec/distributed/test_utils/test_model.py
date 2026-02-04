@@ -837,6 +837,19 @@ class ModelInput(Pipelineable):
             self.idscore_features.record_stream(stream)
         self.label.record_stream(stream)
 
+    def size_in_bytes(self) -> int:
+        """
+        Returns the size of the ModelInput in bytes.
+        Recursively computes size for all contained tensors and sparse data structures.
+        """
+        size = self.float_features.element_size() * self.float_features.numel()
+        size += self.label.element_size() * self.label.numel()
+        if isinstance(self.idlist_features, KeyedJaggedTensor):
+            size += self.idlist_features.size_in_bytes()
+        if isinstance(self.idscore_features, KeyedJaggedTensor):
+            size += self.idscore_features.size_in_bytes()
+        return size
+
 
 DENSE_LAYER_OUT_SIZE = 8
 OVER_ARCH_OUT_SIZE = 16

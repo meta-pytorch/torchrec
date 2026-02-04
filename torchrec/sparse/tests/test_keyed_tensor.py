@@ -244,6 +244,32 @@ class TestKeyedTensor(unittest.TestCase):
         torch.allclose(actual_kt_0_grad, expected_kt_0_grad)
         torch.allclose(actual_kt_1_grad, expected_kt_1_grad)
 
+    def test_size_in_bytes(self) -> None:
+        # Test size_in_bytes with float32 tensor (4 bytes per element)
+        tensor_list = [
+            torch.Tensor([[1.0, 1.0]]),
+            torch.Tensor([[2.0, 2.0], [3.0, 3.0]]),
+        ]
+        keys = ["dense_0", "dense_1"]
+        kt = KeyedTensor.from_tensor_list(keys, tensor_list, cat_dim=0, key_dim=0)
+
+        # Expected: 6 float32 elements (2 + 4) * 4 bytes = 24 bytes
+        expected_size = 6 * 4
+        self.assertEqual(kt.size_in_bytes(), expected_size)
+
+    def test_size_in_bytes_different_dtypes(self) -> None:
+        # Test size_in_bytes with float64 tensor (8 bytes per element)
+        tensor_list = [
+            torch.DoubleTensor([[1.0, 1.0]]),
+            torch.DoubleTensor([[2.0, 2.0], [3.0, 3.0]]),
+        ]
+        keys = ["dense_0", "dense_1"]
+        kt = KeyedTensor.from_tensor_list(keys, tensor_list, cat_dim=0, key_dim=0)
+
+        # Expected: 6 float64 elements (2 + 4) * 8 bytes = 48 bytes
+        expected_size = 6 * 8
+        self.assertEqual(kt.size_in_bytes(), expected_size)
+
     # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "cuda"]),
