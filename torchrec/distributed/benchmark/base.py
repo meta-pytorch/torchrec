@@ -235,6 +235,16 @@ class BenchmarkResult:
 
         return "\n".join(lines)
 
+    @classmethod
+    def print_table(cls, res: List["BenchmarkResult"]) -> str:
+        """Print a human-readable formatted table for console output."""
+        if len(res) == 0:
+            return "Empty BenchmarkResult list"
+        out = res[0].__str__().split("\n")[:-1] + [
+            res[i].__str__().split("\n")[-2] for i in range(1, len(res))
+        ]
+        return "\n".join(out)
+
     def runtime_percentile(
         self,
         percentile: int = 50,
@@ -731,14 +741,14 @@ def _run_benchmark_core(
             if reset_accumulated_memory_stats:
                 torch.cuda.reset_accumulated_memory_stats(di)
 
-    # Preparation & memory reset
-    if device_type == "cuda":
-        # Optional allocator warm-up to create fragmentation similar to production
-        if pre_gpu_load:
-            _tmp = torch.rand(16384, 16384, device="cuda")
+    def pre_gpu_load_fn() -> None:
+        if pre_gpu_load > 0 and device_type == "cuda":
+            _tmp = torch.rand(32768, 32768, device="cuda")
             for _ in range(pre_gpu_load):
-                _tmp = _tmp * torch.rand(16384, 16384, device="cuda")
+                _tmp = _tmp * torch.rand(32768, 32768, device="cuda")
 
+    # Preparation & memory reset
+    pre_gpu_load_fn()
     _reset_memory_stats()
 
     # Timings
@@ -843,11 +853,14 @@ def _run_benchmark_core(
                     f"{output_dir}/stacks-cuda-{name}.stacks", "self_cuda_time_total"
                 )
 
+        pre_gpu_load_fn()
         if memory_snapshot and (all_rank_traces or rank == 0):
             torch.cuda.empty_cache()
             torch.cuda.memory._record_memory_history(
                 max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
             )
+
+        # Optional allocator warm-up to create fragmentation similar to production
         with torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
