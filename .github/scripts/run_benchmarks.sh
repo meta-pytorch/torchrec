@@ -34,3 +34,8 @@ python -m torchrec.distributed.benchmark.benchmark_train_pipeline \
     --memory_snapshot=True \
     --pipeline="sparse" \
     --name="sparse_data_dist_light"
+
+# Jagged tensor benchmark
+python -m torchrec.sparse.tests.jagged_tensor_benchmark \
+    --pre_gpu_load=1 \
+    --memory_snapshot=True

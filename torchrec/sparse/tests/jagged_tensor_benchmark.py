@@ -7,288 +7,274 @@
 
 # pyre-strict
 
+"""
+Benchmark for KeyedTensor regrouping operations.
 
-import functools
-import timeit
-from typing import Any, Callable, Dict, List
+Example usage:
 
-import click
+Buck2 (internal):
+    buck2 run @fbcode//mode/opt fbcode//torchrec/sparse/tests:jagged_tensor_benchmark -- --batch_size=1024 --n_dense=20 --n_sparse=1000
+
+OSS (external):
+    python -m torchrec.sparse.tests.jagged_tensor_benchmark --batch_size=1024 --n_dense=20 --n_sparse=1000
+"""
+
+import copy
+import logging
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Iterator, List
+
 import torch
 from torchrec.distributed.benchmark.base import (
-    benchmark_model_with_warmup,
+    BenchFuncConfig,
+    benchmark_func,
     BenchmarkResult,
-    CPUMemoryStats,
-    GPUMemoryStats,
+    cmd_conf,
 )
 from torchrec.modules.regroup import KTRegroupAsDict
 from torchrec.sparse.jagged_tensor import (
     _fbgemm_permute_pooled_embs,
     _regroup_keyed_tensors,
-    KeyedJaggedTensor,
     KeyedTensor,
     permute_multi_embedding,
     regroup_kts,
 )
 from torchrec.sparse.tests.utils import build_groups, build_kts
 
-
-class DummyModel(torch.nn.Module):
-    # pyre-ignore
-    def forward(self, *args, **kwargs) -> None:
-        pass
+logger: logging.Logger = logging.getLogger(__name__)
 
 
-def bench(
-    name: str,
-    labels: torch.Tensor,
-    batch_size: int,
-    feature_count: int,
-    device_type: str,
-    run_backward: bool,
-    fn: Callable[..., List[torch.Tensor]],
-    fn_kwargs: Dict[str, Any],
-    output_dir: str = "",
-) -> None:
+@dataclass
+class RunOptions(BenchFuncConfig):
+    """
+    Configuration options for running KeyedTensor regrouping benchmarks.
 
-    # initial call
+    This class defines the parameters that control how the benchmark is executed,
+    including tensor dimensions, batch configuration, and profiling options.
+
+    Args:
+        batch_size (int): Batch size for the benchmark. Default is 1024.
+        n_dense (int): Total number of dense embeddings. Default is 20.
+        n_sparse (int): Total number of sparse embeddings. Default is 1000.
+        dim_dense (int): Dimension of dense embeddings. Default is 64.
+        dim_sparse (int): Dimension of sparse embeddings. Default is 128.
+        n_groups (int): Total number of regrouping groups. Default is 2.
+        run_backward (bool): Whether to run backward pass. Default is False.
+        profile_dir (str): Directory to save profiling results. If empty, profiling is disabled.
+            Default is "" (disabled).
+        name (str): Name of the profiling file. Default is "jagged_tensor_benchmark".
+    """
+
+    ALL_NAMES: List[str] = field(
+        default_factory=lambda: [
+            "torch_generic",
+            "kt.regroup",
+            "regroup_module",
+            "permute_multi_embs",
+            "regroup_kts",
+            "permute_pooled_embs",
+        ],
+        repr=False,
+    )
+
+    name: str = "all"
+
+    batch_size: int = 1024
+    n_dense: int = 20
+    n_sparse: int = 1000
+    dim_dense: int = 64
+    dim_sparse: int = 128
+    n_groups: int = 2
+    run_backward: bool = False
+
+    # Override defaults from BenchFuncConfig
+    world_size: int = 1
+    num_benchmarks: int = 20
+    num_profiles: int = 10
+    device_type: str = "cuda"
+    debug_mode: bool = False
+    profile_dir: str = "."
+
+    duplicates: bool = False
+    fn: Callable[..., List[torch.Tensor]] | None = None
+
+    _iter_index: int = field(default=0, repr=False)
+
+    def __post_init__(self) -> None:
+        match self.name:
+            case "torch_generic":
+                self.fn = _regroup_keyed_tensors
+            case "kt.regroup":
+                self.fn = KeyedTensor.regroup
+            case "regroup_module":
+
+                module: torch.nn.Module | None = None
+
+                def regroup_module(
+                    keyed_tensors: List[KeyedTensor],
+                    groups: List[List[str]],
+                ) -> List[torch.Tensor]:
+                    nonlocal module
+                    if module is None:
+                        module = KTRegroupAsDict(
+                            groups=groups, keys=[str(i) for i in range(self.n_groups)]
+                        )
+                    return list(module.forward(keyed_tensors).values())
+
+                self.fn = regroup_module
+            case "permute_multi_embs":
+                self.fn = permute_multi_embedding
+            case "regroup_kts":
+                self.fn = regroup_kts
+            case "permute_pooled_embs":
+                if self.duplicates:
+                    self.fn = _regroup_keyed_tensors
+                    self.name = "torch_generic_fallback"
+                else:
+                    self.fn = _fbgemm_permute_pooled_embs
+            case "all":
+                pass
+            case _:
+                raise ValueError(f"Unknown code name: {self.name}")
+        if self.name != "all":
+            self.name += "_dup" if self.duplicates else ""
+
+    def __iter__(self) -> Iterator["RunOptions"]:
+        """
+        Iterate over benchmark configurations.
+
+        If code_name is "all", yields a new RunOptions for each benchmark type.
+        Otherwise, yields only self.
+
+        Returns:
+            Iterator of RunOptions objects.
+        """
+        self._iter_index = 0
+        return self
+
+    def __next__(self) -> "RunOptions":
+        """
+        Get the next benchmark configuration.
+
+        Returns:
+            Next RunOptions object with a specific code_name.
+
+        Raises:
+            StopIteration: When all configurations have been yielded.
+        """
+        if self.name != "all":
+            if self._iter_index == 0:
+                self._iter_index += 1
+                return self
+            raise StopIteration
+
+        if self._iter_index >= len(self.ALL_NAMES):
+            raise StopIteration
+
+        name = self.ALL_NAMES[self._iter_index]
+        self._iter_index += 1
+
+        new_option = copy.copy(self)
+        new_option.name = name
+        new_option.__post_init__()
+        return new_option
+
+    def build_kts(
+        self,
+    ) -> List[KeyedTensor]:
+        """
+        Build KeyedTensors for benchmarking.
+
+        Creates a list of KeyedTensors with the configured dimensions,
+        batch size, and device settings.
+
+        Returns:
+            List[KeyedTensor]: List of KeyedTensors for benchmarking.
+        """
+        device = torch.device(self.device_type)
+        return build_kts(
+            self.n_dense,
+            self.n_sparse,
+            self.dim_dense,
+            self.dim_sparse,
+            self.batch_size,
+            device,
+            self.run_backward,
+        )
+
+
+def runner(
+    run_option: RunOptions,
+) -> BenchmarkResult:
+    """
+    Run benchmark for a single configuration.
+
+    Args:
+        run_option: Run options containing benchmark configuration.
+
+    Returns:
+        BenchmarkResult object for the benchmark.
+    """
+    device = torch.device(run_option.device_type)
+    kts = run_option.build_kts()
+    labels = torch.randint(0, 1, (run_option.batch_size,), device=device).float()
+    groups = build_groups(kts, run_option.n_groups, duplicates=run_option.duplicates)
+
+    fn = run_option.fn
+    fn_kwargs = {"keyed_tensors": kts, "groups": groups}
+
+    # Initial call to warm up
     fn(**fn_kwargs)
 
-    def wrapped_func(
-        model: torch.nn.Module,  # not used
-        bench_inputs: List[KeyedJaggedTensor],  # not used
-        fn: Callable[..., List[torch.Tensor]],
-        run_backward: bool,
-        **kwargs: Dict[str, Any],
+    def _func_to_benchmark(
+        _bench_inputs: List[Any],
+        fn: Callable[..., List[torch.Tensor]] = fn,
+        fn_kwargs: Dict[str, Any] = fn_kwargs,
+        run_backward: bool = run_option.run_backward,
+        labels: torch.Tensor = labels,
     ) -> None:
         result = fn(**fn_kwargs)
         if run_backward:
-            if isinstance(result, dict):
-                vectors = [tensor.sum(dim=1) for tensor in result.values()]
-            else:
-                vectors = [tensor.sum(dim=1) for tensor in result]
-            pred = vectors[0]
-            for vector in vectors[1:]:
-                pred.mul(vector)
-            loss = torch.nn.functional.l1_loss(pred, labels)
-            loss.sum().backward()
+            vectors = [tensor.reshape(1, -1) for tensor in result]
+            loss = torch.concat(vectors, dim=1).sum()
+            loss.backward()
 
-    model = DummyModel()
-    setattr(model, "forward", lambda kwargs: fn(**kwargs))
-    prof_num = 10
-    if device_type == "cuda":
-        result = benchmark_model_with_warmup(
-            name=name,
-            model=model,
-            warmup_inputs=[],
-            bench_inputs=[],
-            prof_inputs=[fn_kwargs] * prof_num,
-            world_size=1,
-            output_dir=output_dir,
-            num_benchmarks=20,
-            func_to_benchmark=functools.partial(
-                wrapped_func, fn=fn, run_backward=run_backward, fn_kwargs=fn_kwargs
-            ),
-            benchmark_func_kwargs={},
-            rank=0,
-            enable_logging=True,
-        )
-
-    else:  # cpu
-        times = timeit.repeat(
-            lambda: wrapped_func(
-                model=model,
-                bench_inputs=[],
-                fn=fn,
-                fn_kwargs=fn_kwargs,
-                run_backward=run_backward,
-            ),
-            number=1,
-            repeat=20,
-        )
-        result = BenchmarkResult(
-            short_name=name,
-            gpu_elapsed_time=torch.tensor(times) * 1e3,
-            cpu_elapsed_time=torch.tensor(times) * 1e3,
-            gpu_mem_stats=[GPUMemoryStats(0, 0, 0, 0, 0, 0)],
-            cpu_mem_stats=[CPUMemoryStats.for_process(0)],
-        )
-
-    print(
-        f"B: {batch_size : <{8}} | F: {feature_count : <{8}} | device: {device_type : <{8}} | {result}"
+    result = benchmark_func(
+        rank=0,
+        func_to_benchmark=_func_to_benchmark,
+        bench_inputs=[{}],
+        prof_inputs=[{}] * run_option.num_profiles,
+        benchmark_func_kwargs={},
+        **run_option.benchmark_func_kwargs(),
     )
 
+    logger.info(result.prettify())
+    logger.info("\nMarkdown format:\n%s", result)
 
-@click.command()
-@click.option(
-    "--cuda_matrix",
-    type=bool,
-    default=False,
-    help="Run a full GPU matrix, overrides relevant settings",
-)
-@click.option(
-    "--run_backward",
-    type=bool,
-    default=False,
-    help="run backward (forward always runs)",
-)
-@click.option(
-    "--device_type",
-    type=str,
-    default="cuda",
-    help="device type",
-)
-@click.option(
-    "--n_dense",
-    type=int,
-    default=20,
-    help="Total number of dense embeddings.",
-)
-@click.option(
-    "--dim_dense",
-    type=int,
-    default=64,
-    help="Dim dense embedding.",
-)
-@click.option(
-    "--n_sparse",
-    default=1000,
-    help="Total number of sparse embeddings to be used.",
-)
-@click.option(
-    "--dim_sparse",
-    type=int,
-    default=128,
-    help="Dim dense embedding.",
-)
-@click.option(
-    "--batch_size",
-    type=int,
-    default=1024,
-    help="Batch size.",
-)
-@click.option(
-    "--n_groups",
-    type=int,
-    default=2,
-    help="Total num of regrouping",
-)
-@click.option(
-    "--profile",
-    type=str,
-    default="",
-    help="profile output directory",
-)
+    return result
+
+
+@cmd_conf  # pyre-ignore [56]
 def main(
-    cuda_matrix: bool,
-    run_backward: bool,
-    device_type: str,
-    n_dense: int,
-    n_sparse: int,
-    dim_dense: int,
-    dim_sparse: int,
-    batch_size: int,
-    n_groups: int,
-    profile: str,
+    run_option: RunOptions,
 ) -> None:
-    if cuda_matrix:
-        n_denses = [64, 128, 256, 512, 1024]
-        n_sparses = [16, 32, 64, 128, 256]
-        batch_sizes = [512, 1024, 2048, 4096]
-        device_types = ["cuda"]
-    else:
-        n_denses = [n_dense]
-        n_sparses = [n_sparse]
-        batch_sizes = [batch_size]
-        device_types = [device_type]
+    """
+    Main entry point for the jagged tensor benchmark.
 
-    for device_type in device_types:
-        for batch_size in batch_sizes:
-            for duplicates in [False, True]:
-                for n_dense, n_sparse in zip(n_denses, n_sparses):
-                    dup = "_dup" if duplicates else ""
-                    device = torch.device(device_type)
-                    kts = build_kts(
-                        n_dense,
-                        n_sparse,
-                        dim_dense,
-                        dim_sparse,
-                        batch_size,
-                        device,
-                        run_backward,
-                    )
-                    labels = torch.randint(
-                        0, 1, (batch_size,), device=torch.device(device_type)
-                    ).float()
-                    groups = build_groups(kts, n_groups, duplicates=duplicates)
-                    bench(
-                        "[pytorch generic] fallback" + dup,
-                        labels,
-                        batch_size,
-                        n_dense + n_sparse,
-                        device_type,
-                        run_backward,
-                        _regroup_keyed_tensors,
-                        {"keyed_tensors": kts, "groups": groups},
-                        profile,
-                    )
-                    bench(
-                        "[Prod] KeyedTensor.regroup" + dup,
-                        labels,
-                        batch_size,
-                        n_dense + n_sparse,
-                        device_type,
-                        run_backward,
-                        KeyedTensor.regroup,
-                        {"keyed_tensors": kts, "groups": groups},
-                        profile,
-                    )
-                    bench(
-                        "[Module] KTRegroupAsDict" + dup,
-                        labels,
-                        batch_size,
-                        n_dense + n_sparse,
-                        device_type,
-                        run_backward,
-                        KTRegroupAsDict(
-                            groups=groups, keys=[str(i) for i in range(n_groups)]
-                        ),
-                        {"keyed_tensors": kts},
-                        profile,
-                    )
-                    bench(
-                        "[2 Ops] permute_multi_embs" + dup,
-                        labels,
-                        batch_size,
-                        n_dense + n_sparse,
-                        device_type,
-                        run_backward,
-                        permute_multi_embedding,
-                        {"keyed_tensors": kts, "groups": groups},
-                        profile,
-                    )
-                    bench(
-                        "[1 Op] KT_regroup" + dup,
-                        labels,
-                        batch_size,
-                        n_dense + n_sparse,
-                        device_type,
-                        run_backward,
-                        regroup_kts,
-                        {"keyed_tensors": kts, "groups": groups},
-                        profile,
-                    )
-                    if not duplicates:
-                        bench(
-                            "[Old Prod] permute_pooled_embs" + dup,
-                            labels,
-                            batch_size,
-                            n_dense + n_sparse,
-                            device_type,
-                            run_backward,
-                            _fbgemm_permute_pooled_embs,
-                            {"keyed_tensors": kts, "groups": groups},
-                            profile,
-                        )
+    Args:
+        run_option: Configuration options for the benchmark.
+    """
+    run_option.set_log_level()
+    if run_option.debug_mode:
+        from fbvscode import attach_debugger
+
+        attach_debugger()
+
+    results: List[BenchmarkResult] = []
+    for option in run_option:
+        results.append(runner(option))
+
+    print(BenchmarkResult.print_table(results))
 
 
 if __name__ == "__main__":
