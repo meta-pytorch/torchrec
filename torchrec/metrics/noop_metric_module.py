@@ -7,7 +7,7 @@
 
 # pyre-strict
 
-import concurrent
+from concurrent.futures import Future
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -70,7 +70,5 @@ class NoOpMetricModule(RecMetricModule):
     def shutdown(self) -> None:
         pass
 
-    def async_compute(
-        self, future: concurrent.futures.Future[Dict[str, MetricValue]]
-    ) -> None:
+    def async_compute(self, future: Future[Dict[str, MetricValue]]) -> None:
         pass
