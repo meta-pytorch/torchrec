@@ -505,9 +505,13 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     else (None, -1)
                 )
 
+                # self._opt_in_prob == 100 means reserved slots are used as always-on table
+                # we do not need to generate opt_in_rands, and assign it to None
                 opt_in_rands = (
                     (torch.rand_like(values, dtype=torch.float) * 100).to(torch.int32)
-                    if self._opt_in_prob != -1 and self.training
+                    if self._opt_in_prob > 0
+                    and self._opt_in_prob < 100
+                    and self.training
                     else None
                 )
 
