@@ -65,7 +65,6 @@ def get_use_sync_collectives() -> bool:
 
 
 @contextmanager
-# pyre-ignore
 def torchrec_use_sync_collectives():
     original_use_sync_collectives: bool = get_use_sync_collectives()
     set_use_sync_collectives(True)
@@ -850,7 +849,6 @@ def all2all_sequence_sync(
     if a2ai.codecs is not None:
         codecs = none_throws(a2ai.codecs)
         qcomm_ctx = codecs.forward.create_context()
-        # pyre-ignore [16]
         sharded_input_embeddings = a2ai.codecs.forward.encode(
             sharded_input_embeddings, qcomm_ctx
         )
@@ -928,7 +926,6 @@ def reduce_scatter_sync(
     *inputs: Any,
 ) -> Tensor:
     if rsi.codecs is not None:
-        # pyre-ignore
         inputs = [rsi.codecs.forward.encode(input) for input in inputs]
 
     with record_function("## reduce_scatter ##"):
@@ -1274,9 +1271,7 @@ def _recat_seq_embedding(
 
 class All2All_Pooled_Req(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -1370,7 +1365,6 @@ class All2All_Pooled_Req(Function):
         return myreq.dummy_tensor
 
     @staticmethod
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *unused) -> Tuple[None, None, None, Tensor, None]:
         pg = ctx.pg
         my_rank = dist.get_rank(pg)
@@ -1399,9 +1393,7 @@ class All2All_Pooled_Req(Function):
 
 class All2All_Pooled_Wait(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -1458,8 +1450,6 @@ class All2All_Pooled_Wait(Function):
         return result
 
     @staticmethod
-    # pyre-fixme[14]: `backward` overrides method defined in `Function` inconsistently.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         a2ai = ctx.a2ai
@@ -1530,9 +1520,7 @@ class All2All_Pooled_Wait(Function):
 
 class Variable_Batch_All2All_Pooled_Req(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -1626,8 +1614,6 @@ class Variable_Batch_All2All_Pooled_Req(Function):
         return myreq.dummy_tensor
 
     @staticmethod
-    # pyre-fixme[2]: Parameter must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *unused) -> Tuple[None, None, None, Tensor, None]:
         myreq = ctx.myreq
         a2ai = myreq.a2ai
@@ -1653,9 +1639,7 @@ class Variable_Batch_All2All_Pooled_Req(Function):
 
 class Variable_Batch_All2All_Pooled_Wait(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -1683,8 +1667,6 @@ class Variable_Batch_All2All_Pooled_Wait(Function):
         return sharded_output_embeddings
 
     @staticmethod
-    # pyre-fixme[14]: `backward` overrides method defined in `Function` inconsistently.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         a2ai = ctx.a2ai
@@ -1743,9 +1725,7 @@ class Variable_Batch_All2All_Pooled_Wait(Function):
 
 class All2All_Seq_Req(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -1799,7 +1779,6 @@ class All2All_Seq_Req(Function):
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
             qcomm_ctx = codecs.forward.create_context()
-            # pyre-ignore [16]
             sharded_input_embeddings = a2ai.codecs.forward.encode(
                 sharded_input_embeddings, qcomm_ctx
             )
@@ -1844,8 +1823,6 @@ class All2All_Seq_Req(Function):
         return myreq.dummy_tensor
 
     @staticmethod
-    # pyre-fixme[2]: Parameter must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *unused) -> Tuple[None, None, None, Tensor]:
         myreq = ctx.myreq
         a2ai = myreq.a2ai
@@ -1892,9 +1869,7 @@ class All2All_Seq_Req(Function):
 
 class All2All_Seq_Req_Wait(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -1918,8 +1893,6 @@ class All2All_Seq_Req_Wait(Function):
         return sharded_output_embeddings.view(-1, D)
 
     @staticmethod
-    # pyre-fixme[14]: `backward` overrides method defined in `Function` inconsistently.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, sharded_grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         a2ai = ctx.a2ai
@@ -1967,9 +1940,7 @@ class All2All_Seq_Req_Wait(Function):
 
 class All2Allv_Req(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2005,9 +1976,6 @@ class All2Allv_Req(Function):
         return myreq.dummy_tensor
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *grad_output):
         a2ai = ctx.a2ai
         myreq = ctx.myreq
@@ -2028,9 +1996,7 @@ class All2Allv_Req(Function):
 
 class All2Allv_Wait(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2057,7 +2023,6 @@ class All2Allv_Wait(Function):
         return outputs
 
     @staticmethod
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *grad_outputs) -> Tuple[None, None, Tensor]:
         pg = ctx.pg
         myreq = ctx.myreq
@@ -2085,9 +2050,7 @@ class All2Allv_Wait(Function):
 
 class ReduceScatter_Req(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2097,7 +2060,6 @@ class ReduceScatter_Req(Function):
         my_rank = dist.get_rank(pg)
 
         if rsi.codecs is not None:
-            # pyre-ignore
             inputs = [rsi.codecs.forward.encode(input) for input in inputs]
 
         output = inputs[my_rank].new_empty(
@@ -2122,7 +2084,6 @@ class ReduceScatter_Req(Function):
         return myreq.dummy_tensor
 
     @staticmethod
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *unused: Tensor) -> Tuple[Optional[Tensor], ...]:
         myreq = ctx.myreq
         assert myreq.req is not None
@@ -2145,9 +2106,7 @@ class ReduceScatter_Req(Function):
 
 class ReduceScatter_Wait(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2167,8 +2126,6 @@ class ReduceScatter_Wait(Function):
         return output
 
     @staticmethod
-    # pyre-fixme[14]: `backward` overrides method defined in `Function` inconsistently.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         rsi = myreq.rsi
@@ -2198,9 +2155,7 @@ class ReduceScatter_Wait(Function):
 
 class ReduceScatterBase_Req(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2230,7 +2185,6 @@ class ReduceScatterBase_Req(Function):
         return myreq.dummy_tensor
 
     @staticmethod
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *unused: Tensor) -> Tuple[Optional[Tensor], ...]:
         myreq = ctx.myreq
         myreq.req.wait()
@@ -2249,9 +2203,7 @@ class ReduceScatterBase_Req(Function):
 
 class ReduceScatterBase_Wait(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2271,8 +2223,6 @@ class ReduceScatterBase_Wait(Function):
         return output
 
     @staticmethod
-    # pyre-fixme[14]: `backward` overrides method defined in `Function` inconsistently.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         rsi = myreq.rsi
@@ -2294,9 +2244,7 @@ class ReduceScatterBase_Wait(Function):
 
 class AllGatherBase_Req(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2325,7 +2273,6 @@ class AllGatherBase_Req(Function):
         return myreq.dummy_tensor
 
     @staticmethod
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *unused: Tensor) -> Tuple[Optional[Tensor], ...]:
         myreq = ctx.myreq
         assert myreq.req is not None
@@ -2346,9 +2293,7 @@ class AllGatherBase_Req(Function):
 
 class AllGatherBase_Wait(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2368,8 +2313,6 @@ class AllGatherBase_Wait(Function):
         return outputs
 
     @staticmethod
-    # pyre-fixme[14]: `backward` overrides method defined in `Function` inconsistently.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, grad_outputs: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         agi = myreq.agi
@@ -2392,9 +2335,7 @@ class AllGatherBase_Wait(Function):
 
 class ReduceScatterV_Req(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2437,7 +2378,6 @@ class ReduceScatterV_Req(Function):
         return myreq.dummy_tensor
 
     @staticmethod
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, *unused: Tensor) -> Tuple[Optional[Tensor], ...]:
         myreq = ctx.myreq
         assert myreq.req is not None
@@ -2457,9 +2397,7 @@ class ReduceScatterV_Req(Function):
 
 class ReduceScatterV_Wait(Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         pg: dist.ProcessGroup,
         myreq: Request[Tensor],
@@ -2468,7 +2406,6 @@ class ReduceScatterV_Wait(Function):
         assert myreq.req is not None
         myreq.req.wait()
         myreq.req = None
-        # pyre-ignore
         output: torch.Tensor = myreq.tensor
         myreq.tensor = None
 
@@ -2482,8 +2419,6 @@ class ReduceScatterV_Wait(Function):
         return output
 
     @staticmethod
-    # pyre-fixme[14]: `backward` overrides method defined in `Function` inconsistently.
-    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         rsi = myreq.rsi
@@ -2514,9 +2449,7 @@ class ReduceScatterV_Wait(Function):
 
 class AllToAllSingle(torch.autograd.Function):
     @staticmethod
-    # pyre-fixme[14]: `forward` overrides method defined in `Function` inconsistently.
     def forward(
-        # pyre-fixme[2]: Parameter must be annotated.
         ctx,
         input: Tensor,
         output_split_sizes: List[int],
@@ -2535,7 +2468,6 @@ class AllToAllSingle(torch.autograd.Function):
         )
 
     @staticmethod
-    # pyre-ignore
     def backward(ctx, grad):
         grad = torch.distributed._functional_collectives.all_to_all_single(
             grad,
@@ -2583,7 +2515,6 @@ def reduce_scatter_tensor_fake(
     )
 
 
-# pyre-ignore
 def reduce_scatter_tensor_setup_context(ctx, inputs, output) -> None:
     _, _, group_size, group_name, gradient_division = inputs
     ctx.group_size = group_size
@@ -2591,7 +2522,6 @@ def reduce_scatter_tensor_setup_context(ctx, inputs, output) -> None:
     ctx.gradient_division = gradient_division
 
 
-# pyre-ignore
 def reduce_scatter_tensor_backward(ctx, grad):
     # TODO(ivankobzarev): Support codecs(quantization) on backward
     out = torch.ops._c10d_functional.all_gather_into_tensor(
@@ -2641,7 +2571,6 @@ def all_gather_into_tensor_fake(
     )
 
 
-# pyre-ignore
 def all_gather_into_tensor_setup_context(ctx, inputs, output) -> None:
     _, gather_dim, group_size, group_name, gradient_division = inputs
     ctx.group_size = group_size
@@ -2649,7 +2578,6 @@ def all_gather_into_tensor_setup_context(ctx, inputs, output) -> None:
     ctx.gradient_division = gradient_division
 
 
-# pyre-ignore
 def all_gather_into_tensor_backward(ctx, grad):
     # TODO(ivankobzarev): Support codecs(quantization) on backward
     out = torch.ops._c10d_functional.reduce_scatter_tensor(
@@ -2705,13 +2633,11 @@ def _split_1d_cat_2d_backward_impl_fake(
     return grad.new_empty([grad.numel()])
 
 
-# pyre-ignore
 def _split_1d_cat_2d_backward(ctx, grad):
     ret = torch.ops.torchrec._split_1d_cat_2d_backward_impl(grad, ctx.dim1s)
     return ret, None, None
 
 
-# pyre-ignore
 def _split_1d_cat_2d_setup_context(ctx, inputs, output):
     (x, dim0, dim1s) = inputs
     ctx.dim1s = dim1s

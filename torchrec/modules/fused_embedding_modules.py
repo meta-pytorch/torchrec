@@ -63,7 +63,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
     ) -> None:
         self._emb_module: SplitTableBatchedEmbeddingBagsCodegen = emb_module
 
-        # pyre-ignore [33]
         state: Dict[Any, Any] = {}
         param_group: Dict[str, Any] = {
             "params": [],
@@ -95,12 +94,9 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
         super().__init__(params, state, [param_group])
 
     def zero_grad(self, set_to_none: bool = False) -> None:
-        # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
-        # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
 
@@ -442,7 +438,6 @@ class FusedEmbeddingBagCollection(
         ):
             for embedding_config, weight in zip(
                 tables,
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 emb_module.split_embedding_weights(),
                 #  torch._tensor.Tensor]` is not a function.
             ):
@@ -697,7 +692,6 @@ class FusedEmbeddingCollection(EmbeddingCollectionInterface, FusedOptimizerModul
         ):
             for embedding_config, weight in zip(
                 tables,
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 emb_module.split_embedding_weights(),
                 #  torch._tensor.Tensor]` is not a function.
             ):

@@ -356,7 +356,7 @@ class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):
         self.enumerator = EmbeddingEnumerator(
             topology=self.topology, batch_size=self.batch_size
         )
-        self.enumerator.enumerate(module, sharders)  # pyre-ignore
+        self.enumerator.enumerate(module, sharders)
 
         self.storage_reservation = HeuristicalStorageReservation(percentage=0.15)
         self.perf_model = NoopPerfModel(topology=self.topology)
@@ -366,7 +366,7 @@ class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):
             topology=self.topology,
             batch_size=self.batch_size,
             module=module,
-            sharders=sharders,  # pyre-ignore
+            sharders=sharders,
             constraints=self.constraints,
         )
 
@@ -547,11 +547,10 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
 
         sharding_plan = planner.plan(
             module=model,
-            sharders=[EmbeddingCollectionSharder()],  # pyre-ignore
+            sharders=[EmbeddingCollectionSharder()],
         )
 
         for table_index in range(4):
-            # pyre-ignore
             shards = sharding_plan.plan["sparse.ec"][
                 f"table_{table_index}"
             ].sharding_spec.shards
@@ -622,7 +621,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
             constraints=constraints,
         )
         sharding_plan = planner.plan(
-            module=model, sharders=[EmbeddingCollectionSharder()]  # pyre-ignore
+            module=model, sharders=[EmbeddingCollectionSharder()]
         )
 
         expected_ranks = [[0, 1], [0, 1], [0, 1], [0, 1]]
@@ -718,7 +717,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
             constraints=constraints,
         )
         sharding_plan = planner.plan(
-            module=model, sharders=[EmbeddingCollectionSharder()]  # pyre-ignore
+            module=model, sharders=[EmbeddingCollectionSharder()]
         )
 
         expected_ranks = [[0, 1], [0, 1], [0, 1], [0, 1]]
@@ -774,7 +773,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
         #  L1 cache size > size of embedding table * default cache load factor
 
         sharding_plan = planner.plan(
-            module=model, sharders=[EmbeddingCollectionSharder()]  # pyre-ignore
+            module=model, sharders=[EmbeddingCollectionSharder()]
         )
         for table_index in range(4):
             shards = sharding_plan.plan["sparse.ec"][
@@ -824,7 +823,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
         )
         sharding_plan = planner.plan(
             module=model,
-            sharders=[  # pyre-ignore
+            sharders=[
                 EmbeddingCollectionSharder(fused_params={"cache_load_factor": 0.5})
             ],
         )
@@ -1144,10 +1143,7 @@ class TestExtractPlan(unittest.TestCase):
 
     def test_extract_plan_success(self) -> None:
         """Test successful extraction of plan."""
-        enumerated_plan = (
-            # pyre-ignore
-            self.planner._enumerator.last_stored_search_space
-        )
+        enumerated_plan = self.planner._enumerator.last_stored_search_space
         best_plan = none_throws(self.planner._best_plan)
         loaded_sharding_options = self._create_loaded_sharding_options_map(best_plan)
 
@@ -1176,10 +1172,7 @@ class TestExtractPlan(unittest.TestCase):
         """Test extract_plan failure when duplicate storage hashes exist."""
         # Create search space with duplicate storage hashes by modifying sharding options
         # to have the same storage hash
-        enumerated_plan = (
-            # pyre-ignore
-            self.planner._enumerator.last_stored_search_space
-        )
+        enumerated_plan = self.planner._enumerator.last_stored_search_space
         best_plan = none_throws(self.planner._best_plan)
         loaded_sharding_options = self._create_loaded_sharding_options_map(best_plan)
 
@@ -1204,10 +1197,7 @@ class TestExtractPlan(unittest.TestCase):
 
     def test_extract_plan_empty_loaded_options(self) -> None:
         """Test extract_plan with empty loaded options but non-empty search space."""
-        enumerated_plan = (
-            # pyre-ignore
-            self.planner._enumerator.last_stored_search_space
-        )
+        enumerated_plan = self.planner._enumerator.last_stored_search_space
 
         # When loaded options is empty, extract_plan should return empty list
         # This is actually the correct behavior - no matching options means no extracted options
@@ -1216,10 +1206,7 @@ class TestExtractPlan(unittest.TestCase):
 
     def test_extract_plan_excess_loaded_options(self) -> None:
         """Test extract_plan when loaded options contain more entries than search space."""
-        enumerated_plan = (
-            # pyre-ignore
-            self.planner._enumerator.last_stored_search_space
-        )
+        enumerated_plan = self.planner._enumerator.last_stored_search_space
         best_plan = none_throws(self.planner._best_plan)
         loaded_sharding_options = self._create_loaded_sharding_options_map(best_plan)
 
@@ -1247,10 +1234,7 @@ class TestExtractPlan(unittest.TestCase):
 
     def test_extract_plan_properties_preservation(self) -> None:
         """Test that extract_plan preserves all non-shard properties from search space."""
-        enumerated_plan = (
-            # pyre-ignore
-            self.planner._enumerator.last_stored_search_space
-        )
+        enumerated_plan = self.planner._enumerator.last_stored_search_space
         best_plan = none_throws(self.planner._best_plan)
         loaded_sharding_options = self._create_loaded_sharding_options_map(best_plan)
 

@@ -334,7 +334,6 @@ def rec_metric_value_test_helper(
     ) -> TestRecMetricOutput:
         test_metrics: TestRecMetricOutput = ({}, {}, {}, {})
         if test_clazz is not None:
-            # pyre-ignore[45]: Cannot instantiate abstract class `TestMetric`.
             test_metric_obj = test_clazz(world_size, tasks)
             test_metrics = test_metric_obj.compute(
                 model_outs, nsteps, batch_window_size, timestamps
@@ -474,7 +473,6 @@ def sync_test_helper(
     tasks = gen_test_tasks(task_names)
 
     if n_classes:
-        # pyre-ignore[6]: Incompatible parameter type
         kwargs["number_of_classes"] = n_classes
 
     target_metric_obj = target_clazz(
@@ -484,7 +482,6 @@ def sync_test_helper(
         compute_on_all_ranks=compute_on_all_ranks,
         tasks=tasks,
         window_size=batch_window_size * world_size,
-        # pyre-ignore[6]: Incompatible parameter type
         **kwargs,
     ).to(device)
 
@@ -537,7 +534,6 @@ def sync_test_helper(
     # check against test metric
     test_metrics: TestRecMetricOutput = ({}, {}, {}, {})
     if test_clazz is not None:
-        # pyre-ignore[45]: Cannot instantiate abstract class `TestMetric`.
         test_metric_obj = test_clazz(world_size, tasks)
         # with how testmetric is setup we cannot do asymmertrical updates across ranks
         # so we duplicate model_outs twice to match number of updates in aggregate

@@ -16,14 +16,14 @@ from torch.distributed import all_reduce, get_rank, get_world_size, init_process
 
 def compute_world_size() -> int:
     "Dummy script to compute world_size. Meant to test if can run Ray + Pytorch DDP"
-    rank = int(os.getenv("RANK"))  # pyre-ignore[6]
-    world_size = int(os.getenv("WORLD_SIZE"))  # pyre-ignore[6]
-    master_port = int(os.getenv("MASTER_PORT"))  # pyre-ignore[6]
+    rank = int(os.getenv("RANK"))
+    world_size = int(os.getenv("WORLD_SIZE"))
+    master_port = int(os.getenv("MASTER_PORT"))
     master_addr = os.getenv("MASTER_ADDR")
     backend = "gloo"
 
     print(f"initializing `{backend}` process group")
-    init_process_group(  # pyre-ignore[16]
+    init_process_group(
         backend=backend,
         init_method=f"tcp://{master_addr}:{master_port}",
         rank=rank,
@@ -31,11 +31,11 @@ def compute_world_size() -> int:
     )
     print("successfully initialized process group")
 
-    rank = get_rank()  # pyre-ignore[16]
-    world_size = get_world_size()  # pyre-ignore[16]
+    rank = get_rank()
+    world_size = get_world_size()
 
     t = F.one_hot(torch.tensor(rank), num_classes=world_size)
-    all_reduce(t)  # pyre-ignore[16]
+    all_reduce(t)
     computed_world_size = int(torch.sum(t).item())
     print(
         f"rank: {rank}, actual world_size: {world_size}, computed world_size: {computed_world_size}"

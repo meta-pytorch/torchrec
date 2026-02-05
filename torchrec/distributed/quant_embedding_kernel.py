@@ -137,7 +137,6 @@ def _get_shard_offsets_for_kv_zch(
             len(table.global_metadata.shards_metadata) > shard_index
         ), f"Expected table {table.name} to have more shards than shard index {shard_index}. Found {len(table.global_metadata.shards_metadata)} shards"
         shard_row_offsets.append(
-            # pyre-ignore: Undefined attribute [16]
             table.global_metadata.shards_metadata[shard_index].shard_offsets[0]
         )
     logger.info(f"Shard row offsets for kv zch look up table: {shard_row_offsets=}")
@@ -166,7 +165,6 @@ def _get_runtime_device(
                     and len(table.global_metadata.shards_metadata)
                     and table.global_metadata.shards_metadata[index].placement
                     is not None
-                    # pyre-ignore: Undefined attribute [16]
                     and table.global_metadata.shards_metadata[index]
                     .placement.device()
                     .type
@@ -231,7 +229,6 @@ class IntNBitTableBatchedEmbeddingBagsCodegenWithLength(
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
-    # pyre-ignore Inconsistent override [14]
     def forward(
         self,
         indices: torch.Tensor,
@@ -373,7 +370,6 @@ class QuantBatchedEmbeddingBag(
             assert (
                 tbe_clazz == KVEmbeddingInference
             ), "shard_offsets_for_kv_zch should be computed only for kv zch kernel"
-            # pyre-ignore: Call error [29]
             self._emb_module.init_tbe_config(shard_offsets_for_kv_zch)
 
     def init_parameters(self) -> None:
@@ -457,12 +453,10 @@ class QuantBatchedEmbeddingBag(
         ):
             yield append_prefix(prefix, f"{config.name}.weight"), weight
             if self._quant_state_dict_split_scale_bias:
-                # pyre-fixme[7]: Expected `Iterator[Tuple[str, Tensor]]` but got
                 #  `Generator[Tuple[str, Optional[Tensor]], Any, Any]`.
                 yield append_prefix(
                     prefix, f"{config.name}.weight_qscale"
                 ), weight_qscale
-                # pyre-fixme[7]: Expected `Iterator[Tuple[str, Tensor]]` but got
                 #  `Generator[Tuple[str, Optional[Tensor]], Any, Any]`.
                 yield append_prefix(prefix, f"{config.name}.weight_qbias"), weight_qbias
 
@@ -486,7 +480,6 @@ class QuantBatchedEmbeddingBag(
             module, "qconfig"
         ), "BaseEmbedding input float module must have qconfig defined"
 
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `weight`.
         data_type = dtype_to_data_type(module.qconfig.weight().dtype)
         sparse_type = data_type_to_sparse_type(data_type)
 
@@ -501,7 +494,6 @@ class QuantBatchedEmbeddingBag(
         config = _copy_config(module.config, data_type, sparse_type, device)
         ret = QuantBatchedEmbeddingBag(config=config, device=device)
 
-        # pyre-ignore
         quant_weight_list = _quantize_weight(state_dict, data_type)
         ret.emb_module.assign_embedding_weights(quant_weight_list)
 
@@ -610,7 +602,6 @@ class QuantBatchedEmbedding(
             assert (
                 embedding_clazz == KVEmbeddingInference
             ), "shard_offsets_for_kv_zch should be computed only for kv zch kernel"
-            # pyre-ignore: Call error [29]
             self._emb_module.init_tbe_config(shard_offsets_for_kv_zch)
 
     @property
@@ -669,12 +660,10 @@ class QuantBatchedEmbedding(
         ):
             yield append_prefix(prefix, f"{config.name}.weight"), weight
             if self._quant_state_dict_split_scale_bias:
-                # pyre-fixme[7]: Expected `Iterator[Tuple[str, Tensor]]` but got
                 #  `Generator[Tuple[str, Optional[Tensor]], Any, Any]`.
                 yield append_prefix(
                     prefix, f"{config.name}.weight_qscale"
                 ), weight_qscale
-                # pyre-fixme[7]: Expected `Iterator[Tuple[str, Tensor]]` but got
                 #  `Generator[Tuple[str, Optional[Tensor]], Any, Any]`.
                 yield append_prefix(prefix, f"{config.name}.weight_qbias"), weight_qbias
 
@@ -686,7 +675,6 @@ class QuantBatchedEmbedding(
             module, "qconfig"
         ), "BaseEmbedding input float module must have qconfig defined"
 
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `weight`.
         data_type = dtype_to_data_type(module.qconfig.weight().dtype)
         sparse_type = data_type_to_sparse_type(data_type)
 
@@ -701,7 +689,6 @@ class QuantBatchedEmbedding(
         config = _copy_config(module.config, data_type, sparse_type, device)
         ret = QuantBatchedEmbedding(config=config, device=device)
 
-        # pyre-ignore
         quant_weight_list = _quantize_weight(state_dict, data_type)
         ret.emb_module.assign_embedding_weights(quant_weight_list)
 

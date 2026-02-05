@@ -42,9 +42,8 @@ class Nested(torch.nn.Module):
 
 
 def save(
-    name: str, model: torch.nn.Module, eg: Optional[Tuple] = None  # pyre-ignore
+    name: str, model: torch.nn.Module, eg: Optional[Tuple] = None
 ) -> None:
-    # pyre-fixme[10]: Name `p` is used but not defined.
     with PackageExporter(str(p / name)) as e:
         e.mock("iopath.**")
         e.intern("**")

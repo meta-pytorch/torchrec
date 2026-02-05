@@ -73,11 +73,9 @@ class _FakeRandom(random.Random):
         self.current_idx += 1
         return val
 
-    # pyre-ignore[3]
     def getstate(self) -> Tuple[Any, ...]:
         return (self.vals, self.current_idx)
 
-    # pyre-ignore[2]
     def setstate(self, state: Tuple[Any, ...]) -> None:
         self.vals, self.current_idx = state
 

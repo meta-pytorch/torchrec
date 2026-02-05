@@ -6,7 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
-# pyre-ignore-all-errors[16]
 
 """
 Wrapper utilities for EmbeddingCollection (EC), EmbeddingBagCollection (EBC),
@@ -281,7 +280,6 @@ def _transform_module(
     compile_mode: CompileMode,
     world_size: int,
     batch_size: int,
-    # pyre-fixme[24]: Generic type `ContextManager` expects 1 type parameter.
     ctx: ContextManager,
     benchmark_unsharded_module: bool = False,
 ) -> torch.nn.Module:
@@ -315,16 +313,13 @@ def _transform_module(
         # Don't want to modify the module outright
         # Since module is on cpu, won't cause cuda oom.
         copied_module = copy.deepcopy(module)
-        # pyre-ignore [6]
         plan = planner.plan(copied_module, [sharder])
 
         if isinstance(ctx, MultiProcessContext):
             sharded_module = DistributedModelParallel(
                 copied_module,
-                # pyre-ignore[6]
                 env=ShardingEnv.from_process_group(ctx.pg),
                 plan=plan,
-                # pyre-ignore[6]
                 sharders=[sharder],
                 device=ctx.device,
             )
@@ -333,7 +328,6 @@ def _transform_module(
 
             sharded_module = _shard_modules(
                 module=copied_module,
-                # pyre-fixme[6]: For 2nd argument expected
                 #  `Optional[List[ModuleSharder[Module]]]` but got
                 #  `List[ModuleSharder[Variable[T (bound to Module)]]]`.
                 sharders=[sharder],
@@ -344,14 +338,12 @@ def _transform_module(
 
     if compile_mode == CompileMode.FX_SCRIPT:
         return fx_script_module(
-            # pyre-fixme[6]: For 1st argument expected `Module` but got
             #  `Optional[Module]`.
             sharded_module
             if not benchmark_unsharded_module
             else module
         )
     else:
-        # pyre-fixme[7]: Expected `Module` but got `Optional[Module]`.
         return sharded_module if not benchmark_unsharded_module else module
 
 
@@ -387,7 +379,6 @@ def _init_module_and_run_benchmark(
     tables: Union[List[EmbeddingBagConfig], List[EmbeddingConfig]],
     output_dir: str,
     num_benchmarks: int,
-    # pyre-ignore[2]
     func_to_benchmark: Any,
     benchmark_func_kwargs: Optional[Dict[str, Any]],
     rank: int = -1,
@@ -449,7 +440,6 @@ def _init_module_and_run_benchmark(
             compile_mode=compile_mode,
             world_size=world_size,
             batch_size=batch_size,
-            # pyre-ignore[6]
             ctx=ctx,
             benchmark_unsharded_module=benchmark_unsharded_module,
         )
@@ -586,7 +576,6 @@ def benchmark_ebc_module(
             if not benchmark_unsharded:
                 # Test sharders should have a singular sharding_type
                 sharder._sharding_type = sharding_type.value
-                # pyre-ignore [6]
                 benchmark_type = _benchmark_type_name(compile_mode, sharding_type)
             else:
                 benchmark_type = "unsharded" + compile_mode.name
@@ -597,7 +586,6 @@ def benchmark_ebc_module(
 
             if is_train:
                 res = multi_process_benchmark(
-                    # pyre-ignore[6]
                     callable=_init_module_and_run_benchmark,
                     module=wrapped_module,
                     sharder=sharder,
@@ -621,7 +609,6 @@ def benchmark_ebc_module(
                     module=wrapped_module,
                     sharder=sharder,
                     device=torch.device(device_type),
-                    # pyre-ignore
                     sharding_type=sharding_type,
                     compile_mode=compile_mode,
                     world_size=world_size,

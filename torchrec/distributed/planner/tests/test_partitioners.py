@@ -675,9 +675,7 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
                     fwd_compute=25, fwd_comms=25, bwd_compute=25, bwd_comms=25
                 )
                 shard.storage = Storage(
-                    # pyre-ignore [6]
                     hbm=self.topology.devices[0].storage.hbm / 2,
-                    # pyre-ignore [6]
                     ddr=self.topology.devices[0].storage.ddr / 2,
                 )
             sharding_option.partition_by = PartitionByType.HOST.value
@@ -782,10 +780,9 @@ class TestMemoryBalancedPartitioner(unittest.TestCase):
             for shard in sharding_option.shards:
                 if shard.storage and shard.rank is not None:
                     greedy_perf_hbm_uses[
-                        # pyre-fixme[6]: For 1st argument expected `SupportsIndex`
                         #  but got `Optional[int]`.
                         shard.rank
-                    ] += shard.storage.hbm  # pyre-ignore[16]
+                    ] += shard.storage.hbm
 
         reset_shard_rank(sharding_options)
         memory_balanced_sharding_plan = self.memory_balanced_partitioner.partition(
@@ -807,7 +804,6 @@ class TestMemoryBalancedPartitioner(unittest.TestCase):
         for sharding_option in sharding_options:
             for shard in sharding_option.shards:
                 if shard.storage and shard.rank:
-                    # pyre-fixme[6]: For 1st argument expected `SupportsIndex` but
                     #  got `Optional[int]`.
                     memory_balanced_hbm_uses[shard.rank] += shard.storage.hbm
 

@@ -52,7 +52,6 @@ class ShardedFusedEmbeddingCollection(
         fused_params.update(emb_opt_kwargs)
 
         super().__init__(
-            # pyre-ignore
             module=module,
             table_name_to_parameter_sharding=table_name_to_parameter_sharding,
             fused_params=fused_params,

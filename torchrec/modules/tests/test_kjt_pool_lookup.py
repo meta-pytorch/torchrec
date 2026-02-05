@@ -14,7 +14,6 @@ from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
 class KeyedJaggedTensorPoolLookupTest(unittest.TestCase):
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

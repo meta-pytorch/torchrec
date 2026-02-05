@@ -19,7 +19,6 @@ from torchrec.modules.mlp import MLP, Perceptron
 
 
 class TestMLP(unittest.TestCase):
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     # to decorator factory `hypothesis.given`.
     @given(
         has_bias=st.booleans(),

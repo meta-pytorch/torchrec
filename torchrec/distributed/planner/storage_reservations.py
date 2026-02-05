@@ -152,7 +152,7 @@ def _get_batch_inputs_and_shardable_parameters(
                 )
                 input_lengths.extend(pooling_factors)
                 batch_sizes.extend(
-                    constraints[name].batch_sizes  # pyre-ignore[6]
+                    constraints[name].batch_sizes
                     if constraints
                     and constraints.get(name)
                     and constraints[name].batch_sizes

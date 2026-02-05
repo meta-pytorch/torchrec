@@ -903,7 +903,6 @@ class DLRMTrain(nn.Module):
 
 
 class DLRMWrapper(DLRM):
-    # pyre-ignore[14, 15]
     def forward(
         self, model_input: ModelInput
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -919,7 +918,7 @@ class DLRMWrapper(DLRM):
         """
         pred = super().forward(
             dense_features=model_input.float_features,
-            sparse_features=model_input.idlist_features,  # pyre-ignore[6]
+            sparse_features=model_input.idlist_features,
         )
 
         if self.training:

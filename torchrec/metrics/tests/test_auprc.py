@@ -279,11 +279,8 @@ class GroupedAUPRCValueTest(unittest.TestCase):
                 weight_name="weight",
             )
             task_list.append(task_info)
-            # pyre-ignore
             inputs["predictions"][task_info.name] = predictions[i]
-            # pyre-ignore
             inputs["labels"][task_info.name] = labels[i]
-            # pyre-ignore
             inputs["weights"][task_info.name] = weights[i]
 
         auprc = AUPRCMetric(
@@ -291,7 +288,6 @@ class GroupedAUPRCValueTest(unittest.TestCase):
             my_rank=0,
             batch_size=batch_size,
             tasks=task_list,
-            # pyre-ignore
             grouped_auprc=True,
         )
         auprc.update(**inputs)
@@ -344,7 +340,6 @@ class GroupedAUPRCValueTest(unittest.TestCase):
                     weight_name="weight",
                 )
             ],
-            # pyre-ignore
             grouped_auprc=True,
         )
 

@@ -39,7 +39,7 @@ def get_criteo_kaggle_dataloader(
     dataloader = DataLoader(
         datapipe(
             stage,
-            *stage_files,  # pyre-ignore[6]
+            *stage_files,
             batch_size=batch_size,
             rank=dist.get_rank(),
             world_size=dist.get_world_size(),

@@ -47,9 +47,7 @@ class TrainPipelineContext:
         version: int = 0; support for backward compatiblity
     """
 
-    # pyre-ignore [4]
     input_dist_splits_requests: Dict[str, Awaitable[Any]] = field(default_factory=dict)
-    # pyre-ignore [4]
     input_dist_tensors_requests: Dict[str, Awaitable[Any]] = field(default_factory=dict)
     module_contexts: Dict[str, Multistreamable] = field(default_factory=dict)
     module_contexts_next_batch: Dict[str, Multistreamable] = field(

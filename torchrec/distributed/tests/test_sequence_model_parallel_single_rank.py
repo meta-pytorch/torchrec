@@ -80,7 +80,6 @@ class SequenceModelParallelStateDictTest(ModelParallelSingleRankBase):
         torch.cuda.device_count() <= 0,
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -130,7 +129,6 @@ class SequenceModelParallelStateDictTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [

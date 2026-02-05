@@ -69,7 +69,6 @@ class HashZchSingleTtlScorer(HashZchEvictionScorer):
 
         return torch.full_like(
             feature.values(),
-            # pyre-ignore [58]
             self._config.single_ttl + int(time.time() / 3600),
             dtype=torch.int32,
             device=device,
@@ -86,7 +85,6 @@ class HashZchPerFeatureTtlScorer(HashZchEvictionScorer):
         assert self._config.per_feature_ttl is not None and len(
             self._config.features
         ) == len(
-            # pyre-ignore [6]
             self._config.per_feature_ttl
         ), "To use scorer HashZchPerFeatureTtlScorer, a 1:1 mapping between features and per_feature_ttl is required."
 

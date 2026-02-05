@@ -81,7 +81,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -145,7 +144,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             model_class=cast(TestSparseNNBase, TestSequenceSparseNN),
             embedding_groups=self.embedding_groups,
             tables=self.tables,
-            # pyre-ignore [6]
             sharders=sharders,
             quantize_callable=_quantize,
             quantize_callable_kwargs={
@@ -157,7 +155,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]
     @given(
         output_type=st.sampled_from(
             [
@@ -207,7 +204,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
         local_batch = local_batch.to(device)
         sharded_quant_model(local_batch.idlist_features)
 
-    # pyre-fixme[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
@@ -263,7 +259,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
         local_batch = local_batch.to(device)
         sharded_quant_model(local_batch.idlist_features)
         self.assertIsInstance(
-            # pyre-ignore [29]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[0]
@@ -272,7 +267,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             KVEmbeddingInference,
         )
         self.assertIsInstance(
-            # pyre-ignore [29]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[0]
@@ -281,7 +275,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             IntNBitTableBatchedEmbeddingBagsCodegen,
         )
         self.assertEqual(
-            # pyre-ignore [29]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[0]
@@ -290,7 +283,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             [0, 0],
         )
         self.assertEqual(
-            # pyre-ignore [29]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[1]

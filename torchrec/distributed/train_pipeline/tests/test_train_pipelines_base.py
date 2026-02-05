@@ -121,18 +121,13 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
         )
         if enable_fsdp:
             unsharded_model.over.dhn_arch.linear0 = FSDP(
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `dhn_arch`.
                 unsharded_model.over.dhn_arch.linear0
             )
             unsharded_model.over.dhn_arch.linear1 = FSDP(
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `dhn_arch`.
                 unsharded_model.over.dhn_arch.linear1
             )
-            # pyre-fixme[16]: `Module` has no attribute `dhn_arch`.
-            # pyre-fixme[16]: `Tensor` has no attribute `dhn_arch`.
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `dhn_arch`.
             unsharded_model.over.dhn_arch = FSDP(unsharded_model.over.dhn_arch)
 

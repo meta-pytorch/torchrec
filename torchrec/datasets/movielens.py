@@ -63,9 +63,7 @@ def _movielens(
     root: str,
     *,
     include_movies_data: bool = False,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
-    # pyre-ignore[2]
     **open_kw,
 ) -> IterDataPipe:
     ratings_path = os.path.join(root, RATINGS_FILENAME)
@@ -84,9 +82,7 @@ def movielens_20m(
     root: str,
     *,
     include_movies_data: bool = False,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
-    # pyre-ignore[2]
     **open_kw,
 ) -> IterDataPipe:
     """`MovieLens 20M <https://grouplens.org/datasets/movielens/20m/>`_ Dataset
@@ -115,9 +111,7 @@ def movielens_25m(
     root: str,
     *,
     include_movies_data: bool = False,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
-    # pyre-ignore[2]
     **open_kw,
 ) -> IterDataPipe:
     """`MovieLens 25M <https://grouplens.org/datasets/movielens/25m/>`_ Dataset

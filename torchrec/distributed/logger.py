@@ -167,7 +167,7 @@ _P = ParamSpec("_P")
 
 def _torchrec_method_logger(
     **wrapper_kwargs: Any,
-) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:  # pyre-ignore
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
     """
     A method decorator that provides comprehensive logging for TorchRec functions.
 
@@ -203,7 +203,7 @@ def _torchrec_method_logger(
           via functools.wraps.
     """
 
-    def decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:  # pyre-ignore
+    def decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:
         """
         Inner decorator that wraps the actual function.
 

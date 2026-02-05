@@ -139,14 +139,11 @@ class ShardedTensorPool(
     ) -> None:
         super().__init__()
 
-        # pyre-fixme[4]: Attribute must be annotated.
         self._world_size = env.world_size
-        # pyre-fixme[4]: Attribute must be annotated.
         self._rank = env.rank
         self._pool_size = pool_size
         self._sharding_env = env
         self._dim: int = dim
-        # pyre-fixme[4]: Attribute must be annotated.
         self._device = device if device is not None else torch.device("meta")
         self._dtype = dtype
         self._sharding_plan = sharding_plan
@@ -357,7 +354,6 @@ class ShardedInferenceTensorPool(
         )
 
         if self._sharding_plan.sharding_type == ObjectPoolShardingType.ROW_WISE:
-            # pyre-fixme[4]: Attribute must be annotated.
             self._sharding = InferRwTensorPoolSharding(
                 env=self._sharding_env,
                 device=self._device,
@@ -436,14 +432,12 @@ class ShardedInferenceTensorPool(
     def create_context(self) -> ObjectPoolShardingContext:
         raise NotImplementedError("create_context() is not implemented")
 
-    # pyre-ignore
     def _lookup_ids_dist(
         self,
         ids: torch.Tensor,
     ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._lookup_ids_dist_impl(ids)
 
-    # pyre-ignore
     def _update_ids_dist(
         self,
         ids: torch.Tensor,
@@ -451,7 +445,6 @@ class ShardedInferenceTensorPool(
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         return self._lookup_ids_dist_impl.update(ids, values)
 
-    # pyre-ignore
     def _lookup_local(
         self,
         dist_input: List[torch.Tensor],
@@ -461,14 +454,12 @@ class ShardedInferenceTensorPool(
             ret.append(shard(dist_input[i]))
         return ret
 
-    # pyre-ignore
     def _lookup_values_dist(
         self,
         lookups: List[torch.Tensor],
     ) -> torch.Tensor:
         return self._lookup_values_dist_impl(lookups)
 
-    # pyre-ignore
     def forward(self, ids: torch.Tensor) -> torch.Tensor:
         dist_input, unbucketize_permute, bucket_mapping, bucketized_lengths = (
             self._lookup_ids_dist(ids)
@@ -525,11 +516,9 @@ class ShardedInferenceTensorPool(
                 self._dim,
             )
 
-    # pyre-ignore
     def _update_values_dist(self, ctx: ObjectPoolShardingContext, values: torch.Tensor):
         raise NotImplementedError("Inference does not support update")
 
-    # pyre-ignore
     def _update_local(
         self,
         dist_input: List[torch.Tensor],
@@ -539,10 +528,8 @@ class ShardedInferenceTensorPool(
             ids = dist_input[i]
             values = dist_values[i]
             deduped_ids, dedup_permutation = deterministic_dedup(ids)
-            # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
             shard.update(deduped_ids, values[dedup_permutation])
 
-    # pyre-fixme[7]: Expected `Tensor` but got implicit return value of `None`.
     def _update_preproc(self, values: torch.Tensor) -> torch.Tensor:
         pass
 

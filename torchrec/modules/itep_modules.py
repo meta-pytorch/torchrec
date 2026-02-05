@@ -218,20 +218,16 @@ class GenericITEPModule(nn.Module):
         with torch.no_grad():
             # Don't use register_buffer for buffer_offsets and emb_sizes because they
             # may change as the sharding plan changes between preemption/resumption
-            # pyre-fixme[16]: `GenericITEPModule` has no attribute `buffer_offsets`.
             self.buffer_offsets = torch.tensor(
                 buffer_offsets, dtype=torch.int64, device=self.current_device
             )
-            # pyre-fixme[16]: `GenericITEPModule` has no attribute `emb_sizes`.
             self.emb_sizes = torch.tensor(
                 emb_sizes, dtype=torch.int64, device=self.current_device
             )
 
-            # pyre-fixme[16]: `GenericITEPModule` has no attribute `address_lookup`.
             self.address_lookup = torch.zeros(
                 buffer_size, dtype=torch.int64, device=self.current_device
             )
-            # pyre-fixme[16]: `GenericITEPModule` has no attribute `row_util`.
             self.row_util = torch.zeros(
                 buffer_size, dtype=torch.float32, device=self.current_device
             )
@@ -240,12 +236,10 @@ class GenericITEPModule(nn.Module):
             for idx, table_name in enumerate(table_names):
                 self.register_buffer(
                     f"{table_name}_itp_address_lookup",
-                    # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, ...
                     self.address_lookup[buffer_offsets[idx] : buffer_offsets[idx + 1]],
                 )
                 self.register_buffer(
                     f"{table_name}_itp_row_util",
-                    # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, ...
                     self.row_util[buffer_offsets[idx] : buffer_offsets[idx + 1]],
                 )
 
@@ -549,7 +543,6 @@ class GenericITEPModule(nn.Module):
 
 class RowwiseShardedITEPModule(GenericITEPModule):
     def _get_local_metadata_idx(self, table: ShardedEmbeddingTable) -> int:
-        # pyre-ignore Undefined attribute [16]: `Optional` has no attribute `shards_metadata`
         for i, metadata in enumerate(table.global_metadata.shards_metadata):
             if metadata == table.local_metadata:
                 return i
@@ -562,7 +555,6 @@ class RowwiseShardedITEPModule(GenericITEPModule):
         Returns a tuples of 2 lists: local_unpruned_hash_sizes, local_offsets. They are used
         to create itep buffers and set checkpoint local/global metadata.
         """
-        # pyre-ignore Undefined attribute [16]: `Optional` has no attribute `shards_metadata`
         num_devices = len(table.global_metadata.shards_metadata)
 
         if sharding_type == ShardingType.TABLE_ROW_WISE.value:
@@ -627,7 +619,6 @@ class RowwiseShardedITEPModule(GenericITEPModule):
             if sharding_type == ShardingType.ROW_WISE.value:
 
                 local_unpruned_rows = local_unpruned_shard_sizes[
-                    # pyre-ignore Undefined attribute [16]: `Optional` has no attribute `placement`
                     table.local_metadata.placement.rank()
                 ]
             else:
@@ -676,7 +667,6 @@ class RowwiseShardedITEPModule(GenericITEPModule):
 
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
 
         ckp_tables: List[str] = []
@@ -714,7 +704,6 @@ class RowwiseShardedITEPModule(GenericITEPModule):
                 # Build global shards metadata
                 global_shards_metadata: List[ShardMetadata] = []
                 for i, table_global_metadata in enumerate(
-                    # pyre-ignore Undefined attribute [16]: `Optional` has no attribute `shards_metadata`
                     table.global_metadata.shards_metadata
                 ):
                     shard_sizes = [unpruned_row_sizes[i]]
@@ -752,7 +741,6 @@ class RowwiseShardedITEPModule(GenericITEPModule):
         )
         return destination
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module` inconsistently.
     def load_state_dict(
         self,
         state_dict: "OrderedDict[str, torch.Tensor]",
@@ -797,7 +785,6 @@ class RowwiseShardedITEPModule(GenericITEPModule):
         )
         return _IncompatibleKeys(missing_keys, unexpected_keys)
 
-    # pyre-fixme[14]: `state_dict` overrides method defined in `nn.modules.module.Module` inconsistently.
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -806,17 +793,15 @@ class RowwiseShardedITEPModule(GenericITEPModule):
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
         for lookup in self.lookups:
             list_of_tables: List[ShardedEmbeddingTable] = []
-            # pyre-ignore [29]
             for emb_config in lookup.grouped_configs:
                 list_of_tables.extend(emb_config.embedding_tables)
 
             destination = self.get_itp_state_dict(
                 list_of_tables,
-                self.address_lookup,  # pyre-ignore
+                self.address_lookup,
                 self.pg,
                 destination,
                 prefix,
@@ -825,7 +810,7 @@ class RowwiseShardedITEPModule(GenericITEPModule):
             )
             destination = self.get_itp_state_dict(
                 list_of_tables,
-                self.row_util,  # pyre-ignore
+                self.row_util,
                 self.pg,
                 destination,
                 prefix,

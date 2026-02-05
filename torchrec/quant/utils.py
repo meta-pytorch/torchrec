@@ -33,9 +33,8 @@ def populate_fx_names(
         ):
             table_names = []
             for config in emb_configs:
-                table_names.append(config.name)  # pyre-ignore[16]
+                table_names.append(config.name)
             joined_table_names = ",".join(table_names)
-            # pyre-fixme[16]: `Module` has no attribute `_fx_path`.
             emb_module._fx_path = f"emb_module.{joined_table_names}"
     elif isinstance(quant_ebc, ShardedQuantEmbeddingBagCollection):
         for i, (emb_module, emb_dist_module) in enumerate(
@@ -44,7 +43,6 @@ def populate_fx_names(
             embedding_fx_path = f"embedding_lookup.sharding_{i}"
             emb_module._fx_path = embedding_fx_path
             emb_dist_module._fx_path = f"embedding_dist.{i}"
-            # pyre-fixme[6]: For 1st argument expected `Iterable[_T]` but got
             #  `Union[Module, Tensor]`.
             for rank, rank_module in enumerate(emb_module._embedding_lookups_per_rank):
                 rank_fx_path = f"{embedding_fx_path}.rank_{rank}"

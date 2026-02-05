@@ -42,15 +42,12 @@ class SGD(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
-        # pyre-ignore
         **kwargs,
     ) -> None:
         self._params = params
-        # pyre-ignore
         self._kwargs = kwargs
 
     @torch.no_grad()
-    # pyre-ignore
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -63,15 +60,12 @@ class LarsSGD(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
-        # pyre-ignore
         **kwargs,
     ) -> None:
         self._params = params
-        # pyre-ignore
         self._kwargs = kwargs
 
     @torch.no_grad()
-    # pyre-ignore
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -84,15 +78,12 @@ class LAMB(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
-        # pyre-ignore
         **kwargs,
     ) -> None:
         self._params = params
-        # pyre-ignore
         self._kwargs = kwargs
 
     @torch.no_grad()
-    # pyre-ignore
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -105,15 +96,12 @@ class PartialRowWiseLAMB(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
-        # pyre-ignore
         **kwargs,
     ) -> None:
         self._params = params
-        # pyre-ignore
         self._kwargs = kwargs
 
     @torch.no_grad()
-    # pyre-ignore
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -126,15 +114,12 @@ class Adam(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
-        # pyre-ignore
         **kwargs,
     ) -> None:
         self._params = params
-        # pyre-ignore
         self._kwargs = kwargs
 
     @torch.no_grad()
-    # pyre-ignore
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -147,15 +132,12 @@ class PartialRowWiseAdam(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
-        # pyre-ignore
         **kwargs,
     ) -> None:
         self._params = params
-        # pyre-ignore
         self._kwargs = kwargs
 
     @torch.no_grad()
-    # pyre-ignore
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -168,14 +150,11 @@ class Adagrad(Optimizer):
     def __init__(
         self,
         params: Iterable[torch.nn.Parameter],
-        # pyre-ignore
         **kwargs,
     ) -> None:
         self._params = params
-        # pyre-ignore
         self._kwargs = kwargs
 
     @torch.no_grad()
-    # pyre-ignore
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError

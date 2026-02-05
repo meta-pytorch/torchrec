@@ -109,9 +109,7 @@ def _get_recat(
         if vb_per_rank_condition:
             batch_size_per_feature = list(
                 itertools.chain.from_iterable(
-                    itertools.repeat(x, local_split)
-                    # pyre-ignore
-                    for x in batch_size_per_rank
+                    itertools.repeat(x, local_split) for x in batch_size_per_rank
                 )
             )
             permuted_batch_size_per_feature = [batch_size_per_feature[r] for r in recat]
@@ -259,7 +257,6 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                         )
                     )
             # To avoid hasattr in _wait_impl to check self._splits_awaitable
-            # pyre-ignore
             self._splits_awaitable = None
         else:
             with record_function("## all2all_data:kjt splits ##"):
@@ -530,9 +527,7 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
                         self._output_splits[i][rank] == self._input_splits[i][rank]
                     )
                 if self._stride_per_rank is not None:
-                    # pyre-ignore
                     for i in range(len(self._stride_per_rank)):
-                        # pyre-ignore
                         torch._check_is_size(self._stride_per_rank[i])
 
         return KJTAllToAllTensorsAwaitable(

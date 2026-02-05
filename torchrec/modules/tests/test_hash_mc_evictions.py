@@ -20,7 +20,6 @@ from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
 class TestEvictionScorer(unittest.TestCase):
-    # pyre-ignore [56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "This test requires CUDA device",
@@ -46,7 +45,6 @@ class TestEvictionScorer(unittest.TestCase):
                 f"{torch.unique(score)=}",
             )
 
-    # pyre-ignore [56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "This test requires CUDA device",

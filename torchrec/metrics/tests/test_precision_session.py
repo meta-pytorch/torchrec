@@ -123,11 +123,8 @@ class PrecisionSessionValueTest(unittest.TestCase):
                 ),
             )
             task_list.append(task_info)
-            # pyre-ignore
             inputs["predictions"][task_info.name] = predictions[i]
-            # pyre-ignore
             inputs["labels"][task_info.name] = labels[i]
-            # pyre-ignore
             inputs["weights"][task_info.name] = weights[i]
 
         kwargs = {"required_inputs": {"session": session}}

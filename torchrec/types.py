@@ -34,7 +34,6 @@ class ModuleCopyMixin(CopyMixIn):
     """
 
     def copy(self, device: torch.device) -> nn.Module:
-        # pyre-ignore [16]
         return self.to(device)
 
 
@@ -44,7 +43,6 @@ class ModuleNoCopyMixin(CopyMixIn):
     """
 
     def copy(self, device: torch.device) -> nn.Module:
-        # pyre-ignore [7]
         return self
 
 

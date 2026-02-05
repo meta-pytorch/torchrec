@@ -161,7 +161,6 @@ def _state_reduction(state: List[torch.Tensor], dim: int = 1) -> List[torch.Tens
     return [torch.cat(state, dim=dim)]
 
 
-# pyre-ignore
 _grouping_keys_state_reduction = partial(_state_reduction, dim=0)
 
 

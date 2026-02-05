@@ -37,9 +37,7 @@ def print_error_message(
     """
     lint_item = {
         "path": python_path,
-        # pyre-fixme[16]: `AST` has no attribute `lineno`.
         "line": node.lineno,
-        # pyre-fixme[16]: `AST` has no attribute `col_offset`.
         "char": node.col_offset + 1,
         "severity": severity,
         "name": name,
@@ -48,7 +46,6 @@ def print_error_message(
     print(json.dumps(lint_item))
 
 
-# pyre-ignore[3]: Return type must be specified as type that does not contain `Any`.
 def get_function_args(node: ast.FunctionDef) -> Tuple[List[Any], List[Any]]:
     """
     This functon will process function definition and will extract all
@@ -111,11 +108,9 @@ def check_class_definition(python_path: str, node: ast.ClassDef) -> None:
         # We assume that TorchRec module has one of the following inheritance patterns:
         # 1. `class SomeTorchRecModule(LazyModuleExtensionMixin, torch.nn.Module)`
         # 2. `class SomeTorchRecModule(torch.nn.Module)`
-        # pyre-ignore[16]: `_ast.expr` has no attribute `id`.
         if hasattr(base, "id") and base.id == "LazyModuleExtensionMixin":
             is_TorchRec_module = True
             break
-        # pyre-ignore[16]: `_ast.expr` has no attribute `id`.
         elif hasattr(base, "attr") and base.attr == "Module":
             is_TorchRec_module = True
             break
@@ -162,7 +157,6 @@ def check_class_definition(python_path: str, node: ast.ClassDef) -> None:
         )
 
     # Check actual args from the functions
-    # pyre-ignore[33]: Explicit annotation for `functions` cannot contain `Any`.
     functions: Dict[str, Tuple[List[Any], List[Any]]] = {}
     function_sub_nodes = {}
     for sub_node in node.body:
@@ -219,7 +213,6 @@ def check_class_definition(python_path: str, node: ast.ClassDef) -> None:
                     ),
                 )
 
-    # pyre-ignore[53]
     def check_function_docstring(function_name: str) -> None:
         if function_name not in functions:
             return

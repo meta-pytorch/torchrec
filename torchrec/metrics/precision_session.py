@@ -118,7 +118,6 @@ class PrecisionSessionMetricComputation(RecMetricComputation):
                     self.session_var_name
                 )
             )
-        # pyre-ignore
         session = kwargs["required_inputs"][self.session_var_name]
         if predictions is None or weights is None or session is None:
             raise RecMetricException(
@@ -166,12 +165,10 @@ class PrecisionSessionMetricComputation(RecMetricComputation):
         session: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         predictions_ranked = ranking_within_session(predictions, session)
-        # pyre-fixme[58]: `<` is not supported for operand types `Tensor` and
         #  `Optional[int]`.
         predictions_labels = (predictions_ranked < self.top_threshold).to(torch.int32)
         if self.run_ranking_of_labels:
             labels_ranked = ranking_within_session(labels, session)
-            # pyre-fixme[58]: `<` is not supported for operand types `Tensor` and
             #  `Optional[int]`.
             labels = (labels_ranked < self.top_threshold).to(torch.int32)
         num_true_pos = _calc_num_true_pos(labels, predictions_labels, weights)

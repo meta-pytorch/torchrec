@@ -51,7 +51,6 @@ def _join_module_path(path: str, name: str) -> str:
     return (path + "." + name) if path else name
 
 
-# pyre-ignore
 @contract()
 def shard(
     module: nn.Module,
@@ -146,7 +145,6 @@ def _shard(
         for table_name, sharding in plan.items():
             if isinstance(sharding, Callable):
                 param = shardable_parameters[table_name]
-                # pyre-fixme[6]: For 2nd argument expected `(Parameter, int, int,
                 #  str, ModuleSharder[Module]) -> ParameterSharding` but got
                 #  `ParameterSharding`.
                 plan[table_name] = sharding(
@@ -160,7 +158,6 @@ def _shard(
     return sharder.shard(module, plan, env, device)
 
 
-# pyre-ignore
 @contract()
 @_torchrec_method_logger()
 def shard_modules(

@@ -79,7 +79,6 @@ def _to_device(
     if data_copy_stream is not None:
         return cast(
             In,
-            # pyre-ignore[28]
             batch.to(
                 device=device,
                 non_blocking=non_blocking,
@@ -200,7 +199,6 @@ def _start_embedding_lookup(
     context: EmbeddingTrainPipelineContext,
     source_stream: Optional[torch.Stream],
     target_stream: Optional[torch.Stream],
-    # pyre-ignore[2]
     stream_context: Callable[..., AbstractContextManager[Any, Any]],
 ) -> None:
     module_context = context.module_contexts[module.forward.name]
@@ -230,7 +228,6 @@ def _fuse_input_dist_splits(context: TrainPipelineContext) -> None:
             (
                 names,
                 FusedKJTListSplitsAwaitable(
-                    # pyre-ignore[6]
                     requests=[
                         context.input_dist_splits_requests[name] for name in names
                     ],
@@ -280,7 +277,6 @@ def _jit_modules(module: torch.nn.Module, path: str, optional: bool = True) -> b
 def _pipeline_detach_model(
     model: torch.nn.Module,
     pipelined_modules: List[ShardedModule],
-    # pyre-ignore[2]
     original_forwards: List[Callable[..., Any]],
     original_kjt_dist_forwards: List[
         Callable[[KeyedJaggedTensor], Awaitable[KJTAllToAllTensorsAwaitable]]
@@ -290,7 +286,6 @@ def _pipeline_detach_model(
     # Replace pipelined module forward and input dist forward with original forward
     kjt_dists = []
     for mod, original_fwd in zip(pipelined_modules, original_forwards):
-        # pyre-ignore
         mod.forward = original_fwd
 
         for _, child_module in mod.named_modules():
@@ -318,7 +313,6 @@ def _pipeline_detach_model(
         setattr(model, postproc_mod.fqn, postproc_mod.postproc_module)
 
 
-# pyre-ignore[3] Return type must be specified as type that does not contain
 def _rewrite_model(  # noqa C901
     model: torch.nn.Module,
     context: TForwardContext,
@@ -373,13 +367,11 @@ def _rewrite_model(  # noqa C901
     if batch:
         if hasattr(batch, "to_proxy"):
             # for some special models, it requires using "input" as the key for input
-            # pyre-ignore[16]: Variable[In (bound to Pipelineable)] has no attribute to_proxy.
             concrete_args["inputs"] = copy.copy(batch).to_proxy()
         elif hasattr(batch, "to_proxy_tuple"):
             # when the model is pre-fx traced or dynamo exported, the inputs are already flattened,
             # and therefore we use tuple as concrete args that fx.trace will automatically match
             # with the argument names. We pass in the model for the caller side to customize the batch
-            # pyre-ignore[16]: Variable[In (bound to Pipelineable)] has no attribute to_proxy_tuple.
             concrete_args = batch.to_proxy_tuple(model)
 
     tracer = Tracer(leaf_modules=_get_leaf_module_names(model))
@@ -419,7 +411,6 @@ def _rewrite_model(  # noqa C901
             original_forwards.append(child.forward)
             # Set pipelining flag on the child module
             child.is_pipelined = True
-            # pyre-ignore[8] Incompatible attribute type
             child.forward = pipelined_forward(
                 node.target,
                 arg_info_list,

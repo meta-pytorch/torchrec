@@ -301,25 +301,21 @@ class PredictModule(nn.Module):
         return self._module
 
     @abc.abstractmethod
-    # pyre-fixme[3]
     def predict_forward(self, batch: Dict[str, torch.Tensor]) -> Any:
         pass
 
-    # pyre-fixme[3]
     def forward(self, batch: Dict[str, torch.Tensor]) -> Any:
         if self._device is None:
             self._device = torch.device("cuda", torch.cuda.current_device())
         with torch.inference_mode():
             return self.predict_forward(batch)
 
-    # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
         prefix: str = "",
         keep_vars: bool = False,
     ) -> Dict[str, Any]:
-        # pyre-fixme[19]: Expected 0 positional arguments.
         return self._module.state_dict(destination, prefix, keep_vars)
 
 
@@ -430,7 +426,6 @@ def quantize_inference_model(
         quant_prep_enable_cache_features_order(
             model, [FeatureProcessedEmbeddingBagCollection]
         )
-        # pyre-fixme[16]: `FeatureProcessedEmbeddingBagCollection` has no attribute
         #  `qconfig`.
         fp_module.qconfig = QuantConfig(
             activation=quant.PlaceholderObserver.with_args(dtype=output_dtype),
@@ -556,7 +551,6 @@ def shard_quant_model(
             if type(module) in module_types:
                 # TODO: handle other cases/reduce hardcoding
                 if hasattr(module, "embedding_bags"):
-                    # pyre-fixme[29]: `Union[(self: Tensor) -> Any, Module, Tensor]`
                     #  is not a function.
                     for table in module.embedding_bags:
                         table_fqns.append(table)

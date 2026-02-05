@@ -147,7 +147,6 @@ class TestInferenceSchema(unittest.TestCase):
             found = False
             for default_sharder in DEFAULT_SHARDERS:
                 if isinstance(default_sharder, type(sharder)):
-                    # pyre-ignore[16]
                     for key in sharder.fused_params.keys():
                         self.assertTrue(key in default_sharder.fused_params)
                         self.assertTrue(

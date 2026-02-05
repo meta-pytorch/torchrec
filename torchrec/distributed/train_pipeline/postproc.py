@@ -30,7 +30,6 @@ class NoOpStream:
         """Return `self` upon entering the runtime context."""
         return self
 
-    # pyre-ignore
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         return None
 
@@ -88,7 +87,6 @@ class PipelinedPostproc(torch.nn.Module):
 
         if self._dist_stream:
             device: torch.device = self._dist_stream.device
-            # pyre-ignore
             self._stream_context = (
                 torch.get_device_module(device).stream
                 if device.type in ["cuda", "mtia"]
@@ -105,7 +103,6 @@ class PipelinedPostproc(torch.nn.Module):
     def fqn(self) -> str:
         return self._fqn
 
-    # pyre-ignore
     def forward(self, *input, **kwargs) -> Any:
         """
         Args:
@@ -158,7 +155,6 @@ class PipelinedPostproc(torch.nn.Module):
                     # for the second item (Dict), we iterate over the values and call
                     # record_stream accordingly.
 
-                    # pyre-ignore[6]
                     PipelinedPostproc.recursive_record_stream(res, self._default_stream)
                 elif self._context.index == 0:
                     logger.warning(
@@ -220,7 +216,6 @@ class PipelinedPostproc(torch.nn.Module):
             prefix, recurse, remove_duplicate
         )
 
-    # pyre-ignore [14]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -230,14 +225,12 @@ class PipelinedPostproc(torch.nn.Module):
         # super().state_dict(destination, prefix, keep_vars)
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
         self._postproc_module.state_dict(
             destination=destination, prefix=prefix, keep_vars=keep_vars
         )
         return destination
 
-    # pyre-ignore [14]
     def load_state_dict(
         self,
         state_dict: OrderedDict[str, torch.Tensor],
@@ -247,7 +240,6 @@ class PipelinedPostproc(torch.nn.Module):
 
     @staticmethod
     def recursive_record_stream(
-        # pyre-fixme[2]: Parameter `re` must have a type that does not contain `Any`
         res: Union[torch.Tensor, Pipelineable, Iterable[Any], Dict[Any, Any]],
         stream: torch.Stream,
     ) -> None:

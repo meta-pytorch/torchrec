@@ -604,7 +604,6 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
 
         # Initializing all required variables
 
-        # pyre-ignore [33]
         state: Dict[Any, Any] = {}
         param_group: Dict[str, Any] = {
             "params": [],
@@ -720,7 +719,6 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
             ):
                 # Number of optimizers for the table
                 num_states: int = min(
-                    # pyre-ignore
                     [len(opt_state) for opt_state in shard_params.optimizer_states]
                 )
                 optimizer_state_keys = []
@@ -759,7 +757,6 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         optimizer_sharded_tensor_metadata: ShardedTensorMetadata
 
         # Momentum idx is minimum 1
-        # pyre-ignore [16]
         optim_state = shard_params.optimizer_states[0][momentum_idx - 1]
         if (
             optim_state.nelement() == 1 and state_key != "momentum1"
@@ -830,7 +827,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
             return DTensor.from_local(
                 local_tensor=LocalShardsWrapper(
                     local_shards=[x.tensor for x in momentum_local_shards],
-                    local_offsets=[  # pyre-ignore[6]
+                    local_offsets=[
                         x.metadata.shard_offsets for x in momentum_local_shards
                     ],
                 ),
@@ -860,7 +857,6 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         table_shard_metadata_to_optimizer_shard_metadata = {}
         for offset, table_shard_metadata in enumerate(table_global_shards_metadata):
 
-            # pyre-ignore [16]
             table_shard_metadata.placement._device = optimizer_state.device
             # Creating shardMetaData
             table_shard_metadata_to_optimizer_shard_metadata[table_shard_metadata] = (
@@ -924,7 +920,6 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
                 # manually create a row-wise offset
                 offset = idx * table_shard_metadata.shard_sizes[0]
 
-            # pyre-ignore [16]
             table_shard_metadata.placement._device = optimizer_state.device
             table_shard_metadata_to_optimizer_shard_metadata[table_shard_metadata] = (
                 ShardMetadata(
@@ -977,7 +972,6 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         table_shard_metadata_to_optimizer_shard_metadata = {}
 
         for table_shard_metadata in table_global_shards_metadata:
-            # pyre-ignore [16]
             table_shard_metadata.placement._device = optimizer_state.device
             table_shard_metadata_to_optimizer_shard_metadata[table_shard_metadata] = (
                 ShardMetadata(
@@ -1005,12 +999,9 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         )
 
     def zero_grad(self, set_to_none: bool = False) -> None:
-        # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
-        # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
 
@@ -1049,7 +1040,6 @@ class ZeroCollisionKeyValueEmbeddingFusedOptimizer(FusedOptimizer):
             table_name_to_weight_count_per_rank
         )
 
-        # pyre-ignore [33]
         state: Dict[Any, Any] = {}
         param_group: Dict[str, Any] = {
             "params": [],
@@ -1093,12 +1083,9 @@ class ZeroCollisionKeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         super().__init__(params, state, [param_group])
 
     def zero_grad(self, set_to_none: bool = False) -> None:
-        # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
-        # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
     def set_sharded_embedding_weight_ids(
@@ -1141,7 +1128,6 @@ class ZeroCollisionKeyValueEmbeddingFusedOptimizer(FusedOptimizer):
                         )
                         sharded_t.local_shards()[0].tensor = opt_state_t
                         create_virtual_table_local_metadata(
-                            # pyre-ignore [6]
                             table_config.local_metadata,
                             opt_state_t,
                             self._my_rank,
@@ -1329,7 +1315,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                 pointwise_optimizer_st_metadata,
             )
 
-        # pyre-ignore [33]
         state: Dict[Any, Any] = {}
         param_group: Dict[str, Any] = {
             "params": [],
@@ -1450,7 +1435,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
             if all(
                 opt_state is not None for opt_state in shard_params.optimizer_states
             ):
-                # pyre-ignore
+
                 def get_sharded_optim_state(
                     momentum_idx: int, state_key: str
                 ) -> Union[ShardedTensor, DTensor]:
@@ -1458,7 +1443,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                     momentum_local_shards: List[Shard] = []
                     optimizer_sharded_tensor_metadata: ShardedTensorMetadata
 
-                    # pyre-ignore [16]
                     optim_state = shard_params.optimizer_states[0][momentum_idx - 1]
                     if (
                         optim_state.nelement() == 1 and state_key != "momentum1"
@@ -1524,7 +1508,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         return DTensor.from_local(
                             local_tensor=LocalShardsWrapper(
                                 local_shards=[x.tensor for x in momentum_local_shards],
-                                local_offsets=[  # pyre-ignore[6]
+                                local_offsets=[
                                     x.metadata.shard_offsets
                                     for x in momentum_local_shards
                                 ],
@@ -1544,7 +1528,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         )
 
                 num_states: int = min(
-                    # pyre-ignore
                     [len(opt_state) for opt_state in shard_params.optimizer_states]
                 )
                 optimizer_state_keys = []
@@ -1566,12 +1549,9 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
         super().__init__(params, state, [param_group])
 
     def zero_grad(self, set_to_none: bool = False) -> None:
-        # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
-        # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
     def set_optimizer_step(self, step: int) -> None:
@@ -1596,10 +1576,8 @@ def _gen_named_parameters_by_table_ssd_pmt(
     for table_config, pmt in zip(config.embedding_tables, pmts):
         table_name = table_config.name
         emb_table = pmt
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got
         #  `Union[PartiallyMaterializedTensor, Tensor]`.
         weight: nn.Parameter = nn.Parameter(emb_table)
-        # pyre-ignore
         weight._in_backward_optimizers = [EmptyFusedOptimizer()]
         yield (table_name, weight)
 
@@ -1622,17 +1600,13 @@ def _gen_named_parameters_by_table_fused(
         table_count = table_name_to_count.pop(table_name)
         if emb_module.weights_precision == SparseType.INT8:
             dim += emb_module.int8_emb_row_dim_offset
-        # pyre-ignore [29]
         offset = emb_module.weights_physical_offsets[t_idx]
         weights: torch.Tensor
         if location == EmbeddingLocation.DEVICE.value:
-            # pyre-fixme[9]: weights has type `Tensor`; used as `Union[Module, Tensor]`.
             weights = emb_module.weights_dev
         elif location == EmbeddingLocation.HOST.value:
-            # pyre-fixme[9]: weights has type `Tensor`; used as `Union[Module, Tensor]`.
             weights = emb_module.weights_host
         else:
-            # pyre-fixme[9]: weights has type `Tensor`; used as `Union[Module, Tensor]`.
             weights = emb_module.weights_uvm
         weight = TableBatchedEmbeddingSlice(
             data=weights,
@@ -1642,7 +1616,6 @@ def _gen_named_parameters_by_table_fused(
             embedding_dim=dim,
         )
         # this reuses logic in EmbeddingFusedOptimizer but is per table
-        # pyre-ignore
         weight._in_backward_optimizers = [
             EmbeddingFusedOptimizer(
                 config=config,
@@ -1740,14 +1713,12 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
             self._weight_init_maxs,
             self.split_embedding_weights(),
         ):
-            assert param.shape == (rows, emb_dim)  # pyre-ignore[16]
-            if param.data.dtype in [  # pyre-ignore[16]
+            assert param.shape == (rows, emb_dim)
+            if param.data.dtype in [
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             ]:
-                tmp_param = torch.zeros(
-                    param.shape, device=param.device  # pyre-ignore[16]
-                )
+                tmp_param = torch.zeros(param.shape, device=param.device)
                 tmp_param.uniform_(weight_init_min, weight_init_max).to(
                     param.data.dtype
                 )
@@ -1782,7 +1753,6 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
                 **forward_args,
             )
 
-    # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -1792,7 +1762,6 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
         self.flush()
         return get_state_dict(
             self._config.embedding_tables,
-            # pyre-ignore
             self.split_embedding_weights(),
             self._pg,
             destination,
@@ -1961,13 +1930,10 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
         ):
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
-            # pyre-ignore [6]
             param = nn.Parameter(tensor)
-            # pyre-ignore
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
-    # pyre-ignore [15]
     def named_split_embedding_weights(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, PartiallyMaterializedTensor]]:
@@ -2026,14 +1992,12 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
         """
         self.emb_module.create_rocksdb_hard_link_snapshot()
 
-    # pyre-ignore [15]
     def split_embedding_weights(self, no_snapshot: bool = True) -> Tuple[
         List[PartiallyMaterializedTensor],
         Optional[List[torch.Tensor]],
         Optional[List[torch.Tensor]],
         Optional[List[torch.Tensor]],
     ]:
-        # pyre-fixme[7]: Expected `Tuple[List[PartiallyMaterializedTensor],
         #  Optional[List[Tensor]], Optional[List[Tensor]]]` but got
         #  `Tuple[Union[List[PartiallyMaterializedTensor], List[Tensor]],
         #  Optional[List[Tensor]], Optional[List[Tensor]]]`.
@@ -2123,7 +2087,6 @@ class ZeroCollisionKeyValueEmbedding(
             ZeroCollisionKeyValueEmbeddingFusedOptimizer(
                 config,
                 self._emb_module,
-                # pyre-ignore[16]
                 sharded_embedding_weights_by_table=self._split_weights_res[0],
                 table_name_to_weight_count_per_rank=self._table_name_to_weight_count_per_rank,
                 sharded_embedding_weight_ids=self._split_weights_res[1],
@@ -2201,13 +2164,10 @@ class ZeroCollisionKeyValueEmbedding(
         ):
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
-            # pyre-ignore [6]
             param = nn.Parameter(tensor)
-            # pyre-ignore
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
-    # pyre-ignore [15]
     def named_split_embedding_weights(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, Union[PartiallyMaterializedTensor, torch.Tensor]]]:
@@ -2257,14 +2217,14 @@ class ZeroCollisionKeyValueEmbedding(
         )
         weight_id_sharded_t_list = create_virtual_sharded_tensors(
             emb_table_config_copy,
-            weight_ids_list,  # pyre-ignore [6]
+            weight_ids_list,
             self._pg,
             prefix,
             self._table_name_to_weight_count_per_rank,
         )
         bucket_cnt_sharded_t_list = create_virtual_sharded_tensors(
             emb_table_config_copy,
-            bucket_cnt_list,  # pyre-ignore [6]
+            bucket_cnt_list,
             self._pg,
             prefix,
             self._table_name_to_weight_count_per_rank,
@@ -2280,11 +2240,7 @@ class ZeroCollisionKeyValueEmbedding(
                 self._table_name_to_weight_count_per_rank,
             )
 
-        assert (
-            len(pmt_list)
-            == len(weight_ids_list)  # pyre-ignore
-            == len(bucket_cnt_list)  # pyre-ignore
-        )
+        assert len(pmt_list) == len(weight_ids_list) == len(bucket_cnt_list)
         assert (
             len(pmt_sharded_t_list)
             == len(weight_id_sharded_t_list)
@@ -2320,7 +2276,6 @@ class ZeroCollisionKeyValueEmbedding(
         optional ShardedTensor for metadata
         """
         self._init_sharded_split_embedding_weights()
-        # pyre-ignore[16]
         self._optim.set_sharded_embedding_weight_ids(self._split_weights_res[1])
 
         pmt_sharded_t_list = self._split_weights_res[0]
@@ -2358,7 +2313,6 @@ class ZeroCollisionKeyValueEmbedding(
         """
         self.emb_module.create_rocksdb_hard_link_snapshot()
 
-    # pyre-ignore [15]
     def split_embedding_weights(
         self, no_snapshot: bool = True, should_flush: bool = False
     ) -> Tuple[
@@ -2519,7 +2473,6 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
             # hack before we support optimizer on sharded parameter level
             # can delete after SEA deprecation
             param = nn.Parameter(tensor)
-            # pyre-ignore
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
@@ -2560,9 +2513,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         self.weights_sharded = False
         self._input_tensor = None
         self._element_size = self._emb_module.weights_dev.element_size()
-        # pyre-ignore[8]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
-        # pyre-ignore[8]
         self._unsharded_param: torch.Tensor = self._emb_module.weights_dev
         self._shard_buf_nbytes: int = 0
         self._shard_buf: Optional[torch.Tensor] = None
@@ -2575,7 +2526,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
 
         self.register_full_backward_pre_hook(
-            self._hybird_sharded_backward_hook,  # pyre-ignore[6]
+            self._hybird_sharded_backward_hook,
         )
 
     def _all_gather_table_weights(self) -> None:
@@ -2622,11 +2573,9 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
                 group=self._env.replica_pg,
                 async_op=False,
             )
-        # pyre-ignore[16]
         self._emb_module.weights_dev = self._unsharded_param[
             : self._original_shape.numel()
         ]
-        # pyre-ignore[16]
         self._shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
@@ -2677,7 +2626,6 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         with torch.no_grad():
             self.weights_sharded = True
 
-            # pyre-ignore[29]
             total_size = self._emb_module.weights_dev.numel()
 
             num_groups = self._env.num_sharding_groups()
@@ -2697,12 +2645,9 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             if self._shard_buf is None:
                 self._shard_buf = torch.empty(
                     shard_size,
-                    # pyre-ignore[6]
                     dtype=self._emb_module.weights_dev.dtype,
-                    # pyre-ignore[6]
                     device=self._emb_module.weights_dev.device,
                 )
-                # pyre-ignore[16]
                 self._shard_buf_nbytes = self._shard_buf.untyped_storage().nbytes()
             else:
                 self._shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
@@ -2717,15 +2662,13 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
                 )
 
             self._async_event = torch.cuda.Event(enable_timing=False, blocking=False)
-            # pyre-ignore[16]
             self._async_event.record(self._async_stream)
 
             def resize_callback() -> None:
-                # pyre-ignore[29]
                 self._emb_module.weights_dev.untyped_storage().resize_(0)
-                self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
+                self._emb_module.weights_dev = self._shard_buf
                 # padding tensor we resize to 0 and set pointer to None, no op if no padding
-                self._input_tensor.untyped_storage().resize_(0)  # pyre-ignore[29]
+                self._input_tensor.untyped_storage().resize_(0)
                 self._input_tensor = None
 
             return ReduceScatterResizeAwaitable(
@@ -2807,7 +2750,7 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         self._pg = pg
 
         self._pooling: PoolingMode = pooling_type_to_pooling_mode(
-            config.pooling, sharding_type  # pyre-ignore[6]
+            config.pooling, sharding_type
         )
 
         self._local_rows: List[int] = []
@@ -2858,14 +2801,12 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
             self._weight_init_maxs,
             self.split_embedding_weights(),
         ):
-            assert param.shape == (rows, emb_dim)  # pyre-ignore[16]
-            if param.data.dtype in [  # pyre-ignore[16]
+            assert param.shape == (rows, emb_dim)
+            if param.data.dtype in [
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             ]:
-                tmp_param = torch.zeros(
-                    param.shape, device=param.device  # pyre-ignore[16]
-                )
+                tmp_param = torch.zeros(param.shape, device=param.device)
                 tmp_param.uniform_(weight_init_min, weight_init_max).to(
                     param.data.dtype
                 )
@@ -2926,7 +2867,6 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
                 **forward_args,
             )
 
-    # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -2936,7 +2876,6 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         self.flush()
         return get_state_dict(
             self._config.embedding_tables,
-            # pyre-ignore
             self.split_embedding_weights(),
             self._pg,
             destination,
@@ -3104,13 +3043,10 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         ):
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
-            # pyre-ignore [6]
             param = nn.Parameter(tensor)
-            # pyre-ignore
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
-    # pyre-ignore [15]
     def named_split_embedding_weights(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, PartiallyMaterializedTensor]]:
@@ -3168,14 +3104,12 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         """
         self.emb_module.create_rocksdb_hard_link_snapshot()
 
-    # pyre-ignore [15]
     def split_embedding_weights(self, no_snapshot: bool = True) -> Tuple[
         List[PartiallyMaterializedTensor],
         Optional[List[torch.Tensor]],
         Optional[List[torch.Tensor]],
         Optional[List[torch.Tensor]],
     ]:
-        # pyre-fixme[7]: Expected `Tuple[List[PartiallyMaterializedTensor],
         #  Optional[List[Tensor]], Optional[List[Tensor]]]` but got
         #  `Tuple[Union[List[PartiallyMaterializedTensor], List[Tensor]],
         #  Optional[List[Tensor]], Optional[List[Tensor]]]`.
@@ -3253,7 +3187,6 @@ class ZeroCollisionKeyValueEmbeddingBag(
             ZeroCollisionKeyValueEmbeddingFusedOptimizer(
                 config,
                 self._emb_module,
-                # pyre-ignore[16]
                 sharded_embedding_weights_by_table=self._split_weights_res[0],
                 table_name_to_weight_count_per_rank=self._table_name_to_weight_count_per_rank,
                 sharded_embedding_weight_ids=self._split_weights_res[1],
@@ -3331,13 +3264,10 @@ class ZeroCollisionKeyValueEmbeddingBag(
         ):
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
-            # pyre-ignore [6]
             param = nn.Parameter(tensor)
-            # pyre-ignore
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
-    # pyre-ignore [15]
     def named_split_embedding_weights(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, Union[PartiallyMaterializedTensor, torch.Tensor]]]:
@@ -3387,14 +3317,14 @@ class ZeroCollisionKeyValueEmbeddingBag(
         )
         weight_id_sharded_t_list = create_virtual_sharded_tensors(
             emb_table_config_copy,
-            weight_ids_list,  # pyre-ignore [6]
+            weight_ids_list,
             self._pg,
             prefix,
             self._table_name_to_weight_count_per_rank,
         )
         bucket_cnt_sharded_t_list = create_virtual_sharded_tensors(
             emb_table_config_copy,
-            bucket_cnt_list,  # pyre-ignore [6]
+            bucket_cnt_list,
             self._pg,
             prefix,
             self._table_name_to_weight_count_per_rank,
@@ -3410,11 +3340,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
                 self._table_name_to_weight_count_per_rank,
             )
 
-        assert (
-            len(pmt_list)
-            == len(weight_ids_list)  # pyre-ignore
-            == len(bucket_cnt_list)  # pyre-ignore
-        )
+        assert len(pmt_list) == len(weight_ids_list) == len(bucket_cnt_list)
         assert (
             len(pmt_sharded_t_list)
             == len(weight_id_sharded_t_list)
@@ -3450,7 +3376,6 @@ class ZeroCollisionKeyValueEmbeddingBag(
         optional ShardedTensor for metadata
         """
         self._init_sharded_split_embedding_weights()
-        # pyre-ignore[16]
         self._optim.set_sharded_embedding_weight_ids(self._split_weights_res[1])
 
         pmt_sharded_t_list = self._split_weights_res[0]
@@ -3488,7 +3413,6 @@ class ZeroCollisionKeyValueEmbeddingBag(
         """
         self.emb_module.create_rocksdb_hard_link_snapshot()
 
-    # pyre-ignore [15]
     def split_embedding_weights(
         self, no_snapshot: bool = True, should_flush: bool = False
     ) -> Tuple[
@@ -3631,7 +3555,6 @@ class BatchedFusedEmbeddingBag(
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
             param = nn.Parameter(tensor)
-            # pyre-ignore
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
@@ -3672,9 +3595,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self.weights_sharded = False
         self._input_tensor = None
         self._element_size = self._emb_module.weights_dev.element_size()
-        # pyre-ignore[8]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
-        # pyre-ignore[8]
         self._unsharded_param: torch.Tensor = self._emb_module.weights_dev
         self._shard_buf_nbytes: int = 0
         self._shard_buf: Optional[torch.Tensor] = None
@@ -3687,7 +3608,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
 
         self.register_full_backward_pre_hook(
-            self._hybird_sharded_backward_hook,  # pyre-ignore[6]
+            self._hybird_sharded_backward_hook,
         )
 
     def _all_gather_table_weights(self) -> None:
@@ -3735,11 +3656,9 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
                 group=self._env.replica_pg,
                 async_op=False,
             )
-        # pyre-ignore[16]
         self._emb_module.weights_dev = self._unsharded_param[
             : self._original_shape.numel()
         ]
-        # pyre-ignore[16]
         self._shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
@@ -3790,7 +3709,6 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         with torch.no_grad():
             self.weights_sharded = True
 
-            # pyre-ignore[29]
             total_size = self._emb_module.weights_dev.numel()
 
             num_groups = self._env.num_sharding_groups()
@@ -3810,12 +3728,9 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             if self._shard_buf is None:
                 self._shard_buf = torch.empty(
                     shard_size,
-                    # pyre-ignore[6]
                     dtype=self._emb_module.weights_dev.dtype,
-                    # pyre-ignore[6]
                     device=self._emb_module.weights_dev.device,
                 )
-                # pyre-ignore[16]
                 self._shard_buf_nbytes = self._shard_buf.untyped_storage().nbytes()
             else:
                 self._shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
@@ -3830,15 +3745,13 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
                 )
 
             self._async_event = torch.cuda.Event(enable_timing=False, blocking=False)
-            # pyre-ignore[16]
             self._async_event.record(self._async_stream)
 
             def resize_callback() -> None:
-                # pyre-ignore[29]
                 self._emb_module.weights_dev.untyped_storage().resize_(0)
-                self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
+                self._emb_module.weights_dev = self._shard_buf
                 # padding tensor we resize to 0 and set pointer to None
-                self._input_tensor.untyped_storage().resize_(0)  # pyre-ignore[29]
+                self._input_tensor.untyped_storage().resize_(0)
                 self._input_tensor = None
 
             return ReduceScatterResizeAwaitable(

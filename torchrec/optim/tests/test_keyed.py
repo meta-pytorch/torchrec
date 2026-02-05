@@ -81,7 +81,6 @@ class TestKeyedOptimizer(unittest.TestCase):
                     "one": 1.0,
                     "tensor": torch.tensor([5.0, 6.0]),
                     "sharded_tensor": sharded_tensor.full(
-                        # pyre-ignore [28]
                         sharding_spec.ChunkShardingSpec(
                             dim=0, placements=["rank:0/cpu"]
                         ),
@@ -116,7 +115,6 @@ class TestKeyedOptimizer(unittest.TestCase):
                 "one": 1.0,
                 "tensor": torch.tensor([5.0, 6.0]),
                 "sharded_tensor": sharded_tensor.full(
-                    # pyre-ignore [28]
                     sharding_spec.ChunkShardingSpec(dim=0, placements=["rank:0/cpu"]),
                     (4,),
                     fill_value=1.0,
@@ -151,28 +149,20 @@ class TestKeyedOptimizer(unittest.TestCase):
         )
 
         # Modify state dict and call load_state_dict.
-        # pyre-ignore [6]
         expected_state_dict["state"]["param_1"]["one"] = 10.0
-        # pyre-ignore [6]
         expected_state_dict["state"]["param_1"]["tensor"] = torch.tensor([50.0, 60.0])
-        # pyre-ignore [6]
         expected_state_dict["state"]["param_1"]["sharded_tensor"] = sharded_tensor.full(
-            # pyre-ignore [28]
             sharding_spec.ChunkShardingSpec(dim=0, placements=["rank:0/cpu"]),
             (4,),
             fill_value=10.0,
         )
-        # pyre-ignore [6]
         expected_state_dict["state"]["param_1"]["nested_dictionary"]["tensor"] = (
             torch.tensor([70.0, 80.0])
         )
-        # pyre-ignore [6]
         expected_state_dict["state"]["param_1"]["optimizer_module"]["tensor"] = (
             torch.tensor([90.0, 100.0])
         )
-        # pyre-ignore [6]
         expected_state_dict["param_groups"][0]["param_group_val_0"] = 8.0
-        # pyre-ignore [6]
         expected_state_dict["param_groups"][1]["param_group_val_1"] = 9.0
 
         keyed_optimizer.load_state_dict(expected_state_dict)
@@ -318,7 +308,6 @@ class TestCombinedOptimizer(unittest.TestCase):
         # param_groups updated.
         self.assertEqual(keyed_optimizer_1.state[param_1], {"one": 999})
         self.assertEqual(keyed_optimizer_2.state[param_2], {"two": 998})
-        # pyre-ignore[16]
         self.assertEqual(keyed_optimizer_1.param_groups[0]["param_group_val_0"], 997)
         self.assertEqual(keyed_optimizer_2.param_groups[0]["param_group_val_0"], 996)
 
@@ -344,6 +333,5 @@ class TestOptimizerWrapper(unittest.TestCase):
         # param_groups updated.
         self.assertEqual(keyed_optimizer.state[param_1], {"one": 999})
         self.assertEqual(optimizer_wrapper.state[param_1], {"one": 999})
-        # pyre-ignore[16]
         self.assertEqual(keyed_optimizer.param_groups[0]["param_group_val_0"], 998)
         self.assertEqual(optimizer_wrapper.param_groups[0]["param_group_val_0"], 998)

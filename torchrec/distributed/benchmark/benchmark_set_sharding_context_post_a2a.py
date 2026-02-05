@@ -62,7 +62,7 @@ def main(
 def op_bench(
     num_list: int,
     num_keys: int,
-    func_to_benchmark: Any,  # pyre-ignore[2]
+    func_to_benchmark: Any,
 ) -> None:
     kjts = [
         KeyedJaggedTensor(

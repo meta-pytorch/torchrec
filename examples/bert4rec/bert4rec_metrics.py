@@ -49,11 +49,8 @@ def recalls_and_ndcgs_for_ks(
         )
 
         position = torch.arange(2, 2 + k)
-        # pyre-fixme[58]: `/` is not supported for operand types `int` and `Tensor`.
         weights = 1 / torch.log2(position.float())
-        # pyre-fixme[16]: `float` has no attribute `to`.
         dcg = (hits * weights.to(hits.device)).sum(1)
-        # pyre-fixme[16]: `float` has no attribute `to`.
         idcg = torch.Tensor([weights[: min(int(n), k)].sum() for n in answer_count]).to(
             dcg.device
         )

@@ -143,7 +143,6 @@ class McEmbeddingCollectionAdapter(nn.Module):
         Returns:
             Dict[str, EmbeddingConfig]: dictionary of {'feature_name': EmbeddingConfig}
         """
-        # pyre-ignore [29] # NOTE: the function "embedding_configs" returns the _embedding_module attribute of the EmbeddingCollection
         return self.mc_embedding_collection._embedding_module.embedding_configs()
 
 
@@ -261,6 +260,5 @@ class McEmbeddingBagCollectionAdapter(nn.Module):
             Dict[str, EmbeddingConfig]: dictionary of {'feature_name': EmbeddingConfig}
         """
         return (
-            # pyre-ignore[29]: `Union[BoundMethod[typing.Callable(EmbeddingBagCollection.embedding_bag_configs)[[Named(self, EmbeddingBagCollection)], List[EmbeddingBagConfig]], EmbeddingBagCollection], nn.modules.module.Module, torch._tensor.Tensor]` is not a function. # NOTE: the function "embedding_configs" returns the _embedding_module attribute of the EmbeddingCollection
             self.mc_embedding_bag_collection._embedding_module.embedding_bag_configs()
         )

@@ -22,7 +22,6 @@ from torchrec.schema.utils import is_signature_compatible
 
 
 def stable_dmp_init(
-    # pyre-ignore [2]
     self,
     module: nn.Module,
     env: Optional[ShardingEnv] = None,
@@ -36,13 +35,9 @@ def stable_dmp_init(
     pass
 
 
-# pyre-ignore [3]
 def stable_dmp_forward(
-    # pyre-ignore [2]
     self,
-    # pyre-ignore [2]
     *args,
-    # pyre-ignore [2]
     **kwargs,
 ) -> Any:
     pass

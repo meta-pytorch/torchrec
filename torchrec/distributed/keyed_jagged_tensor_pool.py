@@ -226,7 +226,6 @@ class ShardedKeyedJaggedTensorPool(
         self._features: List[str] = list(feature_max_lengths.keys())
         self._enable_uvm = enable_uvm
 
-        # pyre-fixme[4]: Attribute must be annotated.
         self._permute_feature = None
         if sharding_plan.sharding_type == ObjectPoolShardingType.ROW_WISE:
             self._sharding: KeyedJaggedTensorPoolRwSharding = (
@@ -252,7 +251,6 @@ class ShardedKeyedJaggedTensorPool(
                 f"Sharding type {self._sharding_plan.sharding_type} is not implemented"
             )
 
-        # pyre-ignore
         self._lookup: KeyedJaggedTensorPoolLookup = None
         if self._enable_uvm:
             if values_dtype == torch.int64:
@@ -288,13 +286,9 @@ class ShardedKeyedJaggedTensorPool(
                 tensor,
             )
 
-        # pyre-ignore
         self._lookup_ids_dist_impl = self._sharding.create_lookup_ids_dist()
-        # pyre-ignore
         self._lookup_values_dist_impl = self._sharding.create_lookup_values_dist()
-        # pyre-ignore
         self._update_ids_dist_impl = self._sharding.create_update_ids_dist()
-        # pyre-ignore
         self._update_values_dist_impl = self._sharding.create_update_values_dist()
 
         self._initialize_torch_state(self._lookup, sharding_plan.sharding_type)
@@ -328,9 +322,7 @@ class ShardedKeyedJaggedTensorPool(
         # somewhat hacky. ideally, we should be able to invoke this method on
         # any update to the lookup's key_lengths field.
         lengths, offsets = lookup._infer_jagged_lengths_inclusive_offsets()
-        # pyre-fixme[16]: `KeyedJaggedTensorPoolLookup` has no attribute `_lengths`.
         lookup._lengths = lengths
-        # pyre-fixme[16]: `KeyedJaggedTensorPoolLookup` has no attribute `_offsets`.
         lookup._offsets = offsets
 
     def _lookup_ids_dist(
@@ -521,7 +513,6 @@ class ShardedInferenceKeyedJaggedTensorPool(
         )
 
         if self._sharding_plan.sharding_type == ObjectPoolShardingType.ROW_WISE:
-            # pyre-fixme[4]: Attribute must be annotated.
             self._sharding = InferRwKeyedJaggedTensorPoolSharding(
                 env=self._sharding_env,
                 device=self._device,
@@ -553,11 +544,9 @@ class ShardedInferenceKeyedJaggedTensorPool(
             )
             if module._device != torch.device("meta"):
                 self._local_kjt_pool_shards[rank]._values.copy_(
-                    # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, ...
                     module.values[offset : offset + this_rank_size]
                 )
                 self._local_kjt_pool_shards[rank]._key_lengths.copy_(
-                    # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, ...
                     module.key_lengths[offset : offset + this_rank_size]
                 )
                 jagged_lengths, jagged_offsets = self._local_kjt_pool_shards[
@@ -588,7 +577,6 @@ class ShardedInferenceKeyedJaggedTensorPool(
 
     @property
     def dim(self) -> int:
-        # pyre-fixme[7]: Expected `int` but got `Union[Tensor, Module]`.
         return self._dim
 
     @property
@@ -603,14 +591,12 @@ class ShardedInferenceKeyedJaggedTensorPool(
     def create_context(self) -> ObjectPoolShardingContext:
         raise NotImplementedError("create_context() is not implemented")
 
-    # pyre-ignore
     def _lookup_ids_dist(
         self,
         ids: torch.Tensor,
     ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._lookup_ids_dist_impl(ids)
 
-    # pyre-ignore
     def _lookup_local(
         self,
         dist_input: List[torch.Tensor],
@@ -620,14 +606,12 @@ class ShardedInferenceKeyedJaggedTensorPool(
             ret.append(shard(dist_input[i]))
         return ret
 
-    # pyre-ignore
     def _lookup_values_dist(
         self,
         lookups: List[JaggedTensor],
     ) -> JaggedTensor:
         return self._lookup_values_dist_impl(lookups)
 
-    # pyre-ignore
     def forward(self, ids: torch.Tensor) -> KeyedJaggedTensor:
         dist_input, unbucketize_permute, _, _ = self._lookup_ids_dist(ids)
         lookup = self._lookup_local(dist_input)
@@ -651,7 +635,6 @@ class ShardedInferenceKeyedJaggedTensorPool(
         )
         return ret
 
-    # pyre-ignore
     def _update_ids_dist(
         self,
         ctx: ObjectPoolShardingContext,
@@ -659,7 +642,6 @@ class ShardedInferenceKeyedJaggedTensorPool(
     ) -> None:
         raise NotImplementedError("Inference does not currently support update")
 
-    # pyre-ignore
     def _update_values_dist(self, ctx: ObjectPoolShardingContext, values: torch.Tensor):
         raise NotImplementedError("Inference does not currently support update")
 
@@ -671,7 +653,6 @@ class ShardedInferenceKeyedJaggedTensorPool(
     ) -> None:
         raise NotImplementedError("Inference does not support update")
 
-    # pyre-fixme[7]: Expected `KeyedJaggedTensor` but got implicit return value of
     #  `None`.
     def _update_preproc(self, values: KeyedJaggedTensor) -> KeyedJaggedTensor:
         pass
