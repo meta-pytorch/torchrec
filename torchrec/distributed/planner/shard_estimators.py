@@ -9,7 +9,6 @@
 
 import logging
 import math
-from math import ceil
 from typing import cast, Dict, List, Optional, Tuple, Type
 
 import torch
@@ -1322,7 +1321,7 @@ def calculate_shard_storages(
         hbm_specific_sizes = [
             min(
                 (key_value_params.max_l1_cache_size or 0) * 1024 * 1024,
-                ceil(
+                math.ceil(
                     tensor.shape[0]  # num_embeddings
                     * kv_cache_load_factor
                     * tensor.element_size()  # size of one column

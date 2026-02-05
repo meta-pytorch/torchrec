@@ -647,6 +647,87 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         )
 
     @staticmethod
+    def empty_like(
+        jt: "JaggedTensor",
+        device: Optional[torch.device] = None,
+    ) -> "JaggedTensor":
+        """
+        Constructs an empty JaggedTensor with the same dtypes as the input JaggedTensor.
+
+        If device is None, creates an empty JaggedTensor on the same device as input.
+        If device is specified, allocates empty tensors with the same shapes on the
+        target device (similar to torch.Tensor.empty_like behavior for device copies).
+
+        Args:
+            jt (JaggedTensor): input JaggedTensor.
+            device (Optional[torch.device]): device on which the JaggedTensor will be
+                placed. If None, uses the same device as the input JaggedTensor.
+
+        Returns:
+            JaggedTensor: empty JaggedTensor with same dtypes and optionally same shapes.
+        """
+        if device is None:
+            return JaggedTensor(
+                values=torch.empty(0, device=jt.device(), dtype=jt.values().dtype),
+                weights=(
+                    None
+                    if jt.weights_or_none() is None
+                    else torch.empty(0, device=jt.device(), dtype=jt.weights().dtype)
+                ),
+                lengths=torch.empty(0, device=jt.device(), dtype=jt.lengths().dtype),
+            )
+        else:
+            return JaggedTensor(
+                values=torch.empty_like(jt.values(), device=device),
+                weights=(
+                    None
+                    if jt.weights_or_none() is None
+                    else torch.empty_like(jt.weights(), device=device)
+                ),
+                lengths=(
+                    None
+                    if jt.lengths_or_none() is None
+                    else torch.empty_like(jt.lengths(), device=device)
+                ),
+                offsets=(
+                    None
+                    if jt.offsets_or_none() is None
+                    else torch.empty_like(jt.offsets(), device=device)
+                ),
+            )
+
+    def copy_(self, jt: "JaggedTensor", non_blocking: bool = False) -> "JaggedTensor":
+        """
+        Copies the values, weights, lengths, and offsets from the input JaggedTensor
+        to the current JaggedTensor in-place. Assume host-side meta data like the keys, stride, stride_per_key, etc. are already ready.
+
+        Args:
+            jt (JaggedTensor): input JaggedTensor to copy from.
+            non_blocking (bool): whether to perform the copy asynchronously.
+
+        Returns:
+            JaggedTensor: self after copying.
+        """
+        self._values.copy_(jt._values, non_blocking=non_blocking)
+
+        weights_self = self._weights
+        weights_jt = jt._weights
+        if weights_self is not None and weights_jt is not None:
+            weights_self.copy_(weights_jt, non_blocking=non_blocking)
+
+        lengths_self = self._lengths
+        lengths_jt = jt._lengths
+        if lengths_self is not None and lengths_jt is not None:
+            lengths_self.copy_(lengths_jt, non_blocking=non_blocking)
+
+        offsets_self = self._offsets
+        offsets_jt = jt._offsets
+        if offsets_self is not None and offsets_jt is not None:
+            offsets_self.copy_(offsets_jt, non_blocking=non_blocking)
+
+        return self
+
+    @staticmethod
     def from_dense_lengths(
         values: torch.Tensor,
         lengths: torch.Tensor,

@@ -9,7 +9,6 @@
 
 import copy
 import logging
-from copy import deepcopy
 from typing import Dict, List, Optional, Set, Tuple, Union
 
 from torch import nn
@@ -442,14 +441,14 @@ def _extract_constraints_for_param(
         # For nested fields return a deep copy instead
         input_lengths = constraints[name].pooling_factors
         col_wise_shard_dim = constraints[name].min_partition
-        cache_params = deepcopy(constraints[name].cache_params)
+        cache_params = copy.deepcopy(constraints[name].cache_params)
         enforce_hbm = constraints[name].enforce_hbm
         stochastic_rounding = constraints[name].stochastic_rounding
         bounds_check_mode = constraints[name].bounds_check_mode
         feature_names = constraints[name].feature_names
         output_dtype = constraints[name].output_dtype
         device_group = constraints[name].device_group
-        key_value_params = deepcopy(constraints[name].key_value_params)
+        key_value_params = copy.deepcopy(constraints[name].key_value_params)
 
     return (
         input_lengths,

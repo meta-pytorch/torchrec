@@ -1010,3 +1010,223 @@ class TestJaggedTensorTracing(unittest.TestCase):
         # Expected: 4 float64 values (32 bytes) + 2 int64 lengths (16 bytes)
         expected_size = 4 * 8 + 2 * 8
         self.assertEqual(jt.size_in_bytes(), expected_size)
+
+    def test_empty_like_basic(self) -> None:
+        # Setup: Create a weighted JaggedTensor
+        values = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+        weights = torch.tensor([1.0, 0.5, 1.5, 1.0, 0.5, 1.0, 1.0, 1.5])
+        lengths = torch.tensor([2, 2, 3, 1])
+
+        jt = JaggedTensor(
+            values=values,
+            lengths=lengths,
+            weights=weights,
+        )
+
+        # Execute: Create an empty_like JaggedTensor
+        empty_jt = JaggedTensor.empty_like(jt)
+
+        # Assert: Verify the empty JT has the same dtypes but empty tensors
+        self.assertEqual(empty_jt.device(), jt.device())
+        self.assertEqual(empty_jt.values().dtype, jt.values().dtype)
+        self.assertEqual(empty_jt.values().numel(), 0)
+        self.assertEqual(empty_jt.lengths().numel(), 0)
+        self.assertEqual(empty_jt.lengths().dtype, jt.lengths().dtype)
+        self.assertIsNotNone(empty_jt.weights_or_none())
+        self.assertEqual(empty_jt.weights().numel(), 0)
+        self.assertEqual(empty_jt.weights().dtype, jt.weights().dtype)
+
+    def test_empty_like_without_weights(self) -> None:
+        # Setup: Create a non-weighted JaggedTensor
+        values = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        lengths = torch.tensor([2, 2])
+
+        jt = JaggedTensor(
+            values=values,
+            lengths=lengths,
+        )
+
+        # Execute: Create an empty_like JaggedTensor
+        empty_jt = JaggedTensor.empty_like(jt)
+
+        # Assert: Verify the empty JT has no weights
+        self.assertEqual(empty_jt.values().numel(), 0)
+        self.assertEqual(empty_jt.lengths().numel(), 0)
+        self.assertIsNone(empty_jt.weights_or_none())
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_empty_like_with_device(self) -> None:
+        # Setup: Create a JaggedTensor on CPU
+        values = torch.tensor([1.0, 2.0, 3.0])
+        weights = torch.tensor([0.1, 0.2, 0.3])
+        lengths = torch.tensor([3])
+
+        jt = JaggedTensor(
+            values=values,
+            lengths=lengths,
+            weights=weights,
+        )
+
+        # Execute: Create an empty_like JaggedTensor on CUDA device (cross-device)
+        empty_jt = JaggedTensor.empty_like(jt, device=torch.device("cuda"))
+
+        # Assert: Verify the empty JT preserves structure and is on the correct device
+        self.assertEqual(empty_jt.device().type, "cuda")
+        self.assertEqual(empty_jt.values().dtype, jt.values().dtype)
+        self.assertEqual(empty_jt.weights().dtype, jt.weights().dtype)
+        # Assert: Verify tensors are allocated on CUDA
+        self.assertTrue(empty_jt.values().is_cuda)
+        self.assertTrue(empty_jt.lengths().is_cuda)
+        self.assertTrue(empty_jt.weights().is_cuda)
+        # Assert: Verify tensor sizes match the original
+        self.assertEqual(empty_jt.values().size(), jt.values().size())
+        self.assertEqual(empty_jt.weights().size(), jt.weights().size())
+        self.assertEqual(empty_jt.lengths().size(), jt.lengths().size())
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_copy_basic(self) -> None:
+        # Setup: Create source JT on CPU and destination JT on CUDA
+        source_values = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        source_weights = torch.tensor([0.1, 0.2, 0.3, 0.4])
+        source_lengths = torch.tensor([2, 2])
+
+        source_jt = JaggedTensor(
+            values=source_values,
+            lengths=source_lengths,
+            weights=source_weights,
+        )
+
+        dest_values = torch.zeros(4, device=torch.device("cuda"))
+        dest_weights = torch.zeros(4, device=torch.device("cuda"))
+        dest_lengths = torch.zeros(2, dtype=torch.int64, device=torch.device("cuda"))
+
+        dest_jt = JaggedTensor(
+            values=dest_values,
+            lengths=dest_lengths,
+            weights=dest_weights,
+        )
+
+        # Execute: Copy source JT (CPU) to destination JT (CUDA)
+        result_jt = dest_jt.copy_(source_jt)
+
+        # Assert: Verify the destination JT has the source values
+        self.assertTrue(torch.equal(result_jt.values().cpu(), source_values))
+        self.assertTrue(torch.equal(result_jt.weights().cpu(), source_weights))
+        self.assertTrue(torch.equal(result_jt.lengths().cpu(), source_lengths))
+        # Verify it returns the same object (in-place operation)
+        self.assertIs(result_jt, dest_jt)
+        # Assert: Verify tensors are on CUDA
+        self.assertTrue(result_jt.values().is_cuda)
+        self.assertTrue(result_jt.weights().is_cuda)
+        self.assertTrue(result_jt.lengths().is_cuda)
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_copy_without_weights(self) -> None:
+        # Setup: Create source JT on CPU and destination JT on CUDA without weights
+        source_values = torch.tensor([5.0, 6.0, 7.0])
+        source_lengths = torch.tensor([1, 2])
+
+        source_jt = JaggedTensor(
+            values=source_values,
+            lengths=source_lengths,
+        )
+
+        dest_values = torch.zeros(3, device=torch.device("cuda"))
+        dest_lengths = torch.zeros(2, dtype=torch.int64, device=torch.device("cuda"))
+
+        dest_jt = JaggedTensor(
+            values=dest_values,
+            lengths=dest_lengths,
+        )
+
+        # Execute: Copy source JT (CPU) to destination JT (CUDA)
+        result_jt = dest_jt.copy_(source_jt)
+
+        # Assert: Verify the destination JT has the source values
+        self.assertTrue(torch.equal(result_jt.values().cpu(), source_values))
+        self.assertTrue(torch.equal(result_jt.lengths().cpu(), source_lengths))
+        self.assertIsNone(result_jt.weights_or_none())
+        # Assert: Verify tensors are on CUDA
+        self.assertTrue(result_jt.values().is_cuda)
+        self.assertTrue(result_jt.lengths().is_cuda)
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_copy_with_offsets(self) -> None:
+        # Setup: Create source JT on CPU and destination JT on CUDA with offsets
+        source_values = torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0])
+        source_offsets = torch.tensor([0, 2, 5])
+
+        source_jt = JaggedTensor(
+            values=source_values,
+            offsets=source_offsets,
+        )
+
+        dest_values = torch.zeros(5, device=torch.device("cuda"))
+        dest_offsets = torch.zeros(3, dtype=torch.int64, device=torch.device("cuda"))
+
+        dest_jt = JaggedTensor(
+            values=dest_values,
+            offsets=dest_offsets,
+        )
+
+        # Execute: Copy source JT (CPU) to destination JT (CUDA)
+        result_jt = dest_jt.copy_(source_jt)
+
+        # Assert: Verify the destination JT has the source values and offsets
+        self.assertTrue(torch.equal(result_jt.values().cpu(), source_values))
+        self.assertTrue(torch.equal(result_jt.offsets().cpu(), source_offsets))
+        # Assert: Verify tensors are on CUDA
+        self.assertTrue(result_jt.values().is_cuda)
+        self.assertTrue(result_jt.offsets().is_cuda)
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_copy_non_blocking(self) -> None:
+        # Setup: Create source JT on CPU and destination JT on CUDA
+        source_values = torch.tensor([1.0, 2.0, 3.0])
+        source_lengths = torch.tensor([3])
+
+        source_jt = JaggedTensor(
+            values=source_values,
+            lengths=source_lengths,
+        )
+
+        dest_values = torch.zeros(3, device=torch.device("cuda"))
+        dest_lengths = torch.zeros(1, dtype=torch.int64, device=torch.device("cuda"))
+
+        dest_jt = JaggedTensor(
+            values=dest_values,
+            lengths=dest_lengths,
+        )
+
+        # Execute: Copy source JT (CPU) to destination JT (CUDA) with non_blocking=True
+        result_jt = dest_jt.copy_(source_jt, non_blocking=True)
+
+        # Synchronize to ensure the non-blocking copy completes before checking
+        torch.cuda.synchronize()
+
+        # Assert: Verify the copy succeeded
+        self.assertTrue(torch.equal(result_jt.values().cpu(), source_values))
+        self.assertTrue(torch.equal(result_jt.lengths().cpu(), source_lengths))
+        # Assert: Verify tensors are on CUDA
+        self.assertTrue(result_jt.values().is_cuda)
+        self.assertTrue(result_jt.lengths().is_cuda)

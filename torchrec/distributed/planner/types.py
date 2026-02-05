@@ -352,7 +352,7 @@ class Topology:
         self._local_world_size: int = (
             local_world_size if local_world_size else world_size
         )
-        self._pod_size: int = pod_size
+        self._pod_size: Optional[int] = pod_size
         # Maximum numb of devices with high bandwidth interconnect (e.g. NVLink)
         #  if pod_size isn't given, then assumes local_world_size is maximum group size
         self._intra_group_size: int = (
