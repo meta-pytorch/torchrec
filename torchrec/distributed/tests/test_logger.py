@@ -19,6 +19,7 @@ from torchrec.distributed.logger import (
     _get_msg_dict,
     _get_or_create_logger,
     _torchrec_method_logger,
+    ARG_SIZE_LIMIT,
 )
 from torchrec.distributed.logging_handlers import _log_handlers, SingleRankStaticLogger
 
@@ -99,6 +100,24 @@ class TestMethodLogger(unittest.TestCase):
         self.assertIn("_kwargs", result)
         self.assertIn("key", result)
         self.assertIn("value", result)
+
+    def test_get_input_from_func_truncates_large_args(self) -> None:
+        """Test _get_input_from_func truncates arguments that exceed ARG_SIZE_LIMIT."""
+
+        def test_func(_a: str) -> None:
+            pass
+
+        # Create a string larger than ARG_SIZE_LIMIT
+        large_string = "x" * (ARG_SIZE_LIMIT + 100)
+        msg_dict = {"func_name": "test_func"}
+
+        result = _get_input_from_func(test_func, msg_dict, large_string)
+
+        # Verify that the large argument was truncated with the appropriate message
+        self.assertIn("Argument removed due to size limit", result)
+        self.assertIn(f"Original size: {len(large_string)}", result)
+        # Verify that the actual large string is NOT in the result
+        self.assertNotIn(large_string, result)
 
     def test_torchrec_method_logger_success(self) -> None:
         """Test _torchrec_method_logger with a successful function execution when logging is enabled."""
