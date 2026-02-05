@@ -851,7 +851,6 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
             self._has_uninitialized_output_dist = False
 
         return self._managed_collision_collection.input_dist(
-            # pyre-fixme [6]
             ctx,
             features,
             is_sequence_embedding=False,
@@ -884,7 +883,6 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
         Union[KeyedTensor, Dict[str, JaggedTensor]], Optional[KeyedJaggedTensor]
     ]:
 
-        # pyre-ignore [6]
         ebc_out = super().output_dist(ctx, output)
 
         kjt_out: Optional[KeyedJaggedTensor] = None

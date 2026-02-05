@@ -604,7 +604,6 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
 
         # Initializing all required variables
 
-        # pyre-ignore [33]
         state: Dict[Any, Any] = {}
         param_group: Dict[str, Any] = {
             "params": [],
@@ -1008,7 +1007,6 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
@@ -1049,7 +1047,6 @@ class ZeroCollisionKeyValueEmbeddingFusedOptimizer(FusedOptimizer):
             table_name_to_weight_count_per_rank
         )
 
-        # pyre-ignore [33]
         state: Dict[Any, Any] = {}
         param_group: Dict[str, Any] = {
             "params": [],
@@ -1096,7 +1093,6 @@ class ZeroCollisionKeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
@@ -1329,7 +1325,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                 pointwise_optimizer_st_metadata,
             )
 
-        # pyre-ignore [33]
         state: Dict[Any, Any] = {}
         param_group: Dict[str, Any] = {
             "params": [],
@@ -1569,7 +1564,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
         # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
@@ -2558,7 +2552,11 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         self._env: ShardingEnv2D = env
 
         self.weights_sharded = False
+        # pyre-fixme[4]: Attribute must be annotated.
         self._input_tensor = None
+        # pyre-fixme[4]: Attribute must be annotated.
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> int, Module, Tensor]` is not
+        #  a function.
         self._element_size = self._emb_module.weights_dev.element_size()
         # pyre-ignore[8]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
@@ -2591,6 +2589,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         if not self.weights_sharded:
             return
         self.ensure_reduce_scatter_complete()
+        # pyre-fixme[16]: `Optional` has no attribute `numel`.
         shard_size = self._shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
 
@@ -2609,6 +2608,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
                 dtype=self._unsharded_param.dtype,
                 device=self._unsharded_param.device,
             )
+            # pyre-fixme[20]: Argument `stride` expected.
             output_tensor.set_(
                 self._unsharded_param.untyped_storage(),
                 0,  # storage_offset
@@ -2685,10 +2685,15 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size
 
+            # pyre-fixme[29]: `Union[(self: TensorBase, memory_format: memory_format
+            #  = ...) -> Tensor, Module, Tensor]` is not a function.
             self._input_tensor = self._emb_module.weights_dev.contiguous()
             if padding_size > 0:
                 # ideally, we want to avoid padding as this has will cause a short 2x emb memory spike
                 self._input_tensor = torch.nn.functional.pad(
+                    # pyre-fixme[29]: `Union[(self: TensorBase, memory_format:
+                    #  memory_format = ...) -> Tensor, Module, Tensor]` is not a
+                    #  function.
                     self._emb_module.weights_dev.contiguous(),
                     (0, padding_size),
                     value=0.0,
@@ -2725,7 +2730,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
                 self._emb_module.weights_dev.untyped_storage().resize_(0)
                 self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
                 # padding tensor we resize to 0 and set pointer to None, no op if no padding
-                self._input_tensor.untyped_storage().resize_(0)  # pyre-ignore[29]
+                self._input_tensor.untyped_storage().resize_(0)
                 self._input_tensor = None
 
             return ReduceScatterResizeAwaitable(
@@ -3670,7 +3675,11 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self._env: ShardingEnv2D = env
 
         self.weights_sharded = False
+        # pyre-fixme[4]: Attribute must be annotated.
         self._input_tensor = None
+        # pyre-fixme[4]: Attribute must be annotated.
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> int, Module, Tensor]` is not
+        #  a function.
         self._element_size = self._emb_module.weights_dev.element_size()
         # pyre-ignore[8]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
@@ -3704,6 +3713,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             return
         self.ensure_reduce_scatter_complete()
 
+        # pyre-fixme[16]: `Optional` has no attribute `numel`.
         shard_size = self._shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
 
@@ -3722,6 +3732,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
                 dtype=self._unsharded_param.dtype,
                 device=self._unsharded_param.device,
             )
+            # pyre-fixme[20]: Argument `stride` expected.
             output_tensor.set_(
                 self._unsharded_param.untyped_storage(),
                 0,  # storage_offset
@@ -3769,6 +3780,8 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             self._rs_awaitable.wait()
             self._rs_awaitable = None
 
+    # pyre-fixme[14]: `forward` overrides method defined in
+    #  `BaseBatchedEmbeddingBag` inconsistently.
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         embs = super().forward(features)
         self._async_stream.wait_stream(torch.cuda.current_stream())
@@ -3798,10 +3811,15 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size
 
+            # pyre-fixme[29]: `Union[(self: TensorBase, memory_format: memory_format
+            #  = ...) -> Tensor, Module, Tensor]` is not a function.
             self._input_tensor = self._emb_module.weights_dev.contiguous()
             if padding_size > 0:
                 # ideally, we want to avoid padding as this has will cause a short 2x emb memory spike
                 self._input_tensor = torch.nn.functional.pad(
+                    # pyre-fixme[29]: `Union[(self: TensorBase, memory_format:
+                    #  memory_format = ...) -> Tensor, Module, Tensor]` is not a
+                    #  function.
                     self._emb_module.weights_dev.contiguous(),
                     (0, padding_size),
                     value=0.0,
@@ -3838,7 +3856,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
                 self._emb_module.weights_dev.untyped_storage().resize_(0)
                 self._emb_module.weights_dev = self._shard_buf  # pyre-ignore[16]
                 # padding tensor we resize to 0 and set pointer to None
-                self._input_tensor.untyped_storage().resize_(0)  # pyre-ignore[29]
+                self._input_tensor.untyped_storage().resize_(0)
                 self._input_tensor = None
 
             return ReduceScatterResizeAwaitable(

@@ -200,7 +200,6 @@ def _start_embedding_lookup(
     context: EmbeddingTrainPipelineContext,
     source_stream: Optional[torch.Stream],
     target_stream: Optional[torch.Stream],
-    # pyre-ignore[2]
     stream_context: Callable[..., AbstractContextManager[Any, Any]],
 ) -> None:
     module_context = context.module_contexts[module.forward.name]
@@ -280,7 +279,6 @@ def _jit_modules(module: torch.nn.Module, path: str, optional: bool = True) -> b
 def _pipeline_detach_model(
     model: torch.nn.Module,
     pipelined_modules: List[ShardedModule],
-    # pyre-ignore[2]
     original_forwards: List[Callable[..., Any]],
     original_kjt_dist_forwards: List[
         Callable[[KeyedJaggedTensor], Awaitable[KJTAllToAllTensorsAwaitable]]
@@ -318,7 +316,6 @@ def _pipeline_detach_model(
         setattr(model, postproc_mod.fqn, postproc_mod.postproc_module)
 
 
-# pyre-ignore[3] Return type must be specified as type that does not contain
 def _rewrite_model(  # noqa C901
     model: torch.nn.Module,
     context: TForwardContext,

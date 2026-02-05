@@ -400,7 +400,7 @@ class RAUCMetricComputation(RecMetricComputation):
     def _sync_dist(
         self,
         dist_sync_fn: Callable = gather_all_tensors,  # pyre-ignore[24]
-        process_group: Optional[Any] = None,  # pyre-ignore[2]
+        process_group: Optional[Any] = None,
     ) -> None:
         """
         This function is overridden from torchmetric.Metric, since for RAUC we want to concat the tensors

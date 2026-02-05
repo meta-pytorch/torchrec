@@ -228,5 +228,8 @@ class UpdateMetricsOutputTest(unittest.TestCase):
         future.set_result(metrics)
 
         self.assertDictEqual(
-            captured_metrics, {"loss": torch.tensor(0.5), "exception": "error"}
+            # pyre-fixme[6]: For 1st argument expected `Mapping[Any, object]` but
+            #  got `None`.
+            captured_metrics,
+            {"loss": torch.tensor(0.5), "exception": "error"},
         )

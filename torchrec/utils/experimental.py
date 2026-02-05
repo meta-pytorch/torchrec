@@ -71,7 +71,7 @@ def experimental(
         orig_init: Callable[..., None] = obj.__init__
 
         @functools.wraps(orig_init)
-        def new_init(self, *args: Any, **kwargs: Any) -> Any:  # pyre-ignore[2, 3]
+        def new_init(self, *args: Any, **kwargs: Any) -> Any:  # pyre-ignore[2]
             _issue_warning()
             return orig_init(self, *args, **kwargs)
 
@@ -80,7 +80,7 @@ def experimental(
     else:
 
         @functools.wraps(obj)  # pyre-ignore[6]
-        def wrapper(*args: Any, **kwargs: Any) -> Any:  # pyre-ignore[3]
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             _issue_warning()
             return obj(*args, **kwargs)  # pyre-ignore[29]
 

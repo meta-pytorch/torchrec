@@ -888,7 +888,7 @@ def fp_ebc_jk_disabled_pipelined_test_runner(
         max_feature_lengths = [10, 10, 12, 12]
         sparse_arch = DummyWrapper(
             create_module_and_freeze(
-                tables=tables,  # pyre-ignore[6]
+                tables=tables,
                 device=ctx.device,
                 use_fp_collection=False,
                 max_feature_lengths=max_feature_lengths,
@@ -896,6 +896,8 @@ def fp_ebc_jk_disabled_pipelined_test_runner(
         )
 
         module_sharding_plan = construct_module_sharding_plan(
+            # pyre-fixme[6]: For 1st argument expected `Module` but got
+            #  `Union[Module, Tensor]`.
             sparse_arch.m._fp_ebc,
             per_param_sharding={
                 "table_0": row_wise(),
@@ -999,6 +1001,8 @@ class TestFeatureProcessorJKDisabledPipelined(MultiProcessTestBase):
             for _ in range(num_batches)
         ]
 
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument
+    #  `torch.cuda.device_count() <= 1` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

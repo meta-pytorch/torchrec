@@ -820,7 +820,6 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
         for input in input_cases:
             input = torch.tensor(input, dtype=torch.int64)
             ref = kjt_pool_orig.lookup(input)
-            # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
             val = sharded_inference_kjt_pool.lookup(input.to(cuda_device))
 
             torch.testing.assert_close(ref.values().cpu(), val.values().cpu())

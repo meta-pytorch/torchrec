@@ -27,11 +27,18 @@ class _GradCheck(torch.autograd.Function):
     """
 
     @staticmethod
+    # pyre-fixme[14]: `forward` overrides method defined in `_SingleLevelFunction`
+    #  inconsistently.
+    # pyre-fixme[3]: Return type must be annotated.
+    # pyre-fixme[2]: Parameter must be annotated.
     def forward(ctx, x: torch.Tensor, tag: str):
         ctx.tag = tag
         return x
 
     @staticmethod
+    # pyre-fixme[14]: `backward` overrides method defined in `_SingleLevelFunction`
+    #  inconsistently.
+    # pyre-fixme[2]: Parameter must be annotated.
     def backward(ctx, g: torch.Tensor) -> Tuple[torch.Tensor, None]:
         check = g.values() if getattr(g, "is_sparse", False) and g.is_sparse else g
         if torch.isnan(check).any() or torch.isinf(check).any():
@@ -164,6 +171,7 @@ class DebugEmbeddingBagCollection(nn.Module):
     ) -> None:
         super().__init__()
         self.ebc = EmbeddingBagCollection(tables=tables, device=device)
+        # pyre-fixme[4]: Attribute must be annotated.
         self.embedding_bag_configs = self.ebc.embedding_bag_configs
         self.debug_mode = debug_mode
 
@@ -208,6 +216,8 @@ class DebugEmbeddingBagCollection(nn.Module):
         out_dict = out.to_dict() if not isinstance(out, dict) else out
 
         wrapped: Dict[str, torch.Tensor] = {}
+        # pyre-fixme[16]: Item `KeyedTensor` of `Dict[str, Tensor] | KeyedTensor`
+        #  has no attribute `items`.
         for feature_id, tensor_val in out_dict.items():
             wrapped_vals = self._wrap_tensor(
                 tensor_val, tag=f"ebc[{feature_id}].values"

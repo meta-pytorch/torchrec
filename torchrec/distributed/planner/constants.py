@@ -43,6 +43,7 @@ WEIGHTED_KERNEL_MULTIPLIER: float = 1.1  # empirical studies
 DP_ELEMENTWISE_KERNELS_PERF_FACTOR: float = 9.22  # empirical studies
 
 # For rounding memory hashing to nearest 100GB (10^11 bytes):
+# pyre-fixme[5]: Global expression must be annotated.
 HUNDRED_GB = 100 * 1024**3  # 107,374,182,400
 
 

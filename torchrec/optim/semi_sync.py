@@ -139,7 +139,6 @@ class SemisyncOptimizer(KeyedOptimizer):
         return ret
 
     @property
-    # pyre-ignore [3]
     def state(self) -> Mapping[torch.Tensor, Any]:
         """
         Combine state from both local and global optimizers.
@@ -178,7 +177,7 @@ class SemisyncOptimizer(KeyedOptimizer):
         return ret
 
     @torch.no_grad()
-    def step(self, closure: Any = None) -> None:  # pyre-ignore [2]
+    def step(self, closure: Any = None) -> None:
         """
         Perform semi-sync optimization step:
             1. Always perform local optimizer step
@@ -314,7 +313,7 @@ class SemisyncOptimizer(KeyedOptimizer):
 
     def _post_load_state_dict_step_counter(
         self,
-        combined_state: Dict[torch.Tensor, Any],  # pyre-ignore
+        combined_state: Dict[torch.Tensor, Any],
     ) -> None:
         """Extract step counters from any param states that contain them."""
         found = {"global": False, "local": False}

@@ -230,9 +230,7 @@ def _wrapper_func_for_multiprocessing(args):  # pyre-ignore[2, 3]
     return func(**kwargs)
 
 
-# pyre-ignore[3]
 def run_multi_process_func(
-    # pyre-ignore[2]
     func: Callable[
         [int, int, ...],  # rank, world_size, ...
         Any,  # Changed from None to Any to allow return values

@@ -32,6 +32,7 @@ class ModelInputConfig:
     pin_memory: bool = True
     use_variable_batch: bool = False
 
+    # pyre-fixme[3]: Return type must be annotated.
     def __post_init__(self):
         assert self.num_batches is not MISSING, "--num_batches must be specified"
         assert self.batch_size is not MISSING, "--batch_size must be specified"

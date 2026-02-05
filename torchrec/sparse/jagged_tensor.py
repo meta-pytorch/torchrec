@@ -1756,7 +1756,7 @@ def _force_length_offset_computation(
 def _check_attributes(
     attr_1: Union[torch.Tensor, List[int], List[str], int, None],
     attr_2: Union[torch.Tensor, List[int], List[str], int, None],
-    comparison_func: Callable[[Any, Any], bool],  # pyre-ignore[2]
+    comparison_func: Callable[[Any, Any], bool],
 ) -> bool:
     """Helper function to check if two attributes are equal.
 

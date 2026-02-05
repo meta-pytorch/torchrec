@@ -315,7 +315,6 @@ def _transform_module(
         # Don't want to modify the module outright
         # Since module is on cpu, won't cause cuda oom.
         copied_module = copy.deepcopy(module)
-        # pyre-ignore [6]
         plan = planner.plan(copied_module, [sharder])
 
         if isinstance(ctx, MultiProcessContext):
@@ -333,9 +332,6 @@ def _transform_module(
 
             sharded_module = _shard_modules(
                 module=copied_module,
-                # pyre-fixme[6]: For 2nd argument expected
-                #  `Optional[List[ModuleSharder[Module]]]` but got
-                #  `List[ModuleSharder[Variable[T (bound to Module)]]]`.
                 sharders=[sharder],
                 device=device,
                 plan=plan,
@@ -344,14 +340,9 @@ def _transform_module(
 
     if compile_mode == CompileMode.FX_SCRIPT:
         return fx_script_module(
-            # pyre-fixme[6]: For 1st argument expected `Module` but got
-            #  `Optional[Module]`.
-            sharded_module
-            if not benchmark_unsharded_module
-            else module
+            sharded_module if not benchmark_unsharded_module else module
         )
     else:
-        # pyre-fixme[7]: Expected `Module` but got `Optional[Module]`.
         return sharded_module if not benchmark_unsharded_module else module
 
 
@@ -387,7 +378,6 @@ def _init_module_and_run_benchmark(
     tables: Union[List[EmbeddingBagConfig], List[EmbeddingConfig]],
     output_dir: str,
     num_benchmarks: int,
-    # pyre-ignore[2]
     func_to_benchmark: Any,
     benchmark_func_kwargs: Optional[Dict[str, Any]],
     rank: int = -1,

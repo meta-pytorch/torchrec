@@ -86,6 +86,7 @@ def _validate_lengths_and_offsets_consistency(
 
     if not lengths.equal(torch.diff(offsets)):
         raise ValueError("offsets is not equal to the cumulative sum of lengths")
+    # pyre-fixme[7]: Expected `None` but got `bool`.
     return True
 
 

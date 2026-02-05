@@ -547,11 +547,10 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
 
         sharding_plan = planner.plan(
             module=model,
-            sharders=[EmbeddingCollectionSharder()],  # pyre-ignore
+            sharders=[EmbeddingCollectionSharder()],
         )
 
         for table_index in range(4):
-            # pyre-ignore
             shards = sharding_plan.plan["sparse.ec"][
                 f"table_{table_index}"
             ].sharding_spec.shards
@@ -622,7 +621,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
             constraints=constraints,
         )
         sharding_plan = planner.plan(
-            module=model, sharders=[EmbeddingCollectionSharder()]  # pyre-ignore
+            module=model, sharders=[EmbeddingCollectionSharder()]
         )
 
         expected_ranks = [[0, 1], [0, 1], [0, 1], [0, 1]]
@@ -718,7 +717,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
             constraints=constraints,
         )
         sharding_plan = planner.plan(
-            module=model, sharders=[EmbeddingCollectionSharder()]  # pyre-ignore
+            module=model, sharders=[EmbeddingCollectionSharder()]
         )
 
         expected_ranks = [[0, 1], [0, 1], [0, 1], [0, 1]]
@@ -774,7 +773,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
         #  L1 cache size > size of embedding table * default cache load factor
 
         sharding_plan = planner.plan(
-            module=model, sharders=[EmbeddingCollectionSharder()]  # pyre-ignore
+            module=model, sharders=[EmbeddingCollectionSharder()]
         )
         for table_index in range(4):
             shards = sharding_plan.plan["sparse.ec"][
@@ -824,7 +823,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
         )
         sharding_plan = planner.plan(
             module=model,
-            sharders=[  # pyre-ignore
+            sharders=[
                 EmbeddingCollectionSharder(fused_params={"cache_load_factor": 0.5})
             ],
         )

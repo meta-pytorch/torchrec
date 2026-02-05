@@ -48,6 +48,8 @@ class TestDebugEmbedding(MultiProcessTestBase):
     grads for Normal embeddings (not virtual tables).
     """
 
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument
+    #  `torch.cuda.device_count() < 2` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         torch.cuda.device_count() < 2,
         "Need at least 2 GPUs",
@@ -101,6 +103,8 @@ class TestDebugEmbedding(MultiProcessTestBase):
             inputs_per_rank=inputs_per_rank,
         )
 
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument
+    #  `torch.cuda.device_count() < 2` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         torch.cuda.device_count() < 2,
         "Need at least 2 GPUs",
@@ -153,6 +157,8 @@ class TestDebugEmbedding(MultiProcessTestBase):
             inputs_per_rank=inputs_per_rank,
         )
 
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument
+    #  `torch.cuda.device_count() < 2` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         torch.cuda.device_count() < 2,
         "Need at least 2 GPUs",
@@ -197,6 +203,8 @@ def run_debug_model(
             debug_mode=True,
         )
         model = DLRM_DCN(
+            # pyre-fixme[6]: For 1st argument expected `EmbeddingBagCollection` but
+            #  got `DebugEmbeddingBagCollection`.
             embedding_bag_collection=ebc,
             dense_in_features=100,
             dense_arch_layer_sizes=[20, D],
@@ -206,6 +214,7 @@ def run_debug_model(
             dense_device=ctx.device,
         ).to(ctx.device)
 
+        # pyre-fixme[2]: Parameter must be annotated.
         def insert_nan_grad(grad) -> torch.Tensor:
             """Hook to insert nan into the gradient"""
             return torch.full_like(grad, float("nan"))
@@ -258,6 +267,8 @@ def run_embedding_collection(
             local_size=local_size,
             world_size=world_size,
             device_type=ctx.device.type,
+            # pyre-fixme[6]: For 6th argument expected
+            #  `Optional[ModuleSharder[Module]]` but got `EmbeddingCollectionSharder`.
             sharder=sharder,
         )
 
@@ -266,8 +277,13 @@ def run_embedding_collection(
         # Case 1: everything works as usual
         sharded_model = DistributedModelParallel(
             model,
+            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
+            #  `Optional[ProcessGroup]`.
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ec": sharding_plan}),
+            # pyre-fixme[6]: For 4th argument expected
+            #  `Optional[List[ModuleSharder[Module]]]` but got
+            #  `List[EmbeddingCollectionSharder]`.
             sharders=[sharder],
             device=ctx.device,
         )
@@ -280,6 +296,8 @@ def run_embedding_collection(
 
         # compute a scalar loss upon which we can call backward()
         loss = sum(torch.sum(jt.values()) for jt in out.values())
+        # pyre-fixme[16]: Item `int` of `Literal[0] | Tensor` has no attribute
+        #  `backward`.
         loss.backward()
 
         torch.cuda.synchronize()
@@ -292,8 +310,13 @@ def run_embedding_collection(
         )
         debug_sharded_model = DistributedModelParallel(
             debug_model,
+            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
+            #  `Optional[ProcessGroup]`.
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ec": sharding_plan}),
+            # pyre-fixme[6]: For 4th argument expected
+            #  `Optional[List[ModuleSharder[Module]]]` but got
+            #  `List[EmbeddingCollectionSharder]`.
             sharders=[sharder],
             device=ctx.device,
         )
@@ -309,6 +332,7 @@ def run_embedding_collection(
 
         k, first_tensor = candidates[0]
 
+        # pyre-fixme[2]: Parameter must be annotated.
         def insert_nan_grad(grad) -> torch.Tensor:
             """Hook to insert nan into the gradient"""
             return torch.full_like(grad, float("nan"))
@@ -322,6 +346,8 @@ def run_embedding_collection(
             with tc.assertRaisesRegex(
                 RuntimeError, "Function 'SplitWithSizesBackward0' returned nan values"
             ):
+                # pyre-fixme[16]: Item `int` of `Literal[0] | Tensor` has no
+                #  attribute `backward`.
                 debug_loss.backward()
 
         torch.cuda.synchronize()
@@ -331,8 +357,13 @@ def run_embedding_collection(
         )
         debug_sharded_model = DistributedModelParallel(
             debug_model,
+            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
+            #  `Optional[ProcessGroup]`.
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ec": sharding_plan}),
+            # pyre-fixme[6]: For 4th argument expected
+            #  `Optional[List[ModuleSharder[Module]]]` but got
+            #  `List[EmbeddingCollectionSharder]`.
             sharders=[sharder],
             device=ctx.device,
         )
@@ -355,6 +386,8 @@ def run_embedding_collection(
         with tc.assertRaisesRegex(
             RuntimeError, "NaN/Inf detected in gradient entering"
         ):
+            # pyre-fixme[16]: Item `int` of `Literal[0] | Tensor` has no attribute
+            #  `backward`.
             debug_loss.backward()
 
         torch.cuda.synchronize()
@@ -387,6 +420,9 @@ def run_embedding_bag_collection(
             local_size=local_size,
             world_size=world_size,
             device_type=ctx.device.type,
+            # pyre-fixme[6]: For 6th argument expected
+            #  `Optional[ModuleSharder[Module]]` but got
+            #  `EmbeddingBagCollectionSharder`.
             sharder=sharder,
         )
 
@@ -395,8 +431,13 @@ def run_embedding_bag_collection(
         # Case 1: everything works as usual
         sharded_model = DistributedModelParallel(
             model,
+            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
+            #  `Optional[ProcessGroup]`.
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ec": sharding_plan}),
+            # pyre-fixme[6]: For 4th argument expected
+            #  `Optional[List[ModuleSharder[Module]]]` but got
+            #  `List[EmbeddingBagCollectionSharder]`.
             sharders=[sharder],
             device=ctx.device,
         )
@@ -407,6 +448,8 @@ def run_embedding_bag_collection(
 
         # compute a scalar loss upon which we can call backward()
         loss = sum(torch.sum(v) for v in out.values())
+        # pyre-fixme[16]: Item `int` of `Literal[0] | Tensor` has no attribute
+        #  `backward`.
         loss.backward()
 
         torch.cuda.synchronize()
@@ -419,8 +462,13 @@ def run_embedding_bag_collection(
         )
         debug_sharded_model = DistributedModelParallel(
             debug_model,
+            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
+            #  `Optional[ProcessGroup]`.
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ebc": sharding_plan}),
+            # pyre-fixme[6]: For 4th argument expected
+            #  `Optional[List[ModuleSharder[Module]]]` but got
+            #  `List[EmbeddingBagCollectionSharder]`.
             sharders=[sharder],
             device=ctx.device,
         )
@@ -445,6 +493,8 @@ def run_embedding_bag_collection(
             with tc.assertRaisesRegex(
                 RuntimeError, "Function 'UnbindBackward0' returned nan values in"
             ):
+                # pyre-fixme[16]: Item `int` of `Literal[0] | Tensor` has no
+                #  attribute `backward`.
                 debug_loss.backward()
 
         torch.cuda.synchronize()
@@ -454,8 +504,13 @@ def run_embedding_bag_collection(
         )
         debug_sharded_model = DistributedModelParallel(
             debug_model,
+            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
+            #  `Optional[ProcessGroup]`.
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ebc": sharding_plan}),
+            # pyre-fixme[6]: For 4th argument expected
+            #  `Optional[List[ModuleSharder[Module]]]` but got
+            #  `List[EmbeddingBagCollectionSharder]`.
             sharders=[sharder],
             device=ctx.device,
         )
@@ -474,6 +529,8 @@ def run_embedding_bag_collection(
         with tc.assertRaisesRegex(
             RuntimeError, "NaN/Inf detected in gradient entering"
         ):
+            # pyre-fixme[16]: Item `int` of `Literal[0] | Tensor` has no attribute
+            #  `backward`.
             debug_loss.backward()
 
         torch.cuda.synchronize()

@@ -518,6 +518,8 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         # Verify that the tensors received by the metric are on CPU
         # (they should have been transferred from cuda:1 to cpu)
         for predictions in self.mock_metric.predictions_update_calls:
+            # pyre-fixme[16]: Item `Tensor` of `dict[str, Tensor] | Tensor` has no
+            #  attribute `items`.
             for _, tensor in predictions.items():
                 self.assertEqual(
                     tensor.device.type,

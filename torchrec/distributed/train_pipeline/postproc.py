@@ -247,7 +247,6 @@ class PipelinedPostproc(torch.nn.Module):
 
     @staticmethod
     def recursive_record_stream(
-        # pyre-fixme[2]: Parameter `re` must have a type that does not contain `Any`
         res: Union[torch.Tensor, Pipelineable, Iterable[Any], Dict[Any, Any]],
         stream: torch.Stream,
     ) -> None:

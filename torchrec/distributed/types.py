@@ -403,7 +403,6 @@ class LazyAwaitable(Awaitable[W], metaclass=_LazyAwaitableMeta):
         self._result: Optional[W] = None
 
     @staticmethod
-    # pyre-ignore [2, 3]
     def _wait_async(obj: Any) -> Any:
         """
         This method is used internally to automatically wait when necessary
@@ -873,7 +872,6 @@ class NullShardedModuleContext(Multistreamable):
     def record_stream(self, stream: Optional[torch.Stream]) -> None:
         pass
 
-    # pyre-ignore [2]
     def __setattr__(self, key: str, value: Any) -> None:
         raise NotImplementedError()
 
@@ -1345,7 +1343,6 @@ class ModuleSharder(abc.ABC, Generic[M]):
     #  generic functions. Consider using a context manager instead of a decorator, if
     #  possible.
     @abc.abstractclassmethod
-    # pyre-ignore [3]
     def shard(
         self,
         module: M,

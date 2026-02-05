@@ -58,10 +58,9 @@ class ArgInfo:
         self.steps.append(step)
         return self
 
-    # pyre-ignore[3]
     def process_steps(
         self,
-        arg: Any,  # pyre-ignore[2]
+        arg: Any,
     ) -> Any:
         if not self.steps:
             return None
@@ -76,10 +75,7 @@ class CallArgs:
     args: List[ArgInfo]
     kwargs: Dict[str, ArgInfo]
 
-    # pyre-ignore[3]
-    def build_args_kwargs(
-        self, initial_input: Any  # pyre-ignore[2]
-    ) -> Tuple[List[Any], Dict[str, Any]]:
+    def build_args_kwargs(self, initial_input: Any) -> Tuple[List[Any], Dict[str, Any]]:
         args = [arg.process_steps(initial_input) for arg in self.args]
         kwargs = {
             key: arg.process_steps(initial_input) for key, arg in self.kwargs.items()

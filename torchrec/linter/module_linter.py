@@ -48,7 +48,6 @@ def print_error_message(
     print(json.dumps(lint_item))
 
 
-# pyre-ignore[3]: Return type must be specified as type that does not contain `Any`.
 def get_function_args(node: ast.FunctionDef) -> Tuple[List[Any], List[Any]]:
     """
     This functon will process function definition and will extract all
@@ -162,7 +161,6 @@ def check_class_definition(python_path: str, node: ast.ClassDef) -> None:
         )
 
     # Check actual args from the functions
-    # pyre-ignore[33]: Explicit annotation for `functions` cannot contain `Any`.
     functions: Dict[str, Tuple[List[Any], List[Any]]] = {}
     function_sub_nodes = {}
     for sub_node in node.body:

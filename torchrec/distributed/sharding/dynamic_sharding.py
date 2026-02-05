@@ -832,7 +832,7 @@ def transfer_data(
 
 
 def update_module_sharding_plan(
-    module: ShardedModule[Any, Any, Any, Any],  # pyre-ignore
+    module: ShardedModule[Any, Any, Any, Any],
     changed_sharding_params: Dict[str, ParameterSharding],
     sharding_type_to_sharding_infos: Dict[str, List[EmbeddingShardingInfo]],
 ) -> None:

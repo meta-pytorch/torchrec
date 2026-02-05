@@ -226,7 +226,7 @@ class NodeArgsHelper:
 
     def _handle_constant(
         self,
-        arg: Any,  # pyre-ignore
+        arg: Any,
         arg_info: ArgInfo,
         for_postproc_module: bool = False,
     ) -> Optional[ArgInfo]:
@@ -249,10 +249,8 @@ class NodeArgsHelper:
         arg_info.add_step(step)
         return arg_info
 
-    # pyre-ignore[3]
     def _handle_collection_element(
         self,
-        # pyre-ignore[2]
         arg: Any,
         for_postproc_module: bool = False,
     ) -> Any:

@@ -84,6 +84,8 @@ class MultiLabelPrecisionMetricComputation(RecMetricComputation):
         super().__init__(*args, **kwargs)
         self._num_labels: Optional[int] = num_labels  # Store num_labels from config
         self._label_names: List[str] = (
+            # pyre-fixme[6]: For 1st argument expected `SupportsIndex` but got
+            #  `Optional[int]`.
             [f"label_{i}" for i in range(self._num_labels)]
             if label_names is None
             else label_names
@@ -137,11 +139,16 @@ class MultiLabelPrecisionMetricComputation(RecMetricComputation):
         """
         # predictions and labels are integer-encoded [batch_size] or [batch_size, 1]
         predictions = self._decode_integer_to_labels(
-            predictions.flatten(), self._num_labels
+            predictions.flatten(),
+            # pyre-fixme[6]: For 2nd argument expected `int` but got `Optional[int]`.
+            self._num_labels,
         )
+        # pyre-fixme[6]: For 2nd argument expected `int` but got `Optional[int]`.
         labels = self._decode_integer_to_labels(labels.flatten(), self._num_labels)
         # Expand weights to match
         if weights is not None:
+            # pyre-fixme[6]: For 2nd argument expected `Union[int, SymInt]` but got
+            #  `Optional[int]`.
             weights = weights.flatten().unsqueeze(-1).expand(-1, self._num_labels)
         else:
             weights = torch.ones_like(predictions, dtype=torch.float32)
@@ -186,11 +193,16 @@ class MultiLabelPrecisionMetricComputation(RecMetricComputation):
         **kwargs: Dict[str, Any],
     ) -> None:
         """Update metric states with a new batch of integer-encoded data."""
+        # pyre-fixme[16]: `Optional` has no attribute `device`.
         device = predictions.device
         self.to(device)
 
         predictions, labels, weights = self._prepare_inputs(
-            predictions, labels, weights
+            # pyre-fixme[6]: For 1st argument expected `Tensor` but got
+            #  `Optional[Tensor]`.
+            predictions,
+            labels,
+            weights,
         )
 
         for i, label_name in enumerate(self._label_names):

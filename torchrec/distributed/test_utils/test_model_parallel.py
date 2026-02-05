@@ -327,6 +327,8 @@ class ModelParallelBase(ModelParallelTestShared):
         if cls.backend not in ("nccl", "gloo"):
             raise unittest.SkipTest(f"No valid backend specified: {cls.backend}")
 
+    # pyre-fixme[14]: `setUp` overrides method defined in `ModelParallelTestShared`
+    #  inconsistently.
     def setUp(self) -> None:
         super().setUp(backend=self.backend)
 

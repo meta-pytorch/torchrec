@@ -264,6 +264,8 @@ class TestKeyedTensor(unittest.TestCase):
             torch.DoubleTensor([[2.0, 2.0], [3.0, 3.0]]),
         ]
         keys = ["dense_0", "dense_1"]
+        # pyre-fixme[6]: For 2nd argument expected `List[Tensor]` but got
+        #  `List[DoubleTensor]`.
         kt = KeyedTensor.from_tensor_list(keys, tensor_list, cat_dim=0, key_dim=0)
 
         # Expected: 6 float64 elements (2 + 4) * 8 bytes = 48 bytes

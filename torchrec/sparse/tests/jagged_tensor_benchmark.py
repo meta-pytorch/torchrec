@@ -224,6 +224,7 @@ def runner(
     fn_kwargs = {"keyed_tensors": kts, "groups": groups}
 
     # Initial call to warm up
+    # pyre-fixme[29]: `Optional[(...) -> List[Tensor]]` is not a function.
     fn(**fn_kwargs)
 
     def _func_to_benchmark(

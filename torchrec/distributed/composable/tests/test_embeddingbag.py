@@ -269,6 +269,7 @@ class TestEmbeddingBagCollectionSharder(EmbeddingBagCollectionSharder):
 class LookupOrderByShardTypeTest(unittest.TestCase):
     """Tests for _sharded_module_order_overwrite functionality in ShardedEmbeddingBagCollection."""
 
+    # pyre-fixme[3]: Return type must be annotated.
     def _create_sharding_spec(
         self, sharding_type: str, num_embeddings: int, embedding_dim: int
     ):
@@ -292,6 +293,7 @@ class LookupOrderByShardTypeTest(unittest.TestCase):
     def _create_ebc_and_sharding_plan(
         self,
         sharding_types: List[str],
+        # pyre-fixme[24]: Generic type `tuple` expects at least 1 type parameter.
     ) -> tuple:
         """
         Helper to create an EmbeddingBagCollection and parameter sharding plan
@@ -337,6 +339,8 @@ class LookupOrderByShardTypeTest(unittest.TestCase):
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_lookups", lambda self: None
     )
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument `lambda
+    #  ($parameter$self) (None)` to decorator factory `unittest.mock.patch.object`.
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_output_dist", lambda self: None
     )
@@ -379,6 +383,8 @@ class LookupOrderByShardTypeTest(unittest.TestCase):
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_lookups", lambda self: None
     )
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument `lambda
+    #  ($parameter$self) (None)` to decorator factory `unittest.mock.patch.object`.
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_output_dist", lambda self: None
     )
@@ -417,6 +423,8 @@ class LookupOrderByShardTypeTest(unittest.TestCase):
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_lookups", lambda self: None
     )
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument `lambda
+    #  ($parameter$self) (None)` to decorator factory `unittest.mock.patch.object`.
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_output_dist", lambda self: None
     )

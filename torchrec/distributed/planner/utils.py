@@ -17,7 +17,6 @@ from torchrec.distributed.planner.types import Perf, ShardingOption, Storage
 from torchrec.distributed.types import ShardingType
 
 
-# pyre-ignore[2]
 def sharder_name(t: Type[Any]) -> str:
     return t.__module__ + "." + t.__name__
 

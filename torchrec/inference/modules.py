@@ -301,11 +301,9 @@ class PredictModule(nn.Module):
         return self._module
 
     @abc.abstractmethod
-    # pyre-fixme[3]
     def predict_forward(self, batch: Dict[str, torch.Tensor]) -> Any:
         pass
 
-    # pyre-fixme[3]
     def forward(self, batch: Dict[str, torch.Tensor]) -> Any:
         if self._device is None:
             self._device = torch.device("cuda", torch.cuda.current_device())

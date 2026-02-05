@@ -497,6 +497,7 @@ class ShardedEmbeddingBagCollection(
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
         self._module_fqn = module_fqn
         # Normalize to lowercase for case-insensitive matching
+        # pyre-fixme[4]: Attribute must be annotated.
         self._sharded_module_order_overwrite = (
             [s.lower() for s in sharded_module_order_overwrite]
             if sharded_module_order_overwrite is not None

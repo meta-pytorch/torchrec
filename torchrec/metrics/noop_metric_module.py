@@ -70,5 +70,9 @@ class NoOpMetricModule(RecMetricModule):
     def shutdown(self) -> None:
         pass
 
+    # pyre-fixme[14]: `async_compute` overrides method defined in `RecMetricModule`
+    #  inconsistently.
+    # pyre-fixme[15]: `async_compute` overrides method defined in `RecMetricModule`
+    #  inconsistently.
     def async_compute(self, future: Future[Dict[str, MetricValue]]) -> None:
         pass

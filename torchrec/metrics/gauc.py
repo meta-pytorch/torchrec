@@ -165,6 +165,8 @@ class GAUCMetricComputation(RecMetricComputation):
             persistent=True,
         )
 
+    # pyre-fixme[14]: `update` overrides method defined in `RecMetricComputation`
+    #  inconsistently.
     def update(
         self,
         *,

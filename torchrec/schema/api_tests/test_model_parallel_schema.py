@@ -36,7 +36,6 @@ def stable_dmp_init(
     pass
 
 
-# pyre-ignore [3]
 def stable_dmp_forward(
     # pyre-ignore [2]
     self,

@@ -101,7 +101,6 @@ class InferenceModelParallelTestBase(unittest.TestCase):
         dedup_tables: Optional[List[EmbeddingTableConfig]] = None,
         weighted_tables: Optional[List[EmbeddingTableConfig]] = None,
         constraints: Optional[Dict[str, ParameterConstraints]] = None,
-        # pyre-ignore [9]
         generate: ModelInputCallable = ModelInput.generate,
     ) -> None:
         default_rank = 0
@@ -537,6 +536,8 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         if cls.backend not in ("nccl", "gloo"):
             raise unittest.SkipTest(f"No valid backend specified: {cls.backend}")
 
+    # pyre-fixme[14]: `setUp` overrides method defined in
+    #  `ModelParallelSingleRankBase` inconsistently.
     def setUp(self) -> None:
         super().setUp(backend=self.backend)
 

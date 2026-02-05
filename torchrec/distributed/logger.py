@@ -142,10 +142,13 @@ global unfiltered_logger, single_rank_logger, all_rank_logger, capped_logger, me
 unfiltered_logger = _get_or_create_logger(UnfilteredLogger)
 method_logger = _get_or_create_logger(MethodLogger)
 
+# pyre-fixme[5]: Global expression must be annotated.
 static_logger = _get_or_create_logger(SingleRankStaticLogger)
 all_rank_logger = _get_or_create_logger(AllRankStaticLogger)
 capped_logger = _get_or_create_logger(CappedLogger)
+# pyre-fixme[5]: Global expression must be annotated.
 one_time_logger = _get_or_create_logger(Cap1Logger)
+# pyre-fixme[5]: Global expression must be annotated.
 one_time_rank0_logger = _get_or_create_logger(Cap01Logger)
 
 
@@ -203,7 +206,7 @@ def _torchrec_method_logger(
           via functools.wraps.
     """
 
-    def decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:  # pyre-ignore
+    def decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:
         """
         Inner decorator that wraps the actual function.
 

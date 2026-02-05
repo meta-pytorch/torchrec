@@ -2256,9 +2256,6 @@ class InferShardingsTest(unittest.TestCase):
 
         sharded_model = _shard_modules(
             module=quant_model,
-            # pyre-fixme[6]: For 2nd argument expected
-            #  `Optional[List[ModuleSharder[Module]]]` but got
-            #  `List[QuantFeatureProcessedEmbeddingBagCollectionSharder]`.
             sharders=[sharder],
             device=local_device,
             plan=plan,
@@ -2572,9 +2569,6 @@ class InferShardingsTest(unittest.TestCase):
 
         sharded_model = _shard_modules(
             module=quant_model,
-            # pyre-fixme[6]: For 2nd argument expected
-            #  `Optional[List[ModuleSharder[Module]]]` but got
-            #  `List[QuantFeatureProcessedEmbeddingBagCollectionSharder]`.
             sharders=[sharder],
             # shard on meta to simulate device movement from cpu -> meta QFPEBC
             device=torch.device("meta"),

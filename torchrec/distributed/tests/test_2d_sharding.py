@@ -1918,6 +1918,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument `hypothesis.str...
     @given(
         sharding_type=st.just(ShardingType.TABLE_WISE.value),
         kernel_type=st.sampled_from(
