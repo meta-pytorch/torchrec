@@ -63,7 +63,6 @@ class _IdxFilter(IterDataPipe):
         self.datapipe = datapipe
         self.filter_fn = filter_fn
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         for idx, data in enumerate(self.datapipe):
             if self.filter_fn(idx):
@@ -117,10 +116,8 @@ class _RandFilter(IterDataPipe):
         self.datapipe = datapipe
         self.filter_fn = filter_fn
         self.rand_gen = rand_gen
-        # pyre-ignore[4]
         self.rand_gen_init_state: Tuple[Any, ...] = rand_gen.getstate()
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         self.rand_gen.setstate(self.rand_gen_init_state)
         for data in self.datapipe:
@@ -190,7 +187,6 @@ class Limit(IterDataPipe):
         self.datapipe = datapipe
         self.limit = limit
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         for idx, data in enumerate(self.datapipe):
             if idx >= self.limit:
@@ -332,7 +328,6 @@ class ParallelReadConcat(IterDataPipe):
         self.datapipes: Tuple[IterDataPipe, ...] = datapipes
         self.dp_selector = dp_selector
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         selected_dps = self.dp_selector(self.datapipes)
         for dp in selected_dps:

@@ -615,7 +615,7 @@ class ShardedManagedCollisionCollection(
                 values=unique_indices,
             )
 
-            ctx.input_features.append(kjt)  # pyre-ignore
+            ctx.input_features.append(kjt)
             ctx.reverse_indices.append(reverse_indices)  # pyre-ignore
             features_by_sharding.append(dedup_features)
         return features_by_sharding
@@ -749,6 +749,8 @@ class ShardedManagedCollisionCollection(
             and mcm._hash_zch_runtime_meta is not None
         ):
             runtime_meta = mcm._hash_zch_runtime_meta.index_select(dim=0, index=indices)
+        # pyre-fixme[29]: `Optional[(KeyedJaggedTensor, Tensor, Optional[Module],
+        #  Optional[Tensor], Optional[Tensor]) -> None]` is not a function.
         self.post_lookup_tracker_fn(
             KeyedJaggedTensor.from_jt_dict(mc_input),
             torch.empty(0),
@@ -766,6 +768,8 @@ class ShardedManagedCollisionCollection(
         include_readonly_suffix_feature = any(
             1
             for feature_name in features.keys()
+            # pyre-fixme[6]: For 1st argument expected `Union[str, tuple[str, ...]]`
+            #  but got `Union[Module, Tensor]`.
             if feature_name.lower().endswith(mcm.readable_suffix)
         )
 
@@ -1393,6 +1397,9 @@ class ShardedQuantManagedCollisionCollection(
                 out = input_dist(feature_split)
                 input_dist_result_list.append(out.features)
                 if is_sequence_embedding:
+                    # pyre-fixme[16]: Item `NullShardedModuleContext` of
+                    #  `ManagedCollisionCollectionContext | NullShardedModuleContext`
+                    #  has no attribute `sharding_contexts`.
                     ctx.sharding_contexts.append(
                         InferSequenceShardingContext(
                             features=out.features,
@@ -1429,6 +1436,8 @@ class ShardedQuantManagedCollisionCollection(
             ret.append(sharding_ret)
         return ret
 
+    # pyre-fixme[14]: `compute` overrides method defined in `ShardedModule`
+    #  inconsistently.
     def compute(
         self,
         ctx: ManagedCollisionCollectionContext,

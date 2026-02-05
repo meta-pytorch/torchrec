@@ -409,7 +409,6 @@ class TestFixedPercentageStorageReservation(unittest.TestCase):
         )
 
         self.assertIsNotNone(fixed_storage_reservation._kjt_storage)
-        # pyre-ignore
         self.assertGreater(fixed_storage_reservation._kjt_storage.hbm, 0)
         # pyre-ignore
         self.assertEqual(fixed_storage_reservation._kjt_storage.ddr, 0)
@@ -442,7 +441,6 @@ class TestFixedPercentageStorageReservation(unittest.TestCase):
         )
 
         self.assertIsNotNone(fixed_storage_reservation._kjt_storage)
-        # pyre-ignore
         self.assertEqual(fixed_storage_reservation._kjt_storage.hbm, 0)
         # pyre-ignore
         self.assertGreater(fixed_storage_reservation._kjt_storage.ddr, 0)

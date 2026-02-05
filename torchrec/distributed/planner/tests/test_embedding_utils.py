@@ -77,12 +77,12 @@ class CreateShardingInfoTest(unittest.TestCase):
             topology=Topology(world_size=1, compute_device="cpu"),
             constraints=self.constraints,
         )
-        self.expected_plan = planner.plan(self.model, [self.sharder])  # pyre-ignore[6]
+        self.expected_plan = planner.plan(self.model, [self.sharder])
 
         self.expected_sharding_infos = (
             ShardedEmbeddingCollection.create_grouped_sharding_infos(
                 self.model,
-                self.expected_plan.get_plan_for_module(""),  # pyre-ignore[6]
+                self.expected_plan.get_plan_for_module(""),
                 fused_params=None,
             )
         )
@@ -139,7 +139,7 @@ class CreateShardingInfoTest(unittest.TestCase):
             topology=Topology(world_size=1, compute_device="cpu"),
             constraints=new_constraints,
         )
-        new_plan = new_planner.plan(self.model, [self.sharder])  # pyre-ignore[6]
+        new_plan = new_planner.plan(self.model, [self.sharder])
 
         # provide that two fused params from sharder
         sharder_fused_params = {"enforce_hbm": True, "stochastic_rounding": False}
@@ -147,7 +147,7 @@ class CreateShardingInfoTest(unittest.TestCase):
         combined_sharding_infos = (
             ShardedEmbeddingCollection.create_grouped_sharding_infos(
                 self.model,
-                new_plan.get_plan_for_module(""),  # pyre-ignore[6]
+                new_plan.get_plan_for_module(""),
                 fused_params=sharder_fused_params,
             )
         )
@@ -163,7 +163,7 @@ class CreateShardingInfoTest(unittest.TestCase):
         wrong_combined_sharding_infos = (
             ShardedEmbeddingCollection.create_grouped_sharding_infos(
                 self.model,
-                new_plan.get_plan_for_module(""),  # pyre-ignore[6]
+                new_plan.get_plan_for_module(""),
                 fused_params=sharder_fused_params,
             )
         )

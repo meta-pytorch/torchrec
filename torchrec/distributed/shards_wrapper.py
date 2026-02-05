@@ -345,9 +345,7 @@ class LocalShardsWrapper(torch.Tensor):
         """
         return self._storage_meta.size[0] == 0 and self._storage_meta.size[1] == 0
 
-    def __create_write_items__(
-        self, fqn: str, object: Any  # pyre-ignore[2]
-    ) -> List[WriteItem]:
+    def __create_write_items__(self, fqn: str, object: Any) -> List[WriteItem]:
         """
         For compatibility with DCP, we support creation of WriteItems
         such that they can be saved properly.

@@ -336,7 +336,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         else:
             self._dmp_wrapped_module = value
 
-    # pyre-ignore [2, 3]
+    # pyre-ignore [2]
     def forward(self, *args, **kwargs) -> Any:
         for tracker in self.model_trackers.values():
             # The step() call advances the internal batch counter so that subsequent ID tracking and delta
@@ -386,9 +386,13 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         if torch._utils_internal.justknobs_check(
             "pytorch/torchrec:enable_module_id_cache_for_dmp_shard_modules"
         ):
+            # pyre-fixme[24]: Generic type `ShardedModule` expects 4 type parameters.
             module_id_cache: Dict[int, ShardedModule] = {}
         else:
             module_id_cache = None
+        # pyre-fixme[6]: For 2nd argument expected `Optional[Dict[str,
+        #  ShardedModule[Any, Any, Any, Any]]]` but got `Optional[Dict[int,
+        #  ShardedModule[Any, Any, Any, Any]]]`.
         return self._shard_modules_impl(module, module_id_cache=module_id_cache)
 
     def _init_delta_tracker(
@@ -420,8 +424,12 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             module_id_cache: Dict[int, KeyedOptimizer] = {}
         else:
             module_id_cache = None
-        # pyre-ignore [6]
         return CombinedOptimizer(
+            # pyre-fixme[6]: For 1st argument expected `List[Union[Tuple[str,
+            #  KeyedOptimizer], KeyedOptimizer]]` but got `List[Tuple[str,
+            #  KeyedOptimizer]]`.
+            # pyre-fixme[6]: For 3rd argument expected `Optional[Dict[str,
+            #  KeyedOptimizer]]` but got `Optional[Dict[int, KeyedOptimizer]]`.
             self._fused_optim_impl(module, [], module_id_cache=module_id_cache)
         )
 
@@ -461,6 +469,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         self,
         module: nn.Module,
         path: str = "",
+        # pyre-fixme[24]: Generic type `ShardedModule` expects 4 type parameters.
         module_id_cache: Optional[Dict[str, ShardedModule]] = None,
     ) -> nn.Module:
         # pre-sharded module
@@ -481,6 +490,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
                 logger.error(
                     f"Module {path} is already in cache (replaced by sharded module already)"
                 )
+                # pyre-fixme[6]: For 1st argument expected `str` but got `int`.
                 return module_id_cache[module_id]
 
         # shardable module
@@ -495,6 +505,8 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
                 path,
             )
             if module_id_cache is not None:
+                # pyre-fixme[6]: For 1st argument expected `str` but got `int`.
+                # pyre-fixme[61]: `module_id` is undefined, or not always defined.
                 module_id_cache[module_id] = sharded_module
             return sharded_module
 
@@ -1082,10 +1094,13 @@ class DMPCollection(DistributedModelParallel):
         ):
             self._register_sparse_arch_forward_hook(rs_awaitable_hook_module)
 
+    # pyre-fixme[14]: `_shard_modules_impl` overrides method defined in
+    #  `DistributedModelParallel` inconsistently.
     def _shard_modules_impl(
         self,
         module: nn.Module,
         path: str = "",
+        # pyre-fixme[24]: Generic type `ShardedModule` expects 4 type parameters.
         module_id_cache: Optional[Dict[int, ShardedModule]] = None,
     ) -> nn.Module:
 
@@ -1136,6 +1151,7 @@ class DMPCollection(DistributedModelParallel):
                 path,
             )
             if module_id_cache is not None:
+                # pyre-fixme[61]: `module_id` is undefined, or not always defined.
                 module_id_cache[module_id] = sharded_module
             return sharded_module
 
@@ -1282,8 +1298,10 @@ class DMPCollection(DistributedModelParallel):
         for ctx in self._ctxs:
             if ctx.sharding_strategy == ShardingStrategy.FULLY_SHARDED:
                 for _, sharded_module in ctx.modules_to_sync:
+                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                     sharded_module.ensure_reduce_scatter_complete()
 
+    # pyre-fixme[2]: Parameter must be annotated.
     def _register_sparse_arch_forward_hook(self, rs_awaitable_hook_module) -> None:
         """
         Registers a forward hook on a specified first-level submodule to ensure that
@@ -1483,6 +1501,7 @@ class DMPCollection(DistributedModelParallel):
             for _, child in module.named_children():
                 _find_sharded_modules(child, module)
 
+        # pyre-fixme[6]: For 2nd argument expected `Module` but got `None`.
         _find_sharded_modules(self._dmp_wrapped_module, None)
         return sharded_modules
 
@@ -1506,6 +1525,7 @@ class DMPCollection(DistributedModelParallel):
                 for w in emb_kernel.split_embedding_weights():  # pyre-ignore[29]
                     weights_by_dtype[w.dtype].append(w)
 
+                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 for state in emb_kernel.get_optimizer_state():
                     opt_tensor = state["sum"]
                     optimizer_by_dtype[opt_tensor.dtype].append(opt_tensor)

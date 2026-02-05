@@ -512,6 +512,7 @@ class TestClipGradNorm(unittest.TestCase):
 
         grad_norm = torch.linalg.vector_norm(original_grad)
         clip_coef = max_gradient / (grad_norm + 1e-6)
+        # pyre-fixme[16]: `float` has no attribute `item`.
         clip_coef_clamped = min(clip_coef.item(), 1.0)
         expected_grad = original_grad * clip_coef_clamped
 

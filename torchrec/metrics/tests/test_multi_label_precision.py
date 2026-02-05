@@ -67,7 +67,10 @@ class MultiLabelPrecisionMetricTest(unittest.TestCase):
             tasks=tasks,
             compute_mode=compute_mode,
             window_size=100,
+            # pyre-fixme[6]: For 7th argument expected `Dict[str, Any]` but got `int`.
             num_labels=num_labels,
+            # pyre-fixme[6]: For 8th argument expected `Dict[str, Any]` but got
+            #  `Optional[List[str]]`.
             label_names=label_names,
         )
 
@@ -154,9 +157,17 @@ class MultiLabelPrecisionMetricTest(unittest.TestCase):
 
         computation.update(predictions=predictions, labels=labels, weights=weights)
 
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> Union[bool, float, int],
+        #  Tensor, Module]` is not a function.
         self.assertEqual(computation.true_pos_sum_label_0.item(), 2.0)
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> Union[bool, float, int],
+        #  Tensor, Module]` is not a function.
         self.assertEqual(computation.false_pos_sum_label_0.item(), 0.0)
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> Union[bool, float, int],
+        #  Tensor, Module]` is not a function.
         self.assertEqual(computation.true_pos_sum_label_1.item(), 1.0)
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> Union[bool, float, int],
+        #  Tensor, Module]` is not a function.
         self.assertEqual(computation.false_pos_sum_label_1.item(), 1.0)
 
     def test_update_with_weights(self) -> None:
@@ -169,9 +180,17 @@ class MultiLabelPrecisionMetricTest(unittest.TestCase):
 
         computation.update(predictions=predictions, labels=labels, weights=weights)
 
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> Union[bool, float, int],
+        #  Tensor, Module]` is not a function.
         self.assertEqual(computation.true_pos_sum_label_0.item(), 2.0)
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> Union[bool, float, int],
+        #  Tensor, Module]` is not a function.
         self.assertEqual(computation.false_pos_sum_label_0.item(), 1.0)
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> Union[bool, float, int],
+        #  Tensor, Module]` is not a function.
         self.assertEqual(computation.true_pos_sum_label_1.item(), 1.0)
+        # pyre-fixme[29]: `Union[(self: TensorBase) -> Union[bool, float, int],
+        #  Tensor, Module]` is not a function.
         self.assertEqual(computation.false_pos_sum_label_1.item(), 2.0)
 
     # =========================================================================
@@ -360,6 +379,7 @@ class MultiLabelPrecisionMetricTest(unittest.TestCase):
             tasks=tasks,
             compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
             window_size=2,  # Only keep last 2 batches in window
+            # pyre-fixme[6]: For 7th argument expected `Dict[str, Any]` but got `int`.
             num_labels=num_labels,
         )
 

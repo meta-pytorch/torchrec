@@ -97,7 +97,6 @@ class GradientClippingOptimizer(OptimizerWrapper):
                     "clip_grad_value_ for sharded parameters is not supported yet"
                 )
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         if self._check_meta:
             # skip gradient clipping and early return

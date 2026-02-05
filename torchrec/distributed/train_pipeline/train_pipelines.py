@@ -82,9 +82,13 @@ try:
     from torchrec.distributed.logger import _torchrec_method_logger
 except Exception:
 
+    # pyre-fixme[3]: Return type must be annotated.
+    # pyre-fixme[2]: Parameter must be annotated.
     def _torchrec_method_logger(*args, **kwargs):
         """A no-op decorator that accepts any arguments."""
 
+        # pyre-fixme[3]: Return type must be annotated.
+        # pyre-fixme[2]: Parameter must be annotated.
         def decorator(func):
             return func
 
@@ -123,7 +127,6 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         pass
 
-    # pyre-ignore [56]
     @_torchrec_method_logger()
     def __init__(self) -> None:
         # pipeline state such as in foward, in backward etc, used in training recover scenarios
@@ -548,7 +551,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             else None
         )
 
-        # pyre-ignore
         self._original_forwards: List[Callable[..., Any]] = []
 
         self._original_kjt_dist_forwards: List[
@@ -1127,6 +1129,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
         # SDD Lite only uses memcpy stream for H2D copy.
         # When invoking self._stream_context() in start_sparse_data_dist and
         # wait_sparse_data_dist, the stream will be set to the default stream.
+        # pyre-fixme[4]: Attribute must be annotated.
         self._data_dist_stream = None
 
     def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
@@ -1178,6 +1181,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
 
         # Input dist in critical path (key difference from full SDD)
         self._init_pipelined_modules(
+            # pyre-fixme[6]: For 1st argument expected `In` but got `Optional[In]`.
             self.batches[0],
             self.contexts[0],
             self._pipelined_forward_type,

@@ -138,7 +138,6 @@ class WarmupOptimizer(OptimizerWrapper):
         logger.info(f"Warmup Optimizer set to iteration {iter_}")
         self._set_lr(iter_, stage_id)
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         super().step(closure)
         iter_, stage_id = self._get_warmup_state()

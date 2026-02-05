@@ -1094,7 +1094,7 @@ class CriticalPathEstimate:
 
 
 # ---- Types Utils ---- #
-def hash_sha256_to_int(hashable_list: List[Any]) -> int:  # pyre-ignore
+def hash_sha256_to_int(hashable_list: List[Any]) -> int:
     """
     Hashes the given data using SHA256 and returns the hash as an integer
     """
@@ -1104,7 +1104,7 @@ def hash_sha256_to_int(hashable_list: List[Any]) -> int:  # pyre-ignore
     return int(hash_digest, 16)
 
 
-def hash_sha256_str(hashable_list: List[Any]) -> str:  # pyre-ignore
+def hash_sha256_str(hashable_list: List[Any]) -> str:
     """
     Hashes the given data using SHA256 and returns the hash as an string
     """
@@ -1120,7 +1120,6 @@ def hash_planner_context_inputs(
     enumerator: Enumerator,
     storage_reservation: StorageReservation,
     constraints: Optional[Dict[str, ParameterConstraints]],
-    # pyre-ignore
     hash_function: Callable[[List[Any]], int] = hash_sha256_to_int,
 ) -> int:
     assert hasattr(
@@ -1189,7 +1188,6 @@ def hash_planner_context_inputs_str(
     enumerator: Enumerator,
     storage_reservation: StorageReservation,
     constraints: Optional[Dict[str, ParameterConstraints]],
-    # pyre-ignore
     hash_function: Callable[[List[Any]], str] = hash_sha256_str,
 ) -> str:
     assert hasattr(

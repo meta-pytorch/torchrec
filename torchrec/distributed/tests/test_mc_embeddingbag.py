@@ -285,8 +285,6 @@ def _test_sharding(  # noqa C901
             sharded_sparse_arch._mc_ebc, ShardedManagedCollisionEmbeddingBagCollection
         )
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_managed_collision_collection`.
             sharded_sparse_arch._mc_ebc._managed_collision_collection,
             ShardedManagedCollisionCollection,
         )
@@ -353,33 +351,23 @@ def _test_sharding_and_remapping(  # noqa C901
             sharded_sparse_arch._mc_ebc, ShardedManagedCollisionEmbeddingBagCollection
         )
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_bag_collection`.
             sharded_sparse_arch._mc_ebc._embedding_bag_collection,
             ShardedEmbeddingBagCollection,
         )
         assert (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_bag_collection`.
             sharded_sparse_arch._mc_ebc._embedding_bag_collection._has_uninitialized_input_dist
             is False
         )
         assert (
             not hasattr(
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
-                #  attribute `_embedding_bag_collection`.
                 sharded_sparse_arch._mc_ebc._embedding_bag_collection,
                 "_input_dists",
             )
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_bag_collection`.
             or len(sharded_sparse_arch._mc_ebc._embedding_bag_collection._input_dists)
             == 0
         )
 
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_managed_collision_collection`.
             sharded_sparse_arch._mc_ebc._managed_collision_collection,
             ShardedManagedCollisionCollection,
         )
@@ -564,6 +552,8 @@ def _run_single_rank_training_step(
         sharded_train_model = _shard_modules(
             module=copy.deepcopy(train_model),
             plan=ShardingPlan({"_mc_ebc": train_sharding_plan}),
+            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
+            #  `Optional[ProcessGroup]`.
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -575,7 +565,6 @@ def _run_single_rank_training_step(
 
         # Store managed collision module state
         mc_state = (
-            # pyre-ignore
             sharded_train_model._mc_ebc._managed_collision_collection._managed_collision_modules.state_dict()
         )
         for key, value in mc_state.items():
@@ -584,9 +573,7 @@ def _run_single_rank_training_step(
             ] = value.cpu()
 
         # Store embedding bag collection state
-        ebc_state = (
-            sharded_train_model._mc_ebc._embedding_bag_collection.state_dict()
-        )  # pyre-ignore
+        ebc_state = sharded_train_model._mc_ebc._embedding_bag_collection.state_dict()
         for key, value in ebc_state.items():
             tensors = []
             for i in range(len(value.local_shards())):
@@ -699,6 +686,9 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument
+    #  `hypothesis.strategies.sampled_from(["nccl"])` to decorator factory
+    #  `hypothesis.given`.
     @given(
         backend=st.sampled_from(["nccl"]),
         kernel_type=st.sampled_from(

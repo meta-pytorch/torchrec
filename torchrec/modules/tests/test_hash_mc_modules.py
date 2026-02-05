@@ -974,6 +974,9 @@ class TestVBEWithManagedCollision(unittest.TestCase):
 
         # Create ManagedCollisionCollection
         self.mcc = ManagedCollisionCollection(
+            # pyre-fixme[6]: For 1st argument expected `Dict[str,
+            #  ManagedCollisionModule]` but got `Dict[str,
+            #  HashZchManagedCollisionModule]`.
             managed_collision_modules=self.hash_modules,
             embedding_configs=self.embedding_configs,
         )
@@ -1007,6 +1010,8 @@ class TestVBEWithManagedCollision(unittest.TestCase):
         # Verify ID remapping on values is correct for each table
         for i, table in enumerate(["user_table", "product_table"]):
             mapping = torch.ravel(
+                # pyre-fixme[6]: For 1st argument expected `Tensor` but got
+                #  `Union[Tensor, Module]`.
                 self.mcc._managed_collision_modules[table]._hash_zch_identities
             )
             original_inds = kjt_with_weights.values()[
@@ -1065,6 +1070,7 @@ class TestVBEWithManagedCollision(unittest.TestCase):
         """Test that MCEBC correctly handles VBE  using inverse_indices."""
         # Set up MCEBC
         ebc = EmbeddingBagCollection(
+            # pyre-fixme[6]: For 1st argument expected `Optional[device]` but got `str`.
             device="cuda",
             tables=self.embedding_configs,
         )
@@ -1093,6 +1099,8 @@ class TestVBEWithManagedCollision(unittest.TestCase):
             mcc_table = mcebc._managed_collision_collection._managed_collision_modules[
                 table
             ]
+            # pyre-fixme[6]: For 1st argument expected `Tensor` but got
+            #  `Union[Tensor, Module]`.
             remapped_indices = torch.ravel(mcc_table._hash_zch_identities)
 
             original_inds_per_key = self.kjt.values()[
@@ -1120,7 +1128,10 @@ class TestVBEWithManagedCollision(unittest.TestCase):
 
                 # Sum embeddings for the pooled group from new_indices
                 pooled_embeddings[table][i_pooled] = (
-                    tables[table][new_indices, :].sum(axis=0).to("cpu")
+                    # pyre-fixme[29]: `Union[(TensorBase, Union[None, slice[Any, Any,...
+                    tables[table][new_indices, :]
+                    .sum(axis=0)
+                    .to("cpu")
                 )
 
                 i_length += 1

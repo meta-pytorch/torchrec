@@ -553,6 +553,7 @@ class ModelInput(Pipelineable):
         """
         return (
             float_features.pin_memory(),
+            # pyre-fixme[16]: `Optional` has no attribute `pin_memory`.
             idlist_features.pin_memory(),
             idscore_features.pin_memory(),
             label.pin_memory(),

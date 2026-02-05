@@ -2531,7 +2531,13 @@ class AllToAllSingle(torch.autograd.Function):
         ctx.group_size = group_size
         ctx.gradient_division = gradient_division
         return torch.distributed._functional_collectives.all_to_all_single(
-            input, output_split_sizes, input_split_sizes, group_name
+            input,
+            output_split_sizes,
+            input_split_sizes,
+            # pyre-fixme[6]: For 4th argument expected `Union[List[List[int]],
+            #  List[int], Tuple[DeviceMesh, int], DeviceMesh, GroupName, ProcessGroup]`
+            #  but got `str`.
+            group_name,
         )
 
     @staticmethod

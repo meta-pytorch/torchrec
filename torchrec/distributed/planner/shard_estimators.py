@@ -59,9 +59,13 @@ try:
     from torchrec.distributed.logger import _torchrec_method_logger
 except Exception:
 
+    # pyre-fixme[3]: Return type must be annotated.
+    # pyre-fixme[2]: Parameter must be annotated.
     def _torchrec_method_logger(*args, **kwargs):
         """A no-op decorator that accepts any arguments."""
 
+        # pyre-fixme[3]: Return type must be annotated.
+        # pyre-fixme[2]: Parameter must be annotated.
         def decorator(func):
             return func
 

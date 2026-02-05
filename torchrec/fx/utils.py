@@ -126,12 +126,10 @@ def dmp_fx_trace_forward(  # noqa: C901
 
 
 @torch.fx.wrap
-# pyre-ignore
 def _fx_marker(s: str, any_proxy_unused: Any) -> None:
     pass
 
 
-# pyre-ignore
 def fx_marker(s: str, any_proxy_unused: Any) -> None:
     if is_fx_tracing():
         _fx_marker(s, any_proxy_unused)

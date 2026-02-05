@@ -197,7 +197,6 @@ def gen_model_and_input(
     tables: List[EmbeddingTableConfig],
     embedding_groups: Dict[str, List[str]],
     world_size: int,
-    # pyre-ignore [9]
     generate: Union[
         ModelInputCallable, VariableBatchModelInputCallable
     ] = ModelInput.generate,
@@ -370,7 +369,6 @@ def dynamic_sharding_test(
         (global_model, inputs) = gen_model_and_input(
             model_class=model_class,
             tables=tables,
-            # pyre-ignore [6]
             generate=(
                 cast(
                     VariableBatchModelInputCallable,
@@ -802,7 +800,6 @@ def sharding_single_rank_test_single_process(
     (global_model, inputs) = gen_model_and_input(
         model_class=model_class,
         tables=tables,
-        # pyre-ignore [6]
         generate=(
             cast(
                 VariableBatchModelInputCallable,
@@ -962,6 +959,8 @@ def sharding_single_rank_test_single_process(
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=all_reduce_func,
             submodule_configs=submodule_configs,
+            # pyre-fixme[6]: For 12th argument expected `ShardingStrategy` but got
+            #  `Optional[ShardingStrategy]`.
             sharding_strategy=sharding_strategy,
             rs_awaitable_hook_module=rs_awaitable_hook_module,
         )

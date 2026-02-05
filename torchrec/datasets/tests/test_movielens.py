@@ -39,7 +39,6 @@ class MovieLensTest(unittest.TestCase):
 
     MOVIE_ID_RANGE = (0, 100)
 
-    # pyre-ignore[2]
     def _create_csv(self, filename: str, rows: Iterable[Any]) -> None:
         with open(filename, "w") as f:
             cf = csv.writer(f, delimiter=",")

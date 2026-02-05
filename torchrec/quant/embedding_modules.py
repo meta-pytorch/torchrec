@@ -1337,6 +1337,8 @@ class QuantManagedCollisionEmbeddingBagCollection(EmbeddingBagCollection):
         device = _get_device(ebc)
         return cls(
             embedding_bag_configs,
+            # pyre-fixme[29]: `Union[(self: OriginalEmbeddingBagCollection) -> bool,
+            #  Module, Tensor]` is not a function.
             ebc.is_weighted(),
             device,
             output_dtype=qconfig.activation().dtype,

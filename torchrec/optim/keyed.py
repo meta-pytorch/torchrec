@@ -50,7 +50,6 @@ class KeyedOptimizer(optim.Optimizer):
     def __init__(
         self,
         params: Mapping[str, Union[torch.Tensor, ShardedTensor]],
-        # pyre-ignore [2]
         state: Mapping[Any, Any],
         param_groups: Collection[Mapping[str, Any]],
     ) -> None:
@@ -64,7 +63,6 @@ class KeyedOptimizer(optim.Optimizer):
         # pyre-ignore
         self._optimizer_step_post_hooks: Dict[int, Callable] = OrderedDict()
 
-        # pyre-ignore
         self.state: Mapping[Any, Any] = state
         self.param_groups: Collection[Mapping[str, Any]] = param_groups
         self.params = params
@@ -279,7 +277,6 @@ class KeyedOptimizer(optim.Optimizer):
 
         self.post_load_state_dict()
 
-    # pyre-ignore [2]
     def add_param_group(self, param_group: Any) -> None:
         raise NotImplementedError()
 
@@ -363,7 +360,6 @@ class CombinedOptimizer(KeyedOptimizer):
         for _, opt in self._optims:
             opt.zero_grad(set_to_none=set_to_none)
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         for _, opt in self._optims:
             opt.step(closure=closure)
@@ -393,7 +389,6 @@ class CombinedOptimizer(KeyedOptimizer):
         return ret
 
     @property
-    # pyre-ignore [3]
     def state(self) -> Mapping[torch.Tensor, Any]:
         ret = {}
         for _, opt in self._optims:
@@ -438,13 +433,15 @@ class KeyedOptimizerWrapper(KeyedOptimizer):
     ) -> None:
 
         pass_params = params if pass_params_dict else list(params.values())
+        # pyre-fixme[6]: For 1st argument expected `List[Union[Tensor,
+        #  ShardedTensor]]` but got `Union[List[Union[Tensor, ShardedTensor]],
+        #  Mapping[str, Union[Tensor, ShardedTensor]]]`.
         self._optimizer: optim.Optimizer = optim_factory(pass_params)
         super().__init__(params, self._optimizer.state, self._optimizer.param_groups)
 
     def zero_grad(self, set_to_none: bool = False) -> None:
         self._optimizer.zero_grad()
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         self._optimizer.step(closure=closure)
 
@@ -469,7 +466,6 @@ class OptimizerWrapper(KeyedOptimizer):
     def __init__(self, optimizer: KeyedOptimizer) -> None:
         self._optimizer = optimizer
         self.params: Mapping[str, Union[torch.Tensor, ShardedTensor]] = optimizer.params
-        # pyre-ignore [4]
         self.state: Mapping[Any, Any] = optimizer.state
         self.param_groups: Collection[Mapping[str, Any]] = optimizer.param_groups
         self.defaults: Dict[str, Any] = {"_save_param_groups": False}
@@ -480,11 +476,9 @@ class OptimizerWrapper(KeyedOptimizer):
     def zero_grad(self, set_to_none: bool = False) -> None:
         self._optimizer.zero_grad(set_to_none=set_to_none)
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         self._optimizer.step(closure=closure)
 
-    # pyre-ignore [2]
     def add_param_group(self, param_group: Any) -> None:
         raise NotImplementedError()
 

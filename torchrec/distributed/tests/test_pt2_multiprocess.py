@@ -588,7 +588,7 @@ def _test_compile_fake_pg_fn(
         ECSharderFixedShardingType(sharding_type),
     ]
 
-    plan: ShardingPlan = planner.plan(model, sharders)  # pyre-ignore
+    plan: ShardingPlan = planner.plan(model, sharders)
 
     def _dmp(m: torch.nn.Module) -> DistributedModelParallel:  # pyre-ignore
         return DistributedModelParallel(

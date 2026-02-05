@@ -2275,6 +2275,7 @@ class TestEBCSparseArchZCH(nn.Module):
         TestEBCSparseArch()
     """
 
+    # pyre-fixme[3]: Return type must be annotated.
     def _get_mc_module_from_tables(
         self,
         tables: List[EmbeddingBagConfig],

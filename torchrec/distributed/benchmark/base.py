@@ -534,7 +534,7 @@ class cmd_conf:
                     return yaml.safe_load(f) or {}
 
         @functools.wraps(func)
-        def wrapper() -> Any:  # pyre-ignore [3]
+        def wrapper() -> Any:
             sig = inspect.signature(func)
             parser = argparse.ArgumentParser(func.__doc__)
 
@@ -695,7 +695,7 @@ def init_argparse_and_args() -> argparse.Namespace:
 def _run_benchmark_core(
     name: str,
     run_iter_fn: Callable[[], None],
-    profile_iter_fn: Optional[Callable[[Any], None]],  # pyre-ignore [2]
+    profile_iter_fn: Optional[Callable[[Any], None]],
     world_size: int,
     rank: int,
     num_benchmarks: int,
@@ -912,7 +912,6 @@ def benchmark_model_with_warmup(
     world_size: int,
     output_dir: str,
     num_benchmarks: int,
-    # pyre-ignore[2]
     func_to_benchmark: Any,
     benchmark_func_kwargs: Optional[Dict[str, Any]],
     rank: int,
@@ -994,7 +993,7 @@ def benchmark_func(
     name: str,
     rank: int,
     world_size: int,
-    func_to_benchmark: Any,  # pyre-ignore[2]
+    func_to_benchmark: Any,
     bench_inputs: List[Dict[str, Any]],
     prof_inputs: List[Dict[str, Any]],
     benchmark_func_kwargs: Optional[Dict[str, Any]],

@@ -50,7 +50,6 @@ class Tracer(torch.fx.Tracer):
     @compatibility(is_backward_compatible=True)
     def trace(
         self,
-        # pyre-ignore[2]: Missing parameter annotation [2]: Parameter `root` must have a type that does not contain `Any`
         root: Union[torch.nn.Module, Callable[..., Any]],
         concrete_args: Optional[Dict[str, Any]] = None,
     ) -> Graph:
@@ -92,7 +91,6 @@ class Tracer(torch.fx.Tracer):
             _is_fx_tracing_flag = old_is_fx_tracing_flag
         return graph
 
-    # pyre-ignore[2]
     def create_arg(self, a: Any) -> Argument:
         """
         A method to specify the behavior of tracing when preparing values to

@@ -83,7 +83,11 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
         ) -> nn.Module:
             """Override _init_dmp to always set module_id_cache to None"""
             # Call _shard_modules_impl with module_id_cache=None (caching disabled)
+            # pyre-fixme[24]: Generic type `ShardedModule` expects 4 type parameters.
             module_id_cache: Dict[int, ShardedModule] = {}
+            # pyre-fixme[6]: For 2nd argument expected `Optional[Dict[str,
+            #  ShardedModule[Any, Any, Any, Any]]]` but got `Dict[int,
+            #  ShardedModule[Any, Any, Any, Any]]`.
             return self_dmp._shard_modules_impl(module, module_id_cache=module_id_cache)
 
         # Setup: Create shared embedding modules that will be reused
@@ -129,21 +133,27 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
         # Verify that the same module instances are reused (cached behavior)
         wrapped_module = dmp.module
         self.assertIs(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
             wrapped_module.sparse1.ebc,
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
             wrapped_module.sparse2.ebc,
             "ebc1 and ebc2 should be the same sharded instance",
         )
         self.assertIs(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
             wrapped_module.sparse1.ec,
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
             wrapped_module.sparse2.ec,
             "ec1 and ec2 should be the same sharded instance",
         )
         self.assertIsInstance(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
             wrapped_module.sparse1.ebc,
             ShardedModule,
             "ebc1 should be sharded",
         )
         self.assertIsInstance(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
             wrapped_module.sparse1.ec,
             ShardedModule,
             "ec1 should be sharded",
@@ -207,33 +217,41 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
         # Without caching, the same module should be sharded twice,
         # resulting in different sharded instances
         self.assertIsNot(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
             wrapped_module.sparse1.ebc,
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
             wrapped_module.sparse2.ebc,
             "Without caching, ebc1 and ebc2 should be different sharded instances",
         )
         self.assertIsNot(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
             wrapped_module.sparse1.ec,
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
             wrapped_module.sparse2.ec,
             "Without caching, ec1 and ec2 should be different sharded instances",
         )
 
         # Both should still be properly sharded, just not cached
         self.assertIsInstance(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
             wrapped_module.sparse1.ebc,
             ShardedModule,
             "ebc1 should be sharded",
         )
         self.assertIsInstance(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
             wrapped_module.sparse1.ec,
             ShardedModule,
             "ec1 should be sharded",
         )
         self.assertIsInstance(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
             wrapped_module.sparse2.ebc,
             ShardedModule,
             "ebc2 should be sharded",
         )
         self.assertIsInstance(
+            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
             wrapped_module.sparse2.ec,
             ShardedModule,
             "ec2 should be sharded",

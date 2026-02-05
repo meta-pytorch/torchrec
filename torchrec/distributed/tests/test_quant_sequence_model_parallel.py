@@ -263,7 +263,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
         local_batch = local_batch.to(device)
         sharded_quant_model(local_batch.idlist_features)
         self.assertIsInstance(
-            # pyre-ignore [29]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[0]
@@ -272,7 +271,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             KVEmbeddingInference,
         )
         self.assertIsInstance(
-            # pyre-ignore [29]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[0]
@@ -281,7 +279,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             IntNBitTableBatchedEmbeddingBagsCodegen,
         )
         self.assertEqual(
-            # pyre-ignore [29]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[0]
@@ -290,7 +287,6 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             [0, 0],
         )
         self.assertEqual(
-            # pyre-ignore [29]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[1]

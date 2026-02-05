@@ -77,6 +77,7 @@ from torchrec.metrics.xauc import XAUCMetric
 
 
 # Path to the golden snapshot file
+# pyre-fixme[5]: Global expression must be annotated.
 GOLDEN_SNAPSHOT_PATH = Path(__file__).parent / "metric_fqn_golden_snapshot.json"
 
 
@@ -324,6 +325,7 @@ def generate_golden_snapshot() -> Dict[str, Dict[str, Any]]:
                         "non_persistent_buffer_fqns": non_persistent_fqns,
                     }
                 except Exception as e:
+                    # pyre-fixme[61]: `key` is undefined, or not always defined.
                     print(f"Warning: Failed to generate snapshot for {key}: {e}")
                     continue
 
@@ -1076,6 +1078,8 @@ class MetricCoverageTest(unittest.TestCase):
         # e.g., "SomeMetric": "deprecated, will be removed in next release",
     }
 
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument `sys.version <
+    #  "3.11"` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         sys.version < "3.11", "concurrent.futures._base.Future is type but not a class"
     )

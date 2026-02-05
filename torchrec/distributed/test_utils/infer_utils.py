@@ -958,8 +958,6 @@ def shard_qec(
     quant_model_copy = copy.deepcopy(mi.quant_model)
     sharded_model = _shard_modules(
         module=quant_model_copy,
-        # pyre-fixme[6]: For 2nd argument expected
-        #  `Optional[List[ModuleSharder[Module]]]` but got `List[TestQuantECSharder]`.
         sharders=[sharder],
         device=device,
         plan=plan,

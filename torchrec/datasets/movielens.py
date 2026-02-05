@@ -63,7 +63,6 @@ def _movielens(
     root: str,
     *,
     include_movies_data: bool = False,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
     # pyre-ignore[2]
     **open_kw,
@@ -84,7 +83,6 @@ def movielens_20m(
     root: str,
     *,
     include_movies_data: bool = False,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
     # pyre-ignore[2]
     **open_kw,
@@ -115,7 +113,6 @@ def movielens_25m(
     root: str,
     *,
     include_movies_data: bool = False,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
     # pyre-ignore[2]
     **open_kw,

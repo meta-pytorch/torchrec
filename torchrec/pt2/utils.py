@@ -168,7 +168,6 @@ def pt2_compile_callable(f: Callable) -> Callable:
     """
 
     @functools.wraps(f)
-    # pyre-ignore[3]
     def inner_forward(
         ref: torch.nn.Module,
         *args: Any,

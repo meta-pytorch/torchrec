@@ -305,6 +305,8 @@ class KeyedJaggedTensorPoolRwSharding(ObjectPoolSharding):
             num_features=self._num_features, env=self._env
         )
 
+    # pyre-fixme[14]: `get_sharded_states_to_register` overrides method defined in
+    #  `ObjectPoolSharding` inconsistently.
     def get_sharded_states_to_register(
         self, lookup: KeyedJaggedTensorPoolLookup
     ) -> Iterable[Tuple[str, torch.Tensor]]:
@@ -512,6 +514,8 @@ class KeyedJaggedTensorPoolRwReplicatedSharding(ObjectPoolSharding):
             num_features=self._num_features, env=self._local_env
         )
 
+    # pyre-fixme[14]: `get_sharded_states_to_register` overrides method defined in
+    #  `ObjectPoolSharding` inconsistently.
     def get_sharded_states_to_register(
         self, lookup: KeyedJaggedTensorPoolLookup
     ) -> Iterable[Tuple[str, torch.Tensor]]:

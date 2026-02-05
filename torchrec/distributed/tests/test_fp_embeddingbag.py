@@ -109,8 +109,6 @@ def get_unsharded_and_sharded_module(
 
         replicate(
             sharded_sparse_arch,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_bag_collection`.
             ignored_modules=[sharded_sparse_arch._fp_ebc._embedding_bag_collection],
             process_group=ctx.pg,
             gradient_as_bucket_view=True,
@@ -367,6 +365,8 @@ def _test_jk_disabled_non_pipelined(
 
 @skip_if_asan_class
 class TestFeatureProcessorJKDisabledNonPipelined(MultiProcessTestBase):
+    # pyre-fixme[56]: Pyre was not able to infer the type of argument
+    #  `torch.cuda.device_count() <= 1` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

@@ -64,6 +64,7 @@ class XAUCMetricTest(unittest.TestCase):
             my_rank=0,
             batch_size=BATCH_SIZE,
             tasks=[DefaultTaskInfo],
+            # pyre-fixme[6]: For 5th argument expected `Dict[str, Any]` but got `bool`.
             enable_pt2_compile=True,
             window_size=200,
         )
@@ -73,6 +74,7 @@ class XAUCMetricTest(unittest.TestCase):
             my_rank=0,
             batch_size=BATCH_SIZE,
             tasks=[DefaultTaskInfo],
+            # pyre-fixme[6]: For 5th argument expected `Dict[str, Any]` but got `bool`.
             enable_pt2_compile=False,
             window_size=200,
         )

@@ -357,7 +357,6 @@ def get_state_dict(
     key_to_local_shards: Dict[str, List[Shard]] = defaultdict(list)
     key_to_global_metadata: Dict[str, ShardedTensorMetadata] = {}
     key_to_dtensor_metadata: Dict[str, DTensorMetadata] = {}
-    # pyre-ignore[33]
     key_to_local_tensor_shards: Dict[str, List[Any]] = defaultdict(list)
 
     # validate on the function input for kv zch cases

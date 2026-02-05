@@ -23,9 +23,7 @@ from torch.nn.modules.module import (
 
 def _apply_functions_after_first_forward(
     module: torch.nn.Module,
-    # pyre-ignore[2]
     input: Any,
-    # pyre-ignore[2]
     output: Any,
 ) -> None:
     _functions_to_lazy_apply = getattr(module, "_functions_to_lazy_apply", None)
@@ -256,6 +254,5 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
         return result
     # fmt: on
 
-    # pyre-ignore[4]
     # pyre-fixme[15]: `__call__` overrides attribute defined in `type` inconsistently.
     __call__: Callable[..., Any] = _call_impl

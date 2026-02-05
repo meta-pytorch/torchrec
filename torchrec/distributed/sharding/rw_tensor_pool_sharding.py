@@ -161,6 +161,8 @@ class TensorPoolRwSharding(ObjectPoolSharding):
         """
         return RwTensorPoolValuesDist(self._pg, is_update=False)
 
+    # pyre-fixme[14]: `get_sharded_states_to_register` overrides method defined in
+    #  `ObjectPoolSharding` inconsistently.
     def get_sharded_states_to_register(
         self, lookup: TensorPoolLookup
     ) -> Iterable[Tuple[str, torch.Tensor]]:

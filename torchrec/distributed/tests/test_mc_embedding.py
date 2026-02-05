@@ -167,42 +167,28 @@ def _test_sharding_and_remapping(  # noqa C901
             sharded_sparse_arch._mc_ec, ShardedManagedCollisionEmbeddingCollection
         )
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_collection`.
             sharded_sparse_arch._mc_ec._embedding_collection,
             ShardedEmbeddingCollection,
         )
         assert (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_collection`.
             sharded_sparse_arch._mc_ec._embedding_collection._has_uninitialized_input_dist
             is False
         )
         assert (
             not hasattr(
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
-                #  attribute `_embedding_collection`.
                 sharded_sparse_arch._mc_ec._embedding_collection,
                 "_input_dists",
             )
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_collection`.
             or len(sharded_sparse_arch._mc_ec._embedding_collection._input_dists) == 0
         )
 
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_managed_collision_collection`.
             sharded_sparse_arch._mc_ec._managed_collision_collection,
             ShardedManagedCollisionCollection,
         )
 
         assert (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_managed_collision_collection`.
             sharded_sparse_arch._mc_ec._managed_collision_collection._use_index_dedup
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_collection`.
             == sharded_sparse_arch._mc_ec._embedding_collection._use_index_dedup
         )
 
@@ -405,32 +391,22 @@ def _test_sharding_and_resharding(  # noqa C901
             sharded_sparse_arch._mc_ec, ShardedManagedCollisionEmbeddingCollection
         )
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_collection`.
             sharded_sparse_arch._mc_ec._embedding_collection,
             ShardedEmbeddingCollection,
         )
         assert (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_collection`.
             sharded_sparse_arch._mc_ec._embedding_collection._has_uninitialized_input_dist
             is False
         )
         assert (
             not hasattr(
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
-                #  attribute `_embedding_collection`.
                 sharded_sparse_arch._mc_ec._embedding_collection,
                 "_input_dists",
             )
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_collection`.
             or len(sharded_sparse_arch._mc_ec._embedding_collection._input_dists) == 0
         )
 
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_managed_collision_collection`.
             sharded_sparse_arch._mc_ec._managed_collision_collection,
             ShardedManagedCollisionCollection,
         )
@@ -591,33 +567,21 @@ def _test_sharding_dedup(  # noqa C901
         )
 
         assert (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_managed_collision_collection`.
             sharded_sparse_arch._mc_ec._managed_collision_collection._use_index_dedup
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_collection`.
             == sharded_sparse_arch._mc_ec._embedding_collection._use_index_dedup
         )
 
         assert (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_managed_collision_collection`.
             sharded_sparse_arch._mc_ec._managed_collision_collection._use_index_dedup
             is False
         )
 
         assert (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_managed_collision_collection`.
             dedup_sharded_sparse_arch._mc_ec._managed_collision_collection._use_index_dedup
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_embedding_collection`.
             == dedup_sharded_sparse_arch._mc_ec._embedding_collection._use_index_dedup
         )
 
         assert (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `_managed_collision_collection`.
             dedup_sharded_sparse_arch._mc_ec._managed_collision_collection._use_index_dedup
             is True
         )

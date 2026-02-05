@@ -63,7 +63,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
     ) -> None:
         self._emb_module: SplitTableBatchedEmbeddingBagsCodegen = emb_module
 
-        # pyre-ignore [33]
         state: Dict[Any, Any] = {}
         param_group: Dict[str, Any] = {
             "params": [],
@@ -98,7 +97,6 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
         # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         # pyre-ignore [16]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
