@@ -100,6 +100,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
         is_inference (bool): whether or not the estimator is used for inference.
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         topology: Topology,

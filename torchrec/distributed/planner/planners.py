@@ -426,6 +426,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
 
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         topology: Optional[Topology] = None,
