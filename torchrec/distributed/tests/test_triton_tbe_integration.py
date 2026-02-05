@@ -22,7 +22,7 @@ from typing import List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
-from hypothesis import given, Phase, settings, strategies as st, Verbosity
+from hypothesis import given, Phase, seed, settings, strategies as st, Verbosity
 from torch.distributed._shard.sharded_tensor.metadata import ShardMetadata
 from torchrec.distributed.batched_embedding_kernel import (
     TritonBatchedFusedEmbeddingBag,
@@ -979,9 +979,9 @@ class TritonCUDANumericAlignmentTest(unittest.TestCase):
     )
     # pyre-ignore[56]: Invalid decoration
     @given(
-        bag_size=st.integers(3, 15),
-        batch_size=st.integers(5, 10),
-        num_tables=st.integers(2, 5),
+        bag_size=st.integers(8, 12),
+        batch_size=st.just(128),
+        num_tables=st.integers(8, 12),
         dtype=st.sampled_from([torch.float16]),
         iters=st.integers(3, 5),
         multi_feature=st.booleans(),
@@ -1007,6 +1007,8 @@ class TritonCUDANumericAlignmentTest(unittest.TestCase):
         via the multi_feature parameter.
         """
         import random
+
+        torch.manual_seed(42)
 
         device = torch.device("cuda:0")
 
@@ -1042,7 +1044,7 @@ class TritonCUDANumericAlignmentTest(unittest.TestCase):
             triton_output = triton_emb(indices, offsets)
 
             self.assertTrue(
-                torch.allclose(triton_output, cuda_output, rtol=1e-2, atol=1e-2),
+                torch.allclose(triton_output, cuda_output, rtol=1e-8, atol=1e-8),
                 f"Forward pass mismatch (FP16, multi_feature={multi_feature}): "
                 f"max diff = {(triton_output - cuda_output).abs().max().item()}",
             )
@@ -1052,10 +1054,11 @@ class TritonCUDANumericAlignmentTest(unittest.TestCase):
         "CUDA is required for numeric alignment tests",
     )
     # pyre-ignore[56]: Invalid decoration
+    @seed(42)
     @given(
-        bag_size=st.integers(3, 10),
-        batch_size=st.integers(5, 8),
-        num_tables=st.integers(2, 3),
+        bag_size=st.integers(8, 12),
+        batch_size=st.just(128),
+        num_tables=st.integers(8, 12),
         multi_feature=st.booleans(),
     )
     @settings(
@@ -1081,6 +1084,8 @@ class TritonCUDANumericAlignmentTest(unittest.TestCase):
         """
         import random
 
+        random.seed(42)
+        torch.manual_seed(42)
         device = torch.device("cuda:0")
         dtype = torch.float16
         lr = 0.1
@@ -1119,9 +1124,13 @@ class TritonCUDANumericAlignmentTest(unittest.TestCase):
         Ds = [spec[1] for spec in embedding_specs]
         hash_sizes = [spec[0] for spec in embedding_specs]
 
-        # TODO: huge numerical difference need to investigate
-        fwd_tol = 1e-2
-        bwd_tol = 1e-2
+        fwd_tol = 1e-8  # Forward should be exact (same weights, same computation)'
+        # Backward tolerance larger, pending investigation
+        # validated below cases:
+        # - Unique rows (no gradient accumulation): diff = 0.0 (exact match)
+        # - Within-bag accumulation (same row, same bag): diff = 0.0 (exact match)
+        # - Cross-batch accumulation (same row, different batches): diff ~ 1e-3
+        bwd_tol = 1e-3
 
         # Only run a single iteration to check numeric alignment before drift accumulates
         indices, offsets = self._generate_inputs(
@@ -1178,8 +1187,10 @@ class TritonCUDANumericAlignmentTest(unittest.TestCase):
         cuda_output = cuda_emb(indices, offsets)
         triton_output = triton_emb(indices, offsets)
 
+        tol = 1e-8
+
         self.assertTrue(
-            torch.allclose(triton_output, cuda_output, rtol=1e-5, atol=1e-5),
+            torch.allclose(triton_output, cuda_output, rtol=tol, atol=tol),
             f"Empty bags forward mismatch: max diff = {(triton_output - cuda_output).abs().max().item()}",
         )
         # Verify empty bags are zeros
@@ -1198,7 +1209,7 @@ class TritonCUDANumericAlignmentTest(unittest.TestCase):
         triton_output = triton_emb(indices, offsets)
 
         self.assertTrue(
-            torch.allclose(triton_output, cuda_output, rtol=1e-3, atol=1e-3),
+            torch.allclose(triton_output, cuda_output, rtol=tol, atol=tol),
             f"Repeated indices forward mismatch: max diff = {(triton_output - cuda_output).abs().max().item()}",
         )
 
@@ -1223,9 +1234,8 @@ class TritonCUDANumericAlignmentTest(unittest.TestCase):
         cuda_output = cuda_emb(indices, offsets)
         triton_output = triton_emb(indices, offsets)
 
-        # TODO: huge numerical difference need to investigate
         self.assertTrue(
-            torch.allclose(triton_output, cuda_output, rtol=1e-2, atol=1e-2),
+            torch.allclose(triton_output, cuda_output, rtol=tol, atol=tol),
             f"Large batch forward mismatch: max diff = {(triton_output - cuda_output).abs().max().item()}",
         )
 
