@@ -15,7 +15,6 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from torch import distributed as dist
-from torch.monitor import _WaitCounter
 from torch.profiler import record_function
 from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
 from torchrec.metrics.metric_job_types import (
@@ -326,36 +325,35 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         3. Compute metrics via comms module
         """
 
-        with _WaitCounter("pytorch.wait_counter.rec_metrics.compute_job").guard():
-            with record_function("## CPUOffloadedRecMetricModule:compute ##"):
-                start_ms = time.time()
-                self.comms_module.load_local_metric_state_snapshot(
-                    metric_compute_job.metric_state_snapshot
+        with record_function("## CPUOffloadedRecMetricModule:compute ##"):
+            start_ms = time.time()
+            self.comms_module.load_local_metric_state_snapshot(
+                metric_compute_job.metric_state_snapshot
+            )
+
+            with record_function("## cpu_all_gather ##"):
+                # Manual distributed sync (replaces TorchMetrics.metric.Metric.sync())
+                all_gather_start_ms = time.time()
+                aggregated_states = self.comms_module.get_pre_compute_states(
+                    self.cpu_process_group
+                )
+                self.all_gather_time_logger.add(
+                    (time.time() - all_gather_start_ms) * 1000
                 )
 
-                with record_function("## cpu_all_gather ##"):
-                    # Manual distributed sync (replaces TorchMetrics.metric.Metric.sync())
-                    all_gather_start_ms = time.time()
-                    aggregated_states = self.comms_module.get_pre_compute_states(
-                        self.cpu_process_group
-                    )
-                    self.all_gather_time_logger.add(
-                        (time.time() - all_gather_start_ms) * 1000
-                    )
+            with record_function("## cpu_load_states ##"):
+                self.comms_module.load_pre_compute_states(aggregated_states)
 
-                with record_function("## cpu_load_states ##"):
-                    self.comms_module.load_pre_compute_states(aggregated_states)
-
-                with record_function("## metric_compute ##"):
-                    compute_start_ms = time.time()
-                    computed_metrics = self.comms_module.compute()
-                    self.compute_job_time_logger.add((time.time() - start_ms) * 1000)
-                    self.compute_metrics_time_logger.add(
-                        (time.time() - compute_start_ms) * 1000
-                    )
-                    self.compute_count += 1
-                    self._adjust_compute_interval()
-                    return computed_metrics
+            with record_function("## metric_compute ##"):
+                compute_start_ms = time.time()
+                computed_metrics = self.comms_module.compute()
+                self.compute_job_time_logger.add((time.time() - start_ms) * 1000)
+                self.compute_metrics_time_logger.add(
+                    (time.time() - compute_start_ms) * 1000
+                )
+                self.compute_count += 1
+                self._adjust_compute_interval()
+                return computed_metrics
 
     def _update_loop(self) -> None:
         """
