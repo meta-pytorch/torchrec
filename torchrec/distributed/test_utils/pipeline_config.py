@@ -19,6 +19,7 @@ from torchrec.distributed.train_pipeline import (
 )
 from torchrec.distributed.train_pipeline.train_pipelines import (
     PrefetchTrainPipelineSparseDist,
+    TrainEvalHybridPipelineBase,
     TrainPipelineSemiSync,
     TrainPipelineSparseDistLite,
 )
@@ -96,6 +97,7 @@ class PipelineConfig:
             "fused": TrainPipelineFusedSparseDist,
             "semi": TrainPipelineSemiSync,
             "prefetch": PrefetchTrainPipelineSparseDist,
+            "hybrid_base": TrainEvalHybridPipelineBase,
         }
 
         if self.pipeline == "semi":

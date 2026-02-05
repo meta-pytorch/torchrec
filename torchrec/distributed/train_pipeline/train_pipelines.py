@@ -1991,6 +1991,160 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                     )
 
 
+class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
+    """
+    A hybrid pipeline that supports both training and evaluation modes in a single
+    pipelined execution flow.
+
+    This class extends `TrainPipelineSparseDist` to enable seamless switching between
+    training and evaluation within the same pipeline. It is particularly useful for
+    scenarios where you need to interleave training and evaluation batches without
+    the overhead of switching between separate pipelines.
+
+    Key Features:
+        - Supports both training and evaluation modes via the `is_training` flag.
+        - Conditionally executes backward pass and optimizer step only during training.
+        - Maintains the same pipelining benefits (overlapping data transfer, sparse
+          data distribution, and forward pass) for both modes.
+
+    Pipeline Stages (inherited from TrainPipelineSparseDist):
+        - Stage 3: Forward/Backward/Optimizer (current batch)
+        - Stage 2: Sparse data distribution (next batch)
+        - Stage 1: Device transfer (batch i+2)
+
+    Note:
+        The `is_training` flag is set per-batch via the context, allowing fine-grained
+        control over which batches trigger gradient computation and weight updates.
+    """
+
+    def progress(self, dataloader_iter: Iterator[In], is_training: bool = True) -> Out:
+        """
+        Execute one step of the pipelined train/eval loop.
+
+        This method processes one batch through the full pipeline while overlapping
+        operations for subsequent batches. It conditionally executes backward pass
+        and optimizer step based on both the model's training mode and the per-batch
+        `is_training` flag.
+
+        For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
+            - batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt
+                          (expecting input_dist completed)
+            - batches[1]: next batch, for input_dist (expecting copied to device)
+            - batches[2]: i+2 batch, for copy_batch_to_gpu
+                          (expecting non-exhausted dataloader iter)
+
+        Args:
+            dataloader_iter: Iterator yielding input batches from the dataloader.
+            is_training: Whether the *newly enqueued* batch (batch i+2) should be
+                processed in training mode. Defaults to True.
+
+        Returns:
+            Out: The output from the forward pass of the current batch (batches[0]).
+
+        Raises:
+            StopIteration: When all batches have been processed (pipeline is empty).
+
+        Note:
+            The backward/optimizer execution depends on BOTH:
+            1. `self._model.training` - the model's overall training mode
+            2. `self.contexts[0].is_training` - the per-batch training flag set during enqueue
+
+            This allows fine-grained control where the model can be in training mode
+            but specific batches can skip gradient computation (e.g., for evaluation batches
+            interleaved with training batches).
+        """
+
+        self._state = PipelineState.IDLE
+        # Attach the model just in case the user forgets to call it, especially when the user
+        # pauses the pipeline.progress and detaches the model for other purposes.
+        if not self._model_attached:
+            self.attach(self._model)
+
+        # Fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
+        self.fill_pipeline(dataloader_iter)
+
+        for context in self.contexts:
+            if not hasattr(context, "is_training"):
+                logger.info(
+                    f"initial fill batch-{context.index} with {'train' if is_training else 'eval'}"
+                )
+                context.is_training = is_training
+
+        # Here is the expected stop after exhausting all batches
+        if not self.batches:
+            raise StopIteration
+
+        # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
+        self._set_module_context(self.contexts[0])
+
+        # Zero gradients only when model is in training mode
+        if self._model.training:
+            with record_function("## zero_grad ##"):
+                self._optimizer.zero_grad()
+
+        # Wait for batches[0] being available on device, this should always be completed since
+        # the input_dist of batches[0] has been invoked in previous iter. TODO: fact check
+        self._wait_for_batch()
+
+        # Start sparse data distribution for the next batch (overlapped with current forward)
+        if len(self.batches) >= 2:
+            # Invoke splits all_to_all comms (first part of input_dist)
+            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+
+        is_curr_training = self._model.training and self.contexts[0].is_training
+
+        if not self._enqueue_batch_after_forward:
+            # Batch i+2: load data and copy to GPU, the dataloader iter will first exhaust here
+            self.enqueue_batch(dataloader_iter)
+            self.contexts[-1].is_training = is_training
+
+        # Forward pass for current batch
+        if is_curr_training:
+            with record_function(f"## forward {self.contexts[0].index} ##"):
+                self._state = PipelineState.CALL_FWD
+                losses, output = self._model_fwd(self.batches[0])
+        else:
+            with record_function(f"## eval {self.contexts[0].index} ##"):
+                with torch.no_grad():
+                    self._state = PipelineState.CALL_FWD
+                    losses, output = self._model_fwd(self.batches[0])
+
+        if self._enqueue_batch_after_forward:
+            # Batch i+2: load data and copy to GPU, the dataloader iter will first exhaust here.
+            # Start this step after the forward of batch i, so that the H2D copy doesn't compete
+            # for PCIe bandwidth with embedding lookup from UVM/UVM_CACHING.
+            self.enqueue_batch(dataloader_iter, is_training=is_training)
+            self.contexts[-1].is_training = is_training
+
+        # Complete sparse data distribution for the next batch
+        if len(self.batches) >= 2:
+            # Invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
+            self.wait_sparse_data_dist(self.contexts[1])
+
+        # Execute backward and optimizer step only if:
+        # 1. Model is in training mode (self._model.training)
+        # 2. Current batch is marked for training (self.contexts[0].is_training)
+        if is_curr_training:
+            # Backward pass
+            self._state = PipelineState.CALL_BWD
+            self._backward(losses)
+
+            # Sync embeddings if configured (for distributed model parallel)
+            self.sync_embeddings(
+                self._model,
+                self._dmp_collection_sync_interval_batches,
+                self.contexts[0],
+            )
+
+            # Optimizer step (weight update)
+            with record_function(f"## optimizer {self.contexts[0].index} ##"):
+                self._optimizer.step()
+
+        # Remove processed batch from the pipeline
+        self.dequeue_batch()
+        return output
+
+
 class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     """
     This pipeline overlaps device transfer, and `ShardedModule.input_dist()` with
