@@ -23,7 +23,7 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-from torchrec.metrics.auc import AUCMetric
+from torchrec.metrics.auc import _state_reduction, AUCMetric
 from torchrec.metrics.metric_module import (
     generate_metric_module,
     MetricsResult,
@@ -43,7 +43,8 @@ from torchrec.metrics.metrics_config import (
 )
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.rec_metric import RecMetricException, RecMetricList, RecTaskInfo
-from torchrec.metrics.test_utils import gen_test_batch
+from torchrec.metrics.test_utils import gen_test_batch, gen_test_tasks
+from torchrec.metrics.test_utils.mock_metrics import MockRecMetric
 from torchrec.metrics.throughput import ThroughputMetric
 from torchrec.test_utils import get_free_port, seed_and_log, skip_if_asan_class
 
@@ -850,6 +851,68 @@ class MetricModuleTest(unittest.TestCase):
         ):
             metric_module.async_compute()
 
+    def test_shutdown(self) -> None:
+        metric_module = generate_metric_module(
+            TestMetricModule,
+            metrics_config=DefaultMetricsConfig,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+        )
+        # shutdown() should not raise any exception
+        metric_module.shutdown()
+
+    def test_local_compute(self) -> None:
+        metric_module = generate_metric_module(
+            TestMetricModule,
+            metrics_config=DefaultMetricsConfig,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+        )
+        metric_module.update(gen_test_batch(128))
+        result = metric_module.local_compute()
+        self.assertIsInstance(result, dict)
+
+    def test_get_required_inputs(self) -> None:
+        metric_module = generate_metric_module(
+            TestMetricModule,
+            metrics_config=DefaultMetricsConfig,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+        )
+        # get_required_inputs delegates to rec_metrics
+        result = metric_module.get_required_inputs()
+        # Result can be None or a list depending on metric configuration
+        self.assertTrue(result is None or isinstance(result, list))
+
+    def test_invalid_max_compute_interval(self) -> None:
+        with self.assertRaises(ValueError) as context:
+            RecMetricModule(
+                batch_size=128,
+                world_size=1,
+                min_compute_interval=5.0,
+                max_compute_interval=0.0,  # Invalid: <= 0 when min is set
+            )
+        self.assertIn("Max compute interval", str(context.exception))
+
+    def test_invalid_min_compute_interval(self) -> None:
+        with self.assertRaises(ValueError) as context:
+            RecMetricModule(
+                batch_size=128,
+                world_size=1,
+                min_compute_interval=-1.0,  # Invalid: < 0
+                max_compute_interval=30.0,
+            )
+        self.assertIn("Min compute interval", str(context.exception))
+
     def test_load_state_dict_with_trained_batches_key(self) -> None:
         metric_module = generate_metric_module(
             TestMetricModule,
@@ -1001,7 +1064,7 @@ class MetricsConfigPostInitTest(unittest.TestCase):
 
         # Execute & Assert: should raise ValueError about rec_tasks being None
         with self.assertRaises(ValueError) as context:
-            config = MetricsConfig(
+            _ = MetricsConfig(
                 rec_tasks=None,  # pyre-ignore[6]: Intentionally passing None for testing
                 rec_metrics={
                     RecMetricEnum.AUC: RecMetricDef(rec_task_indices=[0]),
@@ -1021,7 +1084,7 @@ class MetricsConfigPostInitTest(unittest.TestCase):
 
         # Execute & Assert: should raise ValueError about index out of range
         with self.assertRaises(ValueError) as context:
-            config = MetricsConfig(
+            _ = MetricsConfig(
                 rec_tasks=rec_tasks,
                 rec_metrics={
                     RecMetricEnum.NE: RecMetricDef(
@@ -1073,4 +1136,429 @@ class MetricModuleDistributedTest(MultiProcessTestBase):
             backend=backend,
             batch_size=batch_size,
             config=metrics_config,
+        )
+
+
+@skip_if_asan_class
+class MetricModuleGlooDistributedTest(MultiProcessTestBase):
+    """
+    Distributed tests using GLOO backend (works on CPU).
+    Tests _get_metric_states functionality with torch.cat optimization.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.device = torch.device("cpu")
+
+    def test_get_metric_states_list_reduction(self) -> None:
+        """
+        Test _get_metric_states with list states and concatenation reduction.
+        Validates the torch.cat optimization for AUC-like metrics.
+        """
+        world_size = 2
+        backend = "gloo"
+
+        self._run_multi_process_test(
+            callable=_test_get_metric_states_with_list_reduction,
+            world_size=world_size,
+            backend=backend,
+        )
+
+    def test_get_metric_states_tensor_reduction(self) -> None:
+        """
+        Test _get_metric_states with tensor states and sum reduction.
+        Validates standard reduction for NE-like metrics.
+        """
+        world_size = 2
+        backend = "gloo"
+
+        self._run_multi_process_test(
+            callable=_test_get_metric_states_with_tensor_reduction,
+            world_size=world_size,
+            backend=backend,
+        )
+
+    def test_get_metric_states_single_tensor(self) -> None:
+        """
+        Test _get_metric_states with a single tensor in the list.
+        Edge case validation.
+        """
+        world_size = 2
+        backend = "gloo"
+
+        self._run_multi_process_test(
+            callable=_test_get_metric_states_with_single_tensor,
+            world_size=world_size,
+            backend=backend,
+        )
+
+    def test_get_metric_states_reduction_fn_none(self) -> None:
+        """
+        Test _get_metric_states with reduction_fn=None.
+        Validates that no TypeError is raised when reduction_fn is None.
+        """
+        world_size = 2
+        backend = "gloo"
+
+        self._run_multi_process_test(
+            callable=_test_get_metric_states_with_reduction_fn_none,
+            world_size=world_size,
+            backend=backend,
+        )
+
+    def test_get_metric_states_asymmetric_batches(self) -> None:
+        """
+        Test _get_metric_states with different batch values across ranks.
+
+        This validates that the torch.cat approach correctly aggregates
+        data when ranks have different tensor values (same batch count).
+        - Rank 0: 3 batch updates with values 1-6
+        - Rank 1: 3 batch updates with values 7-12
+        """
+        world_size = 2
+        backend = "gloo"
+
+        self._run_multi_process_test(
+            callable=_test_get_metric_states_with_asymmetric_batches,
+            world_size=world_size,
+            backend=backend,
+        )
+
+
+def _test_get_metric_states_with_list_reduction(
+    rank: int,
+    world_size: int,
+    backend: str,
+) -> None:
+    """Test _get_metric_states with list states and concatenation reduction (AUC-like)."""
+    with MultiProcessContext(rank, world_size, backend) as ctx:
+        # Create mock metric with list state using concatenation reduction
+        tasks = gen_test_tasks(["task1"])
+        mock_metric = MockRecMetric(
+            world_size=world_size,
+            my_rank=rank,
+            batch_size=10,
+            tasks=tasks,
+            is_tensor_list=True,
+            reduction_fn=_state_reduction,
+            initial_states={"predictions": []},
+        )
+
+        # Each rank appends different local tensors to simulate batch updates
+        # Rank 0: [[1, 2], [3, 4]] -> after local concat: [1, 2, 3, 4]
+        # Rank 1: [[5, 6], [7, 8]] -> after local concat: [5, 6, 7, 8]
+        # After global gather: [[1, 2, 3, 4], [5, 6, 7, 8]] -> reduction -> [[1, 2, 3, 4, 5, 6, 7, 8]]
+        if rank == 0:
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[1.0, 2.0]], device=ctx.device)}
+            )
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[3.0, 4.0]], device=ctx.device)}
+            )
+        else:  # rank == 1
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[5.0, 6.0]], device=ctx.device)}
+            )
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[7.0, 8.0]], device=ctx.device)}
+            )
+
+        # Execute: Call _get_metric_states
+        metric_module = RecMetricModule(
+            batch_size=10,
+            world_size=world_size,
+            rec_tasks=tasks,
+            rec_metrics=RecMetricList([mock_metric]),
+        )
+
+        result = metric_module._get_metric_states(
+            metric=mock_metric,
+            world_size=world_size,
+            process_group=ctx.pg or dist.group.WORLD,
+        )
+
+        # Assert: Verify result matches expected
+        # With torch.cat approach:
+        # - Local concat: rank0 [1,2,3,4], rank1 [5,6,7,8]
+        # - All-gather produces [[1,2,3,4], [5,6,7,8]]
+        # - _state_reduction concatenates: [1,2,3,4,5,6,7,8]
+        expected = [
+            torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]], device=ctx.device)
+        ]
+
+        actual = result["task1"]["predictions"]
+
+        assert len(actual) == len(
+            expected
+        ), f"Expected {len(expected)} tensors, got {len(actual)}"
+        torch.testing.assert_close(
+            actual[0],
+            expected[0],
+            msg="Mismatch in gathered predictions",
+        )
+
+
+def _test_get_metric_states_with_tensor_reduction(
+    rank: int,
+    world_size: int,
+    backend: str,
+) -> None:
+    """Test _get_metric_states with tensor states and sum reduction (NE-like)."""
+    with MultiProcessContext(rank, world_size, backend) as ctx:
+        # Create mock metric with tensor state using sum reduction
+        tasks = gen_test_tasks(["task1"])
+        initial_value = torch.tensor(
+            [float(rank + 1)], device=ctx.device
+        )  # Rank 0: [1.0], Rank 1: [2.0]
+        mock_metric = MockRecMetric(
+            world_size=world_size,
+            my_rank=rank,
+            batch_size=10,
+            tasks=tasks,
+            is_tensor_list=False,
+            reduction_fn="sum",
+            initial_states={"state1": initial_value},
+        )
+
+        # Execute: Call _get_metric_states
+        metric_module = RecMetricModule(
+            batch_size=10,
+            world_size=world_size,
+            rec_tasks=tasks,
+            rec_metrics=RecMetricList([mock_metric]),
+        )
+
+        result = metric_module._get_metric_states(
+            metric=mock_metric,
+            world_size=world_size,
+            process_group=ctx.pg or dist.group.WORLD,
+        )
+
+        # Assert: Verify result matches expected
+        # Expected: sum([rank0_value, rank1_value]) = sum([1.0, 2.0]) = 3.0
+        expected = torch.tensor([3.0], device=ctx.device)
+
+        actual = result["task1"]["state1"]
+
+        torch.testing.assert_close(
+            actual,
+            expected,
+            msg="Mismatch in summed state",
+        )
+
+
+def _test_get_metric_states_with_single_tensor(
+    rank: int,
+    world_size: int,
+    backend: str,
+) -> None:
+    """Test _get_metric_states with a single tensor in the list (edge case)."""
+    with MultiProcessContext(rank, world_size, backend) as ctx:
+
+        # Create mock metric with list state containing a single tensor
+        tasks = gen_test_tasks(["task1"])
+        mock_metric = MockRecMetric(
+            world_size=world_size,
+            my_rank=rank,
+            batch_size=10,
+            tasks=tasks,
+            is_tensor_list=True,
+            reduction_fn=_state_reduction,
+            initial_states={"predictions": []},
+        )
+
+        # Each rank has a single tensor
+        # Rank 0: [[1, 2]]
+        # Rank 1: [[3, 4]]
+        # After local concat (no-op since single tensor): [1, 2] and [3, 4]
+        # After global gather+concat: [[1, 2, 3, 4]]
+        if rank == 0:
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[1.0, 2.0]], device=ctx.device)}
+            )
+        else:  # rank == 1
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[3.0, 4.0]], device=ctx.device)}
+            )
+
+        # Execute: Call _get_metric_states
+        metric_module = RecMetricModule(
+            batch_size=10,
+            world_size=world_size,
+            rec_tasks=tasks,
+            rec_metrics=RecMetricList([mock_metric]),
+        )
+
+        result = metric_module._get_metric_states(
+            metric=mock_metric,
+            world_size=world_size,
+            process_group=ctx.pg or dist.group.WORLD,
+        )
+
+        # Assert: Verify result matches expected
+        # Expected: [[1, 2, 3, 4]]
+        expected = [torch.tensor([[1.0, 2.0, 3.0, 4.0]], device=ctx.device)]
+
+        actual = result["task1"]["predictions"]
+
+        assert len(actual) == len(
+            expected
+        ), f"Expected {len(expected)} tensors, got {len(actual)}"
+        torch.testing.assert_close(
+            actual[0],
+            expected[0],
+            msg="Mismatch in gathered predictions for single tensor case",
+        )
+
+
+def _test_get_metric_states_with_reduction_fn_none(
+    rank: int,
+    world_size: int,
+    backend: str,
+) -> None:
+    """Test _get_metric_states with reduction_fn=None (no reduction applied)."""
+    with MultiProcessContext(rank, world_size, backend) as ctx:
+        # Create mock metric with list state and reduction_fn=None
+        tasks = gen_test_tasks(["task1"])
+        mock_metric = MockRecMetric(
+            world_size=world_size,
+            my_rank=rank,
+            batch_size=10,
+            tasks=tasks,
+            is_tensor_list=True,
+            reduction_fn=None,  # No reduction
+            initial_states={"predictions": []},
+        )
+
+        # Each rank has tensors
+        if rank == 0:
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[1.0, 2.0]], device=ctx.device)}
+            )
+        else:  # rank == 1
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[3.0, 4.0]], device=ctx.device)}
+            )
+
+        # Execute: Call _get_metric_states - should NOT raise TypeError
+        metric_module = RecMetricModule(
+            batch_size=10,
+            world_size=world_size,
+            rec_tasks=tasks,
+            rec_metrics=RecMetricList([mock_metric]),
+        )
+
+        result = metric_module._get_metric_states(
+            metric=mock_metric,
+            world_size=world_size,
+            process_group=ctx.pg or dist.group.WORLD,
+        )
+
+        # Assert: With reduction_fn=None, gathered_list is returned as-is
+        # After torch.cat locally: rank0 [1,2], rank1 [3,4]
+        # After all-gather: [[1,2], [3,4]] (list of 2 tensors)
+        actual = result["task1"]["predictions"]
+
+        # Should be a list of 2 tensors (one per rank)
+        assert isinstance(actual, list), f"Expected list, got {type(actual)}"
+        assert (
+            len(actual) == world_size
+        ), f"Expected {world_size} tensors, got {len(actual)}"
+
+        # Verify the gathered tensors
+        expected_rank0 = torch.tensor([[1.0, 2.0]], device=ctx.device)
+        expected_rank1 = torch.tensor([[3.0, 4.0]], device=ctx.device)
+
+        torch.testing.assert_close(
+            actual[0],
+            expected_rank0,
+            msg="Mismatch in rank 0 gathered tensor",
+        )
+        torch.testing.assert_close(
+            actual[1],
+            expected_rank1,
+            msg="Mismatch in rank 1 gathered tensor",
+        )
+
+
+def _test_get_metric_states_with_asymmetric_batches(
+    rank: int,
+    world_size: int,
+    backend: str,
+) -> None:
+    """
+    Test _get_metric_states with different batch values across ranks.
+
+    This validates that the torch.cat approach correctly aggregates data
+    when ranks have different tensor values (same batch count).
+    """
+    with MultiProcessContext(rank, world_size, backend) as ctx:
+        tasks = gen_test_tasks(["task1"])
+        mock_metric = MockRecMetric(
+            world_size=world_size,
+            my_rank=rank,
+            batch_size=10,
+            tasks=tasks,
+            is_tensor_list=True,
+            reduction_fn=_state_reduction,
+            initial_states={"predictions": []},
+        )
+
+        # Same batch count per rank (3 batches each), but different values:
+        # Rank 0: [[1,2], [3,4], [5,6]] -> local concat -> [1,2,3,4,5,6]
+        # Rank 1: [[7,8], [9,10], [11,12]] -> local concat -> [7,8,9,10,11,12]
+        # After all_gather: [[1,2,3,4,5,6], [7,8,9,10,11,12]]
+        # After reduction (_state_reduction = concat): [1,2,3,4,5,6,7,8,9,10,11,12]
+        if rank == 0:
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[1.0, 2.0]], device=ctx.device)}
+            )
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[3.0, 4.0]], device=ctx.device)}
+            )
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[5.0, 6.0]], device=ctx.device)}
+            )
+        else:  # rank == 1
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[7.0, 8.0]], device=ctx.device)}
+            )
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[9.0, 10.0]], device=ctx.device)}
+            )
+            mock_metric.append_to_computation_states(
+                {"predictions": torch.tensor([[11.0, 12.0]], device=ctx.device)}
+            )
+
+        metric_module = RecMetricModule(
+            batch_size=10,
+            world_size=world_size,
+            rec_tasks=tasks,
+            rec_metrics=RecMetricList([mock_metric]),
+        )
+
+        result = metric_module._get_metric_states(
+            metric=mock_metric,
+            world_size=world_size,
+            process_group=ctx.pg or dist.group.WORLD,
+        )
+
+        # Expected: All values concatenated in rank order
+        # [1,2,3,4,5,6,7,8,9,10,11,12]
+        expected = [
+            torch.tensor(
+                [[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]],
+                device=ctx.device,
+            )
+        ]
+
+        actual = result["task1"]["predictions"]
+
+        assert len(actual) == len(
+            expected
+        ), f"Expected {len(expected)} tensors, got {len(actual)}"
+        torch.testing.assert_close(
+            actual[0],
+            expected[0],
+            msg="Mismatch in gathered predictions with multiple batches per rank",
         )
