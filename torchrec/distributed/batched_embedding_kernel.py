@@ -3694,10 +3694,11 @@ class TritonBatchedFusedEmbeddingBag(
         learning_rate = fused_params.get("learning_rate", 0.01)
         eps = fused_params.get("eps", 0.1)
 
-        # Create Triton TBE module
+        # Create Triton TBE module with feature_table_map for correct batch size handling
         self._emb_module: TritonTableBatchedEmbeddingBags = (
             TritonTableBatchedEmbeddingBags(
                 embedding_specs=list(zip(self._local_rows, self._local_cols)),
+                feature_table_map=self._feature_table_map,
                 weights_precision=weights_precision.as_dtype(),
                 learning_rate=learning_rate,
                 eps=eps,
