@@ -481,6 +481,131 @@ class ShardedEmbeddingBagCollection(
     """
     Sharded implementation of EmbeddingBagCollection.
     This is part of the public API to allow for manual data dist pipelining.
+
+    Core Attributes:
+        _embedding_shardings (List[EmbeddingSharding[EmbeddingShardingContext, KeyedJaggedTensor, torch.Tensor, torch.Tensor]]):
+            Holds sharding strategy instances, one per unique sharding type.
+            Created via `create_embedding_bag_sharding()`. Each sharding encapsulates
+            all logic for a specific sharding strategy (input dist, lookup, output dist).
+
+        _input_dists (nn.ModuleList):
+            Distributes input KeyedJaggedTensor to appropriate ranks before embeddings
+            are computed. Created via `sharding.create_input_dist()` for each sharding.
+            Handles all-to-all communication patterns specific to each sharding type.
+
+        _lookups (nn.ModuleList):
+            Embedding lookup engines, one per sharding type. Created via
+            `sharding.create_lookup()`. The main implementation is
+            `GroupedPooledEmbeddingsLookup` which processes KeyedJaggedTensor features
+            and returns pooled embeddings. Each lookup wraps multiple embedding kernels
+            (`_emb_modules`) in parallel for efficiency.
+
+        _output_dists (nn.ModuleList):
+            Gathers computed embeddings back to original ranks after lookup.
+            Created via `sharding.create_output_dist()`. Handles inverse permutation
+            and feature reordering based on the sharding type (e.g., AllToAll for
+            TableWise/RowWise, ReduceScatter for ColumnWise).
+
+    The forward pass follows a three-stage pipeline:
+        1. **input_dist**: KeyedJaggedTensor → split by sharding type → per-sharding
+           input_dist → KJTListSplitsAwaitable (async communication)
+        2. **compute/lookup**: KJTList → for each lookup: lookup(features) → List[Tensor]
+        3. **output_dist**: List[Tensor] → per-sharding output_dist + inverse indexing
+           → EmbeddingBagCollectionAwaitable → KeyedTensor
+
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │                    ShardedEmbeddingBagCollection                    │
+        ├─────────────────────────────────────────────────────────────────────┤
+        │                                                                     │
+        │  Stage 1: input_dist                                                │
+        │  ┌─────────────────────────────────────────────────────────────┐    │
+        │  │ KeyedJaggedTensor → split by sharding type →                │    │
+        │  │ per-sharding input_dist → KJTListSplitsAwaitable (async)    │    │
+        │  └─────────────────────────────────────────────────────────────┘    │
+        │                              ↓                                      │
+        │  Stage 2: compute/lookup                                            │
+        │  ┌─────────────────────────────────────────────────────────────┐    │
+        │  │ KJTList (distributed features) →                            │    │
+        │  │ for each lookup, shard: lookup(features) → List[Tensor]     │    │
+        │  └─────────────────────────────────────────────────────────────┘    │
+        │                              ↓                                      │
+        │  Stage 3: output_dist                                               │
+        │  ┌─────────────────────────────────────────────────────────────┐    │
+        │  │ List[Tensor] → per-sharding output_dist + inverse indexing  │    │
+        │  │ → EmbeddingBagCollectionAwaitable → KeyedTensor             │    │
+        │  └─────────────────────────────────────────────────────────────┘    │
+        │                                                                     │
+        └─────────────────────────────────────────────────────────────────────┘
+
+    Sharding Strategies
+    Created via create_embedding_bag_sharding():
+        Sharding Type	Class	Communication	Use Case
+        TABLE_WISE	TwPooledEmbeddingSharding	All-to-All	Entire table on one rank
+        ROW_WISE	RwPooledEmbeddingSharding	All-to-All	Partition rows across ranks
+        COLUMN_WISE	CwPooledEmbeddingSharding	Reduce-Scatter	Partition columns across ranks
+        TABLE_ROW_WISE	TwRwPooledEmbeddingSharding	2D All-to-All	2D grid partitioning
+        TABLE_COLUMN_WISE	TwCwPooledEmbeddingSharding	2D Reduce-Scatter	2D grid with column partitioning
+        DATA_PARALLEL	DpPooledEmbeddingSharding	Broadcast	Replicate all data
+        GRID_SHARD	GridPooledEmbeddingSharding	Advanced collective	Complex 2D strategies
+
+    Architecture Diagram
+        ShardedEmbeddingBagCollection (main orchestrator)
+        ├── _embedding_shardings (List[EmbeddingSharding])  ← one per sharding_type
+        │   ├── TwPooledEmbeddingSharding (TableWise)
+        │   ├── RwPooledEmbeddingSharding (RowWise)
+        │   └── ... (other strategies)
+        │
+        ├── _input_dists (List[BaseSparseFeaturesDist])     ← created by each sharding
+        │   ├── KJTAllToAll (for TW/RW/CW)
+        │   └── KJTOneToAll (for DP)
+        │
+        ├── _lookups (List[GroupedPooledEmbeddingsLookup])  ← created by each sharding
+        │   └── _emb_modules (nn.ModuleList)
+        │       ├── BatchedFusedEmbeddingBag (FUSED kernel)
+        │       ├── KeyValueEmbeddingBag (KV kernel)
+        │       └── ... (other kernels)
+        │
+        └── _output_dists (List[BaseEmbeddingDist])         ← created by each sharding
+            ├── PooledEmbeddingsAllToAll (for TW/RW)
+            └── PooledEmbeddingsReduceScatter (for CW)
+
+    Each Kernel's Internal Structure (e.g., BatchedFusedEmbeddingBag)
+        BatchedFusedEmbeddingBag
+        ├── _config: GroupedEmbeddingConfig          # Config with multiple tables
+        ├── _emb_module: SplitTableBatchedEmbeddingBagsCodegen  # FBGEMM TBE kernel
+        │   └── Contains ALL tables in this group fused into one TBE
+        ├── _optim: EmbeddingFusedOptimizer          # Fused optimizer for this kernel
+        ├── _local_rows: List[int]                   # Rows per table
+        ├── _local_cols: List[int]                   # Columns per table
+        ├── _feature_table_map: List[int]            # Maps features → table index
+        └── _param_per_table: Dict[str, TableBatchedEmbeddingSlice]  # Named params
+
+
+    How Tables are Grouped
+        The GroupedEmbeddingConfig groups multiple embedding tables that share:
+            1. Same compute kernel (FUSED, DENSE, KEY_VALUE, etc.)
+            2. Same data type
+            3. Same pooling type
+            4. Same sharding type
+        This allows the TBE to batch multiple tables together for efficiency.
+
+    Visual Diagram
+        GroupedPooledEmbeddingsLookup
+        │
+        ├── grouped_configs: [GroupedEmbeddingConfig_0, GroupedEmbeddingConfig_1, ...]
+        │                     │                         │
+        │                     │ tables: [T1, T2]        │ tables: [T3]
+        │                     │ kernel: FUSED           │ kernel: KEY_VALUE
+        │                     ▼                         ▼
+        ├── _emb_modules: [BatchedFusedEmbeddingBag,   KeyValueEmbeddingBag, ...]
+        │                  │                            │
+        │                  └── _emb_module: TBE         └── _emb_module: KV-TBE
+        │                      (fuses T1, T2)               (handles T3)
+        │
+        ├── _feature_splits: [2, 1, ...]  # num features per group
+        │
+        └── forward(KJT) → split by _feature_splits → each _emb_module → concat results
+
     """
 
     def __init__(
@@ -497,7 +622,7 @@ class ShardedEmbeddingBagCollection(
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
         self._module_fqn = module_fqn
         # Normalize to lowercase for case-insensitive matching
-        self._sharded_module_order_overwrite = (
+        self._sharded_module_order_overwrite: Optional[List[str]] = (
             [s.lower() for s in sharded_module_order_overwrite]
             if sharded_module_order_overwrite is not None
             else None
