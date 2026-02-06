@@ -41,6 +41,7 @@ from torchrec.distributed.batched_embedding_kernel import (
     ShardedBatchedFusedEmbedding,
     ShardedBatchedFusedEmbeddingBag,
     SparseType,
+    TritonBatchedFusedEmbeddingBag,
     ZeroCollisionEmbeddingCache,
     ZeroCollisionKeyValueEmbedding,
     ZeroCollisionKeyValueEmbeddingBag,
@@ -618,6 +619,12 @@ class GroupedPooledEmbeddingsLookup(
                     sharding_type=sharding_type,
                     env=env,
                 )
+        elif config.compute_kernel == EmbeddingComputeKernel.FUSED_TRITON:
+            return TritonBatchedFusedEmbeddingBag(
+                config=config,
+                pg=pg,
+                device=device,
+            )
         elif config.compute_kernel in {
             EmbeddingComputeKernel.KEY_VALUE,
         }:
