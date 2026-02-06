@@ -354,6 +354,9 @@ class ModelInput(Pipelineable):
         lengths_dtype: torch.dtype = torch.int64,
         all_zeros: bool = False,
         pin_memory: bool = False,  # pin_memory is needed for training job qps benchmark
+        power_law_alpha: Optional[
+            float
+        ] = None,  # If set, use power-law distribution for indices
     ) -> "ModelInput":
         """
         Returns a single batch of `ModelInput`
@@ -382,6 +385,7 @@ class ModelInput(Pipelineable):
                 offsets_dtype=offsets_dtype,
                 lengths_dtype=lengths_dtype,
                 all_zeros=all_zeros,
+                power_law_alpha=power_law_alpha,
             )
             if tables is not None and len(tables) > 0
             else None
@@ -400,6 +404,7 @@ class ModelInput(Pipelineable):
                 offsets_dtype=offsets_dtype,
                 lengths_dtype=lengths_dtype,
                 all_zeros=all_zeros,
+                power_law_alpha=power_law_alpha,
             )
             if weighted_tables is not None and len(weighted_tables) > 0
             else None
@@ -424,6 +429,97 @@ class ModelInput(Pipelineable):
         )
 
     @staticmethod
+    def _generate_power_law_indices(
+        alpha: float,
+        num_indices: int,
+        num_embeddings: int,
+        dtype: torch.dtype,
+        device: Optional[torch.device],
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Generate indices following a power-law distribution.
+
+        For a continuous power-law distribution f(x) ∝ 1/x^alpha on [1, n],
+        this uses inverse CDF sampling and shifts results to produce 0-indexed
+        outputs in [0, n-1].
+
+        Args:
+            alpha: The power-law exponent (must be >= 0). Higher values produce more
+                skewed distributions with more samples at low indices.
+                - alpha=0: uniform distribution
+                - 0<alpha<1: truncated power-law via inverse CDF
+                - alpha≈1: log-uniform distribution (special case, uses tolerance)
+                - alpha>1: Pareto distribution via inverse CDF with rejection for truncation
+            num_indices: Number of indices to generate.
+            num_embeddings: Maximum index value (exclusive), i.e., indices in [0, num_embeddings).
+                Must be >= 1.
+            dtype: Data type of the output tensor.
+            device: Device to generate tensor on.
+            seed: Optional random seed (unused, for API compatibility).
+
+        Returns:
+            Tensor of indices following the power-law distribution, in range [0, num_embeddings).
+
+        Raises:
+            ValueError: If alpha < 0 or num_embeddings < 1.
+        """
+        # Validate inputs
+        if alpha < 0:
+            raise ValueError(f"alpha must be >= 0, got {alpha}")
+        if num_embeddings < 1:
+            raise ValueError(f"num_embeddings must be >= 1, got {num_embeddings}")
+
+        # Handle trivial case: only one possible index
+        if num_embeddings == 1:
+            return torch.zeros(num_indices, dtype=dtype, device=device)
+
+        if alpha == 0.0:
+            return torch.randint(
+                0, num_embeddings, (num_indices,), dtype=dtype, device=device
+            )
+
+        u = torch.rand(num_indices, device=device)
+        # Avoid u=0 or u=1 which can cause inf
+        u = u.clamp(1e-10, 1 - 1e-10)
+
+        # Use tolerance for alpha ≈ 1 to avoid numerical instability
+        # When |alpha - 1| < tolerance, exponents become very large (>500)
+        # Using 2e-3 to account for floating-point representation issues
+        # (e.g., abs(0.999 - 1.0) may be slightly > 1e-3 due to float precision)
+        alpha_tolerance = 2e-3
+        if abs(alpha - 1.0) < alpha_tolerance:
+            # Log-uniform distribution (f(x) ∝ 1/x)
+            # CDF: F(x) = ln(x) / ln(n)
+            # Inverse CDF: x = n^u, produces values in [1, n]
+            # Subtract 1 to convert from 1-indexed to 0-indexed
+            indices = (num_embeddings**u - 1).long()
+        elif alpha < 1.0:
+            # Truncated power-law on [1, n] with f(x) ∝ 1/x^alpha
+            # CDF: F(x) = (x^(1-alpha) - 1) / (n^(1-alpha) - 1)
+            # Inverse CDF: x = (u * (n^(1-alpha) - 1) + 1)^(1/(1-alpha))
+            # Subtract 1 to convert from 1-indexed [1,n] to 0-indexed [0,n-1]
+            n_term = num_embeddings ** (1 - alpha) - 1
+            indices = ((u * n_term + 1) ** (1 / (1 - alpha)) - 1).long()
+        else:
+            # Pareto/power-law on [1, inf) with f(x) ∝ 1/x^alpha, alpha > 1
+            # CDF: F(x) = 1 - x^(1-alpha)
+            # Inverse CDF: x = (1-u)^(1/(1-alpha)) = (1-u)^(-1/(alpha-1))
+            # Subtract 1 to convert from 1-indexed to 0-indexed
+            exponent = -1 / (alpha - 1)
+            indices = ((1 - u) ** exponent - 1).long()
+            # Resample any out-of-bounds values
+            mask = indices >= num_embeddings
+            while mask.any():
+                u_new = torch.rand(mask.sum(), device=device).clamp(1e-10, 1 - 1e-10)
+                indices[mask] = ((1 - u_new) ** exponent - 1).long()
+                mask = indices >= num_embeddings
+
+        return indices.clamp(0, num_embeddings - 1).to(
+            dtype
+        )  # safety clamp, shouldn't trigger
+
+    @staticmethod
     def _create_features_lengths_indices(
         batch_size: int,
         tables: Union[
@@ -436,6 +532,7 @@ class ModelInput(Pipelineable):
         indices_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
         all_zeros: bool = False,
+        power_law_alpha: Optional[float] = None,
     ) -> Tuple[List[str], List[torch.Tensor], List[torch.Tensor]]:
         """
         Create keys, lengths, and indices for a KeyedJaggedTensor from embedding table configs.
@@ -487,21 +584,28 @@ class ModelInput(Pipelineable):
 
             # indices
             num_indices = cast(int, torch.sum(_lengths).item())
-            _indices = (
-                torch.zeros(
+            if all_zeros:
+                _indices = torch.zeros(
                     (num_indices,),
                     dtype=indices_dtype,
                     device=device,
                 )
-                if all_zeros
-                else torch.randint(
+            elif power_law_alpha is not None:
+                _indices = ModelInput._generate_power_law_indices(
+                    alpha=power_law_alpha,
+                    num_indices=num_indices,
+                    num_embeddings=num_embeddings,
+                    dtype=indices_dtype,
+                    device=device,
+                )
+            else:
+                _indices = torch.randint(
                     0,
                     num_embeddings,
                     (num_indices,),
                     dtype=indices_dtype,
                     device=device,
                 )
-            )
             indices_per_feature.append(_indices)
         return features, lengths_per_feature, indices_per_feature
 
@@ -574,6 +678,7 @@ class ModelInput(Pipelineable):
         offsets_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
         all_zeros: bool = False,
+        power_law_alpha: Optional[float] = None,
     ) -> KeyedJaggedTensor:
         features, lengths_per_feature, indices_per_feature = (
             ModelInput._create_features_lengths_indices(
@@ -586,6 +691,7 @@ class ModelInput(Pipelineable):
                 indices_dtype=indices_dtype,
                 lengths_dtype=lengths_dtype,
                 all_zeros=all_zeros,
+                power_law_alpha=power_law_alpha,
             )
         )
         return ModelInput._assemble_kjt(
