@@ -2179,13 +2179,27 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         optimizer: torch.optim.Optimizer,
         device: torch.device,
         apply_jit: bool = False,
+        inplace_copy_batch_to_gpu: bool = False,
     ) -> None:
-        super().__init__(model, optimizer, device, True, apply_jit)
+        super().__init__(
+            model,
+            optimizer,
+            device,
+            execute_all_batches=True,
+            apply_jit=apply_jit,
+            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+        )
         self._batch_loader: Optional[DataLoadingThread[In]] = None
 
     def __del__(self) -> None:
         if self._batch_loader is not None:
             self._batch_loader.stop()
+
+    def reset(self) -> None:
+        super().reset()
+        if self._batch_loader is not None:
+            self._batch_loader.stop()
+        self._batch_loader = None
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         if not self._batch_loader:
@@ -2242,6 +2256,68 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             self.wait_sparse_data_dist(self.contexts[1])
         self.dequeue_batch()
 
+        return output
+
+
+class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        """
+        For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
+            batches[0]: i+0 batch, fwd/bwd/opt (expecting output_dist)
+            batches[1]: i+1 batch, for input_dist (expecting copied to device), and compute_and_output_dist
+            batches[2]: i+2 batch, for copy_batch_to_gpu (expecting non-exhausted dataloader iter)
+        """
+
+        # attach the model just in case the user forgets to call it, especially when the user
+        # pauses the pipeline.progress and detach the model for other purpose.
+        if not self._model_attached:
+            self.attach(self._model)
+
+        # fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
+        self.fill_pipeline(dataloader_iter)
+
+        # here is the expected stop after exhausting all batches
+        if not self.batches:
+            raise StopIteration
+
+        # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
+        self._set_module_context(self.contexts[0])
+
+        # start embedding_lookup so it can overlap with previous optimizer
+        if not self._embedding_lookup_after_data_dist:
+            # pyre-ignore [6]
+            self.start_embedding_lookup(self.batches[0], self.contexts[0])
+
+        if self._model.training:
+            with record_function("## zero_grad ##"):
+                self._optimizer.zero_grad()
+
+        # wait for batches[0] being available on device, this should always be completed since
+        # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
+        self._wait_for_batch()
+
+        if len(self.batches) >= 2:
+            # invoke splits all_to_all comms (first part of input_dist)
+            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+
+        # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
+        self.enqueue_batch(dataloader_iter)
+
+        if self._embedding_lookup_after_data_dist:
+            # pyre-ignore [6]
+            self.start_embedding_lookup(self.batches[0], self.contexts[0])
+
+        # forward
+        with record_function(f"## eval {self.contexts[0].index} ##"):
+            with torch.no_grad():
+                losses, output = self._model_fwd(self.batches[0])
+
+        if len(self.batches) >= 2:
+            # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
+            self.wait_sparse_data_dist(self.contexts[1])
+
+        self.dequeue_batch()
         return output
 
 
