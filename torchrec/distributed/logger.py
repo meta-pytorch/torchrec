@@ -77,6 +77,10 @@ from typing_extensions import ParamSpec
 # Module exports - intentionally empty as these are internal utilities
 __all__: list[str] = []
 
+# Some inputs like can get extremely large.
+# Adding logic to limit the input size by truncating any args larger than this size
+ARG_SIZE_LIMIT = 800000
+
 
 def _get_or_create_logger(destination: str) -> logging.Logger:
     """
@@ -322,7 +326,6 @@ def _get_input_from_func(
         input_vars = {
             param.name: param.default for param in signature.parameters.values()
         }
-
         # Update input_vars with actual argument values
         for key, value in bound_args.arguments.items():
             # Special handling for constructor methods (__init__)
@@ -337,6 +340,10 @@ def _get_input_from_func(
             # learning rates, batch sizes, etc.
             if isinstance(value, (int, float)):
                 input_vars[key] = value
+            elif len(str(value)) > ARG_SIZE_LIMIT:
+                input_vars[key] = (
+                    f"Argument removed due to size limit. Original size: {len(str(value))}"
+                )
             else:
                 input_vars[key] = str(value)
 

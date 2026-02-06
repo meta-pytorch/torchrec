@@ -99,7 +99,6 @@ class RunOptions(BenchFuncConfig):
 
     world_size: int = 2
     batch_size: int = 1024 * 32
-    num_float_features: int = 10
     num_batches: int = 10
     sharding_type: ShardingType = ShardingType.TABLE_WISE
     input_type: str = "kjt"
