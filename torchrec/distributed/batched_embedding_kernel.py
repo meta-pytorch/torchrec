@@ -26,6 +26,7 @@ from typing import (
     List,
     Optional,
     Tuple,
+    TYPE_CHECKING,
     TypeVar,
     Union,
 )
@@ -103,6 +104,11 @@ from torchrec.optim.fused import (
     FusedOptimizerModule,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+if TYPE_CHECKING:
+    from deeplearning.fbgemm.fbgemm_gpu.fb.triton.triton_table_batched_embeddings import (
+        TritonTableBatchedEmbeddingBags,
+    )
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -3640,6 +3646,208 @@ class BatchedFusedEmbeddingBag(
 
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
+
+
+class TritonBatchedFusedEmbeddingBag(
+    BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizerModule
+):
+    """
+    Triton-based implementation of BatchedFusedEmbeddingBag.
+
+    Uses TritonTableBatchedEmbeddingBags instead of SplitTableBatchedEmbeddingBagsCodegen
+    for the embedding lookup. This provides a portable alternative to the CUDA-based
+    implementation while maintaining compatible interfaces.
+    """
+
+    def __init__(
+        self,
+        config: GroupedEmbeddingConfig,
+        pg: Optional[dist.ProcessGroup] = None,
+        device: Optional[torch.device] = None,
+        sharding_type: Optional[ShardingType] = None,
+        env: Optional[ShardingEnv] = None,
+    ) -> None:
+        super().__init__(config, pg, device, sharding_type)
+
+        # Lazy import to avoid pulling in triton dependencies at module load time
+        # This is necessary for forward compatibility with prod backends
+        from deeplearning.fbgemm.fbgemm_gpu.fb.triton.triton_table_batched_embeddings import (
+            TritonTableBatchedEmbeddingBags,
+        )
+
+        # Only support CUDA for Triton TBE
+        assert (
+            device is not None and device.type == "cuda"
+        ), "TritonBatchedFusedEmbeddingBag only supports CUDA devices"
+
+        for table in config.embedding_tables:
+            assert table.local_cols % 4 == 0, (
+                f"table {table.name} has local_cols={table.local_cols} "
+                "not divisible by 4. "
+            )
+
+        weights_precision = data_type_to_sparse_type(config.data_type)
+        fused_params = config.fused_params or {}
+
+        # Get optimizer type from fused_params, default to SGD
+        optimizer = fused_params.get("optimizer", OptimType.EXACT_SGD)
+        learning_rate = fused_params.get("learning_rate", 0.01)
+        eps = fused_params.get("eps", 0.1)
+
+        # Create Triton TBE module
+        self._emb_module: TritonTableBatchedEmbeddingBags = (
+            TritonTableBatchedEmbeddingBags(
+                embedding_specs=list(zip(self._local_rows, self._local_cols)),
+                weights_precision=weights_precision.as_dtype(),
+                learning_rate=learning_rate,
+                eps=eps,
+                optimizer=optimizer,
+                device=device,
+            )
+        )
+
+        # Create a simple fused optimizer that delegates to the Triton TBE
+        self._optim: TritonEmbeddingFusedOptimizer = TritonEmbeddingFusedOptimizer(
+            config,
+            self._emb_module,
+            pg,
+        )
+        self.init_parameters()
+
+    @property
+    def _param_per_table(self) -> Dict[str, TableBatchedEmbeddingSlice]:
+        # For Triton TBE, combine multiple shards of the same table (e.g. CW)
+        # into a single TableBatchedEmbeddingSlice to match fused TBE behavior.
+        result: Dict[str, TableBatchedEmbeddingSlice] = {}
+        table_name_to_count = self.table_name_to_count.copy()
+        for t_idx, config in enumerate(self._config.embedding_tables):
+            table_name = config.name
+            if table_name not in table_name_to_count:
+                continue
+            table_count = table_name_to_count.pop(table_name)
+            offset = self._emb_module.table_offsets[t_idx].item()
+            rows = config.local_rows
+            dim = config.local_cols
+            result[table_name] = TableBatchedEmbeddingSlice(
+                data=self._emb_module.weight,
+                start_offset=offset,
+                end_offset=offset + table_count * rows * dim,
+                num_embeddings=-1,
+                embedding_dim=dim,
+            )
+        return result
+
+    @_param_per_table.setter
+    def _param_per_table(self, v: Dict[str, TableBatchedEmbeddingSlice]) -> None:
+        self.__dict__["_param_per_table"] = v
+
+    @property
+    # pyre-ignore[15]
+    def emb_module(
+        self,
+    ) -> "TritonTableBatchedEmbeddingBags":
+        return self._emb_module
+
+    @property
+    def fused_optimizer(self) -> FusedOptimizer:
+        return self._optim
+
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+        vbe_output: Optional[torch.Tensor] = None,
+        vbe_output_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        weights = features.weights_or_none()
+        if weights is not None and not torch.is_floating_point(weights):
+            weights = None
+        return self._emb_module(
+            indices=features.values().long(),
+            offsets=features.offsets().long(),
+            per_sample_weights=weights,
+        )
+
+    def named_buffers(
+        self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+    ) -> Iterator[Tuple[str, torch.Tensor]]:
+        yield from ()
+
+    def named_parameters(
+        self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+    ) -> Iterator[Tuple[str, nn.Parameter]]:
+        for name, tensor in self.named_split_embedding_weights(
+            prefix, recurse, remove_duplicate
+        ):
+            param = nn.Parameter(tensor)
+            # pyre-ignore
+            param._in_backward_optimizers = [EmptyFusedOptimizer()]
+            yield name, param
+
+    def split_embedding_weights(self) -> List[torch.Tensor]:
+        return self._emb_module.split_embedding_weights()
+
+    def flush(self) -> None:
+        self._emb_module.flush()
+
+    def purge(self) -> None:
+        self._emb_module.reset_cache_states()
+
+
+class TritonEmbeddingFusedOptimizer(FusedOptimizer):
+    """
+    Fused optimizer for Triton TBE. The optimizer is built into the Triton TBE backward pass.
+
+    For sharded embeddings (e.g., column-wise sharding), this optimizer creates
+    shard-aware parameter keys to avoid conflicts when combined with CombinedOptimizer.
+    """
+
+    def __init__(
+        self,
+        config: GroupedEmbeddingConfig,
+        emb_module: "TritonTableBatchedEmbeddingBags",
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> None:
+        self._emb_module = emb_module
+        self._pg = pg
+
+        # pyre-ignore [33]
+        state: Dict[Any, Any] = {}
+        param_group: Dict[str, Any] = {
+            "params": [],
+            "lr": emb_module.learning_rate,
+        }
+        params: Dict[str, Union[torch.Tensor, ShardedTensor]] = {}
+
+        # Create parameters from embedding weights with shard-aware keys
+        for table_config, weight in zip(
+            config.embedding_tables,
+            emb_module.split_embedding_weights(),
+        ):
+            # Use local_metadata to create unique shard-aware keys for sharded tables
+            # This prevents duplicate param key errors in CombinedOptimizer
+            if table_config.local_metadata is not None:
+                shard_offsets = table_config.local_metadata.shard_offsets
+                row_offset = shard_offsets[0] if len(shard_offsets) > 0 else 0
+                col_offset = shard_offsets[1] if len(shard_offsets) > 1 else 0
+                param_key = f"{table_config.name}.weight.{row_offset}_{col_offset}"
+            else:
+                param_key = table_config.name + ".weight"
+
+            param = nn.Parameter(weight)
+            state[param] = {}
+            param_group["params"].append(param)
+            params[param_key] = param
+
+        super().__init__(params, state, [param_group])
+
+    def zero_grad(self, set_to_none: bool = False) -> None:
+        # Learning rate is updated directly on the module
+        self._emb_module.learning_rate = self.param_groups[0]["lr"]
+
+    # pyre-ignore [2]
+    def step(self, closure: Any = None) -> None:
+        # Learning rate is updated directly on the module
+        self._emb_module.learning_rate = self.param_groups[0]["lr"]
 
 
 class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
