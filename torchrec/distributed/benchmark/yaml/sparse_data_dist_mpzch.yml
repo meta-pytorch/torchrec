@@ -58,6 +58,9 @@ EmbeddingTablesConfig:
             single_ttl: 1
           disable_fallback: False
 PlannerConfig:
+  pooling_factors: [30.0]  # Must match ModelInputConfig.feature_pooling_avg
+  hardware:  # A100
+    hbm_cap: 85899345920  # 80GB
   # MP-ZCH only works with row-wise sharding
   additional_constraints:
     FP16_table:

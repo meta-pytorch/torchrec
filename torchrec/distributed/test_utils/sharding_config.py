@@ -15,6 +15,9 @@ from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
+from torchrec.distributed.planner.storage_reservations import (
+    HeuristicalStorageReservation,
+)
 from torchrec.distributed.planner.types import CacheParams, ParameterConstraints
 from torchrec.distributed.types import KeyValueParams, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
@@ -25,12 +28,17 @@ class PlannerConfig:
     planner_type: str = "embedding"
     world_size: int = 2
     device_group: str = "cuda"
+    batch_size: int = 512  # Must match RunOptions.batch_size for accurate planner stats
     pooling_factors: List[float] = field(default_factory=lambda: [POOLING_FACTOR])
     num_poolings: Optional[List[float]] = None
     batch_sizes: Optional[List[int]] = None
     compute_kernel: EmbeddingComputeKernel = EmbeddingComputeKernel.FUSED
     sharding_type: ShardingType = ShardingType.TABLE_WISE
     additional_constraints: Dict[str, Any] = field(default_factory=dict)
+    # Storage reservation percentage (0.0 to 1.0) for planner memory estimation
+    storage_reservation_percentage: float = 0.15
+    # Hardware configuration for topology (dict with keys: hbm_cap, ddr_cap, etc.)
+    hardware: Optional[Dict[str, Any]] = None
 
     def generate_topology(self, device_type: str) -> Topology:
         """
@@ -40,11 +48,33 @@ class PlannerConfig:
             A Topology object representing the network topology for distributed training
         """
         local_world_size = get_local_size(self.world_size)
-        return Topology(
-            world_size=self.world_size,
-            local_world_size=local_world_size,
-            compute_device=device_type,
-        )
+
+        # Build topology kwargs from hardware config
+        topology_kwargs: Dict[str, Any] = {
+            "world_size": self.world_size,
+            "local_world_size": local_world_size,
+            "compute_device": device_type,
+        }
+
+        if self.hardware is not None:
+            if "hbm_cap" in self.hardware:
+                topology_kwargs["hbm_cap"] = self.hardware["hbm_cap"]
+            if "ddr_cap" in self.hardware:
+                topology_kwargs["ddr_cap"] = self.hardware["ddr_cap"]
+            if "hbm_mem_bw" in self.hardware:
+                topology_kwargs["hbm_mem_bw"] = self.hardware["hbm_mem_bw"]
+            if "ddr_mem_bw" in self.hardware:
+                topology_kwargs["ddr_mem_bw"] = self.hardware["ddr_mem_bw"]
+            if "hbm_to_ddr_mem_bw" in self.hardware:
+                topology_kwargs["hbm_to_ddr_mem_bw"] = self.hardware[
+                    "hbm_to_ddr_mem_bw"
+                ]
+            if "intra_host_bw" in self.hardware:
+                topology_kwargs["intra_host_bw"] = self.hardware["intra_host_bw"]
+            if "inter_host_bw" in self.hardware:
+                topology_kwargs["inter_host_bw"] = self.hardware["inter_host_bw"]
+
+        return Topology(**topology_kwargs)
 
     def table_to_constraint(
         self,
@@ -113,16 +143,29 @@ class PlannerConfig:
             )
             constraints[name] = cons
 
+        # Create storage reservation if percentage > 0
+        storage_reservation = (
+            HeuristicalStorageReservation(
+                percentage=self.storage_reservation_percentage
+            )
+            if self.storage_reservation_percentage > 0
+            else None
+        )
+
         if self.planner_type == "embedding":
             return EmbeddingShardingPlanner(
                 topology=topology,
+                batch_size=self.batch_size,
                 constraints=constraints if constraints else None,
+                storage_reservation=storage_reservation,
             )
         elif self.planner_type == "hetero":
             topology_groups = {self.device_group: topology}
             return HeteroEmbeddingShardingPlanner(
                 topology_groups=topology_groups,
+                batch_size=self.batch_size,
                 constraints=constraints if constraints else None,
+                storage_reservation=storage_reservation,
             )
         else:
             raise RuntimeError(f"Unknown planner type: {self.planner_type}")

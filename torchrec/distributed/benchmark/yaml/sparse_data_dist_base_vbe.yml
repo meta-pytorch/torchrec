@@ -35,6 +35,9 @@ EmbeddingTablesConfig:
         num_embeddings: 100_000
         feature_names: ["additional_2_1"]
 PlannerConfig:
+  pooling_factors: [30.0]  # Must match ModelInputConfig.feature_pooling_avg
+  hardware:  # A100
+    hbm_cap: 85899345920  # 80GB
   additional_constraints:
     large_table:
       sharding_types: [column_wise]
