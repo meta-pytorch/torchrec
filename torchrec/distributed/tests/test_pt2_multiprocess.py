@@ -33,11 +33,10 @@ from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import QCommsConfig
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.planner.constants import DEFAULT_PERF_ESTIMATOR
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
-from torchrec.distributed.planner.shard_estimators import (
-    EmbeddingPerfEstimator,
-    EmbeddingStorageEstimator,
-)
+from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
+from torchrec.distributed.planner.shard_estimators import EmbeddingStorageEstimator
 from torchrec.distributed.planner.types import ShardingPlan
 from torchrec.distributed.sharding_plan import EmbeddingBagCollectionSharder
 from torchrec.distributed.test_utils.infer_utils import TestModelInfo
@@ -268,7 +267,9 @@ def _test_compile_rank_fn(
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -547,7 +548,9 @@ def _test_compile_fake_pg_fn(
             topology=topology,
             batch_size=batch_size,
             estimator=[
-                EmbeddingPerfEstimator(topology=topology),
+                EmbeddingPerfEstimatorFactory.create(
+                    DEFAULT_PERF_ESTIMATOR, topology=topology
+                ),
                 EmbeddingStorageEstimator(topology=topology),
             ],
         ),
