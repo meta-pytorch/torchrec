@@ -18,7 +18,7 @@ ModelInputConfig:
 ModelSelectionConfig:
   model_name: "test_sparse_nn"
   model_config:
-    num_float_features: 1000
+    num_float_features: 10
 EmbeddingTablesConfig:
   num_unweighted_features: 20
   num_weighted_features: 20
