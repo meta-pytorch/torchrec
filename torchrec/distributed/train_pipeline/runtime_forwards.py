@@ -100,7 +100,9 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
             data.record_stream(cur_stream)
             ctx.record_stream(cur_stream)
 
-        return self._module.compute_and_output_dist(ctx, data)
+        awaitable = self._module.compute_and_output_dist(ctx, data)
+        self._context.output_dist_embeddings_requests[self._name] = awaitable
+        return awaitable
 
 
 class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):

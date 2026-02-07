@@ -31,9 +31,20 @@ from typing import (
 
 import torch
 from torch.autograd.profiler import record_function
+from torchrec.distributed.comm_ops import Request  # noqa: F401
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
+from torchrec.distributed.embedding import EmbeddingCollectionAwaitable  # noqa: F401
+from torchrec.distributed.embeddingbag import (
+    EmbeddingBagCollectionAwaitable,  # noqa: F401
+)
 from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.model_parallel import ShardedModule
+from torchrec.distributed.train_pipeline.backward_injection import (
+    BackwardHookRegistry,
+    BackwardHookWork,
+    InjectionSite,
+    register_hooks,
+)
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
     In,
@@ -68,7 +79,7 @@ from torchrec.distributed.train_pipeline.utils import (
     DataLoadingThread,
     use_context_for_postprocs,
 )
-from torchrec.distributed.types import Awaitable
+from torchrec.distributed.types import Awaitable, NoWait, ShardingType  # noqa: F401
 from torchrec.pt2.checks import is_torchdynamo_compiling
 from torchrec.pt2.utils import default_pipeline_input_transformer
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -506,6 +517,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         inplace_copy_batch_to_gpu: bool = False,
+        backward_hook_registry: Optional[BackwardHookRegistry] = None,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -579,6 +591,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
                 f"{self._dmp_collection_sync_interval_batches} batches"
             )
+
+        # Backward hook registry for injecting work during backward comms
+        self._backward_hook_registry = backward_hook_registry or BackwardHookRegistry()
+
         super().__init__()
 
         # DEPRECATED FIELDS
@@ -779,6 +795,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             self._state = PipelineState.CALL_FWD
             losses, output = self._model_fwd(self.batches[0])
 
+        if torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:killswitch_enable_sdd_backward_injection"
+        ):
+            # Register all user-configured backward hooks
+            self._register_output_dist_hooks(self.contexts[0])
+
         if self._enqueue_batch_after_forward:
             # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here.
             # Start this step after the forward of batch i, so that the H2D copy doesn't compete
@@ -867,6 +889,39 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             return
 
         self._pipeline_model(batch, context, pipelined_forward)
+
+    def register_backward_hook(
+        self,
+        site: InjectionSite,
+        work: BackwardHookWork,
+    ) -> None:
+        """
+        Registers work to execute during backward pass of an EC/EBC.
+
+        Args:
+            site: Injection site specification with fqn and sharding_type.
+                  e.g., InjectionSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE)
+            work: Callable that receives the pipeline instance.
+                  Executed sequentially with other work at same site.
+
+        Example:
+            pipeline.register_backward_hook(
+                site=InjectionSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE),
+                work=lambda p: p._optimizer.step(),
+            )
+        """
+        self._backward_hook_registry.add_hook(site, work)
+
+    def _register_output_dist_hooks(
+        self,
+        context: TrainPipelineContext,
+    ) -> None:
+        """Registers all configured backward hooks on output dist tensors."""
+        register_hooks(
+            registry=self._backward_hook_registry,
+            pipeline=self,
+            output_dist_embeddings_requests=context.output_dist_embeddings_requests,
+        )
 
     def copy_batch_to_gpu(
         self,
