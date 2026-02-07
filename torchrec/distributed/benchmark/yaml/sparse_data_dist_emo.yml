@@ -30,6 +30,9 @@ EmbeddingTablesConfig:
         num_embeddings: 100_000
         feature_names: ["additional_2_1"]
 PlannerConfig:
+  pooling_factors: [1.0]  # Default pooling factor (no ModelInputConfig.feature_pooling_avg specified)
+  hardware:  # A100
+    hbm_cap: 85899345920  # 80GB
   additional_constraints:
     large_table:
       compute_kernels: [fused_uvm_caching]
