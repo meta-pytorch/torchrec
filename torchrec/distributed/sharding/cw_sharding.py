@@ -150,7 +150,6 @@ class BaseCwEmbeddingSharding(BaseTwEmbeddingSharding[C, F, T, W]):
             [] for _ in range(world_size)
         ]
         for info in sharding_infos:
-            # pyre-fixme [16]
             shards: List[ShardMetadata] = info.param_sharding.sharding_spec.shards
 
             # construct the global sharded_tensor_metadata
@@ -188,11 +187,9 @@ class BaseCwEmbeddingSharding(BaseTwEmbeddingSharding[C, F, T, W]):
                     stride=info.param.stride(),
                 )
 
-            # pyre-fixme [6]
             for i, rank in enumerate(info.param_sharding.ranks):
                 # Remap rank by number of replica groups if 2D parallelism is enabled
                 rank = (
-                    # pyre-ignore[16]
                     self._env.remap_rank(
                         rank,
                         ShardingType.COLUMN_WISE,

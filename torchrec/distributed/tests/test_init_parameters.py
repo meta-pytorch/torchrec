@@ -157,7 +157,6 @@ class ParameterInitializationTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -210,7 +209,6 @@ class ParameterInitializationTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [

@@ -74,7 +74,6 @@ class TestSequentialModel(torch.nn.Module):
 
 class FusedEmbeddingBagCollectionTest(unittest.TestCase):
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from(devices))
     def test_unweighted(
         self,
@@ -127,7 +126,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
         )
 
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from(devices))
     def test_unweighted_batchsize_1_shared(
         self,
@@ -167,7 +165,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
         self.assertEqual(pooled_embeddings["f3"].shape, (features.stride(), 4))
 
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from(devices))
     def test_unweighted_batchsize_1_one_table(
         self,
@@ -201,7 +198,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
         self.assertEqual(pooled_embeddings["f2"].shape, (features.stride(), 4))
 
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from(devices))
     def test_shared_tables(
         self,
@@ -239,7 +235,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
         )
 
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from(devices))
     def test_state_dict(
         self,
@@ -265,7 +260,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
         ebc.load_state_dict(ebc.state_dict())
 
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from(devices))
     def test_state_dict_manual(self, device: torch.device) -> None:
         eb1_config = EmbeddingBagConfig(
@@ -352,7 +346,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
         )
 
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from(devices))
     def test_shared_tables_shared_features(self, device: torch.device) -> None:
         eb1_config = EmbeddingBagConfig(
@@ -437,7 +430,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
         )
 
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from(devices))
     def test_weighted(self, device: torch.device) -> None:
         eb1_config = EmbeddingBagConfig(
@@ -505,7 +497,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
         )
 
     @settings(deadline=None)
-    # pyre-ignore
     @given(
         optimizer_type_and_kwargs=st.sampled_from(
             [
@@ -574,7 +565,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
 
         opt = optimizer_type(ebc.parameters(), **optimizer_kwargs)
 
-        # pyre-ignore
         def run_one_training_step() -> None:
             fused_pooled_embeddings = fused_ebc(features)
             fused_vals = []
@@ -663,7 +653,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
     def test_fuse_embedding_optimizer_replacement_cpu(self) -> None:
         self.unweighted_replacement(torch.device("cpu"))
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "This test requires a gpu",
@@ -671,7 +660,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
     def test_fuse_embedding_optimizer_replacement_cuda(self) -> None:
         self.unweighted_replacement(torch.device("cuda"))
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "This test requires a gpu",
@@ -682,7 +670,6 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
         )
 
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from(devices))
     def test_ebc_model_replacement(self, device: torch.device) -> None:
         eb1_config = EmbeddingBagConfig(
@@ -788,7 +775,6 @@ class FusedEmbeddingCollectionTest(unittest.TestCase):
         "This test requires a gpu",
     )
     @settings(deadline=None)
-    # pyre-ignore
     @given(device=st.sampled_from([torch.device("cuda")]))
     def test_forward_with_state_dict(
         self,
@@ -897,7 +883,6 @@ class FusedEmbeddingCollectionTest(unittest.TestCase):
         "This test requires a gpu",
     )
     @settings(deadline=None)
-    # pyre-ignore
     @given(
         optimizer_type_and_kwargs=st.sampled_from(
             [
@@ -966,7 +951,6 @@ class FusedEmbeddingCollectionTest(unittest.TestCase):
 
         opt = optimizer_type(ec.parameters(), **optimizer_kwargs)
 
-        # pyre-ignore
         def run_one_training_step() -> None:
             fused_embeddings = fused_ec(features)
             fused_vals = []
@@ -1002,7 +986,6 @@ class FusedEmbeddingCollectionTest(unittest.TestCase):
         "This test requires a gpu",
     )
     @settings(deadline=None)
-    # pyre-ignore
     @given(
         device=st.sampled_from([torch.device("cuda")]),
     )

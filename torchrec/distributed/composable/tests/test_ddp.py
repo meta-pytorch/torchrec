@@ -105,13 +105,11 @@ class DDPTest(MultiProcessTestBase):
                 weighted_tables=weighted_tables,
                 dense_device=ctx.device,
             )
-            # pyre-ignore
             m.sparse.ebc = trec_shard(
                 module=m.sparse.ebc,
                 device=ctx.device,
                 plan=column_wise(ranks=list(range(world_size))),
             )
-            # pyre-ignore
             m.sparse.weighted_ebc = trec_shard(
                 module=m.sparse.weighted_ebc,
                 device=ctx.device,
@@ -161,7 +159,6 @@ class DDPTest(MultiProcessTestBase):
             # assert p_sum.allclose(p_sum_loaded)
 
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     #  `torch.cuda.device_count() <= 1` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
@@ -175,7 +172,6 @@ class DDPTest(MultiProcessTestBase):
             )
 
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     #  `torch.cuda.device_count() <= 1` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,

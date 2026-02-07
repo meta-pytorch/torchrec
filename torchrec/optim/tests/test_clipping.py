@@ -39,7 +39,6 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         param_1.grad = torch.tensor([1.0, 2.0])
         gradient_clipping_optimizer.step()
 
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.equal(param_1.grad, torch.tensor([0.0, 0.0])))
 
     def test_clip_no_gradients_norm(self) -> None:
@@ -58,7 +57,6 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         param_1.grad = torch.tensor([0.5, 0.5])
         gradient_clipping_optimizer.step()
 
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.equal(param_1.grad, torch.tensor([0.5, 0.5])))
 
     def test_clip_partial_gradients_norm(self) -> None:
@@ -80,7 +78,6 @@ class TestGradientClippingOptimizer(unittest.TestCase):
 
         norm = 2.0**2 + 4.0**2
         expected_grad = torch.tensor([2.0, 4.0]) * norm ** (-0.5)
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.allclose(param_1.grad, expected_grad))
 
     def test_clip_partial_gradients_norm_multi_params(self) -> None:
@@ -116,9 +113,7 @@ class TestGradientClippingOptimizer(unittest.TestCase):
 
         print(param_1.grad, param_2.grad, expected_grad_1, expected_grad_2)
 
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.allclose(param_1.grad, expected_grad_1))
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.allclose(param_2.grad, expected_grad_2))
 
     def test_clip_all_gradients_value(self) -> None:
@@ -137,7 +132,6 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         param_1.grad = torch.tensor([1.0, 2.0])
         gradient_clipping_optimizer.step()
 
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.equal(param_1.grad, torch.tensor([0.0, 0.0])))
 
     def test_clip_no_gradients_value(self) -> None:
@@ -156,7 +150,6 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         param_1.grad = torch.tensor([0.5, 0.5])
         gradient_clipping_optimizer.step()
 
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.equal(param_1.grad, torch.tensor([0.5, 0.5])))
 
     def test_clip_gradients_value(self) -> None:
@@ -178,7 +171,6 @@ class TestGradientClippingOptimizer(unittest.TestCase):
 
         expected_grad = torch.tensor([1.0, 1.0])
 
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.allclose(param_1.grad, expected_grad))
 
     def test_clip_partial_gradients_value_multi_params(self) -> None:
@@ -209,9 +201,7 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         expected_grad_1 = torch.tensor([2.0, 2.0])
         expected_grad_2 = torch.tensor([2.0, 2.0])
 
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.allclose(param_1.grad, expected_grad_1))
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Optional[Tensor]`.
         self.assertTrue(torch.allclose(param_2.grad, expected_grad_2))
 
     @patch("torch.nn.utils.clip_grad_norm_")
@@ -447,7 +437,6 @@ class TestClipGradNorm(unittest.TestCase):
         expected_norm = (3.0**2 + 4.0**2) ** 0.5
         self.assertTrue(
             torch.allclose(
-                # pyre-ignore[6]: Expected Tensor but got Optional[Union[float, Tensor]]
                 total_norm,
                 torch.tensor(expected_norm),
             )
@@ -480,7 +469,6 @@ class TestClipGradNorm(unittest.TestCase):
         with patch("torch.distributed.all_reduce"):
             gradient_clipping_optimizer.clip_grad_norm_()
 
-        # pyre-ignore[6]: Expected Tensor but got Optional[Tensor]
         self.assertTrue(torch.allclose(param_1.grad, original_grad))
 
     def test_clip_grad_norm_applies_clipping_when_above_threshold(self) -> None:
@@ -515,7 +503,6 @@ class TestClipGradNorm(unittest.TestCase):
         clip_coef_clamped = min(clip_coef.item(), 1.0)
         expected_grad = original_grad * clip_coef_clamped
 
-        # pyre-ignore[6]: Expected Tensor but got Optional[Tensor]
         self.assertTrue(torch.allclose(param_1.grad, expected_grad))
 
     def test_clip_grad_norm_with_replicate_and_sharded_params(self) -> None:
@@ -547,5 +534,4 @@ class TestClipGradNorm(unittest.TestCase):
             total_norm = gradient_clipping_optimizer.clip_grad_norm_()
 
         self.assertIsNotNone(total_norm)
-        # pyre-ignore[16]: Optional has no attribute item
         self.assertGreater(total_norm.item(), 0)

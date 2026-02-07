@@ -200,7 +200,6 @@ def build_kjts(
 
 def benchmark_kjt(
     test_name: str,
-    # pyre-ignore[2]
     test_module: Union[torch.nn.Module, Callable[..., Any]],
     kjt: KeyedJaggedTensor,
     num_repeat: int,
@@ -336,7 +335,6 @@ class KJTDistInit(torch.nn.Module):
         )
 
 
-# pyre-ignore
 def dynamo_compile(
     method_name: str,
     kjt_module: torch.nn.Module,

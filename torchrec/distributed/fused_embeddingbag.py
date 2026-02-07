@@ -75,7 +75,6 @@ class ShardedFusedEmbeddingBagCollection(
                     broadcast_buffers=False,
                     static_graph=True,
                 )
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 self._lookups[index]._register_fused_optim(
                     optimizer_type, **optimizer_kwargs
                 )

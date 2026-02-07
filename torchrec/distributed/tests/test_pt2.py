@@ -5,7 +5,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# pyre-ignore-all-errors
 
 import copy
 import itertools
@@ -40,7 +39,6 @@ from torchrec.pt2.utils import (
 from torchrec.sparse.jagged_tensor import _kt_regroup_arguments
 
 try:
-    # pyre-ignore
     from caffe2.test.inductor.test_aot_inductor import AOTIRunnerUtil
 except (unittest.SkipTest, ImportError):
     if __name__ == "__main__":
@@ -139,7 +137,6 @@ def _sharded_quant_ebc_model(
             shardable_params=[table.name for table in mi.tables],
             fused_params=fused_params,
         )
-    # pyre-ignore
     plan = mi.planner.plan(
         mi.quant_model,
         [sharder],
@@ -147,12 +144,10 @@ def _sharded_quant_ebc_model(
 
     sharded_model = _shard_modules(
         module=mi.quant_model,
-        # pyre-ignore
         sharders=[sharder],
         # Always shard on meta
         device=torch.device("meta"),
         plan=plan,
-        # pyre-ignore
         env=ShardingEnv.from_local(world_size=mi.topology.world_size, rank=0),
     )
 
@@ -165,7 +160,6 @@ class _TestType(Enum):
     DYNAMO_COMPILE = auto()
 
 
-# pyre-ignore
 def _copy_input_tensors(t, device):
     if isinstance(t, torch.Tensor):
         ret = t.detach().clone().to(device)
@@ -181,10 +175,8 @@ def _copy_input_tensors(t, device):
         raise ValueError(f"Unsupported type {type(t)}")
 
 
-# pyre-ignore
 def _grad_detach_clone(t):
     if isinstance(t, torch.Tensor):
-        # pyre-ignore
         if t.grad is None:
             return None
         return t.grad.detach().clone()
@@ -196,7 +188,6 @@ def _grad_detach_clone(t):
         raise ValueError(f"Unsupported type {type(t)}")
 
 
-# pyre-ignore
 def _assert_close(actual, expected) -> None:
     if actual is None and expected is None:
         return
@@ -298,13 +289,11 @@ class TestPt2(unittest.TestCase):
                 assert_close(eager_output, export_gm_output)
 
             if test_aot_inductor:
-                # pyre-ignore
                 so_path: str = AOTIRunnerUtil.compile(
                     EM,
                     inputs,
                 )
                 device = "cuda"
-                # pyre-ignore
                 aot_inductor_module = AOTIRunnerUtil.load(device, so_path)
                 aot_actual_output = aot_inductor_module(*em_inputs)
                 assert_close(eager_output, aot_actual_output)
@@ -335,7 +324,6 @@ class TestPt2(unittest.TestCase):
         self,
         kjt_input_module: torch.nn.Module,
         kjt_keys: List[str],
-        # pyre-ignore
         inputs,
         backend: str = "eager",
     ) -> None:
@@ -478,7 +466,6 @@ class TestPt2(unittest.TestCase):
         device = "cuda"
         kjt: KeyedJaggedTensor = make_kjt([2, 3, 4, 5, 6], [1, 2, 1, 1], device=device)
         indices: List[int] = [1, 0, 3, 2]
-        # pyre-ignore
         inputs_fn = lambda kjt: (
             *kjt_module_kjt_inputs_with_strides(kjt),
             indices,
@@ -618,7 +605,6 @@ class TestPt2(unittest.TestCase):
         for n in ep.graph_module.graph.nodes:
             self.assertFalse("auto_functionalized" in str(n.name))
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",

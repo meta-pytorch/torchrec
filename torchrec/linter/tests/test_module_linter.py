@@ -48,7 +48,6 @@ class A:
 
         self.assertEqual(p.call_count, 0)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     #  `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(uses_LazyModuleExtensionMixin=st.booleans())
     def test_docstring_no_docstring(self, uses_LazyModuleExtensionMixin: bool) -> None:
@@ -68,7 +67,6 @@ class F(${parent_class_list}):
             "No docstring found in a TorchRec module" in p.call_args_list[0][0][0]
         )
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     #  `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(uses_LazyModuleExtensionMixin=st.booleans())
     def test_docstring_no_module_init(
@@ -99,7 +97,6 @@ class F(${parent_class_list}):
             "Missing docstring for forward function" in p.call_args_list[2][0][0]
         )
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     #  `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(uses_LazyModuleExtensionMixin=st.booleans())
     def test_missing_args(self, uses_LazyModuleExtensionMixin: bool) -> None:
@@ -134,7 +131,6 @@ class F(${parent_class_list}):
             "Missing docstring for forward function" in p.call_args_list[3][0][0]
         )
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     #  `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(uses_LazyModuleExtensionMixin=st.booleans())
     def test_valid_module(self, uses_LazyModuleExtensionMixin: bool) -> None:
@@ -172,7 +168,6 @@ class F(${parent_class_list}):
 
         self.assertEqual(p.call_count, 0)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     #  `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(uses_LazyModuleExtensionMixin=st.booleans())
     def test_num_ctor_args(self, uses_LazyModuleExtensionMixin: bool) -> None:

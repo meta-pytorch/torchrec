@@ -125,7 +125,6 @@ class TestKeyedTensor(unittest.TestCase):
             )
         )
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "meta", "cuda"]),
         regroup_func=st.sampled_from(
@@ -164,7 +163,6 @@ class TestKeyedTensor(unittest.TestCase):
             else:
                 torch.testing.assert_close(ref, output)
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "meta", "cuda"]),
         regroup_func=st.sampled_from(
@@ -270,7 +268,6 @@ class TestKeyedTensor(unittest.TestCase):
         expected_size = 6 * 8
         self.assertEqual(kt.size_in_bytes(), expected_size)
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "cuda"]),
         regroup_func=st.sampled_from(
@@ -355,7 +352,6 @@ class TestKeyedTensor(unittest.TestCase):
             )
         )
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "meta", "cuda"]),
         regroup_func=st.sampled_from(
@@ -392,7 +388,7 @@ class TestKeyedTensor(unittest.TestCase):
         keys_2 = ["sparse_0", "sparse_1"]
         kt_2 = KeyedTensor.from_tensor_list(keys_2, tensor_list_2, key_dim)
         inputs = [kt_1, kt_2]
-        outputs = script_model(inputs)  # pyre-ignore[29]
+        outputs = script_model(inputs)
         refs = _regroup_keyed_tensors(
             inputs, [["dense_0", "sparse_1", "dense_2"], ["dense_1", "sparse_0"]]
         )
@@ -403,7 +399,6 @@ class TestKeyedTensor(unittest.TestCase):
             else:
                 torch.testing.assert_close(ref, output)
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "meta", "cuda"]),
         regroup_func=st.sampled_from(
@@ -441,7 +436,7 @@ class TestKeyedTensor(unittest.TestCase):
             keys_2 = ["sparse_0", "sparse_1"]
             kt_2 = KeyedTensor.from_tensor_list(keys_2, tensor_list_2, key_dim)
             inputs = [kt_1, kt_2]
-            outputs = script_model(inputs)  # pyre-ignore[29
+            outputs = script_model(inputs)
             refs = _regroup_keyed_tensors(
                 inputs, [["dense_0", "sparse_1", "dense_2"], ["dense_1", "sparse_0"]]
             )
@@ -606,7 +601,6 @@ class TestKeyedTensor(unittest.TestCase):
 
 
 class TestKeyedTensorRegroupOp(unittest.TestCase):
-    # pyre-ignore[56]
     @given(device_str=st.sampled_from(["cpu", "meta", "cuda"]))
     @settings(verbosity=Verbosity.verbose, max_examples=5, deadline=None)
     def test_kt_regroup_arguments(self, device_str: str) -> None:
@@ -645,7 +639,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             self.assertEqual(out_shapes.tolist(), [8, 4, 17, 10])
         self.assertEqual(out_lengths, [8, 4, 17, 10])
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "meta", "cuda"]),
         batch_size=st.sampled_from([16, 128, 1024]),
@@ -680,7 +673,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             for out, ref in zip(outputs, refs):
                 torch.testing.assert_close(out, ref)
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["meta", "cpu", "cuda"]),
         dtype=st.sampled_from(
@@ -725,7 +717,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
                 torch.testing.assert_close(out, ref)
                 self.assertEqual(out.dtype, ref.dtype)
 
-    # pyre-ignore[56]
     @given(
         zipped_args=st.sampled_from(
             [
@@ -777,7 +768,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             assert isinstance(val_grad, torch.Tensor)
             self.assertTrue(torch.allclose(val_grad, ref_grad))
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "cuda"]),
         batch_size=st.sampled_from([16, 1024]),
@@ -828,7 +818,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             assert isinstance(val_grad, torch.Tensor)
             self.assertTrue(torch.allclose(val_grad, ref_grad))
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "meta", "cuda"]),
         batch_size=st.sampled_from([16, 1024]),
@@ -877,7 +866,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             self.assertEqual(out_shapes.tolist(), [8, 4, 17, 10])
         self.assertEqual(out_lengths, [8, 4, 17, 10])
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "meta", "cuda"]),
         batch_size=st.sampled_from([16, 1024]),
@@ -924,7 +912,6 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             else:
                 torch.testing.assert_close(out, ref)
 
-    # pyre-ignore[56]
     @given(
         device_str=st.sampled_from(["cpu", "cuda"]),
         batch_size=st.sampled_from([16, 1024]),
@@ -982,7 +969,6 @@ class TestKeyedTensorGPU(unittest.TestCase):
         super().setUp()
         self.device = torch.cuda.current_device()
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "Not enough GPUs, this test requires at least one GPUs",
@@ -1027,7 +1013,6 @@ class TestKeyedTensorGPU(unittest.TestCase):
         torch.allclose(actual_kt_0_grad, expected_kt_0_grad)
         torch.allclose(actual_kt_1_grad, expected_kt_1_grad)
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "Not enough GPUs, this test requires at least one GPUs",

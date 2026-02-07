@@ -91,7 +91,6 @@ def get_unsharded_and_sharded_module(
         sharded_sparse_arch = DistributedModelParallel(
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_fp_ebc": module_sharding_plan}),
-            # pyre-ignore
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -100,7 +99,6 @@ def get_unsharded_and_sharded_module(
         sharded_sparse_arch = _shard_modules(
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"._fp_ebc": module_sharding_plan}),
-            # pyre-ignore
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -109,7 +107,6 @@ def get_unsharded_and_sharded_module(
 
         replicate(
             sharded_sparse_arch,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `_embedding_bag_collection`.
             ignored_modules=[sharded_sparse_arch._fp_ebc._embedding_bag_collection],
             process_group=ctx.pg,
@@ -182,7 +179,6 @@ def _test_sharding(  # noqa C901
             replicated_param = sharded_named_parameters[fqn]
 
             torch.testing.assert_close(
-                # pyre-ignore
                 param.grad.cpu(),
                 replicated_param.grad.cpu(),
                 msg=f"Did not match for {fqn} {param.grad=} {replicated_param.grad=}",
@@ -227,7 +223,6 @@ class ShardedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         "Not enough GPUs, this test requires at least two GPUs",
     )
     @settings(verbosity=Verbosity.verbose, max_examples=4, deadline=None)
-    # pyre-ignore
     @given(
         set_gradient_division=st.booleans(),
         use_dmp=st.booleans(),
@@ -268,7 +263,6 @@ class ShardedEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         "Not enough GPUs, this test requires at least two GPUs",
     )
     @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
-    # pyre-ignore
     @given(use_fp_collection=st.booleans(), backend=st.sampled_from(["nccl", "gloo"]))
     def test_sharding_fp_ebc_from_meta(
         self, use_fp_collection: bool, backend: str
@@ -355,7 +349,7 @@ def _test_jk_disabled_non_pipelined(
             sharded_model = DistributedModelParallel(
                 module=copy.deepcopy(sparse_arch),
                 plan=ShardingPlan({"_fp_ebc": module_sharding_plan}),
-                env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore[6]
+                env=ShardingEnv.from_process_group(ctx.pg),
                 sharders=[sharder],
                 device=ctx.device,
             )

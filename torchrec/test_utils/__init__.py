@@ -112,14 +112,11 @@ def init_distributed_single_host(
     if dist.is_initialized():
         dist.destroy_process_group()
     dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
-    # pyre-fixme[7]: Expected `ProcessGroup` but got
     #  `Optional[_distributed_c10d.ProcessGroup]`.
     return dist.group.WORLD
 
 
-# pyre-ignore [24]
 def seed_and_log(wrapped_func: Callable) -> Callable:
-    # pyre-ignore [2, 3]
     def _wrapper(*args, **kwargs):
         seed = int(time.time() * 1000) % (1 << 31)
         print(f"Using random seed: {seed}")

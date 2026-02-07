@@ -34,7 +34,6 @@ copyright = "Meta Platforms, Inc"
 author = "Meta"
 
 try:
-    # pyre-ignore
     version = "1.0.0"  # TODO: Hardcode stable version for now
 except Exception:
     # when run internally, we don't have a version yet

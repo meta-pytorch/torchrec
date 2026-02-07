@@ -350,13 +350,9 @@ class SegmentedNEMetricComputation(RecMetricComputation):
     def _compute_fused(self) -> List[MetricComputationReport]:
         reports = []
         computed_ne = compute_ne_fused(
-            # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
             self.cross_entropy_sum,
-            # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
             self.weighted_num_samples,
-            # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
             self.pos_labels,
-            # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
             self.neg_labels,
             num_groups=self._num_groups,
             n_tasks=self._n_tasks,
@@ -374,11 +370,8 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
         if self._include_logloss:
             log_loss_groups = compute_logloss(
-                # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
                 self.cross_entropy_sum,
-                # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
                 self.pos_labels,
-                # pyre-fixme[6]: `In call `compute_ne_fused`, for 1st positional argument, expected `Tensor` but got `Union[Tensor, Module]`
                 self.neg_labels,
                 eta=self.eta,
             )
@@ -403,13 +396,9 @@ class SegmentedNEMetricComputation(RecMetricComputation):
             return self._compute_fused()
 
         computed_ne = compute_ne(
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             self.cross_entropy_sum[0],
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             self.weighted_num_samples[0],
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             self.pos_labels[0],
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             self.neg_labels[0],
             num_groups=self._num_groups,
             eta=self.eta,
@@ -427,11 +416,8 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
         if self._include_logloss:
             log_loss_groups = compute_logloss(
-                # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _Nes...
                 self.cross_entropy_sum[0],
-                # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _Nes...
                 self.pos_labels[0],
-                # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _Nes...
                 self.neg_labels[0],
                 eta=self.eta,
             )
@@ -483,5 +469,4 @@ class SegmentedNEMetric(RecMetric):
         if "grouping_keys" not in kwargs:
             self._required_inputs.add("grouping_keys")
         else:
-            # pyre-ignore[6]
             self._required_inputs.add(kwargs["grouping_keys"])

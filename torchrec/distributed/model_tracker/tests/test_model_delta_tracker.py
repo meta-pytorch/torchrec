@@ -187,7 +187,6 @@ def get_models(
     baseline_dmp = DistributedModelParallel(
         module=baseline_module,
         device=device,
-        # pyre-ignore[6]
         env=torchrec.distributed.ShardingEnv.from_process_group(ctx.pg),
         plan=plan,
         sharders=sharders,
@@ -197,7 +196,6 @@ def get_models(
 
 
 class ModelDeltaTrackerTest(MultiProcessTestBase):
-    # pyre-fixme[2]: Parameter must be annotated.
     def __init__(self, methodName="runTest") -> None:
         super().__init__(methodName)
         self.world_size = 2
@@ -410,7 +408,6 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
         ]
     )
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(torch.cuda.device_count() < 1, "test requires 1+ GPUs")
     def test_fqn_to_feature_names(
         self,
@@ -451,7 +448,6 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
         ]
     )
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(torch.cuda.device_count() < 1, "test requires 1+ GPUs")
     def test_tracker_not_initialized(
         self,
@@ -651,7 +647,6 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
         ]
     )
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 2,
         "Distributed test requires at least 2 GPUs",
@@ -815,7 +810,6 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
         ]
     )
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 2,
         "Distributed test requires at least 2 GPUs",
@@ -1024,7 +1018,6 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
         ]
     )
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
     def test_multiple_get(
         self,
@@ -1432,7 +1425,6 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
         ]
     )
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
     def test_multiple_consumers(
         self,
@@ -1529,7 +1521,6 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
         ]
     )
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
     def test_duplication_with_momentum(
         self,
@@ -1624,7 +1615,6 @@ class ModelDeltaTrackerTest(MultiProcessTestBase):
         ]
     )
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(torch.cuda.device_count() < 2, "test requires 2+ GPUs")
     def test_duplication_with_rowwise_adagrad(
         self,
@@ -1783,7 +1773,6 @@ def _test_embedding_mode(
         if output_params.assert_str is not None:
             with unittest.TestCase().assertRaisesRegex(
                 AssertionError,
-                # pyre-ignore[6]
                 output_params.assert_str,
             ):
                 dt_model, baseline_model = get_models(
@@ -1810,11 +1799,9 @@ def _test_embedding_mode(
             assert isinstance(dt, ModelDeltaTrackerTrec)
 
             orig_emb1 = (
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
                 dt_model._dmp_wrapped_module.module.ec.embeddings.sparse_table_1.weight.detach().clone()
             )
             orig_emb2 = (
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
                 dt_model._dmp_wrapped_module.module.ec.embeddings.sparse_table_2.weight.detach().clone()
             )
 
@@ -1854,7 +1841,6 @@ def _test_embedding_mode(
                     )
                     unittest.TestCase().assertTrue(
                         delta_rows[table_fqns_list[1]].states is not None
-                        # pyre-ignore[16]:
                         and delta_rows[table_fqns_list[1]].states.numel() == 0,
                     )
                 elif rank == 1:
@@ -1933,11 +1919,9 @@ def _test_multiple_get(
             if test_params.embedding_config_type == EmbeddingConfig:
                 # Embedding mode is only supported for EmbeddingCollection
                 expected_emb1 = (
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
                     dt_model._dmp_wrapped_module.module.ec.embeddings.sparse_table_1.weight.detach().clone()
                 )
                 expected_emb2 = (
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
                     dt_model._dmp_wrapped_module.module.ec.embeddings.sparse_table_2.weight.detach().clone()
                 )
 
@@ -2111,7 +2095,6 @@ def _test_duplication_with_rowwise_adagrad(
         # read momemtum directly from the table
         tbe: SplitTableBatchedEmbeddingBagsCodegen = (
             (
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `ec`.
                 dt_model._dmp_wrapped_module.module.ec._lookups[0]
                 ._emb_modules[0]
@@ -2119,7 +2102,7 @@ def _test_duplication_with_rowwise_adagrad(
             )
             if test_params.embedding_config_type == EmbeddingConfig
             else (
-                dt_model._dmp_wrapped_module.module.ebc._lookups[0]  # pyre-ignore
+                dt_model._dmp_wrapped_module.module.ebc._lookups[0]
                 ._emb_modules[0]
                 .emb_module
             )

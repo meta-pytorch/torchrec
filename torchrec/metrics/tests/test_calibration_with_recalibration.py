@@ -37,7 +37,6 @@ class RecalibratedCalibrationMetricMetricTest(unittest.TestCase):
             my_rank=0,
             batch_size=BATCH_SIZE,
             tasks=[DefaultTaskInfo],
-            # pyre-ignore[6]
             recalibration_coefficient=0.1,
         )
 

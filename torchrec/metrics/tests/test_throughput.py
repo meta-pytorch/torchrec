@@ -7,7 +7,6 @@
 
 # pyre-strict
 
-# pyre-ignore-all-errors[56]
 
 import unittest
 from collections import OrderedDict

@@ -77,7 +77,6 @@ def _test_sharding(
         sharded_model = sharder.shard(
             module=model,
             params=parameter_sharding_plan,
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             env=ShardingEnv.from_process_group(ctx.pg),
             device=ctx.device,
@@ -154,7 +153,6 @@ class ConstructParameterShardingTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         per_param_sharding=st.sampled_from(
             [
@@ -243,7 +241,6 @@ class ConstructParameterShardingTest(MultiProcessTestBase):
             per_param_sharding=per_param_sharding,
             local_size=2,
             world_size=2,
-            # pyre-ignore
             sharder=sharder,
         )
 

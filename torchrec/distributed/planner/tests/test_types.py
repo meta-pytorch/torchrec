@@ -510,7 +510,7 @@ def _test_hashing_consistency(
             ),  # Using meta device for now since only getting search space
         )
         sharders = [EmbeddingBagCollectionSharder()]
-        enumerator.enumerate(module, sharders)  # pyre-ignore
+        enumerator.enumerate(module, sharders)
         storage_reservation = HeuristicalStorageReservation(percentage=0.15)
         constraints = {"table1": ParameterConstraints()}
 
@@ -518,7 +518,7 @@ def _test_hashing_consistency(
             topology=topology,
             batch_size=batch_size,
             module=module,
-            sharders=sharders,  # pyre-ignore
+            sharders=sharders,
             constraints=constraints,
         )
         perf_model = NoopPerfModel(topology=topology)

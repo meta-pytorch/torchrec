@@ -462,7 +462,6 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface, ModuleNoCopyMixin)
         ):
             for embedding_config, (weight, qscale, qbias) in zip(
                 tables,
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 emb_module.split_embedding_weights_with_scale_bias(
                     split_scale_bias_mode=2 if quant_state_dict_split_scale_bias else 0
                 ),
@@ -583,7 +582,6 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface, ModuleNoCopyMixin)
         embedding_bag_configs = copy.deepcopy(module.embedding_bag_configs())
         _update_embedding_configs(
             cast(List[BaseEmbeddingConfig], embedding_bag_configs),
-            # pyre-fixme[6]: For 2nd argument expected `Union[QuantConfig, QConfig]`
             #  but got `Union[Module, Tensor]`.
             module.qconfig,
             pruning_dict,
@@ -600,7 +598,6 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface, ModuleNoCopyMixin)
             embedding_bag_configs,
             module.is_weighted(),
             device=device,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `activation`.
             output_dtype=module.qconfig.activation().dtype,
             table_name_to_quantized_weights=table_name_to_quantized_weights,
@@ -677,7 +674,6 @@ class FeatureProcessedEmbeddingBagCollection(EmbeddingBagCollection):
         return "QuantFeatureProcessedEmbeddingBagCollection"
 
     @classmethod
-    # pyre-ignore
     def from_float(
         cls,
         module: OriginalFeatureProcessedEmbeddingBagCollection,
@@ -697,7 +693,6 @@ class FeatureProcessedEmbeddingBagCollection(EmbeddingBagCollection):
         embedding_bag_configs = copy.deepcopy(ebc.embedding_bag_configs())
         _update_embedding_configs(
             cast(List[BaseEmbeddingConfig], embedding_bag_configs),
-            # pyre-fixme[6]: For 2nd argument expected `Union[QuantConfig, QConfig]`
             #  but got `Union[Module, Tensor]`.
             qconfig,
             pruning_dict,
@@ -714,7 +709,6 @@ class FeatureProcessedEmbeddingBagCollection(EmbeddingBagCollection):
             embedding_bag_configs,
             ebc.is_weighted(),
             device=device,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `activation`.
             output_dtype=qconfig.activation().dtype,
             table_name_to_quantized_weights=table_name_to_quantized_weights,
@@ -725,7 +719,6 @@ class FeatureProcessedEmbeddingBagCollection(EmbeddingBagCollection):
             row_alignment=getattr(
                 ebc, MODULE_ATTR_ROW_ALIGNMENT_INT, DEFAULT_ROW_ALIGNMENT
             ),
-            # pyre-ignore
             feature_processor=fp_ebc._feature_processors,
             cache_features_order=getattr(
                 module, MODULE_ATTR_CACHE_FEATURES_ORDER, False
@@ -888,7 +881,6 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
                         "weight_qbias", qbias
                     )
 
-        # pyre-ignore [8]
         self._embedding_names_by_batched_tables: Dict[
             Tuple[DataType, bool], List[str]
         ] = {
@@ -954,7 +946,6 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
             f = kjts_per_key[i]
             lengths = _get_feature_length(f)
             indices, offsets = _fx_trec_unwrap_kjt(f)
-            # pyre-ignore [6]
             embedding_names = self._embedding_names_by_batched_tables[key]
             lookup = (
                 emb_module(indices=indices, offsets=offsets)
@@ -994,7 +985,6 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
         embedding_configs = copy.deepcopy(module.embedding_configs())
         _update_embedding_configs(
             cast(List[BaseEmbeddingConfig], embedding_configs),
-            # pyre-fixme[6]: For 2nd argument expected `Union[QuantConfig, QConfig]`
             #  but got `Union[Module, Tensor]`.
             module.qconfig,
         )
@@ -1008,7 +998,6 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
             embedding_configs,
             device=device,
             need_indices=module.need_indices(),
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `activation`.
             output_dtype=module.qconfig.activation().dtype,
             table_name_to_quantized_weights=table_name_to_quantized_weights,
@@ -1108,15 +1097,14 @@ class QuantManagedCollisionEmbeddingCollection(EmbeddingCollection):
         for (
             managed_collision_module
         ) in self._managed_collision_collection._managed_collision_modules.values():
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             managed_collision_module.reset_inference_mode()
 
     def to(
         self, *args: List[Any], **kwargs: Dict[str, Any]
     ) -> "QuantManagedCollisionEmbeddingCollection":
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(
-            *args,  # pyre-ignore
-            **kwargs,  # pyre-ignore
+            *args,
+            **kwargs,
         )
         for param in self.parameters():
             if param.device.type != "meta":
@@ -1132,7 +1120,6 @@ class QuantManagedCollisionEmbeddingCollection(EmbeddingCollection):
         )
         return self
 
-    # pyre-ignore
     def forward(
         self,
         features: KeyedJaggedTensor,
@@ -1147,7 +1134,6 @@ class QuantManagedCollisionEmbeddingCollection(EmbeddingCollection):
         return "QuantManagedCollisionEmbeddingCollection"
 
     @classmethod
-    # pyre-ignore
     def from_float(
         cls,
         module: OriginalManagedCollisionEmbeddingCollection,
@@ -1156,13 +1142,11 @@ class QuantManagedCollisionEmbeddingCollection(EmbeddingCollection):
         mc_ec = module
         ec = module._embedding_module
 
-        # pyre-ignore[9]
         qconfig: torch.quantization.QConfig = module.qconfig
         assert hasattr(
             module, "qconfig"
         ), "QuantManagedCollisionEmbeddingCollection input float module must have qconfig defined"
 
-        # pyre-ignore[29]
         embedding_configs = copy.deepcopy(ec.embedding_configs())
         _update_embedding_configs(
             cast(List[BaseEmbeddingConfig], embedding_configs),
@@ -1173,7 +1157,6 @@ class QuantManagedCollisionEmbeddingCollection(EmbeddingCollection):
             qconfig,
         )
 
-        # pyre-ignore[9]
         table_name_to_quantized_weights: Dict[str, Tuple[Tensor, Tensor]] | None = (
             ec._table_name_to_quantized_weights
             if hasattr(ec, "_table_name_to_quantized_weights")
@@ -1263,15 +1246,14 @@ class QuantManagedCollisionEmbeddingBagCollection(EmbeddingBagCollection):
         for (
             managed_collision_module
         ) in self._managed_collision_collection._managed_collision_modules.values():
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             managed_collision_module.reset_inference_mode()
 
     def to(
         self, *args: List[Any], **kwargs: Dict[str, Any]
     ) -> "QuantManagedCollisionEmbeddingBagCollection":
         device, dtype, non_blocking, _ = torch._C._nn._parse_to(
-            *args,  # pyre-ignore
-            **kwargs,  # pyre-ignore
+            *args,
+            **kwargs,
         )
         for param in self.parameters():
             if param.device.type != "meta":
@@ -1287,7 +1269,6 @@ class QuantManagedCollisionEmbeddingBagCollection(EmbeddingBagCollection):
         )
         return self
 
-    # pyre-ignore
     def forward(
         self,
         features: KeyedJaggedTensor,
@@ -1302,7 +1283,6 @@ class QuantManagedCollisionEmbeddingBagCollection(EmbeddingBagCollection):
         return "QuantManagedCollisionEmbeddingBagCollection"
 
     @classmethod
-    # pyre-ignore
     def from_float(
         cls,
         module: OriginalManagedCollisionEmbeddingBagCollection,
@@ -1311,13 +1291,11 @@ class QuantManagedCollisionEmbeddingBagCollection(EmbeddingBagCollection):
         mc_ebc = module
         ebc = module._embedding_module
 
-        # pyre-ignore[9]
         qconfig: torch.quantization.QConfig = module.qconfig
         assert hasattr(
             module, "qconfig"
         ), "QuantManagedCollisionEmbeddingBagCollection input float module must have qconfig defined"
 
-        # pyre-ignore[29]
         embedding_bag_configs = copy.deepcopy(ebc.embedding_bag_configs())
         _update_embedding_configs(
             cast(List[BaseEmbeddingConfig], embedding_bag_configs),
@@ -1328,7 +1306,6 @@ class QuantManagedCollisionEmbeddingBagCollection(EmbeddingBagCollection):
             qconfig,
         )
 
-        # pyre-ignore[9]
         table_name_to_quantized_weights: Dict[str, Tuple[Tensor, Tensor]] | None = (
             ebc._table_name_to_quantized_weights
             if hasattr(ebc, "_table_name_to_quantized_weights")

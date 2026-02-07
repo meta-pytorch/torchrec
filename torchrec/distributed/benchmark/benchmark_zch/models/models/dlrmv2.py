@@ -134,7 +134,6 @@ def make_model_dlrmv2(
         raise NotImplementedError(f"ZCH method {args.zch_method} is not supported yet.")
 
     dlrm_model = DLRMv2(
-        # pyre-ignore [6] # NOTE: Pyre reports that DLRM model's _embedding_bag_collection is EmbeddingBagCollection, but here we assign it with an EmbeddingBagCollectionAdapter.
         # This is because we want to implement managed collision functions without changing the DLRM class. The EmbeddingBagCollectionAdapter will simulate all the
         # APIs for EmbeddingBagCollection, and we can use it to replace the EmbeddingBagCollection in DLRM for managed collision functions.
         embedding_bag_collection=ebc,

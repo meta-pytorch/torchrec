@@ -192,20 +192,13 @@ class NDCGMetricValueTest(unittest.TestCase):
             my_rank=my_rank,
             batch_size=batch_size,
             tasks=tasks,
-            # pyre-ignore[6]
             session_key=session_key,
-            # pyre-ignore[6]
             exponential_gain=exponential_gain,
-            # pyre-ignore[6]
             remove_single_length_sessions=remove_single_length_sessions,
-            # pyre-ignore[6]
             scale_by_weights_tensor=scale_by_weights_tensor,
-            # pyre-ignore[6]
             report_ndcg_as_decreasing_curve=report_ndcg_as_decreasing_curve,
-            # pyre-ignore[6]
             k=k,
             compute_mode=compute_mode,
-            # pyre-ignore[6]
             **kwargs,
         )
 

@@ -89,17 +89,14 @@ def _test_sharding(  # noqa C901
             local_size=local_size,
             world_size=world_size,
             device_type=ctx.device.type,
-            # pyre-ignore
             sharder=sharder,
         )
 
         sharded_model = _shard_modules(
             module=unsharded_model,
             plan=ShardingPlan({"": module_sharding_plan}),
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             env=ShardingEnv.from_process_group(ctx.pg),
-            # pyre-fixme[6]: For 4th argument expected
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[EmbeddingCollectionSharder]`.
             sharders=[sharder],
@@ -198,7 +195,6 @@ class ShardedEmbeddingCollectionParallelTest(MultiProcessTestBase):
         "Not enough GPUs, this test requires at least two GPUs",
     )
     @settings(verbosity=Verbosity.verbose, max_examples=10, deadline=None)
-    # pyre-ignore
     @given(
         use_apply_optimizer_in_backward=st.booleans(),
         use_index_dedup=st.booleans(),

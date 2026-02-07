@@ -66,7 +66,7 @@ class CriteoKaggleTest(CriteoTest):
 class CriteoDataLoaderTest(CriteoTest):
     def _validate_dataloader_sample(
         self,
-        sample: Dict[str, List[Any]],  # pyre-ignore[2]
+        sample: Dict[str, List[Any]],
         batch_size: int,
         train: bool = True,
     ) -> None:
@@ -79,7 +79,7 @@ class CriteoDataLoaderTest(CriteoTest):
 
     def _sample_len(
         self,
-        sample: Dict[str, List[Any]],  # pyre-ignore[2]
+        sample: Dict[str, List[Any]],
     ) -> int:
         return len(next(iter(sample.values())))
 

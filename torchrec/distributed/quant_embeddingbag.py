@@ -88,7 +88,6 @@ def get_device_from_parameter_sharding(
         raise ValueError("Expected EnumerableShardingSpec as input to the function")
 
     device_type_list: Tuple[str, ...] = tuple(
-        # pyre-fixme[16]: `Optional` has no attribute `device`
         [shard.placement.device().type for shard in ps.sharding_spec.shards]
     )
     if len(set(device_type_list)) == 1:
@@ -325,8 +324,6 @@ class ShardedQuantEmbeddingBagCollection(
             self._embedding_names.extend(sharding.embedding_names())
             self._embedding_dims.extend(sharding.embedding_dims())
 
-    # pyre-ignore [14]
-    # pyre-ignore
     def input_dist(
         self, ctx: NullShardedModuleContext, features: KeyedJaggedTensor
     ) -> ListOfKJTList:
@@ -346,7 +343,6 @@ class ShardedQuantEmbeddingBagCollection(
         # syntax for torchscript
         return [lookup.forward(dist_input[i]) for i, lookup in enumerate(self._lookups)]
 
-    # pyre-ignore
     def output_dist(
         self,
         ctx: NullShardedModuleContext,
@@ -360,13 +356,11 @@ class ShardedQuantEmbeddingBagCollection(
             embedding_names=self._embedding_names,
         )
 
-    # pyre-ignore
     def compute_and_output_dist(
         self, ctx: NullShardedModuleContext, input: ListOfKJTList
     ) -> KeyedTensor:
         return self.output_dist(ctx, self.compute(ctx, input))
 
-    # pyre-ignore
     def forward(self, *input, **kwargs) -> KeyedTensor:
         ctx = self.create_context()
         dist_input = self.input_dist(ctx, *input, **kwargs)
@@ -382,7 +376,6 @@ class ShardedQuantEmbeddingBagCollection(
     def shardings(
         self,
     ) -> Dict[Tuple[str, Union[str, Tuple[str, ...]]], FeatureShardingMixIn]:
-        # pyre-ignore [7]
         return self._sharding_type_device_group_to_sharding
 
     def create_context(self) -> NullShardedModuleContext:
@@ -390,7 +383,6 @@ class ShardedQuantEmbeddingBagCollection(
             # Context creation is not supported by dynamo yet.
             # Context is not needed for TW sharding =>
             # Unblocking dynamo TW with None.
-            # pyre-ignore
             return None
 
         return NullShardedModuleContext()
@@ -710,7 +702,6 @@ class ShardedQuantEbcInputDist(torch.nn.Module):
             if self._has_features_permute:
                 features = features.permute(
                     self._features_order,
-                    # pyre-fixme[6]: For 2nd argument expected `Optional[Tensor]`
                     #  but got `Union[Module, Tensor]`.
                     self._features_order_tensor,
                 )
@@ -809,7 +800,6 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
                 table_name_to_parameter_sharding,
                 env=env,
                 device=device,
-                # pyre-ignore
                 embedding_shardings=embedding_shardings,
             )
         )
@@ -827,7 +817,7 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
             ebc_sharding_lookups = self._lookups[sharding]
             sharding_mcebc_lookups: List[ShardedMCEBCLookup] = []
             for j, ec_lookup in enumerate(
-                ebc_sharding_lookups._embedding_lookups_per_rank  # pyre-ignore
+                ebc_sharding_lookups._embedding_lookups_per_rank
             ):
                 sharding_mcebc_lookups.append(
                     ShardedMCEBCLookup(
@@ -851,7 +841,6 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
             self._has_uninitialized_output_dist = False
 
         return self._managed_collision_collection.input_dist(
-            # pyre-fixme [6]
             ctx,
             features,
             is_sequence_embedding=False,
@@ -875,7 +864,6 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
             ret.append(sharding_ret)
         return ret
 
-    # pyre-ignore
     def output_dist(
         self,
         ctx: NullShardedModuleContext,
@@ -884,7 +872,6 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
         Union[KeyedTensor, Dict[str, JaggedTensor]], Optional[KeyedJaggedTensor]
     ]:
 
-        # pyre-ignore [6]
         ebc_out = super().output_dist(ctx, output)
 
         kjt_out: Optional[KeyedJaggedTensor] = None

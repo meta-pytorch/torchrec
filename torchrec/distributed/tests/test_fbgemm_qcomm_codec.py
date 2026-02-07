@@ -22,7 +22,6 @@ from torchrec.distributed.fbgemm_qcomm_codec import (
 
 class QuantizationCommCodecTest(unittest.TestCase):
     @settings(deadline=4000)
-    # pyre-ignore
     @given(
         comm_precisions_loss_scale=st.sampled_from(
             [
@@ -96,7 +95,6 @@ class QuantizationCommCodecTest(unittest.TestCase):
         )
 
     @settings(deadline=4000)
-    # pyre-ignore
     @given(
         row_size=st.integers(4, 256),
         col_size=st.integers(4, 256),

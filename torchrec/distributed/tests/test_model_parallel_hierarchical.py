@@ -46,7 +46,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -119,7 +118,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             os.environ["TOPOLOGY_DOMAIN_MULTIPLE"] = str(topology_domain)
 
         self._test_sharding(
-            # pyre-ignore[6]
             sharders=[
                 create_test_sharder(
                     sharder_type,
@@ -143,7 +141,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -210,7 +207,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         )
         world_size = 4
         self._test_sharding(
-            # pyre-ignore[6]
             sharders=[
                 create_test_sharder(
                     sharder_type,
@@ -236,7 +232,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least three GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -284,7 +279,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -337,7 +331,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             or kernel_type != EmbeddingComputeKernel.DENSE.value
         )
         self._test_sharding(
-            # pyre-ignore[6]
             sharders=[
                 create_test_sharder(
                     SharderType.EMBEDDING_TOWER.value,
@@ -361,7 +354,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -413,7 +405,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         )
 
         self._test_sharding(
-            # pyre-ignore[6]
             sharders=[
                 create_test_sharder(
                     SharderType.EMBEDDING_TOWER_COLLECTION.value,
@@ -435,7 +426,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -461,7 +451,6 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         pooling: PoolingType,
     ) -> None:
         self._test_sharding(
-            # pyre-ignore[6]
             sharders=[
                 create_test_sharder(
                     SharderType.EMBEDDING_BAG_COLLECTION.value,

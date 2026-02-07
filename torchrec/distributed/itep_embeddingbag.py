@@ -148,7 +148,6 @@ class ShardedITEPEmbeddingBagCollection(
         ctx.is_reindexed = True
         self._embedding_bag_collection.prefetch(dist_input, forward_stream, ctx)
 
-    # pyre-ignore
     def input_dist(
         self,
         ctx: ITEPEmbeddingBagCollectionContext,
@@ -224,7 +223,6 @@ class ShardedITEPEmbeddingBagCollection(
     def create_context(self) -> ITEPEmbeddingBagCollectionContext:
         return ITEPEmbeddingBagCollectionContext()
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
     def load_state_dict(
         self,
@@ -415,7 +413,6 @@ class ShardedITEPEmbeddingCollection(
             pg=env.process_group,
         )
 
-    # pyre-ignore
     def input_dist(
         self,
         ctx: ITEPEmbeddingCollectionContext,
@@ -485,7 +482,6 @@ class ShardedITEPEmbeddingCollection(
     def create_context(self) -> ITEPEmbeddingCollectionContext:
         return ITEPEmbeddingCollectionContext()
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
     def load_state_dict(
         self,

@@ -125,7 +125,6 @@ class TestGetGroupingFusedParams(unittest.TestCase):
 
 
 class TestPerTBECacheLoadFactor(unittest.TestCase):
-    # pyre-ignore[56]
     @given(
         data_type=st.sampled_from([DataType.FP16, DataType.FP32]),
         has_feature_processor=st.sampled_from([False, True]),
@@ -192,7 +191,6 @@ def _get_table_names_by_groups(
 
 
 class TestGroupTablesPerRank(unittest.TestCase):
-    # pyre-ignore[56]
     @given(
         data_type=st.sampled_from([DataType.FP16, DataType.FP32]),
         has_feature_processor=st.sampled_from([False, True]),
@@ -245,7 +243,6 @@ class TestGroupTablesPerRank(unittest.TestCase):
             expected_table_names_by_groups,
         )
 
-    # pyre-ignore[56]
     @given(
         data_type=st.sampled_from([DataType.FP16, DataType.FP32]),
         has_feature_processor=st.sampled_from([False, True]),
@@ -295,7 +292,6 @@ class TestGroupTablesPerRank(unittest.TestCase):
             expected_table_names_by_groups,
         )
 
-    # pyre-ignore[56]
     @given(
         data_types=st.lists(
             st.sampled_from([DataType.FP16, DataType.FP32]),
@@ -539,7 +535,6 @@ class TestECBucketMetadata(unittest.TestCase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         data_type=st.sampled_from([DataType.FP16, DataType.FP32]),
         embedding_dim=st.sampled_from(list(range(160, 320, 40))),

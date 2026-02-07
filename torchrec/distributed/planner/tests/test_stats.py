@@ -137,7 +137,6 @@ class TestEmbeddingStats(unittest.TestCase):
         p_2 = [0.1, 0.9]
         self.assertAlmostEqual(_kl_divergence(p_2), 0.368, 3)
 
-    # pyre-ignore
     @given(
         N=st.integers(min_value=10, max_value=200),
     )
@@ -152,7 +151,6 @@ class TestEmbeddingStats(unittest.TestCase):
         N = len(normalized_p)
         self.assertEqual(_kl_divergence(normalized_p), _calc_max_kl_divergence(N))
 
-    # pyre-ignore
     @given(
         N=st.integers(min_value=10, max_value=200),
         alpha=st.floats(min_value=1.0, max_value=5.0),

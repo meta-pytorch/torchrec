@@ -111,7 +111,6 @@ class TensorPoolRwSharding(ObjectPoolSharding):
         device: torch.device,
     ) -> None:
         self._env = env
-        # pyre-ignore
         self._pg: dist.ProcessGroup = self._env.process_group
         self._world_size: int = self._env.world_size
         self._rank: int = self._env.rank

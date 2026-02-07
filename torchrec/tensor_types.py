@@ -8,8 +8,6 @@
 # pyre-strict
 
 
-# pyre-ignore-all-errors[2, 3, 4, 6, 13, 14, 20]
-
 import itertools
 from typing import List, Tuple
 
@@ -84,7 +82,6 @@ class UIntXTensor(torch.Tensor):
         self.N: int = N
         self.elem: torch.Tensor = elem
 
-    # pyre-ignore
     def tolist(self) -> List:
         return self.elem.tolist()
 

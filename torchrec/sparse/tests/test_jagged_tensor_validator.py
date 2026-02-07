@@ -327,7 +327,6 @@ class TestJaggedTensorValidator(unittest.TestCase):
             f"Expected warning containing '{expected_error_msg}' not found in {cm.output}",
         )
 
-    # pyre-ignore[56]
     @given(valid_kjt_from_lengths_offsets_strategy())
     @settings(verbosity=Verbosity.verbose, max_examples=20)
     def test_valid_kjt_from_lengths(
@@ -352,7 +351,6 @@ class TestJaggedTensorValidator(unittest.TestCase):
         )
         validate_keyed_jagged_tensor(kjt)
 
-    # pyre-ignore[56]
     @given(valid_kjt_from_lengths_offsets_strategy())
     @settings(verbosity=Verbosity.verbose, max_examples=20)
     def test_valid_kjt_from_offsets(

@@ -114,7 +114,6 @@ def create_sharding_type_to_feature_score_mapping(
                     for k in config.embedding_config.feature_names:
                         if (
                             k
-                            # pyre-ignore [16]
                             in config.embedding_config.virtual_table_eviction_policy.feature_score_mapping
                         ):
                             feature_score_mapping[k] = (
@@ -124,7 +123,6 @@ def create_sharding_type_to_feature_score_mapping(
                             )
                         else:
                             assert (
-                                # pyre-ignore [16]
                                 config.embedding_config.virtual_table_eviction_policy.feature_score_default_value
                                 is not None
                             ), f"Table {config.embedding_config.name} eviction policy feature_score_default_value is not set but feature {k} is not in feature_score_mapping."

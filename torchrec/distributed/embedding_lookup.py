@@ -126,13 +126,12 @@ def _load_state_dict(
                         dst_local_shard.tensor.detach().copy_(src_local_shard.tensor)
                 elif isinstance(dst_param, DTensor):
                     assert isinstance(src_param, DTensor)
-                    assert len(
-                        # pyre-ignore[16]
-                        dst_param.to_local().local_chunks
-                    ) == len(src_param.to_local().local_chunks)
+                    assert len(dst_param.to_local().local_chunks) == len(
+                        src_param.to_local().local_chunks
+                    )
                     for i, (dst_local_shard, src_local_shard) in enumerate(
                         zip(
-                            dst_param.to_local().local_shards(),  # pyre-ignore[16]
+                            dst_param.to_local().local_shards(),
                             src_param.to_local().local_shards(),
                         )
                     ):
@@ -317,7 +316,6 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                             SSDTableBatchedEmbeddingBags,
                         ),
                     )
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                     #  attribute `prefetch_pipeline`.
                     and not emb_op.emb_module.prefetch_pipeline
                 ):
@@ -326,7 +324,6 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                         "If you don’t turn on prefetch_pipeline, cache locations might be wrong in backward and can cause wrong results.\n"
                     )
                 if hasattr(emb_op.emb_module, "prefetch"):
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                     #  attribute `prefetch`.
                     emb_op.emb_module.prefetch(
                         indices=features.values(),
@@ -356,12 +353,11 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
     def get_resize_awaitables(self) -> List[LazyAwaitable[torch.Tensor]]:
         # TODO - we can probably do some smart grouping to make this more efficient
         return [
-            emb_module.get_rs_awaitable()  # pyre-ignore[29]
+            emb_module.get_rs_awaitable()
             for emb_module in self._emb_modules
             if hasattr(emb_module, "get_rs_awaitable")
         ]
 
-    # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -370,16 +366,13 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
 
         for emb_module in self._emb_modules:
-            # pyre-fixme[19]: Expected 0 positional arguments.
             emb_module.state_dict(destination, prefix, keep_vars)
 
         return destination
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
     def load_state_dict(
         self,
@@ -421,7 +414,6 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
             for (
                 table_name,
                 tbe_slice,
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             ) in embedding_kernel.named_parameters_by_table():
                 yield (table_name, tbe_slice)
 
@@ -449,7 +441,6 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
 
     def flush(self) -> None:
         for emb_module in self._emb_modules:
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             emb_module.flush()
 
     def create_rocksdb_hard_link_snapshot(self) -> None:
@@ -459,7 +450,6 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
 
     def purge(self) -> None:
         for emb_module in self._emb_modules:
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             emb_module.purge()
 
     def register_optim_state_tracker_fn(
@@ -501,22 +491,18 @@ class GroupedEmbeddingsUpdate(BaseEmbeddingUpdate[KeyedJaggedTensor]):
             self._feature_splits,
         )
         for emb_module, features in zip(self._emb_modules, features_by_group):
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             emb_module.update(features)
 
 
 class CommOpGradientScaling(torch.autograd.Function):
     @staticmethod
-    # pyre-ignore
     def forward(
         ctx: FunctionCtx, input_tensor: torch.Tensor, scale_gradient_factor: int
     ) -> torch.Tensor:
-        # pyre-ignore
         ctx.scale_gradient_factor = scale_gradient_factor
         return input_tensor
 
     @staticmethod
-    # pyre-ignore[14]: `forward` overrides method defined in `Function` inconsistently.
     def backward(
         ctx: FunctionCtx, grad_output: torch.Tensor
     ) -> Tuple[torch.Tensor, None]:
@@ -524,7 +510,6 @@ class CommOpGradientScaling(torch.autograd.Function):
         # at alltoall backward for model parallelism. However weights
         # is controlled by DDP so it already has gradient division, so we scale
         # the gradient back up
-        # pyre-ignore[16]: `FunctionCtx` has no attribute `scale_gradient_factor`
         grad_output.mul_(ctx.scale_gradient_factor)
         return grad_output, None
 
@@ -677,7 +662,6 @@ class GroupedPooledEmbeddingsLookup(
                 self._feature_splits,
             )
             for emb_op, features in zip(self._emb_modules, features_by_group):
-                # pyre-fixme[6]: For 1st argument expected `GroupedEmbeddingConfig`
                 #  but got `Union[Module, Tensor]`.
                 if not _need_prefetch(emb_op.config):
                     continue
@@ -689,7 +673,6 @@ class GroupedPooledEmbeddingsLookup(
                             SSDTableBatchedEmbeddingBags,
                         ),
                     )
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                     #  attribute `prefetch_pipeline`.
                     and not emb_op.emb_module.prefetch_pipeline
                 ):
@@ -698,7 +681,6 @@ class GroupedPooledEmbeddingsLookup(
                         "If you don't turn on prefetch_pipeline, cache locations might be wrong in backward and can cause wrong results.\n"
                     )
                 if hasattr(emb_op.emb_module, "prefetch"):
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                     #  attribute `prefetch`.
                     emb_op.emb_module.prefetch(
                         indices=features.values(),
@@ -981,12 +963,11 @@ class GroupedPooledEmbeddingsLookup(
     def get_resize_awaitables(self) -> List[LazyAwaitable[torch.Tensor]]:
         # TODO - we can probably do some smart grouping to make this more efficient
         return [
-            emb_module.get_rs_awaitable()  # pyre-ignore[29]
+            emb_module.get_rs_awaitable()
             for emb_module in self._emb_modules
             if hasattr(emb_module, "get_rs_awaitable")
         ]
 
-    # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -995,16 +976,13 @@ class GroupedPooledEmbeddingsLookup(
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
 
         for emb_module in self._emb_modules:
-            # pyre-fixme[19]: Expected 0 positional arguments.
             emb_module.state_dict(destination, prefix, keep_vars)
 
         return destination
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
     def load_state_dict(
         self,
@@ -1046,7 +1024,6 @@ class GroupedPooledEmbeddingsLookup(
             for (
                 table_name,
                 tbe_slice,
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             ) in embedding_kernel.named_parameters_by_table():
                 yield (table_name, tbe_slice)
 
@@ -1074,7 +1051,6 @@ class GroupedPooledEmbeddingsLookup(
 
     def flush(self) -> None:
         for emb_module in self._emb_modules:
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             emb_module.flush()
 
     def create_rocksdb_hard_link_snapshot(self) -> None:
@@ -1084,7 +1060,6 @@ class GroupedPooledEmbeddingsLookup(
 
     def purge(self) -> None:
         for emb_module in self._emb_modules:
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             emb_module.purge()
 
     def register_optim_state_tracker_fn(
@@ -1193,7 +1168,6 @@ class MetaInferGroupedEmbeddingsLookup(
 
         return self.embeddings_cat_empty_rank_handle_inference(embeddings)
 
-    # pyre-ignore [14]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -1202,16 +1176,13 @@ class MetaInferGroupedEmbeddingsLookup(
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
 
         for emb_module in self._emb_modules:
-            # pyre-fixme[19]: Expected 0 positional arguments.
             emb_module.state_dict(destination, prefix, keep_vars)
 
         return destination
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
     def load_state_dict(
         self,
@@ -1361,7 +1332,6 @@ class MetaInferGroupedPooledEmbeddingsLookup(
             dim=1,
         )
 
-    # pyre-ignore [14]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -1370,16 +1340,13 @@ class MetaInferGroupedPooledEmbeddingsLookup(
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
 
         for emb_module in self._emb_modules:
-            # pyre-fixme[19]: Expected 0 positional arguments.
             emb_module.state_dict(destination, prefix, keep_vars)
 
         return destination
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
     def load_state_dict(
         self,
@@ -1427,7 +1394,6 @@ class InferGroupedLookupMixin(ABC):
         sparse_features = input_dist_outputs.features
         # syntax for torchscript
         for i, embedding_lookup in enumerate(
-            # pyre-fixme[16]
             self._embedding_lookups_per_rank,
         ):
             sparse_features_rank = sparse_features[i]
@@ -1442,10 +1408,8 @@ class InferGroupedLookupMixin(ABC):
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
 
-        # pyre-fixme[16]
         for rank_modules in self._embedding_lookups_per_rank:
             rank_modules.state_dict(destination, prefix, keep_vars)
 
@@ -1458,7 +1422,6 @@ class InferGroupedLookupMixin(ABC):
     ) -> _IncompatibleKeys:
         missing_keys = []
         unexpected_keys = []
-        # pyre-fixme[16]
         for rank_modules in self._embedding_lookups_per_rank:
             incompatible_keys = rank_modules.load_state_dict(state_dict)
             missing_keys.extend(incompatible_keys.missing_keys)
@@ -1470,14 +1433,12 @@ class InferGroupedLookupMixin(ABC):
     def named_parameters(
         self, prefix: str = "", recurse: bool = True
     ) -> Iterator[Tuple[str, nn.Parameter]]:
-        # pyre-fixme[16]
         for rank_modules in self._embedding_lookups_per_rank:
             yield from rank_modules.named_parameters(prefix, recurse)
 
     def named_buffers(
         self, prefix: str = "", recurse: bool = True
     ) -> Iterator[Tuple[str, torch.Tensor]]:
-        # pyre-fixme[16]
         for rank_modules in self._embedding_lookups_per_rank:
             yield from rank_modules.named_buffers(prefix, recurse)
 

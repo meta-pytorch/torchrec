@@ -132,7 +132,6 @@ class PipelineConfig:
             )
         else:
             Pipeline = _pipeline_cls[self.pipeline]
-            # pyre-ignore[28]
             return Pipeline(
                 model=model,
                 optimizer=opt,

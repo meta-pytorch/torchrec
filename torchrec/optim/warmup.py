@@ -114,7 +114,6 @@ class WarmupOptimizer(OptimizerWrapper):
         self._lr_param: str = lr_param
         self._lr: float = lr
         self._warmup_param: torch.nn.Parameter = torch.nn.Parameter()
-        # pyre-ignore [16]
         self.params[param_name] = self._warmup_param
         # for fused optimizer we will do first backward() pass before calling step()
         self._set_lr(0, 0)
@@ -122,7 +121,6 @@ class WarmupOptimizer(OptimizerWrapper):
     def _set_lr(self, iter_: int, stage_id: int) -> None:
         lr = self._lr * _get_multiplier(self._stages[stage_id], iter_)
         for param_group in self.param_groups:
-            # pyre-ignore [16]
             param_group[self._lr_param] = lr
 
     def _get_warmup_state(self) -> Tuple[int, int]:
@@ -138,7 +136,6 @@ class WarmupOptimizer(OptimizerWrapper):
         logger.info(f"Warmup Optimizer set to iteration {iter_}")
         self._set_lr(iter_, stage_id)
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         super().step(closure)
         iter_, stage_id = self._get_warmup_state()
@@ -156,7 +153,6 @@ class WarmupOptimizer(OptimizerWrapper):
             )
         self._set_lr(iter_, stage_id)
 
-        # pyre-ignore [16]
         self.state[self._warmup_param] = {
             "warmup": torch.tensor([iter_, stage_id], dtype=torch.long)
         }

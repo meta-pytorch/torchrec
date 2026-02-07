@@ -254,7 +254,7 @@ def runner(
     return result
 
 
-@cmd_conf  # pyre-ignore [56]
+@cmd_conf
 def main(
     run_option: RunOptions,
 ) -> None:

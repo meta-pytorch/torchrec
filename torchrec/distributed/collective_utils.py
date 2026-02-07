@@ -61,7 +61,6 @@ def invoke_on_rank_and_broadcast_result(
     return cast(T, object_list[0])
 
 
-# pyre-ignore Missing return annotation [3]
 def run_on_leader(pg: dist.ProcessGroup, rank: int):
     def callable(func: Callable[..., T]) -> T:
         @wraps(func)

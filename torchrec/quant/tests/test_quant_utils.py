@@ -44,7 +44,6 @@ class QuantUtilsTest(unittest.TestCase):
         ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
 
         # test forward
-        # pyre-fixme[16]: `EmbeddingBagCollection` has no attribute `qconfig`.
         ebc.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -66,7 +65,6 @@ class QuantUtilsTest(unittest.TestCase):
         # successful cpu execution
         _ = dmp(features)
 
-    # pyre-fixme[56]
     @given(
         data_type=st.sampled_from(
             [

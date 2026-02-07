@@ -47,7 +47,6 @@ def enrich_hstu_features(
 
 
 class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -83,13 +82,11 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
             dist_stream=None,
         )
         self.assertNotIsInstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.ebc.forward,
             PipelinedForward,
         )
         self.assertNotIsInstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.weighted_ebc.forward,
             PipelinedForward,
@@ -104,31 +101,25 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
             pipeline_postproc=True,
         )
 
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `sparse`.
         self.assertIsInstance(sharded_model.module.sparse.ebc.forward, PipelinedForward)
         self.assertIsInstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.weighted_ebc.forward,
             PipelinedForward,
         )
         self.assertEqual(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.ebc.forward._args.args[0]
             .steps[0]
             .postproc_module,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `postproc_module`.
             sharded_model.module.postproc_module,
         )
         self.assertEqual(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.weighted_ebc.forward._args.args[0]
             .steps[0]
             .postproc_module,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `postproc_module`.
             sharded_model.module.postproc_module,
         )
@@ -157,7 +148,6 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         model = TestModel()
 
         rewritten_model = copy.deepcopy(model)
-        # pyre-ignore[8]
         rewritten_model.test_module = PipelinedPostproc(
             postproc_module=rewritten_model.test_module,
             fqn="test_module",
@@ -237,7 +227,6 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(missing_keys, [])
         self.assertEqual(unexpected_keys, [])
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -264,7 +253,6 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         for source_model_type, recipient_model_type in variants:
             self._test_restore_from_snapshot(source_model_type, recipient_model_type)
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -320,13 +308,11 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
             pipeline_postproc=True,
         )
         self.assertNotIsInstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.ebc.forward,
             PipelinedForward,
         )
         self.assertNotIsInstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.weighted_ebc.forward,
             PipelinedForward,
@@ -343,31 +329,25 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
             pipeline_postproc=True,
         )
 
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `sparse`.
         self.assertIsInstance(sharded_model.module.sparse.ebc.forward, PipelinedForward)
         self.assertIsInstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.weighted_ebc.forward,
             PipelinedForward,
         )
         self.assertEqual(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.ebc.forward._args.args[0]
             .steps[0]
             .postproc_module,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `postproc_module`.
             sharded_model.module.postproc_module,
         )
         self.assertEqual(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             sharded_model.module.sparse.weighted_ebc.forward._args.args[0]
             .steps[0]
             .postproc_module,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `postproc_module`.
             sharded_model.module.postproc_module,
         )

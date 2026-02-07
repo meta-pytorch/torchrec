@@ -308,9 +308,7 @@ class QuantizedCommCodecs:
     The quantization codecs to use for the forward and backward pass respectively of a comm op (e.g. pooled_all_to_all, reduce_scatter, sequence_all_to_all).
     """
 
-    # pyre-ignore
     forward: QuantizedCommCodec = NoOpQuantizedCommCodec()
-    # pyre-ignore
     backward: QuantizedCommCodec = NoOpQuantizedCommCodec()
 
 
@@ -403,7 +401,6 @@ class LazyAwaitable(Awaitable[W], metaclass=_LazyAwaitableMeta):
         self._result: Optional[W] = None
 
     @staticmethod
-    # pyre-ignore [2, 3]
     def _wait_async(obj: Any) -> Any:
         """
         This method is used internally to automatically wait when necessary
@@ -417,7 +414,6 @@ class LazyAwaitable(Awaitable[W], metaclass=_LazyAwaitableMeta):
             return obj
 
     @classmethod
-    # pyre-ignore [2, 3]
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         """
         The LazyAwaitable type has a `__torch_function__` implementation.
@@ -441,7 +437,6 @@ class LazyAwaitable(Awaitable[W], metaclass=_LazyAwaitableMeta):
 
         return func(*new_args, **new_kwargs)
 
-    # pyre-ignore [2, 3]
     def __getattr__(self, name):
         """
         Overrides __getattr__ to allow LazyAwaitable to first wait and then call getattr
@@ -453,7 +448,7 @@ class LazyAwaitable(Awaitable[W], metaclass=_LazyAwaitableMeta):
                 f"did you forget to call 'super()'?"
             )
         elif name == "__setstate__":
-            return super().__getattr__(name)  # pyre-ignore [16]
+            return super().__getattr__(name)
 
         res = LazyAwaitable._wait_async(self)
         return getattr(res, name)
@@ -549,16 +544,13 @@ for orig_method_name in torch.fx.graph.magic_methods:
         impl.__name__ = as_magic
         setattr(LazyAwaitable, as_magic, impl)
 
-    # pyre-ignore [16]
     scope(orig_method_name)
 
 # install reflective magic methods
 for orig_method_name in torch.fx.graph.reflectable_magic_methods:
     as_magic = f"__r{orig_method_name}__"
 
-    # pyre-ignore [2, 3]
     def scope(method):
-        # pyre-ignore [2, 3, 53]
         def impl(self, rhs):
             op_fn = getattr(operator, method)
             return op_fn(
@@ -569,7 +561,6 @@ for orig_method_name in torch.fx.graph.reflectable_magic_methods:
         impl.__qualname__ = as_magic
         setattr(LazyAwaitable, as_magic, impl)
 
-    # pyre-ignore [16]
     scope(orig_method_name)
 
 
@@ -873,7 +864,6 @@ class NullShardedModuleContext(Multistreamable):
     def record_stream(self, stream: Optional[torch.Stream]) -> None:
         pass
 
-    # pyre-ignore [2]
     def __setattr__(self, key: str, value: Any) -> None:
         raise NotImplementedError()
 
@@ -1194,9 +1184,7 @@ class ShardedModule(
     def input_dist(
         self,
         ctx: ShrdCtx,
-        # pyre-ignore[2]
         *input,
-        # pyre-ignore[2]
         **kwargs,
     ) -> Awaitable[Awaitable[CompIn]]:
         pass
@@ -1228,7 +1216,6 @@ class ShardedModule(
         output = self.compute(ctx, input)
         return self.output_dist(ctx, output)
 
-    # pyre-ignore[2]
     def forward(self, *input, **kwargs) -> LazyAwaitable[Out]:
         """
         Executes the input dist, compute, and output dist steps.
@@ -1257,13 +1244,12 @@ class ShardedModule(
         )
 
     def write_dist(
-        self, ctx: ShrdCtx, *input, **kwargs  # pyre-ignore[2]
+        self, ctx: ShrdCtx, *input, **kwargs
     ) -> Awaitable[Awaitable[CompIn]]:
         raise NotImplementedError(
             "The write_dist method is not implemented for this collection. Please make sure you are using the correct compute kernel and sharding type."
         )
 
-    # pyre-ignore[2]
     def write(self, *input, **kwargs) -> None:
         """
         Executes the write dist and update steps.
@@ -1341,11 +1327,9 @@ class ModuleSharder(abc.ABC, Generic[M]):
         torch._C._log_api_usage_once(f"torchrec.distributed.{self.__class__.__name__}")
         self._qcomm_codecs_registry = qcomm_codecs_registry
 
-    # pyre-fixme[56]: Pyre doesn't yet support decorators with ParamSpec applied to
     #  generic functions. Consider using a context manager instead of a decorator, if
     #  possible.
     @abc.abstractclassmethod
-    # pyre-ignore [3]
     def shard(
         self,
         module: M,
@@ -1495,10 +1479,7 @@ class ObjectPoolShardingPlan(ModuleShardingPlan):
             "inference": self.inference,
         }
         if self.memory_capacity_per_rank is not None:
-            output["memory_capacity_per_rank"] = (
-                # pyre-fixme: Incompatible parameter type [6]
-                self.memory_capacity_per_rank
-            )
+            output["memory_capacity_per_rank"] = self.memory_capacity_per_rank
         return output
 
 

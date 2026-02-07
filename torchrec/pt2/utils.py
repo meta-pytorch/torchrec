@@ -90,7 +90,6 @@ def kjt_for_pt2_tracing(
     )
 
 
-# pyre-ignore
 def default_pipeline_input_transformer(inp):
     for attr_name in ["id_list_features", "id_score_list_features"]:
         if hasattr(inp, attr_name):
@@ -159,7 +158,6 @@ def deregister_fake_classes() -> None:
     torch._library.fake_class_registry.deregister_fake_class("fbgemm::TensorQueue")
 
 
-# pyre-ignore[24]
 def pt2_compile_callable(f: Callable) -> Callable:
     """
     This method is used to decorate the update and compute methods of a metric computation class.
@@ -168,7 +166,6 @@ def pt2_compile_callable(f: Callable) -> Callable:
     """
 
     @functools.wraps(f)
-    # pyre-ignore[3]
     def inner_forward(
         ref: torch.nn.Module,
         *args: Any,

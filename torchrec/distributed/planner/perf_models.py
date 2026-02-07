@@ -31,7 +31,6 @@ class NoopPerfModel(PerfModel):
         perfs = [0] * self._topology.world_size
         for sharding_option in plan:
             for shard in sharding_option.shards:
-                # pyre-ignore [6]: Expected `typing_extensions.SupportsIndex`
                 perfs[shard.rank] += cast(Perf, shard.perf).total
 
         return max(perfs)
@@ -50,7 +49,6 @@ class NoopStorageModel(PerfModel):
         hbms = [0] * self._topology.world_size
         for sharding_option in plan:
             for shard in sharding_option.shards:
-                # pyre-ignore [6]: Expected `typing_extensions.SupportsIndex`
                 hbms[shard.rank] += cast(Storage, shard.storage).hbm
 
         return max(hbms)

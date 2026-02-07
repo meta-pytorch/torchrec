@@ -314,7 +314,6 @@ class PositionWeightedProcessor(BaseGroupedFeatureProcessor):
     ) -> Iterator[Tuple[str, torch.Tensor]]:
         yield from ()
 
-    # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -323,7 +322,6 @@ class PositionWeightedProcessor(BaseGroupedFeatureProcessor):
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
         for name, param in self.position_weights.items():
             destination[prefix + f"position_weights.{name}"] = (

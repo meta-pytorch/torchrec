@@ -100,7 +100,6 @@ class DLRMv3(nn.Module):
         # convert the predictions to [batch_size, ]
         mt_target_preds = mt_target_preds.squeeze()
         # return the loss and the predictions
-        # pyre-ignore[7] # NOTE: aux_losses.values() returns a list of tensors, and taking a sum over tensor list returns a tensor.
         return sum(aux_losses.values()), (
             aux_losses,
             mt_target_preds.detach(),
@@ -217,7 +216,6 @@ def make_model_dlrmv3(
                 mpzch_max_probe=args.max_probe,
             )
         )
-        # pyre-ignore [8] # NOTE: Pyre reports that DLRM_HSTU's _embedding_collection is EmbeddingCollection, but here we assign it with an EmbeddingCollectionAdapter.
         # This is because we want to implement managed collision functions without changing the DLRM_HSTU class. The EmbeddingCollectionAdapter will simulate all the
         # APIs for EmbeddingCollection, and we can use it to replace the EmbeddingCollection in DLRM_HSTU for managed collision functions.
         model.dlrm_hstu._embedding_collection = ec_adapter
