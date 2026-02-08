@@ -41,6 +41,7 @@ class BaseForward(Generic[TForwardContext]):
         module: ShardedModule,
         context: TForwardContext,
         stream: Optional[torch.Stream] = None,
+        memcpy_stream: Optional[torch.Stream] = None,
     ) -> None:
         self._name = name
         self._args = args
@@ -48,6 +49,7 @@ class BaseForward(Generic[TForwardContext]):
         self._context = context
         self._stream = stream
         self._device: torch.device = stream.device if stream else torch.device("cuda")
+        self._memcpy_stream: Optional[torch.Stream] = memcpy_stream
 
     @property
     def name(self) -> str:
@@ -100,7 +102,7 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
             data.record_stream(cur_stream)
             ctx.record_stream(cur_stream)
 
-        awaitable = self._module.compute_and_output_dist(ctx, data)
+        awaitable = self._module.compute_and_output_dist(ctx, data, self._memcpy_stream)
         self._context.output_dist_embeddings_requests[self._name] = awaitable
         return awaitable
 

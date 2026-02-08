@@ -328,6 +328,7 @@ def _rewrite_model(  # noqa C901
     pipelined_forward: Type[BaseForward[TrainPipelineContext]] = PipelinedForward,
     pipeline_postproc: bool = False,
     default_stream: Optional[torch.Stream] = None,
+    memcpy_stream: Optional[torch.Stream] = None,
 ) -> Tuple[
     List[ShardedModule],
     torch.nn.Module,
@@ -426,6 +427,7 @@ def _rewrite_model(  # noqa C901
                 child,
                 context,
                 dist_stream,
+                memcpy_stream,
             )
             pipelined_forwards.append(child)
         else:
