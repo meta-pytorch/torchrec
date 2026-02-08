@@ -392,13 +392,13 @@ class BaseEmbeddingConfig:
 
     def get_weight_init_max(self) -> float:
         if self.weight_init_max is None:
-            return sqrt(1 / self.num_embeddings)
+            return sqrt(1 / self.embedding_dim)
         else:
             return self.weight_init_max
 
     def get_weight_init_min(self) -> float:
         if self.weight_init_min is None:
-            return -sqrt(1 / self.num_embeddings)
+            return -sqrt(1 / self.embedding_dim)
         else:
             return self.weight_init_min
 
