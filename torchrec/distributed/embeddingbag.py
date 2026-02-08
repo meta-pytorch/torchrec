@@ -15,6 +15,7 @@ from functools import partial
 from itertools import zip_longest
 from typing import (
     Any,
+    Callable,
     cast,
     Dict,
     Iterator,
@@ -2516,3 +2517,143 @@ def _apply_mean_pooling(
             length_per_key=keyed_tensor.length_per_key(),
             key_dim=1,
         )
+
+
+def stash_embedding_weights(
+    lookup: nn.Module,
+    stash_stream: Optional[torch.cuda.Stream] = None,
+) -> Callable[[], None]:
+    """
+    Stash embedding weights from HBM to CPU asynchronously.
+
+    This function immediately starts an async copy of embedding weights from GPU (HBM)
+    to CPU (pinned memory), and returns a callback function that restores the weights
+    back to HBM when called.
+
+    Args:
+        lookup: A lookup module (e.g., GroupedPooledEmbeddingsLookup) containing
+            embedding modules with weights to stash.
+        stash_stream: Optional CUDA stream for async HBM→CPU transfer. If None,
+            a new stream will be created.
+
+    Returns:
+        A callback function that, when called, restores weights from CPU back to HBM
+        asynchronously and waits for completion.
+
+    Usage:
+        >>> # After forward lookup completes:
+        >>> restore_fn = stash_embedding_weights(lookup)
+        >>> # ... HBM is now free for other ops ...
+        >>> # Before backward (or next forward):
+        >>> restore_fn()
+
+        >>> # With custom stream:
+        >>> stream = torch.cuda.Stream()
+        >>> restore_fn = stash_embedding_weights(lookup, stash_stream=stream)
+
+    Note:
+        - Uses pinned CPU memory for efficient async transfers
+        - Uses separate CUDA stream to overlap with computation
+        - The restore callback blocks until restoration is complete
+    """
+    # Handle DDP wrapper - unwrap to get the actual module
+    module = lookup.module if hasattr(lookup, "module") else lookup
+
+    # Early return if module doesn't have embedding modules
+    if not hasattr(module, "_emb_modules"):
+        return lambda: None
+
+    # List to store stash data for each embedding module:
+    # (weights_dev tensor ref, cpu_buffer, cuda_stream)
+    stash_data: List[Tuple[torch.Tensor, torch.Tensor, torch.cuda.Stream]] = []
+
+    # Process each embedding module and start async HBM → CPU copy
+    for emb_module in module._emb_modules:
+        # Skip if no inner embedding module (e.g., BatchedFusedEmbeddingBag)
+        if not hasattr(emb_module, "_emb_module"):
+            continue
+
+        # Get the inner FBGEMM TBE (SplitTableBatchedEmbeddingBagsCodegen)
+        inner = emb_module._emb_module
+        if not hasattr(inner, "weights_dev"):
+            continue
+
+        # weights_dev is the actual embedding table weights on GPU
+        weights_dev = inner.weights_dev
+        if weights_dev is None or not weights_dev.is_cuda:
+            continue
+
+        # Create pinned CPU buffer for efficient async DMA transfer
+        # Pinned memory allows GPU to directly access CPU memory via DMA
+        cpu_buffer = torch.empty(
+            weights_dev.shape,
+            dtype=weights_dev.dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+        # Use provided stream or create a new one for this transfer
+        stream = stash_stream or torch.cuda.Stream(device=weights_dev.device)
+
+        # Ensure all operations on the default stream complete before we start copying
+        # This prevents reading weights while they're still being written by forward pass
+        stream.wait_stream(torch.cuda.current_stream())
+
+        # Start async copy from HBM to CPU
+        size_gb = weights_dev.numel() * weights_dev.element_size() / (1024**3)
+        with record_function(f"stash embedding to host ({size_gb:.2f} GB)"):
+            with torch.cuda.stream(stream):
+                # non_blocking=True: CPU returns immediately, copy runs async on GPU
+                cpu_buffer.copy_(weights_dev, non_blocking=True)
+                # Record event to mark when copy completes
+                stash_event = torch.cuda.Event()
+                stash_event.record(stream)
+
+        # CPU-blocking wait: block CPU thread until GPU copy completes
+        # This is necessary because resize_(0) is a CPU operation that frees GPU memory
+        # We must ensure data is safely on CPU before freeing HBM
+        stash_event.synchronize()
+
+        # Free HBM storage immediately after copy completes
+        # This makes the GPU memory available for other operations
+        # cavet: this is a CPU-side operation
+        weights_dev.untyped_storage().resize_(0)
+
+        stash_data.append((weights_dev, cpu_buffer, stream))
+
+    def restore(_dummy_tensor: torch.Tensor) -> None:
+        """Restore weights from CPU to HBM asynchronously."""
+        for hbm_ref, cpu_buffer, stream in stash_data:
+            # Re-allocate HBM storage (was freed after stash with resize_(0))
+            storage_size = cpu_buffer.numel() * cpu_buffer.element_size()
+            hbm_ref.untyped_storage().resize_(storage_size)
+
+            # Copy data back to HBM using a temporary tensor to bypass autograd
+            # Problem: copy_() on the original tensor increments its version counter,
+            # causing "modified by inplace operation" error during backward
+            # Solution: create a new tensor viewing the same storage - it has its own
+            # version counter, so copy_() on it won't affect the original tensor's version
+            size_gb = cpu_buffer.numel() * cpu_buffer.element_size() / (1024**3)
+            with record_function(f"restore embedding from host ({size_gb:.2f} GB)"):
+                with torch.cuda.stream(stream):
+                    # Create a temporary tensor that views the same storage
+                    # but is not tracked by autograd (fresh version counter)
+                    tmp = torch.tensor([], dtype=hbm_ref.dtype, device=hbm_ref.device)
+                    tmp.set_(
+                        hbm_ref.untyped_storage(),
+                        storage_offset=0,
+                        size=hbm_ref.shape,
+                        stride=hbm_ref.stride(),
+                    )
+                    # Async copy from CPU to HBM
+                    tmp.copy_(cpu_buffer, non_blocking=True)
+                    # Record event to mark when copy completes
+                    restore_event = torch.cuda.Event()
+                    restore_event.record(stream)
+
+            # Make the default stream wait for restore to complete
+            # This is GPU-stream blocking (not CPU-blocking), allowing CPU to continue
+            # while ensuring backward pass (on default stream) waits for restore
+            torch.cuda.current_stream().wait_event(restore_event)
+
+    return restore

@@ -36,6 +36,9 @@ EmbeddingTablesConfig:
         feature_names: ["additional_0_0"]
         data_type: FP16
 PlannerConfig:
+  pooling_factors: [30.0]  # Must match ModelInputConfig.feature_pooling_avg
+  hardware:  # A100
+    hbm_cap: 85899345920  # 80GB
   # MP-ZCH only works with row-wise sharding
   additional_constraints:
     FP16_table:
