@@ -1818,7 +1818,10 @@ class ShardedEmbeddingBagCollection(
         return awaitable
 
     def compute_and_output_dist(
-        self, ctx: EmbeddingBagCollectionContext, input: KJTList
+        self,
+        ctx: EmbeddingBagCollectionContext,
+        input: KJTList,
+        memcpy_stream: torch.cuda.Stream,
     ) -> LazyAwaitable[KeyedTensor]:
         """
         the main API called in PipelineForward, where the shardedEBC's forward is swapped
@@ -1843,6 +1846,7 @@ class ShardedEmbeddingBagCollection(
             ):
                 # with fully sharded 2D enabled, it returns an awaitable for the reduce scatter and resize operation
                 embs = lookup(features)
+                restore = stash_embedding_weights(lookup, memcpy_stream)
                 if hasattr(lookup, "get_resize_awaitables"):
                     # pyre-ignore[29]
                     resize_awaitables.extend(lookup.get_resize_awaitables())
@@ -1854,7 +1858,9 @@ class ShardedEmbeddingBagCollection(
                 self._module_fqn,
                 sharding_type,
             ):
-                awaitables.append(dist(embs, sharding_context))
+                dist_awaitable = dist(embs, sharding_context)
+                dist_awaitable._tensor_awaitable.dummy_tensor.register_hook(restore)
+                awaitables.append(dist_awaitable)
                 if self.post_odist_tracker_fn is not None:
                     self.post_odist_tracker_fn()
 

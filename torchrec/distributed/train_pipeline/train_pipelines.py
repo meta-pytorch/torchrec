@@ -855,6 +855,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             apply_jit=self._apply_jit,
             pipelined_forward=pipelined_forward,
             pipeline_postproc=self._pipeline_postproc,
+            memcpy_stream=self._memcpy_stream,
         )
         # initializes input dist, so we can override input dist forwards
         self.start_sparse_data_dist(batch, context)
