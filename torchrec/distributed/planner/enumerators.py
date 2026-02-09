@@ -11,9 +11,14 @@ import copy
 import logging
 from typing import Dict, List, Optional, Set, Tuple, Union
 
+import torch
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.planner.constants import POOLING_FACTOR
+from torchrec.distributed.planner.constants import (
+    DEFAULT_PERF_ESTIMATOR,
+    POOLING_FACTOR,
+)
+from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
 from torchrec.distributed.planner.shard_estimators import (
     EmbeddingPerfEstimator,
     EmbeddingStorageEstimator,
@@ -112,7 +117,19 @@ class EmbeddingEnumerator(Enumerator):
             )
         else:
             self._estimators: List[ShardEstimator] = [
-                EmbeddingPerfEstimator(topology=topology, constraints=constraints),
+                (
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR,
+                        topology=topology,
+                        constraints=constraints,
+                    )
+                    if torch._utils_internal.justknobs_check(
+                        "pytorch/torchrec:enable_config_based_fb_perf_estimators"
+                    )
+                    else EmbeddingPerfEstimator(
+                        topology=topology, constraints=constraints
+                    )
+                ),
                 EmbeddingStorageEstimator(topology=topology, constraints=constraints),
             ]
 

@@ -45,7 +45,8 @@ DP_ELEMENTWISE_KERNELS_PERF_FACTOR: float = 9.22  # empirical studies
 # For rounding memory hashing to nearest 100GB (10^11 bytes):
 HUNDRED_GB = 100 * 1024**3  # 107,374,182,400
 
-DEFAULT_PERF_ESTIMATOR: str = "oss_estimator"
+# Default perf estimator name - use this constant when creating estimators
+DEFAULT_PERF_ESTIMATOR: str = "default_estimator"
 
 
 def kernel_bw_lookup(
