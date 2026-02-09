@@ -289,6 +289,39 @@ def _fx_split_embeddings_per_feature_length(
     return embeddings.split(length_per_key, dim=0)
 
 
+@torch.fx.wrap
+def _fx_apply_feature_offsets(
+    kjt: KeyedJaggedTensor,
+    feature_to_offset: Dict[str, int],
+) -> torch.Tensor:
+    """
+    Apply table offsets to each feature's values in a KeyedJaggedTensor.
+
+    This function is wrapped with torch.fx.wrap to ensure compatibility with
+    torch.fx tracing. The dict iteration in kjt.to_dict().items() would
+    otherwise cause tracing failures.
+
+    Args:
+        kjt: KeyedJaggedTensor containing remapped feature values
+        feature_to_offset: Mapping from feature name to its table's shard offset
+
+    Returns:
+        Concatenated tensor of all feature values with table offsets applied
+
+    Test:
+        This functionality is exercised via test_mc_embedding.py when
+        return_remapped_features=True is set. The test creates a SparseArch with
+        ManagedCollisionEmbeddingCollection, shards it, and verifies the forward
+        pass works correctly with remapped feature output.
+        Run with: buck2 test //torchrec/distributed/tests:test_mc_embedding
+    """
+    offset_values_list: List[torch.Tensor] = []
+    for key, jt in kjt.to_dict().items():
+        offset = feature_to_offset.get(key, 0)
+        offset_values_list.append(jt.values() + offset)
+    return torch.cat(offset_values_list)
+
+
 def _construct_jagged_tensors_tw(
     embeddings: List[torch.Tensor],
     embedding_names_per_rank: List[List[str]],
@@ -1238,11 +1271,30 @@ class ShardedMCECLookup(torch.nn.Module):
     def forward(
         self,
         features: KeyedJaggedTensor,
-    ) -> Tuple[
-        Union[KeyedTensor, Dict[str, JaggedTensor]], Optional[KeyedJaggedTensor]
-    ]:
+        return_remapped_features: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[KeyedJaggedTensor]]:
         remapped_kjt = self._mcc_remapper(features)
-        return self._ec_lookup(remapped_kjt)
+        embedding_result = self._ec_lookup(remapped_kjt)
+        if return_remapped_features:
+            # When returning remapped features, add table shard offsets to the values.
+            # The remapped values from _mcc_remapper are local indices within each
+            # table's shard. Adding the table offset converts them to global indices
+            # that account for sharding, which is useful for debugging and analysis.
+            # Uses _fx_apply_feature_offsets (torch.fx.wrap) for FX tracing compatibility.
+            offset_values = _fx_apply_feature_offsets(
+                remapped_kjt,
+                self._mcc_remapper._feature_to_offset,
+            )
+
+            remapped_kjt = KeyedJaggedTensor(
+                keys=remapped_kjt.keys(),
+                values=offset_values,
+                lengths=remapped_kjt.lengths(),
+                weights=remapped_kjt.weights_or_none(),
+            )
+
+            return embedding_result, remapped_kjt
+        return embedding_result, None
 
 
 class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingCollection):
@@ -1313,6 +1365,9 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
     def _embedding_collection(self) -> ShardedQuantEmbeddingCollection:
         return cast(ShardedQuantEmbeddingCollection, self)
 
+    def create_context(self) -> ManagedCollisionEmbeddingCollectionContext:
+        return ManagedCollisionEmbeddingCollectionContext(sharding_contexts=[])
+
     def input_dist(
         self,
         ctx: EmbeddingCollectionContext,
@@ -1335,16 +1390,24 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
         dist_input: ListOfKJTList,
     ) -> List[List[torch.Tensor]]:
         ret: List[List[torch.Tensor]] = []
+        remapped_kjts: List[KeyedJaggedTensor] = []
         for i in range(len(self._managed_collision_collection._embedding_shardings)):
             dist_input_i = dist_input[i]
             lookups = self._mcec_lookup[i]
             sharding_ret: List[torch.Tensor] = []
             for j, lookup in enumerate(lookups):
-                rank_ret = lookup(
+                embedding_result, remapped_kjt = lookup(
                     features=dist_input_i[j],
+                    return_remapped_features=self._return_remapped_features,
                 )
-                sharding_ret.append(rank_ret)
+                sharding_ret.append(embedding_result)
+                if remapped_kjt is not None:
+                    remapped_kjts.append(remapped_kjt)
             ret.append(sharding_ret)
+        # Store remapped features in context for output_dist
+        if self._return_remapped_features and remapped_kjts:
+            # pyre-ignore[16]
+            ctx.remapped_kjt = KJTList(remapped_kjts)
         return ret
 
     # pyre-ignore
@@ -1360,6 +1423,14 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
         ebc_out = super().output_dist(ctx, output)
 
         kjt_out: Optional[KeyedJaggedTensor] = None
+        if self._return_remapped_features:
+            # pyre-ignore[16]
+            remapped_kjt = getattr(ctx, "remapped_kjt", None)
+            if remapped_kjt is not None:
+                kjt_out = self._managed_collision_collection.output_dist(
+                    ctx,
+                    remapped_kjt,
+                )
 
         return ebc_out, kjt_out
 
