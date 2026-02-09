@@ -38,18 +38,24 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         return lookup
 
     def test_basic_stash_and_restore(self) -> None:
-        """Test basic stash and restore functionality."""
+        """Test basic stash and restore functionality with the three-callback API."""
         original_weights = torch.ones((100, 64), device=self.device)
         original_values = original_weights.clone()
 
         lookup = self._create_mock_lookup([original_weights])
 
-        restore_fn = stash_embedding_weights(lookup)
+        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
+
+        # Free HBM after stash copy completes
+        free_hbm()
 
         # Verify HBM is freed
         self.assertEqual(original_weights.untyped_storage().size(), 0)
 
-        restore_fn(torch.tensor([]))
+        # Restore weights
+        dummy_grad = torch.tensor([])
+        restore(dummy_grad)
+        await_restore(dummy_grad)
 
         # Verify HBM is restored and values are correct
         self.assertGreater(original_weights.untyped_storage().size(), 0)
@@ -67,14 +73,20 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         lookup = self._create_mock_lookup([weights_1, weights_2, weights_3])
 
-        restore_fn = stash_embedding_weights(lookup)
+        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
+
+        # Free HBM
+        free_hbm()
 
         # Verify all are stashed
         self.assertEqual(weights_1.untyped_storage().size(), 0)
         self.assertEqual(weights_2.untyped_storage().size(), 0)
         self.assertEqual(weights_3.untyped_storage().size(), 0)
 
-        restore_fn(torch.tensor([]))
+        # Restore all
+        dummy_grad = torch.tensor([])
+        restore(dummy_grad)
+        await_restore(dummy_grad)
 
         # Verify all are restored correctly
         self.assertTrue(torch.allclose(weights_1, original_values_1))
@@ -90,12 +102,20 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         lookup = self._create_mock_lookup([original_weights])
 
-        restore_fn = stash_embedding_weights(lookup, stash_stream=custom_stream)
+        free_hbm, restore, await_restore = stash_embedding_weights(
+            lookup, stash_stream=custom_stream
+        )
+
+        # Free HBM
+        free_hbm()
 
         # Verify stash worked
         self.assertEqual(original_weights.untyped_storage().size(), 0)
 
-        restore_fn(torch.tensor([]))
+        # Restore
+        dummy_grad = torch.tensor([])
+        restore(dummy_grad)
+        await_restore(dummy_grad)
 
         # Verify restoration
         self.assertTrue(torch.allclose(original_weights, original_values))
@@ -112,8 +132,12 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         output = torch.matmul(x, weights.t())
 
         # Stash and restore
-        restore_fn = stash_embedding_weights(lookup)
-        restore_fn(torch.tensor([]))
+        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
+        free_hbm()
+
+        dummy_grad = torch.tensor([])
+        restore(dummy_grad)
+        await_restore(dummy_grad)
 
         # Version should not have changed
         self.assertEqual(weights._version, initial_version)
@@ -124,3 +148,109 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         self.assertIsNotNone(weights.grad)
         self.assertGreater(weights.grad.abs().sum().item(), 0)
+
+    def test_skip_non_cuda_weights(self) -> None:
+        """Test that non-CUDA weights are skipped."""
+        cuda_weights = torch.randn(50, 32, device=self.device)
+        cpu_weights = torch.randn(50, 32, device="cpu")
+
+        cuda_original = cuda_weights.clone()
+
+        # Create mock with both CUDA and CPU weights
+        emb_modules = []
+
+        inner_cuda = Mock()
+        inner_cuda.weights_dev = cuda_weights
+        emb_cuda = Mock()
+        emb_cuda._emb_module = inner_cuda
+        emb_modules.append(emb_cuda)
+
+        inner_cpu = Mock()
+        inner_cpu.weights_dev = cpu_weights
+        emb_cpu = Mock()
+        emb_cpu._emb_module = inner_cpu
+        emb_modules.append(emb_cpu)
+
+        lookup = Mock(spec=["_emb_modules"])
+        lookup._emb_modules = emb_modules
+
+        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
+        free_hbm()
+
+        # Only CUDA weights should be stashed
+        self.assertEqual(cuda_weights.untyped_storage().size(), 0)
+        self.assertGreater(cpu_weights.untyped_storage().size(), 0)
+
+        # Restore
+        dummy_grad = torch.tensor([])
+        restore(dummy_grad)
+        await_restore(dummy_grad)
+
+        self.assertTrue(torch.allclose(cuda_weights, cuda_original))
+
+    def test_skip_none_weights(self) -> None:
+        """Test that None weights are handled gracefully."""
+        valid_weights = torch.randn(50, 32, device=self.device)
+        valid_original = valid_weights.clone()
+
+        emb_modules = []
+
+        # Module with valid weights
+        inner_valid = Mock()
+        inner_valid.weights_dev = valid_weights
+        emb_valid = Mock()
+        emb_valid._emb_module = inner_valid
+        emb_modules.append(emb_valid)
+
+        # Module with None weights
+        inner_none = Mock()
+        inner_none.weights_dev = None
+        emb_none = Mock()
+        emb_none._emb_module = inner_none
+        emb_modules.append(emb_none)
+
+        lookup = Mock(spec=["_emb_modules"])
+        lookup._emb_modules = emb_modules
+
+        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
+        free_hbm()
+
+        # Valid weights should be stashed
+        self.assertEqual(valid_weights.untyped_storage().size(), 0)
+
+        # Restore
+        dummy_grad = torch.tensor([])
+        restore(dummy_grad)
+        await_restore(dummy_grad)
+
+        self.assertTrue(torch.allclose(valid_weights, valid_original))
+
+    def test_callback_signature_compatibility_with_register_hook(self) -> None:
+        """Test that restore and await_restore can be used as backward hooks."""
+        weights = torch.randn(10, 5, device=self.device, requires_grad=True)
+        original_values = weights.clone()
+
+        lookup = self._create_mock_lookup([weights])
+
+        # Create a tensor that we'll register hooks on
+        x = torch.randn(3, 5, device=self.device, requires_grad=True)
+        output = torch.matmul(x, weights.t())
+
+        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
+        free_hbm()
+
+        # Register callbacks as backward hooks (this is how they're used in practice)
+        output.register_hook(restore)
+        output.register_hook(await_restore)
+
+        # Backward pass should trigger the hooks
+        loss = output.sum()
+        loss.backward()
+
+        # Weights should be restored after backward
+        self.assertGreater(weights.untyped_storage().size(), 0)
+        self.assertTrue(torch.allclose(weights, original_values))
+
+
+if __name__ == "__main__":
+    unittest.main()
