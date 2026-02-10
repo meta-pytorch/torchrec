@@ -406,27 +406,62 @@ class RecMetricModule(nn.Module):
         world_size: int,
         process_group: Union[dist.ProcessGroup, DeviceMesh],
     ) -> Dict[str, Dict[str, Union[torch.Tensor, List[torch.Tensor]]]]:
+        """
+        Gather metric states from all ranks and apply reduction.
+
+        For list states (e.g., AUC predictions/labels):
+        - Concatenate local tensors into single tensor for efficient transport
+        - Single all_gather instead of N all_gathers
+        - Apply reduction once on gathered tensors
+
+        For tensor states (e.g., NE cross_entropy_sum):
+        - Stack gathered tensors
+        - Apply reduction
+
+        This approach works with ANY reduction function (no associativity requirement).
+        """
         result = defaultdict(dict)
         for task, computation in zip(metric._tasks, metric._metrics_computations):
             # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `items`.
             for state_name, reduction_fn in computation._reductions.items():
-                tensor_or_list: Union[List[torch.Tensor], torch.Tensor] = getattr(
-                    computation, state_name
-                )
+                with record_function(f"## RecMetricModule: {state_name} all gather ##"):
+                    tensor_or_list: Union[List[torch.Tensor], torch.Tensor] = getattr(
+                        computation, state_name
+                    )
 
-                if isinstance(tensor_or_list, list):
-                    gathered = _all_gather_tensor_list(
-                        tensor_or_list, world_size, process_group
-                    )
-                else:
-                    gathered = torch.stack(
-                        _all_gather_tensor(tensor_or_list, world_size, process_group)
-                    )
-                reduced = (
-                    reduction_fn(gathered) if reduction_fn is not None else gathered
-                )
-                result[task.name][state_name] = reduced
+                    if isinstance(tensor_or_list, list):
+                        if len(tensor_or_list) == 0:
+                            result[task.name][state_name] = []
+                            continue
+
+                        # Concatenate local tensors into single tensor for transport
+                        # This reduces N all_gathers to 1 all_gather
+                        local_concat = torch.cat(tensor_or_list, dim=-1)
+
+                        # Single all_gather for the concatenated tensor
+                        gathered_list = _all_gather_tensor(
+                            local_concat, world_size, process_group
+                        )
+
+                        # Apply reduction once on the gathered tensors (one per rank)
+                        if reduction_fn is not None:
+                            reduced = reduction_fn(gathered_list)
+                        else:
+                            reduced = gathered_list
+                    else:
+                        # Single tensor case
+                        gathered = torch.stack(
+                            _all_gather_tensor(
+                                tensor_or_list, world_size, process_group
+                            )
+                        )
+                        if reduction_fn is not None:
+                            reduced = reduction_fn(gathered)
+                        else:
+                            reduced = gathered
+
+                    result[task.name][state_name] = reduced
 
         return result
 
@@ -475,7 +510,8 @@ class RecMetricModule(nn.Module):
         # throughput metric requires special handling, since it's not a RecMetric
         throughput_metric = self.throughput_metric
         if throughput_metric is not None:
-            aggregated_states[throughput_metric._namespace.value] = (
+            # Merge in case there are rec metric namespaces that overlap with throughput metric namespace
+            aggregated_states.setdefault(throughput_metric._namespace.value, {}).update(
                 self._get_throughput_metric_states(throughput_metric)
             )
 
@@ -662,15 +698,3 @@ def _all_gather_tensor(
     out = [torch.empty_like(tensor) for _ in range(world_size)]  # pragma: no cover
     dist.all_gather(out, tensor, group=pg)
     return out
-
-
-def _all_gather_tensor_list(
-    tensors: List[torch.Tensor],
-    world_size: int,
-    pg: Union[dist.ProcessGroup, DeviceMesh],
-) -> List[torch.Tensor]:
-    """All-gather every tensor in a list and flatten the result."""
-    gathered: List[torch.Tensor] = []  # pragma: no cover
-    for t in tensors:
-        gathered.extend(_all_gather_tensor(t, world_size, pg))
-    return gathered
