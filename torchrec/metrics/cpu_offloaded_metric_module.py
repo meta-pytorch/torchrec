@@ -106,6 +106,9 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         self.update_thread.start()
         self.compute_thread.start()
 
+        self.update_job_time_logger: PercentileLogger = PercentileLogger(
+            metric_name="update_job_time_ms", log_interval=1000
+        )
         self.update_queue_size_logger: PercentileLogger = PercentileLogger(
             metric_name="update_queue_size", log_interval=1000
         )
@@ -145,15 +148,9 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             raise self._captured_exception
 
         try:
-            cpu_model_out, transfer_completed_event = (
-                self._transfer_to_cpu(model_out)
-                if self._model_out_device.type == "cuda"
-                else (model_out, None)
-            )
             self.update_queue.put_nowait(
                 MetricUpdateJob(
-                    model_out=cpu_model_out,
-                    transfer_completed_event=transfer_completed_event,
+                    model_out=model_out,
                     kwargs=kwargs,
                 )
             )
@@ -207,11 +204,17 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         """
 
         with record_function("## CPUOffloadedRecMetricModule:update ##"):
-            if metric_update_job.transfer_completed_event is not None:
-                metric_update_job.transfer_completed_event.synchronize()
+            start_ms = time.time()
+            cpu_model_out, transfer_completed_event = (
+                self._transfer_to_cpu(metric_update_job.model_out)
+                if self._model_out_device.type == "cuda"
+                else (metric_update_job.model_out, None)
+            )
+            if transfer_completed_event is not None:
+                transfer_completed_event.synchronize()
             labels, predictions, weights, required_inputs = parse_task_model_outputs(
                 self.rec_tasks,
-                metric_update_job.model_out,
+                cpu_model_out,
                 self.get_required_inputs(),
             )
             if required_inputs:
@@ -227,6 +230,8 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             if self.throughput_metric:
                 self.throughput_metric.update()
 
+            self.update_job_time_logger.add((time.time() - start_ms) * 1000)
+
     @override
     def shutdown(self) -> None:
         """
@@ -241,6 +246,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         if self.compute_thread.is_alive():
             self.compute_thread.join(timeout=30.0)
 
+        self.update_job_time_logger.log_percentiles()
         self.update_queue_size_logger.log_percentiles()
         self.compute_queue_size_logger.log_percentiles()
         self.compute_job_time_logger.log_percentiles()
