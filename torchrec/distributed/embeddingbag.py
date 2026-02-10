@@ -2522,13 +2522,15 @@ def _apply_mean_pooling(
 def stash_embedding_weights(
     lookup: nn.Module,
     stash_stream: Optional[torch.cuda.Stream] = None,
-) -> Callable[[], None]:
+) -> Tuple[
+    Callable[[], None], Callable[[torch.Tensor], None], Callable[[torch.Tensor], None]
+]:
     """
     Stash embedding weights from HBM to CPU asynchronously.
 
     This function immediately starts an async copy of embedding weights from GPU (HBM)
-    to CPU (pinned memory), and returns a callback function that restores the weights
-    back to HBM when called.
+    to CPU (pinned memory), and returns three callback functions for managing the
+    stash/restore lifecycle.
 
     Args:
         lookup: A lookup module (e.g., GroupedPooledEmbeddingsLookup) containing
@@ -2537,35 +2539,46 @@ def stash_embedding_weights(
             a new stream will be created.
 
     Returns:
-        A callback function that, when called, restores weights from CPU back to HBM
-        asynchronously and waits for completion.
+        A tuple of three callback functions:
+        - free_hbm: Frees HBM storage from CPU side (call after stash copy completes)
+        - restore: Retrieves stashed data from CPU back to HBM asynchronously
+        - await_restore: Pauses current stream awaiting restore completion
 
     Usage:
         >>> # After forward lookup completes:
-        >>> restore_fn = stash_embedding_weights(lookup)
+        >>> free_hbm, restore, await_restore = stash_embedding_weights(lookup)
+        >>> # ... do other work while stash copy is in progress ...
+        >>> free_hbm()  # Free HBM once stash copy completes
         >>> # ... HBM is now free for other ops ...
         >>> # Before backward (or next forward):
-        >>> restore_fn()
+        >>> restore()  # Start async restore from CPU to HBM
+        >>> await_restore()  # Wait for restore to complete before using weights
 
         >>> # With custom stream:
         >>> stream = torch.cuda.Stream()
-        >>> restore_fn = stash_embedding_weights(lookup, stash_stream=stream)
+        >>> free_hbm, restore, await_restore = stash_embedding_weights(lookup, stash_stream=stream)
 
     Note:
         - Uses pinned CPU memory for efficient async transfers
         - Uses separate CUDA stream to overlap with computation
-        - The restore callback blocks until restoration is complete
+        - free_hbm blocks CPU until stash copy completes (necessary for safe resize)
+        - restore starts async copy, await_restore blocks GPU stream until complete
     """
     # Handle DDP wrapper - unwrap to get the actual module
     module = lookup.module if hasattr(lookup, "module") else lookup
 
     # Early return if module doesn't have embedding modules
     if not hasattr(module, "_emb_modules"):
-        return lambda: None
+        return lambda: None, lambda _grad: None, lambda _grad: None
 
     # List to store stash data for each embedding module:
-    # (weights_dev tensor ref, cpu_buffer, cuda_stream)
-    stash_data: List[Tuple[torch.Tensor, torch.Tensor, torch.cuda.Stream]] = []
+    # (weights_dev tensor ref, cpu_buffer, cuda_stream, stash_event)
+    stash_data: List[
+        Tuple[torch.Tensor, torch.Tensor, torch.cuda.Stream, torch.cuda.Event]
+    ] = []
+
+    # List to store restore events for wait_for_restore
+    restore_events: List[torch.cuda.Event] = []
 
     # Process each embedding module and start async HBM → CPU copy
     for emb_module in module._emb_modules:
@@ -2609,21 +2622,25 @@ def stash_embedding_weights(
                 stash_event = torch.cuda.Event()
                 stash_event.record(stream)
 
-        # CPU-blocking wait: block CPU thread until GPU copy completes
-        # This is necessary because resize_(0) is a CPU operation that frees GPU memory
-        # We must ensure data is safely on CPU before freeing HBM
-        stash_event.synchronize()
+        stash_data.append((weights_dev, cpu_buffer, stream, stash_event))
 
-        # Free HBM storage immediately after copy completes
-        # This makes the GPU memory available for other operations
-        # cavet: this is a CPU-side operation
-        weights_dev.untyped_storage().resize_(0)
+    def free_hbm() -> None:
+        """Free HBM storage from CPU side after stash copy completes."""
+        for weights_dev, _cpu_buffer, _stream, stash_event in stash_data:
+            # CPU-blocking wait: block CPU thread until GPU copy completes
+            # This is necessary because resize_(0) is a CPU operation that frees GPU memory
+            # We must ensure data is safely on CPU before freeing HBM
+            stash_event.synchronize()
 
-        stash_data.append((weights_dev, cpu_buffer, stream))
+            # Free HBM storage immediately after copy completes
+            # This makes the GPU memory available for other operations
+            # caveat: this is a CPU-side operation
+            weights_dev.untyped_storage().resize_(0)
 
-    def restore(_dummy_tensor: torch.Tensor) -> None:
+    def restore(_grad: torch.Tensor) -> None:
         """Restore weights from CPU to HBM asynchronously."""
-        for hbm_ref, cpu_buffer, stream in stash_data:
+        restore_events.clear()
+        for hbm_ref, cpu_buffer, stream, _stash_event in stash_data:
             # Re-allocate HBM storage (was freed after stash with resize_(0))
             storage_size = cpu_buffer.numel() * cpu_buffer.element_size()
             hbm_ref.untyped_storage().resize_(storage_size)
@@ -2634,6 +2651,7 @@ def stash_embedding_weights(
             # Solution: create a new tensor viewing the same storage - it has its own
             # version counter, so copy_() on it won't affect the original tensor's version
             size_gb = cpu_buffer.numel() * cpu_buffer.element_size() / (1024**3)
+            stream.wait_stream(torch.cuda.current_stream())
             with record_function(f"restore embedding from host ({size_gb:.2f} GB)"):
                 with torch.cuda.stream(stream):
                     # Create a temporary tensor that views the same storage
@@ -2650,10 +2668,14 @@ def stash_embedding_weights(
                     # Record event to mark when copy completes
                     restore_event = torch.cuda.Event()
                     restore_event.record(stream)
+                    restore_events.append(restore_event)
 
-            # Make the default stream wait for restore to complete
-            # This is GPU-stream blocking (not CPU-blocking), allowing CPU to continue
-            # while ensuring backward pass (on default stream) waits for restore
+    def await_restore(_grad: torch.Tensor) -> None:
+        """Pause current stream awaiting restore completion."""
+        # Make the default stream wait for all restore operations to complete
+        # This is GPU-stream blocking (not CPU-blocking), allowing CPU to continue
+        # while ensuring backward pass (on default stream) waits for restore
+        for restore_event in restore_events:
             torch.cuda.current_stream().wait_event(restore_event)
 
-    return restore
+    return free_hbm, restore, await_restore

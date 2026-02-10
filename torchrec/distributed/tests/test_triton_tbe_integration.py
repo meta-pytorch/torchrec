@@ -15,11 +15,14 @@ TritonBatchedFusedEmbeddingBag class, verifying that the Triton-based embedding 
 works correctly for forward pass, backward pass, optimizer updates, and weight management.
 """
 
+import os
 import unittest
-from typing import List
+from typing import List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from hypothesis import given, Phase, seed, settings, strategies as st, Verbosity
 from torch.distributed._shard.sharded_tensor.metadata import ShardMetadata
 from torchrec.distributed.batched_embedding_kernel import (
     TritonBatchedFusedEmbeddingBag,
@@ -30,7 +33,14 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
-from torchrec.modules.embedding_configs import DataType, PoolingType
+from torchrec.distributed.planner import ParameterConstraints
+from torchrec.distributed.test_utils.test_model_parallel import ModelParallelTestShared
+from torchrec.distributed.test_utils.test_sharding import (
+    create_test_sharder,
+    SharderType,
+)
+from torchrec.distributed.types import ShardingType
+from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig, PoolingType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import skip_if_asan_class
 
@@ -40,7 +50,7 @@ def _create_embedding_table_config(
     num_embeddings: int,
     embedding_dim: int,
     feature_names: List[str],
-    data_type: DataType = DataType.FP32,
+    data_type: DataType = DataType.FP16,
     pooling: PoolingType = PoolingType.SUM,
 ) -> ShardedEmbeddingTable:
     """Create a ShardedEmbeddingTable configuration for testing."""
@@ -60,7 +70,7 @@ def _create_embedding_table_config(
 
 def _create_grouped_embedding_config(
     tables: List[ShardedEmbeddingTable],
-    data_type: DataType = DataType.FP32,
+    data_type: DataType = DataType.FP16,
     pooling: PoolingType = PoolingType.SUM,
     optimizer: OptimType = OptimType.EXACT_SGD,
     learning_rate: float = 0.01,
@@ -478,8 +488,8 @@ class TritonEmbeddingFusedOptimizerTest(unittest.TestCase):
         not torch.cuda.is_available(),
         "CUDA is required for Triton TBE tests",
     )
-    def test_zero_grad(self) -> None:
-        """Test that zero_grad updates learning rate on module."""
+    def test_learning_rate_propagation(self) -> None:
+        """Test that learning rate changes are propagated to module via zero_grad and step."""
         device = torch.device("cuda:0")
 
         # Setup: Create embedding
@@ -499,43 +509,14 @@ class TritonEmbeddingFusedOptimizerTest(unittest.TestCase):
 
         optimizer = emb_bag.fused_optimizer
 
-        # Execute: Change learning rate and call zero_grad
+        # Test zero_grad propagates learning rate
         optimizer.param_groups[0]["lr"] = 0.05
         optimizer.zero_grad()
-
-        # Assert: Learning rate should be propagated to module
         self.assertEqual(emb_bag._emb_module.learning_rate, 0.05)
 
-    @unittest.skipIf(
-        not torch.cuda.is_available(),
-        "CUDA is required for Triton TBE tests",
-    )
-    def test_step(self) -> None:
-        """Test that step updates learning rate on module."""
-        device = torch.device("cuda:0")
-
-        # Setup: Create embedding
-        table = _create_embedding_table_config(
-            name="table_0",
-            num_embeddings=100,
-            embedding_dim=64,
-            feature_names=["feature_0"],
-        )
-        config = _create_grouped_embedding_config([table], learning_rate=0.01)
-
-        emb_bag = TritonBatchedFusedEmbeddingBag(
-            config=config,
-            pg=None,
-            device=device,
-        )
-
-        optimizer = emb_bag.fused_optimizer
-
-        # Execute: Change learning rate and call step
+        # Test step propagates learning rate
         optimizer.param_groups[0]["lr"] = 0.1
         optimizer.step()
-
-        # Assert: Learning rate should be propagated to module
         self.assertEqual(emb_bag._emb_module.learning_rate, 0.1)
 
     @unittest.skipIf(
@@ -587,7 +568,7 @@ class TritonEmbeddingFusedOptimizerTest(unittest.TestCase):
             embedding_dim=64,
             feature_names=["feature_0"],
             pooling=PoolingType.SUM,
-            data_type=DataType.FP32,
+            data_type=DataType.FP16,
             has_feature_processor=False,
             local_rows=100,
             local_cols=32,  # Sharded column dimension (half of 64)
@@ -634,7 +615,7 @@ class TritonEmbeddingFusedOptimizerTest(unittest.TestCase):
             embedding_dim=64,
             feature_names=["feature_0"],
             pooling=PoolingType.SUM,
-            data_type=DataType.FP32,
+            data_type=DataType.FP16,
             has_feature_processor=False,
             local_rows=100,
             local_cols=32,
@@ -647,7 +628,7 @@ class TritonEmbeddingFusedOptimizerTest(unittest.TestCase):
             embedding_dim=64,
             feature_names=["feature_0"],
             pooling=PoolingType.SUM,
-            data_type=DataType.FP32,
+            data_type=DataType.FP16,
             has_feature_processor=False,
             local_rows=100,
             local_cols=32,
@@ -672,6 +653,591 @@ class TritonEmbeddingFusedOptimizerTest(unittest.TestCase):
         self.assertEqual(len(param_keys), 2)
         self.assertIn("same_table.weight.0_0", param_keys)
         self.assertIn("same_table.weight.0_32", param_keys)
+
+
+@skip_if_asan_class
+class TritonTBEColumnWiseShardingTest(ModelParallelTestShared):
+    """
+    Tests for Triton TBE with column-wise sharding.
+
+    Mimics test_sharding_nccl_twrw from ModelParallelHierarchicalTest but focuses on
+    column-wise sharding with EXACT_ROWWISE_ADAGRAD optimizer for Triton TBE.
+
+    NOTE:
+        Requires at least 2 GPUs to test.
+
+    This test uses tables where some tables have multiple features mapped to them.
+    This exercises the feature_table_map code path in Triton TBE to ensure
+    proper handling of the case where multiple features share the same embedding table.
+    """
+
+    def _build_tables_and_groups(
+        self,
+        data_type: DataType = DataType.FP16,
+    ) -> None:
+        """
+        Override to create tables with multiple features per table.
+
+        This configuration exercises the feature_table_map bug where the backward
+        kernel was incorrectly using embedding_offset from only the first entry
+        in a segment, when entries in the same segment can come from different
+        features with different embedding_offsets.
+
+        Table configuration:
+        - table_0: 2 features (feature_0, feature_1) - exercises multi-feature per table
+        - table_1: 1 feature (feature_2) - standard single-feature table
+        - table_2: 2 features (feature_3, feature_4) - another multi-feature table
+        """
+        # Table 0 has 2 features
+        self.tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_0",
+                feature_names=["feature_0", "feature_1"],
+                data_type=data_type,
+            ),
+            # Table 1 has 1 feature
+            EmbeddingBagConfig(
+                num_embeddings=80,
+                embedding_dim=32,
+                name="table_1",
+                feature_names=["feature_2"],
+                data_type=data_type,
+            ),
+            # Table 2 has 2 features
+            EmbeddingBagConfig(
+                num_embeddings=120,
+                embedding_dim=48,
+                name="table_2",
+                feature_names=["feature_3", "feature_4"],
+                data_type=data_type,
+            ),
+        ]
+
+        # Mean pooling tables (same structure)
+        self.mean_tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_0",
+                feature_names=["feature_0", "feature_1"],
+                pooling=PoolingType.MEAN,
+                data_type=data_type,
+            ),
+            EmbeddingBagConfig(
+                num_embeddings=80,
+                embedding_dim=32,
+                name="table_1",
+                feature_names=["feature_2"],
+                pooling=PoolingType.MEAN,
+                data_type=data_type,
+            ),
+            EmbeddingBagConfig(
+                num_embeddings=120,
+                embedding_dim=48,
+                name="table_2",
+                feature_names=["feature_3", "feature_4"],
+                pooling=PoolingType.MEAN,
+                data_type=data_type,
+            ),
+        ]
+
+        # Weighted tables (not used in this test but required by parent class)
+        self.weighted_tables = []
+        self.embedding_groups = {}
+        self.shared_features = []
+
+    @unittest.skipIf(
+        not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+        "Not enough GPUs, this test requires at least 2 GPUs",
+    )
+    # pyre-fixme[56]
+    @given(
+        sharder_type=st.sampled_from(
+            [
+                SharderType.EMBEDDING_BAG_COLLECTION.value,
+            ]
+        ),
+        sharding_type=st.just(ShardingType.COLUMN_WISE.value),
+        kernel_type=st.sampled_from(
+            [
+                EmbeddingComputeKernel.FUSED_TRITON.value,
+            ]
+        ),
+        pooling=st.sampled_from([PoolingType.SUM]),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=2,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
+    @unittest.skip(
+        "Skip due to Triton PTX codegen error with clusterlaunchcontrol instructions on current CUDA toolchain"
+    )
+    def test_sharding_cw_triton_tbe(
+        self,
+        sharder_type: str,
+        sharding_type: str,
+        kernel_type: str,
+        pooling: PoolingType,
+    ) -> None:
+        """
+        Test column-wise sharding with Triton TBE and EXACT_ROWWISE_ADAGRAD optimizer.
+
+        This test validates that:
+        1. Column-wise sharding works correctly with Triton TBE
+        2. The shard-aware parameter keys prevent CombinedOptimizer conflicts
+        3. Forward/backward passes produce correct results
+        """
+        # Enable detailed distributed debug for non-even collectives
+        os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+
+        world_size = 2
+
+        self._test_sharding(
+            # pyre-ignore[6]
+            sharders=[
+                create_test_sharder(
+                    sharder_type,
+                    sharding_type,
+                    kernel_type,
+                    fused_params={
+                        "optimizer": OptimType.EXACT_ROWWISE_ADAGRAD,
+                        "learning_rate": 0.01,
+                        "eps": 0.1,
+                    },
+                    device=torch.device("cuda"),
+                ),
+            ],
+            backend="nccl",
+            world_size=world_size,
+            constraints={
+                table.name: ParameterConstraints(min_partition=4)
+                for table in self.tables
+            },
+            pooling=pooling,
+            has_weighted_tables=False,  # We don't use weighted tables in this test
+        )
+
+
+@skip_if_asan_class
+class TritonCUDANumericAlignmentTest(unittest.TestCase):
+    """
+    Tests for verifying numeric alignment between Triton TBE and CUDA TBE.
+
+    These tests ensure that the Triton-based TBE implementation produces
+    numerically equivalent results to the CUDA-based SplitTableBatchedEmbeddingBagsCodegen
+    for both forward and backward passes.
+    """
+
+    @staticmethod
+    def _create_cuda_tbe(
+        embedding_specs: List[Tuple[int, int]],
+        feature_table_map: Optional[List[int]] = None,
+        dtype: torch.dtype = torch.float16,
+        optimizer: OptimType = OptimType.EXACT_SGD,
+        learning_rate: float = 0.01,
+        eps: float = 0.1,
+    ) -> torch.nn.Module:
+        """Create a CUDA TBE with the given specs."""
+        from fbgemm_gpu.split_embedding_configs import SparseType
+        from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
+            EmbeddingLocation,
+            PoolingMode,
+        )
+        from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+            ComputeDevice,
+            SplitTableBatchedEmbeddingBagsCodegen,
+        )
+
+        emb = SplitTableBatchedEmbeddingBagsCodegen(
+            embedding_specs=[
+                (
+                    E,
+                    D,
+                    EmbeddingLocation.DEVICE,
+                    ComputeDevice.CUDA,
+                )
+                for (E, D) in embedding_specs
+            ],
+            feature_table_map=feature_table_map,
+            weights_precision=SparseType.from_dtype(dtype),
+            output_dtype=SparseType.from_dtype(dtype),
+            stochastic_rounding=False,
+            optimizer=optimizer,
+            learning_rate=learning_rate,
+            eps=eps,
+            pooling_mode=PoolingMode.SUM,
+        )
+        return emb
+
+    @staticmethod
+    def _create_triton_tbe(
+        embedding_specs: List[Tuple[int, int]],
+        feature_table_map: Optional[List[int]] = None,
+        dtype: torch.dtype = torch.float16,
+        learning_rate: float = 0.01,
+        eps: float = 0.1,
+        optimizer: OptimType = OptimType.EXACT_SGD,
+    ) -> torch.nn.Module:
+        """Create a Triton TBE with the given specs."""
+        from deeplearning.fbgemm.fbgemm_gpu.fb.triton.triton_table_batched_embeddings import (
+            TritonTableBatchedEmbeddingBags,
+        )
+
+        emb = TritonTableBatchedEmbeddingBags(
+            embedding_specs=embedding_specs,
+            feature_table_map=feature_table_map,
+            weights_precision=dtype,
+            learning_rate=learning_rate,
+            eps=eps,
+            optimizer=optimizer,
+        )
+        return emb
+
+    @staticmethod
+    def _generate_feature_table_map(
+        num_tables: int,
+        multi_feature: bool = False,
+    ) -> Tuple[List[int], List[int]]:
+        """Generate feature_table_map and features_per_table.
+
+        Args:
+            num_tables: Number of physical embedding tables
+            multi_feature: If True, some tables will have multiple features
+
+        Returns:
+            feature_table_map: Maps each feature to its table index
+            features_per_table: Number of features per table
+        """
+        import random
+
+        if multi_feature:
+            # Randomly assign 1-3 features per table
+            features_per_table = [random.randint(1, 3) for _ in range(num_tables)]
+        else:
+            # One feature per table (default behavior)
+            features_per_table = [1] * num_tables
+
+        feature_table_map = []
+        for table_idx, num_features in enumerate(features_per_table):
+            feature_table_map.extend([table_idx] * num_features)
+
+        return feature_table_map, features_per_table
+
+    @staticmethod
+    def _generate_inputs(
+        hash_sizes: List[int],
+        feature_table_map: List[int],
+        batch_size: int,
+        max_len: int,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate random indices and offsets for TBE forward.
+
+        Args:
+            hash_sizes: Number of rows per table (indexed by table)
+            feature_table_map: Maps each feature to its table index
+            batch_size: Batch size
+            max_len: Maximum bag size
+            device: Device to create tensors on
+
+        Returns:
+            indices: Concatenated indices for all features
+            offsets: Offsets tensor
+        """
+        import random
+
+        num_features = len(feature_table_map)
+        offsets = [0]
+        indices_per_feature = []
+
+        for feature_idx in range(num_features):
+            table_idx = feature_table_map[feature_idx]
+            n_rows = hash_sizes[table_idx]
+            len_sum = 0
+
+            for _ in range(batch_size):
+                length = random.randint(0, max_len)
+                len_sum += length
+                offsets.append(offsets[-1] + length)
+
+            indices_per_feature.append(
+                torch.randint(n_rows, [len_sum], dtype=torch.int64, device=device)
+            )
+
+        indices = torch.cat(indices_per_feature, dim=0)
+        offsets_tensor = torch.tensor(offsets, dtype=torch.int64, device=device)
+
+        return indices, offsets_tensor
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "CUDA is required for numeric alignment tests",
+    )
+    # pyre-ignore[56]: Invalid decoration
+    @given(
+        bag_size=st.integers(8, 12),
+        batch_size=st.just(128),
+        num_tables=st.integers(8, 12),
+        dtype=st.sampled_from([torch.float16]),
+        iters=st.integers(3, 5),
+        multi_feature=st.booleans(),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=10,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
+    def test_forward_numeric_alignment_fp16(
+        self,
+        bag_size: int,
+        batch_size: int,
+        num_tables: int,
+        dtype: torch.dtype,
+        iters: int,
+        multi_feature: bool,
+    ) -> None:
+        """Test that Triton TBE forward pass produces same results as CUDA TBE (FP16).
+
+        This test covers both single-feature and multi-feature per table configurations
+        via the multi_feature parameter.
+        """
+        import random
+
+        torch.manual_seed(42)
+
+        device = torch.device("cuda:0")
+
+        # Create embedding specs with dims divisible by 4
+        embedding_specs = [
+            (random.randint(50, 200), random.randrange(16, 128, 4))
+            for _ in range(num_tables)
+        ]
+
+        # Generate feature_table_map (some tables may have multiple features)
+        feature_table_map, _ = self._generate_feature_table_map(
+            num_tables, multi_feature=multi_feature
+        )
+
+        cuda_emb = self._create_cuda_tbe(
+            embedding_specs, feature_table_map=feature_table_map, dtype=dtype
+        )
+        triton_emb = self._create_triton_tbe(
+            embedding_specs, feature_table_map=feature_table_map, dtype=dtype
+        )
+
+        cuda_emb.init_embedding_weights_uniform(-1.0, 1.0)
+        triton_emb.weight.data.copy_(cuda_emb.weights_dev)
+
+        hash_sizes = [spec[0] for spec in embedding_specs]
+
+        for _ in range(iters):
+            indices, offsets = self._generate_inputs(
+                hash_sizes, feature_table_map, batch_size, bag_size, device
+            )
+
+            cuda_output = cuda_emb(indices, offsets)
+            triton_output = triton_emb(indices, offsets)
+
+            self.assertTrue(
+                torch.allclose(triton_output, cuda_output, rtol=1e-8, atol=1e-8),
+                f"Forward pass mismatch (FP16, multi_feature={multi_feature}): "
+                f"max diff = {(triton_output - cuda_output).abs().max().item()}",
+            )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "CUDA is required for numeric alignment tests",
+    )
+    # pyre-ignore[56]: Invalid decoration
+    @seed(42)
+    @given(
+        bag_size=st.integers(8, 12),
+        batch_size=st.just(128),
+        num_tables=st.integers(8, 12),
+        multi_feature=st.booleans(),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=5,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
+    @unittest.skip(
+        "Skip due to Triton PTX codegen error with clusterlaunchcontrol instructions on current CUDA toolchain"
+    )
+    def test_backward_rowwise_adagrad_numeric_alignment(
+        self,
+        bag_size: int,
+        batch_size: int,
+        num_tables: int,
+        multi_feature: bool,
+    ) -> None:
+        """Test backward pass with rowwise Adagrad optimizer.
+
+        This test covers both single-feature and multi-feature per table configurations
+        via the multi_feature parameter.
+        """
+        import random
+
+        random.seed(42)
+        torch.manual_seed(42)
+        device = torch.device("cuda:0")
+        dtype = torch.float16
+        lr = 0.1
+        eps = 0.1
+
+        embedding_specs = [
+            (random.randint(30, 80), random.randrange(16, 64, 4))
+            for _ in range(num_tables)
+        ]
+
+        feature_table_map, _ = self._generate_feature_table_map(
+            num_tables, multi_feature=multi_feature
+        )
+
+        cuda_emb = self._create_cuda_tbe(
+            embedding_specs,
+            feature_table_map=feature_table_map,
+            dtype=dtype,
+            optimizer=OptimType.EXACT_ROWWISE_ADAGRAD,
+            learning_rate=lr,
+            eps=eps,
+        )
+        triton_emb = self._create_triton_tbe(
+            embedding_specs,
+            feature_table_map=feature_table_map,
+            dtype=dtype,
+            learning_rate=lr,
+            eps=eps,
+            optimizer=OptimType.EXACT_ROWWISE_ADAGRAD,
+        )
+
+        cuda_emb.init_embedding_weights_uniform(-1.0, 1.0)
+        triton_emb.weight.data.copy_(cuda_emb.weights_dev)
+
+        B = batch_size
+        Ds = [spec[1] for spec in embedding_specs]
+        hash_sizes = [spec[0] for spec in embedding_specs]
+
+        fwd_tol = 1e-8  # Forward should be exact (same weights, same computation)'
+        # Backward tolerance larger, pending investigation
+        # validated below cases:
+        # - Unique rows (no gradient accumulation): diff = 0.0 (exact match)
+        # - Within-bag accumulation (same row, same bag): diff = 0.0 (exact match)
+        # - Cross-batch accumulation (same row, different batches): diff ~ 1e-3
+        bwd_tol = 1e-3
+
+        # Only run a single iteration to check numeric alignment before drift accumulates
+        indices, offsets = self._generate_inputs(
+            hash_sizes, feature_table_map, batch_size, bag_size, device
+        )
+
+        # Calculate total output dim based on feature_table_map
+        total_output_dim = sum(Ds[t] for t in feature_table_map)
+
+        cuda_output = cuda_emb(indices, offsets)
+        triton_output = triton_emb(indices, offsets)
+
+        # Check forward alignment
+        self.assertTrue(
+            torch.allclose(triton_output, cuda_output, rtol=fwd_tol, atol=fwd_tol),
+            f"Forward mismatch (Adagrad, multi_feature={multi_feature}): max diff = {(triton_output - cuda_output).abs().max().item()}",
+        )
+
+        # Run backward
+        grad_output = torch.randn(B, total_output_dim, device=device, dtype=dtype)
+
+        cuda_output.backward(grad_output)
+        triton_output.backward(grad_output)
+
+        max_diff = (triton_emb.weight - cuda_emb.weights_dev).abs().max().item()
+        self.assertTrue(
+            max_diff < bwd_tol,
+            f"Weight mismatch after Adagrad backward (multi_feature={multi_feature}): max diff = {max_diff} (tolerance = {bwd_tol})",
+        )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "CUDA is required for numeric alignment tests",
+    )
+    def test_forward_edge_cases(self) -> None:
+        """Test forward pass with various edge cases: empty bags, repeated indices, large batch."""
+        device = torch.device("cuda:0")
+        dtype = torch.float16
+
+        # Test 1: Empty bags (zero-length lookups)
+        embedding_specs = [(100, 64)]
+        cuda_emb = self._create_cuda_tbe(embedding_specs, dtype=dtype)
+        triton_emb = self._create_triton_tbe(embedding_specs, dtype=dtype)
+
+        torch.manual_seed(42)
+        weights = torch.randn(100 * 64, dtype=dtype, device=device)
+        cuda_emb.weights_dev.copy_(weights)
+        triton_emb.weight.data.copy_(weights)
+
+        # Indices and offsets with empty bags (samples 1 and 3 have no indices)
+        indices = torch.tensor([0, 5, 10, 15], dtype=torch.int64, device=device)
+        offsets = torch.tensor([0, 2, 2, 4, 4], dtype=torch.int64, device=device)
+
+        cuda_output = cuda_emb(indices, offsets)
+        triton_output = triton_emb(indices, offsets)
+
+        tol = 1e-8
+
+        self.assertTrue(
+            torch.allclose(triton_output, cuda_output, rtol=tol, atol=tol),
+            f"Empty bags forward mismatch: max diff = {(triton_output - cuda_output).abs().max().item()}",
+        )
+        # Verify empty bags are zeros
+        self.assertTrue(
+            torch.allclose(cuda_output[1], torch.zeros(64, device=device, dtype=dtype)),
+            "Empty bag should produce zeros",
+        )
+
+        # Test 2: Repeated indices (same row accessed multiple times)
+        indices = torch.tensor(
+            [5, 5, 5, 10, 10, 15, 20], dtype=torch.int64, device=device
+        )
+        offsets = torch.tensor([0, 3, 5, 7], dtype=torch.int64, device=device)
+
+        cuda_output = cuda_emb(indices, offsets)
+        triton_output = triton_emb(indices, offsets)
+
+        self.assertTrue(
+            torch.allclose(triton_output, cuda_output, rtol=tol, atol=tol),
+            f"Repeated indices forward mismatch: max diff = {(triton_output - cuda_output).abs().max().item()}",
+        )
+
+        # Test 3: Large batch with multiple tables and multi-feature
+        embedding_specs = [(1000, 64), (500, 128)]
+        feature_table_map = [0, 0, 1, 1, 1]  # 2 features for table 0, 3 for table 1
+        cuda_emb = self._create_cuda_tbe(
+            embedding_specs, feature_table_map=feature_table_map, dtype=dtype
+        )
+        triton_emb = self._create_triton_tbe(
+            embedding_specs, feature_table_map=feature_table_map, dtype=dtype
+        )
+
+        cuda_emb.init_embedding_weights_uniform(-1.0, 1.0)
+        triton_emb.weight.data.copy_(cuda_emb.weights_dev)
+
+        hash_sizes = [spec[0] for spec in embedding_specs]
+        indices, offsets = self._generate_inputs(
+            hash_sizes, feature_table_map, 64, 20, device
+        )
+
+        cuda_output = cuda_emb(indices, offsets)
+        triton_output = triton_emb(indices, offsets)
+
+        self.assertTrue(
+            torch.allclose(triton_output, cuda_output, rtol=tol, atol=tol),
+            f"Large batch forward mismatch: max diff = {(triton_output - cuda_output).abs().max().item()}",
+        )
 
 
 if __name__ == "__main__":
