@@ -51,8 +51,8 @@ def experimental(
         >>> fancy_new_op(3)  # first call triggers a warning
         6
 
-        >>> @experimental(feature="Hybird 2D Parallel", since="1.2.0")
-        ... class HybirdDistributedModelParallel:
+        >>> @experimental(feature="Hybrid 2D Parallel", since="1.2.0")
+        ... class HybridDistributedModelParallel:
         ...     ...
     """
     tag: str = feature or obj.__name__  # pyre-ignore[16]
