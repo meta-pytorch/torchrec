@@ -848,6 +848,7 @@ class PlannerErrorType(Enum):
     PLANNER_INPUT_CONTEXT_MISMATCH = "planner_input_context_mismatch"
     PLAN_LOADING_FAILED = "plan_loading_failed"
     INVALID_RANK_ASSIGNMENT = "invalid_rank_assignment"
+    MISSING_MODULE_IN_PLAN = "missing_module_in_plan"
 
 
 class PlannerError(Exception):

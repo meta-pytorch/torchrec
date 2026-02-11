@@ -18,7 +18,11 @@ from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.perf_models import NoopPerfModel
-from torchrec.distributed.planner.planners import EmbeddingShardingPlanner, extract_plan
+from torchrec.distributed.planner.planners import (
+    EmbeddingShardingPlanner,
+    extract_plan,
+    validate_modules_inclusion_in_sharding_plan,
+)
 from torchrec.distributed.planner.proposers import EmbeddingOffloadScaleupProposer
 from torchrec.distributed.planner.stats import EmbeddingStats
 from torchrec.distributed.planner.storage_reservations import (
@@ -1284,3 +1288,167 @@ class TestExtractPlan(unittest.TestCase):
             self.assertEqual(result_so.shards, loaded_so.shards)
             self.assertEqual(len(result_so.shards), 1)
             self.assertEqual(result_so.shards[0].size, [200, 128])
+
+
+class TestValidateModulesInclusionInShardingPlan(unittest.TestCase):
+    """Test cases for validate_modules_inclusion_in_sharding_plan function."""
+
+    def setUp(self) -> None:
+        compute_device = "cuda"
+        self.topology = Topology(
+            world_size=2, hbm_cap=1024 * 1024 * 2, compute_device=compute_device
+        )
+        self.tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(4)
+        ]
+        self.model = TestSparseNN(
+            tables=self.tables, sparse_device=torch.device("meta")
+        )
+        self.planner = EmbeddingShardingPlanner(topology=self.topology)
+
+    def test_validate_modules_inclusion_success(self) -> None:
+        """Test that validation passes when all shardable modules are in the plan."""
+        sharders = [TWvsRWSharder()]
+        sharding_plan = self.planner.plan(module=self.model, sharders=sharders)
+
+        # Should not raise any exception
+        validate_modules_inclusion_in_sharding_plan(sharding_plan, self.model, sharders)
+
+    def test_validate_modules_inclusion_missing_module(self) -> None:
+        """Test that validation fails when a shardable module is missing from the plan."""
+        sharders = [TWvsRWSharder()]
+        sharding_plan = self.planner.plan(module=self.model, sharders=sharders)
+
+        # Remove a module from the plan to simulate missing module
+        original_plan = sharding_plan.plan.copy()
+        if "sparse.ebc" in sharding_plan.plan:
+            del sharding_plan.plan["sparse.ebc"]
+
+        with self.assertRaises(PlannerError) as context:
+            validate_modules_inclusion_in_sharding_plan(
+                sharding_plan, self.model, sharders
+            )
+
+        self.assertEqual(
+            context.exception.error_type, PlannerErrorType.MISSING_MODULE_IN_PLAN
+        )
+        self.assertIn("not present in the sharding plan", str(context.exception))
+
+        # Restore the plan for cleanup
+        sharding_plan.plan = original_plan
+
+    def test_validate_modules_inclusion_empty_plan(self) -> None:
+        """Test that validation fails with empty sharding plan when model has shardable modules."""
+        sharders = [TWvsRWSharder()]
+        empty_plan = ShardingPlan({})
+
+        with self.assertRaises(PlannerError) as context:
+            validate_modules_inclusion_in_sharding_plan(
+                empty_plan, self.model, sharders
+            )
+
+        self.assertEqual(
+            context.exception.error_type, PlannerErrorType.MISSING_MODULE_IN_PLAN
+        )
+
+    def test_validate_modules_inclusion_no_shardable_modules(self) -> None:
+        """Test that validation passes when model has no shardable modules."""
+        # Use a simple model with no embedding tables
+        simple_model = nn.Linear(10, 10)
+        empty_plan = ShardingPlan({})
+        sharders = [TWvsRWSharder()]
+
+        # Should not raise any exception since there are no shardable modules
+        validate_modules_inclusion_in_sharding_plan(empty_plan, simple_model, sharders)
+
+    def test_validate_modules_inclusion_no_sharders(self) -> None:
+        """Test that validation passes when no sharders are provided."""
+        empty_plan = ShardingPlan({})
+
+        # Should not raise any exception since no sharders means no modules are considered shardable
+        validate_modules_inclusion_in_sharding_plan(empty_plan, self.model, [])
+
+    def test_validate_modules_inclusion_partial_shardable_params(self) -> None:
+        """Test that validation passes when sharder filters out some modules via shardable_params.
+
+        When a sharder is configured with shardable_params to only shard specific tables,
+        modules that exist but have no shardable parameters (due to the filter) should
+        NOT be flagged as missing from the sharding plan.
+        """
+        # Create a model with multiple EBC modules (weighted and non-weighted)
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(2)
+        ]
+        weighted_tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=32,
+                name="weighted_table_" + str(i),
+                feature_names=["weighted_feature_" + str(i)],
+            )
+            for i in range(2)
+        ]
+        model = TestSparseNN(
+            tables=tables,
+            weighted_tables=weighted_tables,
+            sparse_device=torch.device("meta"),
+        )
+
+        # Create a sharder that only shards the non-weighted tables
+        # This simulates the scenario where weighted_ebc module has a matching sharder type
+        # but the sharder filters out all its parameters via shardable_params
+        class PartialEBCSharder(
+            EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]
+        ):
+            def __init__(self, shardable_params: List[str]) -> None:
+                super().__init__()
+                self._shardable_params = shardable_params
+
+            def sharding_types(self, compute_device_type: str) -> List[str]:
+                return [ShardingType.TABLE_WISE.value]
+
+            def compute_kernels(
+                self, sharding_type: str, compute_device_type: str
+            ) -> List[str]:
+                return [EmbeddingComputeKernel.FUSED.value]
+
+            def shardable_parameters(
+                self, module: EmbeddingBagCollection
+            ) -> Dict[str, nn.Parameter]:
+                # Filter to only include parameters that are in shardable_params
+                all_params = super().shardable_parameters(module)
+                return {
+                    name: param
+                    for name, param in all_params.items()
+                    if name in self._shardable_params
+                }
+
+        # Only include non-weighted table names in shardable_params
+        sharder = PartialEBCSharder(shardable_params=[table.name for table in tables])
+        sharders = [cast(ModuleSharder[nn.Module], sharder)]
+
+        # Plan with the partial sharder - this should only plan for non-weighted tables
+        planner = EmbeddingShardingPlanner(topology=self.topology)
+        sharding_plan = planner.plan(module=model, sharders=sharders)
+
+        # The validation should pass because weighted_ebc has no shardable parameters
+        # (they were filtered out by shardable_params), so it shouldn't be expected
+        # in the sharding plan
+        validate_modules_inclusion_in_sharding_plan(sharding_plan, model, sharders)
+
+        # Verify that only non-weighted ebc is in the plan
+        self.assertIn("sparse.ebc", sharding_plan.plan)
+        # weighted_ebc should not be in the plan since it has no shardable params
+        self.assertNotIn("sparse.weighted_ebc", sharding_plan.plan)

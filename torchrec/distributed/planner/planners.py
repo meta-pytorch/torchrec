@@ -55,6 +55,7 @@ from torchrec.distributed.planner.types import (
 from torchrec.distributed.planner.utils import (
     bytes_to_gb,
     reset_shard_rank,
+    sharder_name,
     storage_repr_in_gb,
 )
 from torchrec.distributed.sharding_plan import get_default_sharders, placement
@@ -134,6 +135,114 @@ def to_sharding_plan(
         )
         plan[sharding_option.path] = module_plan
     return ShardingPlan(plan)
+
+
+def validate_modules_inclusion_in_sharding_plan(
+    sharding_plan: ShardingPlan,
+    module: nn.Module,
+    sharders: List[ModuleSharder[nn.Module]],
+    constraints: Optional[Dict[str, ParameterConstraints]] = None,
+    device_group: Optional[str] = None,
+) -> None:
+    """
+    Validates that all shardable modules in the model are included in the sharding plan.
+
+    This function traverses through the module hierarchy to identify all shardable
+    modules (modules that have a corresponding sharder AND have shardable parameters)
+    and validates that each one is present in the final sharding plan.
+
+    A module is only expected to be in the sharding plan if:
+    1. It has a corresponding sharder (by module type)
+    2. The sharder's shardable_parameters() returns at least one parameter for it
+    3. If device_group is specified, the module's constraint must match the device_group
+
+    This handles cases where a sharder is configured to only shard specific tables
+    (e.g., via shardable_params filter), leaving some modules with no parameters
+    to shard. It also supports group-based validation for HeteroEmbeddingShardingPlanner
+    where modules are partitioned across different device groups.
+
+    Args:
+        sharding_plan (ShardingPlan): The final sharding plan to validate.
+        module (nn.Module): The root module to traverse and validate.
+        sharders (List[ModuleSharder[nn.Module]]): The list of sharders used for
+            sharding. These define which module types are considered shardable.
+        constraints (Optional[Dict[str, ParameterConstraints]]): Per-table constraints
+            for sharding. Required when device_group is specified.
+        device_group (Optional[str]): If specified, only validate modules that belong
+            to this device group. This is used by HeteroEmbeddingShardingPlanner to
+            validate per-group sharding plans.
+
+    Raises:
+        PlannerError: If any shardable module with shardable parameters
+            is not found in the sharding plan.
+    """
+    # Build a map of sharder names to sharders
+    sharder_map = {sharder_name(sharder.module_type): sharder for sharder in sharders}
+
+    # Collect all shardable modules by traversing the module tree
+    # Only include modules that have at least one shardable parameter
+    expected_modules: List[str] = []
+
+    named_modules_queue = [("", module)]
+    while named_modules_queue:
+        child_path, child_module = named_modules_queue.pop()
+        sharder_key = sharder_name(type(child_module))
+        sharder = sharder_map.get(sharder_key, None)
+
+        if not sharder:
+            # Not a shardable module, continue traversing its children
+            for n, m in child_module.named_children():
+                if child_path != "":
+                    named_modules_queue.append((child_path + "." + n, m))
+                else:
+                    named_modules_queue.append((n, m))
+            continue
+
+        # This module has a matching sharder, but check if it has any shardable params
+        # A sharder may be configured to only shard specific tables, so some modules
+        # with the matching type may have no parameters to shard
+        shardable_params = sharder.shardable_parameters(child_module)
+        if not shardable_params:
+            continue
+
+        # If device_group is specified, filter by device group
+        if device_group is not None and constraints is not None:
+            # Check each shardable parameter's constraint for device_group
+            module_in_group = False
+            for param_name in shardable_params.keys():
+                if param_name in constraints:
+                    param_constraint = constraints[param_name]
+                    if param_constraint.device_group == device_group:
+                        module_in_group = True
+                        break
+            if not module_in_group:
+                # This module doesn't belong to the specified device group, skip it
+                continue
+
+        if child_path not in expected_modules:
+            expected_modules.append(child_path)
+
+    # Get modules present in the sharding plan
+    plan_modules = set(sharding_plan.plan.keys())
+
+    # Check for missing modules
+    missing_modules: List[str] = []
+
+    for module_path in expected_modules:
+        if module_path not in plan_modules:
+            missing_modules.append(module_path)
+
+    if missing_modules:
+        group_info = f" for device group '{device_group}'" if device_group else ""
+        msg = (
+            f"The following shardable modules are not present in the "
+            f"sharding plan{group_info}: {missing_modules}."
+        )
+        logging.error(msg)
+        raise PlannerError(
+            error_type=PlannerErrorType.MISSING_MODULE_IN_PLAN,
+            message=msg,
+        )
 
 
 def validate_rank_assignment(sharding_plan: ShardingPlan, topology: Topology) -> None:
@@ -708,6 +817,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     ),
                 )
 
+            validate_modules_inclusion_in_sharding_plan(sharding_plan, module, sharders)
             validate_rank_assignment(sharding_plan, self._topology)
             return sharding_plan
         else:
@@ -1071,6 +1181,9 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                 self._best_plan = best_plan
                 sharding_plan = to_sharding_plan(
                     best_plan, self._topology_groups[group]
+                )
+                validate_modules_inclusion_in_sharding_plan(
+                    sharding_plan, module, sharders, self._constraints, group
                 )
                 validate_rank_assignment(sharding_plan, self._topology_groups[group])
                 best_plans.append(sharding_plan)
