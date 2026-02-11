@@ -2072,6 +2072,11 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
         control over which batches trigger gradient computation and weight updates.
     """
 
+    def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
+        if self._state == PipelineState.UNKNOWN:
+            return super()._next_batch(dataloader_iter)
+        return self._next_batch_on_cpu
+
     def progress(self, dataloader_iter: Iterator[In], is_training: bool = True) -> Out:
         """
         Execute one step of the pipelined train/eval loop.
@@ -2109,7 +2114,7 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
             interleaved with training batches).
         """
 
-        self._state = PipelineState.IDLE
+        self._state = PipelineState.UNKNOWN
         # Attach the model just in case the user forgets to call it, especially when the user
         # pauses the pipeline.progress and detaches the model for other purposes.
         if not self._model_attached:
@@ -2117,8 +2122,18 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
 
         # Fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
         self.fill_pipeline(dataloader_iter)
+        self._state = PipelineState.IDLE
+
+        self._next_batch_on_cpu = TrainPipelineSparseDist._next_batch(
+            self, dataloader_iter
+        )
+        if self._next_batch_on_cpu is None and not is_training:
+            # stop current progress if eval iter is exhausted
+            # training iter will continue
+            raise StopIteration
 
         for context in self.contexts:
+            # this only fills the context loaded from fill_pipeline
             if not hasattr(context, "is_training"):
                 logger.info(
                     f"initial fill batch-{context.index} with {'train' if is_training else 'eval'}"
@@ -2148,9 +2163,8 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
 
         is_curr_training = self._model.training and self.contexts[0].is_training
 
-        if not self._enqueue_batch_after_forward:
-            # Batch i+2: load data and copy to GPU, the dataloader iter will first exhaust here
-            self.enqueue_batch(dataloader_iter)
+        # Batch i+2: load data and copy to GPU, the dataloader iter will first exhaust here
+        if self.enqueue_batch(dataloader_iter):
             self.contexts[-1].is_training = is_training
 
         # Forward pass for current batch
@@ -2163,13 +2177,6 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
                 with torch.no_grad():
                     self._state = PipelineState.CALL_FWD
                     losses, output = self._model_fwd(self.batches[0])
-
-        if self._enqueue_batch_after_forward:
-            # Batch i+2: load data and copy to GPU, the dataloader iter will first exhaust here.
-            # Start this step after the forward of batch i, so that the H2D copy doesn't compete
-            # for PCIe bandwidth with embedding lookup from UVM/UVM_CACHING.
-            self.enqueue_batch(dataloader_iter, is_training=is_training)
-            self.contexts[-1].is_training = is_training
 
         # Complete sparse data distribution for the next batch
         if len(self.batches) >= 2:
