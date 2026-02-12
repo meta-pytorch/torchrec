@@ -657,8 +657,8 @@ class ModelInput(Pipelineable):
         """
         return (
             float_features.pin_memory(),
-            idlist_features.pin_memory(),
-            idscore_features.pin_memory(),
+            idlist_features.pin_memory() if idlist_features is not None else None,
+            idscore_features.pin_memory() if idscore_features is not None else None,
             label.pin_memory(),
         )
 
