@@ -243,7 +243,6 @@ class EBCJsonSerializer(JsonSerializer):
     @classmethod
     def swap_meta_forward(cls, module: nn.Module) -> None:
         assert isinstance(module, cls._module_cls)
-        # pyre-ignore
         module.forward = ebc_meta_forward.__get__(module, cls._module_cls)
 
     @classmethod
@@ -254,10 +253,8 @@ class EBCJsonSerializer(JsonSerializer):
         ebc_metadata = EBCMetadata(
             tables=[
                 embedding_bag_config_to_metadata(table_config)
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 for table_config in module.embedding_bag_configs()
             ],
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             is_weighted=module.is_weighted(),
             device=str(module.device),
         )
@@ -328,7 +325,6 @@ class PWMCJsonSerializer(JsonSerializer):
         metadata = PositionWeightedModuleCollectionMetadata(
             max_feature_lengths=[  # convert to list of tuples to preserve the order
                 (feature, len)
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `items`.
                 for feature, len in module.max_feature_lengths.items()
             ],
@@ -371,7 +367,6 @@ class FPEBCJsonSerializer(JsonSerializer):
         else:
             metadata = FPEBCMetadata(
                 is_fp_collection=False,
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `keys`.
                 features=list(module._feature_processors.keys()),
             )
@@ -414,7 +409,6 @@ class KTRegroupAsDictJsonSerializer(JsonSerializer):
     @classmethod
     def swap_meta_forward(cls, module: nn.Module) -> None:
         assert isinstance(module, cls._module_cls)
-        # pyre-ignore
         module.forward = kt_regroup_meta_forward.__get__(module, cls._module_cls)
 
     @classmethod
@@ -423,16 +417,12 @@ class KTRegroupAsDictJsonSerializer(JsonSerializer):
         module: nn.Module,
     ) -> Dict[str, Any]:
         metadata = KTRegroupAsDictMetadata(
-            # pyre-fixme[6]: For 1st argument expected `List[str]` but got
             #  `Union[Module, Tensor]`.
             keys=module._keys,
-            # pyre-fixme[6]: For 2nd argument expected `List[List[str]]` but got
             #  `Union[Module, Tensor]`.
             groups=module._groups,
             emb_dtype=(
-                module._emb_dtype.value  # pyre-ignore[16]
-                if module._emb_dtype is not None
-                else None
+                module._emb_dtype.value if module._emb_dtype is not None else None
             ),
         )
         return metadata.__dict__

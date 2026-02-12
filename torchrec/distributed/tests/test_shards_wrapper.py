@@ -89,7 +89,7 @@ def all_gather_object(
         )
         for i in range(world_size):
             torch.testing.assert_close(
-                output[i]._local_shards[0],  # pyre-ignore[16]
+                output[i]._local_shards[0],
                 shards_wrapper[i]._local_shards[0],
             )
 
@@ -99,7 +99,6 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
     def setUp(self, backend: str = "nccl") -> None:
         super().setUp()
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -130,7 +129,6 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
             backend=backend,
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -159,7 +157,6 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
             backend=backend,
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

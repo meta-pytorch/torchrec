@@ -86,16 +86,13 @@ class CriteoIterDataPipe(IterDataPipe):
         self,
         paths: Iterable[str],
         *,
-        # pyre-ignore[2]
         row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
-        # pyre-ignore[2]
         **open_kw,
     ) -> None:
         self.paths = paths
         self.row_mapper = row_mapper
-        self.open_kw: Any = open_kw  # pyre-ignore[4]
+        self.open_kw: Any = open_kw
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         worker_info = torch.utils.data.get_worker_info()
         paths = self.paths
@@ -115,9 +112,7 @@ class CriteoIterDataPipe(IterDataPipe):
 def criteo_terabyte(
     paths: Iterable[str],
     *,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
-    # pyre-ignore[2]
     **open_kw,
 ) -> IterDataPipe:
     """`Criteo 1TB Click Logs <https://ailab.criteo.com/download-criteo-1tb-click-logs-dataset/>`_ Dataset
@@ -145,9 +140,7 @@ def criteo_terabyte(
 def criteo_kaggle(
     path: str,
     *,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
-    # pyre-ignore[2]
     **open_kw,
 ) -> IterDataPipe:
     """`Kaggle/Criteo Display Advertising <https://www.kaggle.com/c/criteo-display-ad-challenge/>`_ Dataset

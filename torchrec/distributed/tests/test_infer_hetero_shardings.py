@@ -37,7 +37,6 @@ class InferHeteroShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         sharding_device=st.sampled_from(["cpu"]),
     )
@@ -73,7 +72,6 @@ class InferHeteroShardingsTest(unittest.TestCase):
         sharder = QuantEmbeddingCollectionSharder()
         compute_kernel = EmbeddingComputeKernel.QUANT.value
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             non_sharded_model._module_kjt_input[0],
             per_param_sharding={
                 "table_0": row_wise(([20, 10, 100], "cpu")),
@@ -84,7 +82,6 @@ class InferHeteroShardingsTest(unittest.TestCase):
                     rank=1, device="cuda", compute_kernel=compute_kernel
                 ),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -110,7 +107,6 @@ class InferHeteroShardingsTest(unittest.TestCase):
 
         sharded_model = _shard_modules(
             module=non_sharded_model,
-            # pyre-fixme[6]: For 2nd argument expected
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[QuantEmbeddingCollectionSharder]`.
             sharders=[sharder],
@@ -119,24 +115,19 @@ class InferHeteroShardingsTest(unittest.TestCase):
             env=env_dict,
         )
 
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
         self.assertTrue(hasattr(sharded_model._module_kjt_input[0], "_lookups"))
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
         self.assertTrue(len(sharded_model._module_kjt_input[0]._lookups) == 2)
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
         self.assertTrue(hasattr(sharded_model._module_kjt_input[0], "_input_dists"))
 
         for i, env in enumerate(env_dict.values()):
             self.assertTrue(
                 hasattr(
-                    # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, ...
                     sharded_model._module_kjt_input[0]._lookups[i],
                     "_embedding_lookups_per_rank",
                 )
             )
             self.assertTrue(
                 len(
-                    # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, ...
                     sharded_model._module_kjt_input[0]
                     ._lookups[i]
                     ._embedding_lookups_per_rank
@@ -144,7 +135,6 @@ class InferHeteroShardingsTest(unittest.TestCase):
                 == env.world_size
             )
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 3,
         "Not enough GPUs available",
@@ -180,7 +170,6 @@ class InferHeteroShardingsTest(unittest.TestCase):
         sharder = QuantEmbeddingBagCollectionSharder()
         compute_kernel = EmbeddingComputeKernel.QUANT.value
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             non_sharded_model._module_kjt_input[0],
             per_param_sharding={
                 "table_0": row_wise(([20, 10, 100], "cpu")),
@@ -191,7 +180,6 @@ class InferHeteroShardingsTest(unittest.TestCase):
                     rank=1, device="cuda", compute_kernel=compute_kernel
                 ),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -209,7 +197,6 @@ class InferHeteroShardingsTest(unittest.TestCase):
         }
         sharded_model = _shard_modules(
             module=non_sharded_model,
-            # pyre-fixme[6]: For 2nd argument expected
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[QuantEmbeddingBagCollectionSharder]`.
             sharders=[sharder],
@@ -217,21 +204,17 @@ class InferHeteroShardingsTest(unittest.TestCase):
             plan=plan,
             env=env_dict,
         )
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
         self.assertTrue(hasattr(sharded_model._module_kjt_input[0], "_lookups"))
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
         self.assertTrue(len(sharded_model._module_kjt_input[0]._lookups) == 2)
         for i, env in enumerate(env_dict.values()):
             self.assertTrue(
                 hasattr(
-                    # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, ...
                     sharded_model._module_kjt_input[0]._lookups[i],
                     "_embedding_lookups_per_rank",
                 )
             )
             self.assertTrue(
                 len(
-                    # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, ...
                     sharded_model._module_kjt_input[0]
                     ._lookups[i]
                     ._embedding_lookups_per_rank
@@ -282,13 +265,11 @@ class InferHeteroShardingsTest(unittest.TestCase):
         )
         module_plan = planner.plan(
             non_sharded_model,
-            # pyre-ignore
             sharders=[sharder],
         )
         print(module_plan)
 
         self.assertTrue(
-            # pyre-ignore
             module_plan.plan["_module_kjt_input.0"]["table_0"]
             .sharding_spec.shards[0]
             .placement.device()

@@ -16,7 +16,6 @@ from torchrec.tensor_types import UInt2Tensor, UInt4Tensor
 
 
 class QuantUtilsTest(unittest.TestCase):
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "Not enough GPUs available",

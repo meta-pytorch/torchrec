@@ -56,7 +56,6 @@ def _append_table_shard(
 
 def post_state_dict_hook(
     # Union["ShardedQuantEmbeddingBagCollection", "ShardedQuantEmbeddingCollection"]
-    # pyre-ignore [24]
     module: ShardedEmbeddingModule,
     destination: Dict[str, torch.Tensor],
     prefix: str,
@@ -66,7 +65,6 @@ def post_state_dict_hook(
     for (
         table_name,
         sharded_t,
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `items`.
     ) in module._table_name_to_sharded_tensor.items():
         destination[f"{prefix}{tables_weights_prefix}.{table_name}.weight"] = sharded_t
 
@@ -85,7 +83,6 @@ def post_state_dict_hook(
         for (
             table_name,
             sharded_t,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `items`.
         ) in dict_sharded_t.items():
             destination[f"{prefix}{tables_weights_prefix}.{table_name}.{sfx}"] = (
                 sharded_t
@@ -93,7 +90,6 @@ def post_state_dict_hook(
         for (
             table_name,
             t_list,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `items`.
         ) in dict_t_list.items():
             destination[f"{prefix}{tables_weights_prefix}.{table_name}.{sfx}"] = t_list
 
@@ -115,38 +111,30 @@ class ShardedQuantEmbeddingModuleState(
         )
 
         # weight
-        # pyre-fixme[16]: `ShardedQuantEmbeddingModuleState` has no attribute
         #  `_table_name_to_local_shards`.
         self._table_name_to_local_shards: Dict[str, List[Shard]] = {}
-        # pyre-fixme[16]: `ShardedQuantEmbeddingModuleState` has no attribute
         #  `_table_name_to_sharded_tensor`.
         self._table_name_to_sharded_tensor: Dict[
             str, Union[torch.Tensor, ShardedTensorBase]
         ] = {}
 
         # weight_qscale
-        # pyre-fixme[16]: `ShardedQuantEmbeddingModuleState` has no attribute
         #  `_table_name_to_local_shards_qscale`.
         self._table_name_to_local_shards_qscale: Dict[str, List[Shard]] = {}
-        # pyre-fixme[16]: `ShardedQuantEmbeddingModuleState` has no attribute
         #  `_table_name_to_sharded_tensor_qscale`.
         self._table_name_to_sharded_tensor_qscale: Dict[
             str, Union[torch.Tensor, ShardedTensorBase]
         ] = {}
-        # pyre-fixme[16]: `ShardedQuantEmbeddingModuleState` has no attribute
         #  `_table_name_to_tensors_list_qscale`.
         self._table_name_to_tensors_list_qscale: Dict[str, List[torch.Tensor]] = {}
 
         # weight_qbias
-        # pyre-fixme[16]: `ShardedQuantEmbeddingModuleState` has no attribute
         #  `_table_name_to_local_shards_qbias`.
         self._table_name_to_local_shards_qbias: Dict[str, List[Shard]] = {}
-        # pyre-fixme[16]: `ShardedQuantEmbeddingModuleState` has no attribute
         #  `_table_name_to_sharded_tensor_qbias`.
         self._table_name_to_sharded_tensor_qbias: Dict[
             str, Union[torch.Tensor, ShardedTensorBase]
         ] = {}
-        # pyre-fixme[16]: `ShardedQuantEmbeddingModuleState` has no attribute
         #  `_table_name_to_tensors_list_qbias`.
         self._table_name_to_tensors_list_qbias: Dict[str, List[torch.Tensor]] = {}
         _table_name_to_shard_idx: Dict[str, int] = {}
@@ -173,11 +161,9 @@ class ShardedQuantEmbeddingModuleState(
                 _table_name_to_shard_idx[table.name] = column_idx + 1
 
                 # TODO(ivankobzarev): "meta" sharding support: cleanup when copy to "meta" moves all tensors to "meta"
-                # pyre-ignore
                 if metadata.placement.device != tbe_split_w.device:
                     metadata.placement = _remote_device(tbe_split_w.device)
                 _append_table_shard(
-                    # pyre-fixme[6]: For 1st argument expected `Dict[str,
                     #  List[Shard]]` but got `Union[Tensor, Module]`.
                     self._table_name_to_local_shards,
                     table.name,
@@ -212,17 +198,14 @@ class ShardedQuantEmbeddingModuleState(
                     sharding_type: str = parameter_sharding.sharding_type
 
                     if sharding_type == ShardingType.COLUMN_WISE.value:
-                        # pyre-fixme[58]: `not in` is not supported for right
                         #  operand type `Union[Tensor, Module]`.
                         if table.name not in table_name_to_tensors_list:
                             assert parameter_sharding.ranks
                             num_shards: int = len(parameter_sharding.ranks)
-                            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Unio...
                             table_name_to_tensors_list[table.name] = [
                                 torch.empty([])
                             ] * num_shards
 
-                        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[No...
                         table_name_to_tensors_list[table.name][
                             column_idx
                         ] = tbe_split_qparam
@@ -230,25 +213,20 @@ class ShardedQuantEmbeddingModuleState(
                         qmetadata = ShardMetadata(
                             shard_offsets=metadata.shard_offsets,
                             shard_sizes=[
-                                # pyre-fixme[16]: `Optional` has no attribute `shape`.
                                 tbe_split_qparam.shape[0],
                                 tbe_split_qparam.shape[1],
                             ],
-                            # pyre-ignore
                             placement=table.local_metadata.placement,
                         )
                         # TODO(ivankobzarev): "meta" sharding support: cleanup when copy to "meta" moves all tensors to "meta"
-                        # pyre-fixme[16]: `Optional` has no attribute `device`.
                         if qmetadata.placement.device != tbe_split_qparam.device:
                             qmetadata.placement = _remote_device(
                                 tbe_split_qparam.device
                             )
                         _append_table_shard(
-                            # pyre-fixme[6]: For 1st argument expected `Dict[str,
                             #  List[Shard]]` but got `Union[Tensor, Module]`.
                             table_name_to_local_shards,
                             table.name,
-                            # pyre-fixme[6]: For 1st argument expected `Tensor` but
                             #  got `Optional[Tensor]`.
                             Shard(tensor=tbe_split_qparam, metadata=qmetadata),
                         )
@@ -265,12 +243,10 @@ class ShardedQuantEmbeddingModuleState(
                 self._table_name_to_sharded_tensor_qbias,
             ),
         ]:
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `items`.
             for table_name, local_shards in table_name_to_local_shards.items():
                 if len(local_shards) == 1:
                     # Single Tensor per table (TW sharding)
-                    # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, ...
                     table_name_to_sharded_tensor[table_name] = local_shards[0].tensor
                     continue
 
@@ -291,7 +267,6 @@ class ShardedQuantEmbeddingModuleState(
                     shards_metadata=[ls.metadata for ls in local_shards],
                     size=torch.Size([global_rows, global_cols]),
                 )
-                # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _Nes...
                 table_name_to_sharded_tensor[table_name] = (
                     ShardedTensorBase._init_from_local_shards_and_global_metadata(
                         local_shards=local_shards,
@@ -308,7 +283,6 @@ class ShardedQuantEmbeddingModuleState(
         self,
         state_dict: Mapping[str, Any],
         prefix: str,
-        # pyre-ignore
         local_metadata,
         strict: bool,
         missing_keys: List[str],
@@ -399,9 +373,7 @@ def get_bucket_offsets_per_virtual_table(
         tables = config.embedding_tables
         for table in tables:
             assert (
-                # pyre-fixme: Undefined attribute [16]
-                table.global_metadata.shards_metadata
-                is not None
+                table.global_metadata.shards_metadata is not None
             ), f"Table: {table} doesn't have global metadata in grouped embedding config"
             if table.name in none_throws(virtual_table_name_to_bucket_lengths):
                 if table.name in shard_metadata_per_virtual_table:
@@ -518,11 +490,9 @@ def sharded_tbes_weights_spec(
                     if table.virtual_table_eviction_policy:
                         table_dim_offsets = [
                             table.virtual_table_eviction_policy.get_meta_header_len(),
-                            # pyre-ignore [16]
                             table.virtual_table_eviction_policy.get_meta_header_len()
                             + table.embedding_dim,
                         ]
-                    # pyre-ignore
                     table_metadata: ShardMetadata = table.local_metadata
                     local_rows = table.local_rows
                     row_offsets = table_metadata.shard_offsets[0]
@@ -537,10 +507,8 @@ def sharded_tbes_weights_spec(
                         shard_index = bisect.bisect_left(
                             [
                                 shard_metadata.shard_offsets[0]
-                                # pyre-fixme: Undefined attribute[16]
                                 for shard_metadata in table.global_metadata.shards_metadata
                             ],
-                            # pyre-fixme: Undefined attribute[16]
                             table.local_metadata.shard_offsets[0],
                         )
                         assert (

@@ -144,7 +144,6 @@ def get_device_from_parameter_sharding(
         raise ValueError("Expected EnumerableShardingSpec as input to the function")
 
     device_type_list: Tuple[str, ...] = tuple(
-        # pyre-fixme[16]: `Optional` has no attribute `device`
         [shard.placement.device().type for shard in ps.sharding_spec.shards]
     )
     if len(set(device_type_list)) == 1:
@@ -396,7 +395,6 @@ class VariableBatchEmbeddingBagCollectionAwaitable(
 
         # free memory and resize
         if self._resize_awaitables is not None:
-            # pyre-ignore[16]
             for awaitable in self._resize_awaitables:
                 awaitable.wait()
 
@@ -439,7 +437,6 @@ class EmbeddingBagCollectionAwaitable(
 
         # free memory and resize
         if self._resize_awaitables is not None:
-            # pyre-ignore[16]
             for awaitable in self._resize_awaitables:
                 awaitable.wait()
 
@@ -747,7 +744,6 @@ class ShardedEmbeddingBagCollection(
                     # modify param keys to match EmbeddingBagCollection
                     params: Mapping[str, Union[torch.Tensor, ShardedTensor]] = {}
                     for param_key, weight in tbe_module.fused_optimizer.params.items():
-                        # pyre-fixme[16]: `Mapping` has no attribute `__setitem__`
                         params["embedding_bags." + param_key] = weight
                     tbe_module.fused_optimizer.params = params
                     optims.append(("", tbe_module.fused_optimizer))
@@ -1172,11 +1168,9 @@ class ShardedEmbeddingBagCollection(
                         ]
                         local_shards_wrapper = v._local_tensor
                         shards_wrapper["local_tensors"].extend(
-                            # pyre-ignore[16]
                             local_shards_wrapper.local_shards()
                         )
                         shards_wrapper["local_offsets"].extend(
-                            # pyre-ignore[16]
                             local_shards_wrapper.local_offsets()
                         )
                         shards_wrapper["global_size"] = v.size()
@@ -1191,7 +1185,6 @@ class ShardedEmbeddingBagCollection(
             for (
                 table_name,
                 tbe_slice,
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
                 #  `named_parameters_by_table`.
             ) in lookup.named_parameters_by_table():
                 # for virtual table, currently we don't expose id tensor and bucket tensor
@@ -1212,9 +1205,7 @@ class ShardedEmbeddingBagCollection(
                     _model_parallel_name_to_compute_kernel[table_name]
                     != EmbeddingComputeKernel.DENSE.value
                 ):
-                    # pyre-fixme[16]: `Module` has no attribute
                     #  `_in_backward_optimizers`.
-                    # pyre-fixme[16]: `Tensor` has no attribute
                     #  `_in_backward_optimizers`.
                     self.embedding_bags[table_name].weight._in_backward_optimizers = [
                         EmptyFusedOptimizer()
@@ -1381,9 +1372,7 @@ class ShardedEmbeddingBagCollection(
                         weight_ids_sharded_t,
                         id_cnt_per_bucket_sharded_t,
                         metadata_sharded_t,
-                    ) in (
-                        lookup.get_named_split_embedding_weights_snapshot()  # pyre-ignore
-                    ):
+                    ) in lookup.get_named_split_embedding_weights_snapshot():
                         assert table_name in sharded_kvtensors_copy
                         if self._table_name_to_config[table_name].use_virtual_table:
                             assert isinstance(weights_t, ShardedTensor)
@@ -1410,7 +1399,6 @@ class ShardedEmbeddingBagCollection(
                             )
                             # The logic here assumes there is only one shard per table on any particular rank
                             # if there are cases each rank has >1 shards, we need to update here accordingly
-                            # pyre-ignore
                             sharded_kvtensors_copy[table_name].local_shards()[
                                 0
                             ].tensor = weights_t
@@ -1488,18 +1476,16 @@ class ShardedEmbeddingBagCollection(
             assert table_config.init_fn is not None
             param = self.embedding_bags[f"{table_config.name}"].weight
             if param.data.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
-                tmp_param = torch.zeros(param.shape, device=param.device)  # pyre-ignore
-                table_config.init_fn(tmp_param).to(param.data.dtype)  # pyre-ignore
-                param.data.copy_(tmp_param)  # pyre-ignore
+                tmp_param = torch.zeros(param.shape, device=param.device)
+                table_config.init_fn(tmp_param).to(param.data.dtype)
+                param.data.copy_(tmp_param)
             else:
-                # pyre-ignore
                 table_config.init_fn(param)
 
             sharding_type = self.module_sharding_plan[table_config.name].sharding_type
             if sharding_type == ShardingType.DATA_PARALLEL.value:
                 pg = self._env.process_group
                 with torch.no_grad():
-                    # pyre-fixme[6]: For 1st argument expected `Tensor` but got
                     #  `Union[Module, Tensor]`.
                     dist.broadcast(param.data, src=0, group=pg)
 
@@ -1676,7 +1662,6 @@ class ShardedEmbeddingBagCollection(
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=env.process_group)
         return bool(flag.item())
 
-    # pyre-ignore [14]
     def input_dist(
         self,
         ctx: EmbeddingBagCollectionContext,
@@ -1687,11 +1672,11 @@ class ShardedEmbeddingBagCollection(
         in advance
         """
         if isinstance(features, TensorDict):
-            feature_keys = list(features.keys())  # pyre-ignore[6]
+            feature_keys = list(features.keys())
             if len(self._features_order) > 0:
                 feature_keys = [feature_keys[i] for i in self._features_order]
                 self._has_features_permute = False  # feature_keys are in order
-            features = maybe_td_to_kjt(features, feature_keys)  # pyre-ignore[6]
+            features = maybe_td_to_kjt(features, feature_keys)
         ctx.variable_batch_per_feature = features.variable_stride_per_key()
         ctx.inverse_indices = features.inverse_indices_or_none()
 
@@ -1710,7 +1695,6 @@ class ShardedEmbeddingBagCollection(
             if self._has_features_permute:
                 features = features.permute(
                     self._features_order,
-                    # pyre-fixme[6]: For 2nd argument expected `Optional[Tensor]`
                     #  but got `Union[Module, Tensor]`.
                     self._features_order_tensor,
                 )
@@ -1722,13 +1706,13 @@ class ShardedEmbeddingBagCollection(
                     offsets=features.offsets(),
                     pooling_type_to_rs_features=self._pooling_type_to_rs_features,
                     stride_per_key=features.stride_per_key(),
-                    dim_per_key=self._dim_per_key,  # pyre-ignore[6]
+                    dim_per_key=self._dim_per_key,
                     embedding_names=self._embedding_names,
                     embedding_dims=self._embedding_dims,
                     variable_batch_per_feature=ctx.variable_batch_per_feature,
-                    kjt_inverse_order=self._kjt_inverse_order,  # pyre-ignore[6]
+                    kjt_inverse_order=self._kjt_inverse_order,
                     kjt_key_indices=self._kjt_key_indices,
-                    kt_key_ordering=self._kt_key_ordering,  # pyre-ignore[6]
+                    kt_key_ordering=self._kt_key_ordering,
                     inverse_indices=ctx.inverse_indices,
                     weights=features.weights_or_none(),
                 )
@@ -1844,7 +1828,6 @@ class ShardedEmbeddingBagCollection(
                 # with fully sharded 2D enabled, it returns an awaitable for the reduce scatter and resize operation
                 embs = lookup(features)
                 if hasattr(lookup, "get_resize_awaitables"):
-                    # pyre-ignore[29]
                     resize_awaitables.extend(lookup.get_resize_awaitables())
                 if self.post_lookup_tracker_fn is not None:
                     self.post_lookup_tracker_fn(features, embs, self, None)
@@ -1999,7 +1982,6 @@ class ShardedEmbeddingBagCollection(
                         param_key,
                         weight,
                     ) in tbe_module.fused_optimizer.params.items():
-                        # pyre-fixme[16]: `Mapping` has no attribute `__setitem__`
                         params["embedding_bags." + param_key] = weight
                     tbe_module.fused_optimizer.params = params
                     optims.append(("", tbe_module.fused_optimizer))
@@ -2265,7 +2247,6 @@ class ShardedEmbeddingBag(
                 # modify param keys to match EmbeddingBag
                 params: Mapping[str, Union[torch.Tensor, ShardedTensor]] = {}
                 for param_key, weight in module.fused_optimizer.params.items():
-                    # pyre-fixme[16]: `Mapping` has no attribute `__setitem__`.
                     params[param_key.split(".")[-1]] = weight
                 module.fused_optimizer.params = params
                 optims.append(("", module.fused_optimizer))
@@ -2290,7 +2271,6 @@ class ShardedEmbeddingBag(
             qcomm_codecs_registry=qcomm_codecs_registry,
         )
 
-    # pyre-ignore [14]
     def input_dist(
         self,
         ctx: NullShardedModuleContext,
@@ -2320,7 +2300,6 @@ class ShardedEmbeddingBag(
             awaitable=self._output_dist(output),
         )
 
-    # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -2329,9 +2308,7 @@ class ShardedEmbeddingBag(
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
-        # pyre-fixme[19]: Expected 0 positional arguments.
         lookup_state_dict = self._lookup.state_dict(None, "", keep_vars)
         # update key to match embeddingBag state_dict key
         for key, item in lookup_state_dict.items():
@@ -2369,7 +2346,6 @@ class ShardedEmbeddingBag(
         for name, buffer in self._lookup.named_buffers("", recurse):
             yield append_prefix(prefix, name.split(".")[-1]), buffer
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
     def load_state_dict(
         self,

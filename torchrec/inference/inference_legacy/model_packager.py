@@ -26,7 +26,6 @@ T = TypeVar("T")
 
 
 try:
-    # pyre-fixme[21]: Could not find module `torch_package_importer`.
     import torch_package_importer  # @manual
 except ImportError:
     pass
@@ -68,10 +67,8 @@ class PredictFactoryPackager:
         ] = torch.package.sys_importer,
     ) -> None:
         with PackageExporter(output, importer=package_importer) as pe:
-            # pyre-fixme[29]: `BoundMethod[abc.abstractclassmethod[None],
             #  Type[PredictFactoryPackager]]` is not a function.
             cls.set_extern_modules(pe)
-            # pyre-fixme[29]: `BoundMethod[abc.abstractclassmethod[None],
             #  Type[PredictFactoryPackager]]` is not a function.
             cls.set_mocked_modules(pe)
             pe.extern(["sys"])

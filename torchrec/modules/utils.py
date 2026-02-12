@@ -59,7 +59,6 @@ def extract_module_or_tensor_callable(
     ],
 ) -> Union[torch.nn.Module, Callable[[torch.Tensor], torch.Tensor]]:
     try:
-        # pyre-ignore[20]: PositionalOnly call expects argument in position 0
         module = module_or_callable()
         if isinstance(module, torch.nn.Module):
             return module
@@ -70,7 +69,6 @@ def extract_module_or_tensor_callable(
             )
     except TypeError as e:
         if "required positional argument" in str(e):
-            # pyre-ignore[7]: Expected `Union[typing.Callable[[torch.Tensor], torch.Tensor], torch.nn.Module]`
             return module_or_callable
         raise
 
@@ -100,7 +98,6 @@ def check_module_output_dimension(
             for submodule in module
         )
     else:
-        # pyre-fixme[6]: Expected `Union[typing.Callable[[torch.Tensor],
         #  torch.Tensor], torch.nn.Module]` for 1st param but got
         #  `Union[Iterable[torch.nn.Module], torch.nn.Module]`.
         return get_module_output_dimension(module, in_features) == out_features
@@ -140,11 +137,9 @@ def convert_list_of_modules_to_modulelist(
     modules: Iterable[torch.nn.Module], sizes: Tuple[int, ...]
 ) -> torch.nn.Module:
     assert (
-        # pyre-fixme[6]: Expected `Sized` for 1st param but got
         #  `Iterable[torch.nn.Module]`.
         len(modules)
         == sizes[0]
-        # pyre-fixme[6]: For 1st argument expected `pyre_extensions.PyreReadOnly[Sized]`
         #  but got `Iterable[Module]`.
     ), f"the counts of modules ({len(modules)}) do not match with the required counts {sizes}"
     if len(sizes) == 1:
@@ -152,7 +147,6 @@ def convert_list_of_modules_to_modulelist(
     else:
         # recursively create nested list
         return torch.nn.ModuleList(
-            # pyre-fixme[6]: For 1st argument expected `Iterable[Module]` but got
             #  `Module`.
             convert_list_of_modules_to_modulelist(m, sizes[1:])
             for m in modules
@@ -350,7 +344,6 @@ def construct_jagged_tensors_inference(
                     if len(indices) == 1
                     else torch.cat([embeddings_list[i] for i in indices], dim=1)
                 ),
-                # pyre-ignore
                 weights=values_list[indices[0]] if need_indices else None,
             )
         return ret

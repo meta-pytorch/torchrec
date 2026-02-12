@@ -330,7 +330,6 @@ class RegisterHooksTest(MultiProcessTestBase):
         "Not enough GPUs, this test requires at least 2 GPUs",
     )
     @settings(max_examples=6, deadline=None)
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [

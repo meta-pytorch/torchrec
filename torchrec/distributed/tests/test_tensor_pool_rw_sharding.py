@@ -33,7 +33,6 @@ class TestTensorPoolRwSharding(MultiProcessTestBase):
         with MultiProcessContext(
             rank, world_size, backend, local_size=world_size
         ) as ctx:
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             sharding_env = ShardingEnv.from_process_group(ctx.pg)
             if ctx.rank == 0:
@@ -95,7 +94,6 @@ class TestTensorPoolRwSharding(MultiProcessTestBase):
         with MultiProcessContext(
             rank, world_size, backend, local_size=world_size
         ) as ctx:
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             sharding_env = ShardingEnv.from_process_group(ctx.pg)
 
@@ -182,7 +180,6 @@ class TestTensorPoolRwSharding(MultiProcessTestBase):
                 ),
             )
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -193,7 +190,6 @@ class TestTensorPoolRwSharding(MultiProcessTestBase):
         world_size = 2
         self._run_multi_process_test(callable=self._test_update, world_size=world_size)
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -226,7 +222,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Execute: create InferRwTensorPoolSharding with memory_capacity_per_rank
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
-            # pyre-fixme: Incompatible parameter type [6]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -246,7 +241,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Assert: verify the row offsets are correct [0, 600, 800, 1000]
         expected_row_offsets = torch.tensor([0, 600, 800, 1000], device=device)
         torch.testing.assert_close(
-            # pyre-fixme: Undefined attribute [16]
             sharding._block_bucketize_row_pos[0],
             expected_row_offsets,
         )
@@ -271,7 +265,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Execute: create InferRwTensorPoolSharding with memory_capacity_per_rank
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
-            # pyre-fixme: Incompatible parameter type [6]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -290,7 +283,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Assert: verify the row offsets are correct [0, 250, 400, 500]
         expected_row_offsets = torch.tensor([0, 250, 400, 500], device=device)
         torch.testing.assert_close(
-            # pyre-fixme: Undefined attribute [16]
             sharding._block_bucketize_row_pos[0],
             expected_row_offsets,
         )
@@ -314,7 +306,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Execute: create InferRwTensorPoolSharding with memory_capacity_per_rank
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
-            # pyre-fixme: Incompatible parameter type [6]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -325,7 +316,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         self.assertEqual(total_rows, pool_size)
 
         # Assert: verify the last row offset equals the pool size
-        # pyre-fixme: Undefined attribute [16]
         self.assertEqual(sharding._block_bucketize_row_pos[0][-1].item(), pool_size)
 
     def test_even_sharding_without_memory_capacity_per_rank(self) -> None:
@@ -347,7 +337,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Execute: create InferRwTensorPoolSharding without memory_capacity_per_rank
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
-            # pyre-fixme: Incompatible parameter type [6]
             env=env,
             device=device,
             memory_capacity_per_rank=None,
@@ -382,7 +371,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
 
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
-            # pyre-fixme: Incompatible parameter type [6]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -422,7 +410,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
 
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
-            # pyre-fixme: Incompatible parameter type [6]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -489,7 +476,6 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
 
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
-            # pyre-fixme: Incompatible parameter type [6]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,

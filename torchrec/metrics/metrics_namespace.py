@@ -28,7 +28,6 @@ from typing import Optional
 
 class StrValueMixin:
     def __str__(self) -> str:
-        # pyre-fixme[16]: `StrValueMixin` has no attribute `value`.
         return self.value
 
 

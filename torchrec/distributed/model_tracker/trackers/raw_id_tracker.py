@@ -275,7 +275,6 @@ class RawIdTracker(ModelDeltaTracker):
                 continue
             if isinstance(named_module, MANAGED_COLLISION_WRAPPER_MODULES):
                 for lookup in named_module._embedding_module._lookups:
-                    # pyre-ignore
                     for emb in lookup._emb_modules:
                         # Only initialize tracker for TBEs that contain tables we want to track
                         should_track_table = self._should_track_table(

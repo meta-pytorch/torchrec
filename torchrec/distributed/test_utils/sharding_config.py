@@ -105,15 +105,13 @@ class PlannerConfig:
                 key_value_params["kvzch_tbe_config"] = KVZCHTBEConfig(
                     **key_value_params["kvzch_tbe_config"]
                 )
-            # pyre-ignore[6,32]
             kwargs["key_value_params"] = KeyValueParams(**key_value_params)
 
         # Convert cache_params dict to CacheParams object if present
         if "cache_params" in kwargs:
-            # pyre-ignore[6,32]
             kwargs["cache_params"] = CacheParams(**kwargs["cache_params"])
 
-        constraint = ParameterConstraints(**kwargs)  # pyre-ignore [6]
+        constraint = ParameterConstraints(**kwargs)
         return table.name, constraint
 
     def generate_planner(

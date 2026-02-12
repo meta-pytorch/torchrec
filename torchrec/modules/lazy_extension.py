@@ -23,19 +23,15 @@ from torch.nn.modules.module import (
 
 def _apply_functions_after_first_forward(
     module: torch.nn.Module,
-    # pyre-ignore[2]
     input: Any,
-    # pyre-ignore[2]
     output: Any,
 ) -> None:
     _functions_to_lazy_apply = getattr(module, "_functions_to_lazy_apply", None)
     if _functions_to_lazy_apply is not None:
-        # pyre-fixme[29]: `Union[(self: Tensor) -> Any, Tensor, Module]` is not a
         #  function.
         for fn in _functions_to_lazy_apply:
             module.apply(fn)
         delattr(module, "_functions_to_lazy_apply")
-    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `remove`.
     module._lazy_apply_hook.remove()
     delattr(module, "_lazy_apply_hook")
 
@@ -83,20 +79,16 @@ def lazy_apply(
     """
 
     if not hasattr(module, "_functions_to_lazy_apply"):
-        # pyre-fixme[16]: `Module` has no attribute `_functions_to_lazy_apply`.
         module._functions_to_lazy_apply = []
     if not hasattr(module, "_lazy_apply_hook"):
-        # pyre-fixme[16]: `Module` has no attribute `_lazy_apply_hook`.
         module._lazy_apply_hook = module.register_forward_hook(
             _apply_functions_after_first_forward
         )
-    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `append`.
     module._functions_to_lazy_apply.append(fn)
     return module
 
 
 class _LazyExtensionProtocol(_LazyProtocol):
-    # pyre-ignore[2,3]
     def _call_impl(self, *input, **kwargs): ...
 
 
@@ -159,11 +151,9 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
             )
         # If the module is already initialized, call `super().apply(fn)` to
         # run the usual apply logic.
-        # pyre-ignore[16]
         return super().apply(fn)
 
     # fmt: off
-    # pyre-ignore[2, 47]
     #  `LazyModuleMixin` inconsistently.
     def _infer_parameters(self: _LazyExtensionProtocol, module, args, kwargs) -> None:
         r"""Infers the size and initializes the parameters according to the provided input batch.
@@ -188,23 +178,18 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
     # fmt: on
 
     # fmt: off
-    # pyre-ignore[2,3]
     def _call_impl(self, *input, **kwargs):  # noqa: C901
-        # pyre-ignore[16]
         forward_call = (self._slow_forward if torch._C._get_tracing_state() else self.forward)
         # If we don't have any hooks, we want to skip the rest of the logic in
         # this function, and just call forward.
-        # pyre-ignore[16]
         if not (self._backward_hooks or self._forward_hooks or self._forward_pre_hooks or _global_backward_hooks
                 or _global_forward_hooks or _global_forward_pre_hooks):
             return forward_call(*input, **kwargs)
         # Do not call functions when jit is used
         full_backward_hooks, non_full_backward_hooks = [], []
         if self._backward_hooks or _global_backward_hooks:
-            # pyre-ignore[16]
             full_backward_hooks, non_full_backward_hooks = self._get_backward_hooks()
         if _global_forward_pre_hooks or self._forward_pre_hooks:
-            # pyre-ignore[60]: Concatenation not yet support for multiple variadic
             #  tuples: `*torch.nn.modules.module._global_forward_pre_hooks.values(),
             #  *self._forward_pre_hooks.values()`.
             for hook in (*_global_forward_pre_hooks.values(), *self._forward_pre_hooks.values()):
@@ -219,13 +204,11 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
 
         bw_hook = None
         if full_backward_hooks:
-            # pyre-fixme[20]: Argument `user_pre_hooks` expected.
             bw_hook = hooks.BackwardHook(self, full_backward_hooks)
             input = bw_hook.setup_input_hook(input)
 
         result = forward_call(*input, **kwargs)
         if _global_forward_hooks or self._forward_hooks:
-            # pyre-ignore[60]: Concatenation not yet support for multiple variadic
             #  tuples: `*torch.nn.modules.module._global_forward_hooks.values(),
             #  *self._forward_hooks.values()`.
             for hook in (*_global_forward_hooks.values(), *self._forward_hooks.values()):
@@ -250,12 +233,9 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
                     wrapper = functools.partial(hook, self)
                     functools.update_wrapper(wrapper, hook)
                     grad_fn.register_hook(wrapper)
-                # pyre-ignore[16]
                 self._maybe_warn_non_full_backward_hook(input, result, grad_fn)
 
         return result
     # fmt: on
 
-    # pyre-ignore[4]
-    # pyre-fixme[15]: `__call__` overrides attribute defined in `type` inconsistently.
     __call__: Callable[..., Any] = _call_impl

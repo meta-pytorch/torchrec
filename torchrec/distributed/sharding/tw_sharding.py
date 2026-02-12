@@ -80,9 +80,7 @@ class BaseTwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         self._device: Optional[torch.device] = device
         self._is_2D_parallel: bool = isinstance(env, ShardingEnv2D)
         self._pg: Optional[dist.ProcessGroup] = (
-            self._env.sharding_pg  # pyre-ignore[16]
-            if self._is_2D_parallel
-            else self._env.process_group
+            self._env.sharding_pg if self._is_2D_parallel else self._env.process_group
         )
         self._world_size: int = self._env.world_size
         self._rank: int = self._env.rank
@@ -113,7 +111,6 @@ class BaseTwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             [] for _ in range(world_size)
         ]
         for info in sharding_infos:
-            # pyre-fixme [16]
             shards = info.param_sharding.sharding_spec.shards
             # construct the global sharded_tensor_metadata
 
@@ -136,8 +133,7 @@ class BaseTwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             if self._env.output_dtensor:
                 dtensor_metadata = DTensorMetadata(
                     mesh=self._env.device_mesh,
-                    placements=(Replicate(),)
-                    * (self._env.device_mesh.ndim),  # pyre-ignore[16]
+                    placements=(Replicate(),) * (self._env.device_mesh.ndim),
                     size=(
                         info.embedding_config.num_embeddings,
                         info.embedding_config.embedding_dim,
@@ -146,9 +142,8 @@ class BaseTwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                 )
 
             rank = (
-                # pyre-ignore [16]
                 self._env.remap_rank(
-                    info.param_sharding.ranks[0],  # pyre-ignore[16]
+                    info.param_sharding.ranks[0],
                     ShardingType.TABLE_WISE,
                 )
                 if self._is_2D_parallel

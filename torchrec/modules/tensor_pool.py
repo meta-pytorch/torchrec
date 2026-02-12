@@ -79,7 +79,6 @@ class TensorPool(ObjectPool[torch.Tensor]):
         super().__init__()
         self._pool_size = pool_size
         self._dtype = dtype
-        # pyre-fixme[4]: Attribute must be annotated.
         self._device = device if device is not None else torch.device("meta")
         self._dim = dim
         self._enable_uvm = enable_uvm

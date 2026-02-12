@@ -422,7 +422,6 @@ class RecMetricModule(nn.Module):
         """
         result = defaultdict(dict)
         for task, computation in zip(metric._tasks, metric._metrics_computations):
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `items`.
             for state_name, reduction_fn in computation._reductions.items():
                 with record_function(f"## RecMetricModule: {state_name} all gather ##"):
@@ -488,7 +487,7 @@ class RecMetricModule(nn.Module):
             Dict[str, Dict[str, Dict[str, torch.Tensor]]]: the states for each metric to be saved
         """
         pg = pg if pg is not None else dist.group.WORLD
-        process_group: dist.ProcessGroup = (  # pyre-ignore[9]
+        process_group: dist.ProcessGroup = (
             pg.get_group(mesh_dim="shard") if isinstance(pg, DeviceMesh) else pg
         )
 
@@ -498,10 +497,8 @@ class RecMetricModule(nn.Module):
         )  # Under 2D parallel context, this should be sharding world size
 
         for metric in self.rec_metrics.rec_metrics:
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `value`.
             aggregated_states[metric._namespace.value] = self._get_metric_states(
-                # pyre-fixme[6]: For 1st argument expected `RecMetric` but got `Module`.
                 metric,
                 world_size,
                 process_group,
@@ -534,16 +531,12 @@ class RecMetricModule(nn.Module):
             None
         """
         for metric in self.rec_metrics.rec_metrics:
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `value`.
             states = source[metric._namespace.value]
             for task, metric_computation in zip(
-                # pyre-fixme[6]: For 1st argument expected `Iterable[_T1]` but got
                 #  `Union[Module, Tensor]`.
-                # pyre-fixme[6]: For 2nd argument expected `Iterable[_T2]` but got
                 #  `Union[Module, Tensor]`.
                 metric._tasks,
-                # pyre-fixme[6]: For 2nd argument expected `Iterable[_T2]` but got
                 #  `Union[Module, Tensor]`.
                 metric._metrics_computations,
             ):
@@ -553,9 +546,9 @@ class RecMetricModule(nn.Module):
 
         if self.throughput_metric is not None:
             states = source[self.throughput_metric._namespace.value][
-                self.throughput_metric._metric_name.value  # pyre-ignore[16]
+                self.throughput_metric._metric_name.value
             ]
-            for name, buf in self.throughput_metric.named_buffers():  # pyre-ignore[16]
+            for name, buf in self.throughput_metric.named_buffers():
                 buf.copy_(states[name])
 
     def shutdown(self) -> None:

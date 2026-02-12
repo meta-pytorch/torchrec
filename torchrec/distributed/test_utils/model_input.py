@@ -115,13 +115,11 @@ class ModelInput(Pipelineable):
                 label.copy_(self.label, non_blocking=non_blocking)
                 if idlist_features is not None:
                     idlist_features.copy_(
-                        # pyre-ignore[6]: Pyre doesn't understand self.idlist_features is not None here
                         self.idlist_features,
                         non_blocking=non_blocking,
                     )
                 if idscore_features is not None:
                     idscore_features.copy_(
-                        # pyre-ignore[6]: Pyre doesn't understand self.idscore_features is not None here
                         self.idscore_features,
                         non_blocking=non_blocking,
                     )
@@ -138,10 +136,8 @@ class ModelInput(Pipelineable):
         """
         self.float_features.record_stream(stream)
         if isinstance(self.idlist_features, KeyedJaggedTensor):
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             self.idlist_features.record_stream(stream)
         if isinstance(self.idscore_features, KeyedJaggedTensor):
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             self.idscore_features.record_stream(stream)
         self.label.record_stream(stream)
 
@@ -983,4 +979,4 @@ class VariableBatchModelInput(ModelInput):
 
 @dataclass
 class TdModelInput(ModelInput):
-    idlist_features: TensorDict  # pyre-ignore
+    idlist_features: TensorDict

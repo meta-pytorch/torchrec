@@ -75,7 +75,6 @@ class RandomDataLoader(unittest.TestCase):
         for batch in feat2:
             self.assertEqual(len(batch), 200)
 
-    # pyre-ignore
     @given(
         batch_size=st.sampled_from([2048, 4096, 8192]),
     )

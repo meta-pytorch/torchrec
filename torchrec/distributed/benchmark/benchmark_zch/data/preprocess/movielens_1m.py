@@ -38,9 +38,7 @@ class Batch(Pipelineable):
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
-        # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
         self.uih_features.record_stream(stream)
-        # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
         self.candidates_features.record_stream(stream)
 
     def pin_memory(self) -> "Batch":

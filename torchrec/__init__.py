@@ -29,7 +29,6 @@ from torchrec.sparse.jagged_tensor import (  # noqa
 from torchrec.streamable import Multistreamable, Pipelineable  # noqa
 
 try:
-    # pyre-ignore[21]
     # @manual=//torchrec/fb:version
     from .version import __version__, github_version  # noqa
 except ImportError:

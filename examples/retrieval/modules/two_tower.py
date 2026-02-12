@@ -221,7 +221,6 @@ class TwoTowerRetrieval(nn.Module):
             (batch_size, self.k), device=self.device, dtype=torch.int64
         )
         query_embedding = query_embedding.to(torch.float32)  # required by faiss
-        # pyre-ignore[19]
         self.faiss_index.search(query_embedding, self.k, distances, candidates)
 
         # candidate lookup
@@ -237,7 +236,6 @@ class TwoTowerRetrieval(nn.Module):
         # return logit (dot product)
         return (query_embedding * candidate_embedding).sum(dim=1).squeeze()
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
     def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool) -> None:
         super().load_state_dict(state_dict, strict)

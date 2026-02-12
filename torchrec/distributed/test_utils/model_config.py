@@ -239,8 +239,7 @@ class MixedEmbeddingConfig(BaseModelConfig):
         )
 
 
-# pyre-ignore[2]: Missing parameter annotation
-def create_model_config(model_name: str, **kwargs) -> BaseModelConfig:
+def create_model_config(model_name: str, **kwargs: Any) -> BaseModelConfig:
     """
     deprecated function, please use ModelSelectionConfig.create_model_config instead
     """
@@ -372,7 +371,6 @@ class ModelSelectionConfig:
         filtered_kwargs = {
             k: v for k, v in self.model_config.items() if k in valid_field_names
         }
-        # pyre-ignore[45]: Invalid class instantiation
         return config_class(**filtered_kwargs)
 
     def create_test_model(self, **kwargs: Any) -> nn.Module:

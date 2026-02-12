@@ -66,9 +66,7 @@ class EmbeddingTower(nn.Module):
 
     def forward(
         self,
-        # pyre-ignore [2]
         *args,
-        # pyre-ignore [2]
         **kwargs,
     ) -> torch.Tensor:
         """

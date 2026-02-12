@@ -61,7 +61,6 @@ class BaseManagedCollisionEmbeddingCollection(nn.Module):
 
         if isinstance(embedding_module, EmbeddingBagCollection):
             assert (
-                # pyre-fixme[29]: `Union[(self: EmbeddingBagCollection) ->
                 #  list[EmbeddingBagConfig], Module, Tensor]` is not a function.
                 self._embedding_module.embedding_bag_configs()
                 == self._managed_collision_collection.embedding_configs()
@@ -69,7 +68,6 @@ class BaseManagedCollisionEmbeddingCollection(nn.Module):
 
         else:
             assert (
-                # pyre-fixme[29]: `Union[(self: EmbeddingCollection) ->
                 #  list[EmbeddingConfig], Module, Tensor]` is not a function.
                 self._embedding_module.embedding_configs()
                 == self._managed_collision_collection.embedding_configs()

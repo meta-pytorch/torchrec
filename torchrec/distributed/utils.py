@@ -202,27 +202,22 @@ class sharded_model_copy:
         self.device = device
 
     def __enter__(self) -> None:
-        # pyre-ignore [16]
         self.t_copy_save_ = torch.Tensor.__deepcopy__
-        # pyre-ignore [16]
         self.p_copy_save_ = torch.nn.Parameter.__deepcopy__
 
         device = self.device
 
-        # pyre-ignore [2, 3, 53]
         def _tensor_copy(tensor, memo):
             if tensor.device != device:
                 return tensor.detach().to(device)
             else:
                 return tensor.detach().clone()
 
-        # pyre-ignore [2, 3]
         def _no_copy(obj, memo):
             return obj
 
         _copy_or_not = _tensor_copy if self.device is not None else _no_copy
 
-        # pyre-ignore [2, 3, 53]
         def _param_copy(param, memo):
             return torch.nn.Parameter(
                 _copy_or_not(param, memo), requires_grad=param.requires_grad
@@ -230,28 +225,17 @@ class sharded_model_copy:
 
         torch.Tensor.__deepcopy__ = _copy_or_not
         torch.nn.Parameter.__deepcopy__ = _param_copy
-        # pyre-fixme[16]: `Type` has no attribute `__deepcopy__`.
         torch._C._distributed_c10d.ProcessGroupNCCL.__deepcopy__ = _no_copy
-        # pyre-fixme[16]: `Type` has no attribute `__deepcopy__`.
         torch._C._distributed_c10d.ProcessGroupGloo.__deepcopy__ = _no_copy
-        # pyre-fixme[16]: `Type` has no attribute `__deepcopy__`.
         torch._C._distributed_c10d.Work.__deepcopy__ = _no_copy
-        # pyre-ignore [16]
         torch.cuda.streams.Stream.__deepcopy__ = _no_copy
 
-    # pyre-ignore [2]
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        # pyre-ignore [16]
         torch.Tensor.__deepcopy__ = self.t_copy_save_
-        # pyre-ignore [16]
         torch.nn.Parameter.__deepcopy__ = self.p_copy_save_
-        # pyre-fixme[16]: `Type` has no attribute `__deepcopy__`.
         torch._C._distributed_c10d.ProcessGroupNCCL.__deepcopy__ = None
-        # pyre-fixme[16]: `Type` has no attribute `__deepcopy__`.
         torch._C._distributed_c10d.ProcessGroupGloo.__deepcopy__ = None
-        # pyre-fixme[16]: `Type` has no attribute `__deepcopy__`.
         torch._C._distributed_c10d.Work.__deepcopy__ = None
-        # pyre-ignore [16]
         torch.cuda.streams.Stream.__deepcopy__ = None
 
 
@@ -564,7 +548,6 @@ def init_parameters(module: nn.Module, device: torch.device) -> None:
 
             def maybe_reset_parameters(m: nn.Module) -> None:
                 if hasattr(m, "reset_parameters"):
-                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                     m.reset_parameters()
 
             module.apply(maybe_reset_parameters)
@@ -574,7 +557,6 @@ def maybe_annotate_embedding_event(
     event: EmbeddingEvent,
     module_fqn: Optional[str],
     sharding_type: Optional[str],
-    # pyre-fixme[24]: Generic type `AbstractContextManager` expects 2 type parameters,
     #  received 1.
 ) -> AbstractContextManager[None]:
     if module_fqn and sharding_type:
@@ -597,7 +579,6 @@ class ForkedPdb(pdb.Pdb):
         dist.barrier()
     """
 
-    # pyre-ignore
     def interaction(self, *args, **kwargs) -> None:
         _stdin = sys.stdin
         try:
@@ -619,7 +600,6 @@ def create_global_tensor_shape_stride_from_metadata(
     """
     size = None
     if parameter_sharding.sharding_type == ShardingType.COLUMN_WISE.value:
-        # pyre-ignore[16]
         row_dim = parameter_sharding.sharding_spec.shards[0].shard_sizes[0]
         col_dim = 0
         for shard in parameter_sharding.sharding_spec.shards:
@@ -646,7 +626,6 @@ def create_global_tensor_shape_stride_from_metadata(
         for _ in range(devices_per_node):
             row_dim += parameter_sharding.sharding_spec.shards[0].shard_sizes[0]
         size = torch.Size([row_dim, col_dim])
-    # pyre-ignore[7]
     return size, (size[1], 1) if size else (torch.Size([0, 0]), (0, 1))
 
 
@@ -704,7 +683,6 @@ def _group_sharded_modules(
         if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
             sharded_modules.append(module)
         if hasattr(module, "_lookups"):
-            # pyre-fixme[29]: `Union[(self: Tensor) -> Any, Module, Tensor]` is
             #  not a function.
             for lookup in module._lookups:
                 _find_sharded_modules(lookup)
@@ -728,9 +706,9 @@ def _convert_weights(
 
 def weights_bytes_in_emb_kernel(emb: nn.Module) -> int:
     total_bytes = (
-        emb.weights_dev.element_size() * emb.weights_dev.numel()  # pyre-ignore [29]
-        + emb.weights_host.element_size() * emb.weights_host.numel()  # pyre-ignore [29]
-        + emb.weights_uvm.element_size() * emb.weights_uvm.numel()  # pyre-ignore [29]
+        emb.weights_dev.element_size() * emb.weights_dev.numel()
+        + emb.weights_host.element_size() * emb.weights_host.numel()
+        + emb.weights_uvm.element_size() * emb.weights_uvm.numel()
     )
     return total_bytes
 
@@ -752,23 +730,23 @@ class EmbeddingQuantizationUtils:
         converted_sparse_dtype = data_type_to_sparse_type(converted_dtype)
 
         for emb_kernel in sharded_embs:
-            emb_kernel.weights_dev = _convert_weights(  # pyre-ignore [16]
-                emb_kernel.weights_dev,  # pyre-ignore [6]
+            emb_kernel.weights_dev = _convert_weights(
+                emb_kernel.weights_dev,
                 converted_sparse_dtype,
             )
-            emb_kernel.weights_host = _convert_weights(  # pyre-ignore [16]
-                emb_kernel.weights_host,  # pyre-ignore [6]
+            emb_kernel.weights_host = _convert_weights(
+                emb_kernel.weights_host,
                 converted_sparse_dtype,
             )
-            emb_kernel.weights_uvm = _convert_weights(  # pyre-ignore [16]
-                emb_kernel.weights_uvm,  # pyre-ignore [6]
+            emb_kernel.weights_uvm = _convert_weights(
+                emb_kernel.weights_uvm,
                 converted_sparse_dtype,
             )
             self._emb_kernel_to_sparse_dtype.setdefault(
-                emb_kernel, emb_kernel.weights_precision  # pyre-ignore [6]
+                emb_kernel, emb_kernel.weights_precision
             )
 
-            emb_kernel.weights_precision = converted_sparse_dtype  # pyre-ignore [16]
+            emb_kernel.weights_precision = converted_sparse_dtype
 
     def recreate_embedding_modules(
         self,
@@ -778,20 +756,18 @@ class EmbeddingQuantizationUtils:
         sharded_embs.sort(key=weights_bytes_in_emb_kernel)
 
         for emb_kernel in sharded_embs:
-            converted_sparse_dtype = self._emb_kernel_to_sparse_dtype[
-                emb_kernel  # pyre-ignore [6]: Incompatible parameter type
-            ]
+            converted_sparse_dtype = self._emb_kernel_to_sparse_dtype[emb_kernel]
 
-            emb_kernel.weights_dev = _convert_weights(  # pyre-ignore [16]
-                emb_kernel.weights_dev,  # pyre-ignore [6]
+            emb_kernel.weights_dev = _convert_weights(
+                emb_kernel.weights_dev,
                 converted_sparse_dtype,
             )
-            emb_kernel.weights_host = _convert_weights(  # pyre-ignore [16]
-                emb_kernel.weights_host,  # pyre-ignore [6]
+            emb_kernel.weights_host = _convert_weights(
+                emb_kernel.weights_host,
                 converted_sparse_dtype,
             )
-            emb_kernel.weights_uvm = _convert_weights(  # pyre-ignore [16]
-                emb_kernel.weights_uvm,  # pyre-ignore [6]
+            emb_kernel.weights_uvm = _convert_weights(
+                emb_kernel.weights_uvm,
                 converted_sparse_dtype,
             )
         self._recalculate_torch_state(module)
@@ -801,7 +777,6 @@ class EmbeddingQuantizationUtils:
             module: torch.nn.Module,
         ) -> None:
             if hasattr(module, "_lookups") or hasattr(module, "_lookup"):
-                # pyre-fixme[29]: `Union[(self: Tensor) -> Any, Module, Tensor]` is
                 #  not a function.
                 module._initialize_torch_state(skip_registering=True)
                 return
@@ -829,7 +804,7 @@ def modify_input_for_feature_processor(
 
         if is_collection:
             if hasattr(feature_processors, "pre_process_input"):
-                feature_processors.pre_process_input(features)  # pyre-ignore[29]
+                feature_processors.pre_process_input(features)
             else:
                 logging.info(
                     f"[Feature Processor Pipeline] Skipping pre_process_input for feature processor {feature_processors=}"
@@ -837,8 +812,8 @@ def modify_input_for_feature_processor(
         else:
             # per feature process
             for feature in features.keys():
-                if feature in feature_processors:  # pyre-ignore[58]
-                    feature_processor = feature_processors[feature]  # pyre-ignore[29]
+                if feature in feature_processors:
+                    feature_processor = feature_processors[feature]
                     if hasattr(feature_processor, "pre_process_input"):
                         feature_processor.pre_process_input(features[feature])
                     else:

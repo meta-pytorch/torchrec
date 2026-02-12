@@ -134,7 +134,6 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         pass
 
-    # pyre-ignore [56]
     @_torchrec_method_logger()
     def __init__(self) -> None:
         # pipeline state such as in foward, in backward etc, used in training recover scenarios
@@ -233,7 +232,6 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             f"train_pipeline uses inplace_copy_batch_to_gpu: {inplace_copy_batch_to_gpu}"
         )
 
-        # pyre-ignore
         self._stream_context = (
             torch.get_device_module(self._device).stream
             if self._device.type in ["cuda", "mtia"]
@@ -397,7 +395,6 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
         )
         self._pre_compile_fn = pre_compile_fn
         self._post_compile_fn = post_compile_fn
-        # pyre-ignore
         self._input_transformer = (
             input_transformer or default_pipeline_input_transformer
         )
@@ -542,7 +539,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 not is_torchdynamo_compiling()
             ), "Train Pipelines rely on cuda streams, which is not supported by Dynamo"
 
-        # pyre-ignore
         self._stream_context = (
             torch.get_device_module(self._device).stream
             if self._device.type in ["cuda", "mtia"]
@@ -560,7 +556,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             else None
         )
 
-        # pyre-ignore
         self._original_forwards: List[Callable[..., Any]] = []
 
         self._original_kjt_dist_forwards: List[
@@ -680,7 +675,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             return False
         self._batch_count += 1
         self.batches.append(batch)
-        # pyre-ignore [6]
         self.contexts.append(context)
 
         return True
@@ -725,7 +719,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
 
         # modify the (sharded) sparse module forward, and invoke the first part of input_dist
         self._init_pipelined_modules(
-            self.batches[0],  # pyre-ignore [6]
+            self.batches[0],
             self.contexts[0],
             self._pipelined_forward_type,
         )
@@ -1301,7 +1295,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
     """
 
     # The PipelinedForward class that is used in _rewrite_model
-    _pipelined_forward_type = InSyncEmbeddingPipelinedForward  # pyre-ignore
+    _pipelined_forward_type = InSyncEmbeddingPipelinedForward
 
     def __init__(
         self,
@@ -1409,7 +1403,6 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
         # start embedding_lookup so it can overlap with previous optimizer
         if not self._embedding_lookup_after_data_dist:
-            # pyre-ignore [6]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         if self._model.training:
@@ -1430,7 +1423,6 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             self.enqueue_batch(dataloader_iter)
 
         if self._embedding_lookup_after_data_dist:
-            # pyre-ignore [6]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         # forward
@@ -1488,7 +1480,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
     """
 
     # The PipelinedForward class that is used in _rewrite_model
-    _pipelined_forward_type = EmbeddingPipelinedForward  # pyre-ignore
+    _pipelined_forward_type = EmbeddingPipelinedForward
 
     def __init__(
         self,
@@ -1556,15 +1548,12 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             return
 
         self._init_pipelined_modules(
-            # pyre-ignore [6]
             self.batches[0],
             self.contexts[0],
-            # pyre-ignore [6]
             self._pipelined_forward_type,
         )
         self.wait_sparse_data_dist(self.contexts[0])
         self._validate_optimizer()
-        # pyre-ignore [6]
         self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         # batch i+1
@@ -1579,7 +1568,6 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
 
     def is_semi_sync(self) -> bool:
         if len(self.batches) >= 1:
-            # pyre-ignore [58]
             return self.contexts[0].index >= self._start_batch
         return False
 
@@ -1628,7 +1616,6 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
         self.enqueue_batch(dataloader_iter)
 
         if len(self.batches) >= 1 and is_semi_sync:
-            # pyre-ignore [6]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         if len(self.batches) >= 2:
@@ -1638,7 +1625,6 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             with record_function(f"## backward {iteration} ##"):
                 torch.sum(losses, dim=0).backward()
             with record_function(f"## emb_backward {iteration} ##"):
-                # pyre-ignore [6]
                 self.embedding_backward(context)
 
             self.sync_embeddings(
@@ -1660,7 +1646,6 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
 
         if len(self.batches) >= 1 and not is_semi_sync:
             torch.get_device_module().synchronize()  # needed to avoid race condition
-            # pyre-ignore [6]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         return output
@@ -1866,7 +1851,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     """
 
     # The PipelinedForward class that is used in _rewrite_model
-    _pipelined_forward_type = PrefetchPipelinedForward  # pyre-ignore
+    _pipelined_forward_type = PrefetchPipelinedForward
 
     def __init__(
         self,
@@ -1934,7 +1919,6 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         self._init_pipelined_modules(
             self._batch_i,
             self._context,
-            # pyre-ignore
             self._pipelined_forward_type,
         )
         self._start_sparse_data_dist(self._batch_i)
@@ -2275,7 +2259,6 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             self._batch_loader.start()
 
             # batch 0
-            # pyre-ignore [16]
             batch = self._batch_loader.get_next_batch()
             if batch is None:
                 raise StopIteration
@@ -2283,7 +2266,6 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             self.contexts.append(self._create_context())
 
             self._init_pipelined_modules(
-                # pyre-ignore
                 self.batches[0],
                 self.contexts[0],
                 self._pipelined_forward_type,
@@ -2348,7 +2330,6 @@ class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
 
         # start embedding_lookup so it can overlap with previous optimizer
         if not self._embedding_lookup_after_data_dist:
-            # pyre-ignore [6]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         if self._model.training:
@@ -2367,7 +2348,6 @@ class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
         self.enqueue_batch(dataloader_iter)
 
         if self._embedding_lookup_after_data_dist:
-            # pyre-ignore [6]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         # forward
@@ -2455,7 +2435,6 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
             ).current_stream()
         )
 
-        # pyre-ignore
         self._stream_context = (
             torch.get_device_module(self._compute_stream.device).stream
             if self._compute_stream.device.type in ["cuda", "mtia"]
@@ -2724,7 +2703,6 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
 
         # it will check this path on model to inject configuration other than
         # the default one.
-        # pyre-fixme[8]: Attribute has type `Dict[str, Union[bool, str]]`; used as
         #  `Union[Tensor, Module]`.
         self.compiled_autograd_options: Dict[str, Union[str, bool]] = getattr(
             model,
@@ -2749,7 +2727,6 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
 
     def get_compiled_autograd_ctx(
         self,
-        # pyre-fixme[24]: Generic type `ContextManager` expects 1 type parameter.
     ) -> ContextManager:
         # this allows for pipelining
         # to avoid doing a sum on None
@@ -2759,7 +2736,6 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
             return contextlib.nullcontext()
 
         return torch._dynamo.compiled_autograd._enable(
-            # pyre-ignore
             torch.compile(**self.compiled_autograd_options)
         )
 
