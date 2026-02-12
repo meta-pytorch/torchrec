@@ -41,6 +41,7 @@ from torchrec.distributed.planner.estimator.types import (  # noqa: F401
 # =============================================================================
 
 # Shared coefficients for sharding types with block usage penalty (TABLE_WISE, COLUMN_WISE)
+# bwd=None means use fwd_compute * bwd_compute_multiplier (OSS legacy behavior)
 _TABLE_WISE_COEFFICIENTS = EstimatorPerfCoefficients(
     fwd=PerfCoefficient(
         input_read_size_multiplier=1.0,
@@ -48,15 +49,11 @@ _TABLE_WISE_COEFFICIENTS = EstimatorPerfCoefficients(
         embedding_output_multiplier=1.0,
         hash_size_multiplier=0.0,  #  doesn't use hash_size
     ),
-    bwd=PerfCoefficient(
-        input_read_size_multiplier=1.0,
-        lookup_size_multiplier=1.0,
-        embedding_output_multiplier=1.0,
-        hash_size_multiplier=0.0,
-    ),
+    bwd=None,  # Use fwd_compute * bwd_compute_multiplier for backward compatibility
 )
 
 # Shared coefficients for sharding types without block usage penalty (ROW_WISE, TABLE_ROW_WISE)
+# bwd=None means use fwd_compute * bwd_compute_multiplier (OSS legacy behavior)
 _ROW_WISE_COEFFICIENTS = EstimatorPerfCoefficients(
     fwd=PerfCoefficient(
         input_read_size_multiplier=1.0,
@@ -64,12 +61,7 @@ _ROW_WISE_COEFFICIENTS = EstimatorPerfCoefficients(
         embedding_output_multiplier=1.0,
         hash_size_multiplier=0.0,
     ),
-    bwd=PerfCoefficient(
-        input_read_size_multiplier=1.0,
-        lookup_size_multiplier=1.0,
-        embedding_output_multiplier=0.0,
-        hash_size_multiplier=0.0,
-    ),
+    bwd=None,  # Use fwd_compute * bwd_compute_multiplier for backward compatibility
 )
 
 

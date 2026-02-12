@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Type
 
 from torch import nn
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import (
     BATCHED_COPY_PERF_FACTOR,
     DP_ELEMENTWISE_KERNELS_PERF_FACTOR,
@@ -201,9 +202,7 @@ class EmbeddingShardingPerfEvaluator(ABC):
         Get device bandwidth, preferring config annotation if set.
 
         Priority:
-        1. config.device_bw (if annotated via @device_bw decorator)
-        2. ctx.device_bw (computed from topology via kernel_bw_lookup)
-
+        1. ctx.device_bw (computed from @device_bw or topology via kernel_bw_lookup)
         Args:
             ctx: Shard performance context
             config: Hardware performance configuration
@@ -211,8 +210,6 @@ class EmbeddingShardingPerfEvaluator(ABC):
         Returns:
             Device bandwidth in bytes/second
         """
-        if config.device_bw is not None:
-            return config.device_bw
         return ctx.device_bw
 
     def _get_hbm_to_ddr_mem_bw(
@@ -465,7 +462,9 @@ class EmbeddingShardingPerfEvaluator(ABC):
             + fwd_coeff.hash_size_multiplier * ctx.hash_size
         )
 
-        return compute_size * block_penalty / device_bw
+        fwd_compute = compute_size * block_penalty / device_bw
+
+        return fwd_compute
 
     def use_min_dim_for_lookup(self, config: HardwarePerfConfig) -> bool:
         """
@@ -556,9 +555,8 @@ class EmbeddingShardingPerfEvaluator(ABC):
             )
 
         fwd_compute = self._default_fwd_comp(ctx=ctx, config=config)
-        if config.name == "default":
-            bwd_compute = fwd_compute * config.coefficients.bwd_compute_multiplier
-        else:
+        if bwd_coeff is not None:
+            # Use bwd_coeff based approach if backward coefficients are defined
             device_bw = self._get_device_bw(ctx=ctx, config=config)
             compute_size = (
                 bwd_coeff.input_read_size_multiplier * input_read_size
@@ -567,6 +565,13 @@ class EmbeddingShardingPerfEvaluator(ABC):
                 + bwd_coeff.hash_size_multiplier * ctx.hash_size
             )
             bwd_compute = compute_size / device_bw
+        else:
+            # Use default approach if backward coefficients are not defined
+            # Priority: config override -> ctx (from topology)
+            bwd_compute_multiplier = config.get_bwd_compute_multiplier(
+                ctx.bwd_compute_multiplier
+            )
+            bwd_compute = fwd_compute * bwd_compute_multiplier
 
         # Add bwd_grad_indice_weights_kernel for weighted features
         bwd_grad_indice_weights_kernel = self._compute_bwd_grad_indice_weights_kernel(
@@ -574,10 +579,11 @@ class EmbeddingShardingPerfEvaluator(ABC):
         )
         # Apply weighted feature multiplier if applicable
         if ctx.is_weighted:
-            bwd_compute = (
-                bwd_compute
-                * config.coefficients.weighted_feature_bwd_compute_multiplier
+            # Priority: config override -> ctx (from topology)
+            weighted_multiplier = config.get_weighted_feature_bwd_compute_multiplier(
+                ctx.weighted_feature_bwd_compute_multiplier
             )
+            bwd_compute = bwd_compute * weighted_multiplier
 
         return bwd_compute + bwd_grad_indice_weights_kernel
 
@@ -745,12 +751,26 @@ class EmbeddingShardingPerfEvaluator(ABC):
     ) -> float:
         """
         Default prefetch compute with support for both OSS and FB hardware formulas.
-        The prefetch_divisor varies by sharding type:
-        - TABLE_WISE: 1 (no division)
-        - ROW_WISE: world_size
-        - TABLE_ROW_WISE: local_world_size
 
-        For linear regression (FB hardware):
+        This method handles prefetch computation following OSS DefaultEmbeddingPerfEstimator
+        as the baseline, with FB-specific options layered on top.
+
+        OSS DefaultEmbeddingPerfEstimator behavior:
+        - expected_cache_fetches is pre-computed as: expected_miss_rate * expected_lookups
+        - prefetch_bytes = expected_cache_fetches * emb_dim * table_data_type_size
+        - prefetch_time = prefetch_bytes / hbm_to_ddr_mem_bw
+        - Prefetch divisor by sharding type:
+            - TABLE_WISE/COLUMN_WISE: 1 (no division)
+            - ROW_WISE: world_size
+            - TABLE_ROW_WISE: local_world_size
+
+        FB Hardware Extensions (via flags in context):
+        - use_batch_inputs_for_expected_cache_fetches: Use batch_inputs instead of
+          cache_stats.expected_lookups for expected_cache_fetches calculation
+        - use_linear_regression_prefetch_estimate: Use linear regression formula with
+          prefetch coefficients instead of bandwidth-based formula
+
+        Linear regression formula (FB hardware with prefetch coefficients):
             prefetch_time = (
                 expected_num_lookups_coefficient * expected_lookups +
                 expected_num_unique_lookups_coefficient * expected_unique_lookups +
@@ -758,34 +778,92 @@ class EmbeddingShardingPerfEvaluator(ABC):
             )
             where prefetch_bytes = expected_cache_fetches * emb_dim (NO table_data_type_size!)
 
-        For default (OSS):
-            prefetch_time = prefetch_bytes / hbm_to_ddr_mem_bw
-            where prefetch_bytes = expected_cache_fetches * emb_dim * table_data_type_size
+        Priority order:
+        1. If use_linear_regression=True AND prefetch_coeffs available:
+           → Use linear regression formula
+        2. If use_linear_regression=True but prefetch_coeffs missing:
+           → Raise ValueError (misconfiguration)
+        3. Otherwise:
+           → Use bandwidth formula (OSS default)
         """
-
-        # Apply prefetch divisor based on sharding type
+        # Get prefetch divisor based on sharding type
         prefetch_divisor = self.get_prefetch_divisor(ctx)
 
-        # Get expected cache fetches with divisor applied
-        expected_cache_fetches = ctx.expected_cache_fetches
+        # Get flags from context (passed from estimator)
+        use_linear_regression = ctx.use_linear_regression_prefetch_estimate
+        use_batch_inputs_for_cache_fetches = (
+            ctx.use_batch_inputs_for_expected_cache_fetches
+        )
+
+        # =========================================================================
+        # Compute expected_cache_fetches
+        # OSS: expected_cache_fetches = expected_miss_rate * expected_lookups
+        # FB:  optionally uses batch_inputs instead of expected_lookups
+        # =========================================================================
+        expected_cache_fetches: float = 0.0
+        expected_lookups: Optional[float] = None
+        expected_unique_lookups: Optional[float] = None
+
+        # Only compute if we have cache stats and using FUSED_UVM_CACHING kernel
+        if (
+            ctx.caching_ratio is not None
+            and ctx.cache_stats_expected_lookups is not None
+            and ctx.expected_miss_rate is not None
+            and ctx.compute_kernel == EmbeddingComputeKernel.FUSED_UVM_CACHING.value
+        ):
+            # Get num_unique_lookups from cache stats (same as _stats.expected_lookups in OSS)
+            num_unique_lookups = ctx.cache_stats_expected_lookups
+
+            # Calculate total batch_inputs across world (reuse ctx.batch_inputs property)
+            batch_inputs = math.ceil(ctx.world_size * ctx.batch_inputs)
+
+            # FB extension: clamp num_unique_lookups if linear regression is enabled
+            if use_linear_regression:
+                num_unique_lookups = min(
+                    num_unique_lookups,
+                    batch_inputs,
+                    ctx.hash_size_for_clamping,  # hash size
+                )
+
+            # Calculate expected_cache_fetches
+            # OSS: expected_miss_rate * expected_lookups (where expected_lookups = cache_stats.expected_lookups)
+            # FB extension: optionally use batch_inputs instead
+            if use_batch_inputs_for_cache_fetches:
+                expected_cache_fetches = ctx.expected_miss_rate * batch_inputs
+            else:
+                # OSS default: use cache_stats.expected_lookups (num_unique_lookups)
+                expected_cache_fetches = ctx.expected_miss_rate * num_unique_lookups
+
+            # Set expected_lookups and expected_unique_lookups for linear regression
+            expected_lookups = float(batch_inputs)
+            expected_unique_lookups = num_unique_lookups
+
+        # =========================================================================
+        # Apply prefetch divisor (matches OSS behavior per sharding type)
+        # - TABLE_WISE/COLUMN_WISE: no division (divisor = 1)
+        # - ROW_WISE: / world_size
+        # - TABLE_ROW_WISE: / local_world_size
+        # =========================================================================
         if prefetch_divisor > 0:
             expected_cache_fetches = expected_cache_fetches / prefetch_divisor
-
-        # Check if linear regression mode is enabled (FB hardware estimators)
-        # If prefetch coefficients are defined and lookup data is available, use linear regression
-        prefetch_coeffs = config.coefficients.prefetch
-        if (
-            prefetch_coeffs
-            and ctx.expected_lookups is not None
-            and ctx.expected_unique_lookups is not None
-        ):
-            # Apply divisor to lookups as well
-            expected_lookups = ctx.expected_lookups
-            expected_unique_lookups = ctx.expected_unique_lookups
-            if prefetch_divisor > 0:
+            if expected_lookups is not None:
                 expected_lookups = expected_lookups / prefetch_divisor
+            if expected_unique_lookups is not None:
                 expected_unique_lookups = expected_unique_lookups / prefetch_divisor
 
+        # =========================================================================
+        # Compute prefetch time
+        # =========================================================================
+        # Check for prefetch coefficients (from @prefetch_coefficient annotation)
+        prefetch_coeffs = config.coefficients.prefetch
+
+        # FB extension: linear regression formula
+        if (
+            use_linear_regression
+            and prefetch_coeffs
+            and expected_lookups is not None
+            and expected_unique_lookups is not None
+        ):
             # IMPORTANT: For linear regression, prefetch_bytes does NOT include table_data_type_size
             # This matches the FB hardware estimator implementation (D89929552)
             prefetch_bytes = expected_cache_fetches * ctx.emb_dim
@@ -797,14 +875,42 @@ class EmbeddingShardingPerfEvaluator(ABC):
                 + prefetch_coeffs.expected_size_cache_fetches_coefficient
                 * prefetch_bytes
             )
-        else:
-            # Default OSS formula: prefetch_bytes / hbm_to_ddr_mem_bw
-            # For OSS, prefetch_bytes includes table_data_type_size
-            prefetch_bytes = (
-                expected_cache_fetches * ctx.emb_dim * ctx.table_data_type_size
+
+        # Raise error if linear regression is enabled but prefetch params are missing
+        if use_linear_regression and not prefetch_coeffs:
+            raise ValueError(
+                f"_use_linear_regression_prefetch_estimate is set to True but linear regression "
+                f"coefficients are not available for {config.__class__.__name__}. "
+                f"Please add @prefetch_coefficient decorator to specify the hardware-aware linear "
+                f"regression coefficients, or set _use_linear_regression_prefetch_estimate to False."
             )
-            hbm_to_ddr_bw = self._get_hbm_to_ddr_mem_bw(ctx, config)
-            return prefetch_bytes / hbm_to_ddr_bw if hbm_to_ddr_bw > 0 else 0.0
+
+        # =========================================================================
+        # OSS default: bandwidth-based formula
+        # prefetch_bytes = expected_cache_fetches * emb_dim * table_data_type_size
+        # prefetch_time = prefetch_bytes / hbm_to_ddr_mem_bw
+        # =========================================================================
+        prefetch_bytes = expected_cache_fetches * ctx.emb_dim * ctx.table_data_type_size
+        hbm_to_ddr_bw = self._get_hbm_to_ddr_mem_bw(ctx, config)
+        prefetch_time = prefetch_bytes / hbm_to_ddr_bw if hbm_to_ddr_bw > 0 else 0.0
+
+        # DEBUG: Log prefetch computation
+        logger.info(
+            f"[PREFETCH_COMP DEBUG] sharding_type={ctx.sharding_type}, "
+            f"table_name={ctx.table_name}, "
+            f"shard_id=(hash={ctx.hash_size}, dim={ctx.emb_dim}), "
+            f"use_linear_regression={use_linear_regression}, "
+            f"use_batch_inputs_for_cache_fetches={use_batch_inputs_for_cache_fetches}, "
+            f"expected_cache_fetches={expected_cache_fetches}, "
+            f"expected_lookups={expected_lookups}, "
+            f"expected_unique_lookups={expected_unique_lookups}, "
+            f"prefetch_divisor={prefetch_divisor}, "
+            f"prefetch_bytes={prefetch_bytes}, "
+            f"hbm_to_ddr_bw={hbm_to_ddr_bw}, "
+            f"prefetch_time={prefetch_time}"
+        )
+
+        return prefetch_time
 
     # =========================================================================
     # Communication methods
@@ -1094,7 +1200,8 @@ class RowWiseEvaluator(EmbeddingShardingPerfEvaluator):
         Note: ROW_WISE always uses bytes (input_data_type_size), ignoring the
         use_bytes_for_input_read_size config flag since legacy behavior was consistent.
         """
-        size = math.ceil(ctx.batch_inputs * ctx.input_data_type_size)
+        indices_size = ctx.batch_inputs / self.get_batch_inputs_divisor(ctx=ctx)
+        size = math.ceil(indices_size * ctx.world_size * ctx.input_data_type_size)
         if ctx.is_weighted:
             size *= 2
         return size
@@ -1108,7 +1215,13 @@ class RowWiseEvaluator(EmbeddingShardingPerfEvaluator):
         In OLD estimator, batch_inputs is pre-divided by world_size, then multiplied back.
         The world_size factors cancel out.
         """
-        return ctx.batch_inputs * ctx.emb_dim * ctx.table_data_type_size
+        return (
+            ctx.batch_inputs
+            / self.get_batch_inputs_divisor(ctx=ctx)
+            * ctx.world_size
+            * ctx.emb_dim
+            * ctx.table_data_type_size
+        )
 
     def _get_output_write_size(
         self, ctx: ShardPerfContext, data_type_size: float
@@ -1135,7 +1248,13 @@ class RowWiseEvaluator(EmbeddingShardingPerfEvaluator):
             return ctx.batch_outputs * ctx.world_size * ctx.emb_dim * data_type_size
         else:
             # For non-pooled (sequence), world_size factor cancels out in OLD estimator
-            return ctx.batch_outputs * ctx.emb_dim * data_type_size
+            return (
+                ctx.batch_outputs
+                / self.get_batch_inputs_divisor(ctx=ctx)
+                * ctx.world_size
+                * ctx.emb_dim
+                * data_type_size
+            )
 
     def _get_comm_data_type_size(
         self, ctx: ShardPerfContext, is_fwd: bool = True
@@ -1217,7 +1336,9 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
         Note: TABLE_ROW_WISE always uses bytes (input_data_type_size), ignoring the
         use_bytes_for_input_read_size config flag since legacy behavior was consistent.
         """
-        effective_batch_inputs = ctx.batch_inputs / ctx.local_world_size
+        effective_batch_inputs = ctx.batch_inputs / self.get_batch_inputs_divisor(
+            ctx=ctx
+        )
         size = math.ceil(
             effective_batch_inputs * ctx.world_size * ctx.input_data_type_size
         )
@@ -1231,13 +1352,16 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
         """
         TABLE_ROW_WISE: embedding_lookup_size = (raw / local_world_size) * world_size * emb_dim * table_data_type_size.
         """
-        effective_batch_inputs = ctx.batch_inputs / ctx.local_world_size
-        return (
+        effective_batch_inputs = ctx.batch_inputs / self.get_batch_inputs_divisor(
+            ctx=ctx
+        )
+        size = (
             effective_batch_inputs
             * ctx.world_size
             * ctx.emb_dim
             * ctx.table_data_type_size
         )
+        return size
 
     def _get_output_write_size(
         self, ctx: ShardPerfContext, data_type_size: float
@@ -1247,7 +1371,18 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
 
         This matches the OLD estimator formula exactly.
         """
-        return ctx.batch_outputs * ctx.world_size * ctx.emb_dim * data_type_size
+        if ctx.is_pooled:
+            size = ctx.batch_outputs * ctx.world_size * ctx.emb_dim * data_type_size
+        else:
+            # For non-pooled (sequence), world_size factor cancels out in OLD estimator
+            size = (
+                ctx.batch_outputs
+                / self.get_batch_inputs_divisor(ctx=ctx)
+                * ctx.world_size
+                * ctx.emb_dim
+                * data_type_size
+            )
+        return size
 
     def _get_comm_data_type_size(
         self, ctx: ShardPerfContext, is_fwd: bool = True

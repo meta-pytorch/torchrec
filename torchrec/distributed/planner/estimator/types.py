@@ -19,7 +19,6 @@ This module contains the core dataclasses  performance estimator:
 Evaluator classes and factory are in estimator.py.
 """
 import logging
-import math
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
@@ -83,8 +82,8 @@ class PerfCoefficient:
 class EstimatorPerfCoefficients:
     # Coefficients for forward pass
     fwd: PerfCoefficient = field(default_factory=PerfCoefficient)
-    # Coefficients for backward pass
-    bwd: PerfCoefficient = field(default_factory=PerfCoefficient)
+    # Coefficients for backward pass (None = use fwd_compute * bwd_compute_multiplier)
+    bwd: Optional[PerfCoefficient] = None
 
 
 @dataclass(frozen=True)
@@ -172,7 +171,7 @@ class PerfCoefficientConfig:
         elif sharding_type_lower == ShardingType.TABLE_COLUMN_WISE.value:
             coeff = self.column_wise
         elif sharding_type_lower == ShardingType.GRID_SHARD.value:
-            coeff = self.default
+            coeff = self.table_row_wise
         else:
             coeff = None
 
@@ -238,7 +237,7 @@ class HardwarePerfConfig:
             if fwd_coeff is not None or bwd_coeff is not None:
                 config_kwargs[sharding_type.value] = EstimatorPerfCoefficients(
                     fwd=fwd_coeff if fwd_coeff is not None else PerfCoefficient(),
-                    bwd=bwd_coeff if bwd_coeff is not None else PerfCoefficient(),
+                    bwd=bwd_coeff,  # Keep as None if @bwd_coefficient not defined
                 )
 
         # Get prefetch coefficients
@@ -276,6 +275,55 @@ class HardwarePerfConfig:
     # Set to 4.0 in FBHardwarePerfConfig to match FB legacy behavior, None for OSS default
     _default_output_data_type_size: Optional[float] = None
 
+    # Optional multiplier overrides (None = use ctx/topology values)
+    # These allow configs to override the default multipliers from topology
+    _bwd_compute_multiplier: Optional[float] = None
+    _weighted_feature_bwd_compute_multiplier: Optional[float] = None
+
+    # Linear regression prefetch estimation flag
+    # When True: use linear regression coefficients (requires @prefetch_coefficient)
+    # When False: use bandwidth-based formula (prefetch_bytes / hbm_to_ddr_mem_bw)
+    # FB hardware estimators set this to True when tuned coefficients are available
+    _use_linear_regression_prefetch_estimate: bool = False
+
+    def get_bwd_compute_multiplier(self, ctx_multiplier: float) -> float:
+        """
+        Get backward compute multiplier with priority-based lookup.
+
+        Priority:
+        1. Config-defined _bwd_compute_multiplier (if explicitly set)
+        2. ctx_multiplier (from topology)
+
+        Args:
+            ctx_multiplier: The multiplier from ShardPerfContext (sourced from topology)
+
+        Returns:
+            The backward compute multiplier to use
+        """
+        if self._bwd_compute_multiplier is not None:
+            return self._bwd_compute_multiplier
+        return ctx_multiplier
+
+    def get_weighted_feature_bwd_compute_multiplier(
+        self, ctx_multiplier: float
+    ) -> float:
+        """
+        Get weighted feature backward compute multiplier with priority-based lookup.
+
+        Priority:
+        1. Config-defined _weighted_feature_bwd_compute_multiplier (if explicitly set)
+        2. ctx_multiplier (from topology)
+
+        Args:
+            ctx_multiplier: The multiplier from ShardPerfContext (sourced from topology)
+
+        Returns:
+            The weighted feature backward compute multiplier to use
+        """
+        if self._weighted_feature_bwd_compute_multiplier is not None:
+            return self._weighted_feature_bwd_compute_multiplier
+        return ctx_multiplier
+
     def get_coefficients_for_sharding(
         self, sharding_type: str, compute_kernel: Optional[str] = None
     ) -> EstimatorPerfCoefficients:
@@ -301,7 +349,7 @@ class HardwarePerfConfig:
         if fwd_coeff is not None or bwd_coeff is not None:
             return EstimatorPerfCoefficients(
                 fwd=fwd_coeff if fwd_coeff is not None else PerfCoefficient(),
-                bwd=bwd_coeff if bwd_coeff is not None else PerfCoefficient(),
+                bwd=bwd_coeff,  # Keep as None if @bwd_coefficient not defined
             )
 
         # Priority 2 & 3: Use explicit coefficients attribute (falls back to default)
@@ -493,13 +541,26 @@ class ShardPerfContext:
         WEIGHTED_FEATURE_BWD_COMPUTE_MULTIPLIER
     )
 
-    # Cache-related
-    expected_cache_fetches: float = 0.0
+    # =========================================================================
+    # Raw prefetch data - passed to _default_prefetch_comp for computation
+    # =========================================================================
+    # Prefetch computation happens in _default_prefetch_comp, not in build_shard_perf_contexts.
+    # This allows prefetch logic to be customized via config annotations.
 
-    # Extended prefetch fields (used by FB hardware estimators for linear regression)
-    # These are optional and only populated when cache stats are available
-    expected_lookups: Optional[float] = None
-    expected_unique_lookups: Optional[float] = None
+    # Flags controlling prefetch computation (passed from config/estimator)
+    use_linear_regression_prefetch_estimate: bool = False
+    use_batch_inputs_for_expected_cache_fetches: bool = False
+
+    # Raw cache data for prefetch computation
+    caching_ratio: Optional[float] = None
+    table_name: str = ""
+    hash_size_for_clamping: int = 0  # sharding_option.tensor.shape[0] for clamping
+
+    # Raw cache stats expected_lookups (from cache_stats.expected_lookups)
+    cache_stats_expected_lookups: Optional[float] = None
+
+    # Computed expected_miss_rate (computed once from cache_stats in build_shard_perf_contexts)
+    expected_miss_rate: Optional[float] = None
 
     # =========================================================================
     # Class method to build from ShardingOption
@@ -605,6 +666,9 @@ class ShardPerfContext:
         # Check prefetch pipeline
         prefetch_pipeline = is_prefetch_pipelined(sharding_option, sharder)
 
+        # Get input_data_type_size from config annotation (if set) or use default BIGINT_DTYPE
+        input_data_type_size = getattr(config, "_input_data_type_size", BIGINT_DTYPE)
+
         # Output data type size - fetch default from config if output_dtype not specified
         # FB legacy uses INT_DTYPE (4.0), OSS uses tensor.element_size()
         default_output_data_type_size = getattr(
@@ -620,21 +684,15 @@ class ShardPerfContext:
             )
         )
 
-        # Calculate expected cache fetches and extended prefetch fields
-        expected_cache_fetches = 0.0
-        expected_lookups: Optional[float] = None
-        expected_unique_lookups: Optional[float] = None
+        # =========================================================================
+        # Raw prefetch data - passed to _default_prefetch_comp for computation
+        # =========================================================================
+        # Prefetch computation happens in _default_prefetch_comp, not here.
+        # This allows prefetch logic to be customized via config annotations.
 
-        # Calculate batch_inputs for all features
-        batch_inputs = math.ceil(
-            topology.world_size
-            * sum(
-                x * y * z
-                for x, y, z in zip(
-                    sharding_option.input_lengths, num_poolings, batch_sizes
-                )
-            )
-        )
+        # Extract raw cache stats for prefetch computation
+        cache_stats_expected_lookups: Optional[float] = None
+        expected_miss_rate: Optional[float] = None
 
         if (
             caching_ratio is not None
@@ -644,47 +702,8 @@ class ShardPerfContext:
             == EmbeddingComputeKernel.FUSED_UVM_CACHING.value
         ):
             _stats = sharding_option.cache_params.stats
-
-            # Get num_unique_lookups from cache stats
-            num_unique_lookups = float(_stats.expected_lookups)
-
-            # If linear regression prefetch estimate is enabled, clamp num_unique_lookups
-            if use_linear_regression_prefetch_estimate:
-                num_unique_lookups = min(
-                    num_unique_lookups,
-                    batch_inputs,
-                    sharding_option.tensor.shape[0],  # hash size
-                )
-                logger.info(
-                    "Since use_linear_regression_prefetch_estimate is enabled, "
-                    "adjusting num_unique_lookups to be min(estimated_num_unique_lookups, batch_input_count, hash_size)."
-                )
-
+            cache_stats_expected_lookups = _stats.expected_lookups
             expected_miss_rate = _stats.expected_miss_rate(caching_ratio)
-
-            # Calculate expected_cache_fetches based on flag
-            if use_batch_inputs_for_expected_cache_fetches:
-                expected_cache_fetches = expected_miss_rate * batch_inputs
-                logger.info(
-                    f"Since use_batch_inputs_for_expected_cache_fetches is enabled, "
-                    f"computing expected_cache_fetches = expected_miss_rate * batch_inputs. "
-                    f"For example, [expected_cache_fetches] table={sharding_option.name} "
-                    f"using batch_inputs: expected_miss_rate={expected_miss_rate} * "
-                    f"batch_inputs={batch_inputs} = {expected_cache_fetches}"
-                )
-            else:
-                expected_cache_fetches = expected_miss_rate * num_unique_lookups
-                logger.info(
-                    f"Computing expected_cache_fetches = expected_miss_rate * expected_unique_lookups. "
-                    f"For example, [expected_cache_fetches] table={sharding_option.name} "
-                    f"using expected_unique_lookups: expected_miss_rate={expected_miss_rate} * "
-                    f"expected_unique_lookups={num_unique_lookups} = {expected_cache_fetches}"
-                )
-
-            # Extended prefetch fields for FB hardware estimators (linear regression)
-            expected_unique_lookups = num_unique_lookups
-            # expected_lookups is total lookups (batch_inputs)
-            expected_lookups = float(batch_inputs)
 
         # Get device bandwidth
         device_bw = config.get_device_bw(
@@ -703,27 +722,9 @@ class ShardPerfContext:
                 f"compute kernel: {sharding_option.compute_kernel}"
             )
 
-        # Get input_data_type_size from config annotation (if set) or use default BIGINT_DTYPE
-        input_data_type_size = getattr(config, "_input_data_type_size", BIGINT_DTYPE)
-
         # Build contexts
         contexts = []
         for hash_size, emb_dim in shard_sizes:
-            # Calculate expected_lookups for this shard (based on input_read_size formula)
-            # This matches FB hardware estimator's usage: expected_lookups=input_read_size
-            shard_expected_lookups = expected_lookups
-            if expected_unique_lookups is not None:
-                # batch_inputs * world_size * input_data_type_size
-                batch_inputs = sum(
-                    x * y * z
-                    for x, y, z in zip(
-                        sharding_option.input_lengths, num_poolings, batch_sizes
-                    )
-                )
-                shard_expected_lookups = (
-                    batch_inputs * topology.world_size * BIGINT_DTYPE
-                )
-
             ctx = cls(
                 sharding_type=sharding_option.sharding_type,
                 compute_kernel=sharding_option.compute_kernel,
@@ -750,9 +751,14 @@ class ShardPerfContext:
                 has_feature_processor=has_feature_processor,
                 bwd_compute_multiplier=topology.bwd_compute_multiplier,
                 weighted_feature_bwd_compute_multiplier=topology.weighted_feature_bwd_compute_multiplier,
-                expected_cache_fetches=expected_cache_fetches,
-                expected_lookups=shard_expected_lookups,
-                expected_unique_lookups=expected_unique_lookups,
+                # Raw prefetch data - computation happens in _default_prefetch_comp
+                use_linear_regression_prefetch_estimate=use_linear_regression_prefetch_estimate,
+                use_batch_inputs_for_expected_cache_fetches=use_batch_inputs_for_expected_cache_fetches,
+                caching_ratio=caching_ratio,
+                table_name=sharding_option.name,
+                hash_size_for_clamping=sharding_option.tensor.shape[0],
+                cache_stats_expected_lookups=cache_stats_expected_lookups,
+                expected_miss_rate=expected_miss_rate,
             )
             contexts.append(ctx)
 

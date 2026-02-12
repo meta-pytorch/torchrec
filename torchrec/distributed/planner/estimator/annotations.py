@@ -30,7 +30,7 @@ Creating hardware-specific estimators for Meta’s infrastructure.
 
 """
 
-from typing import Any, Callable, Optional, overload, Type, TypeVar, Union
+from typing import Any, Callable, List, Optional, overload, Type, TypeVar, Union
 
 # Type variable for decorator return types
 T = TypeVar("T")
@@ -307,7 +307,7 @@ def device_bw(
     bandwidth: Optional[float] = None,
     *,
     device: Optional[str] = None,
-    compute_kernel: Optional[str] = None,
+    compute_kernel: Optional[Union[str, List[str]]] = None,
 ) -> Callable[[Type[T]], Type[T]]:
     """
     Decorator to set device bandwidth for a hardware config.
@@ -317,9 +317,13 @@ def device_bw(
         @device_bw(3200 * 1024 * 1024 * 1024)
         class MyConfig(HardwarePerfConfig): pass
 
-        # Specific device + kernel bandwidth (NEW)
+        # Specific device + kernel bandwidth
         @device_bw(bandwidth=5000, device='cuda', compute_kernel='fused')
         @device_bw(bandwidth=3000, device='cuda', compute_kernel='dense')
+        class MyConfig(HardwarePerfConfig): pass
+
+        # Multiple compute kernels with same bandwidth (NEW)
+        @device_bw(bandwidth=5000, device='cuda', compute_kernel=['fused', 'fused_uvm'])
         class MyConfig(HardwarePerfConfig): pass
     """
 
@@ -346,9 +350,16 @@ def device_bw(
                             cls.kernel_device_bandwidths
                         )  # pyre-ignore[16]
                         break
+
+            # Normalize compute_kernel to a list for uniform processing
+            kernels = (
+                compute_kernel if isinstance(compute_kernel, list) else [compute_kernel]
+            )
+
             # Store with lowercase keys for case-insensitive lookup
-            key = (device.lower(), compute_kernel.lower())
-            cls.kernel_device_bandwidths[key] = bandwidth  # pyre-ignore[16]
+            for kernel in kernels:
+                key = (device.lower(), kernel.lower())
+                cls.kernel_device_bandwidths[key] = bandwidth  # pyre-ignore[16]
         else:
             # General device bandwidth (existing behavior)
             cls.device_bw = bandwidth  # pyre-ignore[16]
