@@ -281,6 +281,9 @@ class RecMetricModule(nn.Module):
                 **kwargs,
             )
 
+        if self.throughput_metric:
+            self.throughput_metric.update()
+
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
         r"""update() is called per batch, usually right after forward() to
         update the local states of metrics based on the model_output.
@@ -290,8 +293,6 @@ class RecMetricModule(nn.Module):
         """
         with record_function("## RecMetricModule:update ##"):
             self._update_rec_metrics(model_out, **kwargs)
-            if self.throughput_metric:
-                self.throughput_metric.update()
             self.trained_batches += 1
 
     def _adjust_compute_interval(self) -> None:

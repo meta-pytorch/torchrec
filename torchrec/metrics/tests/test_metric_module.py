@@ -90,12 +90,15 @@ class TestMetricModule(RecMetricModule):
     def _update_rec_metrics(
         self, model_out: Dict[str, torch.Tensor], **kwargs: Any
     ) -> None:
-        if isinstance(model_out, MagicMock):
-            return
-        labels, predictions, weights, _ = parse_task_model_outputs(
-            self.rec_tasks, model_out
-        )
-        self.rec_metrics.update(predictions=predictions, labels=labels, weights=weights)
+        if not isinstance(model_out, MagicMock):
+            labels, predictions, weights, _ = parse_task_model_outputs(
+                self.rec_tasks, model_out
+            )
+            self.rec_metrics.update(
+                predictions=predictions, labels=labels, weights=weights
+            )
+        if self.throughput_metric:
+            self.throughput_metric.update()
 
 
 class MetricModuleTest(unittest.TestCase):
