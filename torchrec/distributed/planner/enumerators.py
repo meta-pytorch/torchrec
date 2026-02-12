@@ -18,7 +18,14 @@ from torchrec.distributed.planner.constants import (
     DEFAULT_PERF_ESTIMATOR,
     POOLING_FACTOR,
 )
-from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
+
+# Explicit import to ensure default estimator config is registered before factory use.
+# This is required for spawned subprocesses where module-level registration
+# decorators may not execute before EmbeddingPerfEstimatorFactory.create() is called.
+from torchrec.distributed.planner.estimator import (  # noqa: F401
+    config as _config_module,
+    EmbeddingPerfEstimatorFactory,
+)
 from torchrec.distributed.planner.shard_estimators import (
     EmbeddingPerfEstimator,
     EmbeddingStorageEstimator,
