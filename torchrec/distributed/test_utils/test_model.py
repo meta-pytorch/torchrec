@@ -2701,24 +2701,19 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
             KeyedTensor with combined embeddings from all modules
         """
         features = input.idlist_features
-        batch_size = input.float_features.size(0)
         ebc_embeddings = torch.empty(0)
         ec_embeddings = torch.empty(0)
 
         # Process EmbeddingBagCollection features
+        # EBC internally filters features based on its configured table feature names
         if self.ebc is not None and self._ebc_features:
-            # Create a new KJT with only the features needed for EBC
-            ebc_jt_dict = {feature: features[feature] for feature in self._ebc_features}
-            ebc_features = KeyedJaggedTensor.from_jt_dict(ebc_jt_dict)
-            ebc_result = self.ebc(ebc_features)  # pyre-ignore[29]
+            ebc_result = self.ebc(features)  # pyre-ignore[29]
             ebc_embeddings = ebc_result.values()
 
         # Process EmbeddingCollection features
+        # EC internally filters features based on its configured table feature names
         if self.ec is not None and self._ec_features:
-            # Create a new KJT with only the features needed for EC
-            ec_jt_dict = {feature: features[feature] for feature in self._ec_features}
-            ec_features = KeyedJaggedTensor.from_jt_dict(ec_jt_dict)
-            ec_result = self.ec(ec_features)  # pyre-ignore[29]
+            ec_result = self.ec(features)  # pyre-ignore[29]
             padded_embeddings = [
                 torch.ops.fbgemm.jagged_2d_to_dense(
                     values=ec_result[e].values(),
@@ -2728,26 +2723,9 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
                 for e in self._ec_features
             ]
 
-            def _post_ec_forward(
-                padded_embeddings: List[torch.Tensor], batch_size: Optional[int] = None
-            ) -> torch.Tensor:
-                if batch_size is None or padded_embeddings[0].size(0) == batch_size:
-                    return torch.cat(
-                        padded_embeddings,
-                        dim=1,
-                    )
-                else:
-                    seq_emb = torch.cat(padded_embeddings, dim=1)
-                    ec_values = torch.zeros(
-                        batch_size,
-                        seq_emb.size(1),
-                        dtype=seq_emb.dtype,
-                        device=seq_emb.device,
-                    )
-                    ec_values[: seq_emb.size(0), :] = seq_emb
-                    return ec_values
-
-            ec_embeddings = _post_ec_forward(padded_embeddings, batch_size)
+            # Concatenate all EC embeddings along feature dimension
+            # Note: We avoid using batch_size in control flow for FX tracing compatibility
+            ec_embeddings = torch.cat(padded_embeddings, dim=1)
 
         return torch.cat([ebc_embeddings, ec_embeddings], dim=1)
 

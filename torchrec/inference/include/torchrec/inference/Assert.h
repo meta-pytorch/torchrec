@@ -40,7 +40,7 @@
   }
 
 #define TORCHREC_CHECK_NO_MESSAGE(condition) \
-  TORCHREC_CHECK_WITH_MESSAGE(#condition, "")
+  TORCHREC_CHECK_WITH_MESSAGE(condition, "")
 
 #define TORCHREC_CHECK_(x, condition, message, FUNC, ...) FUNC
 

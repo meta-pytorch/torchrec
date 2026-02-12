@@ -8,12 +8,13 @@
 # pyre-strict
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type, Union
 
 from torchrec.modules.embedding_configs import (
     CountBasedEvictionPolicy,
     CountTimestampMixedEvictionPolicy,
     EmbeddingBagConfig,
+    EmbeddingConfig,
     FeatureScoreBasedEvictionPolicy,
     NoEvictionPolicy,
     TimestampBasedEvictionPolicy,
@@ -160,7 +161,9 @@ class EmbeddingTablesConfig:
                 **self.mc_config
             )
 
-    def convert_to_ebconf(self, kwargs: Dict[str, Any]) -> EmbeddingBagConfig:
+    def convert_to_ebconf(
+        self, kwargs: Dict[str, Any]
+    ) -> Union[EmbeddingConfig, EmbeddingBagConfig]:
         if "data_type" in kwargs:
             kwargs["data_type"] = DataType[kwargs["data_type"]]
         else:
@@ -176,6 +179,13 @@ class EmbeddingTablesConfig:
         # Remove all keys that are not part of EmbeddingBagConfig
         kwargs.pop("location", None)
 
+        # Support EmbeddingConfig via config_class field
+        if "config_class" in kwargs:
+            config_class = kwargs.pop("config_class")
+            if config_class == "EmbeddingConfig":
+                return EmbeddingConfig(**kwargs)
+            elif config_class != "EmbeddingBagConfig":
+                raise ValueError(f"Unknown config class: {config_class}")
         return EmbeddingBagConfig(**kwargs)
 
     def generate_tables(
