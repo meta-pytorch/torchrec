@@ -93,11 +93,8 @@ class RwKeyedJaggedTensorPoolLookupValuesDist(torch.nn.Module):
         """
         return JaggedTensorAllToAll(
             jt=jagged_tensor,
-            # pyre-ignore
             num_items_to_send=ctx.num_ids_each_rank_to_send * self._num_features,
-            # pyre-ignore
             num_items_to_receive=ctx.num_ids_each_rank_to_receive * self._num_features,
-            # pyre-ignore
             pg=self._sharding_env.process_group,
         )
 
@@ -235,11 +232,8 @@ class RwKeyedJaggedTensorPoolUpdateValuesDist(torch.nn.Module):
                 lengths=lengths_to_send,
                 weights=kjt_weights_to_send,
             ),
-            # pyre-ignore
             num_items_to_send=ctx.num_ids_each_rank_to_send * self._num_features,
-            # pyre-ignore
             num_items_to_receive=ctx.num_ids_each_rank_to_receive * self._num_features,
-            # pyre-ignore
             pg=self._env.process_group,
         )
 
@@ -255,7 +249,6 @@ class KeyedJaggedTensorPoolRwSharding(ObjectPoolSharding):
         num_features: int,
     ) -> None:
         self._env = env
-        # pyre-ignore
         self._pg: dist.ProcessGroup = self._env.process_group
         self._world_size: int = self._env.world_size
         self._rank: int = self._env.rank
@@ -434,7 +427,6 @@ class KeyedJaggedTensorPoolRwReplicatedSharding(ObjectPoolSharding):
         num_features: int,
     ) -> None:
         self._env = env
-        # pyre-ignore
         self._pg: dist.ProcessGroup = self._env.process_group
         self._world_size: int = self._env.world_size
         self._rank: int = self._env.rank
@@ -449,7 +441,6 @@ class KeyedJaggedTensorPoolRwReplicatedSharding(ObjectPoolSharding):
             device, backend=dist.get_backend(self._pg)
         )
 
-        # pyre-ignore
         self._intra_pg: dist.ProcessGroup = intra_pg
 
         self._local_rank: int = get_local_rank(self._world_size)

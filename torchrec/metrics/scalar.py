@@ -67,7 +67,6 @@ class ScalarMetricComputation(RecMetricComputation):
             MetricComputationReport(
                 name=MetricName.SCALAR,
                 metric_prefix=MetricPrefix.LIFETIME,
-                # pyre-fixme[6]: For 3rd argument expected `Tensor` but got
                 #  `Union[Tensor, Module]`.
                 value=self.labels,
             ),

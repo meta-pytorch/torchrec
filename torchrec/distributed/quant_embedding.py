@@ -131,7 +131,6 @@ class ManagedCollisionEmbeddingCollectionContext(EmbeddingCollectionContext):
         evictions_per_table: Optional[Dict[str, Optional[torch.Tensor]]] = None,
         remapped_kjt: Optional[KJTList] = None,
     ) -> None:
-        # pyre-ignore
         super().__init__(sharding_contexts)
         self.evictions_per_table: Optional[Dict[str, Optional[torch.Tensor]]] = (
             evictions_per_table
@@ -141,13 +140,11 @@ class ManagedCollisionEmbeddingCollectionContext(EmbeddingCollectionContext):
     def record_stream(self, stream: torch.Stream) -> None:
         super().record_stream(stream)
         if self.evictions_per_table:
-            #  pyre-ignore
             for value in self.evictions_per_table.values():
                 if value is None:
                     continue
                 value.record_stream(stream)
         if self.remapped_kjt is not None:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             self.remapped_kjt.record_stream(stream)
 
 
@@ -162,7 +159,6 @@ def get_device_from_parameter_sharding(
         raise ValueError("Expected EnumerableShardingSpec as input to the function")
 
     device_type_list: Tuple[str, ...] = tuple(
-        # pyre-fixme[16]: `Optional` has no attribute `device`
         [shard.placement.device().type for shard in ps.sharding_spec.shards]
     )
     if len(set(device_type_list)) == 1:
@@ -404,7 +400,6 @@ def _construct_jagged_tensors_rw(
     lengths_list = torch.unbind(feature_length_2d, dim=0)
     values_list: List[torch.Tensor] = []
     if need_indices:
-        # pyre-ignore
         values_list = torch.split(
             _fx_trec_unwrap_optional_tensor(feature_indices),
             length_per_key,
@@ -435,7 +430,6 @@ def _construct_jagged_tensors_cw(
     for i in range(len(features)):
         embedding = embeddings[i]
         feature = features[i]
-        # pyre-fixme[6]: For 1st argument expected `List[Tensor]` but got
         #  `Tuple[Tensor, ...]`.
         lengths_lists.append(torch.unbind(feature.lengths().view(-1, stride), dim=0))
         embeddings_lists.append(
@@ -860,15 +854,12 @@ class ShardedQuantEmbeddingCollection(
         for sharding in self._sharding_type_device_group_to_sharding.values():
             self._output_dists.append(sharding.create_output_dist(device))
 
-    # pyre-ignore [14]
-    # pyre-ignore
     def input_dist(
         self,
         ctx: EmbeddingCollectionContext,
         features: KeyedJaggedTensor,
     ) -> ListOfKJTList:
         if self._has_uninitialized_input_dist:
-            # pyre-fixme[16]: `ShardedQuantEmbeddingCollection` has no attribute
             #  `_input_dist`.
             self._input_dist = ShardedQuantEcInputDist(
                 input_feature_names=features.keys() if features is not None else [],
@@ -887,7 +878,6 @@ class ShardedQuantEmbeddingCollection(
             unbucketize_permute_tensor_list,
             bucket_mapping_tensor_list,
             bucketized_length_list,
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
         ) = self._input_dist(features)
 
         with torch.no_grad():
@@ -926,7 +916,6 @@ class ShardedQuantEmbeddingCollection(
             ret.append(lookup.forward(features))
         return ret
 
-    # pyre-ignore
     def output_dist(
         self, ctx: EmbeddingCollectionContext, output: List[List[torch.Tensor]]
     ) -> Dict[str, JaggedTensor]:
@@ -962,7 +951,6 @@ class ShardedQuantEmbeddingCollection(
                 else None
             )
             features_before_input_dist_per_sharding.append(
-                # pyre-ignore
                 sharding_ctx.features_before_input_dist
             )
         return self.output_jt_dict(
@@ -1040,13 +1028,11 @@ class ShardedQuantEmbeddingCollection(
 
         return jt_dict_res
 
-    # pyre-ignore
     def compute_and_output_dist(
         self, ctx: EmbeddingCollectionContext, input: ListOfKJTList
     ) -> Dict[str, JaggedTensor]:
         return self.output_dist(ctx, self.compute(ctx, input))
 
-    # pyre-ignore
     def forward(self, *input, **kwargs) -> Dict[str, JaggedTensor]:
         ctx = self.create_context()
         dist_input = self.input_dist(ctx, *input, **kwargs)
@@ -1065,7 +1051,6 @@ class ShardedQuantEmbeddingCollection(
     def shardings(
         self,
     ) -> Dict[Tuple[str, Union[str, Tuple[str, ...]]], FeatureShardingMixIn]:
-        # pyre-ignore [7]
         return self._sharding_type_device_group_to_sharding
 
 
@@ -1329,7 +1314,6 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
                 table_name_to_parameter_sharding,
                 env=env,
                 device=device,
-                # pyre-ignore
                 embedding_shardings=embedding_shardings,
             )
         )
@@ -1347,7 +1331,7 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
             ec_sharding_lookups = self._lookups[sharding]
             sharding_mcec_lookups: List[ShardedMCECLookup] = []
             for j, ec_lookup in enumerate(
-                ec_sharding_lookups._embedding_lookups_per_rank  # pyre-ignore
+                ec_sharding_lookups._embedding_lookups_per_rank
             ):
                 sharding_mcec_lookups.append(
                     ShardedMCECLookup(
@@ -1379,7 +1363,6 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
             self._has_uninitialized_output_dist = False
 
         return self._managed_collision_collection.input_dist(
-            # pyre-fixme [6]
             ctx,
             features,
         )
@@ -1406,11 +1389,9 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
             ret.append(sharding_ret)
         # Store remapped features in context for output_dist
         if self._return_remapped_features and remapped_kjts:
-            # pyre-ignore[16]
             ctx.remapped_kjt = KJTList(remapped_kjts)
         return ret
 
-    # pyre-ignore
     def output_dist(
         self,
         ctx: ShrdCtx,
@@ -1419,12 +1400,10 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
         Union[KeyedTensor, Dict[str, JaggedTensor]], Optional[KeyedJaggedTensor]
     ]:
 
-        # pyre-ignore [6]
         ebc_out = super().output_dist(ctx, output)
 
         kjt_out: Optional[KeyedJaggedTensor] = None
         if self._return_remapped_features:
-            # pyre-ignore[16]
             remapped_kjt = getattr(ctx, "remapped_kjt", None)
             if remapped_kjt is not None:
                 kjt_out = self._managed_collision_collection.output_dist(

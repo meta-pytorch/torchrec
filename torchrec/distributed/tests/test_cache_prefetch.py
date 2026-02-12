@@ -76,7 +76,6 @@ class ShardedEmbeddingModuleCachePrefetchTest(unittest.TestCase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(SHARDING_TYPES),
         cache_load_factor=st.sampled_from([0.5, 0.8]),
@@ -131,7 +130,6 @@ class ShardedEmbeddingModuleCachePrefetchTest(unittest.TestCase):
         sharded_ebc = sharded_model.module
         self.assertIsInstance(sharded_ebc, ShardedEmbeddingBagCollection)
         lookups = sharded_ebc._lookups
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
         emb_module = lookups[0]._emb_modules[0]._emb_module
         self.assertIsInstance(emb_module, SplitTableBatchedEmbeddingBagsCodegen)
 
@@ -142,7 +140,6 @@ class ShardedEmbeddingModuleCachePrefetchTest(unittest.TestCase):
         self.assertEqual(self.get_cache_unique_misses(emb_module), 3)
 
         kjt_list = KJTList([batch_1_kjt])
-        # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
         sharded_ebc.prefetch(kjt_list)
 
         # Reset cache stats so that local uvm cache stats are reset
@@ -171,7 +168,6 @@ class ShardedEmbeddingModuleCachePrefetchTest(unittest.TestCase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(SHARDING_TYPES),
         cache_load_factor=st.sampled_from([0.5, 0.8]),
@@ -213,11 +209,9 @@ class ShardedEmbeddingModuleCachePrefetchTest(unittest.TestCase):
         )
         sharded_ebc = sharded_model.module
         lookups = sharded_ebc._lookups
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
         emb_module = lookups[0]._emb_modules[0]._emb_module
 
         kjt_list = KJTList([batch_1_kjt])
-        # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
         sharded_ebc.prefetch(kjt_list)
 
         # Reset cache stats so that local uvm cache stats are reset

@@ -73,7 +73,6 @@ class SequenceShardingContext(EmbeddingShardingContext):
 
     def record_stream(self, stream: torch.Stream) -> None:
         if self.features_before_input_dist is not None:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             self.features_before_input_dist.record_stream(stream)
         if self.sparse_features_recat is not None:
             self.sparse_features_recat.record_stream(stream)
@@ -103,10 +102,8 @@ class InferSequenceShardingContext(Multistreamable):
 
     def record_stream(self, stream: torch.Stream) -> None:
         for feature in self.features:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             feature.record_stream(stream)
         if self.features_before_input_dist is not None:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             self.features_before_input_dist.record_stream(stream)
         if self.unbucketize_permute_tensor is not None:
             self.unbucketize_permute_tensor.record_stream(stream)

@@ -107,7 +107,6 @@ class RwObjectPoolIDsDist(torch.nn.Module):
             indices=ids,
             bucketize_pos=False,
             sequence=True,
-            # pyre-ignore
             block_sizes=ctx.block_size.to(ids.dtype),
             my_size=self._bucketize_world_size,
             weights=None,

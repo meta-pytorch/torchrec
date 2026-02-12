@@ -104,7 +104,6 @@ class GreedyProposer(Proposer):
             if perf_rating < self._best_perf_rating:
                 self._best_perf_rating = perf_rating
                 self._num_inferior_perf = 0
-            # pyre-fixme [58]: `>` is not supported for operand types `int` and `Optional[int]`.
             if self._num_inferior_perf > self._threshold:
                 self._current_proposal = {}
                 return
@@ -116,10 +115,8 @@ class GreedyProposer(Proposer):
             if index + 1 < len(sharding_options):
                 sharding_option = sharding_options[index]
                 current_storage = (
-                    # pyre-fixme [16]: `Optional` has no attribute `hbm`
                     max([shard.storage.hbm for shard in sharding_option.shards]),
                     sum([shard.storage.hbm for shard in sharding_option.shards]),
-                    # pyre-fixme [16]: `Optional` has no attribute `ddr`
                     max([shard.storage.ddr for shard in sharding_option.shards]),
                     sum([shard.storage.ddr for shard in sharding_option.shards]),
                 )
@@ -247,7 +244,6 @@ class GridSearchProposer(Proposer):
             range(len(sharding_options))
             for sharding_options in self._sharding_options_by_fqn.values()
         ]
-        # pyre-fixme[8]: Attribute has type `List[List[int]]`; used as
         #  `List[Tuple[int]]`.
         self._proposals = list(itertools.product(*sharding_options_by_fqn_indices))
 
@@ -682,7 +678,7 @@ class EmbeddingOffloadScaleupProposer(Proposer):
                 for sharding_option in self.starting_proposal
             )
             new_budget = hbm_used_previously - starting_size
-            self.search.shrink_right(new_budget)  # pyre-ignore
+            self.search.shrink_right(new_budget)
 
         assert self.search is not None  # keep pyre happy
         budget = self.search.next(perf_rating or 1e99)
@@ -911,7 +907,7 @@ class EmbeddingOffloadScaleupProposer(Proposer):
             )
             actual_increase_bytes = new_cache_size_bytes - cache_size_bytes
 
-            budget -= torch.sum(actual_increase_bytes).item()  # pyre-ignore[58]
+            budget -= torch.sum(actual_increase_bytes).item()
             cache_size_bytes = new_cache_size_bytes
             # TODO: consider trade off of using remaining budget to push >0.95 tables
             # to HBM vs spending that budget on improving hit rate on other tables in
@@ -928,7 +924,7 @@ class EmbeddingOffloadScaleupProposer(Proposer):
                 logger.debug(
                     f"[allocate_budget] {promotes.sum()} tables exceeded ceiling, promoting to save {budget_reclaimed} bytes"
                 )
-                budget += budget_reclaimed  # pyre-ignore[58]
+                budget += budget_reclaimed
                 # force these tables to 1.0 to ensure promotion
                 cache_size_bytes[promotes] = max_cache_size_bytes[promotes]
 

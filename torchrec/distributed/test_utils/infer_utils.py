@@ -121,15 +121,12 @@ class KJTInputExportWrapper(torch.nn.Module):
         self._module_kjt_input = module_kjt_input
         self._kjt_keys = kjt_keys
 
-    # pyre-ignore
     def forward(
         self,
         values: torch.Tensor,
         lengths: torch.Tensor,
         weights: Optional[torch.Tensor] = None,
-        # pyre-ignore
         *args,
-        # pyre-ignore
         **kwargs,
     ):
         kjt = KeyedJaggedTensor(
@@ -151,15 +148,12 @@ class KJTInputExportDynamicShapeWrapper(torch.nn.Module):
         super().__init__()
         self.kjt_input_wrapper = kjt_input_wrapper
 
-    # pyre-ignore
     def forward(
         self,
         values: torch.Tensor,
         lengths: torch.Tensor,
         weights: Optional[torch.Tensor] = None,
-        # pyre-ignore
         *args,
-        # pyre-ignore
         **kwargs,
     ):
         # Generate unbacked symints to represent sizes
@@ -167,13 +161,11 @@ class KJTInputExportDynamicShapeWrapper(torch.nn.Module):
         values_size = values[0].item()
         torch._check_is_size(values_size)
         torch._check(values_size >= lengths.shape[0])
-        # pyre-ignore
         values = torch.ones(values_size).to(values.device)
         if weights is not None:
             weights_size = weights.int()[0].item()
             torch._check_is_size(weights_size)
             torch._check(weights_size >= lengths.shape[0])
-            # pyre-ignore
             weights = torch.ones(weights_size).to(weights.device)
 
         return self.kjt_input_wrapper(values, lengths, weights, *args, **kwargs)
@@ -223,15 +215,12 @@ class KJTInputExportWrapperWithStrides(torch.nn.Module):
         self._module_kjt_input = module_kjt_input
         self._kjt_keys = kjt_keys
 
-    # pyre-ignore
     def forward(
         self,
         values: torch.Tensor,
         lengths: torch.Tensor,
         stride_per_key_per_rank: Optional[List[List[int]]],
-        # pyre-ignore
         *args,
-        # pyre-ignore
         **kwargs,
     ):
         kjt = KeyedJaggedTensor(
@@ -567,7 +556,6 @@ class KJTInputWrapper(torch.nn.Module):
         self._module_kjt_input = module_kjt_input
         self.add_module("_module_kjt_input", self._module_kjt_input)
 
-    # pyre-ignore
     def forward(
         self,
         keys: List[str],
@@ -785,7 +773,6 @@ def create_test_model_ebc_only_no_quantize(
         )
         ebc = FeatureProcessedEmbeddingBagCollection(
             embedding_bag_collection=EmbeddingBagCollection(
-                # pyre-ignore [6]
                 tables=mi.tables,
                 device=mi.sparse_device,
                 is_weighted=True,
@@ -881,7 +868,6 @@ def shard_qebc(
             ),
         )
     if not plan:
-        # pyre-ignore
         plan = mi.planner.plan(
             mi.quant_model,
             [sharder],
@@ -894,7 +880,6 @@ def shard_qebc(
             assert ps.sharding_type == sharding_type.value
             assert ps.sharding_spec is not None
             sharding_spec: ShardingSpec = ps.sharding_spec
-            # pyre-ignore
             assert len(sharding_spec.shards) == len(expected_shards[i])
             for shard, ((offset_r, offset_c, size_r, size_c), placement) in zip(
                 sharding_spec.shards, expected_shards[i]
@@ -907,11 +892,9 @@ def shard_qebc(
     quant_model_copy = copy.deepcopy(mi.quant_model)
     sharded_model, _ = shard_quant_model(
         model=quant_model_copy,
-        # pyre-fixme[6]: For 2nd argument expected
         #  `Optional[List[ModuleSharder[Module]]]` but got `List[TestQuantEBCSharder]`.
         sharders=[sharder],
         sharding_device=str(device),
-        # pyre-ignore
         world_size=mi.topology.world_size,
         sharding_plan=plan,
     )
@@ -931,7 +914,6 @@ def shard_qec(
     )
 
     if not plan:
-        # pyre-ignore
         plan = mi.planner.plan(
             mi.quant_model,
             [sharder],
@@ -940,12 +922,10 @@ def shard_qec(
     if expected_shards is not None:
         msp: ModuleShardingPlan = plan.plan["_module_kjt_input.0"]  # TODO: hardcoded
         for i in range(mi.num_features):
-            # pyre-ignore
             ps: ParameterSharding = msp[f"table_{i}"]
             assert ps.sharding_type == sharding_type.value
             assert ps.sharding_spec is not None
             sharding_spec: ShardingSpec = ps.sharding_spec
-            # pyre-ignore
             assert len(sharding_spec.shards) == len(expected_shards[i])
             for shard, ((offset_r, offset_c, size_r, size_c), placement) in zip(
                 sharding_spec.shards, expected_shards[i]
@@ -958,18 +938,15 @@ def shard_qec(
     quant_model_copy = copy.deepcopy(mi.quant_model)
     sharded_model = _shard_modules(
         module=quant_model_copy,
-        # pyre-fixme[6]: For 2nd argument expected
         #  `Optional[List[ModuleSharder[Module]]]` but got `List[TestQuantECSharder]`.
         sharders=[sharder],
         device=device,
         plan=plan,
-        # pyre-ignore
         env=ShardingEnv.from_local(world_size=mi.topology.world_size, rank=0),
     )
     return sharded_model
 
 
-# pyre-ignore
 def assert_close(expected, actual) -> None:
     if isinstance(expected, KeyedTensor):
         assert isinstance(actual, KeyedTensor)
@@ -1081,7 +1058,6 @@ class MockTBE(nn.Module):
         self, split_scale_bias_mode: int = 1
     ) -> List[Tuple[Tensor, Optional[Tensor], Optional[Tensor]]]:
         if split_scale_bias_mode == 2:
-            # pyre-ignore
             return self.split_embedding_weights
         raise NotImplementedError()
 
@@ -1111,7 +1087,6 @@ def replace_sharded_quant_modules_tbes_with_mock_tbes(M: torch.nn.Module) -> Non
     for m in M.modules():
         if isinstance(m, ShardedQuantEmbeddingBagCollection):
             for lookup in m._lookups:
-                # pyre-fixme[29]: `Union[(self: Tensor) -> Any, Module, Tensor]` is
                 #  not a function.
                 for lookup_per_rank in lookup._embedding_lookups_per_rank:
                     replace_registered_tbes_with_mock_tbes(lookup_per_rank)

@@ -646,7 +646,6 @@ class ShardingOption:
     def total_perf(self) -> float:
         perf: float = 0
         for shard in self.shards:
-            # pyre-ignore: Undefined attribute [16]
             perf += shard.perf.total
         return perf
 
@@ -1094,7 +1093,7 @@ class CriticalPathEstimate:
 
 
 # ---- Types Utils ---- #
-def hash_sha256_to_int(hashable_list: List[Any]) -> int:  # pyre-ignore
+def hash_sha256_to_int(hashable_list: List[Any]) -> int:
     """
     Hashes the given data using SHA256 and returns the hash as an integer
     """
@@ -1104,7 +1103,7 @@ def hash_sha256_to_int(hashable_list: List[Any]) -> int:  # pyre-ignore
     return int(hash_digest, 16)
 
 
-def hash_sha256_str(hashable_list: List[Any]) -> str:  # pyre-ignore
+def hash_sha256_str(hashable_list: List[Any]) -> str:
     """
     Hashes the given data using SHA256 and returns the hash as an string
     """
@@ -1120,20 +1119,19 @@ def hash_planner_context_inputs(
     enumerator: Enumerator,
     storage_reservation: StorageReservation,
     constraints: Optional[Dict[str, ParameterConstraints]],
-    # pyre-ignore
     hash_function: Callable[[List[Any]], int] = hash_sha256_to_int,
 ) -> int:
     assert hasattr(
         enumerator, "last_stored_search_space"
     ), "This enumerator is not compatible with hashing"
     assert (
-        enumerator.last_stored_search_space is not None  # pyre-ignore
+        enumerator.last_stored_search_space is not None
     ), "Unable to hash planner context without an enumerator that has a precomputed search space"
     search_space = enumerator.last_stored_search_space
     storage_reservation_policy = type(storage_reservation).__name__
 
     assert (
-        storage_reservation._last_reserved_topology is not None  # pyre-ignore
+        storage_reservation._last_reserved_topology is not None
     ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
 
     # Round device memory to 1% to avoid hash mismatches due to minor driver version differences which does not impact the behavior of planner
@@ -1189,20 +1187,19 @@ def hash_planner_context_inputs_str(
     enumerator: Enumerator,
     storage_reservation: StorageReservation,
     constraints: Optional[Dict[str, ParameterConstraints]],
-    # pyre-ignore
     hash_function: Callable[[List[Any]], str] = hash_sha256_str,
 ) -> str:
     assert hasattr(
         enumerator, "last_stored_search_space"
     ), "This enumerator is not compatible with hashing"
     assert (
-        enumerator.last_stored_search_space is not None  # pyre-ignore
+        enumerator.last_stored_search_space is not None
     ), "Unable to hash planner context without an enumerator that has a precomputed search space"
     search_space = enumerator.last_stored_search_space
     storage_reservation_policy = type(storage_reservation).__name__
 
     assert (
-        storage_reservation._last_reserved_topology is not None  # pyre-ignore
+        storage_reservation._last_reserved_topology is not None
     ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
 
     hashable_list = [

@@ -39,7 +39,6 @@ class MovieLensTest(unittest.TestCase):
 
     MOVIE_ID_RANGE = (0, 100)
 
-    # pyre-ignore[2]
     def _create_csv(self, filename: str, rows: Iterable[Any]) -> None:
         with open(filename, "w") as f:
             cf = csv.writer(f, delimiter=",")
@@ -94,7 +93,6 @@ class MovieLensTest(unittest.TestCase):
         for val, expected_type in zip(ordered_vals, expected_column_types):
             self.assertTrue(isinstance(val, expected_type))
 
-    # pyre-ignore[24]
     def _test_ratings(self, dataset_fn: Callable) -> None:
         ratings_row_count = 100
         with self._create_root(ratings_row_count) as tmpdir:
@@ -107,7 +105,6 @@ class MovieLensTest(unittest.TestCase):
                 )
             self.assertEqual(len(list(dataset)), ratings_row_count)
 
-    # pyre-ignore[24]
     def _test_ratings_movies(self, dataset_fn: Callable) -> None:
         ratings_row_count = 200
         with self._create_root(ratings_row_count) as tmpdir:

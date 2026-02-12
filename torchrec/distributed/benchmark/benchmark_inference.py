@@ -72,7 +72,6 @@ def benchmark_qec(args: argparse.Namespace, output_dir: str) -> List[BenchmarkRe
     )
 
     module = QuantEmbeddingCollection(
-        # pyre-ignore [6]
         tables=tables,
         device=torch.device("cpu"),
         quant_state_dict_split_scale_bias=True,
@@ -105,7 +104,6 @@ def benchmark_qebc(args: argparse.Namespace, output_dir: str) -> List[BenchmarkR
     )
 
     module = QuantEmbeddingBagCollection(
-        # pyre-ignore [6]
         tables=tables,
         is_weighted=False,
         device=torch.device("cpu"),
@@ -141,7 +139,6 @@ def benchmark_qec_unsharded(
     )
 
     module = QuantEmbeddingCollection(
-        # pyre-ignore [6]
         tables=tables,
         device=torch.device("cpu"),
         quant_state_dict_split_scale_bias=True,
@@ -177,7 +174,6 @@ def benchmark_qebc_unsharded(
     )
 
     module = QuantEmbeddingBagCollection(
-        # pyre-ignore [6]
         tables=tables,
         is_weighted=False,
         device=torch.device("cpu"),

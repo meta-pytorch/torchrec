@@ -50,7 +50,6 @@ class RowWiseAdagrad(Optimizer):
         eps: float = 1e-10,
         *,
         maximize: bool = False,
-        # pyre-ignore
         **unused,
     ) -> None:
         if not 0.0 <= lr:
@@ -88,7 +87,6 @@ class RowWiseAdagrad(Optimizer):
                     else initial_accumulator_value
                 )
                 state["sum"] = (
-                    # pyre-fixme[28]: Unexpected keyword argument `axis`.
                     torch.full_like(p, init_value, memory_format=torch.preserve_format)
                     .mean(axis=1)
                     .view(-1, 1)
@@ -114,7 +112,6 @@ class RowWiseAdagrad(Optimizer):
                 state["sum"].share_memory_()
 
     @torch.no_grad()
-    # pyre-ignore
     def step(self, closure=None) -> torch.Tensor:
         """Performs a single optimization step.
         Args:

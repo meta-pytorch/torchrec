@@ -204,7 +204,6 @@ class SparseDataDistUtil(Generic[In]):
             else torch.cuda.stream
         )
 
-        # pyre-ignore
         self._original_forwards: List[Callable[..., Any]] = []
         self._original_kjt_dist_forwards: List[
             Callable[[KeyedJaggedTensor], Awaitable[KJTAllToAllTensorsAwaitable]]

@@ -189,7 +189,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
 
         return torch.tensor(address_lookup, dtype=torch.int64)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -226,7 +225,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             equal_nan=True,
         )
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -242,7 +240,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
         self.assertEqual(itep_module.address_lookup.cpu().shape, torch.Size([0]))
         self.assertEqual(itep_module.row_util.cpu().shape, torch.Size([0]))
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -267,7 +264,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             )
             _ = itep_ebc(input_kjt)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -292,7 +288,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             )
             _ = itep_ebc(input_kjt)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -326,7 +321,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
         # Check that reset_weight_momentum is called
         self.assertEqual(mock_reset_weight_momentum.call_count, 5)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -362,7 +356,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
         # Check that reset_weight_momentum is not called
         self.assertEqual(mock_reset_weight_momentum.call_count, 0)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -394,7 +387,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             # Verify iter incremented correctly after forward pass
             self.assertEqual(itep_ebc._iter.item(), expected_iter)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -417,7 +409,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
         original_forward = itep_module.forward
         captured_iter_args = []
 
-        # pyre-ignore[53]: Captured variable `captured_iter_args` is not annotated.
         def mock_forward(features: KeyedJaggedTensor, iter_val: int) -> List[Tensor]:
             captured_iter_args.append((type(iter_val), iter_val))
             return original_forward(features, iter_val)
@@ -437,7 +428,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             self.assertEqual(arg_type, int)
             self.assertEqual(arg_value, 42)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -469,7 +459,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
         # Verify iter incremented
         self.assertEqual(itep_ebc._iter.item(), 1)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -499,7 +488,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
                 original_forward = itep_module.forward
                 captured_iter = None
 
-                # pyre-ignore[53]: Captured variable `captured_iter` is not annotated.
                 def mock_forward(
                     features: KeyedJaggedTensor, iter_val: int
                 ) -> List[Tensor]:
@@ -517,7 +505,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
                     self.assertEqual(captured_iter, iter_val)
                     self.assertIsInstance(captured_iter, int)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -566,7 +553,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
         except Exception as e:
             self.fail(f"Unexpected exception with large iter: {e}")
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -590,7 +576,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
 
         original_forward = itep_module.forward
 
-        # pyre-ignore[53]: Captured variable `iter_history` is not annotated.
         def track_iter_forward(
             features: KeyedJaggedTensor, iter_val: int
         ) -> List[Tensor]:
@@ -625,7 +610,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
                 self.assertEqual(iter_val, expected_iter)
                 self.assertIsInstance(iter_val, int)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -679,7 +663,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             f"({num_iterations} iterations, total: {total_time:.4f}s)"
         )
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -715,7 +698,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
         original_forward = itep_module.forward
         captured_values = []
 
-        # pyre-ignore[53]: Captured variable `captured_values` is not annotated.
         def capture_iter_forward(
             features: KeyedJaggedTensor, iter_val: int
         ) -> List[Tensor]:
@@ -743,7 +725,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
                         f"Value mismatch for {description}",
                     )
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -770,7 +751,6 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
         iter_values_received = []
         original_forward = itep_module.forward
 
-        # pyre-ignore[53]: Captured variable `iter_values_received` is not annotated.
         def tracking_forward(
             features: KeyedJaggedTensor, iter_val: int
         ) -> List[Tensor]:

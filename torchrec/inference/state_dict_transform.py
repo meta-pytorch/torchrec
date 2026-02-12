@@ -55,7 +55,6 @@ def state_dict_all_gather_keys(
     dist.all_gather_object(all_names, names, pg)
     deduped_names = set()
     for local_names in all_names:
-        # pyre-ignore[16]
         for name in local_names:
             deduped_names.add(name)
     return sorted(deduped_names)

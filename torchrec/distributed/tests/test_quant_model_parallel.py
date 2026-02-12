@@ -143,7 +143,6 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]
     @given(
         output_type=st.sampled_from(
             [
@@ -206,7 +205,6 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]
     @given(
         output_type=st.sampled_from(
             [
@@ -289,7 +287,6 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
             weighted_tables=self.weighted_tables,
         )
 
-        # pyre-ignore
         dmp_copy.load_state_dict(dmp.state_dict())
         torch.testing.assert_close(
             dmp(local_batch[0].to(device)).cpu(),
@@ -300,7 +297,6 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]
     @given(
         output_type=st.sampled_from(
             [
@@ -378,7 +374,6 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
             sharded_model_copy(local_batch[0].to(device_1)).cpu(),
         )
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
@@ -393,9 +388,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
             dense_device=device,
             sparse_device=torch.device("meta"),
         )
-        # pyre-fixme[16]: `TestSparseNN` has no attribute `copy_module`.
         model.copy_module = CopyModule()
-        # pyre-fixme[16]: `TestSparseNN` has no attribute `no_copy_module`.
         model.no_copy_module = NoCopyModule()
         quant_model = quantize(model, inplace=True)
         dmp = DistributedModelParallel(
@@ -415,9 +408,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         )
 
         dmp_1 = dmp.copy(device_1)
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `tensor`.
         self.assertEqual(dmp_1.module.copy_module.tensor.device, device_1)
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `tensor`.
         self.assertEqual(dmp_1.module.no_copy_module.tensor.device, torch.device("cpu"))
 
 
@@ -449,7 +440,6 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         torch.cuda.device_count() <= 0,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type_qsplitscalebias=st.sampled_from(
             [
@@ -535,7 +525,6 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
             # flake8: noqa:C419
             all(
                 param.device.type == sharding_device_type
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `ebc`.
                 for param in dmp.module.sparse.ebc.buffers()
             )
@@ -544,7 +533,6 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
             # flake8: noqa:C419
             all(
                 param.device.type == sparse_device.type
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `weighted_ebc`.
                 for param in dmp.module.sparse.weighted_ebc.buffers()
             )
@@ -554,7 +542,6 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         torch.cuda.device_count() <= 0,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type_qsplitscalebias=st.sampled_from(
             [
@@ -621,14 +608,12 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         )
 
         self.assertTrue(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
             all(param.device == device for param in dmp.module.sparse.ebc.buffers())
         )
         self.assertTrue(
             # flake8: noqa:C419
             all(
                 param.device == torch.device("meta")
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `weighted_ebc`.
                 for param in dmp.module.sparse.weighted_ebc.buffers()
             )
@@ -638,7 +623,6 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         torch.cuda.device_count() <= 0,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type_qsplitscalebias=st.sampled_from(
             [
@@ -707,7 +691,6 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         self.assertTrue(
             all(
                 param.device.type == device.type
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `ebc`.
                 for param in dmp.module.sparse.ebc.buffers()
             )
@@ -716,7 +699,6 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         self.assertTrue(
             all(
                 param.device.type == device.type
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `weighted_ebc`.
                 for param in dmp.module.sparse.weighted_ebc.buffers()
             )
@@ -726,7 +708,6 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         torch.cuda.device_count() <= 0,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type_qsplitscalebias=st.sampled_from(
             [

@@ -93,7 +93,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             except Exception:
                 pass
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -115,7 +114,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.assertEqual(tensor.device.type, "cpu")
             torch.testing.assert_close(tensor, output[key].cpu())
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -137,17 +135,14 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.assertTrue(self.mock_metric.predictions_update_calls is not None)
         torch.testing.assert_close(
             model_out["task1-prediction"],
-            # pyre-ignore[6]
             self.mock_metric.predictions_update_calls[0]["task1"],
         )
         self.assertTrue(self.mock_metric.labels_update_calls is not None)
         torch.testing.assert_close(
             model_out["task1-label"],
-            # pyre-ignore[6]
             self.mock_metric.labels_update_calls[0]["task1"],
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -197,7 +192,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.cpu_module.compute,
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -258,7 +252,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.assertFalse(self.cpu_module.update_thread.is_alive())
         self.assertFalse(self.cpu_module.compute_thread.is_alive())
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -356,7 +349,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.cpu_module.async_compute()
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -432,7 +424,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         )
         offloaded_module.shutdown()
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -480,7 +471,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             },
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least 2 GPUs",
@@ -527,7 +517,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         cpu_module_indexed.shutdown()
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",

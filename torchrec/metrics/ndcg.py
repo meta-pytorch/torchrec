@@ -467,7 +467,6 @@ class NDCGMetric(RecMetric):
         if "session_key" not in kwargs:
             self._required_inputs.add(SESSION_KEY)
         else:
-            # pyre-ignore[6]
             self._required_inputs.add(kwargs["session_key"])
 
     def _get_task_kwargs(

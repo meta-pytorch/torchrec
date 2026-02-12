@@ -24,7 +24,6 @@ class AwaitableInstance(Awaitable[torch.Tensor]):
 class AwaitableTests(unittest.TestCase):
     def test_callback(self) -> None:
         awaitable = AwaitableInstance()
-        # pyre-fixme[6]: For 1st argument expected `(Tensor) -> Tensor` but got
         #  `(ret: Any) -> int`.
         awaitable.callbacks.append(lambda ret: 2 * ret)
         self.assertTrue(
@@ -33,7 +32,6 @@ class AwaitableTests(unittest.TestCase):
 
     def test_callback_chained(self) -> None:
         awaitable = AwaitableInstance()
-        # pyre-fixme[6]: For 1st argument expected `(Tensor) -> Tensor` but got
         #  `(ret: Any) -> int`.
         awaitable.callbacks.append(lambda ret: 2 * ret)
         awaitable.callbacks.append(lambda ret: ret**2)

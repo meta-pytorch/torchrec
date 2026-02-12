@@ -17,17 +17,13 @@ from torch.fx._symbolic_trace import is_fx_tracing
 # def dmp_fx_trace_forward(dmp: DistributedModelParallel)
 
 
-# pyre-ignore
 def fake_range():
-    # pyre-fixme[16]: Module `_C` has no attribute `_jit_tree_views`.
     return torch._C._jit_tree_views.SourceRangeFactory("", None, 0, 0).make_raw_range(
         0, 1
     )
 
 
-# pyre-ignore
 def dmp_fx_trace_forward(  # noqa: C901
-    # pyre-ignore
     dmp,
     tracer: torch.fx.Tracer,
 ):
@@ -126,12 +122,10 @@ def dmp_fx_trace_forward(  # noqa: C901
 
 
 @torch.fx.wrap
-# pyre-ignore
 def _fx_marker(s: str, any_proxy_unused: Any) -> None:
     pass
 
 
-# pyre-ignore
 def fx_marker(s: str, any_proxy_unused: Any) -> None:
     if is_fx_tracing():
         _fx_marker(s, any_proxy_unused)

@@ -623,7 +623,6 @@ class MetricModuleTest(unittest.TestCase):
             )
         mock_time.time = MagicMock(return_value=0.0)
 
-        # pyre-fixme[53]: Captured variable `batch` is not annotated.
         def _train(metric_module: RecMetricModule) -> float:
             for _ in range(metric_module.compute_interval_steps):
                 metric_module.update(batch)
@@ -1065,7 +1064,7 @@ class MetricsConfigPostInitTest(unittest.TestCase):
         # Execute & Assert: should raise ValueError about rec_tasks being None
         with self.assertRaises(ValueError) as context:
             _ = MetricsConfig(
-                rec_tasks=None,  # pyre-ignore[6]: Intentionally passing None for testing
+                rec_tasks=None,
                 rec_metrics={
                     RecMetricEnum.AUC: RecMetricDef(rec_task_indices=[0]),
                 },

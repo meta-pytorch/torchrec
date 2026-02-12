@@ -128,7 +128,6 @@ class ShardedEmbeddingTower(
         devices_per_host = dist.get_world_size(intra_pg)
         tower_devices = set()
         for sharding in table_name_to_parameter_sharding.values():
-            # pyre-ignore [6]
             tower_devices.update(sharding.ranks)
         host = {tower_device // devices_per_host for tower_device in tower_devices}
         assert len(host) == 1, f"{tower_devices}, {table_name_to_parameter_sharding}"
@@ -175,7 +174,6 @@ class ShardedEmbeddingTower(
             )
 
         # Setup output dists for quantized comms
-        # pyre-fixme[8]: Attribute has type `ModuleList`; used as `Union[Module,
         #  Tensor]`.
         self._output_dists: nn.ModuleList = (
             self.embedding._output_dists if self.embedding else nn.ModuleList()
@@ -220,19 +218,16 @@ class ShardedEmbeddingTower(
             for node in range(node_count)
         ]
         self._cross_dist = KJTAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             self._cross_pg,
             kjt_features_per_node,
         )
         self._weighted_cross_dist = KJTAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             self._cross_pg,
             wkjt_features_per_node,
         )
 
-    # pyre-ignore[14]
     def input_dist(
         self,
         ctx: NullShardedModuleContext,
@@ -263,7 +258,6 @@ class ShardedEmbeddingTower(
 
         with torch.no_grad():
             if self._has_kjt_features_permute:
-                # pyre-ignore [16]
                 kjt_features = kjt_features.permute(
                     self._kjt_features_order,
                     self._kjt_features_order_tensor,
@@ -289,12 +283,9 @@ class ShardedEmbeddingTower(
             if len(dist_input) == 2:
                 kjt_features = dist_input[0]
                 wkjt_features = dist_input[1]
-                # pyre-ignore [29]
                 embeddings = self.embedding(kjt_features, wkjt_features)
             else:
-                # pyre-ignore [29]
                 embeddings = self.embedding(dist_input[0])
-            # pyre-ignore [29]
             output = self.interaction(embeddings)
         else:
             output = torch.empty(
@@ -331,10 +322,8 @@ class ShardedEmbeddingTower(
         )
         dim_sum_per_rank = [x.item() for x in dim_sum_per_rank]
         self._output_dist = PooledEmbeddingsAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             pg=self._cross_pg,
-            # pyre-fixme[6]: For 2nd param expected `List[int]` but got
             #  `List[Union[bool, float, int]]`.
             dim_sum_per_rank=dim_sum_per_rank,
             device=self._device,
@@ -353,10 +342,8 @@ class ShardedEmbeddingTower(
         if self._has_uninitialized_output_dist:
             self._create_output_dist(ctx, output)
             self._has_uninitialized_output_dist = False
-        # pyre-ignore [29]
         return TowerLazyAwaitable(self._output_dist(output))
 
-    # pyre-ignore [14]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -365,12 +352,9 @@ class ShardedEmbeddingTower(
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
         if self._active_device:
-            # pyre-ignore [16]
             self.embedding.state_dict(destination, prefix + "embedding.", keep_vars)
-            # pyre-ignore [16]
             self.interaction.module.state_dict(
                 destination, prefix + "interaction.", keep_vars
             )
@@ -379,7 +363,6 @@ class ShardedEmbeddingTower(
     @property
     def fused_optimizer(self) -> KeyedOptimizer:
         if self.embedding:
-            # pyre-fixme[7]: Expected `KeyedOptimizer` but got `Union[Module, Tensor]`.
             return self.embedding.fused_optimizer
         else:
             return CombinedOptimizer([])
@@ -388,11 +371,9 @@ class ShardedEmbeddingTower(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, nn.Parameter]]:
         if self._active_device:
-            # pyre-ignore[16]
             yield from self.embedding.named_parameters(
                 append_prefix(prefix, "embedding"), recurse
             )
-            # pyre-ignore[16]
             yield from self.interaction.module.named_parameters(
                 append_prefix(prefix, "interaction"), recurse
             )
@@ -403,11 +384,9 @@ class ShardedEmbeddingTower(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, torch.Tensor]]:
         if self._active_device:
-            # pyre-ignore[16]
             yield from self.embedding.named_buffers(
                 append_prefix(prefix, "embedding"), recurse
             )
-            # pyre-ignore[16]
             yield from self.interaction.module.named_buffers(
                 append_prefix(prefix, "interaction"), recurse
             )
@@ -415,11 +394,9 @@ class ShardedEmbeddingTower(
 
     def sharded_parameter_names(self, prefix: str = "") -> Iterator[str]:
         if self._active_device:
-            # pyre-ignore[16]
             yield from self.embedding.sharded_parameter_names(
                 append_prefix(prefix, "embedding")
             )
-            # pyre-ignore[16]
             for name, _ in self.interaction.module.named_parameters(
                 append_prefix(prefix, "interaction")
             ):
@@ -494,14 +471,12 @@ class ShardedEmbeddingTowerCollection(
             tables_per_pt[i].add(k)
             for i in range(self._cross_pg_world_size)
             for k, v in table_name_to_parameter_sharding.items()
-            # pyre-ignore [16]
             if v.ranks[0] // self._intra_pg_world_size == i
         ]
 
         # create mapping of logical towers to physical towers
         tables_per_lt: List[Set[str]] = []
         for tower in module.towers:
-            # pyre-fixme[6]: For 1st argument expected `EmbeddingTower` but got
             #  `Module`.
             lt_tables = set(tower_sharder.shardable_parameters(tower).keys())
             tables_per_lt.append(lt_tables)
@@ -535,7 +510,6 @@ class ShardedEmbeddingTowerCollection(
 
         for pt_index, lt_on_pt in enumerate(logical_to_physical_order):
             for lt_index in lt_on_pt:
-                # pyre-ignore [16]
                 kjt_features, wkjt_features = tower_sharder.embedding_feature_names(
                     module.towers[lt_index]
                 )
@@ -548,7 +522,6 @@ class ShardedEmbeddingTowerCollection(
             self._kjt_num_features_per_pt.append(len(kjt_names))
             self._wkjt_num_features_per_pt.append(len(wkjt_names))
 
-        # pyre-fixme[9]: local_towers has type `List[Tuple[str, EmbeddingTower]]`;
         #  used as `List[Tuple[str, Module]]`.
         local_towers: List[Tuple[str, EmbeddingTower]] = [
             (str(i), tower)
@@ -577,12 +550,10 @@ class ShardedEmbeddingTowerCollection(
                         table.name for table in tower.embedding.embedding_configs()
                     }
                 elif hasattr(tower.embedding, "tables"):
-                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                     table_names = {table.name for table in tower.embedding.tables()}
                 else:
                     # Use all tables if unable to determine from tower.embedding
                     table_names = set(table_name_to_parameter_sharding.keys())
-                # pyre-ignore [16]
                 self.embeddings[i] = tower_sharder.embedding_sharder(tower).shard(
                     tower.embedding,
                     {
@@ -607,7 +578,6 @@ class ShardedEmbeddingTowerCollection(
         # Setup output dists for quantized comms
         output_dists = nn.ModuleList()
         for embedding in self.embeddings.values():
-            # pyre-fixme[6]: For 1st argument expected `Iterable[Module]` but got
             #  `Union[Module, Tensor]`.
             output_dists.extend(embedding._output_dists)
         self._output_dists: nn.ModuleList = output_dists
@@ -641,19 +611,16 @@ class ShardedEmbeddingTowerCollection(
             )
 
         self._cross_dist = KJTAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             self._cross_pg,
             self._kjt_num_features_per_pt,
         )
         self._weighted_cross_dist = KJTAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             self._cross_pg,
             self._wkjt_num_features_per_pt,
         )
 
-    # pyre-ignore [14]
     def input_dist(
         self,
         ctx: EmbeddingTowerCollectionContext,
@@ -661,7 +628,6 @@ class ShardedEmbeddingTowerCollection(
         wkjt_features: Optional[KeyedJaggedTensor] = None,
     ) -> Awaitable[Awaitable[KJTList]]:
         if self._has_uninitialized_input_dist:
-            # pyre-ignore [16]
             stride = kjt_features.stride() if kjt_features else wkjt_features.stride()
             self._cross_pg_global_batch_size = stride * self._cross_pg_world_size
             self._create_input_dist(
@@ -671,7 +637,7 @@ class ShardedEmbeddingTowerCollection(
             self._has_uninitialized_input_dist = False
         with torch.no_grad():
             if self._has_kjt_features_permute:
-                kjt_features = kjt_features.permute(  # pyre-ignore [16]
+                kjt_features = kjt_features.permute(
                     self._kjt_features_order,
                     cast(torch.Tensor, self._kjt_features_order_tensor),
                 )
@@ -747,10 +713,8 @@ class ShardedEmbeddingTowerCollection(
         )
         dim_sum_per_rank = [x.item() for x in dim_sum_per_rank]
         self._output_dist = PooledEmbeddingsAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
             pg=self._cross_pg,
-            # pyre-ignore
             dim_sum_per_rank=dim_sum_per_rank,
             device=self._device,
             codecs=(
@@ -768,13 +732,11 @@ class ShardedEmbeddingTowerCollection(
         if self._has_uninitialized_output_dist:
             self._create_output_dist(output)
             self._has_uninitialized_output_dist = False
-        # pyre-ignore [29]
         return TowerLazyAwaitable(self._output_dist(output))
 
     def create_context(self) -> EmbeddingTowerCollectionContext:
         return EmbeddingTowerCollectionContext(embedding_contexts=[])
 
-    # pyre-ignore [14]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -783,15 +745,12 @@ class ShardedEmbeddingTowerCollection(
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
             destination._metadata = OrderedDict()
         for i, embedding in self.embeddings.items():
-            # pyre-fixme[19]: Expected 0 positional arguments.
             embedding.state_dict(
                 destination, prefix + f"towers.{i}.embedding.", keep_vars
             )
         for i, interaction in self.interactions.items():
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `state_dict`.
             interaction.module.state_dict(
                 destination, prefix + f"towers.{i}.interaction.", keep_vars
@@ -801,7 +760,6 @@ class ShardedEmbeddingTowerCollection(
     @property
     def fused_optimizer(self) -> KeyedOptimizer:
         return CombinedOptimizer(
-            # pyre-fixme[6]: For 1st argument expected `List[Union[Tuple[str,
             #  KeyedOptimizer], KeyedOptimizer]]` but got `List[Tuple[str,
             #  Union[Module, Tensor]]]`.
             [
@@ -821,7 +779,6 @@ class ShardedEmbeddingTowerCollection(
             )
         for i, interaction in self.interactions.items():
             yield from (
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `named_parameters`.
                 interaction.module.named_parameters(
                     append_prefix(prefix, f"towers.{i}.interaction"), recurse
@@ -839,7 +796,6 @@ class ShardedEmbeddingTowerCollection(
             )
         for i, interaction in self.interactions.items():
             yield from (
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `named_buffers`.
                 interaction.module.named_buffers(
                     append_prefix(prefix, f"towers.{i}.interaction"), recurse
@@ -849,7 +805,6 @@ class ShardedEmbeddingTowerCollection(
     def sharded_parameter_names(self, prefix: str = "") -> Iterator[str]:
         for i, embedding in self.embeddings.items():
             yield from (
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 embedding.sharded_parameter_names(
                     append_prefix(prefix, f"towers.{i}.embedding")
                 )
@@ -857,7 +812,6 @@ class ShardedEmbeddingTowerCollection(
         for i, interaction in self.interactions.items():
             yield from (
                 key
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `named_parameters`.
                 for key, _ in interaction.module.named_parameters(
                     append_prefix(prefix, f"towers.{i}.interaction")
@@ -920,12 +874,10 @@ class EmbeddingTowerSharder(BaseEmbeddingSharder[EmbeddingTower]):
     ) -> BaseEmbeddingSharder[nn.Module]:
         embedding: nn.Module = module.embedding
         if isinstance(embedding, EmbeddingBagCollection):
-            # pyre-ignore [7]
             return EmbeddingBagCollectionSharder(
                 self.fused_params, qcomm_codecs_registry=self.qcomm_codecs_registry
             )
         elif isinstance(embedding, EmbeddingCollection):
-            # pyre-ignore [7]
             return EmbeddingCollectionSharder(
                 self.fused_params, qcomm_codecs_registry=self.qcomm_codecs_registry
             )
@@ -1012,7 +964,6 @@ class EmbeddingTowerCollectionSharder(BaseEmbeddingSharder[EmbeddingTowerCollect
 
         named_parameters: Dict[str, nn.Parameter] = {}
         for tower in module.towers:
-            # pyre-fixme[6]: For 1st argument expected `EmbeddingTower` but got
             #  `Module`.
             named_parameters.update(self._tower_sharder.shardable_parameters(tower))
         return named_parameters

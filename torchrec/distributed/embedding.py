@@ -130,7 +130,6 @@ def get_device_from_parameter_sharding(
         raise ValueError("Expected EnumerableShardingSpec as input to the function")
 
     device_type_list: Tuple[str, ...] = tuple(
-        # pyre-fixme[16]: `Optional` has no attribute `device`
         [shard.placement.device().type for shard in ps.sharding_spec.shards]
     )
     if len(set(device_type_list)) == 1:
@@ -322,7 +321,6 @@ class EmbeddingCollectionContext(Multistreamable):
         for ctx in self.sharding_contexts:
             ctx.record_stream(stream)
         for f in self.input_features:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             f.record_stream(stream)
         for r in self.reverse_indices:
             r.record_stream(stream)
@@ -402,7 +400,6 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
 
         # free memory and resize
         if self._resize_awaitables:
-            # pyre-ignore[16]
             for awaitable in self._resize_awaitables:
                 awaitable.wait()
 
@@ -902,11 +899,9 @@ class ShardedEmbeddingCollection(
                         ]
                         local_shards_wrapper = v._local_tensor
                         shards_wrapper["local_tensors"].extend(
-                            # pyre-ignore[16]
                             local_shards_wrapper.local_shards()
                         )
                         shards_wrapper["local_offsets"].extend(
-                            # pyre-ignore[16]
                             local_shards_wrapper.local_offsets()
                         )
                         shards_wrapper["global_size"] = v.size()
@@ -921,7 +916,6 @@ class ShardedEmbeddingCollection(
             for (
                 table_name,
                 tbe_slice,
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
                 #  `named_parameters_by_table`.
             ) in lookup.named_parameters_by_table():
                 # for virtual table, currently we don't expose id tensor and bucket tensor
@@ -942,9 +936,7 @@ class ShardedEmbeddingCollection(
                     _model_parallel_name_to_compute_kernel[table_name]
                     != EmbeddingComputeKernel.DENSE.value
                 ):
-                    # pyre-fixme[16]: `Module` has no attribute
                     #  `_in_backward_optimizers`.
-                    # pyre-fixme[16]: `Tensor` has no attribute
                     #  `_in_backward_optimizers`.
                     self.embeddings[table_name].weight._in_backward_optimizers = [
                         EmptyFusedOptimizer()
@@ -1084,9 +1076,7 @@ class ShardedEmbeddingCollection(
                         weight_ids_sharded_t,
                         id_cnt_per_bucket_sharded_t,
                         metadata_sharded_t,
-                    ) in (
-                        lookup.get_named_split_embedding_weights_snapshot()  # pyre-ignore
-                    ):
+                    ) in lookup.get_named_split_embedding_weights_snapshot():
                         assert table_name in sharded_kvtensors_copy
                         if self._table_name_to_config[table_name].use_virtual_table:
                             assert isinstance(weights_t, ShardedTensor)
@@ -1113,7 +1103,6 @@ class ShardedEmbeddingCollection(
                             )
                             # The logic here assumes there is only one shard per table on any particular rank
                             # if there are cases each rank has >1 shards, we need to update here accordingly
-                            # pyre-ignore
                             sharded_kvtensors_copy[table_name].local_shards()[
                                 0
                             ].tensor = weights_t
@@ -1188,14 +1177,12 @@ class ShardedEmbeddingCollection(
                 continue
             assert table_config.init_fn is not None
             param = self.embeddings[f"{table_config.name}"].weight
-            # pyre-ignore
             table_config.init_fn(param)
 
             sharding_type = self.module_sharding_plan[table_config.name].sharding_type
             if sharding_type == ShardingType.DATA_PARALLEL.value:
                 pg = self._env.process_group
                 with torch.no_grad():
-                    # pyre-fixme[6]: For 1st argument expected `Tensor` but got
                     #  `TypeUnion[Module, Tensor]`.
                     dist.broadcast(param.data, src=0, group=pg)
 
@@ -1438,7 +1425,6 @@ class ShardedEmbeddingCollection(
         if self._features_order:
             unpadded_features = unpadded_features.permute(
                 self._features_order,
-                # pyre-fixme[6]: For 2nd argument expected `Optional[Tensor]` but
                 #  got `TypeUnion[Module, Tensor]`.
                 self._features_order_tensor,
             )
@@ -1481,7 +1467,6 @@ class ShardedEmbeddingCollection(
                 )
             )
 
-    # pyre-ignore [14]
     def input_dist(
         self,
         ctx: EmbeddingCollectionContext,
@@ -1489,11 +1474,11 @@ class ShardedEmbeddingCollection(
     ) -> Awaitable[Awaitable[KJTList]]:
         need_permute: bool = True
         if isinstance(features, TensorDict):
-            feature_keys = list(features.keys())  # pyre-ignore[6]
+            feature_keys = list(features.keys())
             if self._features_order:
                 feature_keys = [feature_keys[i] for i in self._features_order]
                 need_permute = False
-            features = maybe_td_to_kjt(features, feature_keys)  # pyre-ignore[6]
+            features = maybe_td_to_kjt(features, feature_keys)
         if self._has_uninitialized_input_dist:
             self._create_input_dist(input_feature_names=features.keys(), ctx=ctx)
             self._has_uninitialized_input_dist = False
@@ -1506,7 +1491,6 @@ class ShardedEmbeddingCollection(
             if need_permute and self._features_order:
                 features = features.permute(
                     self._features_order,
-                    # pyre-fixme[6]: For 2nd argument expected `Optional[Tensor]`
                     #  but got `TypeUnion[Module, Tensor]`.
                     self._features_order_tensor,
                 )
@@ -1577,7 +1561,6 @@ class ShardedEmbeddingCollection(
         ):
             awaitables_per_sharding.append(odist(embeddings, sharding_ctx))
             features_before_all2all_per_sharding.append(
-                # pyre-fixme[6]: For 1st argument expected `KeyedJaggedTensor` but
                 #  got `Optional[KeyedJaggedTensor]`.
                 sharding_ctx.features_before_input_dist
             )
@@ -1615,7 +1598,6 @@ class ShardedEmbeddingCollection(
             ):
                 embs = lookup(features)
                 if hasattr(lookup, "get_resize_awaitables"):
-                    # pyre-ignore[29]
                     resize_awaitables.extend(lookup.get_resize_awaitables())
                 if self.post_lookup_tracker_fn is not None:
                     self.post_lookup_tracker_fn(features, embs, self, None)
@@ -1630,7 +1612,6 @@ class ShardedEmbeddingCollection(
                     self.post_odist_tracker_fn()
 
             features_before_all2all_per_sharding.append(
-                # pyre-fixme[6]: For 1st argument expected `KeyedJaggedTensor` but
                 #  got `Optional[KeyedJaggedTensor]`.
                 sharding_ctx.features_before_input_dist
             )
@@ -1676,7 +1657,6 @@ class ShardedEmbeddingCollection(
                 self._write_dists.append(sharding.create_write_dist())
                 self._write_splits.append(sharding._get_num_writable_features())
 
-    # pyre-ignore [14]
     def write_dist(
         self, ctx: EmbeddingCollectionContext, embeddings: KeyedJaggedTensor
     ) -> Awaitable[Awaitable[KJTList]]:

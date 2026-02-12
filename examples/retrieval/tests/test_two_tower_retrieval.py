@@ -18,7 +18,6 @@ from ..two_tower_retrieval import infer
 
 class InferTest(unittest.TestCase):
     @skip_if_asan
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

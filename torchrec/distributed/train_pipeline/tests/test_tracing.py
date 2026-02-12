@@ -122,26 +122,21 @@ class DummyShardedModule(
         super().__init__()
         self.alpha = alpha
 
-    # pyre-ignore
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.alpha * x
 
-    # pyre-ignore
     def compute(self) -> torch.Tensor:
         return torch.empty(0)
 
     def create_context(self) -> NullShardedModuleContext:
         return NullShardedModuleContext()
 
-    # pyre-ignore
     def input_dist(self, ctx: NullShardedModuleContext):
         pass
 
-    # pyre-ignore
     def output_dist(self):
         pass
 
-    # pyre-ignore
     def unsharded_module_type(self):
         pass
 

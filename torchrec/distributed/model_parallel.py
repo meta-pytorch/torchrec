@@ -145,12 +145,10 @@ class DefaultDataParallelWrapper(DataParallelWrapper):
             ),
         )
         if self._allreduce_comm_precision == "fp16":
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             dmp._dmp_wrapped_module.register_comm_hook(
                 None, ddp_default_hooks.fp16_compress_hook
             )
         elif self._allreduce_comm_precision == "bf16":
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             dmp._dmp_wrapped_module.register_comm_hook(
                 None, ddp_default_hooks.bf16_compress_hook
             )
@@ -336,7 +334,6 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         else:
             self._dmp_wrapped_module = value
 
-    # pyre-ignore [2, 3]
     def forward(self, *args, **kwargs) -> Any:
         for tracker in self.model_trackers.values():
             # The step() call advances the internal batch counter so that subsequent ID tracking and delta
@@ -420,7 +417,6 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             module_id_cache: Dict[int, KeyedOptimizer] = {}
         else:
             module_id_cache = None
-        # pyre-ignore [6]
         return CombinedOptimizer(
             self._fused_optim_impl(module, [], module_id_cache=module_id_cache)
         )
@@ -526,7 +522,6 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
 
             # Init parameters if at least one parameter is over 'meta' device.
             if has_meta_param and hasattr(module, "reset_parameters"):
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 module.reset_parameters()
 
         module.apply(init_parameters)
@@ -577,7 +572,6 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
                 )
         return destination
 
-    # pyre-ignore [14]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -593,7 +587,6 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         add_prefix_to_state_dict(state_dict, prefix)
         return state_dict
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
     def load_state_dict(
         self,
@@ -844,7 +837,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         ), "Could not find sharded_module to reshard"
         data_volume, delta_plan = changed_shard_to_params[sharded_module_fqn]
 
-        sharded_module = sharder.reshard(  # pyre-ignore
+        sharded_module = sharder.reshard(
             sharded_module,
             delta_plan,
             self._env,
@@ -853,7 +846,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
 
         # Need to use .module to maintain FQN consistency
         self._optim: CombinedOptimizer = self._init_optim(
-            self._dmp_wrapped_module.module  # pyre-ignore
+            self._dmp_wrapped_module.module
         )
         self._plan.plan[sharded_module_fqn] = sharded_module.module_sharding_plan
         return data_volume
@@ -988,7 +981,7 @@ class DMPCollection(DistributedModelParallel):
         # Create the default context for modules without submodule configs
         self._default_ctx: DMPCollectionContext = DMPCollectionContext(
             # default context has module type None
-            module=None,  # pyre-ignore[6]
+            module=None,
             plan=plan,
             sharding_group_size=sharding_group_size,
             node_group_size=node_group_size,
@@ -1040,7 +1033,6 @@ class DMPCollection(DistributedModelParallel):
             )
 
             if ctx.module:
-                # pyre-ignore[16]
                 ctx.sharded_module = self._sharder_map[ctx.module].sharded_module_type
 
         consolidated_plan = self._default_ctx.plan
@@ -1392,7 +1384,6 @@ class DMPCollection(DistributedModelParallel):
         """
         group_start = rank % step
         for key in plan.plan:
-            # pyre-ignore[16]
             for _, param_sharding in plan.plan[key].items():
                 new_ranks = []
                 if use_inter_host_allreduce:
@@ -1434,12 +1425,9 @@ class DMPCollection(DistributedModelParallel):
         """
         # Process submodule-specific contexts first (contexts[1:])
         for context in contexts[1:]:
-            context.modules_to_sync = self._group_sharded_module(
-                context.sharded_module  # pyre-ignore[6]
-            )
+            context.modules_to_sync = self._group_sharded_module(context.sharded_module)
 
         # Group leftover embedding kernels, with respect to default context
-        # pyre-ignore[9]
         modules_to_skip: List[nn.Module] = [c.sharded_module for c in contexts[1:]]
         sharded_modules: List[Tuple[nn.Module, nn.Module]] = []
 
@@ -1449,16 +1437,15 @@ class DMPCollection(DistributedModelParallel):
         ) -> None:
             if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
                 sharded_modules.append((module, prev_module))
-            if not isinstance(
-                module, tuple(modules_to_skip)  # pyre-ignore[6]
-            ) and hasattr(module, "_lookups"):
-                for lookup in module._lookups:  # pyre-ignore[29]
+            if not isinstance(module, tuple(modules_to_skip)) and hasattr(
+                module, "_lookups"
+            ):
+                for lookup in module._lookups:
                     _find_sharded_modules(lookup, module)
 
             for _, child in module.named_children():
                 _find_sharded_modules(child, module)
 
-        # pyre-ignore[6]
         _find_sharded_modules(self._dmp_wrapped_module, None)
         contexts[0].modules_to_sync = sharded_modules
 
@@ -1476,8 +1463,8 @@ class DMPCollection(DistributedModelParallel):
         ) -> None:
             if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
                 sharded_modules.append((module, prev_module))
-            if isinstance(module, sharded_module):  # pyre-ignore[6]
-                for lookup in module._lookups:  # pyre-ignore[29]
+            if isinstance(module, sharded_module):
+                for lookup in module._lookups:
                     _find_sharded_modules(lookup, module)
 
             for _, child in module.named_children():
@@ -1503,7 +1490,7 @@ class DMPCollection(DistributedModelParallel):
                 list
             )
             for emb_kernel, _ in context.modules_to_sync:
-                for w in emb_kernel.split_embedding_weights():  # pyre-ignore[29]
+                for w in emb_kernel.split_embedding_weights():
                     weights_by_dtype[w.dtype].append(w)
 
                 for state in emb_kernel.get_optimizer_state():

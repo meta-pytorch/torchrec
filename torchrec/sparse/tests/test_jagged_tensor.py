@@ -255,7 +255,6 @@ class TestJaggedTensor(unittest.TestCase):
             torch.equal(j1.weights(), torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]))
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -621,7 +620,6 @@ class TestJaggedTensor(unittest.TestCase):
         self.assertTrue(torch.equal(j.values(), j2.values()))
         self.assertTrue(torch.equal(j.weights(), j2.weights()))
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1054,7 +1052,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertEqual(empty_jt.lengths().numel(), 0)
         self.assertIsNone(empty_jt.weights_or_none())
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1087,7 +1084,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertEqual(empty_jt.weights().size(), jt.weights().size())
         self.assertEqual(empty_jt.lengths().size(), jt.lengths().size())
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1128,7 +1124,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertTrue(result_jt.weights().is_cuda)
         self.assertTrue(result_jt.lengths().is_cuda)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1162,7 +1157,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertTrue(result_jt.values().is_cuda)
         self.assertTrue(result_jt.lengths().is_cuda)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1195,7 +1189,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertTrue(result_jt.values().is_cuda)
         self.assertTrue(result_jt.offsets().is_cuda)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
