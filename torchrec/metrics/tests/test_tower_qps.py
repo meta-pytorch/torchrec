@@ -9,9 +9,9 @@
 
 
 import unittest
-from functools import partial, update_wrapper
-from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Type, Union
 from collections import OrderedDict
+from functools import partial, update_wrapper
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 from unittest.mock import Mock, patch
 
 import torch
