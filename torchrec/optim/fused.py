@@ -21,6 +21,7 @@ class FusedOptimizer(KeyedOptimizer, abc.ABC):
     """
 
     @abc.abstractmethod
+    # pyrefly: ignore[bad-override]
     def step(self, closure: Any = None) -> None: ...
 
     @abc.abstractmethod

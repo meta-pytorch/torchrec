@@ -1799,9 +1799,11 @@ def _test_embedding_mode(
             assert isinstance(dt, ModelDeltaTrackerTrec)
 
             orig_emb1 = (
+                # pyrefly: ignore[missing-attribute]
                 dt_model._dmp_wrapped_module.module.ec.embeddings.sparse_table_1.weight.detach().clone()
             )
             orig_emb2 = (
+                # pyrefly: ignore[missing-attribute]
                 dt_model._dmp_wrapped_module.module.ec.embeddings.sparse_table_2.weight.detach().clone()
             )
 
@@ -1841,6 +1843,7 @@ def _test_embedding_mode(
                     )
                     unittest.TestCase().assertTrue(
                         delta_rows[table_fqns_list[1]].states is not None
+                        # pyrefly: ignore[missing-attribute]
                         and delta_rows[table_fqns_list[1]].states.numel() == 0,
                     )
                 elif rank == 1:
@@ -1862,6 +1865,7 @@ def _test_embedding_mode(
                     )
                     unittest.TestCase().assertTrue(
                         delta_rows[table_fqns_list[0]].states is not None
+                        # pyrefly: ignore[missing-attribute]
                         and delta_rows[table_fqns_list[0]].states.numel() == 0,
                     )
 
@@ -1919,9 +1923,11 @@ def _test_multiple_get(
             if test_params.embedding_config_type == EmbeddingConfig:
                 # Embedding mode is only supported for EmbeddingCollection
                 expected_emb1 = (
+                    # pyrefly: ignore[missing-attribute]
                     dt_model._dmp_wrapped_module.module.ec.embeddings.sparse_table_1.weight.detach().clone()
                 )
                 expected_emb2 = (
+                    # pyrefly: ignore[missing-attribute]
                     dt_model._dmp_wrapped_module.module.ec.embeddings.sparse_table_2.weight.detach().clone()
                 )
 
@@ -2096,12 +2102,14 @@ def _test_duplication_with_rowwise_adagrad(
         tbe: SplitTableBatchedEmbeddingBagsCodegen = (
             (
                 #  attribute `ec`.
+                # pyrefly: ignore[missing-attribute]
                 dt_model._dmp_wrapped_module.module.ec._lookups[0]
                 ._emb_modules[0]
                 .emb_module
             )
             if test_params.embedding_config_type == EmbeddingConfig
             else (
+                # pyrefly: ignore[missing-attribute]
                 dt_model._dmp_wrapped_module.module.ebc._lookups[0]
                 ._emb_modules[0]
                 .emb_module

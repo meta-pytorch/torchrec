@@ -197,6 +197,7 @@ def run_debug_model(
             debug_mode=True,
         )
         model = DLRM_DCN(
+            # pyrefly: ignore[bad-argument-type]
             embedding_bag_collection=ebc,
             dense_in_features=100,
             dense_arch_layer_sizes=[20, D],
@@ -258,6 +259,7 @@ def run_embedding_collection(
             local_size=local_size,
             world_size=world_size,
             device_type=ctx.device.type,
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
         )
 
@@ -268,6 +270,7 @@ def run_embedding_collection(
             model,
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ec": sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=ctx.device,
         )
@@ -280,6 +283,7 @@ def run_embedding_collection(
 
         # compute a scalar loss upon which we can call backward()
         loss = sum(torch.sum(jt.values()) for jt in out.values())
+        # pyrefly: ignore[missing-attribute]
         loss.backward()
 
         torch.cuda.synchronize()
@@ -294,6 +298,7 @@ def run_embedding_collection(
             debug_model,
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ec": sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=ctx.device,
         )
@@ -322,6 +327,7 @@ def run_embedding_collection(
             with tc.assertRaisesRegex(
                 RuntimeError, "Function 'SplitWithSizesBackward0' returned nan values"
             ):
+                # pyrefly: ignore[missing-attribute]
                 debug_loss.backward()
 
         torch.cuda.synchronize()
@@ -333,6 +339,7 @@ def run_embedding_collection(
             debug_model,
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ec": sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=ctx.device,
         )
@@ -355,6 +362,7 @@ def run_embedding_collection(
         with tc.assertRaisesRegex(
             RuntimeError, "NaN/Inf detected in gradient entering"
         ):
+            # pyrefly: ignore[missing-attribute]
             debug_loss.backward()
 
         torch.cuda.synchronize()
@@ -387,6 +395,7 @@ def run_embedding_bag_collection(
             local_size=local_size,
             world_size=world_size,
             device_type=ctx.device.type,
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
         )
 
@@ -397,6 +406,7 @@ def run_embedding_bag_collection(
             model,
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ec": sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=ctx.device,
         )
@@ -407,6 +417,7 @@ def run_embedding_bag_collection(
 
         # compute a scalar loss upon which we can call backward()
         loss = sum(torch.sum(v) for v in out.values())
+        # pyrefly: ignore[missing-attribute]
         loss.backward()
 
         torch.cuda.synchronize()
@@ -421,6 +432,7 @@ def run_embedding_bag_collection(
             debug_model,
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ebc": sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=ctx.device,
         )
@@ -445,6 +457,7 @@ def run_embedding_bag_collection(
             with tc.assertRaisesRegex(
                 RuntimeError, "Function 'UnbindBackward0' returned nan values in"
             ):
+                # pyrefly: ignore[missing-attribute]
                 debug_loss.backward()
 
         torch.cuda.synchronize()
@@ -456,6 +469,7 @@ def run_embedding_bag_collection(
             debug_model,
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ebc": sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=ctx.device,
         )
@@ -474,6 +488,7 @@ def run_embedding_bag_collection(
         with tc.assertRaisesRegex(
             RuntimeError, "NaN/Inf detected in gradient entering"
         ):
+            # pyrefly: ignore[missing-attribute]
             debug_loss.backward()
 
         torch.cuda.synchronize()

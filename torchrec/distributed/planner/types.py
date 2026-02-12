@@ -646,6 +646,7 @@ class ShardingOption:
     def total_perf(self) -> float:
         perf: float = 0
         for shard in self.shards:
+            # pyrefly: ignore[missing-attribute]
             perf += shard.perf.total
         return perf
 
@@ -1131,7 +1132,9 @@ def hash_planner_context_inputs(
     storage_reservation_policy = type(storage_reservation).__name__
 
     assert (
-        storage_reservation._last_reserved_topology is not None
+        # pyrefly: ignore[missing-attribute]
+        storage_reservation._last_reserved_topology
+        is not None
     ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
 
     # Round device memory to 1% to avoid hash mismatches due to minor driver version differences which does not impact the behavior of planner
@@ -1199,7 +1202,9 @@ def hash_planner_context_inputs_str(
     storage_reservation_policy = type(storage_reservation).__name__
 
     assert (
-        storage_reservation._last_reserved_topology is not None
+        # pyrefly: ignore[missing-attribute]
+        storage_reservation._last_reserved_topology
+        is not None
     ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
 
     hashable_list = [

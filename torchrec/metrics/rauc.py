@@ -418,6 +418,7 @@ class RAUCMetricComputation(RecMetricComputation):
 
 
 class RAUCMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.RAUC
     _computation_class: Type[RecMetricComputation] = RAUCMetricComputation
 

@@ -39,6 +39,7 @@ from torchrec.distributed.types import ModuleSharder, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class RWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.ROW_WISE.value]
@@ -49,6 +50,7 @@ class RWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_WISE.value]
@@ -59,6 +61,7 @@ class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class TWRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_ROW_WISE.value]
@@ -69,6 +72,7 @@ class TWRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class TWCWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_COLUMN_WISE.value]
@@ -79,6 +83,7 @@ class TWCWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class HostLevelSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_ROW_WISE.value, ShardingType.TABLE_COLUMN_WISE.value]
@@ -125,7 +130,9 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
 
     def test_tw_balanced_perf_device(self) -> None:
         sharding_options = self.enumerator.enumerate(
-            module=self.model, sharders=[TWSharder()]
+            module=self.model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[TWSharder()],
         )
 
         for sharding_option in sharding_options:
@@ -252,7 +259,9 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
 
     def test_tw_unbalanced_perf_device(self) -> None:
         sharding_options = self.enumerator.enumerate(
-            module=self.model, sharders=[TWSharder()]
+            module=self.model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[TWSharder()],
         )
 
         for i, sharding_option in enumerate(sharding_options):
@@ -321,7 +330,9 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
         )
         self.partitioner = GreedyPerfPartitioner()
         sharding_options = self.enumerator.enumerate(
-            module=self.model, sharders=[TWRWSharder()]
+            module=self.model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[TWRWSharder()],
         )
         for sharding_option in sharding_options:
             for shard in sharding_option.shards:
@@ -384,7 +395,9 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
         )
         self.partitioner = GreedyPerfPartitioner()
         sharding_options = self.enumerator.enumerate(
-            module=self.model, sharders=[RWSharder()]
+            module=self.model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[RWSharder()],
         )
         for sharding_option in sharding_options:
             for shard in sharding_option.shards:
@@ -447,6 +460,7 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
         self.partitioner = GreedyPerfPartitioner()
         sharding_options = self.enumerator.enumerate(
             module=self.model,
+            # pyrefly: ignore[bad-argument-type]
             sharders=[TWCWSharder()],
         )
         for sharding_option in sharding_options:
@@ -512,6 +526,7 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
         self.partitioner = GreedyPerfPartitioner()
         sharding_options = self.enumerator.enumerate(
             module=self.model,
+            # pyrefly: ignore[bad-argument-type]
             sharders=[HostLevelSharder()],
         )
 
@@ -578,6 +593,7 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
         self.partitioner = GreedyPerfPartitioner()
         sharding_options = self.enumerator.enumerate(
             module=self.model,
+            # pyrefly: ignore[bad-argument-type]
             sharders=[HostLevelSharder()],
         )
 
@@ -666,6 +682,7 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
         self.partitioner = GreedyPerfPartitioner()
         sharding_options = self.enumerator.enumerate(
             module=self.model,
+            # pyrefly: ignore[bad-argument-type]
             sharders=[HostLevelSharder()],
         )
 
@@ -675,7 +692,9 @@ class TestGreedyPerfPartitioner(unittest.TestCase):
                     fwd_compute=25, fwd_comms=25, bwd_compute=25, bwd_comms=25
                 )
                 shard.storage = Storage(
+                    # pyrefly: ignore[bad-argument-type]
                     hbm=self.topology.devices[0].storage.hbm / 2,
+                    # pyrefly: ignore[bad-argument-type]
                     ddr=self.topology.devices[0].storage.ddr / 2,
                 )
             sharding_option.partition_by = PartitionByType.HOST.value
@@ -716,7 +735,9 @@ class TestMemoryBalancedPartitioner(unittest.TestCase):
 
     def test_same_sharding_plan(self) -> None:
         sharding_options = self.enumerator.enumerate(
-            module=self.model, sharders=[TWSharder()]
+            module=self.model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[TWSharder()],
         )
 
         for sharding_option in sharding_options:
@@ -749,7 +770,9 @@ class TestMemoryBalancedPartitioner(unittest.TestCase):
 
     def test_different_sharding_plan(self) -> None:
         sharding_options = self.enumerator.enumerate(
-            module=self.model, sharders=[TWSharder()]
+            module=self.model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[TWSharder()],
         )
 
         for i, sharding_option in enumerate(sharding_options):
@@ -843,7 +866,9 @@ class TestBalanceModules(unittest.TestCase):
         )
 
         self.sharding_options = self.enumerator.enumerate(
-            module=self.model, sharders=[TWSharder()]
+            module=self.model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[TWSharder()],
         )
         for sharding_option in self.sharding_options:
             sharding_option.shards[0].perf = Perf(

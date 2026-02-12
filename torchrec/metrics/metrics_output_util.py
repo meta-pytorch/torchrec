@@ -43,6 +43,7 @@ def update_metrics_output(
         Updated metrics_output
     """
 
+    # pyrefly: ignore[implicit-import]
     if isinstance(metrics_output, concurrent.futures.Future):
 
         def _update_callback(future: PublishableMetricsFuture) -> None:
@@ -81,6 +82,7 @@ def get_metrics_async(
     """
 
     # Asynchronous path
+    # pyrefly: ignore[implicit-import]
     if isinstance(metrics_output, concurrent.futures.Future):
 
         def on_complete(future: PublishableMetricsFuture) -> None:
@@ -124,6 +126,7 @@ def get_metrics_sync(
         >>> metrics_result = get_metrics_sync(metrics_output) # wait until metrics are ready
         >>> publish_metrics(metrics_result)
     """
+    # pyrefly: ignore[implicit-import]
     if isinstance(metrics_output, concurrent.futures.Future):
         return metrics_output.result()
     else:

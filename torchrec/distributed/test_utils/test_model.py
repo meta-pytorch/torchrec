@@ -205,11 +205,13 @@ class ModelInput(Pipelineable):
                     indices = ModelInput._generate_power_law_indices(
                         alpha=power_law_alpha,
                         num_indices=num_indices,
+                        # pyrefly: ignore[bad-argument-type]
                         num_embeddings=ind_range,
                         dtype=indices_dtype,
                         device=device,
                     )
                 else:
+                    # pyrefly: ignore[no-matching-overload]
                     indices = torch.randint(
                         0,
                         ind_range,
@@ -323,6 +325,7 @@ class ModelInput(Pipelineable):
                     idlist_features, global_idlist_indices, global_idlist_lengths
                 )
             }
+            # pyrefly: ignore[bad-specialization]
             global_idlist_input = TensorDict(source=dict_of_nt)
 
             assert (
@@ -434,6 +437,7 @@ class ModelInput(Pipelineable):
                         local_idlist_lengths,
                     )
                 }
+                # pyrefly: ignore[bad-specialization]
                 local_idlist_input = TensorDict(source=dict_of_nt)
                 assert (
                     len(idscore_features) == 0
@@ -941,8 +945,10 @@ class ModelInput(Pipelineable):
     def record_stream(self, stream: torch.Stream) -> None:
         self.float_features.record_stream(stream)
         if isinstance(self.idlist_features, KeyedJaggedTensor):
+            # pyrefly: ignore[bad-argument-type]
             self.idlist_features.record_stream(stream)
         if isinstance(self.idscore_features, KeyedJaggedTensor):
+            # pyrefly: ignore[bad-argument-type]
             self.idscore_features.record_stream(stream)
         self.label.record_stream(stream)
 
@@ -1696,6 +1702,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
         )
         if zch_kwargs is not None:
             self.sparse: nn.Module = TestEBCSparseArchZCH(
+                # pyrefly: ignore[bad-argument-type]
                 tables,
                 weighted_tables,
                 torch.device("meta"),
@@ -1704,12 +1711,14 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
             )
         elif len(tables) > 0 and isinstance(tables[0], EmbeddingConfig):
             self.sparse = TestECSparseArch(
+                # pyrefly: ignore[bad-argument-type]
                 tables,
                 sparse_device,
                 **(submodule_kwargs or {}),
             )
         else:
             self.sparse = TestEBCSparseArch(
+                # pyrefly: ignore[bad-argument-type]
                 tables,
                 weighted_tables,
                 sparse_device,
@@ -1729,6 +1738,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
             feature for table in weighted_tables for feature in table.feature_names
         ]
         self.over: nn.Module = over_arch_clazz(
+            # pyrefly: ignore[bad-argument-type]
             tables,
             weighted_tables,
             embedding_names,
@@ -1753,6 +1763,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         dense_r = self.dense(input.float_features)
         over_r = self.over(dense_r, sparse_output)
+        # pyrefly: ignore[unsupported-operation]
         pred = torch.sigmoid(torch.mean(over_r, dim=1)) + self.dummy_ones
         if self.training:
             return (
@@ -1878,18 +1889,24 @@ class TestTowerSparseNN(TestSparseNNBase):
         )
         self.sparse_arch = TestEBCSparseArch(
             [tables[1]],
+            # pyrefly: ignore[unsupported-operation]
             [weighted_tables[0]],
             sparse_device,
         )
         self.sparse_arch_feature_names: List[str] = (
-            tables[1].feature_names + weighted_tables[0].feature_names
+            tables[1].feature_names
+            # pyrefly: ignore[unsupported-operation]
+            + weighted_tables[0].feature_names
         )
 
         self.over = nn.Linear(
             in_features=8
+            # pyrefly: ignore[missing-attribute]
             + self.tower_0.interaction.linear.out_features
+            # pyrefly: ignore[missing-attribute]
             + self.tower_1.interaction.linear.out_features
             + tables[1].embedding_dim * len(tables[1].feature_names)
+            # pyrefly: ignore[unsupported-operation]
             + weighted_tables[0].embedding_dim * len(weighted_tables[0].feature_names),
             out_features=16,
             device=dense_device,
@@ -1970,16 +1987,21 @@ class TestTowerCollectionSparseNN(TestSparseNNBase):
         )
         tower_2 = EmbeddingTower(
             embedding_module=EmbeddingBagCollection(
+                # pyrefly: ignore[unsupported-operation]
                 tables=[weighted_tables[0]],
                 is_weighted=True,
             ),
+            # pyrefly: ignore[unsupported-operation]
             interaction_module=TestTowerInteraction(tables=[weighted_tables[0]]),
         )
         self.tower_arch = EmbeddingTowerCollection(towers=[tower_0, tower_1, tower_2])
         self.over = nn.Linear(
             in_features=8
+            # pyrefly: ignore[missing-attribute]
             + tower_0.interaction.linear.out_features
+            # pyrefly: ignore[missing-attribute]
             + tower_1.interaction.linear.out_features
+            # pyrefly: ignore[missing-attribute]
             + tower_2.interaction.linear.out_features,
             out_features=16,
             device=dense_device,
@@ -2130,8 +2152,11 @@ class TestModelWithPreproc(nn.Module):
         elif self._run_postproc_inline:
             idlist_features = modified_input.idlist_features
             modified_input.idlist_features = KeyedJaggedTensor.from_lengths_sync(
+                # pyrefly: ignore[bad-argument-type]
                 idlist_features.keys(),
+                # pyrefly: ignore[bad-argument-type]
                 idlist_features.values(),
+                # pyrefly: ignore[missing-attribute]
                 idlist_features.lengths(),
             )
 
@@ -2301,6 +2326,7 @@ class TestNegSamplingModule(torch.nn.Module):
         if self._extra_input.idscore_features is not None:
             # stride will be smae but features will be joined
             modified_input.idscore_features = KeyedJaggedTensor.concat(
+                # pyrefly: ignore[bad-argument-type]
                 [modified_input.idscore_features, self._extra_input.idscore_features]
             )
 
@@ -2413,6 +2439,7 @@ class TestEBCSparseArchZCH(nn.Module):
                     disable_fallback=mc_config.disable_fallback,
                 )
             elif mc_type == "sort-zch":
+                # pyrefly: ignore[unsupported-operation]
                 mc_modules[table.name] = MCHManagedCollisionModule(
                     zch_size=table.num_embeddings,
                     input_hash_size=mc_config.input_hash_size,
@@ -2496,6 +2523,7 @@ class TestEBCSparseArchZCH(nn.Module):
             KeyedTensor
         """
         ebc, _ = self.ebc(features)
+        # pyrefly: ignore[not-iterable]
         w_ebc, _ = (
             self.weighted_ebc(weighted_features)
             if self.weighted_ebc is not None and weighted_features is not None
@@ -2653,6 +2681,7 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         dense_r = self.dense(input.float_features)
         over_r = self.over(dense_r, sparse_output)
+        # pyrefly: ignore[unsupported-operation]
         pred = torch.sigmoid(torch.mean(over_r, dim=1)) + self.dummy_ones
         if self.training:
             return (

@@ -62,6 +62,7 @@ class BaseManagedCollisionEmbeddingCollection(nn.Module):
         if isinstance(embedding_module, EmbeddingBagCollection):
             assert (
                 #  list[EmbeddingBagConfig], Module, Tensor]` is not a function.
+                # pyrefly: ignore[not-callable]
                 self._embedding_module.embedding_bag_configs()
                 == self._managed_collision_collection.embedding_configs()
             ), "Embedding Bag Collection and Managed Collision Collection must contain the Embedding Configs"
@@ -69,6 +70,7 @@ class BaseManagedCollisionEmbeddingCollection(nn.Module):
         else:
             assert (
                 #  list[EmbeddingConfig], Module, Tensor]` is not a function.
+                # pyrefly: ignore[not-callable]
                 self._embedding_module.embedding_configs()
                 == self._managed_collision_collection.embedding_configs()
             ), "Embedding Collection and Managed Collision Collection must contain the Embedding Configs"

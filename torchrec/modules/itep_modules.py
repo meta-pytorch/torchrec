@@ -158,6 +158,7 @@ class GenericITEPModule(nn.Module):
             logged_eviction_mapping = {}
             for idx in sorted_mapping.keys():
                 try:
+                    # pyrefly: ignore[bad-index]
                     logged_eviction_mapping[self.reversed_feature_table_map[idx]] = (
                         sorted_mapping[idx]
                     )
@@ -256,6 +257,7 @@ class GenericITEPModule(nn.Module):
         for lookup in self.lookups:
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
+            # pyrefly: ignore[not-iterable]
             for emb in lookup._emb_modules:
 
                 emb_tables: List[ShardedEmbeddingTable] = emb._config.embedding_tables
@@ -341,6 +343,7 @@ class GenericITEPModule(nn.Module):
         for lookup in self.lookups:
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
+            # pyrefly: ignore[not-iterable]
             for emb in lookup._emb_modules:
                 emb_tables: List[ShardedEmbeddingTable] = emb._config.embedding_tables
 
@@ -378,6 +381,7 @@ class GenericITEPModule(nn.Module):
         for lookup in self.lookups:
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
+            # pyrefly: ignore[not-iterable]
             for emb in lookup._emb_modules:
                 emb.emb_module.flush()
                 emb.emb_module.reset_cache_states()
@@ -543,6 +547,7 @@ class GenericITEPModule(nn.Module):
 
 class RowwiseShardedITEPModule(GenericITEPModule):
     def _get_local_metadata_idx(self, table: ShardedEmbeddingTable) -> int:
+        # pyrefly: ignore[missing-attribute]
         for i, metadata in enumerate(table.global_metadata.shards_metadata):
             if metadata == table.local_metadata:
                 return i
@@ -555,10 +560,12 @@ class RowwiseShardedITEPModule(GenericITEPModule):
         Returns a tuples of 2 lists: local_unpruned_hash_sizes, local_offsets. They are used
         to create itep buffers and set checkpoint local/global metadata.
         """
+        # pyrefly: ignore[missing-attribute]
         num_devices = len(table.global_metadata.shards_metadata)
 
         if sharding_type == ShardingType.TABLE_ROW_WISE.value:
             i = 0
+            # pyrefly: ignore[missing-attribute]
             for shard in table.global_metadata.shards_metadata:
                 if table.name not in self.rank_to_virtual_index_mapping:
                     self.rank_to_virtual_index_mapping[table.name] = {}
@@ -619,12 +626,14 @@ class RowwiseShardedITEPModule(GenericITEPModule):
             if sharding_type == ShardingType.ROW_WISE.value:
 
                 local_unpruned_rows = local_unpruned_shard_sizes[
+                    # pyrefly: ignore[missing-attribute]
                     table.local_metadata.placement.rank()
                 ]
             else:
 
                 local_unpruned_rows = local_unpruned_shard_sizes[
                     self.rank_to_virtual_index_mapping[table.name][
+                        # pyrefly: ignore[missing-attribute]
                         table.local_metadata.placement.rank()
                     ]
                 ]
@@ -667,6 +676,7 @@ class RowwiseShardedITEPModule(GenericITEPModule):
 
         if destination is None:
             destination = OrderedDict()
+            # pyrefly: ignore[missing-attribute]
             destination._metadata = OrderedDict()
 
         ckp_tables: List[str] = []
@@ -741,6 +751,7 @@ class RowwiseShardedITEPModule(GenericITEPModule):
         )
         return destination
 
+    # pyrefly: ignore[bad-override]
     def load_state_dict(
         self,
         state_dict: "OrderedDict[str, torch.Tensor]",
@@ -785,6 +796,7 @@ class RowwiseShardedITEPModule(GenericITEPModule):
         )
         return _IncompatibleKeys(missing_keys, unexpected_keys)
 
+    # pyrefly: ignore[bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -793,9 +805,11 @@ class RowwiseShardedITEPModule(GenericITEPModule):
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
+            # pyrefly: ignore[missing-attribute]
             destination._metadata = OrderedDict()
         for lookup in self.lookups:
             list_of_tables: List[ShardedEmbeddingTable] = []
+            # pyrefly: ignore[not-iterable]
             for emb_config in lookup.grouped_configs:
                 list_of_tables.extend(emb_config.embedding_tables)
 

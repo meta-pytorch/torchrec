@@ -21,6 +21,7 @@ class DummyKeyedOptimizer(KeyedOptimizer):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
+    # pyrefly: ignore[bad-override]
     def step(self, closure: Any) -> None:
         pass  # Override NotImplementedError.
 

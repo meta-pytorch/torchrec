@@ -47,7 +47,7 @@ from torchrec.distributed.types import Awaitable, NoWait, ShardingType
 
 
 if TYPE_CHECKING:
-    from torchrec.distributed.train_pipeline.train_pipelines import (  # @manual
+    from torchrec.distributed.train_pipeline.train_pipelines import (  # @manual  # pyrefly: ignore[missing-import]
         TrainPipeline,
     )
 
@@ -134,13 +134,16 @@ def _filter_awaitables(
 
     # Filter out DP (NoWait) and build dict mapping sharding type to awaitable
     valid_awaitables: Dict[str, Awaitable[torch.Tensor]] = {}
-    for w, sharding_type in zip(awaitables, sharding_types):
+    for w, sharding_type in zip(  # pyrefly: ignore[no-matching-overload]
+        awaitables, sharding_types
+    ):
         if isinstance(w, NoWait):
             continue
 
+        # pyrefly: ignore[unsupported-operation]
         valid_awaitables[ShardingType(sharding_type)] = w
 
-    return valid_awaitables
+    return valid_awaitables  # pyrefly: ignore[bad-return]
 
 
 def _find_awaitable_for_site(

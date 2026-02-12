@@ -68,6 +68,7 @@ class ScalarMetricComputation(RecMetricComputation):
                 name=MetricName.SCALAR,
                 metric_prefix=MetricPrefix.LIFETIME,
                 #  `Union[Tensor, Module]`.
+                # pyrefly: ignore[bad-argument-type]
                 value=self.labels,
             ),
             MetricComputationReport(
@@ -81,5 +82,6 @@ class ScalarMetricComputation(RecMetricComputation):
 
 
 class ScalarMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.SCALAR
     _computation_class: Type[RecMetricComputation] = ScalarMetricComputation

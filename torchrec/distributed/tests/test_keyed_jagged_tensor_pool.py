@@ -62,11 +62,13 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
 
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
+                # pyrefly: ignore[bad-assignment]
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
                 #  got `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
 
@@ -213,11 +215,13 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
 
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
+                # pyrefly: ignore[bad-assignment]
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
                 #  got `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
 
@@ -343,11 +347,13 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
 
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
+                # pyrefly: ignore[bad-assignment]
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
                 #  got `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
 
@@ -474,11 +480,13 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
 
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
+                # pyrefly: ignore[bad-assignment]
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
                 #  got `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
 
@@ -596,11 +604,13 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
 
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
+                # pyrefly: ignore[bad-assignment]
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
                 #  got `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
 

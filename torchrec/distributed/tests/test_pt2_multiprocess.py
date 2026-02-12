@@ -166,6 +166,7 @@ def _gen_model(test_model_type: _ModelType, mi: TestModelInfo) -> torch.nn.Modul
 
         return M_ebc(
             EmbeddingBagCollection(
+                # pyrefly: ignore[bad-argument-type]
                 tables=mi.tables,
                 device=mi.sparse_device,
             )
@@ -189,6 +190,7 @@ def _gen_model(test_model_type: _ModelType, mi: TestModelInfo) -> torch.nn.Modul
         return M_fpebc(
             FeatureProcessedEmbeddingBagCollection(
                 embedding_bag_collection=EmbeddingBagCollection(
+                    # pyrefly: ignore[bad-argument-type]
                     tables=mi.tables,
                     device=mi.sparse_device,
                     is_weighted=True,
@@ -207,12 +209,16 @@ def _gen_model(test_model_type: _ModelType, mi: TestModelInfo) -> torch.nn.Modul
                 self, x: KeyedJaggedTensor, y: torch.Tensor
             ) -> List[JaggedTensor]:
                 d: Dict[str, JaggedTensor] = self._ec(x)
+                # pyrefly: ignore[bad-argument-type]
                 v = torch.stack(d.values(), dim=0).sum(dim=0)
+                # pyrefly: ignore[not-callable]
                 y = self._linear(y)
+                # pyrefly: ignore[bad-return]
                 return torch.mul(torch.mean(v, dim=1), torch.mean(y, dim=1))
 
         return M_ec(
             EmbeddingCollection(
+                # pyrefly: ignore[bad-argument-type]
                 tables=mi.tables,
                 device=mi.sparse_device,
             )
@@ -250,7 +256,9 @@ def _test_compile_rank_fn(
 
         topology: Topology = Topology(world_size=world_size, compute_device="cuda")
         mi = TestModelInfo(
+            # pyrefly: ignore[bad-argument-type]
             dense_device=device,
+            # pyrefly: ignore[bad-argument-type]
             sparse_device=device,
             num_features=num_features,
             num_float_features=num_float_features,
@@ -276,6 +284,7 @@ def _test_compile_rank_fn(
             else EmbeddingConfig
         )
 
+        # pyrefly: ignore[bad-assignment]
         mi.tables = [
             config_type(
                 num_embeddings=num_embeddings,
@@ -286,6 +295,7 @@ def _test_compile_rank_fn(
             for i in range(mi.num_features)
         ]
 
+        # pyrefly: ignore[bad-assignment]
         mi.weighted_tables = [
             config_type(
                 num_embeddings=num_embeddings,
@@ -313,6 +323,7 @@ def _test_compile_rank_fn(
 
         plan: ShardingPlan = planner.collective_plan(
             model,
+            # pyrefly: ignore[bad-argument-type]
             sharders,
             pg,
         )
@@ -320,9 +331,12 @@ def _test_compile_rank_fn(
         def _dmp(m: torch.nn.Module) -> DistributedModelParallel:
             return DistributedModelParallel(
                 m,
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(pg),
                 plan=plan,
+                # pyrefly: ignore[bad-argument-type]
                 sharders=sharders,
+                # pyrefly: ignore[bad-argument-type]
                 device=device,
                 init_data_parallel=False,
             )
@@ -359,16 +373,19 @@ def _test_compile_rank_fn(
                 )
             ins.append(local_model_inputs)
 
+        # pyrefly: ignore[bad-argument-type]
         local_model_input = ins[0][rank].to(device)
 
         kjt = local_model_input.idlist_features
         ff = local_model_input.float_features
         ff.requires_grad = True
+        # pyrefly: ignore[bad-argument-type]
         kjt_ft = kjt_for_pt2_tracing(kjt, convert_to_vb=convert_to_vb)
 
         compile_input_ff = ff.clone().detach()
         compile_input_ff.requires_grad = True
 
+        # pyrefly: ignore[implicit-import]
         torchrec.distributed.comm_ops.set_use_sync_collectives(True)
         torchrec.pt2.checks.set_use_torchdynamo_compiling_path(True)
 
@@ -380,6 +397,7 @@ def _test_compile_rank_fn(
             if test_model_type == _ModelType.EBC:
                 tbe = (
                     #  attribute `_lookups`.
+                    # pyrefly: ignore[missing-attribute]
                     dmp._dmp_wrapped_module._ebc._lookups[0]
                     ._emb_modules[0]
                     ._emb_module
@@ -387,6 +405,7 @@ def _test_compile_rank_fn(
             elif test_model_type == _ModelType.FPEBC:
                 tbe = (
                     #  attribute `_lookups`.
+                    # pyrefly: ignore[missing-attribute]
                     dmp._dmp_wrapped_module._fpebc._lookups[0]
                     ._emb_modules[0]
                     ._emb_module
@@ -394,6 +413,7 @@ def _test_compile_rank_fn(
             elif test_model_type == _ModelType.EC:
                 tbe = (
                     #  attribute `_lookups`.
+                    # pyrefly: ignore[missing-attribute]
                     dmp._dmp_wrapped_module._ec._lookups[0]
                     ._emb_modules[0]
                     ._emb_module
@@ -402,6 +422,7 @@ def _test_compile_rank_fn(
 
             #  Optional[memory_format] = ...) -> Tensor, Tensor, Module]` is not a
             #  function.
+            # pyrefly: ignore[not-callable]
             return tbe.weights_dev.clone().detach()
 
         original_weights = get_weights(dmp)
@@ -419,6 +440,7 @@ def _test_compile_rank_fn(
 
         ##### COMPILE #####
         run_compile_backward: bool = torch_compile_backend in ["aot_eager", "inductor"]
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,
@@ -426,6 +448,7 @@ def _test_compile_rank_fn(
             torch._dynamo.config.capture_scalar_outputs = True
             torch._dynamo.config.capture_dynamic_output_shape_ops = True
             torch._dynamo.config.force_unspec_int_unbacked_size_like_on_torchrec_kjt = (
+                # pyrefly: ignore[bad-assignment]
                 True
             )
 
@@ -435,7 +458,9 @@ def _test_compile_rank_fn(
                 fullgraph=True,
             )
             compile_out = opt_fn(
-                kjt_for_pt2_tracing(kjt, convert_to_vb=convert_to_vb), compile_input_ff
+                # pyrefly: ignore[bad-argument-type]
+                kjt_for_pt2_tracing(kjt, convert_to_vb=convert_to_vb),
+                compile_input_ff,
             )
             torch.testing.assert_close(eager_out, compile_out, atol=1e-3, rtol=1e-3)
             if run_compile_backward:
@@ -455,13 +480,16 @@ def _test_compile_rank_fn(
         ##### COMPILE END #####
 
         ##### NUMERIC CHECK #####
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,
         ):
             for i in range(n_extra_numerics_checks):
+                # pyrefly: ignore[bad-argument-type]
                 local_model_input = ins[1 + i][rank].to(device)
                 kjt = local_model_input.idlist_features
+                # pyrefly: ignore[bad-argument-type]
                 kjt_ft = kjt_for_pt2_tracing(kjt, convert_to_vb=convert_to_vb)
                 ff = local_model_input.float_features
                 ff.requires_grad = True
@@ -476,6 +504,7 @@ def _test_compile_rank_fn(
                     eager_out_i, compile_out_i, atol=1e-3, rtol=1e-3
                 )
                 if run_compile_backward:
+                    # pyrefly: ignore[implicit-import]
                     torch._dynamo.testing.reduce_to_scalar_loss(
                         compile_out_i
                     ).backward()
@@ -520,7 +549,9 @@ def _test_compile_fake_pg_fn(
 
     topology: Topology = Topology(world_size=world_size, compute_device="cuda")
     mi = TestModelInfo(
+        # pyrefly: ignore[bad-argument-type]
         dense_device=device,
+        # pyrefly: ignore[bad-argument-type]
         sparse_device=device,
         num_features=num_features,
         num_float_features=num_float_features,
@@ -576,6 +607,7 @@ def _test_compile_fake_pg_fn(
         ECSharderFixedShardingType(sharding_type),
     ]
 
+    # pyrefly: ignore[bad-argument-type, missing-argument]
     plan: ShardingPlan = planner.plan(model, sharders)
 
     def _dmp(m: torch.nn.Module) -> DistributedModelParallel:
@@ -583,7 +615,9 @@ def _test_compile_fake_pg_fn(
             m,
             env=ShardingEnv(world_size, rank, pg),
             plan=plan,
+            # pyrefly: ignore[bad-argument-type]
             sharders=sharders,
+            # pyrefly: ignore[bad-argument-type]
             device=device,
             init_data_parallel=False,
         )
@@ -609,16 +643,19 @@ def _test_compile_fake_pg_fn(
         )
         ins.append(local_model_inputs)
 
+    # pyrefly: ignore[bad-argument-type]
     local_model_input = ins[0][rank].to(device)
 
     kjt = local_model_input.idlist_features
     ff = local_model_input.float_features
     ff.requires_grad = True
+    # pyrefly: ignore[bad-argument-type]
     kjt_ft = kjt_for_pt2_tracing(kjt, convert_to_vb=True)
 
     compile_input_ff = ff.clone().detach()
     compile_input_ff.requires_grad = True
 
+    # pyrefly: ignore[implicit-import]
     torchrec.distributed.comm_ops.set_use_sync_collectives(True)
     torchrec.pt2.checks.set_use_torchdynamo_compiling_path(True)
 
@@ -627,10 +664,12 @@ def _test_compile_fake_pg_fn(
 
     def get_weights(dmp: DistributedModelParallel) -> torch.Tensor:
         #  `_lookups`.
+        # pyrefly: ignore[missing-attribute]
         tbe = dmp._dmp_wrapped_module._ebc._lookups[0]._emb_modules[0]._emb_module
         assert isinstance(tbe, SplitTableBatchedEmbeddingBagsCodegen)
         #  Optional[memory_format] = ...) -> Tensor, Tensor, Module]` is not a
         #  function.
+        # pyrefly: ignore[not-callable]
         return tbe.weights_dev.clone().detach()
 
     original_weights = get_weights(dmp)
@@ -642,12 +681,14 @@ def _test_compile_fake_pg_fn(
     reduce_to_scalar_loss(eager_out).backward()
 
     ##### COMPILE #####
+    # pyrefly: ignore[implicit-import]
     with unittest.mock.patch(
         "torch._dynamo.config.skip_torchrec",
         False,
     ):
         torch._dynamo.config.capture_scalar_outputs = True
         torch._dynamo.config.capture_dynamic_output_shape_ops = True
+        # pyrefly: ignore[bad-assignment]
         torch._dynamo.config.force_unspec_int_unbacked_size_like_on_torchrec_kjt = True
 
         opt_fn = torch.compile(
@@ -656,7 +697,9 @@ def _test_compile_fake_pg_fn(
             fullgraph=True,
         )
         compile_out = opt_fn(
-            kjt_for_pt2_tracing(kjt, convert_to_vb=True), compile_input_ff
+            # pyrefly: ignore[bad-argument-type]
+            kjt_for_pt2_tracing(kjt, convert_to_vb=True),
+            compile_input_ff,
         )
         torch.testing.assert_close(eager_out, compile_out, atol=1e-3, rtol=1e-3)
     ##### COMPILE END #####

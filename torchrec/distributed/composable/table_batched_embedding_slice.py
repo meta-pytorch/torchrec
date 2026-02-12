@@ -82,6 +82,7 @@ class TableBatchedEmbeddingSlice(nn.Parameter):
             return result
 
     @property
+    # pyrefly: ignore[bad-override]
     def grad(self) -> Optional[torch.Tensor]:
         if self._original_tensor.grad is None:
             return self._init_grad
@@ -100,6 +101,7 @@ class TableBatchedEmbeddingSlice(nn.Parameter):
             )
 
     @property
+    # pyrefly: ignore[bad-override]
     def grad_fn(self) -> None:
         # set as leaf node
         return None

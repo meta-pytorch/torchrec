@@ -85,6 +85,7 @@ class CollectiveUtilsTest(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="gloo",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_is_leader,
         )
 
@@ -127,6 +128,7 @@ class CollectiveUtilsTest(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="gloo",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_invoke_on_rank_and_broadcast_result,
         )
 
@@ -162,5 +164,6 @@ class CollectiveUtilsTest(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="gloo",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_run_on_leader_decorator,
         )

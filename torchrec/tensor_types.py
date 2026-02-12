@@ -17,10 +17,12 @@ import torch._prims_common as utils
 
 def down_size(N: int, size: torch.Size) -> Tuple[int, int]:
     assert size[-1] % N == 0, f"{size} last dim not divisible by {N}"
+    # pyrefly: ignore[bad-return]
     return (*size[:-1], size[-1] // N)
 
 
 def up_size(N: int, size: torch.Size) -> Tuple[int, int]:
+    # pyrefly: ignore[bad-return]
     return (*size[:-1], size[-1] * N)
 
 
@@ -69,6 +71,7 @@ class UIntXTensor(torch.Tensor):
     .detach,.clone - work as an op on underlying uint8 data.
     """
 
+    # pyrefly: ignore[bad-param-name-override]
     __torch_function__ = torch._C._disabled_torch_function_impl
 
     @staticmethod
@@ -85,18 +88,22 @@ class UIntXTensor(torch.Tensor):
     def tolist(self) -> List:
         return self.elem.tolist()
 
+    # pyrefly: ignore[bad-override]
     def __repr__(self) -> str:
         return f"UInt{8 // self.N}Tensor(shape={self.shape}, elem={self.elem})"
 
     @classmethod
+    # pyrefly: ignore[bad-param-name-override]
     def __torch_dispatch__(cls, func, types, args, kwargs=None):  # noqa: C901
         if func is torch.ops.aten.detach.default:
             # Temp workaround to avoid 'Cannot set version_counter for inference tensor'
             with torch.inference_mode(False):
                 (self,) = args
+                # pyrefly: ignore[missing-argument]
                 return cls(func(self.elem))
         elif func is torch.ops.aten.clone.default:
             (self,) = args
+            # pyrefly: ignore[missing-argument]
             return cls(func(self.elem))
         elif func is torch.ops.aten.copy_.default:
             (self, src) = args
@@ -110,14 +117,19 @@ class UIntXTensor(torch.Tensor):
         elif func is torch.ops.aten._to_copy.default:
             (self,) = args
             dtype = find_arg_of_type(
-                itertools.chain(args, kwargs.values()), torch.dtype
+                # pyrefly: ignore[missing-attribute]
+                itertools.chain(args, kwargs.values()),
+                torch.dtype,
             )
             device = find_arg_of_type(
-                itertools.chain(args, kwargs.values()), torch.device
+                # pyrefly: ignore[missing-attribute]
+                itertools.chain(args, kwargs.values()),
+                torch.device,
             )
             # Handle only to device
             if device:
                 assert dtype is None or dtype == torch.uint8
+                # pyrefly: ignore[missing-argument]
                 return cls(self.elem.to(device))
         elif func is torch.ops.aten.slice.Tensor:
             self, dim, start, end, step = fill_defaults(args, 5, [0, None, None, 1])
@@ -127,12 +139,14 @@ class UIntXTensor(torch.Tensor):
                     raise NotImplementedError(f"slice step={step}")
                 assert start % self.N == 0, start
                 assert end >= self.shape[dim] or end % self.N == 0, end
+                # pyrefly: ignore[missing-argument]
                 return cls(
                     torch.ops.aten.slice.Tensor(
                         self.elem, dim, start // self.N, end // self.N, 1
                     ),
                 )
             else:
+                # pyrefly: ignore[missing-argument]
                 return cls(
                     torch.ops.aten.slice.Tensor(self.elem, dim, start, end, step),
                 )
@@ -140,10 +154,12 @@ class UIntXTensor(torch.Tensor):
             self, size = args
             size = utils.infer_size(size, self.numel())
             assert not kwargs
+            # pyrefly: ignore[bad-argument-type, missing-argument]
             return cls(self.elem.reshape(down_size(self.N, size)))
         elif func is torch.ops.aten.select.int:
             self, dim, index = args
             if dim != self.dim() - 1:
+                # pyrefly: ignore[missing-argument]
                 return cls(torch.ops.aten.select.int(self.elem, dim, index))
             else:
                 raise NotImplementedError(f"select dim={dim}")

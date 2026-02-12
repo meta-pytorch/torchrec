@@ -959,12 +959,14 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         ec_submodule_config = DMPCollectionConfig(
             module=EmbeddingCollection,
             sharding_group_size=2,
+            # pyrefly: ignore[bad-argument-type]
             plan=None,
         )
 
         self._test_sharding(
             world_size=self.WORLD_SIZE,
             world_size_2D=self.WORLD_SIZE_2D,
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 cast(
                     ModuleSharder[nn.Module],
@@ -1044,6 +1046,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         ec_submodule_config = DMPCollectionConfig(
             module=EmbeddingCollection,
             sharding_group_size=2,
+            # pyrefly: ignore[bad-argument-type]
             plan=None,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
         )
@@ -1051,6 +1054,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         self._test_sharding(
             world_size=self.WORLD_SIZE,
             world_size_2D=self.WORLD_SIZE_2D,
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 cast(
                     ModuleSharder[nn.Module],
@@ -1132,6 +1136,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         ec_submodule_config = DMPCollectionConfig(
             module=EmbeddingCollection,
             sharding_group_size=2,
+            # pyrefly: ignore[bad-argument-type]
             plan=None,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,  # only apply fully sharded to EC tables
         )
@@ -1139,6 +1144,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         self._test_sharding(
             world_size=self.WORLD_SIZE,
             world_size_2D=self.WORLD_SIZE_2D,
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 cast(
                     ModuleSharder[nn.Module],

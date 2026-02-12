@@ -64,6 +64,7 @@ class ScalarArgInfoStep(BaseArgInfoStep):
         super().__init__()
         self.value = value
 
+    # pyrefly: ignore[bad-param-name-override]
     def process(self, _arg) -> Any:
         return self.value
 
@@ -378,20 +379,25 @@ class NodeArgsHelper:
             elif (
                 child_node.op == "call_function"
                 and child_node.target.__module__ == "builtins"
+                # pyrefly: ignore[missing-attribute]
                 and child_node.target.__name__ == "getattr"
             ):
+                # pyrefly: ignore[bad-argument-type]
                 arg_info.add_step(ArgInfoStepFactory.get_attr(child_node.args[1]))
                 arg = child_node.args[0]
             elif (
                 child_node.op == "call_function"
                 and child_node.target.__module__ == "_operator"
+                # pyrefly: ignore[missing-attribute]
                 and child_node.target.__name__ == "getitem"
             ):
+                # pyrefly: ignore[bad-argument-type]
                 arg_info.add_step(ArgInfoStepFactory.get_item(child_node.args[1]))
                 arg = child_node.args[0]
             elif (
                 child_node.op == "call_function"
                 and child_node.target.__module__ == "torch.utils._pytree"
+                # pyrefly: ignore[missing-attribute]
                 and child_node.target.__name__ == "tree_unflatten"
             ):
                 """
@@ -400,10 +406,12 @@ class NodeArgsHelper:
                 """
                 step = arg_info.steps[0]
                 assert isinstance(step, GetItemArgInfoStep)
+                # pyrefly: ignore[bad-index, unsupported-operation]
                 arg = child_node.args[0][step.item_index]
             elif (
                 child_node.op == "call_function"
                 and child_node.target.__module__ == "torchrec.sparse.jagged_tensor"
+                # pyrefly: ignore[missing-attribute]
                 and child_node.target.__name__ == "KeyedJaggedTensor"
             ):
                 call_module_found = False
@@ -424,6 +432,7 @@ class NodeArgsHelper:
                     arg = child_node.args[1]
 
             elif child_node.op == "call_method" and child_node.target == "get":
+                # pyrefly: ignore[bad-argument-type]
                 arg_info.add_step(ArgInfoStepFactory.get_item(child_node.args[1]))
                 arg = child_node.args[0]
             else:

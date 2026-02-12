@@ -43,6 +43,7 @@ class Batch(Pipelineable):
 
     def record_stream(self, stream: torch.Stream) -> None:
         self.dense_features.record_stream(stream)
+        # pyrefly: ignore[bad-argument-type]
         self.sparse_features.record_stream(stream)
         self.labels.record_stream(stream)
 
@@ -207,6 +208,7 @@ class ReadLinesFromCSV(IterDataPipe):
 
     def __iter__(self) -> Iterator[List[str]]:
         for _, data in self.datapipe:
+            # pyrefly: ignore[bad-argument-type]
             reader = csv.reader(data, **self.kw)
             if self.skip_first_line:
                 next(reader, None)

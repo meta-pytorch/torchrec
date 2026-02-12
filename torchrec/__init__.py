@@ -30,6 +30,7 @@ from torchrec.streamable import Multistreamable, Pipelineable  # noqa
 
 try:
     # @manual=//torchrec/fb:version
+    # pyrefly: ignore[missing-import]
     from .version import __version__, github_version  # noqa
 except ImportError:
     pass

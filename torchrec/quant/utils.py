@@ -33,17 +33,22 @@ def populate_fx_names(
         ):
             table_names = []
             for config in emb_configs:
+                # pyrefly: ignore[missing-attribute]
                 table_names.append(config.name)
             joined_table_names = ",".join(table_names)
+            # pyrefly: ignore[bad-argument-type]
             emb_module._fx_path = f"emb_module.{joined_table_names}"
     elif isinstance(quant_ebc, ShardedQuantEmbeddingBagCollection):
         for i, (emb_module, emb_dist_module) in enumerate(
             zip(quant_ebc._lookups, quant_ebc._output_dists)
         ):
             embedding_fx_path = f"embedding_lookup.sharding_{i}"
+            # pyrefly: ignore[bad-argument-type]
             emb_module._fx_path = embedding_fx_path
+            # pyrefly: ignore[bad-argument-type]
             emb_dist_module._fx_path = f"embedding_dist.{i}"
             #  `Union[Module, Tensor]`.
+            # pyrefly: ignore[bad-argument-type]
             for rank, rank_module in enumerate(emb_module._embedding_lookups_per_rank):
                 rank_fx_path = f"{embedding_fx_path}.rank_{rank}"
                 rank_module._fx_path = rank_fx_path

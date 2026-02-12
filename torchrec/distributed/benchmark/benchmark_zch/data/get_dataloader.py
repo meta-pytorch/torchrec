@@ -55,4 +55,5 @@ def get_dataloader(
         return get_kuairand_27k_dataloader(args, dataset_config, stage)
     else:
         raise NotImplementedError(f"Dataset {dataset_name} is not implemented.")
+        # pyrefly: ignore[unreachable]
         return None

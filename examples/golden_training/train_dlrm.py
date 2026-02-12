@@ -118,7 +118,9 @@ def train(
     qcomm_codecs_registry = (
         get_qcomm_codecs_registry(
             qcomms_config=QCommsConfig(
+                # pyrefly: ignore[bad-argument-type]
                 forward_precision=qcomm_forward_precision,
+                # pyrefly: ignore[bad-argument-type]
                 backward_precision=qcomm_backward_precision,
             )
         )
@@ -130,6 +132,7 @@ def train(
     model = DistributedModelParallel(
         module=train_model,
         device=device,
+        # pyrefly: ignore[bad-argument-type]
         sharders=[sharder],
     )
 

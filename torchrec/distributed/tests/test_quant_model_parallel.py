@@ -287,6 +287,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
             weighted_tables=self.weighted_tables,
         )
 
+        # pyrefly: ignore[bad-argument-type]
         dmp_copy.load_state_dict(dmp.state_dict())
         torch.testing.assert_close(
             dmp(local_batch[0].to(device)).cpu(),
@@ -408,7 +409,9 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         )
 
         dmp_1 = dmp.copy(device_1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(dmp_1.module.copy_module.tensor.device, device_1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(dmp_1.module.no_copy_module.tensor.device, torch.device("cpu"))
 
 
@@ -510,6 +513,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
+            # pyrefly: ignore[bad-argument-type, missing-argument]
         ).plan(quant_model, sharders)
 
         sharding_device_type = "cuda"
@@ -526,6 +530,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
             all(
                 param.device.type == sharding_device_type
                 #  attribute `ebc`.
+                # pyrefly: ignore[missing-attribute]
                 for param in dmp.module.sparse.ebc.buffers()
             )
         )
@@ -534,6 +539,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
             all(
                 param.device.type == sparse_device.type
                 #  attribute `weighted_ebc`.
+                # pyrefly: ignore[missing-attribute]
                 for param in dmp.module.sparse.weighted_ebc.buffers()
             )
         )
@@ -596,6 +602,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
+            # pyrefly: ignore[bad-argument-type, missing-argument]
         ).plan(quant_model, sharders)
 
         dmp = DistributedModelParallel(
@@ -608,6 +615,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         )
 
         self.assertTrue(
+            # pyrefly: ignore[missing-attribute]
             all(param.device == device for param in dmp.module.sparse.ebc.buffers())
         )
         self.assertTrue(
@@ -615,6 +623,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
             all(
                 param.device == torch.device("meta")
                 #  attribute `weighted_ebc`.
+                # pyrefly: ignore[missing-attribute]
                 for param in dmp.module.sparse.weighted_ebc.buffers()
             )
         )
@@ -677,6 +686,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
+            # pyrefly: ignore[bad-argument-type, missing-argument]
         ).plan(quant_model, sharders)
 
         dmp = DistributedModelParallel(
@@ -692,6 +702,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
             all(
                 param.device.type == device.type
                 #  attribute `ebc`.
+                # pyrefly: ignore[missing-attribute]
                 for param in dmp.module.sparse.ebc.buffers()
             )
         )
@@ -700,6 +711,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
             all(
                 param.device.type == device.type
                 #  attribute `weighted_ebc`.
+                # pyrefly: ignore[missing-attribute]
                 for param in dmp.module.sparse.weighted_ebc.buffers()
             )
         )
@@ -765,4 +777,5 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
                         EmbeddingStorageEstimator(topology=topology),
                     ],
                 ),
+                # pyrefly: ignore[bad-argument-type, missing-argument]
             ).plan(quant_model, sharders)

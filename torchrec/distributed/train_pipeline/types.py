@@ -111,6 +111,7 @@ class PipelinePhase(Enum):
     def __str__(self) -> str:
         return self.value
 
+    # pyrefly: ignore[bad-override]
     def __eq__(self, obj: "PipelinePhase") -> bool:
         return self.value == obj.value
 

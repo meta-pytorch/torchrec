@@ -155,6 +155,7 @@ class RecallSessionMetricComputation(RecMetricComputation):
                     self.session_var_name
                 )
             )
+        # pyrefly: ignore[bad-index]
         session = kwargs["required_inputs"][self.session_var_name]
         if predictions is None or weights is None or session is None:
             raise RecMetricException(
@@ -205,10 +206,12 @@ class RecallSessionMetricComputation(RecMetricComputation):
 
         predictions_ranked = ranking_within_session(predictions, session)
         #  `Optional[int]`.
+        # pyrefly: ignore[unsupported-operation]
         predictions_labels = (predictions_ranked < self.top_threshold).to(torch.int32)
         if self.run_ranking_of_labels:
             labels_ranked = ranking_within_session(labels, session)
             #  `Optional[int]`.
+            # pyrefly: ignore[unsupported-operation]
             labels = (labels_ranked < self.top_threshold).to(torch.int32)
         num_true_pos = _calc_num_true_pos(labels, predictions_labels, weights)
         num_false_neg = _calc_num_false_neg(labels, predictions_labels, weights)
@@ -217,6 +220,7 @@ class RecallSessionMetricComputation(RecMetricComputation):
 
 
 class RecallSessionMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.RECALL_SESSION_LEVEL
     _computation_class: Type[RecMetricComputation] = RecallSessionMetricComputation
 

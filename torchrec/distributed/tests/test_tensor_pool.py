@@ -54,6 +54,7 @@ class TestShardedTensorPool(MultiProcessTestBase):
                 plan=sharding_plan,
                 device=ctx.device,
                 #  `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
 
@@ -159,6 +160,7 @@ class TestShardedTensorPool(MultiProcessTestBase):
                 plan=sharding_plan,
                 device=ctx.device,
                 #  `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
 

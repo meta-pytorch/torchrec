@@ -152,6 +152,7 @@ class RecMetricComputation(Metric, abc.ABC):
         if "compute_mode" in metric_init_signature.parameters:
             kwargs["compute_mode"] = compute_mode
         super().__init__(
+            # pyrefly: ignore[bad-keyword-argument]
             process_group=process_group,
             *args,
             **kwargs,
@@ -205,6 +206,7 @@ class RecMetricComputation(Metric, abc.ABC):
             metric and this state is required to compute the checkpointed metric.
         """
         #  param but got `DefaultValueT`.
+        # pyrefly: ignore[bad-argument-type]
         super().add_state(name, default, **kwargs)
         if add_window_state:
             if self._batch_window_buffers is None:
@@ -238,6 +240,7 @@ class RecMetricComputation(Metric, abc.ABC):
         )
 
     @abc.abstractmethod
+    # pyrefly: ignore[bad-override]
     def update(
         self,
         *,
@@ -385,12 +388,14 @@ class RecMetric(nn.Module, abc.ABC):
             self.WEIGHTS: [],
         }
         #  Dict[str, Any]]`.
+        # pyrefly: ignore[bad-assignment]
         self.enable_pt2_compile: bool = kwargs.get("enable_pt2_compile", False)
         # we need to remove the enable_pt2_compile from kwargs to avoid Metric object being initialized with it
         if "enable_pt2_compile" in kwargs:
             del kwargs["enable_pt2_compile"]
 
         #  Dict[str, Any]]`.
+        # pyrefly: ignore[bad-assignment]
         self._should_clone_update_inputs: bool = kwargs.get(
             "should_clone_update_inputs", False
         )
@@ -421,6 +426,7 @@ class RecMetric(nn.Module, abc.ABC):
             ]
             else self._tasks
         ):
+            # pyrefly: ignore[unsupported-operation]
             kwargs["fused_update_limit"] = fused_update_limit
             # This Pyre error seems to be Pyre's bug as it can be inferred by mypy
             # according to https://github.com/python/mypy/issues/3048.
@@ -433,6 +439,7 @@ class RecMetric(nn.Module, abc.ABC):
                 should_validate_update=self._should_validate_update,
                 compute_mode=compute_mode,
                 process_group=process_group,
+                # pyrefly: ignore[bad-argument-type]
                 **{**kwargs, **self._get_task_kwargs(task_config)},
             )
             required_inputs = self._get_task_required_inputs(task_config)
@@ -454,10 +461,12 @@ class RecMetric(nn.Module, abc.ABC):
     # compute_scope str input with an enum
     def _fused_tasks_iter(self, compute_scope: str) -> ComputeIterType:
         assert len(self._metrics_computations) == 1
+        # pyrefly: ignore[not-callable]
         self._metrics_computations[0].pre_compute()
         for metric_report in getattr(
             self._metrics_computations[0], compute_scope + "compute"
         )():
+            # pyrefly: ignore[no-matching-overload]
             for task, metric_value, has_valid_update in zip(
                 self._tasks,
                 metric_report.value,
@@ -485,6 +494,7 @@ class RecMetric(nn.Module, abc.ABC):
         This would mean in the states of each RecMetricComputation object, the n_tasks dimension is 1.
         """
         for task, metric_computation in zip(self._tasks, self._metrics_computations):
+            # pyrefly: ignore[not-callable]
             metric_computation.pre_compute()
             for metric_report in getattr(
                 metric_computation, compute_scope + "compute"
@@ -496,6 +506,7 @@ class RecMetric(nn.Module, abc.ABC):
                 valid_metric_value = (
                     metric_report.value
                     if not self._should_validate_update
+                    # pyrefly: ignore[bad-index]
                     or metric_computation.has_valid_update[0] > 0
                     else torch.zeros_like(metric_report.value)
                 )
@@ -662,16 +673,19 @@ class RecMetric(nn.Module, abc.ABC):
                     # update.
                     has_valid_weights = self._check_nonempty_weights(weights)
                     if torch.any(has_valid_weights):
+                        # pyrefly: ignore[not-callable]
                         self._metrics_computations[0].update(
                             predictions=predictions,
                             labels=labels,
                             weights=weights,
                             **kwargs,
                         )
+                        # pyrefly: ignore[not-callable]
                         self._metrics_computations[0].has_valid_update.logical_or_(
                             has_valid_weights
                         )
                 else:
+                    # pyrefly: ignore[not-callable]
                     self._metrics_computations[0].update(
                         predictions=predictions,
                         labels=labels,
@@ -684,28 +698,35 @@ class RecMetric(nn.Module, abc.ABC):
                         continue
                     #  List[typing.Any], int, slice, Tensor, typing.Tuple[typing.Any,
                     #  ...]]` but got `str`.
+                    # pyrefly: ignore[bad-index]
                     if torch.numel(predictions[task.name]) == 0:
                         #  List[typing.Any], int, slice, Tensor,
                         #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                        # pyrefly: ignore[bad-index]
                         assert torch.numel(labels[task.name]) == 0
                         #  List[typing.Any], int, slice, Tensor,
                         #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                        # pyrefly: ignore[bad-index]
                         assert weights is None or torch.numel(weights[task.name]) == 0
                         continue
                     task_predictions = (
                         #  List[typing.Any], int, slice, Tensor,
                         #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                        # pyrefly: ignore[bad-index]
                         predictions[task.name].view(1, -1)
                         #  List[typing.Any], int, slice, Tensor,
                         #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                        # pyrefly: ignore[bad-index]
                         if predictions[task.name].dim() == labels[task.name].dim()
                         # predictions[task.name].dim() == labels[task.name].dim() + 1 for multiclass models
                         #  List[typing.Any], int, slice, Tensor,
                         #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                        # pyrefly: ignore[bad-index]
                         else predictions[task.name].view(
                             1,
                             -1,
                             predictions[
+                                # pyrefly: ignore[bad-index]
                                 task.name
                                 #  List[typing.Any], int, slice, Tensor,
                                 #  typing.Tuple[typing.Any, ...]]` but got `str`.
@@ -714,12 +735,14 @@ class RecMetric(nn.Module, abc.ABC):
                     )
                     #  List[typing.Any], int, slice, Tensor, typing.Tuple[typing.Any,
                     #  ...]]` but got `str`.
+                    # pyrefly: ignore[bad-index]
                     task_labels = labels[task.name].view(1, -1)
                     if weights is None:
                         task_weights = self._create_default_weights(task_predictions)
                     else:
                         #  List[typing.Any], int, slice, Tensor,
                         #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                        # pyrefly: ignore[bad-index]
                         task_weights = weights[task.name].view(1, -1)
                     if self._should_validate_update:
                         # has_valid_weights is a tensor with only 1 value corresponding to
@@ -729,6 +752,7 @@ class RecMetric(nn.Module, abc.ABC):
                         has_valid_weights = self._check_nonempty_weights(task_weights)
                         if has_valid_weights[0]:
                             #  Tensor) -> Tensor, Module, Tensor]` is not a function.
+                            # pyrefly: ignore[not-callable]
                             metric_.has_valid_update.logical_or_(has_valid_weights)
                         else:
                             continue
@@ -742,6 +766,7 @@ class RecMetric(nn.Module, abc.ABC):
                             )
                             for k, v in kwargs["required_inputs"].items()
                         }
+                    # pyrefly: ignore[not-callable]
                     metric_.update(
                         predictions=task_predictions,
                         labels=task_labels,
@@ -799,15 +824,18 @@ class RecMetric(nn.Module, abc.ABC):
 
     def sync(self) -> None:
         for computation in self._metrics_computations:
+            # pyrefly: ignore[not-callable]
             computation.sync()
 
     def unsync(self) -> None:
         for computation in self._metrics_computations:
             if computation._is_synced:
+                # pyrefly: ignore[not-callable]
                 computation.unsync()
 
     def reset(self) -> None:
         for computation in self._metrics_computations:
+            # pyrefly: ignore[not-callable]
             computation.reset()
 
     def get_memory_usage(self) -> Dict[torch.Tensor, int]:
@@ -830,6 +858,7 @@ class RecMetric(nn.Module, abc.ABC):
                 attributes_q.extend(attribute.__dict__.values())
         return tensor_map
 
+    # pyrefly: ignore[bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, torch.Tensor]] = None,
@@ -838,6 +867,7 @@ class RecMetric(nn.Module, abc.ABC):
     ) -> Dict[str, torch.Tensor]:
         # We need to flush the cached output to ensure checkpointing correctness.
         self._check_fused_update(force=True)
+        # pyrefly: ignore[no-matching-overload]
         destination = super().state_dict(
             destination=destination, prefix=prefix, keep_vars=keep_vars
         )
@@ -913,6 +943,7 @@ class RecMetricList(nn.Module):
         **kwargs: Dict[str, Any],
     ) -> None:
         for metric in self.rec_metrics:
+            # pyrefly: ignore[not-callable]
             metric.update(
                 predictions=predictions, labels=labels, weights=weights, **kwargs
             )
@@ -920,23 +951,28 @@ class RecMetricList(nn.Module):
     def compute(self) -> Dict[str, torch.Tensor]:
         ret = {}
         for metric in self.rec_metrics:
+            # pyrefly: ignore[not-callable]
             ret.update(metric.compute())
         return ret
 
     def local_compute(self) -> Dict[str, torch.Tensor]:
         ret = {}
         for metric in self.rec_metrics:
+            # pyrefly: ignore[not-callable]
             ret.update(metric.local_compute())
         return ret
 
     def sync(self) -> None:
         for metric in self.rec_metrics:
+            # pyrefly: ignore[not-callable]
             metric.sync()
 
     def unsync(self) -> None:
         for metric in self.rec_metrics:
+            # pyrefly: ignore[not-callable]
             metric.unsync()
 
     def reset(self) -> None:
         for metric in self.rec_metrics:
+            # pyrefly: ignore[not-callable]
             metric.reset()

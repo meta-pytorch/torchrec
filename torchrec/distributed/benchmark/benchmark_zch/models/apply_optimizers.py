@@ -31,6 +31,7 @@ def apply_sparse_optimizers(model: nn.Module, args: argparse.Namespace) -> None:
     elif args.sparse_optim == "sgd":
         embedding_optimizer = torch.optim.SGD
     elif args.sparse_optim == "rowwiseadagrad":
+        # pyrefly: ignore[implicit-import]
         embedding_optimizer = torchrec.optim.RowWiseAdagrad
     else:
         raise NotImplementedError("Optimizer not supported")

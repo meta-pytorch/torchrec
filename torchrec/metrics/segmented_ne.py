@@ -350,9 +350,13 @@ class SegmentedNEMetricComputation(RecMetricComputation):
     def _compute_fused(self) -> List[MetricComputationReport]:
         reports = []
         computed_ne = compute_ne_fused(
+            # pyrefly: ignore[bad-argument-type]
             self.cross_entropy_sum,
+            # pyrefly: ignore[bad-argument-type]
             self.weighted_num_samples,
+            # pyrefly: ignore[bad-argument-type]
             self.pos_labels,
+            # pyrefly: ignore[bad-argument-type]
             self.neg_labels,
             num_groups=self._num_groups,
             n_tasks=self._n_tasks,
@@ -370,8 +374,11 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
         if self._include_logloss:
             log_loss_groups = compute_logloss(
+                # pyrefly: ignore[bad-argument-type]
                 self.cross_entropy_sum,
+                # pyrefly: ignore[bad-argument-type]
                 self.pos_labels,
+                # pyrefly: ignore[bad-argument-type]
                 self.neg_labels,
                 eta=self.eta,
             )
@@ -396,9 +403,13 @@ class SegmentedNEMetricComputation(RecMetricComputation):
             return self._compute_fused()
 
         computed_ne = compute_ne(
+            # pyrefly: ignore[bad-index]
             self.cross_entropy_sum[0],
+            # pyrefly: ignore[bad-index]
             self.weighted_num_samples[0],
+            # pyrefly: ignore[bad-index]
             self.pos_labels[0],
+            # pyrefly: ignore[bad-index]
             self.neg_labels[0],
             num_groups=self._num_groups,
             eta=self.eta,
@@ -416,8 +427,11 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
         if self._include_logloss:
             log_loss_groups = compute_logloss(
+                # pyrefly: ignore[bad-index]
                 self.cross_entropy_sum[0],
+                # pyrefly: ignore[bad-index]
                 self.pos_labels[0],
+                # pyrefly: ignore[bad-index]
                 self.neg_labels[0],
                 eta=self.eta,
             )
@@ -436,6 +450,7 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
 
 class SegmentedNEMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.SEGMENTED_NE
     _computation_class: Type[RecMetricComputation] = SegmentedNEMetricComputation
 
@@ -469,4 +484,5 @@ class SegmentedNEMetric(RecMetric):
         if "grouping_keys" not in kwargs:
             self._required_inputs.add("grouping_keys")
         else:
+            # pyrefly: ignore[bad-argument-type]
             self._required_inputs.add(kwargs["grouping_keys"])

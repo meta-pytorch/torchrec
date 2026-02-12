@@ -35,6 +35,7 @@ def get_tbes_from_sharded_module(
         ShardedQuantEmbeddingCollection,
     ], "Only support ShardedQuantEmbeddingBagCollection and ShardedQuantEmbeddingCollection for get TBEs"
     tbes = []
+    # pyrefly: ignore[not-iterable]
     for lookup in module._lookups:
         for lookup_per_rank in lookup._embedding_lookups_per_rank:
             for emb_module in lookup_per_rank._emb_modules:
@@ -169,7 +170,10 @@ def get_all_torchrec_modules(
                 _recursive_get_module(c_module, child_path, target_module_class)
 
     _recursive_get_module(
-        model, "", cast(List[Type[torch.nn.Module]], trec_module_class_types)
+        model,
+        "",
+        # pyrefly: ignore[redundant-cast]
+        cast(List[Type[torch.nn.Module]], trec_module_class_types),
     )
 
     return trec_modules

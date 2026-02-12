@@ -217,6 +217,7 @@ class TrainPipelinePT2Test(unittest.TestCase):
 
             def forward(self, x: KeyedJaggedTensor) -> List[JaggedTensor]:
                 kt: KeyedTensor = self.model(x)
+                # pyrefly: ignore[no-matching-overload]
                 return list(kt.to_dict().values())
 
         return M_ebc(
@@ -275,6 +276,7 @@ class TrainPipelinePT2Test(unittest.TestCase):
         ]
 
         def pre_compile_fn(model: nn.Module) -> None:
+            # pyrefly: ignore[bad-argument-type]
             model._dummy_setting = "dummy modified"
 
         dataloader = iter(data)
@@ -309,8 +311,10 @@ class TrainPipelinePT2Test(unittest.TestCase):
 
         model_gpu.load_state_dict(model_cpu.state_dict())
         #  `parameters`.
+        # pyrefly: ignore[missing-attribute]
         optimizer_cpu = optim.SGD(model_cpu.model.parameters(), lr=0.01)
         #  `parameters`.
+        # pyrefly: ignore[missing-attribute]
         optimizer_gpu = optim.SGD(model_gpu.model.parameters(), lr=0.01)
 
         data = [
@@ -677,6 +681,7 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
             batch_size = pred.size(0)
             return loss, pred.expand(batch_size * 2, -1)
 
+        # pyrefly: ignore[bad-specialization]
         pipeline = self.pipeline_class(
             model=sharded_model_pipelined,
             optimizer=optim_pipelined,
@@ -718,6 +723,7 @@ def fp_ebc_rw_sharding_test_runner(
         max_feature_lengths = [10, 10, 12, 12]
         sparse_arch = DummyWrapper(
             create_module_and_freeze(
+                # pyrefly: ignore[bad-argument-type]
                 tables=tables,
                 device=ctx.device,
                 use_fp_collection=False,
@@ -884,6 +890,7 @@ def fp_ebc_jk_disabled_pipelined_test_runner(
         )
 
         module_sharding_plan = construct_module_sharding_plan(
+            # pyrefly: ignore[bad-argument-type]
             sparse_arch.m._fp_ebc,
             per_param_sharding={
                 "table_0": row_wise(),
@@ -1176,6 +1183,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
             sharded_model.state_dict(), sharded_model_pipelined.state_dict()
         )
 
+        # pyrefly: ignore[not-callable]
         pipeline = pipeline_class(
             model=sharded_model_pipelined,
             optimizer=optim_pipelined,
@@ -1199,8 +1207,10 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         # Check internal states
         ebcs = [
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.ebc,
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.weighted_ebc,
         ]
         for ebc in ebcs:
@@ -1208,6 +1218,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
 
         if with_postproc:
             self.assertIsInstance(
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 PipelinedPostproc,
             )
@@ -1217,6 +1228,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         if with_postproc:
             # Check we removed pipelined postproc wrapping after detach
             self.assertIsInstance(
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 TestNegSamplingModule,
             )
@@ -1251,6 +1263,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         if with_postproc:
             # Check we have pipelined postproc after re-attaching
             self.assertIsInstance(
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 PipelinedPostproc,
             )
@@ -1334,6 +1347,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
             sharded_model.state_dict(), sharded_model_pipelined.state_dict()
         )
 
+        # pyrefly: ignore[not-callable]
         pipeline = pipeline_class(
             model=sharded_model_pipelined,
             optimizer=optim_pipelined,
@@ -1359,6 +1373,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
 
         if with_postproc:
             self.assertIsInstance(
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 PipelinedPostproc,
             )
@@ -1368,6 +1383,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         if with_postproc:
             # Check we removed pipelined postproc wrapping after detach
             self.assertIsInstance(
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 TestNegSamplingModule,
             )
@@ -1375,8 +1391,10 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         # Check internal states
         ebcs = [
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.ebc,
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.weighted_ebc,
         ]
         for ebc in ebcs:
@@ -1410,6 +1428,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
 
         if with_postproc:
             self.assertIsInstance(
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 PipelinedPostproc,
             )
@@ -1492,6 +1511,7 @@ class EmbeddingTrainPipelineTest(TrainPipelineSparseDistTestBase):
         )
 
         #  `sparse_forward`.
+        # pyrefly: ignore[missing-attribute]
         prior_sparse_out = sharded_model._dmp_wrapped_module.sparse_forward(
             data[0].to(self.device)
         )
@@ -1505,11 +1525,13 @@ class EmbeddingTrainPipelineTest(TrainPipelineSparseDistTestBase):
             batch = batch.to(self.device)
 
             #  `dense_forward`.
+            # pyrefly: ignore[missing-attribute]
             loss, pred = sharded_model._dmp_wrapped_module.dense_forward(
                 prior_batch, prior_sparse_out
             )
             if batch_index - 1 >= start_batch:
                 #  attribute `sparse_forward`.
+                # pyrefly: ignore[missing-attribute]
                 sparse_out = sharded_model._dmp_wrapped_module.sparse_forward(batch)
 
             loss.backward()
@@ -1533,6 +1555,7 @@ class EmbeddingTrainPipelineTest(TrainPipelineSparseDistTestBase):
 
             if batch_index - 1 < start_batch:
                 #  attribute `sparse_forward`.
+                # pyrefly: ignore[missing-attribute]
                 sparse_out = sharded_model._dmp_wrapped_module.sparse_forward(batch)
 
             prior_stashed_grads = stashed_grads
@@ -1825,10 +1848,12 @@ class DataLoadingThreadTest(unittest.TestCase):
         for i in range(7):
             data.append(torch.tensor([i]))
         data_iter = iter(data)
+        # pyrefly: ignore[bad-specialization]
         data_loader = DataLoadingThread(torch.device("cpu"), data_iter, True)
         data_loader.start()
         for i in range(7):
             item = data_loader.get_next_batch()
+            # pyrefly: ignore[missing-attribute]
             self.assertEqual(item.item(), i)
 
         self.assertIsNone(data_loader.get_next_batch(False))
@@ -1853,6 +1878,7 @@ class EvalPipelineSparseDistTest(unittest.TestCase):
             def __init__(self, model, optimizer, device: torch.device) -> None:
                 super().__init__(model, optimizer, device)
 
+            # pyrefly: ignore[bad-param-name-override]
             def _init_pipelined_modules(
                 self,
                 item: Pipelineable,
@@ -1861,11 +1887,13 @@ class EvalPipelineSparseDistTest(unittest.TestCase):
             ) -> None:
                 pass
 
+            # pyrefly: ignore[bad-param-name-override]
             def _start_sparse_data_dist(
                 self, item: Pipelineable, context: TrainPipelineContext
             ) -> None:
                 pass
 
+            # pyrefly: ignore[bad-override]
             def _wait_sparse_data_dist(self, context: TrainPipelineContext) -> None:
                 pass
 
@@ -2249,8 +2277,10 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
         # Check internal states
         ebcs = [
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.ebc,
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.weighted_ebc,
         ]
         for ebc in ebcs:
@@ -2410,6 +2440,7 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
             PipelineStage(
                 name="prefetch",
                 runnable=sdd.prefetch,
+                # pyrefly: ignore[bad-argument-type]
                 stream=sdd.prefetch_stream,
                 fill_callback=sdd.load_prefetch,
             ),

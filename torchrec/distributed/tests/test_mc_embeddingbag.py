@@ -183,6 +183,7 @@ class SparseArch(nn.Module):
                 is_inference=is_inference,
             )
         else:
+            # pyrefly: ignore[unsupported-operation]
             mc_modules["table_0"] = MCHManagedCollisionModule(
                 zch_size=tables[0].num_embeddings,
                 input_hash_size=4000,
@@ -191,6 +192,7 @@ class SparseArch(nn.Module):
                 eviction_policy=DistanceLFU_EvictionPolicy(),
             )
 
+            # pyrefly: ignore[unsupported-operation]
             mc_modules["table_1"] = MCHManagedCollisionModule(
                 zch_size=tables[1].num_embeddings,
                 device=device,
@@ -206,6 +208,7 @@ class SparseArch(nn.Module):
                     device=device,
                 ),
                 ManagedCollisionCollection(
+                    # pyrefly: ignore[bad-argument-type]
                     managed_collision_modules=mc_modules,
                     embedding_configs=tables,
                 ),
@@ -251,6 +254,7 @@ def _test_sharding(  # noqa C901
         apply_optimizer_in_backward(
             RowWiseAdagrad,
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ebc._embedding_bag_collection.embedding_bags[
                     "table_0"
@@ -274,6 +278,7 @@ def _test_sharding(  # noqa C901
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ebc": module_sharding_plan}),
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -316,6 +321,7 @@ def _test_sharding_and_remapping(  # noqa C901
         apply_optimizer_in_backward(
             RowWiseAdagrad,
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ebc._embedding_bag_collection.embedding_bags[
                     "table_0"
@@ -339,6 +345,7 @@ def _test_sharding_and_remapping(  # noqa C901
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ebc": module_sharding_plan}),
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -421,6 +428,7 @@ def _test_in_place_embd_weight_update(  # noqa C901
         apply_optimizer_in_backward(
             RowWiseAdagrad,
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ebc._embedding_bag_collection.embedding_bags[
                     "table_0"
@@ -444,6 +452,7 @@ def _test_in_place_embd_weight_update(  # noqa C901
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ebc": module_sharding_plan}),
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -552,6 +561,7 @@ def _run_single_rank_training_step(
         sharded_train_model = _shard_modules(
             module=copy.deepcopy(train_model),
             plan=ShardingPlan({"_mc_ebc": train_sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -563,6 +573,7 @@ def _run_single_rank_training_step(
 
         # Store managed collision module state
         mc_state = (
+            # pyrefly: ignore[missing-attribute]
             sharded_train_model._mc_ebc._managed_collision_collection._managed_collision_modules.state_dict()
         )
         for key, value in mc_state.items():
@@ -571,6 +582,7 @@ def _run_single_rank_training_step(
             ] = value.cpu()
 
         # Store embedding bag collection state
+        # pyrefly: ignore[missing-attribute]
         ebc_state = sharded_train_model._mc_ebc._embedding_bag_collection.state_dict()
         for key, value in ebc_state.items():
             tensors = []
@@ -743,7 +755,9 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         )
 
         merged_state_dict = _merge_sharded_return_state_dict(
-            train_state_dict, is_with_metadata=False
+            # pyrefly: ignore[bad-argument-type]
+            train_state_dict,
+            is_with_metadata=False,
         )
 
         # Global model that loads sharded model state

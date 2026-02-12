@@ -156,6 +156,7 @@ class MulticlassRecallMetricComputation(RecMetricComputation):
 
 
 class MulticlassRecallMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.MULTICLASS_RECALL
     _computation_class: Type[RecMetricComputation] = MulticlassRecallMetricComputation
 

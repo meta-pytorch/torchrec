@@ -113,6 +113,7 @@ class ShardedEmbeddingTower(
         device: Optional[torch.device] = None,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
     ) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
         intra_pg, cross_pg = intra_and_cross_node_pg(device)
         self._intra_pg: Optional[dist.ProcessGroup] = intra_pg
@@ -128,6 +129,7 @@ class ShardedEmbeddingTower(
         devices_per_host = dist.get_world_size(intra_pg)
         tower_devices = set()
         for sharding in table_name_to_parameter_sharding.values():
+            # pyrefly: ignore[bad-argument-type]
             tower_devices.update(sharding.ranks)
         host = {tower_device // devices_per_host for tower_device in tower_devices}
         assert len(host) == 1, f"{tower_devices}, {table_name_to_parameter_sharding}"
@@ -160,6 +162,7 @@ class ShardedEmbeddingTower(
             # shard embedding module
             self.embedding = embedding_sharder.shard(
                 module.embedding,
+                # pyrefly: ignore[bad-argument-type]
                 table_name_to_parameter_sharding,
                 intra_env,
                 device,
@@ -175,6 +178,7 @@ class ShardedEmbeddingTower(
 
         # Setup output dists for quantized comms
         #  Tensor]`.
+        # pyrefly: ignore[bad-override]
         self._output_dists: nn.ModuleList = (
             self.embedding._output_dists if self.embedding else nn.ModuleList()
         )
@@ -219,15 +223,18 @@ class ShardedEmbeddingTower(
         ]
         self._cross_dist = KJTAllToAll(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             self._cross_pg,
             kjt_features_per_node,
         )
         self._weighted_cross_dist = KJTAllToAll(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             self._cross_pg,
             wkjt_features_per_node,
         )
 
+    # pyrefly: ignore[bad-override]
     def input_dist(
         self,
         ctx: NullShardedModuleContext,
@@ -258,11 +265,13 @@ class ShardedEmbeddingTower(
 
         with torch.no_grad():
             if self._has_kjt_features_permute:
+                # pyrefly: ignore[missing-attribute]
                 kjt_features = kjt_features.permute(
                     self._kjt_features_order,
                     self._kjt_features_order_tensor,
                 )
             if self._has_wkjt_features_permute:
+                # pyrefly: ignore[missing-attribute]
                 wkjt_features = wkjt_features.permute(
                     self._wkjt_features_order,
                     self._wkjt_features_order_tensor,
@@ -283,9 +292,12 @@ class ShardedEmbeddingTower(
             if len(dist_input) == 2:
                 kjt_features = dist_input[0]
                 wkjt_features = dist_input[1]
+                # pyrefly: ignore[not-callable]
                 embeddings = self.embedding(kjt_features, wkjt_features)
             else:
+                # pyrefly: ignore[not-callable]
                 embeddings = self.embedding(dist_input[0])
+            # pyrefly: ignore[not-callable]
             output = self.interaction(embeddings)
         else:
             output = torch.empty(
@@ -323,8 +335,10 @@ class ShardedEmbeddingTower(
         dim_sum_per_rank = [x.item() for x in dim_sum_per_rank]
         self._output_dist = PooledEmbeddingsAllToAll(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=self._cross_pg,
             #  `List[Union[bool, float, int]]`.
+            # pyrefly: ignore[bad-argument-type]
             dim_sum_per_rank=dim_sum_per_rank,
             device=self._device,
             codecs=(
@@ -342,8 +356,10 @@ class ShardedEmbeddingTower(
         if self._has_uninitialized_output_dist:
             self._create_output_dist(ctx, output)
             self._has_uninitialized_output_dist = False
+        # pyrefly: ignore[not-callable]
         return TowerLazyAwaitable(self._output_dist(output))
 
+    # pyrefly: ignore[bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -352,9 +368,12 @@ class ShardedEmbeddingTower(
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
+            # pyrefly: ignore[missing-attribute]
             destination._metadata = OrderedDict()
         if self._active_device:
+            # pyrefly: ignore[missing-attribute]
             self.embedding.state_dict(destination, prefix + "embedding.", keep_vars)
+            # pyrefly: ignore[missing-attribute]
             self.interaction.module.state_dict(
                 destination, prefix + "interaction.", keep_vars
             )
@@ -363,6 +382,7 @@ class ShardedEmbeddingTower(
     @property
     def fused_optimizer(self) -> KeyedOptimizer:
         if self.embedding:
+            # pyrefly: ignore[bad-return]
             return self.embedding.fused_optimizer
         else:
             return CombinedOptimizer([])
@@ -371,9 +391,11 @@ class ShardedEmbeddingTower(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, nn.Parameter]]:
         if self._active_device:
+            # pyrefly: ignore[missing-attribute]
             yield from self.embedding.named_parameters(
                 append_prefix(prefix, "embedding"), recurse
             )
+            # pyrefly: ignore[missing-attribute]
             yield from self.interaction.module.named_parameters(
                 append_prefix(prefix, "interaction"), recurse
             )
@@ -384,9 +406,11 @@ class ShardedEmbeddingTower(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, torch.Tensor]]:
         if self._active_device:
+            # pyrefly: ignore[missing-attribute]
             yield from self.embedding.named_buffers(
                 append_prefix(prefix, "embedding"), recurse
             )
+            # pyrefly: ignore[missing-attribute]
             yield from self.interaction.module.named_buffers(
                 append_prefix(prefix, "interaction"), recurse
             )
@@ -394,9 +418,11 @@ class ShardedEmbeddingTower(
 
     def sharded_parameter_names(self, prefix: str = "") -> Iterator[str]:
         if self._active_device:
+            # pyrefly: ignore[missing-attribute]
             yield from self.embedding.sharded_parameter_names(
                 append_prefix(prefix, "embedding")
             )
+            # pyrefly: ignore[missing-attribute]
             for name, _ in self.interaction.module.named_parameters(
                 append_prefix(prefix, "interaction")
             ):
@@ -435,6 +461,7 @@ class ShardedEmbeddingTowerCollection(
         device: Optional[torch.device] = None,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
     ) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
 
         intra_pg, cross_pg = intra_and_cross_node_pg(device)
@@ -471,6 +498,7 @@ class ShardedEmbeddingTowerCollection(
             tables_per_pt[i].add(k)
             for i in range(self._cross_pg_world_size)
             for k, v in table_name_to_parameter_sharding.items()
+            # pyrefly: ignore[unsupported-operation]
             if v.ranks[0] // self._intra_pg_world_size == i
         ]
 
@@ -478,6 +506,7 @@ class ShardedEmbeddingTowerCollection(
         tables_per_lt: List[Set[str]] = []
         for tower in module.towers:
             #  `Module`.
+            # pyrefly: ignore[bad-argument-type]
             lt_tables = set(tower_sharder.shardable_parameters(tower).keys())
             tables_per_lt.append(lt_tables)
             # check the tables in a logical tower are on same physical tower
@@ -510,6 +539,7 @@ class ShardedEmbeddingTowerCollection(
 
         for pt_index, lt_on_pt in enumerate(logical_to_physical_order):
             for lt_index in lt_on_pt:
+                # pyrefly: ignore[missing-attribute]
                 kjt_features, wkjt_features = tower_sharder.embedding_feature_names(
                     module.towers[lt_index]
                 )
@@ -523,6 +553,7 @@ class ShardedEmbeddingTowerCollection(
             self._wkjt_num_features_per_pt.append(len(wkjt_names))
 
         #  used as `List[Tuple[str, Module]]`.
+        # pyrefly: ignore[bad-assignment]
         local_towers: List[Tuple[str, EmbeddingTower]] = [
             (str(i), tower)
             for i, tower in enumerate(module.towers)
@@ -550,10 +581,12 @@ class ShardedEmbeddingTowerCollection(
                         table.name for table in tower.embedding.embedding_configs()
                     }
                 elif hasattr(tower.embedding, "tables"):
+                    # pyrefly: ignore[not-callable]
                     table_names = {table.name for table in tower.embedding.tables()}
                 else:
                     # Use all tables if unable to determine from tower.embedding
                     table_names = set(table_name_to_parameter_sharding.keys())
+                # pyrefly: ignore[missing-attribute]
                 self.embeddings[i] = tower_sharder.embedding_sharder(tower).shard(
                     tower.embedding,
                     {
@@ -579,7 +612,9 @@ class ShardedEmbeddingTowerCollection(
         output_dists = nn.ModuleList()
         for embedding in self.embeddings.values():
             #  `Union[Module, Tensor]`.
+            # pyrefly: ignore[bad-argument-type]
             output_dists.extend(embedding._output_dists)
+        # pyrefly: ignore[bad-override]
         self._output_dists: nn.ModuleList = output_dists
 
     def _create_input_dist(
@@ -612,15 +647,18 @@ class ShardedEmbeddingTowerCollection(
 
         self._cross_dist = KJTAllToAll(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             self._cross_pg,
             self._kjt_num_features_per_pt,
         )
         self._weighted_cross_dist = KJTAllToAll(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             self._cross_pg,
             self._wkjt_num_features_per_pt,
         )
 
+    # pyrefly: ignore[bad-override]
     def input_dist(
         self,
         ctx: EmbeddingTowerCollectionContext,
@@ -628,6 +666,7 @@ class ShardedEmbeddingTowerCollection(
         wkjt_features: Optional[KeyedJaggedTensor] = None,
     ) -> Awaitable[Awaitable[KJTList]]:
         if self._has_uninitialized_input_dist:
+            # pyrefly: ignore[missing-attribute]
             stride = kjt_features.stride() if kjt_features else wkjt_features.stride()
             self._cross_pg_global_batch_size = stride * self._cross_pg_world_size
             self._create_input_dist(
@@ -637,11 +676,13 @@ class ShardedEmbeddingTowerCollection(
             self._has_uninitialized_input_dist = False
         with torch.no_grad():
             if self._has_kjt_features_permute:
+                # pyrefly: ignore[missing-attribute]
                 kjt_features = kjt_features.permute(
                     self._kjt_features_order,
                     cast(torch.Tensor, self._kjt_features_order_tensor),
                 )
             if self._has_wkjt_features_permute:
+                # pyrefly: ignore[missing-attribute]
                 wkjt_features = wkjt_features.permute(
                     self._wkjt_features_order,
                     cast(torch.Tensor, self._wkjt_features_order_tensor),
@@ -714,7 +755,9 @@ class ShardedEmbeddingTowerCollection(
         dim_sum_per_rank = [x.item() for x in dim_sum_per_rank]
         self._output_dist = PooledEmbeddingsAllToAll(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=self._cross_pg,
+            # pyrefly: ignore[bad-argument-type]
             dim_sum_per_rank=dim_sum_per_rank,
             device=self._device,
             codecs=(
@@ -732,11 +775,13 @@ class ShardedEmbeddingTowerCollection(
         if self._has_uninitialized_output_dist:
             self._create_output_dist(output)
             self._has_uninitialized_output_dist = False
+        # pyrefly: ignore[not-callable]
         return TowerLazyAwaitable(self._output_dist(output))
 
     def create_context(self) -> EmbeddingTowerCollectionContext:
         return EmbeddingTowerCollectionContext(embedding_contexts=[])
 
+    # pyrefly: ignore[bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -745,13 +790,16 @@ class ShardedEmbeddingTowerCollection(
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
+            # pyrefly: ignore[missing-attribute]
             destination._metadata = OrderedDict()
         for i, embedding in self.embeddings.items():
+            # pyrefly: ignore[no-matching-overload]
             embedding.state_dict(
                 destination, prefix + f"towers.{i}.embedding.", keep_vars
             )
         for i, interaction in self.interactions.items():
             #  `state_dict`.
+            # pyrefly: ignore[missing-attribute]
             interaction.module.state_dict(
                 destination, prefix + f"towers.{i}.interaction.", keep_vars
             )
@@ -762,6 +810,7 @@ class ShardedEmbeddingTowerCollection(
         return CombinedOptimizer(
             #  KeyedOptimizer], KeyedOptimizer]]` but got `List[Tuple[str,
             #  Union[Module, Tensor]]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 (f"towers.{tower_index}.embedding", embedding.fused_optimizer)
                 for tower_index, embedding in self.embeddings.items()
@@ -780,6 +829,7 @@ class ShardedEmbeddingTowerCollection(
         for i, interaction in self.interactions.items():
             yield from (
                 #  attribute `named_parameters`.
+                # pyrefly: ignore[missing-attribute]
                 interaction.module.named_parameters(
                     append_prefix(prefix, f"towers.{i}.interaction"), recurse
                 )
@@ -797,6 +847,7 @@ class ShardedEmbeddingTowerCollection(
         for i, interaction in self.interactions.items():
             yield from (
                 #  attribute `named_buffers`.
+                # pyrefly: ignore[missing-attribute]
                 interaction.module.named_buffers(
                     append_prefix(prefix, f"towers.{i}.interaction"), recurse
                 )
@@ -805,6 +856,7 @@ class ShardedEmbeddingTowerCollection(
     def sharded_parameter_names(self, prefix: str = "") -> Iterator[str]:
         for i, embedding in self.embeddings.items():
             yield from (
+                # pyrefly: ignore[not-callable]
                 embedding.sharded_parameter_names(
                     append_prefix(prefix, f"towers.{i}.embedding")
                 )
@@ -813,6 +865,7 @@ class ShardedEmbeddingTowerCollection(
             yield from (
                 key
                 #  attribute `named_parameters`.
+                # pyrefly: ignore[missing-attribute]
                 for key, _ in interaction.module.named_parameters(
                     append_prefix(prefix, f"towers.{i}.interaction")
                 )
@@ -874,10 +927,12 @@ class EmbeddingTowerSharder(BaseEmbeddingSharder[EmbeddingTower]):
     ) -> BaseEmbeddingSharder[nn.Module]:
         embedding: nn.Module = module.embedding
         if isinstance(embedding, EmbeddingBagCollection):
+            # pyrefly: ignore[bad-return]
             return EmbeddingBagCollectionSharder(
                 self.fused_params, qcomm_codecs_registry=self.qcomm_codecs_registry
             )
         elif isinstance(embedding, EmbeddingCollection):
+            # pyrefly: ignore[bad-return]
             return EmbeddingCollectionSharder(
                 self.fused_params, qcomm_codecs_registry=self.qcomm_codecs_registry
             )
@@ -965,6 +1020,7 @@ class EmbeddingTowerCollectionSharder(BaseEmbeddingSharder[EmbeddingTowerCollect
         named_parameters: Dict[str, nn.Parameter] = {}
         for tower in module.towers:
             #  `Module`.
+            # pyrefly: ignore[bad-argument-type]
             named_parameters.update(self._tower_sharder.shardable_parameters(tower))
         return named_parameters
 

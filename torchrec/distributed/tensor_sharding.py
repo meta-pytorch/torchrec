@@ -106,6 +106,7 @@ class InferObjectPoolSharding(ABC):
     ) -> None:
         self._pool_size = pool_size
         self._env = env
+        # pyrefly: ignore[bad-assignment]
         self._pg: dist.ProcessGroup = self._env.process_group
         self._world_size: int = self._env.world_size
         self._rank: int = self._env.rank

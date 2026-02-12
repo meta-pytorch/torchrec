@@ -97,6 +97,7 @@ class DLRMPredictModule(PredictModule):
             over_arch_layer_sizes=over_arch_layer_sizes,
             dense_device=dense_device,
         )
+        # pyrefly: ignore[bad-argument-type]
         super().__init__(module, dense_device)
 
         self.id_list_features_keys: List[str] = id_list_features_keys
@@ -153,6 +154,7 @@ class DLRMPredictFactory(PredictFactory):
     def __init__(self, model_config: DLRMModelConfig) -> None:
         self.model_config = model_config
 
+    # pyrefly: ignore[bad-override]
     def create_predict_module(self, world_size: int, device: str) -> torch.nn.Module:
         logging.basicConfig(level=logging.INFO)
         set_propogate_device(True)
@@ -180,6 +182,7 @@ class DLRMPredictFactory(PredictFactory):
             dense_arch_layer_sizes=self.model_config.dense_arch_layer_sizes,
             over_arch_layer_sizes=self.model_config.over_arch_layer_sizes,
             id_list_features_keys=self.model_config.id_list_features_keys,
+            # pyrefly: ignore[bad-argument-type]
             dense_device=device,
         )
 
@@ -211,6 +214,7 @@ class DLRMPredictFactory(PredictFactory):
         scripted_gm(batch)
         return scripted_gm
 
+    # pyrefly: ignore[bad-override]
     def batching_metadata(self) -> Dict[str, str]:
         return {
             "float_features": "dense",

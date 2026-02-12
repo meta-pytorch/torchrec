@@ -106,6 +106,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
                 ),
             )
         else:
+            # pyrefly: ignore[bad-argument-type]
             ebc.qconfig = QuantConfig(
                 activation=torch.quantization.PlaceholderObserver.with_args(
                     dtype=output_type
@@ -467,6 +468,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         test_model = TestModel(ebc)
 
         before_quant_state_dict = test_model.state_dict()
+        # pyrefly: ignore[bad-assignment]
         test_model.ebc = QuantEmbeddingBagCollection.from_float(ebc)
 
         state_dict = test_model.state_dict()
@@ -583,6 +585,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
         embeddings = ec(features)
 
         # test forward
+        # pyrefly: ignore[bad-argument-type]
         ec.qconfig = QuantConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -777,6 +780,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
             inplace=True,
             per_table_weight_dtype={"t1": torch.float16},
         )
+        # pyrefly: ignore[not-callable]
         configs = model.m.embedding_configs()
         self.assertEqual(len(configs), 2)
         self.assertNotEqual(configs[0].name, configs[1].name)
@@ -835,6 +839,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
         # feature name should be consistent with the order of grouped embeddings
         self.assertEqual(qec.m._feature_names, ["f1", "f3", "f2"])
 
+        # pyrefly: ignore[not-callable]
         configs = model.m.embedding_configs()
         self.assertEqual(len(configs), 3)
         features = KeyedJaggedTensor(
@@ -897,6 +902,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
             inplace=True,
             per_table_weight_dtype={"t1": torch.float16},
         )
+        # pyrefly: ignore[not-callable]
         configs = model.m.embedding_bag_configs()
         self.assertEqual(len(configs), 2)
         self.assertNotEqual(configs[0].name, configs[1].name)

@@ -411,6 +411,7 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
 
         def mock_forward(features: KeyedJaggedTensor, iter_val: int) -> List[Tensor]:
             captured_iter_args.append((type(iter_val), iter_val))
+            # pyrefly: ignore[bad-return]
             return original_forward(features, iter_val)
 
         with patch.object(itep_module, "forward", mock_forward):
@@ -493,6 +494,7 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
                 ) -> List[Tensor]:
                     nonlocal captured_iter
                     captured_iter = iter_val
+                    # pyrefly: ignore[bad-return]
                     return original_forward(features, iter_val)
 
                 with patch.object(itep_module, "forward", mock_forward):
@@ -580,6 +582,7 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             features: KeyedJaggedTensor, iter_val: int
         ) -> List[Tensor]:
             iter_history.append(iter_val)
+            # pyrefly: ignore[bad-return]
             return original_forward(features, iter_val)
 
         with patch.object(itep_module, "forward", track_iter_forward):
@@ -702,6 +705,7 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             features: KeyedJaggedTensor, iter_val: int
         ) -> List[Tensor]:
             captured_values.append((type(iter_val), iter_val))
+            # pyrefly: ignore[bad-return]
             return original_forward(features, iter_val)
 
         with patch.object(itep_module, "forward", capture_iter_forward):
@@ -755,6 +759,7 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             features: KeyedJaggedTensor, iter_val: int
         ) -> List[Tensor]:
             iter_values_received.append(iter_val)
+            # pyrefly: ignore[bad-return]
             return original_forward(features, iter_val)
 
         with patch.object(itep_module, "forward", tracking_forward):

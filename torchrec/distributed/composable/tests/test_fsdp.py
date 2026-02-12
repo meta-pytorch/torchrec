@@ -82,16 +82,19 @@ class FullyShardTest(MultiProcessTestBase):
                 m.sparse.parameters(),
                 {"lr": 0.01},
             )
+            # pyrefly: ignore[invalid-param-spec]
             m.sparse.ebc = trec_shard(
                 module=m.sparse.ebc,
                 device=ctx.device,
                 plan=row_wise(),
             )
+            # pyrefly: ignore[invalid-param-spec]
             m.sparse.weighted_ebc = trec_shard(
                 module=m.sparse.weighted_ebc,
                 device=ctx.device,
                 plan=row_wise(),
             )
+            # pyrefly: ignore[bad-assignment]
             m.dense = FSDP(
                 m.dense,
                 auto_wrap_policy=ModuleWrapPolicy({nn.Linear}),
@@ -120,6 +123,7 @@ class FullyShardTest(MultiProcessTestBase):
             ):
                 # Add learning rate scheduler
                 warmup = WarmupOptimizer(
+                    # pyrefly: ignore[missing-attribute]
                     p._in_backward_optimizers[0],
                     [
                         WarmupStage(
@@ -135,6 +139,7 @@ class FullyShardTest(MultiProcessTestBase):
                 optims.append((name, warmup))
                 sparse_grad_parameter_names.add(name)
             assert len(sparse_grad_parameter_names) == 5
+            # pyrefly: ignore[bad-argument-type]
             fused_opt_scheduled = CombinedOptimizer(optims)
             dense_opt_scheduled = WarmupOptimizer(
                 dense_opt,
@@ -195,8 +200,10 @@ class FullyShardTest(MultiProcessTestBase):
                             continue
                         p = p.local_tensor()
                     if isinstance(p, DTensor):
+                        # pyrefly: ignore[missing-attribute]
                         if not p.to_local().local_shards():
                             continue
+                        # pyrefly: ignore[missing-attribute]
                         p = p.to_local().local_shards()[0]
                     p_sum += p.sum()
                     p.zero_()
@@ -211,8 +218,10 @@ class FullyShardTest(MultiProcessTestBase):
                             continue
                         t = t.local_tensor()
                     if isinstance(t, DTensor):
+                        # pyrefly: ignore[missing-attribute]
                         if not t.to_local().local_shards():
                             continue
+                        # pyrefly: ignore[missing-attribute]
                         t = t.to_local().local_shards()[0]
                     o_sum += t.sum()
                     t.zero_()
@@ -238,8 +247,10 @@ class FullyShardTest(MultiProcessTestBase):
                         p = p.local_tensor()
                     p_sum_loaded += p.sum()
                     if isinstance(p, DTensor):
+                        # pyrefly: ignore[missing-attribute]
                         if not p.to_local().local_shards():
                             continue
+                        # pyrefly: ignore[missing-attribute]
                         p = p.to_local().local_shards()[0]
             assert p_sum.allclose(p_sum_loaded)
 
@@ -253,8 +264,10 @@ class FullyShardTest(MultiProcessTestBase):
                             continue
                         t = t.local_tensor()
                     if isinstance(t, DTensor):
+                        # pyrefly: ignore[missing-attribute]
                         if not t.to_local().local_shards():
                             continue
+                        # pyrefly: ignore[missing-attribute]
                         t = t.to_local().local_shards()[0]
                     o_sum_loaded += t.sum()
             assert o_sum.allclose(o_sum_loaded)

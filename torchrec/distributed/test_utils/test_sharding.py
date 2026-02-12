@@ -198,7 +198,9 @@ def gen_model_and_input(
     embedding_groups: Dict[str, List[str]],
     world_size: int,
     generate: Union[
-        ModelInputCallable, VariableBatchModelInputCallable
+        ModelInputCallable,
+        VariableBatchModelInputCallable,
+        # pyrefly: ignore[bad-function-definition]
     ] = ModelInput.generate,
     weighted_tables: Optional[List[EmbeddingTableConfig]] = None,
     num_float_features: int = 16,
@@ -338,6 +340,7 @@ def dynamic_sharding_test(
     indices_dtype: torch.dtype = torch.int64,
     offsets_dtype: torch.dtype = torch.int64,
     lengths_dtype: torch.dtype = torch.int64,
+    # pyrefly: ignore[bad-function-definition]
     sharding_type: ShardingType = None,
     random_seed: int = 0,
     skip_passing_resharding_fqn: bool = False,
@@ -370,6 +373,7 @@ def dynamic_sharding_test(
             model_class=model_class,
             tables=tables,
             generate=(
+                # pyrefly: ignore[bad-argument-type]
                 cast(
                     VariableBatchModelInputCallable,
                     ModelInput.generate_variable_batch_input,
@@ -480,8 +484,10 @@ def dynamic_sharding_test(
                 ):
                     sharding_spec = parameter_sharding.sharding_spec
                     if sharding_spec is not None:
+                        # pyrefly: ignore[missing-attribute]
                         for shard in sharding_spec.shards:
                             placement = shard.placement
+                            # pyrefly: ignore[redefinition]
                             rank: Optional[int] = placement.rank()
                             assert rank is not None
                             shard.placement = torch.distributed._remote_device(
@@ -513,15 +519,20 @@ def dynamic_sharding_test(
         new_per_param_sharding = {}
 
         assert len(sharders) == 1
+        # pyrefly: ignore[missing-attribute]
         kernel_type = sharders[0]._kernel_type
         # Construct parameter shardings
         for i in range(num_tables):
             table_name = tables[i].name
+            # pyrefly: ignore[unsupported-operation]
             table_constraint = constraints[table_name]
             assert hasattr(table_constraint, "sharding_types")
             assert (
-                len(table_constraint.sharding_types) == 1
+                # pyrefly: ignore[bad-argument-type]
+                len(table_constraint.sharding_types)
+                == 1
             ), "Dynamic Sharding currently only supports 1 sharding type per table"
+            # pyrefly: ignore[unsupported-operation]
             sharding_type = ShardingType(table_constraint.sharding_types[0])
             sharding_type_constructor = get_sharding_constructor_from_type(
                 sharding_type
@@ -588,7 +599,10 @@ def dynamic_sharding_test(
         )
 
         new_module_sharding_plan_delta = output_sharding_plans_delta(
-            plan.plan, plan_1.plan
+            # pyrefly: ignore[bad-argument-type]
+            plan.plan,
+            # pyrefly: ignore[bad-argument-type]
+            plan_1.plan,
         )
 
         dense_m1_optim = KeyedOptimizerWrapper(
@@ -675,6 +689,7 @@ def copy_state_dict(
         if isinstance(global_tensor, ShardedTensor):
             global_tensor = global_tensor.local_shards()[0].tensor
         if isinstance(global_tensor, DTensor):
+            # pyrefly: ignore[missing-attribute]
             global_tensor = global_tensor.to_local().local_shards()[0]
 
         if isinstance(tensor, ShardedTensor):
@@ -714,7 +729,9 @@ def copy_state_dict(
                     local_shard.tensor.copy_(t)
         elif isinstance(tensor, DTensor):
             for local_shard, global_offset in zip(
+                # pyrefly: ignore[missing-attribute]
                 tensor.to_local().local_shards(),
+                # pyrefly: ignore[missing-attribute]
                 tensor.to_local().local_offsets(),
             ):
                 assert (
@@ -747,6 +764,7 @@ def alter_global_ebc_dtype(model: nn.Module) -> None:
             with torch.no_grad():
                 for bag in ebc.embedding_bags.values():
                     #  `Union[Module, Tensor]`.
+                    # pyrefly: ignore[bad-argument-type]
                     bag.weight = torch.nn.Parameter(bag.weight.float())
 
 
@@ -796,6 +814,7 @@ def sharding_single_rank_test_single_process(
         model_class=model_class,
         tables=tables,
         generate=(
+            # pyrefly: ignore[bad-argument-type]
             cast(
                 VariableBatchModelInputCallable,
                 ModelInput.generate_variable_batch_input,
@@ -883,7 +902,9 @@ def sharding_single_rank_test_single_process(
                 kernel_type=EmbeddingComputeKernel.FUSED.value,
                 qcomms_config=qcomms_config,
             )
+            # pyrefly: ignore[bad-argument-type]
             sharders.append(sharder)
+            # pyrefly: ignore[bad-argument-type]
             config.plan = planner.collective_plan(local_model, [sharder], pg)
 
     """
@@ -911,8 +932,10 @@ def sharding_single_rank_test_single_process(
             ):
                 sharding_spec = parameter_sharding.sharding_spec
                 if sharding_spec is not None:
+                    # pyrefly: ignore[missing-attribute]
                     for shard in sharding_spec.shards:
                         placement = shard.placement
+                        # pyrefly: ignore[redefinition]
                         rank: Optional[int] = placement.rank()
                         assert rank is not None
                         shard.placement = torch.distributed._remote_device(
@@ -951,6 +974,7 @@ def sharding_single_rank_test_single_process(
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=all_reduce_func,
             submodule_configs=submodule_configs,
+            # pyrefly: ignore[bad-argument-type]
             sharding_strategy=sharding_strategy,
             rs_awaitable_hook_module=rs_awaitable_hook_module,
         )
@@ -1201,6 +1225,7 @@ def compare_models_pred_one_step(
     Helper function to compare the model predictions of two models after one training step.
     Useful for debugging sharding tests to see which model weights are different
     """
+    # pyrefly: ignore[missing-attribute]
     compare_model_weights(model_1.module.sparse, model_2.module.sparse)
     # Run a single training step of the global model.
     output_1 = gen_full_pred_after_one_step(model_1, opt_1, input, skip_inference=True)
@@ -1208,7 +1233,9 @@ def compare_models_pred_one_step(
 
     torch.testing.assert_close(output_1, output_2)
     compare_model_weights(
+        # pyrefly: ignore[missing-attribute]
         model_1.module.sparse,
+        # pyrefly: ignore[missing-attribute]
         model_2.module.sparse,
     )  # Module weights are the same
 
@@ -1261,11 +1288,15 @@ def compare_model_weights(
             # Compare local tensors for DTensor
             local1 = param1.to_local()
             local2 = param2.to_local()
+            # pyrefly: ignore[missing-attribute]
             for shard1, offset1 in zip(local1.local_shards(), local1.local_offsets()):
                 found_match = False
 
                 for shard2, offset2 in zip(
-                    local2.local_shards(), local2.local_offsets()
+                    # pyrefly: ignore[missing-attribute]
+                    local2.local_shards(),
+                    # pyrefly: ignore[missing-attribute]
+                    local2.local_offsets(),
                 ):
                     if offset1 == offset2:
                         torch.testing.assert_close(
@@ -1295,6 +1326,7 @@ def generate_rank_placements(
     world_size: int,
     num_tables: int,
     ranks_per_tables: List[int],
+    # pyrefly: ignore[bad-function-definition]
     random_seed: int = None,
 ) -> List[List[int]]:
     # Cannot include old/new rank generation with hypothesis library due to depedency on world_size

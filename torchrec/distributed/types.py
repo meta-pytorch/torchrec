@@ -47,6 +47,7 @@ try:
     # other metaclasses (i.e. AwaitableMeta) for customized
     # behaviors, as Generic is non-trival metaclass in
     # python 3.6 and below
+    # pyrefly: ignore[missing-module-attribute]
     from typing import GenericMeta
 except ImportError:
     # In python 3.7+, GenericMeta doesn't exist as it's no
@@ -96,6 +97,7 @@ def _tabulate(
         str: A string representation of the table.
     """
     if headers is None:
+        # pyrefly: ignore[bad-assignment]
         headers = table[0]
         table = table[1:]
     headers = cast(List[str], headers)
@@ -308,7 +310,9 @@ class QuantizedCommCodecs:
     The quantization codecs to use for the forward and backward pass respectively of a comm op (e.g. pooled_all_to_all, reduce_scatter, sequence_all_to_all).
     """
 
+    # pyrefly: ignore[bad-assignment]
     forward: QuantizedCommCodec = NoOpQuantizedCommCodec()
+    # pyrefly: ignore[bad-assignment]
     backward: QuantizedCommCodec = NoOpQuantizedCommCodec()
 
 
@@ -354,7 +358,10 @@ class NoWait(Awaitable[W]):
 
 
 class _LazyAwaitableMeta(
-    GenericMeta, abc.ABCMeta, torch.fx._symbolic_trace.ProxyableClassMeta
+    # pyrefly: ignore[invalid-inheritance]
+    GenericMeta,
+    abc.ABCMeta,
+    torch.fx._symbolic_trace.ProxyableClassMeta,
 ):
     """
     The _LazyAwaitableMeta class that inherits both ABCMeta and ProxyableClassMeta
@@ -448,6 +455,7 @@ class LazyAwaitable(Awaitable[W], metaclass=_LazyAwaitableMeta):
                 f"did you forget to call 'super()'?"
             )
         elif name == "__setstate__":
+            # pyrefly: ignore[missing-attribute]
             return super().__getattr__(name)
 
         res = LazyAwaitable._wait_async(self)
@@ -503,6 +511,7 @@ class LazyGetItemMixin(Generic[KT, VT_co]):
     """
 
     def __getitem__(self, key: KT) -> LazyAwaitable[VT_co]:
+        # pyrefly: ignore[bad-argument-type]
         return GetItemLazyAwaitable(self, key)
 
 
@@ -788,10 +797,14 @@ class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterShardin
                             ]
                         )
         out += "\n\n" + _tabulate(
-            param_table, ["param", "sharding type", "compute kernel", "ranks"]
+            # pyrefly: ignore[bad-argument-type]
+            param_table,
+            ["param", "sharding type", "compute kernel", "ranks"],
         )
         out += "\n\n" + _tabulate(
-            shard_table, ["param", "shard offsets", "shard sizes", "placement"]
+            # pyrefly: ignore[bad-argument-type]
+            shard_table,
+            ["param", "shard offsets", "shard sizes", "placement"],
         )
         return out
 
@@ -810,6 +823,7 @@ class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterShardin
                     for shard in shards:
                         shard_dict = asdict(shard)
                         shard_dict["placement"] = str(shard_dict["placement"])
+                        # pyrefly: ignore[missing-attribute]
                         sharding_plan_dict[param_name]["shards"].append(shard_dict)
 
         return sharding_plan_dict
@@ -1036,8 +1050,11 @@ class DMPCollectionContext(DMPCollectionConfig):
             modules_to_sync if modules_to_sync is not None else []
         )
         self.sharded_module: Optional[nn.Module] = sharded_module
+        # pyrefly: ignore[bad-assignment]
         self.device_mesh: Optional["DeviceMesh"] = device_mesh
+        # pyrefly: ignore[bad-assignment]
         self.sharding_pg: Optional["dist.ProcessGroup"] = sharding_pg
+        # pyrefly: ignore[bad-assignment]
         self.replica_pg: Optional["dist.ProcessGroup"] = replica_pg
         self.weights_by_dtype: Dict["torch.dtype", List["torch.Tensor"]] = (
             weights_by_dtype if weights_by_dtype is not None else {}
@@ -1083,11 +1100,13 @@ class ShardingEnv2D(ShardingEnv):
         self.global_world_size: int = dist.get_world_size(global_pg)
         self.rank: int = dist.get_rank(sharding_pg)
         self.global_rank: int = dist.get_rank(global_pg)
+        # pyrefly: ignore[bad-override]
         self.process_group: dist.ProcessGroup = (
             global_pg  # to keep consistent naming between ShardingEnv and ShardingEnv2D
         )
         self.sharding_pg: dist.ProcessGroup = sharding_pg
         self.replica_pg: dist.ProcessGroup = replica_pg
+        # pyrefly: ignore[bad-override]
         self.device_mesh: DeviceMesh = device_mesh
         self.node_group_size: Optional[int] = node_group_size
         self.output_dtensor: bool = True
@@ -1479,6 +1498,7 @@ class ObjectPoolShardingPlan(ModuleShardingPlan):
             "inference": self.inference,
         }
         if self.memory_capacity_per_rank is not None:
+            # pyrefly: ignore[bad-typed-dict-key]
             output["memory_capacity_per_rank"] = self.memory_capacity_per_rank
         return output
 

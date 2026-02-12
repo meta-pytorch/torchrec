@@ -84,6 +84,7 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
             """Override _init_dmp to always set module_id_cache to None"""
             # Call _shard_modules_impl with module_id_cache=None (caching disabled)
             module_id_cache: Dict[int, ShardedModule] = {}
+            # pyrefly: ignore[bad-argument-type]
             return self_dmp._shard_modules_impl(module, module_id_cache=module_id_cache)
 
         # Setup: Create shared embedding modules that will be reused
@@ -129,12 +130,16 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
         # Verify that the same module instances are reused (cached behavior)
         wrapped_module = dmp.module
         self.assertIs(
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse1.ebc,
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse2.ebc,
             "ebc1 and ebc2 should be the same sharded instance",
         )
         self.assertIs(
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse1.ec,
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse2.ec,
             "ec1 and ec2 should be the same sharded instance",
         )
@@ -207,12 +212,16 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
         # Without caching, the same module should be sharded twice,
         # resulting in different sharded instances
         self.assertIsNot(
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse1.ebc,
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse2.ebc,
             "Without caching, ebc1 and ebc2 should be different sharded instances",
         )
         self.assertIsNot(
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse1.ec,
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse2.ec,
             "Without caching, ec1 and ec2 should be different sharded instances",
         )
@@ -229,11 +238,13 @@ class ModelParallelSparseOnlyTestNccl(ModelParallelSparseOnlyBase):
             "ec1 should be sharded",
         )
         self.assertIsInstance(
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse2.ebc,
             ShardedModule,
             "ebc2 should be sharded",
         )
         self.assertIsInstance(
+            # pyrefly: ignore[missing-attribute]
             wrapped_module.sparse2.ec,
             ShardedModule,
             "ec2 should be sharded",

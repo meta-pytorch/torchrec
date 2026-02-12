@@ -136,6 +136,7 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
 
         awaitable = self._context.embedding_a2a_requests.pop(self._name)
         # in case of MC modules
+        # pyrefly: ignore[unsafe-overlap]
         is_mc_module: bool = isinstance(awaitable, Iterable)
         remapped_kjts: Optional[KeyedJaggedTensor] = None
 
@@ -148,11 +149,14 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
                 awaitable.wait()
             )  # trigger awaitable manually for type checking
 
+        # pyrefly: ignore[bad-argument-type]
         self.detach_embeddings(embeddings=embeddings, cur_stream=cur_stream)
 
         if is_mc_module:
+            # pyrefly: ignore[bad-argument-type]
             return (LazyNoWait(embeddings), LazyNoWait(remapped_kjts))
         else:
+            # pyrefly: ignore[bad-argument-type]
             return LazyNoWait(embeddings)
 
     def detach_embeddings(
@@ -183,6 +187,7 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
         else:
             # in case of EBC, embeddings are KeyedTensor
             assert isinstance(embeddings, KeyedTensor)
+            # pyrefly: ignore[bad-argument-type]
             embeddings.record_stream(cur_stream)
             tensor = embeddings.values()
             detached_tensor = tensor.detach().requires_grad_()

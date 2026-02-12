@@ -141,6 +141,7 @@ class EmbeddingEnumerator(Enumerator):
             self._last_stored_module == module
             and self._last_stored_sharders == sharders
         ):
+            # pyrefly: ignore[bad-argument-type]
             return copy.deepcopy(self._last_stored_search_space)
 
         self._sharder_map = {
@@ -376,6 +377,7 @@ class EmbeddingEnumerator(Enumerator):
             and self._constraints.get(name)
             and self._constraints[name].compute_kernels
         ):
+            # pyrefly: ignore[bad-assignment]
             constrained_compute_kernels: List[str] = self._constraints[
                 name
             ].compute_kernels

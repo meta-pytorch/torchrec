@@ -165,6 +165,7 @@ def _get_runtime_device(
                     and len(table.global_metadata.shards_metadata)
                     and table.global_metadata.shards_metadata[index].placement
                     is not None
+                    # pyrefly: ignore[missing-attribute]
                     and table.global_metadata.shards_metadata[index]
                     .placement.device()
                     .type
@@ -229,6 +230,7 @@ class IntNBitTableBatchedEmbeddingBagsCodegenWithLength(
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
 
+    # pyrefly: ignore[bad-param-name-override]
     def forward(
         self,
         indices: torch.Tensor,
@@ -370,6 +372,7 @@ class QuantBatchedEmbeddingBag(
             assert (
                 tbe_clazz == KVEmbeddingInference
             ), "shard_offsets_for_kv_zch should be computed only for kv zch kernel"
+            # pyrefly: ignore[not-callable]
             self._emb_module.init_tbe_config(shard_offsets_for_kv_zch)
 
     def init_parameters(self) -> None:
@@ -409,6 +412,7 @@ class QuantBatchedEmbeddingBag(
             # For some post processing that requires TBE emb_module copied in fx.GraphModule we need to be call_module, as it will copies this module inside fx.GraphModule unchanged.
             return self._emb_module(**kwargs)
         else:
+            # pyrefly: ignore[missing-argument]
             return self._emb_module.forward(**kwargs)
 
     # TODO: T232803649 Remove unused VBE parameters from the forward signature
@@ -434,7 +438,10 @@ class QuantBatchedEmbeddingBag(
                 indices, offsets, per_sample_weights = _unwrap_kjt(features)
 
         return self._emb_module_forward(
-            indices, lengths if lengths is not None else offsets, per_sample_weights
+            indices,
+            # pyrefly: ignore[bad-argument-type]
+            lengths if lengths is not None else offsets,
+            per_sample_weights,
         )
 
     def named_buffers(
@@ -454,10 +461,12 @@ class QuantBatchedEmbeddingBag(
             yield append_prefix(prefix, f"{config.name}.weight"), weight
             if self._quant_state_dict_split_scale_bias:
                 #  `Generator[Tuple[str, Optional[Tensor]], Any, Any]`.
+                # pyrefly: ignore[invalid-yield]
                 yield append_prefix(
                     prefix, f"{config.name}.weight_qscale"
                 ), weight_qscale
                 #  `Generator[Tuple[str, Optional[Tensor]], Any, Any]`.
+                # pyrefly: ignore[invalid-yield]
                 yield append_prefix(prefix, f"{config.name}.weight_qbias"), weight_qbias
 
     def split_embedding_weights(
@@ -480,6 +489,7 @@ class QuantBatchedEmbeddingBag(
             module, "qconfig"
         ), "BaseEmbedding input float module must have qconfig defined"
 
+        # pyrefly: ignore[missing-attribute]
         data_type = dtype_to_data_type(module.qconfig.weight().dtype)
         sparse_type = data_type_to_sparse_type(data_type)
 
@@ -494,6 +504,7 @@ class QuantBatchedEmbeddingBag(
         config = _copy_config(module.config, data_type, sparse_type, device)
         ret = QuantBatchedEmbeddingBag(config=config, device=device)
 
+        # pyrefly: ignore[bad-argument-type]
         quant_weight_list = _quantize_weight(state_dict, data_type)
         ret.emb_module.assign_embedding_weights(quant_weight_list)
 
@@ -602,6 +613,7 @@ class QuantBatchedEmbedding(
             assert (
                 embedding_clazz == KVEmbeddingInference
             ), "shard_offsets_for_kv_zch should be computed only for kv zch kernel"
+            # pyrefly: ignore[not-callable]
             self._emb_module.init_tbe_config(shard_offsets_for_kv_zch)
 
     @property
@@ -661,10 +673,12 @@ class QuantBatchedEmbedding(
             yield append_prefix(prefix, f"{config.name}.weight"), weight
             if self._quant_state_dict_split_scale_bias:
                 #  `Generator[Tuple[str, Optional[Tensor]], Any, Any]`.
+                # pyrefly: ignore[invalid-yield]
                 yield append_prefix(
                     prefix, f"{config.name}.weight_qscale"
                 ), weight_qscale
                 #  `Generator[Tuple[str, Optional[Tensor]], Any, Any]`.
+                # pyrefly: ignore[invalid-yield]
                 yield append_prefix(prefix, f"{config.name}.weight_qbias"), weight_qbias
 
     @classmethod
@@ -675,6 +689,7 @@ class QuantBatchedEmbedding(
             module, "qconfig"
         ), "BaseEmbedding input float module must have qconfig defined"
 
+        # pyrefly: ignore[missing-attribute]
         data_type = dtype_to_data_type(module.qconfig.weight().dtype)
         sparse_type = data_type_to_sparse_type(data_type)
 
@@ -689,6 +704,7 @@ class QuantBatchedEmbedding(
         config = _copy_config(module.config, data_type, sparse_type, device)
         ret = QuantBatchedEmbedding(config=config, device=device)
 
+        # pyrefly: ignore[bad-argument-type]
         quant_weight_list = _quantize_weight(state_dict, data_type)
         ret.emb_module.assign_embedding_weights(quant_weight_list)
 

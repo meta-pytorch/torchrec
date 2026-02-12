@@ -65,6 +65,7 @@ def post_state_dict_hook(
     for (
         table_name,
         sharded_t,
+        # pyrefly: ignore[missing-attribute]
     ) in module._table_name_to_sharded_tensor.items():
         destination[f"{prefix}{tables_weights_prefix}.{table_name}.weight"] = sharded_t
 
@@ -83,6 +84,7 @@ def post_state_dict_hook(
         for (
             table_name,
             sharded_t,
+            # pyrefly: ignore[missing-attribute]
         ) in dict_sharded_t.items():
             destination[f"{prefix}{tables_weights_prefix}.{table_name}.{sfx}"] = (
                 sharded_t
@@ -90,6 +92,7 @@ def post_state_dict_hook(
         for (
             table_name,
             t_list,
+            # pyrefly: ignore[missing-attribute]
         ) in dict_t_list.items():
             destination[f"{prefix}{tables_weights_prefix}.{table_name}.{sfx}"] = t_list
 
@@ -161,6 +164,7 @@ class ShardedQuantEmbeddingModuleState(
                 _table_name_to_shard_idx[table.name] = column_idx + 1
 
                 # TODO(ivankobzarev): "meta" sharding support: cleanup when copy to "meta" moves all tensors to "meta"
+                # pyrefly: ignore[missing-attribute]
                 if metadata.placement.device != tbe_split_w.device:
                     metadata.placement = _remote_device(tbe_split_w.device)
                 _append_table_shard(
@@ -206,6 +210,7 @@ class ShardedQuantEmbeddingModuleState(
                                 torch.empty([])
                             ] * num_shards
 
+                        # pyrefly: ignore[unsupported-operation]
                         table_name_to_tensors_list[table.name][
                             column_idx
                         ] = tbe_split_qparam
@@ -213,14 +218,18 @@ class ShardedQuantEmbeddingModuleState(
                         qmetadata = ShardMetadata(
                             shard_offsets=metadata.shard_offsets,
                             shard_sizes=[
+                                # pyrefly: ignore[missing-attribute]
                                 tbe_split_qparam.shape[0],
+                                # pyrefly: ignore[missing-attribute]
                                 tbe_split_qparam.shape[1],
                             ],
                             placement=table.local_metadata.placement,
                         )
                         # TODO(ivankobzarev): "meta" sharding support: cleanup when copy to "meta" moves all tensors to "meta"
+                        # pyrefly: ignore[missing-attribute]
                         if qmetadata.placement.device != tbe_split_qparam.device:
                             qmetadata.placement = _remote_device(
+                                # pyrefly: ignore[missing-attribute]
                                 tbe_split_qparam.device
                             )
                         _append_table_shard(
@@ -228,6 +237,7 @@ class ShardedQuantEmbeddingModuleState(
                             table_name_to_local_shards,
                             table.name,
                             #  got `Optional[Tensor]`.
+                            # pyrefly: ignore[bad-argument-type]
                             Shard(tensor=tbe_split_qparam, metadata=qmetadata),
                         )
                     # end of weight_qscale & weight_qbias section
@@ -373,7 +383,9 @@ def get_bucket_offsets_per_virtual_table(
         tables = config.embedding_tables
         for table in tables:
             assert (
-                table.global_metadata.shards_metadata is not None
+                # pyrefly: ignore[missing-attribute]
+                table.global_metadata.shards_metadata
+                is not None
             ), f"Table: {table} doesn't have global metadata in grouped embedding config"
             if table.name in none_throws(virtual_table_name_to_bucket_lengths):
                 if table.name in shard_metadata_per_virtual_table:
@@ -383,6 +395,7 @@ def get_bucket_offsets_per_virtual_table(
                     ), f"Virtual table: {table.name} should have same global metadata across all gouped embedding config got sharded_metadata_map: {shard_metadata_per_virtual_table[table.name]} vs global metadata: {table.global_metadata.shards_metadata}"
                 else:
                     shard_metadata_per_virtual_table[table.name] = (
+                        # pyrefly: ignore[unsupported-operation]
                         table.global_metadata.shards_metadata
                     )
 
@@ -493,6 +506,7 @@ def sharded_tbes_weights_spec(
                             table.virtual_table_eviction_policy.get_meta_header_len()
                             + table.embedding_dim,
                         ]
+                    # pyrefly: ignore[bad-assignment]
                     table_metadata: ShardMetadata = table.local_metadata
                     local_rows = table.local_rows
                     row_offsets = table_metadata.shard_offsets[0]
@@ -507,16 +521,22 @@ def sharded_tbes_weights_spec(
                         shard_index = bisect.bisect_left(
                             [
                                 shard_metadata.shard_offsets[0]
+                                # pyrefly: ignore[missing-attribute]
                                 for shard_metadata in table.global_metadata.shards_metadata
                             ],
+                            # pyrefly: ignore[missing-attribute]
                             table.local_metadata.shard_offsets[0],
                         )
                         assert (
+                            # pyrefly: ignore[missing-attribute]
                             shard_index < len(table.global_metadata.shards_metadata)
+                            # pyrefly: ignore[missing-attribute]
                             and table.global_metadata.shards_metadata[
                                 shard_index
                             ].shard_offsets[0]
+                            # pyrefly: ignore[missing-attribute]
                             == table.local_metadata.shard_offsets[0]
+                            # pyrefly: ignore[missing-attribute]
                         ), f"virtual table: {table_name} local metadata shard offsets: {table.local_metadata.shard_offsets} should match with at least one of the shards in its global meetadata: {table.global_metadata.shards_metadata}"
                         bucket_id_offset = bucket_metadata_per_virtual_table[
                             table_name

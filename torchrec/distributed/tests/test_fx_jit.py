@@ -245,6 +245,7 @@ class ModelTraceScriptTest(unittest.TestCase):
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
+            # pyrefly: ignore[bad-argument-type, missing-argument]
         ).plan(model_info.quant_model, model_info.sharders)
 
         dmp = DistributedModelParallel(
@@ -292,6 +293,7 @@ class ModelTraceScriptTest(unittest.TestCase):
                         EmbeddingStorageEstimator(topology=topology),
                     ],
                 ),
+                # pyrefly: ignore[bad-argument-type, missing-argument]
             ).plan(model_info.quant_model, model_info.sharders)
             m = DistributedModelParallel(
                 model_info.quant_model,

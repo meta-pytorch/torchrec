@@ -104,6 +104,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         """
         Util function to compare optimizer weights from SSD TBE and DistributedModelParallel.
         """
+        # pyrefly: ignore[missing-attribute]
         for lookup1 in m1.module.sparse.ebc._lookups:
             for emb_module1 in lookup1._emb_modules:
                 ssd_emb_modules = {KeyValueEmbeddingBag, KeyValueEmbedding}
@@ -166,7 +167,9 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         requires both DMP modules to have the same sharding plan.
         """
         for lookup1, lookup2 in zip(
+            # pyrefly: ignore[missing-attribute]
             m1.module.sparse.ebc._lookups,
+            # pyrefly: ignore[missing-attribute]
             m2.module.sparse.ebc._lookups,
         ):
             for emb_module1, emb_module2 in zip(
@@ -269,6 +272,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
 
+        # pyrefly: ignore[bad-argument-type]
         models, batch = self._generate_dmps_and_batch(sharders, constraints=constraints)
         m1, m2 = models
 
@@ -374,12 +378,16 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         )
 
         # for this to work, we expect the order of lookups to be the same
+        # pyrefly: ignore[missing-attribute]
         assert len(fused_model.module.sparse.ebc._lookups) == len(
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups
         ), "Expect same number of lookups"
 
         for fused_lookup, ssd_lookup in zip(
+            # pyrefly: ignore[missing-attribute]
             fused_model.module.sparse.ebc._lookups,
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups,
         ):
             assert len(fused_lookup._emb_modules) == len(
@@ -470,6 +478,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, batch = self._generate_dmps_and_batch(
+            # pyrefly: ignore[bad-argument-type]
             base_sharders,
             constraints=constraints,
         )
@@ -487,6 +496,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, _ = self._generate_dmps_and_batch(
+            # pyrefly: ignore[bad-argument-type]
             test_sharders,
             constraints=constraints,
         )
@@ -504,6 +514,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
 
         # change learning rate for test_model
         fused_opt = test_model.fused_optimizer
+        # pyrefly: ignore[bad-index]
         fused_opt.param_groups[0]["lr"] = 0.2
         fused_opt.zero_grad()
 
@@ -576,6 +587,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, _ = self._generate_dmps_and_batch(
+            # pyrefly: ignore[bad-argument-type]
             base_sharders,
             constraints=constraints,
         )
@@ -653,6 +665,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             EmbeddingBagCollectionSharder(fused_params=fused_params),
         ]
 
+        # pyrefly: ignore[bad-argument-type]
         models, batch = self._generate_dmps_and_batch(sharders, constraints=constraints)
         m1, m2 = models
 
@@ -725,9 +738,11 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
                 device=self.device,
                 rank=0,
                 world_size=1,
+                # pyrefly: ignore[bad-argument-type]
                 model_class=TestSparseNN,
                 embedding_groups={},
                 tables=self.tables,
+                # pyrefly: ignore[bad-argument-type]
                 sharders=[EmbeddingBagCollectionSharder()],
                 optim=EmbOptimType.EXACT_SGD,
                 # The optimizer config here will overwrite the SGD optimizer above
@@ -810,6 +825,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             EmbeddingBagCollectionSharder(fused_params=fused_params),
         ]
 
+        # pyrefly: ignore[bad-argument-type]
         models, batch = self._generate_dmps_and_batch(sharders, constraints=constraints)
         m1, m2 = models
 
@@ -881,7 +897,9 @@ class KeyValueSequenceModelParallelStateDictTest(ModelParallelSingleRankBase):
         requires both DMP modules to have the same sharding plan.
         """
         for lookup1, lookup2 in zip(
+            # pyrefly: ignore[missing-attribute]
             m1.module.sparse.ec._lookups,
+            # pyrefly: ignore[missing-attribute]
             m2.module.sparse.ec._lookups,
         ):
             for emb_module1, emb_module2 in zip(
@@ -1016,7 +1034,9 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         requires both DMP modules to have the same sharding plan.
         """
         for lookup1, lookup2 in zip(
+            # pyrefly: ignore[missing-attribute]
             m1.module.sparse.ebc._lookups,
+            # pyrefly: ignore[missing-attribute]
             m2.module.sparse.ebc._lookups,
         ):
             for emb_module1, emb_module2 in zip(
@@ -1072,7 +1092,9 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         """
 
         for fused_lookup, ssd_lookup in zip(
+            # pyrefly: ignore[missing-attribute]
             fused_m.module.sparse.ebc._lookups,
+            # pyrefly: ignore[missing-attribute]
             ssd_m.module.sparse.ebc._lookups,
         ):
             for fused_emb_module, ssd_emb_module in zip(
@@ -1169,6 +1191,7 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
 
+        # pyrefly: ignore[bad-argument-type]
         models, batch = self._generate_dmps_and_batch(sharders, constraints=constraints)
         m1, m2 = models
 
@@ -1284,12 +1307,16 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         )
 
         # for this to work, we expect the order of lookups to be the same
+        # pyrefly: ignore[missing-attribute]
         assert len(fused_model.module.sparse.ebc._lookups) == len(
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups
         ), "Expect same number of lookups"
 
         for fused_lookup, ssd_lookup in zip(
+            # pyrefly: ignore[missing-attribute]
             fused_model.module.sparse.ebc._lookups,
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups,
         ):
             assert len(fused_lookup._emb_modules) == len(
@@ -1366,6 +1393,7 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, batch = self._generate_dmps_and_batch(
+            # pyrefly: ignore[bad-argument-type]
             base_sharders,
             constraints=constraints,
         )
@@ -1383,6 +1411,7 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, _ = self._generate_dmps_and_batch(
+            # pyrefly: ignore[bad-argument-type]
             test_sharders,
             constraints=constraints,
         )
@@ -1400,6 +1429,7 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
 
         # change learning rate for test_model
         fused_opt = test_model.fused_optimizer
+        # pyrefly: ignore[bad-index]
         fused_opt.param_groups[0]["lr"] = 0.2
         fused_opt.zero_grad()
 
@@ -1481,7 +1511,9 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
         requires both DMP modules to have the same sharding plan.
         """
         for lookup1, lookup2 in zip(
+            # pyrefly: ignore[missing-attribute]
             m1.module.sparse.ec._lookups,
+            # pyrefly: ignore[missing-attribute]
             m2.module.sparse.ec._lookups,
         ):
             for emb_module1, emb_module2 in zip(
@@ -1540,7 +1572,9 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
         """
 
         for fused_lookup, ssd_lookup in zip(
+            # pyrefly: ignore[missing-attribute]
             fused_m.module.sparse.ec._lookups,
+            # pyrefly: ignore[missing-attribute]
             ssd_m.module.sparse.ec._lookups,
         ):
             for fused_emb_module, ssd_emb_module in zip(
@@ -1738,12 +1772,16 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
         )
 
         # for this to work, we expect the order of lookups to be the same
+        # pyrefly: ignore[missing-attribute]
         assert len(fused_model.module.sparse.ec._lookups) == len(
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ec._lookups
         ), "Expect same number of lookups"
 
         for fused_lookup, ssd_lookup in zip(
+            # pyrefly: ignore[missing-attribute]
             fused_model.module.sparse.ec._lookups,
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ec._lookups,
         ):
             assert len(fused_lookup._emb_modules) == len(

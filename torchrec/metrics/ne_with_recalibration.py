@@ -111,5 +111,6 @@ class RecalibratedNEMetricComputation(NEMetricComputation):
 
 
 class RecalibratedNEMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.RECALIBRATED_NE
     _computation_class: Type[RecMetricComputation] = RecalibratedNEMetricComputation

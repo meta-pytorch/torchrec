@@ -32,6 +32,7 @@ def _apply_functions_after_first_forward(
         for fn in _functions_to_lazy_apply:
             module.apply(fn)
         delattr(module, "_functions_to_lazy_apply")
+    # pyrefly: ignore[missing-attribute]
     module._lazy_apply_hook.remove()
     delattr(module, "_lazy_apply_hook")
 
@@ -79,11 +80,14 @@ def lazy_apply(
     """
 
     if not hasattr(module, "_functions_to_lazy_apply"):
+        # pyrefly: ignore[bad-argument-type]
         module._functions_to_lazy_apply = []
     if not hasattr(module, "_lazy_apply_hook"):
+        # pyrefly: ignore[bad-argument-type]
         module._lazy_apply_hook = module.register_forward_hook(
             _apply_functions_after_first_forward
         )
+    # pyrefly: ignore[missing-attribute]
     module._functions_to_lazy_apply.append(fn)
     return module
 
@@ -151,10 +155,12 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
             )
         # If the module is already initialized, call `super().apply(fn)` to
         # run the usual apply logic.
+        # pyrefly: ignore[missing-attribute]
         return super().apply(fn)
 
     # fmt: off
     #  `LazyModuleMixin` inconsistently.
+    # pyrefly: ignore[bad-override]
     def _infer_parameters(self: _LazyExtensionProtocol, module, args, kwargs) -> None:
         r"""Infers the size and initializes the parameters according to the provided input batch.
 
@@ -179,19 +185,25 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
 
     # fmt: off
     def _call_impl(self, *input, **kwargs):  # noqa: C901
+        # pyrefly: ignore[missing-attribute]
         forward_call = (self._slow_forward if torch._C._get_tracing_state() else self.forward)
         # If we don't have any hooks, we want to skip the rest of the logic in
         # this function, and just call forward.
+        # pyrefly: ignore[missing-attribute]
         if not (self._backward_hooks or self._forward_hooks or self._forward_pre_hooks or _global_backward_hooks
                 or _global_forward_hooks or _global_forward_pre_hooks):
             return forward_call(*input, **kwargs)
         # Do not call functions when jit is used
         full_backward_hooks, non_full_backward_hooks = [], []
+        # pyrefly: ignore[missing-attribute]
         if self._backward_hooks or _global_backward_hooks:
+            # pyrefly: ignore[missing-attribute]
             full_backward_hooks, non_full_backward_hooks = self._get_backward_hooks()
+        # pyrefly: ignore[missing-attribute]
         if _global_forward_pre_hooks or self._forward_pre_hooks:
             #  tuples: `*torch.nn.modules.module._global_forward_pre_hooks.values(),
             #  *self._forward_pre_hooks.values()`.
+            # pyrefly: ignore[missing-attribute]
             for hook in (*_global_forward_pre_hooks.values(), *self._forward_pre_hooks.values()):
                 if len(inspect.signature(hook).parameters) == 3:
                     result = hook(self, input, kwargs)
@@ -204,13 +216,16 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
 
         bw_hook = None
         if full_backward_hooks:
+            # pyrefly: ignore[missing-argument]
             bw_hook = hooks.BackwardHook(self, full_backward_hooks)
             input = bw_hook.setup_input_hook(input)
 
         result = forward_call(*input, **kwargs)
+        # pyrefly: ignore[missing-attribute]
         if _global_forward_hooks or self._forward_hooks:
             #  tuples: `*torch.nn.modules.module._global_forward_hooks.values(),
             #  *self._forward_hooks.values()`.
+            # pyrefly: ignore[missing-attribute]
             for hook in (*_global_forward_hooks.values(), *self._forward_hooks.values()):
                 hook_result = hook(self, input, result)
                 if hook_result is not None:
@@ -233,6 +248,7 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
                     wrapper = functools.partial(hook, self)
                     functools.update_wrapper(wrapper, hook)
                     grad_fn.register_hook(wrapper)
+                # pyrefly: ignore[missing-attribute]
                 self._maybe_warn_non_full_backward_hook(input, result, grad_fn)
 
         return result

@@ -48,6 +48,7 @@ class SGD(Optimizer):
         self._kwargs = kwargs
 
     @torch.no_grad()
+    # pyrefly: ignore[bad-override]
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -66,6 +67,7 @@ class LarsSGD(Optimizer):
         self._kwargs = kwargs
 
     @torch.no_grad()
+    # pyrefly: ignore[bad-override]
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -84,6 +86,7 @@ class LAMB(Optimizer):
         self._kwargs = kwargs
 
     @torch.no_grad()
+    # pyrefly: ignore[bad-override]
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -102,6 +105,7 @@ class PartialRowWiseLAMB(Optimizer):
         self._kwargs = kwargs
 
     @torch.no_grad()
+    # pyrefly: ignore[bad-override]
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -120,6 +124,7 @@ class Adam(Optimizer):
         self._kwargs = kwargs
 
     @torch.no_grad()
+    # pyrefly: ignore[bad-override]
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -138,6 +143,7 @@ class PartialRowWiseAdam(Optimizer):
         self._kwargs = kwargs
 
     @torch.no_grad()
+    # pyrefly: ignore[bad-override]
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError
 
@@ -156,5 +162,6 @@ class Adagrad(Optimizer):
         self._kwargs = kwargs
 
     @torch.no_grad()
+    # pyrefly: ignore[bad-override]
     def step(self, closure=None) -> torch.Tensor:
         raise NotImplementedError

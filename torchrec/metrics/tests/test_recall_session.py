@@ -107,8 +107,11 @@ class RecallSessionValueTest(unittest.TestCase):
                 ),
             )
             task_list.append(task_info)
+            # pyrefly: ignore[unsupported-operation]
             inputs["predictions"][task_info.name] = predictions[i]
+            # pyrefly: ignore[unsupported-operation]
             inputs["labels"][task_info.name] = labels[i]
+            # pyrefly: ignore[unsupported-operation]
             inputs["weights"][task_info.name] = weights[i]
 
         kwargs = {"required_inputs": {"session": session}}

@@ -118,6 +118,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             os.environ["TOPOLOGY_DOMAIN_MULTIPLE"] = str(topology_domain)
 
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     sharder_type,
@@ -207,6 +208,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         )
         world_size = 4
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     sharder_type,
@@ -331,6 +333,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             or kernel_type != EmbeddingComputeKernel.DENSE.value
         )
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     SharderType.EMBEDDING_TOWER.value,
@@ -405,6 +408,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         )
 
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     SharderType.EMBEDDING_TOWER_COLLECTION.value,
@@ -451,6 +455,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
         pooling: PoolingType,
     ) -> None:
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     SharderType.EMBEDDING_BAG_COLLECTION.value,

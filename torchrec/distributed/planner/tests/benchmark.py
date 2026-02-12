@@ -44,6 +44,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     """
     Table-wise sharder for benchmarking.
@@ -60,6 +61,7 @@ class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class RWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     """
     Row-wise sharder for benchmarking.
@@ -76,6 +78,7 @@ class RWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class CWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     """
     Column-wise sharder for benchmarking.
@@ -135,6 +138,7 @@ def measure_memory_and_time(
     world_size: int,
     num_tables: int,
     embedding_dim: int = 128,
+    # pyrefly: ignore[bad-function-definition]
     sharder_class: Type[ModuleSharder[nn.Module]] = TWSharder,
 ) -> Dict[str, float]:
     """
@@ -194,6 +198,7 @@ def measure_memory_and_time(
 
 
 def benchmark_enumerator_comprehensive(
+    # pyrefly: ignore[bad-function-definition]
     sharder_class: Type[ModuleSharder[nn.Module]] = TWSharder,
 ) -> None:
     """
@@ -318,12 +323,15 @@ def main() -> None:
 
     # Run benchmark with specified sharder(s)
     if args.sharder == "tw" or args.sharder == "all":
+        # pyrefly: ignore[bad-argument-type]
         benchmark_enumerator_comprehensive(TWSharder)
 
     if args.sharder == "rw" or args.sharder == "all":
+        # pyrefly: ignore[bad-argument-type]
         benchmark_enumerator_comprehensive(RWSharder)
 
     if args.sharder == "cw" or args.sharder == "all":
+        # pyrefly: ignore[bad-argument-type]
         benchmark_enumerator_comprehensive(CWSharder)
 
 

@@ -103,6 +103,7 @@ def share_tensor_via_shm(
                 shm_pickler.dispatch_table[t] = reduce_storage
             else:
                 shm_pickler.dispatch_table[t] = reduce_typed_storage_child
+        # pyrefly: ignore[missing-attribute]
         shm_pickler.dispatch_table[torch.storage._TypedStorage] = reduce_typed_storage
 
         tensor.share_memory_()

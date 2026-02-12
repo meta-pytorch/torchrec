@@ -502,6 +502,7 @@ class FusedEmbeddingBagCollectionTest(unittest.TestCase):
             [
                 (torch.optim.SGD, {"lr": 0.1}),
                 (torch.optim.Adagrad, {"lr": 0.1}),
+                # pyrefly: ignore[implicit-import]
                 (torchrec.optim.RowWiseAdagrad, {"lr": 0.1}),
             ]
         ),
@@ -888,6 +889,7 @@ class FusedEmbeddingCollectionTest(unittest.TestCase):
             [
                 (torch.optim.SGD, {"lr": 0.1}),
                 (torch.optim.Adagrad, {"lr": 0.1}),
+                # pyrefly: ignore[implicit-import]
                 (torchrec.optim.RowWiseAdagrad, {"lr": 0.1}),
             ]
         ),

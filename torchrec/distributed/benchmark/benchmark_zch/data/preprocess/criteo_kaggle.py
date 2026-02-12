@@ -39,12 +39,19 @@ def get_criteo_kaggle_dataloader(
     dataloader = DataLoader(
         datapipe(
             stage,
+            # pyrefly: ignore[bad-argument-type]
             *stage_files,
+            # pyrefly: ignore[bad-keyword-argument]
             batch_size=batch_size,
+            # pyrefly: ignore[bad-keyword-argument]
             rank=dist.get_rank(),
+            # pyrefly: ignore[bad-keyword-argument]
             world_size=dist.get_world_size(),
+            # pyrefly: ignore[bad-keyword-argument]
             drop_last=False,
+            # pyrefly: ignore[bad-keyword-argument]
             shuffle_batches=args.shuffle_batches,
+            # pyrefly: ignore[bad-keyword-argument]
             hashes=(
                 [args.num_embeddings] * CAT_FEATURE_COUNT
                 if args.input_hash_size is None

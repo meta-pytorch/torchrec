@@ -130,6 +130,7 @@ def get_device_from_parameter_sharding(
         raise ValueError("Expected EnumerableShardingSpec as input to the function")
 
     device_type_list: Tuple[str, ...] = tuple(
+        # pyrefly: ignore[missing-attribute]
         [shard.placement.device().type for shard in ps.sharding_spec.shards]
     )
     if len(set(device_type_list)) == 1:
@@ -321,6 +322,7 @@ class EmbeddingCollectionContext(Multistreamable):
         for ctx in self.sharding_contexts:
             ctx.record_stream(stream)
         for f in self.input_features:
+            # pyrefly: ignore[bad-argument-type]
             f.record_stream(stream)
         for r in self.reverse_indices:
             r.record_stream(stream)
@@ -432,6 +434,7 @@ class ShardedEmbeddingCollection(
         use_index_dedup: bool = False,
         module_fqn: Optional[str] = None,
     ) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
         self._enable_feature_score_weight_accumulation: bool = False
 
@@ -528,6 +531,7 @@ class ShardedEmbeddingCollection(
                         params["embeddings." + param_key] = weight
                     m.fused_optimizer.params = params
                     optims.append(("", m.fused_optimizer))
+        # pyrefly: ignore[bad-argument-type]
         self._optim: CombinedOptimizer = CombinedOptimizer(optims)
         self._embedding_dim: int = module.embedding_dim()
         self._embedding_names_per_sharding: List[List[str]] = []
@@ -718,6 +722,7 @@ class ShardedEmbeddingCollection(
         for lookup in self._lookups:
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
+            # pyrefly: ignore[not-callable]
             lookup.flush()
 
     @staticmethod
@@ -832,6 +837,7 @@ class ShardedEmbeddingCollection(
         for lookup in self._lookups:
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
+            # pyrefly: ignore[not-callable]
             lookup.purge()
 
     def _initialize_torch_state(self) -> None:  # noqa
@@ -899,9 +905,11 @@ class ShardedEmbeddingCollection(
                         ]
                         local_shards_wrapper = v._local_tensor
                         shards_wrapper["local_tensors"].extend(
+                            # pyrefly: ignore[missing-attribute]
                             local_shards_wrapper.local_shards()
                         )
                         shards_wrapper["local_offsets"].extend(
+                            # pyrefly: ignore[missing-attribute]
                             local_shards_wrapper.local_offsets()
                         )
                         shards_wrapper["global_size"] = v.size()
@@ -917,6 +925,7 @@ class ShardedEmbeddingCollection(
                 table_name,
                 tbe_slice,
                 #  `named_parameters_by_table`.
+                # pyrefly: ignore[missing-attribute]
             ) in lookup.named_parameters_by_table():
                 # for virtual table, currently we don't expose id tensor and bucket tensor
                 # because they are not updated in real time, and they are created on the fly
@@ -938,6 +947,7 @@ class ShardedEmbeddingCollection(
                 ):
                     #  `_in_backward_optimizers`.
                     #  `_in_backward_optimizers`.
+                    # pyrefly: ignore[bad-argument-type, missing-attribute]
                     self.embeddings[table_name].weight._in_backward_optimizers = [
                         EmptyFusedOptimizer()
                     ]
@@ -951,6 +961,7 @@ class ShardedEmbeddingCollection(
                 if shards_wrapper_map["local_tensors"]:
                     self._model_parallel_name_to_dtensor[table_name] = (
                         DTensor.from_local(
+                            # pyrefly: ignore[no-matching-overload]
                             local_tensor=LocalShardsWrapper(
                                 local_shards=shards_wrapper_map["local_tensors"],
                                 local_offsets=shards_wrapper_map["local_offsets"],
@@ -974,6 +985,7 @@ class ShardedEmbeddingCollection(
                     # empty shard case
                     self._model_parallel_name_to_dtensor[table_name] = (
                         DTensor.from_local(
+                            # pyrefly: ignore[no-matching-overload]
                             local_tensor=LocalShardsWrapper(
                                 local_shards=[],
                                 local_offsets=[],
@@ -1076,6 +1088,7 @@ class ShardedEmbeddingCollection(
                         weight_ids_sharded_t,
                         id_cnt_per_bucket_sharded_t,
                         metadata_sharded_t,
+                        # pyrefly: ignore[not-callable]
                     ) in lookup.get_named_split_embedding_weights_snapshot():
                         assert table_name in sharded_kvtensors_copy
                         if self._table_name_to_config[table_name].use_virtual_table:
@@ -1089,6 +1102,7 @@ class ShardedEmbeddingCollection(
                             # The logic here assumes there is only one shard per table on any particular rank
                             # if there are cases each rank has >1 shards, we need to update here accordingly
                             sharded_kvtensors_copy[table_name] = weights_t
+                            # pyrefly: ignore[unsupported-operation]
                             virtual_table_sharded_t_map[table_name] = (
                                 weight_ids_sharded_t,
                                 id_cnt_per_bucket_sharded_t,
@@ -1105,6 +1119,7 @@ class ShardedEmbeddingCollection(
                             # if there are cases each rank has >1 shards, we need to update here accordingly
                             sharded_kvtensors_copy[table_name].local_shards()[
                                 0
+                                # pyrefly: ignore[bad-assignment]
                             ].tensor = weights_t
 
             def update_destination(
@@ -1137,11 +1152,13 @@ class ShardedEmbeddingCollection(
                         destination,
                         virtual_table_sharded_t_map[table_name][1],
                     )
+                    # pyrefly: ignore[bad-index]
                     if virtual_table_sharded_t_map[table_name][2] is not None:
                         update_destination(
                             table_name,
                             "metadata",
                             destination,
+                            # pyrefly: ignore[bad-index]
                             virtual_table_sharded_t_map[table_name][2],
                         )
 
@@ -1177,6 +1194,7 @@ class ShardedEmbeddingCollection(
                 continue
             assert table_config.init_fn is not None
             param = self.embeddings[f"{table_config.name}"].weight
+            # pyrefly: ignore[bad-argument-type]
             table_config.init_fn(param)
 
             sharding_type = self.module_sharding_plan[table_config.name].sharding_type
@@ -1184,6 +1202,7 @@ class ShardedEmbeddingCollection(
                 pg = self._env.process_group
                 with torch.no_grad():
                     #  `TypeUnion[Module, Tensor]`.
+                    # pyrefly: ignore[bad-argument-type]
                     dist.broadcast(param.data, src=0, group=pg)
 
     def _generate_permute_indices_per_feature(
@@ -1426,6 +1445,7 @@ class ShardedEmbeddingCollection(
             unpadded_features = unpadded_features.permute(
                 self._features_order,
                 #  got `TypeUnion[Module, Tensor]`.
+                # pyrefly: ignore[bad-argument-type]
                 self._features_order_tensor,
             )
 
@@ -1467,6 +1487,7 @@ class ShardedEmbeddingCollection(
                 )
             )
 
+    # pyrefly: ignore[bad-override]
     def input_dist(
         self,
         ctx: EmbeddingCollectionContext,
@@ -1474,10 +1495,12 @@ class ShardedEmbeddingCollection(
     ) -> Awaitable[Awaitable[KJTList]]:
         need_permute: bool = True
         if isinstance(features, TensorDict):
+            # pyrefly: ignore[no-matching-overload]
             feature_keys = list(features.keys())
             if self._features_order:
                 feature_keys = [feature_keys[i] for i in self._features_order]
                 need_permute = False
+            # pyrefly: ignore[bad-argument-type]
             features = maybe_td_to_kjt(features, feature_keys)
         if self._has_uninitialized_input_dist:
             self._create_input_dist(input_feature_names=features.keys(), ctx=ctx)
@@ -1492,6 +1515,7 @@ class ShardedEmbeddingCollection(
                 features = features.permute(
                     self._features_order,
                     #  but got `TypeUnion[Module, Tensor]`.
+                    # pyrefly: ignore[bad-argument-type]
                     self._features_order_tensor,
                 )
             features_by_shards = features.split(self._feature_splits)
@@ -1562,6 +1586,7 @@ class ShardedEmbeddingCollection(
             awaitables_per_sharding.append(odist(embeddings, sharding_ctx))
             features_before_all2all_per_sharding.append(
                 #  got `Optional[KeyedJaggedTensor]`.
+                # pyrefly: ignore[bad-argument-type]
                 sharding_ctx.features_before_input_dist
             )
         return EmbeddingCollectionAwaitable(
@@ -1598,6 +1623,7 @@ class ShardedEmbeddingCollection(
             ):
                 embs = lookup(features)
                 if hasattr(lookup, "get_resize_awaitables"):
+                    # pyrefly: ignore[not-callable]
                     resize_awaitables.extend(lookup.get_resize_awaitables())
                 if self.post_lookup_tracker_fn is not None:
                     self.post_lookup_tracker_fn(features, embs, self, None)
@@ -1613,6 +1639,7 @@ class ShardedEmbeddingCollection(
 
             features_before_all2all_per_sharding.append(
                 #  got `Optional[KeyedJaggedTensor]`.
+                # pyrefly: ignore[bad-argument-type]
                 sharding_ctx.features_before_input_dist
             )
         return EmbeddingCollectionAwaitable(
@@ -1640,8 +1667,10 @@ class ShardedEmbeddingCollection(
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
             if hasattr(lookup, "create_rocksdb_hard_link_snapshot") and callable(
+                # pyrefly: ignore[not-callable]
                 lookup.create_rocksdb_hard_link_snapshot()
             ):
+                # pyrefly: ignore[not-callable]
                 lookup.create_rocksdb_hard_link_snapshot()
 
     @property
@@ -1657,6 +1686,7 @@ class ShardedEmbeddingCollection(
                 self._write_dists.append(sharding.create_write_dist())
                 self._write_splits.append(sharding._get_num_writable_features())
 
+    # pyrefly: ignore[bad-override]
     def write_dist(
         self, ctx: EmbeddingCollectionContext, embeddings: KeyedJaggedTensor
     ) -> Awaitable[Awaitable[KJTList]]:

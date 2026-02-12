@@ -28,6 +28,7 @@ from typing import Optional
 
 class StrValueMixin:
     def __str__(self) -> str:
+        # pyrefly: ignore[missing-attribute]
         return self.value
 
 

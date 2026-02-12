@@ -135,6 +135,7 @@ class RwSequenceEmbeddingSharding(
         )
         return RwSparseFeaturesDist(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=self._pg,
             num_features=num_features,
             feature_hash_sizes=feature_hash_sizes,
@@ -165,6 +166,7 @@ class RwSequenceEmbeddingSharding(
     ) -> BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]:
         return RwSequenceEmbeddingDist(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             self._pg,
             self._get_num_features(),
             device if device is not None else self._device,
@@ -178,6 +180,7 @@ class RwSequenceEmbeddingSharding(
         feature_hash_sizes = self._get_writable_feature_hash_sizes()
         return RwSparseFeaturesWriteDist(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=self._pg,
             num_features=num_features,
             feature_hash_sizes=feature_hash_sizes,
@@ -185,6 +188,7 @@ class RwSequenceEmbeddingSharding(
             is_sequence=True,
         )
 
+    # pyrefly: ignore[bad-override]
     def create_update(
         self,
         grouped_embeddings_lookup: GroupedEmbeddingsLookup,

@@ -598,6 +598,7 @@ def group_tables(
 
             grouped_embedding_configs.append(
                 GroupedEmbeddingConfig(
+                    # pyrefly: ignore[bad-argument-type]
                     data_type=data_type,
                     pooling=pooling,
                     is_weighted=is_weighted,
@@ -645,6 +646,7 @@ class KJTListAwaitable(Awaitable[KJTList]):
     ) -> None:
         super().__init__()
         self.awaitables = awaitables
+        # pyrefly: ignore[invalid-type-var]
         self.ctx = ctx
 
     def _wait_impl(self) -> KJTList:
@@ -851,6 +853,7 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
         pg: Optional[dist.ProcessGroup],
     ) -> None:
         super().__init__()
+        # pyrefly: ignore[invalid-type-var]
         self._contexts = contexts
         self._awaitables: List[
             Union[KJTSplitsAllToAllMeta, Awaitable[Awaitable[KeyedJaggedTensor]]]

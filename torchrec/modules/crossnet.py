@@ -83,7 +83,9 @@ class CrossNet(torch.nn.Module):
         x_l = x_0
 
         for layer in range(self._num_layers):
+            # pyrefly: ignore[bad-index]
             xl_w = torch.matmul(self.kernels[layer], x_l)  # (B, N, 1)
+            # pyrefly: ignore[bad-index]
             x_l = x_0 * (xl_w + self.bias[layer]) + x_l  # (B, N, 1)
 
         return torch.squeeze(x_l, dim=2)
@@ -250,9 +252,11 @@ class VectorCrossNet(torch.nn.Module):
         for layer in range(self._num_layers):
             xl_w = torch.tensordot(
                 x_l,
+                # pyrefly: ignore[bad-index]
                 self.kernels[layer],
                 dims=([1], [0]),
             )  # (B, 1, 1)
+            # pyrefly: ignore[bad-index]
             x_l = torch.matmul(x_0, xl_w) + self.bias[layer] + x_l  # (B, N, 1)
 
         return torch.squeeze(x_l, dim=2)  # (B, N)
@@ -395,6 +399,7 @@ class LowRankMixtureCrossNet(torch.nn.Module):
             if self._num_experts > 1:
                 gating = []
                 for i in range(self._num_experts):
+                    # pyrefly: ignore[bad-index, unsupported-operation]
                     gating.append(self.gates[i](x_l.squeeze(2)))
                 gating = torch.stack(gating, 1)  # (B, K, 1)
 
@@ -402,17 +407,21 @@ class LowRankMixtureCrossNet(torch.nn.Module):
             experts = []
             for i in range(self._num_experts):
                 expert = torch.matmul(
+                    # pyrefly: ignore[bad-index]
                     self.V_kernels[layer][i],
                     x_l,
                 )  # (B, r, 1)
                 expert = torch.matmul(
+                    # pyrefly: ignore[bad-index]
                     self.C_kernels[layer][i],
                     self._activation(expert),
                 )  # (B, r, 1)
                 expert = torch.matmul(
+                    # pyrefly: ignore[bad-index]
                     self.U_kernels[layer][i],
                     self._activation(expert),
                 )  # (B, N, 1)
+                # pyrefly: ignore[bad-index]
                 expert = x_0 * (expert + self.bias[layer])  # (B, N, 1)
                 experts.append(expert.squeeze(2))  # (B, N)
             experts = torch.stack(experts, 2)  # (B, N, K)
@@ -421,6 +430,7 @@ class LowRankMixtureCrossNet(torch.nn.Module):
                 # MOE update
                 moe = torch.matmul(
                     experts,
+                    # pyrefly: ignore[unbound-name]
                     torch.nn.functional.softmax(gating, 1),
                 )  # (B, N, 1)
                 x_l = moe + x_l  # (B, N, 1)

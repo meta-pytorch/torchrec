@@ -205,6 +205,7 @@ def get_tables(
             for i, (num_embeddings, embedding_dim) in enumerate(table_sizes)
         ]
     else:
+        # pyrefly: ignore[redefinition]
         tables: List[EmbeddingConfig] = [
             EmbeddingConfig(
                 num_embeddings=num_embeddings,
@@ -268,6 +269,7 @@ def _get_inputs(
     # Transpose if train, as inputs_by_rank is currently in  [B X R] format
     inputs_by_rank = list(zip(*inputs_batch))
 
+    # pyrefly: ignore[bad-return]
     return inputs_by_rank
 
 
@@ -313,13 +315,16 @@ def _transform_module(
         # Don't want to modify the module outright
         # Since module is on cpu, won't cause cuda oom.
         copied_module = copy.deepcopy(module)
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         plan = planner.plan(copied_module, [sharder])
 
         if isinstance(ctx, MultiProcessContext):
             sharded_module = DistributedModelParallel(
                 copied_module,
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
                 plan=plan,
+                # pyrefly: ignore[bad-argument-type]
                 sharders=[sharder],
                 device=ctx.device,
             )
@@ -330,6 +335,7 @@ def _transform_module(
                 module=copied_module,
                 #  `Optional[List[ModuleSharder[Module]]]` but got
                 #  `List[ModuleSharder[Variable[T (bound to Module)]]]`.
+                # pyrefly: ignore[bad-argument-type]
                 sharders=[sharder],
                 device=device,
                 plan=plan,
@@ -339,11 +345,13 @@ def _transform_module(
     if compile_mode == CompileMode.FX_SCRIPT:
         return fx_script_module(
             #  `Optional[Module]`.
+            # pyrefly: ignore[bad-argument-type]
             sharded_module
             if not benchmark_unsharded_module
             else module
         )
     else:
+        # pyrefly: ignore[bad-return]
         return sharded_module if not benchmark_unsharded_module else module
 
 
@@ -440,6 +448,7 @@ def _init_module_and_run_benchmark(
             compile_mode=compile_mode,
             world_size=world_size,
             batch_size=batch_size,
+            # pyrefly: ignore[bad-argument-type]
             ctx=ctx,
             benchmark_unsharded_module=benchmark_unsharded_module,
         )
@@ -575,7 +584,9 @@ def benchmark_ebc_module(
         for compile_mode in compile_modes:
             if not benchmark_unsharded:
                 # Test sharders should have a singular sharding_type
+                # pyrefly: ignore[missing-attribute]
                 sharder._sharding_type = sharding_type.value
+                # pyrefly: ignore[bad-argument-type]
                 benchmark_type = _benchmark_type_name(compile_mode, sharding_type)
             else:
                 benchmark_type = "unsharded" + compile_mode.name
@@ -586,6 +597,7 @@ def benchmark_ebc_module(
 
             if is_train:
                 res = multi_process_benchmark(
+                    # pyrefly: ignore[bad-argument-type]
                     callable=_init_module_and_run_benchmark,
                     module=wrapped_module,
                     sharder=sharder,
@@ -609,6 +621,7 @@ def benchmark_ebc_module(
                     module=wrapped_module,
                     sharder=sharder,
                     device=torch.device(device_type),
+                    # pyrefly: ignore[bad-argument-type]
                     sharding_type=sharding_type,
                     compile_mode=compile_mode,
                     world_size=world_size,

@@ -104,8 +104,10 @@ class RecMetricTest(unittest.TestCase):
             weights=self.weights,
         )
         #  got `Tensor`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertGreater(mse_computation.error_sum, torch.tensor(0.0))
         #  got `Tensor`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertGreater(mse_computation.weighted_num_samples, torch.tensor(0.0))
 
         res = mse.compute()
@@ -151,8 +153,10 @@ class RecMetricTest(unittest.TestCase):
         self.assertEqual(ne_computation[0].cross_entropy_sum, torch.tensor(0.0))
         self.assertEqual(ne_computation[0].weighted_num_samples, torch.tensor(0.0))
         #  got `Tensor`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertGreater(ne_computation[1].cross_entropy_sum, torch.tensor(0.0))
         #  got `Tensor`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertGreater(ne_computation[1].weighted_num_samples, torch.tensor(0.0))
 
         res = ne.compute()
@@ -165,8 +169,10 @@ class RecMetricTest(unittest.TestCase):
             weights=weights,
         )
         #  got `Tensor`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertGreater(ne_computation[0].cross_entropy_sum, torch.tensor(0.0))
         #  got `Tensor`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertGreater(ne_computation[0].weighted_num_samples, torch.tensor(0.0))
 
         res = ne.compute()
@@ -256,9 +262,12 @@ class RecMetricTest(unittest.TestCase):
             weights=self.weights,
         )
         ne = ne._metrics_computations[0]
+        # pyrefly: ignore[bad-index, missing-attribute]
         window_buffer = ne._batch_window_buffers["window_cross_entropy_sum"].buffers
         self.assertTrue(len(window_buffer) > 0)
+        # pyrefly: ignore[not-callable]
         ne.reset()
+        # pyrefly: ignore[bad-index, missing-attribute]
         window_buffer = ne._batch_window_buffers["window_cross_entropy_sum"].buffers
         self.assertEqual(len(window_buffer), 0)
 
@@ -271,6 +280,7 @@ class RecMetricTest(unittest.TestCase):
                 ),
             ],
             # got Dict[str, Union[List[str], Tensor]]
+            # pyrefly: ignore[bad-argument-type]
             model_out={
                 "label": torch.tensor(
                     [0.0, 1.0, 0.0, 1.0], device=torch.device("cuda:0")

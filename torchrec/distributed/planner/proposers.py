@@ -115,9 +115,13 @@ class GreedyProposer(Proposer):
             if index + 1 < len(sharding_options):
                 sharding_option = sharding_options[index]
                 current_storage = (
+                    # pyrefly: ignore[missing-attribute]
                     max([shard.storage.hbm for shard in sharding_option.shards]),
+                    # pyrefly: ignore[missing-attribute]
                     sum([shard.storage.hbm for shard in sharding_option.shards]),
+                    # pyrefly: ignore[missing-attribute]
                     max([shard.storage.ddr for shard in sharding_option.shards]),
+                    # pyrefly: ignore[missing-attribute]
                     sum([shard.storage.ddr for shard in sharding_option.shards]),
                 )
                 if current_storage > largest_storage:
@@ -245,6 +249,7 @@ class GridSearchProposer(Proposer):
             for sharding_options in self._sharding_options_by_fqn.values()
         ]
         #  `List[Tuple[int]]`.
+        # pyrefly: ignore[no-matching-overload]
         self._proposals = list(itertools.product(*sharding_options_by_fqn_indices))
 
     def _reset(self) -> None:
@@ -907,6 +912,7 @@ class EmbeddingOffloadScaleupProposer(Proposer):
             )
             actual_increase_bytes = new_cache_size_bytes - cache_size_bytes
 
+            # pyrefly: ignore[bad-assignment]
             budget -= torch.sum(actual_increase_bytes).item()
             cache_size_bytes = new_cache_size_bytes
             # TODO: consider trade off of using remaining budget to push >0.95 tables
@@ -924,6 +930,7 @@ class EmbeddingOffloadScaleupProposer(Proposer):
                 logger.debug(
                     f"[allocate_budget] {promotes.sum()} tables exceeded ceiling, promoting to save {budget_reclaimed} bytes"
                 )
+                # pyrefly: ignore[bad-assignment]
                 budget += budget_reclaimed
                 # force these tables to 1.0 to ensure promotion
                 cache_size_bytes[promotes] = max_cache_size_bytes[promotes]

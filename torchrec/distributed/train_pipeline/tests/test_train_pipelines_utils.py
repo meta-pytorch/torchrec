@@ -83,11 +83,13 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         )
         self.assertNotIsInstance(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.forward,
             PipelinedForward,
         )
         self.assertNotIsInstance(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.weighted_ebc.forward,
             PipelinedForward,
         )
@@ -101,26 +103,32 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
             pipeline_postproc=True,
         )
 
+        # pyrefly: ignore[missing-attribute]
         self.assertIsInstance(sharded_model.module.sparse.ebc.forward, PipelinedForward)
         self.assertIsInstance(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.weighted_ebc.forward,
             PipelinedForward,
         )
         self.assertEqual(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.forward._args.args[0]
             .steps[0]
             .postproc_module,
             #  `postproc_module`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.postproc_module,
         )
         self.assertEqual(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.weighted_ebc.forward._args.args[0]
             .steps[0]
             .postproc_module,
             #  `postproc_module`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.postproc_module,
         )
         state_dict = sharded_model.state_dict()
@@ -148,6 +156,7 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         model = TestModel()
 
         rewritten_model = copy.deepcopy(model)
+        # pyrefly: ignore[bad-assignment]
         rewritten_model.test_module = PipelinedPostproc(
             postproc_module=rewritten_model.test_module,
             fqn="test_module",
@@ -280,6 +289,7 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
                 input: ModelInput,
             ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
                 if (type(self)).use_postproc_module:
+                    # pyrefly: ignore[not-callable]
                     input = self.postproc_module(input)
                 else:
                     input = enrich_hstu_features(input, 0.3)
@@ -309,11 +319,13 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         )
         self.assertNotIsInstance(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.forward,
             PipelinedForward,
         )
         self.assertNotIsInstance(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.weighted_ebc.forward,
             PipelinedForward,
         )
@@ -329,26 +341,32 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
             pipeline_postproc=True,
         )
 
+        # pyrefly: ignore[missing-attribute]
         self.assertIsInstance(sharded_model.module.sparse.ebc.forward, PipelinedForward)
         self.assertIsInstance(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.weighted_ebc.forward,
             PipelinedForward,
         )
         self.assertEqual(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.forward._args.args[0]
             .steps[0]
             .postproc_module,
             #  `postproc_module`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.postproc_module,
         )
         self.assertEqual(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.weighted_ebc.forward._args.args[0]
             .steps[0]
             .postproc_module,
             #  `postproc_module`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.postproc_module,
         )
         state_dict = sharded_model.state_dict()

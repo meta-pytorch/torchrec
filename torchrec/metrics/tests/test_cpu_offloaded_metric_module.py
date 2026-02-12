@@ -135,11 +135,13 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.assertTrue(self.mock_metric.predictions_update_calls is not None)
         torch.testing.assert_close(
             model_out["task1-prediction"],
+            # pyrefly: ignore[bad-index]
             self.mock_metric.predictions_update_calls[0]["task1"],
         )
         self.assertTrue(self.mock_metric.labels_update_calls is not None)
         torch.testing.assert_close(
             model_out["task1-label"],
+            # pyrefly: ignore[bad-index]
             self.mock_metric.labels_update_calls[0]["task1"],
         )
 
@@ -459,6 +461,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         self.assertTrue(offloaded_module.update_queue.empty())
         self.assertTrue(offloaded_module.compute_queue.empty())
+        # pyrefly: ignore[not-callable]
         synced_state = offloaded_module.rec_metrics.rec_metrics[
             0
         ].get_computation_states()
@@ -508,6 +511,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         # Verify that the tensors received by the metric are on CPU
         # (they should have been transferred from cuda:1 to cpu)
         for predictions in self.mock_metric.predictions_update_calls:
+            # pyrefly: ignore[missing-attribute]
             for _, tensor in predictions.items():
                 self.assertEqual(
                     tensor.device.type,
@@ -537,6 +541,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         test_queue.put(metric_update_job)
         test_queue.put(metric_update_job)
 
+        # pyrefly: ignore[bad-argument-type]
         items_processed = self.cpu_module._flush_remaining_work(test_queue)
 
         self.assertEqual(items_processed, 2)

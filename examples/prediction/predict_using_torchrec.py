@@ -84,6 +84,7 @@ class RecommendationDataset(Dataset):
         """
         return self.num_samples
 
+    # pyrefly: ignore[bad-param-name-override]
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         """
         Retrieves a sample from the dataset at the specified index.

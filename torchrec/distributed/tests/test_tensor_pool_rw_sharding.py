@@ -34,6 +34,7 @@ class TestTensorPoolRwSharding(MultiProcessTestBase):
             rank, world_size, backend, local_size=world_size
         ) as ctx:
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             sharding_env = ShardingEnv.from_process_group(ctx.pg)
             if ctx.rank == 0:
                 ids = [4, 1]
@@ -95,6 +96,7 @@ class TestTensorPoolRwSharding(MultiProcessTestBase):
             rank, world_size, backend, local_size=world_size
         ) as ctx:
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             sharding_env = ShardingEnv.from_process_group(ctx.pg)
 
             block_size = torch.tensor([3], dtype=torch.int, device=ctx.device)
@@ -222,6 +224,7 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Execute: create InferRwTensorPoolSharding with memory_capacity_per_rank
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
+            # pyrefly: ignore[bad-argument-type]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -265,6 +268,7 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Execute: create InferRwTensorPoolSharding with memory_capacity_per_rank
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
+            # pyrefly: ignore[bad-argument-type]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -283,6 +287,7 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Assert: verify the row offsets are correct [0, 250, 400, 500]
         expected_row_offsets = torch.tensor([0, 250, 400, 500], device=device)
         torch.testing.assert_close(
+            # pyrefly: ignore[unsupported-operation]
             sharding._block_bucketize_row_pos[0],
             expected_row_offsets,
         )
@@ -306,6 +311,7 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Execute: create InferRwTensorPoolSharding with memory_capacity_per_rank
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
+            # pyrefly: ignore[bad-argument-type]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -316,6 +322,7 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         self.assertEqual(total_rows, pool_size)
 
         # Assert: verify the last row offset equals the pool size
+        # pyrefly: ignore[unsupported-operation]
         self.assertEqual(sharding._block_bucketize_row_pos[0][-1].item(), pool_size)
 
     def test_even_sharding_without_memory_capacity_per_rank(self) -> None:
@@ -337,6 +344,7 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
         # Execute: create InferRwTensorPoolSharding without memory_capacity_per_rank
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
+            # pyrefly: ignore[bad-argument-type]
             env=env,
             device=device,
             memory_capacity_per_rank=None,
@@ -371,6 +379,7 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
 
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
+            # pyrefly: ignore[bad-argument-type]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -410,6 +419,7 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
 
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
+            # pyrefly: ignore[bad-argument-type]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,
@@ -476,6 +486,7 @@ class TestInferRwTensorPoolSharding(unittest.TestCase):
 
         sharding = InferRwTensorPoolSharding(
             pool_size=pool_size,
+            # pyrefly: ignore[bad-argument-type]
             env=env,
             device=device,
             memory_capacity_per_rank=memory_capacity_per_rank,

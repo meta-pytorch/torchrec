@@ -25,6 +25,7 @@ from torchrec.metrics.test_utils import (
 
 
 WORLD_SIZE = 4
+# pyrefly: ignore[bad-assignment]
 METRIC_NAMESPACE: str = TensorWeightedAvgMetric._namespace.value
 DEVICE: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -195,7 +196,9 @@ class TensorWeightedAvgFunctionalityTest(unittest.TestCase):
         self.assertEqual(len(metric._metrics_computations), 1)
 
         computation = metric._metrics_computations[0]
+        # pyrefly: ignore[bad-index, missing-attribute]
         self.assertEqual(computation.tasks[0].tensor_name, "test_tensor")
+        # pyrefly: ignore[bad-index, missing-attribute]
         self.assertTrue(computation.tasks[0].weighted)
 
     def test_tensor_weighted_avg_unweighted_task(self) -> None:
@@ -222,7 +225,9 @@ class TensorWeightedAvgFunctionalityTest(unittest.TestCase):
         )
 
         computation = metric._metrics_computations[0]
+        # pyrefly: ignore[bad-index, missing-attribute]
         self.assertEqual(computation.tasks[0].tensor_name, "test_tensor")
+        # pyrefly: ignore[bad-index, missing-attribute]
         self.assertFalse(computation.tasks[0].weighted)
 
     def test_tensor_weighted_avg_unfused_required_inputs_validation(self) -> None:

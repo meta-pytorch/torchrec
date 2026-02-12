@@ -90,6 +90,7 @@ class RecalibratedCalibrationMetricComputation(CalibrationMetricComputation):
 
 
 class RecalibratedCalibrationMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.RECALIBRATED_CALIBRATION
     _computation_class: Type[RecMetricComputation] = (
         RecalibratedCalibrationMetricComputation

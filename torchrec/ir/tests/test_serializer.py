@@ -48,6 +48,7 @@ class CompoundModule(nn.Module):
         self.list = nn.ModuleList(mlist)
 
     def forward(self, features: KeyedJaggedTensor) -> List[torch.Tensor]:
+        # pyrefly: ignore[not-callable]
         res = self.comp(features) if self.comp else []
         res.append(self.ebc(features).values())
         for m in self.list:
@@ -92,6 +93,7 @@ class CompoundModuleSerializer(JsonSerializer):
             i += 1
         #  `Union[Module, Tensor]`.
         #  got `Union[Module, Tensor]`.
+        # pyrefly: ignore[bad-argument-type]
         return CompoundModule(ebc, comp, mlist)
 
 
@@ -303,6 +305,7 @@ class TestJsonSerializer(unittest.TestCase):
             keys=["f1", "f2", "f3"],
             values=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
             lengths=torch.tensor([1, 2, 3, 2, 1, 1]),
+            # pyrefly: ignore[bad-argument-type]
             stride_per_key_per_rank=torch.tensor([[3], [2], [1]]),
             inverse_indices=(
                 ["f1", "f2", "f3"],
@@ -313,6 +316,7 @@ class TestJsonSerializer(unittest.TestCase):
             keys=["f1", "f2", "f3"],
             values=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
             lengths=torch.tensor([1, 2, 3, 2, 1, 1]),
+            # pyrefly: ignore[bad-argument-type]
             stride_per_key_per_rank=torch.tensor([[1], [2], [3]]),
             inverse_indices=(
                 ["f1", "f2", "f3"],
@@ -692,6 +696,7 @@ class TestJsonSerializer(unittest.TestCase):
         )
 
         #  `_is_inited`.
+        # pyrefly: ignore[missing-attribute]
         self.assertFalse(model.regroup._is_inited)
         eager_out = model(id_list_features)
         #  `_is_inited`.
@@ -705,6 +710,7 @@ class TestJsonSerializer(unittest.TestCase):
         unflatten_ep = torch.export.unflatten(ep)
         deserialized_model = decapsulate_ir_modules(unflatten_ep, JsonSerializer)
         #  `_is_inited`.
+        # pyrefly: ignore[missing-attribute]
         self.assertFalse(deserialized_model.regroup._is_inited)
         deserialized_out = deserialized_model(id_list_features)
         #  `_is_inited`.
@@ -793,6 +799,7 @@ class TestJsonSerializer(unittest.TestCase):
         #  we export the model with ebc1 and unflatten the model,
         #  and then swap with ebc2 (you can think this as the the sharding process
         #  resulting a shardedEBC), so that we can mimic the key-order change
+        # pyrefly: ignore[missing-attribute]
         deserialized_model.sparse.ebc = ebc2
 
         deserialized_out = deserialized_model(id_list_features)
@@ -881,6 +888,7 @@ class TestJsonSerializer(unittest.TestCase):
         #  we export the model with ebc1 and unflatten the model,
         #  and then swap with ebc2 (you can think this as the the sharding process
         #  resulting a shardedEBC), so that we can mimic the key-order change
+        # pyrefly: ignore[missing-attribute]
         deserialized_model.sparse.ebc = ebc2
 
         deserialized_out = deserialized_model(id_list_features)
@@ -961,14 +969,19 @@ class TestJsonSerializer(unittest.TestCase):
         # Create subgraph for regroup node
         regroup_nodes = []
         mod = unflatten_ep.sparse
+        # pyrefly: ignore[missing-attribute]
         for node in mod.graph.nodes:
             if node.op == "call_module" and "regroup" in str(node.target):
                 regroup_nodes.append(node)
         partitions: List[Dict[torch.fx.Node, Optional[int]]] = []
         partitions.append(dict.fromkeys(regroup_nodes, None))
+        # pyrefly: ignore[missing-attribute]
         fuse_by_partitions(unflatten_ep.sparse.graph_module, partitions)
+        # pyrefly: ignore[missing-attribute]
         sub_mod = torch.fx.graph_module._get_attr(mod.graph_module, "fused_0")
+        # pyrefly: ignore[missing-attribute]
         mod.add_module("fused_0", sub_mod)
+        # pyrefly: ignore[missing-attribute]
         mod.graph = mod.graph_module.graph
 
         # decapsulate method will short circuit the kt_regroup node
@@ -982,6 +995,7 @@ class TestJsonSerializer(unittest.TestCase):
         #  we export the model with ebc1 and unflatten the model,
         #  and then swap with ebc2 (you can think this as the the sharding process
         #  resulting a shardedEBC), so that we can mimic the key-order change
+        # pyrefly: ignore[missing-attribute]
         deserialized_model.sparse.ebc = ebc2
 
         deserialized_out = deserialized_model(id_list_features)
@@ -1071,6 +1085,7 @@ class TestJsonSerializer(unittest.TestCase):
 
         unflatten_ep = torch.export.unflatten(ep)
         deserialized = decapsulate_ir_modules(unflatten_ep, JsonSerializer)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(deserialized.regroup._emb_dtype, data_type)
 
     def test_qualname(self) -> None:

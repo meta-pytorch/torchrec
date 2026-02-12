@@ -59,6 +59,7 @@ def kjt_for_pt2_tracing(
         )
 
     inverse_indices = None
+    # pyrefly: ignore[bad-assignment]
     stride = None
 
     if is_vb:

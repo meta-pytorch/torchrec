@@ -181,5 +181,6 @@ class NEPositiveMetricComputation(RecMetricComputation):
 
 
 class NEPositiveMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.NE_POSITIVE
     _computation_class: Type[RecMetricComputation] = NEPositiveMetricComputation

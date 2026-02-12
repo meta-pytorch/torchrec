@@ -306,6 +306,7 @@ def generate_sharded_model_and_optimizer(
         if pg is not None:
             plan = planner.collective_plan(model, sharders, pg)
         else:
+            # pyrefly: ignore[bad-argument-type, missing-argument]
             plan = planner.plan(model, sharders)
 
     sharded_model = DistributedModelParallel(

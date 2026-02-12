@@ -95,6 +95,7 @@ class TestHeuristicalStorageReservation(unittest.TestCase):
 
         self.assertEqual(
             _get_module_size(model.dense_arch, multiplier=6),
+            # pyrefly: ignore[missing-attribute]
             heuristical_storage_reservation._dense_storage.hbm,
         )
 
@@ -134,6 +135,7 @@ class TestHeuristicalStorageReservation(unittest.TestCase):
 
         self.assertEqual(
             _get_module_size(model.dense_arch, multiplier=6),
+            # pyrefly: ignore[missing-attribute]
             heuristical_storage_reservation._dense_storage.hbm,
         )
 
@@ -174,6 +176,7 @@ class TestHeuristicalStorageReservation(unittest.TestCase):
 
         self.assertEqual(
             _get_module_size(model.dense_arch, multiplier=6),
+            # pyrefly: ignore[missing-attribute]
             heuristical_storage_reservation._dense_storage.hbm,
         )
 
@@ -206,6 +209,7 @@ class TestHeuristicalStorageReservation(unittest.TestCase):
 
         self.assertEqual(
             dense_tensor_estimate,
+            # pyrefly: ignore[missing-attribute]
             heuristical_storage_reservation._dense_storage.hbm,
         )
 

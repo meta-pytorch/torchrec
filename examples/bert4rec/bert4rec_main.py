@@ -37,15 +37,19 @@ from tqdm import tqdm
 try:
 
     # @manual=//torchrec/github/examples/bert4rec:bert4rec_metrics
+    # pyrefly: ignore[missing-import]
     from bert4rec_metrics import recalls_and_ndcgs_for_ks
 
     # @manual=//torchrec/github/examples/bert4rec/data:bert4rec_movielens_datasets
+    # pyrefly: ignore[missing-import]
     from data.bert4rec_movielens_datasets import Bert4RecPreprocsser, get_raw_dataframe
 
     # @manual=//torchrec/github/examples/bert4rec/dataloader:bert4rec_movielens_dataloader
+    # pyrefly: ignore[missing-import]
     from dataloader.bert4rec_movielens_dataloader import Bert4RecDataloader
 
     # @manual=//torchrec/github/examples/bert4rec/models:bert4rec
+    # pyrefly: ignore[missing-import]
     from models.bert4rec import BERT4Rec
 except ImportError:
     pass
@@ -300,6 +304,7 @@ def _train_one_epoch(
     dist.all_gather_object(outputs, sum(loss_logs) / len(loss_logs))
     if dist.get_rank() == 0:
         #  _SupportsSum)]]` but got `List[None]`.
+        # pyrefly: ignore[no-matching-overload]
         print(f"Epoch {epoch + 1}, average loss { (sum(outputs) or 0) /len(outputs)}")
     lr_scheduler.step()
 
@@ -349,6 +354,7 @@ def _validate(
     dist.all_gather_object(outputs, metrics_avg)
     if dist.get_rank() == 0:
         print(
+            # pyrefly: ignore[bad-argument-type]
             f"{'Epoch ' + str(epoch + 1) if not is_testing else 'Test'}, metrics {_dict_mean(outputs)}"
         )
 
@@ -386,6 +392,7 @@ def train_val_test(
     """
     _validate(model, val_loader, device, -1, metric_ks)
     for epoch in range(num_epochs):
+        # pyrefly: ignore[missing-attribute]
         train_loader.sampler.set_epoch(epoch)
         _train_one_epoch(
             model,
@@ -545,6 +552,7 @@ def main(argv: List[str]) -> None:
         test_loader,
         device,
         #  `Union[CombinedOptimizer, Adam]`.
+        # pyrefly: ignore[bad-argument-type]
         optimizer,
         lr_scheduler,
         args.num_epochs,

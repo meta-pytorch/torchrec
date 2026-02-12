@@ -238,6 +238,7 @@ class ShardedKeyedJaggedTensorPool(
             )
         elif sharding_plan.sharding_type == ObjectPoolShardingType.REPLICATED_ROW_WISE:
             self._sharding: KeyedJaggedTensorPoolRwReplicatedSharding = (
+                # pyrefly: ignore[bad-assignment]
                 KeyedJaggedTensorPoolRwReplicatedSharding(
                     env=self._sharding_env,
                     device=self._device,
@@ -251,6 +252,7 @@ class ShardedKeyedJaggedTensorPool(
                 f"Sharding type {self._sharding_plan.sharding_type} is not implemented"
             )
 
+        # pyrefly: ignore[bad-assignment]
         self._lookup: KeyedJaggedTensorPoolLookup = None
         if self._enable_uvm:
             if values_dtype == torch.int64:
@@ -350,6 +352,7 @@ class ShardedKeyedJaggedTensorPool(
             .max(dim=1)
         )
 
+        # pyrefly: ignore[no-matching-overload]
         assert torch.all(
             max_elements <= self._feature_max_lengths_t
         ).item(), "input KJT has a feature that exceeds specified max lengths"
@@ -420,6 +423,7 @@ class ShardedKeyedJaggedTensorPool(
     ) -> LazyAwaitable[KeyedJaggedTensor]:
         return KeyedJaggedTensorPoolAwaitable(
             awaitable=self._lookup_values_dist_impl(ctx, values),
+            # pyrefly: ignore[bad-argument-type]
             unbucketize_permute=ctx.unbucketize_permute,
             keys=self._features,
             device=self._device,
@@ -543,12 +547,17 @@ class ShardedInferenceKeyedJaggedTensorPool(
                 )
             )
             if module._device != torch.device("meta"):
+                # pyrefly: ignore[not-callable]
                 self._local_kjt_pool_shards[rank]._values.copy_(
+                    # pyrefly: ignore[bad-index]
                     module.values[offset : offset + this_rank_size]
                 )
+                # pyrefly: ignore[not-callable]
                 self._local_kjt_pool_shards[rank]._key_lengths.copy_(
+                    # pyrefly: ignore[bad-index]
                     module.key_lengths[offset : offset + this_rank_size]
                 )
+                # pyrefly: ignore[not-callable]
                 jagged_lengths, jagged_offsets = self._local_kjt_pool_shards[
                     rank
                 ]._infer_jagged_lengths_inclusive_offsets()
@@ -577,6 +586,7 @@ class ShardedInferenceKeyedJaggedTensorPool(
 
     @property
     def dim(self) -> int:
+        # pyrefly: ignore[bad-return]
         return self._dim
 
     @property
@@ -591,12 +601,14 @@ class ShardedInferenceKeyedJaggedTensorPool(
     def create_context(self) -> ObjectPoolShardingContext:
         raise NotImplementedError("create_context() is not implemented")
 
+    # pyrefly: ignore[bad-param-name-override]
     def _lookup_ids_dist(
         self,
         ids: torch.Tensor,
     ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._lookup_ids_dist_impl(ids)
 
+    # pyrefly: ignore[bad-param-name-override]
     def _lookup_local(
         self,
         dist_input: List[torch.Tensor],
@@ -606,12 +618,14 @@ class ShardedInferenceKeyedJaggedTensorPool(
             ret.append(shard(dist_input[i]))
         return ret
 
+    # pyrefly: ignore[bad-param-name-override]
     def _lookup_values_dist(
         self,
         lookups: List[JaggedTensor],
     ) -> JaggedTensor:
         return self._lookup_values_dist_impl(lookups)
 
+    # pyrefly: ignore[bad-override]
     def forward(self, ids: torch.Tensor) -> KeyedJaggedTensor:
         dist_input, unbucketize_permute, _, _ = self._lookup_ids_dist(ids)
         lookup = self._lookup_local(dist_input)
@@ -635,6 +649,7 @@ class ShardedInferenceKeyedJaggedTensorPool(
         )
         return ret
 
+    # pyrefly: ignore[bad-override]
     def _update_ids_dist(
         self,
         ctx: ObjectPoolShardingContext,
@@ -642,6 +657,7 @@ class ShardedInferenceKeyedJaggedTensorPool(
     ) -> None:
         raise NotImplementedError("Inference does not currently support update")
 
+    # pyrefly: ignore[bad-override]
     def _update_values_dist(self, ctx: ObjectPoolShardingContext, values: torch.Tensor):
         raise NotImplementedError("Inference does not currently support update")
 
@@ -654,6 +670,7 @@ class ShardedInferenceKeyedJaggedTensorPool(
         raise NotImplementedError("Inference does not support update")
 
     #  `None`.
+    # pyrefly: ignore[bad-return]
     def _update_preproc(self, values: KeyedJaggedTensor) -> KeyedJaggedTensor:
         pass
 
@@ -662,6 +679,7 @@ class KeyedJaggedTensorPoolSharder(ModuleSharder[KeyedJaggedTensorPool]):
     def __init__(self) -> None:
         super().__init__()
 
+    # pyrefly: ignore[bad-param-name-override]
     def shard(
         self,
         module: KeyedJaggedTensorPool,

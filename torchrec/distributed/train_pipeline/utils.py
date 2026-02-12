@@ -82,6 +82,7 @@ def _to_device(
             batch.to(
                 device=device,
                 non_blocking=non_blocking,
+                # pyrefly: ignore[unexpected-keyword]
                 data_copy_stream=data_copy_stream,
             ),
         )
@@ -201,14 +202,17 @@ def _start_embedding_lookup(
     target_stream: Optional[torch.Stream],
     stream_context: Callable[..., AbstractContextManager[Any, Any]],
 ) -> None:
+    # pyrefly: ignore[missing-attribute]
     module_context = context.module_contexts[module.forward.name]
     with stream_context(source_stream):
+        # pyrefly: ignore[missing-attribute]
         kjt = context.input_dist_tensors_requests[module.forward.name].wait()
 
     if target_stream is not None:
         kjt.record_stream(target_stream)
         module_context.record_stream(target_stream)
     output_dist_out = module.compute_and_output_dist(module_context, kjt)
+    # pyrefly: ignore[missing-attribute]
     context.embedding_a2a_requests[module.forward.name] = output_dist_out
 
 
@@ -228,6 +232,7 @@ def _fuse_input_dist_splits(context: TrainPipelineContext) -> None:
             (
                 names,
                 FusedKJTListSplitsAwaitable(
+                    # pyrefly: ignore[bad-argument-type]
                     requests=[
                         context.input_dist_splits_requests[name] for name in names
                     ],
@@ -367,6 +372,7 @@ def _rewrite_model(  # noqa C901
     if batch:
         if hasattr(batch, "to_proxy"):
             # for some special models, it requires using "input" as the key for input
+            # pyrefly: ignore[missing-attribute]
             concrete_args["inputs"] = copy.copy(batch).to_proxy()
         elif hasattr(batch, "to_proxy_tuple"):
             # when the model is pre-fx traced or dynamo exported, the inputs are already flattened,
@@ -411,6 +417,7 @@ def _rewrite_model(  # noqa C901
             original_forwards.append(child.forward)
             # Set pipelining flag on the child module
             child.is_pipelined = True
+            # pyrefly: ignore[bad-assignment]
             child.forward = pipelined_forward(
                 node.target,
                 arg_info_list,
@@ -473,11 +480,13 @@ def _override_input_dist_forwards(
                 if hasattr(input_dist, "_dist"):
                     assert isinstance(input_dist._dist, KJTAllToAll)
                     original_kjt_dist_forwards.append(input_dist._dist.forward)
+                    # pyrefly: ignore[bad-assignment]
                     input_dist._dist.forward = KJTAllToAllForward(
                         pg=input_dist._dist._pg,
                         splits=input_dist._dist._splits,
                         stagger=input_dist._dist._stagger,
                     )
+    # pyrefly: ignore[bad-return]
     return original_kjt_dist_forwards
 
 

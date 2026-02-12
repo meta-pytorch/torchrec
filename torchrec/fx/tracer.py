@@ -133,6 +133,7 @@ class Tracer(torch.fx.Tracer):
         """
 
         if hasattr(mod, "_fx_path"):
+            # pyrefly: ignore[bad-return]
             return mod._fx_path
         else:
             return super().path_of_module(mod)

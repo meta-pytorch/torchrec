@@ -135,6 +135,7 @@ class GAUCMetricValueTest(unittest.TestCase):
             "predictions": self.predictions,
             "labels": self.labels,
             "num_candidates": self.num_candidates,
+            # pyrefly: ignore[bad-typed-dict-key]
             "weights": None,
         }
 
@@ -168,6 +169,7 @@ class GAUCMetricValueTest(unittest.TestCase):
             "predictions": self.predictions,
             "labels": self.labels,
             "num_candidates": self.num_candidates,
+            # pyrefly: ignore[bad-typed-dict-key]
             "weights": None,
         }
 
@@ -197,11 +199,13 @@ class GAUCMetricValueTest(unittest.TestCase):
         self.labels["DefaultTask"] = torch.tensor([[1, 1, 0, 1, 0]])
         self.weights["DefaultTask"] = torch.tensor([[1, 1, 1, 1, 1]])
         self.num_candidates = torch.tensor([3, 2])
+        # pyrefly: ignore[bad-assignment]
         self.weights = None
         self.batches = {
             "predictions": self.predictions,
             "labels": self.labels,
             "num_candidates": self.num_candidates,
+            # pyrefly: ignore[bad-typed-dict-key]
             "weights": None,
         }
 

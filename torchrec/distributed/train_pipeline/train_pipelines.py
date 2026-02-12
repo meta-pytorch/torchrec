@@ -240,6 +240,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._cur_batch: Optional[In] = None
         self._connected = False
         self._data_iter_stopped = False
+        # pyrefly: ignore [missing-argument]
         super().__init__()
 
     def _reset_data_iter(self) -> None:
@@ -264,6 +265,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                     data_copy_stream=self._memcpy_stream,
                 )
             else:
+                # pyrefly: ignore [bad-argument-type]
                 with self._stream_context(self._memcpy_stream):
                     self._cur_batch = _to_device(
                         cur_batch, self._device, non_blocking=True
@@ -305,6 +307,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                 )
         else:
             with record_function("## copy_batch_to_gpu ##"):
+                # pyrefly: ignore [bad-argument-type]
                 with self._stream_context(self._memcpy_stream):
                     self._cur_batch = _to_device(
                         cur_batch, self._device, non_blocking=True
@@ -437,8 +440,10 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
                 torch._dynamo.config.capture_scalar_outputs = True
                 torch._dynamo.config.capture_dynamic_output_shape_ops = True
                 torch._dynamo.config.force_unspec_int_unbacked_size_like_on_torchrec_kjt = (
+                    # pyrefly: ignore [bad-assignment]
                     True
                 )
+                # pyrefly: ignore [bad-assignment]
                 torch._dynamo.config.skip_torchrec = False
 
                 # Importing only before compilation to not slow-done train_pipelines import
@@ -590,6 +595,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         # Backward hook registry for injecting work during backward comms
         self._backward_hook_registry = backward_hook_registry or BackwardHookRegistry()
 
+        # pyrefly: ignore [missing-argument]
         super().__init__()
 
         # DEPRECATED FIELDS
@@ -656,6 +662,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         please check PipelinedForward for details.
         """
         for module in self._pipelined_modules:
+            # pyrefly: ignore [missing-attribute]
             module.forward.set_context(context)
 
         for postproc_module in self._pipelined_postprocs:
@@ -675,6 +682,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             return False
         self._batch_count += 1
         self.batches.append(batch)
+        # pyrefly: ignore [bad-argument-type]
         self.contexts.append(context)
 
         return True
@@ -719,6 +727,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
 
         # modify the (sharded) sparse module forward, and invoke the first part of input_dist
         self._init_pipelined_modules(
+            # pyrefly: ignore [bad-argument-type]
             self.batches[0],
             self.contexts[0],
             self._pipelined_forward_type,
@@ -930,6 +939,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         """
         context = self._create_context()
         with record_function(f"## copy_batch_to_gpu {context.index} ##"):
+            # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._memcpy_stream):
                 batch = self._next_batch(dataloader_iter)
                 if batch is not None:
@@ -1007,6 +1017,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         if batch is None:
             return
         with record_function(f"## start_sparse_data_dist {context.index} ##"):
+            # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._data_dist_stream):
                 _wait_for_batch(batch, self._memcpy_stream)
 
@@ -1020,6 +1031,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         and populates the context with them.
         """
         with record_function(f"## wait_sparse_data_dist {context.index} ##"):
+            # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._data_dist_stream):
                 for names, awaitable in context.fused_splits_awaitables:
                     for name, request in zip(names, awaitable.wait()):
@@ -1051,6 +1063,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         """
         self._set_module_context(self._context)
         with record_function("## wait_sparse_data_dist ##"):
+            # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._data_dist_stream):
                 self._context.module_contexts = (
                     self._context.module_contexts_next_batch.copy()
@@ -1227,6 +1240,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
 
         # Input dist in critical path (key difference from full SDD)
         self._init_pipelined_modules(
+            # pyrefly: ignore [bad-argument-type]
             self.batches[0],
             self.contexts[0],
             self._pipelined_forward_type,
@@ -1295,6 +1309,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
     """
 
     # The PipelinedForward class that is used in _rewrite_model
+    # pyrefly: ignore [bad-override]
     _pipelined_forward_type = InSyncEmbeddingPipelinedForward
 
     def __init__(
@@ -1365,6 +1380,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
         with record_function(f"## start_embedding_lookup {context.index} ##"):
             current_stream = torch.get_device_module(self._device).current_stream()
+            # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._emb_lookup_stream):
                 for module in self._pipelined_modules:
                     _start_embedding_lookup(
@@ -1403,6 +1419,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
 
         # start embedding_lookup so it can overlap with previous optimizer
         if not self._embedding_lookup_after_data_dist:
+            # pyrefly: ignore [bad-argument-type]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         if self._model.training:
@@ -1423,6 +1440,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             self.enqueue_batch(dataloader_iter)
 
         if self._embedding_lookup_after_data_dist:
+            # pyrefly: ignore [bad-argument-type]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         # forward
@@ -1480,6 +1498,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
     """
 
     # The PipelinedForward class that is used in _rewrite_model
+    # pyrefly: ignore [bad-override]
     _pipelined_forward_type = EmbeddingPipelinedForward
 
     def __init__(
@@ -1548,12 +1567,15 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             return
 
         self._init_pipelined_modules(
+            # pyrefly: ignore [bad-argument-type]
             self.batches[0],
             self.contexts[0],
+            # pyrefly: ignore [bad-argument-type]
             self._pipelined_forward_type,
         )
         self.wait_sparse_data_dist(self.contexts[0])
         self._validate_optimizer()
+        # pyrefly: ignore [bad-argument-type]
         self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         # batch i+1
@@ -1568,6 +1590,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
 
     def is_semi_sync(self) -> bool:
         if len(self.batches) >= 1:
+            # pyrefly: ignore [unsupported-operation]
             return self.contexts[0].index >= self._start_batch
         return False
 
@@ -1616,6 +1639,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
         self.enqueue_batch(dataloader_iter)
 
         if len(self.batches) >= 1 and is_semi_sync:
+            # pyrefly: ignore [bad-argument-type]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         if len(self.batches) >= 2:
@@ -1625,6 +1649,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             with record_function(f"## backward {iteration} ##"):
                 torch.sum(losses, dim=0).backward()
             with record_function(f"## emb_backward {iteration} ##"):
+                # pyrefly: ignore [bad-argument-type]
                 self.embedding_backward(context)
 
             self.sync_embeddings(
@@ -1646,6 +1671,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
 
         if len(self.batches) >= 1 and not is_semi_sync:
             torch.get_device_module().synchronize()  # needed to avoid race condition
+            # pyrefly: ignore [bad-argument-type]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         return output
@@ -1699,6 +1725,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
     ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
         context = None
         with record_function(f"## copy_batch_to_gpu {self._next_index} ##"):
+            # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._memcpy_stream):
                 batch = self._next_batch(dataloader_iter)
                 if batch is not None:
@@ -1726,6 +1753,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
         # Temporarily set context for next iter to populate cache
         with use_context_for_postprocs(self._pipelined_postprocs, context):
             with record_function(f"## start_sparse_data_dist {context.index} ##"):
+                # pyrefly: ignore [bad-argument-type]
                 with self._stream_context(self._data_dist_stream):
                     _wait_for_events(batch, context, self._data_dist_stream)
                     model_input = self.extract_model_input_from_batch(batch)
@@ -1851,6 +1879,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     """
 
     # The PipelinedForward class that is used in _rewrite_model
+    # pyrefly: ignore [bad-override]
     _pipelined_forward_type = PrefetchPipelinedForward
 
     def __init__(
@@ -1919,6 +1948,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         self._init_pipelined_modules(
             self._batch_i,
             self._context,
+            # pyrefly: ignore [bad-argument-type]
             self._pipelined_forward_type,
         )
         self._start_sparse_data_dist(self._batch_i)
@@ -2004,28 +2034,37 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         """
         if batch is None:
             return
+        # pyrefly: ignore [missing-attribute]
         self._context.module_input_post_prefetch.clear()
+        # pyrefly: ignore [missing-attribute]
         self._context.module_contexts_post_prefetch.clear()
 
         with record_function("## sharded_module_prefetch ##"):
+            # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._prefetch_stream):
                 batch.record_stream(
                     torch.get_device_module(self._device).current_stream()
                 )
                 data_per_pipelined_module = _prefetch_embeddings(
                     batch,
+                    # pyrefly: ignore [bad-argument-type]
                     self._context,
                     self._pipelined_modules,
                     self._device,
+                    # pyrefly: ignore [bad-argument-type]
                     self._stream_context,
                     self._data_dist_stream,
                     self._default_stream,
                 )
                 for sharded_module in self._pipelined_modules:
                     forward = sharded_module.forward
+                    # pyrefly: ignore [missing-attribute]
                     data = data_per_pipelined_module[forward._name]
+                    # pyrefly: ignore [missing-attribute]
                     self._context.module_input_post_prefetch[forward._name] = data
+                    # pyrefly: ignore [missing-attribute]
                     self._context.module_contexts_post_prefetch[forward._name] = (
+                        # pyrefly: ignore [missing-attribute]
                         self._context.module_contexts.pop(forward._name)
                     )
 
@@ -2122,6 +2161,7 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
                 logger.info(
                     f"initial fill batch-{context.index} with {'train' if is_training else 'eval'}"
                 )
+                # pyrefly: ignore [missing-attribute]
                 context.is_training = is_training
 
         # Here is the expected stop after exhausting all batches
@@ -2145,10 +2185,12 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
             # Invoke splits all_to_all comms (first part of input_dist)
             self.start_sparse_data_dist(self.batches[1], self.contexts[1])
 
+        # pyrefly: ignore [missing-attribute]
         is_curr_training = self._model.training and self.contexts[0].is_training
 
         # Batch i+2: load data and copy to GPU, the dataloader iter will first exhaust here
         if self.enqueue_batch(dataloader_iter):
+            # pyrefly: ignore [missing-attribute]
             self.contexts[-1].is_training = is_training
 
         # Forward pass for current batch
@@ -2266,6 +2308,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             self.contexts.append(self._create_context())
 
             self._init_pipelined_modules(
+                # pyrefly: ignore [bad-argument-type]
                 self.batches[0],
                 self.contexts[0],
                 self._pipelined_forward_type,
@@ -2330,6 +2373,7 @@ class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
 
         # start embedding_lookup so it can overlap with previous optimizer
         if not self._embedding_lookup_after_data_dist:
+            # pyrefly: ignore [bad-argument-type]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         if self._model.training:
@@ -2348,6 +2392,7 @@ class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
         self.enqueue_batch(dataloader_iter)
 
         if self._embedding_lookup_after_data_dist:
+            # pyrefly: ignore [bad-argument-type]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
         # forward
@@ -2463,6 +2508,7 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
         inputs: In,
         stream: torch.Stream,
     ) -> StageOutputWithEvent:
+        # pyrefly: ignore [bad-argument-type]
         with self._stream_context(stream):
             # If there is no previous event, data is entering the pipeline
             if event is not None:
@@ -2657,6 +2703,7 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
             # Since model forward() is expected to run outside the pipeline,
             # we need to explicitly wait for the last stage to finish
             event.wait(self._compute_stream)
+            # pyrefly: ignore [missing-attribute]
             out.record_stream(self._compute_stream)
 
         if out is None and self._flushing:
@@ -2714,10 +2761,15 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
             },
         )
         torch._dynamo.config.inline_inbuilt_nn_modules = True
+        # pyrefly: ignore [bad-assignment]
         torch._dynamo.config.skip_fsdp_hooks = False
+        # pyrefly: ignore [bad-assignment, implicit-import]
         torch._functorch.config.recompute_views = True
+        # pyrefly: ignore [bad-assignment, implicit-import]
         torch._functorch.config.cse = False
+        # pyrefly: ignore [bad-assignment, implicit-import]
         torch._inductor.config.reorder_for_compute_comm_overlap = True
+        # pyrefly: ignore [implicit-import]
         torch._inductor.config.reorder_for_compute_comm_overlap_passes = [
             "sink_waits",
             "raise_comms",
@@ -2735,7 +2787,9 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
             self.initialized = True
             return contextlib.nullcontext()
 
+        # pyrefly: ignore [implicit-import]
         return torch._dynamo.compiled_autograd._enable(
+            # pyrefly: ignore [no-matching-overload]
             torch.compile(**self.compiled_autograd_options)
         )
 

@@ -136,5 +136,6 @@ class AverageMetricComputation(RecMetricComputation):
 
 
 class AverageMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.AVERAGE
     _computation_class: Type[RecMetricComputation] = AverageMetricComputation

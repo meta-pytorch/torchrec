@@ -50,6 +50,7 @@ from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class TWvsRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.ROW_WISE.value, ShardingType.TABLE_WISE.value]
@@ -60,6 +61,7 @@ class TWvsRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.FUSED.value]
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_WISE.value]
@@ -89,6 +91,7 @@ class TestEmbeddingShardingPlanner(unittest.TestCase):
             for i in range(4)
         ]
         model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         sharding_plan = self.planner.plan(module=model, sharders=[TWSharder()])
         ranks = [
             cast(List[int], param_shard.ranks)
@@ -111,6 +114,7 @@ class TestEmbeddingShardingPlanner(unittest.TestCase):
             for i in range(4)
         ]
         model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         sharding_plan = self.planner.plan(module=model, sharders=[TWvsRWSharder()])
         expected_ranks = [[0], [0], [1], [1]]
         ranks = [
@@ -133,6 +137,7 @@ class TestEmbeddingShardingPlanner(unittest.TestCase):
             for i in range(3)
         ]
         model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         sharding_plan = self.planner.plan(module=model, sharders=[TWvsRWSharder()])
         expected_ranks = [[0], [0, 1], [1]]
         ranks = [
@@ -157,6 +162,7 @@ class TestEmbeddingShardingPlanner(unittest.TestCase):
         model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
 
         with self.assertRaises(PlannerError) as context:
+            # pyrefly: ignore[bad-argument-type, missing-argument]
             self.planner.plan(module=model, sharders=[TWvsRWSharder()])
         self.assertEqual(
             context.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
@@ -178,11 +184,13 @@ class TestEmbeddingShardingPlanner(unittest.TestCase):
         model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
 
         with self.assertRaises(PlannerError) as context:
+            # pyrefly: ignore[bad-argument-type, missing-argument]
             self.planner.plan(module=model, sharders=[TWSharder()])
         self.assertEqual(
             context.exception.error_type, PlannerErrorType.STRICT_CONSTRAINTS
         )
 
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         sharding_plan = self.planner.plan(module=model, sharders=[TWvsRWSharder()])
         expected_ranks = [[0, 1]]
         ranks = [
@@ -205,6 +213,7 @@ class TestEmbeddingShardingPlanner(unittest.TestCase):
             for i in range(4)
         ]
         model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        # pyrefly: ignore[missing-argument]
         sharding_plan = self.planner.plan(module=model, sharders=[])
 
         self.assertEqual(sharding_plan, ShardingPlan({}))
@@ -258,6 +267,7 @@ class TestEmbeddingShardingPlannerWithConstraints(unittest.TestCase):
 
     def test_fused_paramters_from_constraints(self) -> None:
         model = TestSparseNN(tables=self.tables, sparse_device=torch.device("meta"))
+        # pyrefly: ignore[missing-argument]
         sharding_plan = self.planner.plan(module=model, sharders=get_default_sharders())
 
         expected_fused_params = {
@@ -304,6 +314,7 @@ class TestEmbeddingShardingPlannerWithConstraints(unittest.TestCase):
 
     def test_passing_info_through_constraints(self) -> None:
         model = TestSparseNN(tables=self.tables, sparse_device=torch.device("meta"))
+        # pyrefly: ignore[missing-argument]
         _ = self.planner.plan(module=model, sharders=get_default_sharders())
 
         best_plan: Optional[List[ShardingOption]] = self.planner._best_plan
@@ -356,6 +367,7 @@ class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):
         self.enumerator = EmbeddingEnumerator(
             topology=self.topology, batch_size=self.batch_size
         )
+        # pyrefly: ignore[bad-argument-type]
         self.enumerator.enumerate(module, sharders)
 
         self.storage_reservation = HeuristicalStorageReservation(percentage=0.15)
@@ -366,6 +378,7 @@ class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):
             topology=self.topology,
             batch_size=self.batch_size,
             module=module,
+            # pyrefly: ignore[bad-argument-type]
             sharders=sharders,
             constraints=self.constraints,
         )
@@ -427,6 +440,7 @@ class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):
         )
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class AutoSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.ROW_WISE.value, ShardingType.TABLE_WISE.value]
@@ -473,6 +487,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
 
     def test_auto_sharder_solution(self) -> None:
         model = TestSparseNN(tables=self.tables, sparse_device=torch.device("meta"))
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         sharding_plan = self.planner.plan(module=model, sharders=[AutoSharder()])
         expected_ranks = [[0, 1], [0, 1], [0, 1], [0, 1]]
         ranks = [
@@ -545,12 +560,15 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
             constraints=constraints,
         )
 
+        # pyrefly: ignore[missing-argument]
         sharding_plan = planner.plan(
             module=model,
+            # pyrefly: ignore[bad-argument-type]
             sharders=[EmbeddingCollectionSharder()],
         )
 
         for table_index in range(4):
+            # pyrefly: ignore[bad-index]
             shards = sharding_plan.plan["sparse.ec"][
                 f"table_{table_index}"
             ].sharding_spec.shards
@@ -620,8 +638,11 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
             proposer=EmbeddingOffloadScaleupProposer(),
             constraints=constraints,
         )
+        # pyrefly: ignore[missing-argument]
         sharding_plan = planner.plan(
-            module=model, sharders=[EmbeddingCollectionSharder()]
+            module=model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[EmbeddingCollectionSharder()],
         )
 
         expected_ranks = [[0, 1], [0, 1], [0, 1], [0, 1]]
@@ -647,6 +668,7 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
         )
 
         for table_index in range(4):
+            # pyrefly: ignore[bad-index]
             shards = sharding_plan.plan["sparse.ec"][
                 f"table_{table_index}"
             ].sharding_spec.shards
@@ -716,8 +738,11 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
             proposer=EmbeddingOffloadScaleupProposer(),
             constraints=constraints,
         )
+        # pyrefly: ignore[missing-argument]
         sharding_plan = planner.plan(
-            module=model, sharders=[EmbeddingCollectionSharder()]
+            module=model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[EmbeddingCollectionSharder()],
         )
 
         expected_ranks = [[0, 1], [0, 1], [0, 1], [0, 1]]
@@ -772,10 +797,14 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
 
         #  L1 cache size > size of embedding table * default cache load factor
 
+        # pyrefly: ignore[missing-argument]
         sharding_plan = planner.plan(
-            module=model, sharders=[EmbeddingCollectionSharder()]
+            module=model,
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[EmbeddingCollectionSharder()],
         )
         for table_index in range(4):
+            # pyrefly: ignore[bad-index]
             shards = sharding_plan.plan["sparse.ec"][
                 f"table_{table_index}"
             ].sharding_spec.shards
@@ -821,13 +850,16 @@ class TestAutoPlannerWithScaleupProposer(unittest.TestCase):
             proposer=EmbeddingOffloadScaleupProposer(),
             constraints=constraints,
         )
+        # pyrefly: ignore[missing-argument]
         sharding_plan = planner.plan(
             module=model,
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 EmbeddingCollectionSharder(fused_params={"cache_load_factor": 0.5})
             ],
         )
         for table_index in range(4):
+            # pyrefly: ignore[bad-index]
             shards = sharding_plan.plan["sparse.ec"][
                 f"table_{table_index}"
             ].sharding_spec.shards
@@ -930,6 +962,7 @@ class TestPlanLoaderIntegration(unittest.TestCase):
         baseline_planner = EmbeddingShardingPlanner(
             topology=self.topology, constraints=self.constraints
         )
+        # pyrefly: ignore[missing-argument]
         baseline_plan = baseline_planner.plan(
             module=self.model, sharders=get_default_sharders()
         )
@@ -987,6 +1020,7 @@ class TestPlanLoaderIntegration(unittest.TestCase):
         )
 
         # Plan with loader should use the loaded plan
+        # pyrefly: ignore[missing-argument]
         loaded_plan = planner_with_loader.plan(
             module=self.model, sharders=get_default_sharders()
         )
@@ -1024,6 +1058,7 @@ class TestPlanLoaderIntegration(unittest.TestCase):
 
         # Planning should raise PlannerError due to context mismatch
         with self.assertRaises(PlannerError) as context:
+            # pyrefly: ignore[missing-argument]
             planner_with_loader.plan(module=self.model, sharders=get_default_sharders())
 
         self.assertEqual(
@@ -1038,6 +1073,7 @@ class TestPlanLoaderIntegration(unittest.TestCase):
         baseline_planner = EmbeddingShardingPlanner(
             topology=self.topology, constraints=self.constraints
         )
+        # pyrefly: ignore[missing-argument]
         baseline_planner.plan(module=self.model, sharders=get_default_sharders())
         context_hash = baseline_planner.hash_planner_context_inputs_str()
 
@@ -1055,6 +1091,7 @@ class TestPlanLoaderIntegration(unittest.TestCase):
         )
 
         # Planning should succeed and generate a new plan (no loading)
+        # pyrefly: ignore[missing-argument]
         loaded_plan = planner_with_loader.plan(
             module=self.model, sharders=get_default_sharders()
         )
@@ -1112,6 +1149,7 @@ class TestExtractPlan(unittest.TestCase):
         self.model = TestSparseNN(
             tables=self.tables, sparse_device=torch.device("meta")
         )
+        # pyrefly: ignore[missing-argument]
         self.sharding_plan = self.planner.plan(
             module=self.model, sharders=get_default_sharders()
         )
@@ -1143,6 +1181,7 @@ class TestExtractPlan(unittest.TestCase):
 
     def test_extract_plan_success(self) -> None:
         """Test successful extraction of plan."""
+        # pyrefly: ignore[missing-attribute]
         enumerated_plan = self.planner._enumerator.last_stored_search_space
         best_plan = none_throws(self.planner._best_plan)
         loaded_sharding_options = self._create_loaded_sharding_options_map(best_plan)
@@ -1172,6 +1211,7 @@ class TestExtractPlan(unittest.TestCase):
         """Test extract_plan failure when duplicate storage hashes exist."""
         # Create search space with duplicate storage hashes by modifying sharding options
         # to have the same storage hash
+        # pyrefly: ignore[missing-attribute]
         enumerated_plan = self.planner._enumerator.last_stored_search_space
         best_plan = none_throws(self.planner._best_plan)
         loaded_sharding_options = self._create_loaded_sharding_options_map(best_plan)
@@ -1197,6 +1237,7 @@ class TestExtractPlan(unittest.TestCase):
 
     def test_extract_plan_empty_loaded_options(self) -> None:
         """Test extract_plan with empty loaded options but non-empty search space."""
+        # pyrefly: ignore[missing-attribute]
         enumerated_plan = self.planner._enumerator.last_stored_search_space
 
         # When loaded options is empty, extract_plan should return empty list
@@ -1206,6 +1247,7 @@ class TestExtractPlan(unittest.TestCase):
 
     def test_extract_plan_excess_loaded_options(self) -> None:
         """Test extract_plan when loaded options contain more entries than search space."""
+        # pyrefly: ignore[missing-attribute]
         enumerated_plan = self.planner._enumerator.last_stored_search_space
         best_plan = none_throws(self.planner._best_plan)
         loaded_sharding_options = self._create_loaded_sharding_options_map(best_plan)
@@ -1234,6 +1276,7 @@ class TestExtractPlan(unittest.TestCase):
 
     def test_extract_plan_properties_preservation(self) -> None:
         """Test that extract_plan preserves all non-shard properties from search space."""
+        # pyrefly: ignore[missing-attribute]
         enumerated_plan = self.planner._enumerator.last_stored_search_space
         best_plan = none_throws(self.planner._best_plan)
         loaded_sharding_options = self._create_loaded_sharding_options_map(best_plan)

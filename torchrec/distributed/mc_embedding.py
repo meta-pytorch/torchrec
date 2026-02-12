@@ -57,6 +57,7 @@ class ManagedCollisionEmbeddingCollectionContext(EmbeddingCollectionContext):
                     continue
                 value.record_stream(stream)
         if self.remapped_kjt is not None:
+            # pyrefly: ignore[bad-argument-type]
             self.remapped_kjt.record_stream(stream)
 
 
@@ -130,6 +131,7 @@ class ManagedCollisionEmbeddingCollectionSharder(
         return ShardedManagedCollisionEmbeddingCollection(
             module,
             params,
+            # pyrefly: ignore[bad-argument-type]
             ec_sharder=self._e_sharder,
             mc_sharder=self._mc_sharder,
             env=env,

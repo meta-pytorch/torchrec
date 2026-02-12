@@ -297,6 +297,7 @@ def move_to_copy_nodes_to_device(
     """
     Moves all the copy nodes to the given device.
     """
+    # pyrefly: ignore[missing-attribute]
     for nodes in unflattened_module.graph.nodes:
         if "_to_copy" in nodes.name:
             new_kwargs = {}
@@ -310,6 +311,7 @@ def move_to_copy_nodes_to_device(
 
 
 def _check_graph_node(mod: nn.Module, fqn: str) -> bool:
+    # pyrefly: ignore[missing-attribute]
     for node in mod.graph.nodes:
         if node.op == "call_module" and node.target == fqn:
             return True
@@ -374,6 +376,7 @@ def prune_pytree_flatten_unflatten(
     """
 
     def _get_graph_node(mod: nn.Module, fqn: str) -> Tuple[nn.Module, Node, str]:
+        # pyrefly: ignore[missing-attribute]
         for node in mod.graph.nodes:
             if node.op == "call_module" and node.target == fqn:
                 return mod, node, fqn
@@ -419,6 +422,7 @@ def prune_pytree_flatten_unflatten(
         tree_unflatten = cast(Node, tree_unflatten_getitem.args[0])
         assert (
             tree_unflatten.op == "call_function"
+            # pyrefly: ignore[implicit-import]
             and tree_unflatten.target == torch.utils._pytree.tree_unflatten
         )
         logger.info(f"Removing tree_unflatten from {fqn}")
@@ -428,6 +432,7 @@ def prune_pytree_flatten_unflatten(
         else:
             node.kwargs = {list(node.kwargs.keys())[0]: input_nodes}
         #  `eliminate_dead_code`.
+        # pyrefly: ignore[missing-attribute]
         submodule.graph.eliminate_dead_code()
 
     # remove tree_flatten_spec from the out_fqns (out-going nodes)
@@ -437,6 +442,7 @@ def prune_pytree_flatten_unflatten(
         assert (
             len(users) == 1
             and users[0].op == "call_function"
+            # pyrefly: ignore[implicit-import]
             and users[0].target == torch.fx._pytree.tree_flatten_spec
         )
         tree_flatten_users = list(users[0].users.keys())
@@ -449,5 +455,6 @@ def prune_pytree_flatten_unflatten(
         getitem_node = tree_flatten_users[0]
         getitem_node.replace_all_uses_with(node)
         #  `eliminate_dead_code`.
+        # pyrefly: ignore[missing-attribute]
         submodule.graph.eliminate_dead_code()
     return module

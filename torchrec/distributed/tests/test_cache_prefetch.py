@@ -130,6 +130,7 @@ class ShardedEmbeddingModuleCachePrefetchTest(unittest.TestCase):
         sharded_ebc = sharded_model.module
         self.assertIsInstance(sharded_ebc, ShardedEmbeddingBagCollection)
         lookups = sharded_ebc._lookups
+        # pyrefly: ignore[bad-index, missing-attribute]
         emb_module = lookups[0]._emb_modules[0]._emb_module
         self.assertIsInstance(emb_module, SplitTableBatchedEmbeddingBagsCodegen)
 
@@ -209,9 +210,11 @@ class ShardedEmbeddingModuleCachePrefetchTest(unittest.TestCase):
         )
         sharded_ebc = sharded_model.module
         lookups = sharded_ebc._lookups
+        # pyrefly: ignore[bad-index, missing-attribute]
         emb_module = lookups[0]._emb_modules[0]._emb_module
 
         kjt_list = KJTList([batch_1_kjt])
+        # pyrefly: ignore[not-callable]
         sharded_ebc.prefetch(kjt_list)
 
         # Reset cache stats so that local uvm cache stats are reset

@@ -182,6 +182,7 @@ class TowerQPSMetric(RecMetric):
         tower_qps = torch.sum(num_examples) / torch.max(time_lapse) = 2.80
     """
 
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.TOWER_QPS
     _computation_class: Type[RecMetricComputation] = TowerQPSMetricComputation
 
@@ -257,6 +258,7 @@ class TowerQPSMetric(RecMetric):
                 if self._should_validate_update:
                     # Set the default value to be all True. When weights is None, it's considered
                     # to be a valid input, and we'll use the default value
+                    # pyrefly: ignore[no-matching-overload]
                     has_valid_weights = torch.ones(
                         len(self._tasks),
                         dtype=torch.bool,
@@ -280,13 +282,16 @@ class TowerQPSMetric(RecMetric):
                         )
 
                     if torch.any(has_valid_weights):
+                        # pyrefly: ignore[not-callable]
                         self._metrics_computations[0].update(
                             predictions=None, labels=labels, weights=None
                         )
+                        # pyrefly: ignore[not-callable]
                         self._metrics_computations[0].has_valid_update.logical_or_(
                             has_valid_weights
                         )
                 else:
+                    # pyrefly: ignore[not-callable]
                     self._metrics_computations[0].update(
                         predictions=None, labels=labels, weights=None
                     )
@@ -296,8 +301,10 @@ class TowerQPSMetric(RecMetric):
                         continue
                     #  List[typing.Any], int, slice, Tensor, typing.Tuple[typing.Any,
                     #  ...]]` but got `str`.
+                    # pyrefly: ignore[bad-index]
                     task_labels = labels[task.name].view(1, -1)
                     if self._should_validate_update:
+                        # pyrefly: ignore[no-matching-overload]
                         has_valid_weights = torch.ones(
                             1,
                             dtype=torch.bool,
@@ -311,6 +318,7 @@ class TowerQPSMetric(RecMetric):
                                     #  `Union[None, List[typing.Any], int, slice,
                                     #  Tensor, typing.Tuple[typing.Any, ...]]` but got
                                     #  `str`.
+                                    # pyrefly: ignore[bad-index]
                                     weights[task.name].view(1, -1),
                                     dim=-1,
                                 ),
@@ -318,9 +326,11 @@ class TowerQPSMetric(RecMetric):
                             )
                         if has_valid_weights[0]:
                             #  Tensor) -> Tensor, Tensor, Module]` is not a function.
+                            # pyrefly: ignore[not-callable]
                             metric_.has_valid_update.logical_or_(has_valid_weights)
                         else:
                             continue
+                    # pyrefly: ignore[not-callable]
                     metric_.update(
                         predictions=None,
                         labels=task_labels,

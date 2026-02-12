@@ -29,6 +29,7 @@ def main(
 ) -> None:
     # seed everything for reproducibility
     torch.manual_seed(args.seed)
+    # pyrefly: ignore[implicit-import]
     np.random.seed(args.seed)
     # setup environment
     os.environ["RANK"] = str(rank)

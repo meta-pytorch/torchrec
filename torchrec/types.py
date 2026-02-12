@@ -34,6 +34,7 @@ class ModuleCopyMixin(CopyMixIn):
     """
 
     def copy(self, device: torch.device) -> nn.Module:
+        # pyrefly: ignore[missing-attribute]
         return self.to(device)
 
 
@@ -43,6 +44,7 @@ class ModuleNoCopyMixin(CopyMixIn):
     """
 
     def copy(self, device: torch.device) -> nn.Module:
+        # pyrefly: ignore[bad-return]
         return self
 
 

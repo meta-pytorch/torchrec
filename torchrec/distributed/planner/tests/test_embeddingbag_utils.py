@@ -77,15 +77,15 @@ class CreateShardingInfoTest(unittest.TestCase):
             topology=Topology(world_size=1, compute_device="cpu"),
             constraints=self.constraints,
         )
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         self.expected_plan = planner.plan(self.model, [self.sharder])
 
-        self.expected_sharding_infos = (
-            ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
-                self.model,
-                self.expected_plan.get_plan_for_module(""),
-                prefix="embedding_bags.",
-                fused_params=None,
-            )
+        self.expected_sharding_infos = ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
+            self.model,
+            # pyrefly: ignore[bad-argument-type]
+            self.expected_plan.get_plan_for_module(""),
+            prefix="embedding_bags.",
+            fused_params=None,
         )
 
     def test_create_sharding_infos_by_group_override(self) -> None:
@@ -95,13 +95,12 @@ class CreateShardingInfoTest(unittest.TestCase):
 
         # with sharder fused params that will get overridden
         sharder_fused_params = {"enforce_hbm": False}
-        overriden_sharding_infos = (
-            ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
-                self.model,
-                self.expected_plan.get_plan_for_module(""),
-                prefix="embedding_bags.",
-                fused_params=sharder_fused_params,
-            )
+        overriden_sharding_infos = ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
+            self.model,
+            # pyrefly: ignore[bad-argument-type]
+            self.expected_plan.get_plan_for_module(""),
+            prefix="embedding_bags.",
+            fused_params=sharder_fused_params,
         )
         for sharding_type, overriden_sharding_info in overriden_sharding_infos.items():
             expected_sharding_info = self.expected_sharding_infos[sharding_type]
@@ -110,13 +109,12 @@ class CreateShardingInfoTest(unittest.TestCase):
 
         # with sharder fused params that won't get overridden
         sharder_fused_params = {"ABC": True}
-        not_overriden_sharding_infos = (
-            ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
-                self.model,
-                self.expected_plan.get_plan_for_module(""),
-                prefix="embedding_bags.",
-                fused_params=sharder_fused_params,
-            )
+        not_overriden_sharding_infos = ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
+            self.model,
+            # pyrefly: ignore[bad-argument-type]
+            self.expected_plan.get_plan_for_module(""),
+            prefix="embedding_bags.",
+            fused_params=sharder_fused_params,
         )
         for (
             sharding_type,
@@ -142,18 +140,18 @@ class CreateShardingInfoTest(unittest.TestCase):
             topology=Topology(world_size=1, compute_device="cpu"),
             constraints=new_constraints,
         )
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         new_plan = new_planner.plan(self.model, [self.sharder])
 
         # provide that two fused params from sharder
         sharder_fused_params = {"enforce_hbm": True, "stochastic_rounding": False}
 
-        combined_sharding_infos = (
-            ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
-                self.model,
-                new_plan.get_plan_for_module(""),
-                prefix="embedding_bags.",
-                fused_params=sharder_fused_params,
-            )
+        combined_sharding_infos = ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
+            self.model,
+            # pyrefly: ignore[bad-argument-type]
+            new_plan.get_plan_for_module(""),
+            prefix="embedding_bags.",
+            fused_params=sharder_fused_params,
         )
 
         # directly assertion won't work, since sharding_infos also have parameter_sharding
@@ -164,13 +162,12 @@ class CreateShardingInfoTest(unittest.TestCase):
 
         # provide that two fused params from sharder wrongly
         sharder_fused_params = {"enforce_hbm": True, "stochastic_rounding": True}
-        wrong_combined_sharding_infos = (
-            ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
-                self.model,
-                new_plan.get_plan_for_module(""),
-                prefix="embedding_bags.",
-                fused_params=sharder_fused_params,
-            )
+        wrong_combined_sharding_infos = ShardedEmbeddingBagCollection.create_grouped_sharding_infos(
+            self.model,
+            # pyrefly: ignore[bad-argument-type]
+            new_plan.get_plan_for_module(""),
+            prefix="embedding_bags.",
+            fused_params=sharder_fused_params,
         )
         for (
             sharding_type,

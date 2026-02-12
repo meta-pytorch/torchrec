@@ -86,6 +86,7 @@ class SparseArch(nn.Module):
                     device=device,
                 ),
                 ManagedCollisionCollection(
+                    # pyrefly: ignore[bad-argument-type]
                     managed_collision_modules=mc_modules,
                     embedding_configs=tables,
                 ),
@@ -137,6 +138,7 @@ def _test_sharding_and_remapping(  # noqa C901
         apply_optimizer_in_backward(
             RowWiseAdagrad,
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ec._embedding_collection.embeddings["table_0"].weight,
                 sparse_arch._mc_ec._embedding_collection.embeddings["table_1"].weight,
@@ -156,6 +158,7 @@ def _test_sharding_and_remapping(  # noqa C901
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ec": module_sharding_plan}),
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -267,6 +270,7 @@ def _test_in_place_embd_weight_update(  # noqa C901
         apply_optimizer_in_backward(
             RowWiseAdagrad,
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ec._embedding_collection.embeddings["table_0"].weight,
                 sparse_arch._mc_ec._embedding_collection.embeddings["table_1"].weight,
@@ -286,6 +290,7 @@ def _test_in_place_embd_weight_update(  # noqa C901
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ec": module_sharding_plan}),
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -364,6 +369,7 @@ def _test_sharding_and_resharding(  # noqa C901
         apply_optimizer_in_backward(
             RowWiseAdagrad,
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ec._embedding_collection.embeddings["table_0"].weight,
                 sparse_arch._mc_ec._embedding_collection.embeddings["table_1"].weight,
@@ -383,6 +389,7 @@ def _test_sharding_and_resharding(  # noqa C901
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ec": module_sharding_plan}),
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -451,6 +458,7 @@ def _test_sharding_and_resharding(  # noqa C901
             apply_optimizer_in_backward(
                 RowWiseAdagrad,
                 #  got `Iterable[Union[Module, Tensor]]`.
+                # pyrefly: ignore[bad-argument-type]
                 [
                     sparse_arch._mc_ec._embedding_collection.embeddings[
                         "table_0"
@@ -474,6 +482,7 @@ def _test_sharding_and_resharding(  # noqa C901
                 module=copy.deepcopy(sparse_arch),
                 plan=ShardingPlan({"_mc_ec": module_sharding_plan}),
                 #  `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
                 sharders=[sharder],
                 device=ctx.device,
@@ -483,11 +492,13 @@ def _test_sharding_and_resharding(  # noqa C901
             for key in state_dict.keys():
                 if isinstance(state_dict[key], ShardedTensor):
                     replacement_tensor = torch.cat(
+                        # pyrefly: ignore[unsupported-operation]
                         [gather_list[0][key], gather_list[1][key]],
                         dim=0,
                     ).to(ctx.device)
                     state_dict[key].local_shards()[0].tensor.copy_(replacement_tensor)
                 else:
+                    # pyrefly: ignore[unsupported-operation]
                     state_dict[key] = gather_list[0][key].to(ctx.device)
 
             sharded_sparse_arch.load_state_dict(state_dict)
@@ -534,6 +545,7 @@ def _test_sharding_dedup(  # noqa C901
         apply_optimizer_in_backward(
             RowWiseAdagrad,
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ec._embedding_collection.embeddings["table_0"].weight,
                 sparse_arch._mc_ec._embedding_collection.embeddings["table_1"].weight,
@@ -553,6 +565,7 @@ def _test_sharding_dedup(  # noqa C901
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ec": module_sharding_plan}),
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -561,6 +574,7 @@ def _test_sharding_dedup(  # noqa C901
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ec": module_sharding_plan}),
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[dedup_sharder],
             device=ctx.device,
@@ -568,26 +582,32 @@ def _test_sharding_dedup(  # noqa C901
 
         assert (
             #  `_managed_collision_collection`.
+            # pyrefly: ignore[missing-attribute]
             sharded_sparse_arch._mc_ec._managed_collision_collection._use_index_dedup
             #  `_embedding_collection`.
+            # pyrefly: ignore[missing-attribute]
             == sharded_sparse_arch._mc_ec._embedding_collection._use_index_dedup
         )
 
         assert (
             #  `_managed_collision_collection`.
+            # pyrefly: ignore[missing-attribute]
             sharded_sparse_arch._mc_ec._managed_collision_collection._use_index_dedup
             is False
         )
 
         assert (
             #  `_managed_collision_collection`.
+            # pyrefly: ignore[missing-attribute]
             dedup_sharded_sparse_arch._mc_ec._managed_collision_collection._use_index_dedup
             #  `_embedding_collection`.
+            # pyrefly: ignore[missing-attribute]
             == dedup_sharded_sparse_arch._mc_ec._embedding_collection._use_index_dedup
         )
 
         assert (
             #  `_managed_collision_collection`.
+            # pyrefly: ignore[missing-attribute]
             dedup_sharded_sparse_arch._mc_ec._managed_collision_collection._use_index_dedup
             is True
         )

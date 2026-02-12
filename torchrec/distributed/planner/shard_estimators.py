@@ -1105,7 +1105,9 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 else None
             )
             kv_cache_load_factor: float = (
+                # pyrefly: ignore[missing-attribute]
                 sharder.fused_params.get("cache_load_factor", KV_CACHING_RATIO)
+                # pyrefly: ignore[missing-attribute]
                 if sharder.fused_params
                 else KV_CACHING_RATIO
             )

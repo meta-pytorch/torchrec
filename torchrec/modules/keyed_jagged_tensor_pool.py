@@ -162,6 +162,7 @@ class KeyedJaggedTensorPool(ObjectPool[KeyedJaggedTensor]):
         )
 
         self._keys = list(self._feature_max_lengths.keys())
+        # pyrefly: ignore[bad-assignment]
         self._lookup: KeyedJaggedTensorPoolLookup = None
         if self._enable_uvm and values_dtype == torch.int64:
             self._lookup = UVMCachingInt64Lookup(
@@ -257,6 +258,7 @@ class KeyedJaggedTensorPool(ObjectPool[KeyedJaggedTensor]):
             valid_input.lengths().reshape(len(self._keys), -1).max(dim=1)
         )
 
+        # pyrefly: ignore[no-matching-overload]
         assert torch.all(
             max_elements <= self._feature_max_lengths_t
         ).item(), "input KJT has a feature that exceeds specified max lengths"
