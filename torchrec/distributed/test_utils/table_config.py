@@ -88,6 +88,7 @@ class ManagedCollisionConfig:
     # MP-ZCH (HashZCH class) parameters
     max_probe: int = 128
     total_num_buckets: Optional[int] = None
+    # pyrefly: ignore[bad-assignment]
     output_segments: Optional[List[int]] = (None,)
     eviction_policy_name: Optional[str] = None
     eviction_config: Optional[Dict[str, int]] = None
@@ -158,6 +159,7 @@ class EmbeddingTablesConfig:
         elif self.mc_config is not None:
             # Use global default for tables
             self.mc_configs_per_table[table_name] = ManagedCollisionConfig(
+                # pyrefly: ignore[bad-unpacking]
                 **self.mc_config
             )
 
@@ -246,6 +248,7 @@ class EmbeddingTablesConfig:
             else:
                 tables = []
             for adt in adts:
+                # pyrefly: ignore[bad-argument-type]
                 tables.append(self.convert_to_ebconf(adt))
             tables_list.append(tables)
 

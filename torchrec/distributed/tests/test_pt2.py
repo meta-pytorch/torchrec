@@ -99,6 +99,7 @@ def _sharded_quant_ebc_model(
     world_size = 2
     batch_size = 4
 
+    # pyrefly: ignore[bad-assignment]
     local_device = torch.device(local_device)
     mi = create_test_model_ebc_only(
         num_embeddings,
@@ -107,13 +108,16 @@ def _sharded_quant_ebc_model(
         batch_size,
         num_features=2,
         num_weighted_features=1,
+        # pyrefly: ignore[bad-argument-type]
         dense_device=local_device,
+        # pyrefly: ignore[bad-argument-type]
         sparse_device=local_device,
         quant_state_dict_split_scale_bias=True,
         compute_device=compute_device,
         feature_processor=feature_processor,
     )
     input_kjts = [
+        # pyrefly: ignore[bad-argument-type]
         inp.to(local_device).idlist_features
         for inp in prep_inputs(mi, world_size, batch_size, long_indices=False)
     ]
@@ -137,6 +141,7 @@ def _sharded_quant_ebc_model(
             shardable_params=[table.name for table in mi.tables],
             fused_params=fused_params,
         )
+    # pyrefly: ignore[missing-attribute]
     plan = mi.planner.plan(
         mi.quant_model,
         [sharder],
@@ -144,14 +149,18 @@ def _sharded_quant_ebc_model(
 
     sharded_model = _shard_modules(
         module=mi.quant_model,
+        # pyrefly: ignore[bad-argument-type]
         sharders=[sharder],
         # Always shard on meta
         device=torch.device("meta"),
         plan=plan,
+        # pyrefly: ignore[missing-attribute]
         env=ShardingEnv.from_local(world_size=mi.topology.world_size, rank=0),
     )
 
+    # pyrefly: ignore[bad-argument-type]
     model: torch.nn.Module = KJTInputExportWrapper(sharded_model, input_kjts[0].keys())
+    # pyrefly: ignore[bad-return]
     return model, input_kjts
 
 
@@ -230,6 +239,7 @@ def _test_compile_fwd_bwd(
         eager_loss.backward()
         eager_bwd_out = _grad_detach_clone(eager_input)
 
+    # pyrefly: ignore[implicit-import]
     with unittest.mock.patch(
         "torch._dynamo.config.skip_torchrec",
         False,
@@ -247,11 +257,13 @@ def _test_compile_fwd_bwd(
             )
 
         if not skip_backward:
+            # pyrefly: ignore[no-matching-overload]
             reduce_to_scalar_loss(compile_out).backward()
             compile_bwd_out = _grad_detach_clone(compile_input)
 
         _assert_close(compile_out, eager_out)
         if not skip_backward:
+            # pyrefly: ignore[unbound-name]
             _assert_close(compile_bwd_out, eager_bwd_out)
 
 
@@ -273,6 +285,7 @@ class TestPt2(unittest.TestCase):
         test_aot_inductor: bool = True,
         test_pt2_ir_export: bool = False,
     ) -> None:
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,
@@ -294,17 +307,20 @@ class TestPt2(unittest.TestCase):
                     inputs,
                 )
                 device = "cuda"
+                # pyrefly: ignore[missing-attribute]
                 aot_inductor_module = AOTIRunnerUtil.load(device, so_path)
                 aot_actual_output = aot_inductor_module(*em_inputs)
                 assert_close(eager_output, aot_actual_output)
 
             if test_pt2_ir_export:
+                # pyrefly: ignore[bad-argument-type]
                 symint_wrapper = KJTInputExportDynamicShapeWrapper(EM)
 
                 # KJTInputExportDynamicShapeWrapper represents sizes of values/weights
                 # from first element of values/weights respectively (simulate symint)
                 # Need to set as size in order to run a proper forward
                 em_inputs[0][0] = kjt.values().size(0)
+                # pyrefly: ignore[unsupported-operation]
                 em_inputs[2][0] = kjt.weights().size(0)
 
                 if not kjt.values().is_meta:
@@ -327,6 +343,7 @@ class TestPt2(unittest.TestCase):
         inputs,
         backend: str = "eager",
     ) -> None:
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,
@@ -361,6 +378,7 @@ class TestPt2(unittest.TestCase):
             self._test_kjt_input_module(
                 M(),
                 kjt,
+                # pyrefly: ignore[bad-argument-type]
                 (),
                 test_aot_inductor=False,
                 test_dynamo=False,
@@ -440,6 +458,7 @@ class TestPt2(unittest.TestCase):
             torch._dynamo.decorators.mark_dynamic(t, 1)
 
         eager_output = m(inputs)
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,
@@ -487,6 +506,7 @@ class TestPt2(unittest.TestCase):
         self._test_kjt_input_module(
             M(),
             kjt,
+            # pyrefly: ignore[bad-argument-type]
             (),
             test_aot_inductor=False,
             test_pt2_ir_export=True,
@@ -498,6 +518,7 @@ class TestPt2(unittest.TestCase):
                 return kjt.length_per_key()
 
         kjt: KeyedJaggedTensor = make_kjt([2, 3, 4, 5, 6], [1, 2, 1, 1])
+        # pyrefly: ignore[bad-argument-type]
         kjt = kjt.to("meta")
 
         # calling forward on meta inputs once traced should error out
@@ -508,6 +529,7 @@ class TestPt2(unittest.TestCase):
             lambda: self._test_kjt_input_module(
                 M(),
                 kjt,
+                # pyrefly: ignore[bad-argument-type]
                 (),
                 test_aot_inductor=False,
                 test_pt2_ir_export=True,
@@ -524,6 +546,7 @@ class TestPt2(unittest.TestCase):
         self._test_kjt_input_module(
             M(),
             kjt,
+            # pyrefly: ignore[bad-argument-type]
             (),
             test_aot_inductor=False,
             test_pt2_ir_export=True,
@@ -552,6 +575,7 @@ class TestPt2(unittest.TestCase):
             self._test_kjt_input_module(
                 M(),
                 kjt,
+                # pyrefly: ignore[bad-argument-type]
                 (),
                 test_dynamo=False,
                 test_aot_inductor=False,
@@ -641,12 +665,14 @@ class TestPt2(unittest.TestCase):
         self._test_kjt_input_module(
             ComputeKJTToJTDict(),
             kjt,
+            # pyrefly: ignore[bad-argument-type]
             (),
             # TODO: turn on AOT Inductor test once the support is ready
             test_aot_inductor=False,
         )
 
     def test_kjt_values_specialization(self):
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,
@@ -682,6 +708,7 @@ class TestPt2(unittest.TestCase):
             self.assertEqual(counter.frame_count, 1)
 
     def test_kjt_values_specialization_utils(self):
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,
@@ -756,6 +783,7 @@ class TestPt2(unittest.TestCase):
         )
 
         ins = (embs, indices, input_num_indices, input_rows, input_columns)
+        # pyrefly: ignore[bad-argument-type]
         _test_compile_fwd_bwd(fn, ins, device, unpack_inp=True)
 
     @unittest.skipIf(
@@ -769,6 +797,7 @@ class TestPt2(unittest.TestCase):
             permute=[2, 1, 0],
         )
         inp = torch.randn(12, 3)
+        # pyrefly: ignore[bad-argument-type]
         _test_compile_fwd_bwd(m, inp, device, backend="aot_eager")
 
     @unittest.skipIf(
@@ -782,6 +811,7 @@ class TestPt2(unittest.TestCase):
             permute=[2, 1, 0],
         )
         inp = torch.randn(12, 3)
+        # pyrefly: ignore[bad-argument-type]
         _test_compile_fwd_bwd(m, inp, device)
 
     @unittest.skipIf(
@@ -809,6 +839,7 @@ class TestPt2(unittest.TestCase):
         )
         out_lengths = torch.tensor(out_lengths, device=device, dtype=torch.int32)
         inp = (values, permutes, in_shapes, out_shapes, out_lengths)
+        # pyrefly: ignore[bad-argument-type]
         _test_compile_fwd_bwd(func, inp, device, unpack_inp=True)
 
     @unittest.skipIf(
@@ -880,6 +911,7 @@ class TestPt2(unittest.TestCase):
 
         # COMPILE
         orig_compile_weights = get_weights(m_compile)
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,
@@ -962,6 +994,7 @@ class TestPt2(unittest.TestCase):
 
         # COMPILE
         orig_compile_weights = get_weights(m_compile)
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,

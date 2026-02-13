@@ -94,9 +94,11 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
         super().__init__(params, state, [param_group])
 
     def zero_grad(self, set_to_none: bool = False) -> None:
+        # pyrefly: ignore[bad-index]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
     def step(self, closure: Any = None) -> None:
+        # pyrefly: ignore[bad-index]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
 
@@ -210,9 +212,11 @@ class _BatchedFusedEmbeddingLookups(nn.Module, FusedOptimizerModule):
     def split_embedding_weights(self) -> List[torch.Tensor]:
         return self._emb_module.split_embedding_weights()
 
+    # pyrefly: ignore[bad-override]
     def fused_optimizer(self) -> FusedOptimizer:
         return self._optim
 
+    # pyrefly: ignore[bad-param-name-override]
     def parameters(
         self, prefix: str = "", recurse: bool = True
     ) -> Iterator[nn.Parameter]:
@@ -242,6 +246,7 @@ class _BatchedFusedEmbeddingLookups(nn.Module, FusedOptimizerModule):
             key = f"{prefix}.{name}" if (prefix and name) else (prefix + name)
             yield key, param
 
+    # pyrefly: ignore[bad-param-name-override]
     def buffers(self, prefix: str = "", recurse: bool = True) -> Iterator[torch.Tensor]:
         yield from self.split_embedding_weights()
 
@@ -424,6 +429,7 @@ class FusedEmbeddingBagCollection(
                 params[f"embedding_bags.{param_key}"] = weight
             optims.append(("", emb_module.fused_optimizer()))
 
+        # pyrefly: ignore[bad-argument-type]
         self._optim: CombinedOptimizer = CombinedOptimizer(optims)
         self._embedding_names: List[str] = list(
             itertools.chain(*get_embedding_names_by_table(self._embedding_bag_configs))
@@ -438,6 +444,7 @@ class FusedEmbeddingBagCollection(
         ):
             for embedding_config, weight in zip(
                 tables,
+                # pyrefly: ignore[not-callable]
                 emb_module.split_embedding_weights(),
                 #  torch._tensor.Tensor]` is not a function.
             ):
@@ -516,6 +523,7 @@ class FusedEmbeddingBagCollection(
     def optimizer_kwargs(self) -> Dict[str, Any]:
         return self._optimizer_kwargs
 
+    # pyrefly: ignore[bad-override]
     def fused_optimizer(self) -> KeyedOptimizer:
         return self._optim
 
@@ -674,6 +682,7 @@ class FusedEmbeddingCollection(EmbeddingCollectionInterface, FusedOptimizerModul
                 params[f"embeddings.{param_key}"] = weight
             optims.append(("", emb_module.fused_optimizer()))
 
+        # pyrefly: ignore[bad-argument-type]
         self._optim: CombinedOptimizer = CombinedOptimizer(optims)
         self._embedding_names: List[str] = list(
             itertools.chain(*get_embedding_names_by_table(self._embedding_configs))
@@ -692,6 +701,7 @@ class FusedEmbeddingCollection(EmbeddingCollectionInterface, FusedOptimizerModul
         ):
             for embedding_config, weight in zip(
                 tables,
+                # pyrefly: ignore[not-callable]
                 emb_module.split_embedding_weights(),
                 #  torch._tensor.Tensor]` is not a function.
             ):
@@ -744,6 +754,7 @@ class FusedEmbeddingCollection(EmbeddingCollectionInterface, FusedOptimizerModul
             offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
 
             lookups = emb_op(indicies.int(), offsets.int(), weights=None)
+            # pyrefly: ignore[bad-argument-type]
             lookups = torch.split(lookups, split_size_or_sections=splits)
 
             for feature, lookup, feature_length, values in zip(
@@ -776,6 +787,7 @@ class FusedEmbeddingCollection(EmbeddingCollectionInterface, FusedOptimizerModul
     def optimizer_kwargs(self) -> Dict[str, Any]:
         return self._optimizer_kwargs
 
+    # pyrefly: ignore[bad-override]
     def fused_optimizer(self) -> KeyedOptimizer:
         return self._optim
 

@@ -120,15 +120,20 @@ class TrainPipelineSparseDistTestBase(unittest.TestCase):
             zch_kwargs=zch_kwargs,
         )
         if enable_fsdp:
+            # pyrefly: ignore[missing-attribute]
             unsharded_model.over.dhn_arch.linear0 = FSDP(
                 #  attribute `dhn_arch`.
+                # pyrefly: ignore[missing-attribute]
                 unsharded_model.over.dhn_arch.linear0
             )
+            # pyrefly: ignore[missing-attribute]
             unsharded_model.over.dhn_arch.linear1 = FSDP(
                 #  attribute `dhn_arch`.
+                # pyrefly: ignore[missing-attribute]
                 unsharded_model.over.dhn_arch.linear1
             )
             #  `dhn_arch`.
+            # pyrefly: ignore[missing-attribute]
             unsharded_model.over.dhn_arch = FSDP(unsharded_model.over.dhn_arch)
 
         return unsharded_model

@@ -198,5 +198,6 @@ class UnweightedNEMetricComputation(RecMetricComputation):
 
 
 class UnweightedNEMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.UNWEIGHTED_NE
     _computation_class: Type[RecMetricComputation] = UnweightedNEMetricComputation

@@ -65,6 +65,7 @@ def _copy_input_tensors(t, device):
 
 def _grad_detach_clone(t):
     if isinstance(t, torch.Tensor):
+        # pyrefly: ignore[missing-attribute]
         return t.grad.detach().clone()
     elif isinstance(t, list):
         return [_grad_detach_clone(_t) for _t in t]
@@ -98,6 +99,7 @@ def _test_async_sync_compile(
     input_tensor_compile = _copy_input_tensors(input_tensor, device)
 
     # Async
+    # pyrefly: ignore[implicit-import]
     torchrec.distributed.comm_ops.set_use_sync_collectives(False)
     out = fn(input_tensor_async, *args, **kwargs)
     out.retain_grad()
@@ -106,6 +108,7 @@ def _test_async_sync_compile(
     async_bwd_out = _grad_detach_clone(input_tensor_async)
 
     # Sync
+    # pyrefly: ignore[implicit-import]
     torchrec.distributed.comm_ops.set_use_sync_collectives(True)
     out = fn(input_tensor_sync, *args, **kwargs)
     sync_fwd_out = out.clone()
@@ -120,6 +123,7 @@ def _test_async_sync_compile(
     if compile_config.backend is not None:
         fn_transform = compile_config_to_fn_transform(compile_config)
 
+        # pyrefly: ignore[implicit-import]
         with unittest.mock.patch(
             "torch._dynamo.config.skip_torchrec",
             False,
@@ -302,6 +306,7 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_alltoall_sequence,
             compile_config=_CompileConfig(),
             specify_pg=specify_pg,
@@ -379,6 +384,7 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_alltoall_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -452,6 +458,7 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_reduce_scatter_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -520,6 +527,7 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_reduce_scatter_v_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -594,6 +602,7 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_reduce_scatter_v_per_feature_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -652,6 +661,7 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_all_gather_base_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -683,5 +693,6 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="gloo",
+            # pyrefly: ignore[bad-argument-type]
             callable=self._test_all_gather_base_pooled_cpu,
         )

@@ -165,6 +165,7 @@ class GAUCMetricComputation(RecMetricComputation):
             persistent=True,
         )
 
+    # pyrefly: ignore[bad-override]
     def update(
         self,
         *,
@@ -227,5 +228,6 @@ class GAUCMetricComputation(RecMetricComputation):
 
 
 class GAUCMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.GAUC
     _computation_class: Type[RecMetricComputation] = GAUCMetricComputation

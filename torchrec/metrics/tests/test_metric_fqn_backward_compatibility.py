@@ -324,6 +324,7 @@ def generate_golden_snapshot() -> Dict[str, Dict[str, Any]]:
                         "non_persistent_buffer_fqns": non_persistent_fqns,
                     }
                 except Exception as e:
+                    # pyrefly: ignore[unbound-name]
                     print(f"Warning: Failed to generate snapshot for {key}: {e}")
                     continue
 

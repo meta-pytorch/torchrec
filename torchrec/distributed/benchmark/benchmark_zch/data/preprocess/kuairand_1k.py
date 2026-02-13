@@ -40,7 +40,9 @@ class Batch(Pipelineable):
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
+        # pyrefly: ignore[bad-argument-type]
         self.uih_features.record_stream(stream)
+        # pyrefly: ignore[bad-argument-type]
         self.candidates_features.record_stream(stream)
 
     def pin_memory(self) -> "Batch":
@@ -237,6 +239,7 @@ class KuaiRand1KDataset(Dataset):
         self.unload_query_samples(indices)
         return samples
 
+    # pyrefly: ignore[bad-param-name-override]
     def __getitem__(self, idx: int) -> Batch:
         self.load_query_samples([idx])
         sample = self.get_sample(idx)

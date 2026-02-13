@@ -104,5 +104,6 @@ class CTRMetricComputation(RecMetricComputation):
 
 
 class CTRMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.CTR
     _computation_class: Type[RecMetricComputation] = CTRMetricComputation

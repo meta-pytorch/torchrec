@@ -118,6 +118,7 @@ class BaseEmbedding(abc.ABC, nn.Module):
         ):
             return None
 
+        # pyrefly: ignore[redundant-cast]
         emb_module = cast(SplitTableBatchedEmbeddingBagsCodegen, self.emb_module)
         raw_id_tracker_wrapper = self._raw_id_tracker_wrapper
         assert (
@@ -190,9 +191,12 @@ def create_virtual_table_local_metadata(
             if weight_count_per_rank is None
             else sum(weight_count_per_rank[:my_rank])
         )
+    # pyrefly: ignore[no-matching-overload]
     local_metadata.shard_sizes = list(param.size())
     local_metadata.shard_offsets = [
-        offset if dim == 0 else 0 for dim in range(len(param.size()))
+        offset if dim == 0 else 0
+        # pyrefly: ignore[bad-argument-type]
+        for dim in range(len(param.size()))
     ]
 
 
@@ -220,34 +224,46 @@ def create_virtual_table_global_metadata(
             # correctly calculate the size for other ranks, we need to use the current
             # rank's shard size compared to the shard size of my_rank.
             curr_rank_rows = (
-                param.size()[0] * metadata.shards_metadata[rank].shard_sizes[0]
+                # pyrefly: ignore[bad-index]
+                param.size()[0]
+                * metadata.shards_metadata[rank].shard_sizes[0]
             ) // my_rank_shard_size
         else:
             curr_rank_rows = (
                 weight_count_per_rank[rank] if weight_count_per_rank is not None else 1
             )
         if rank < my_rank:
+            # pyrefly: ignore[bad-assignment]
             shard_metadata.shard_sizes = [
                 curr_rank_rows if dim == 0 else param.size(dim)
+                # pyrefly: ignore[bad-argument-type]
                 for dim in range(len(param.size()))
             ]
             shard_metadata.shard_offsets = [
-                offset if dim == 0 else 0 for dim in range(len(param.size()))
+                offset if dim == 0 else 0
+                # pyrefly: ignore[bad-argument-type]
+                for dim in range(len(param.size()))
             ]
         elif rank == my_rank:
+            # pyrefly: ignore[bad-index]
             curr_rank_rows = param.size()[0]
             create_virtual_table_local_metadata(shard_metadata, param, my_rank, offset)
         else:
+            # pyrefly: ignore[bad-assignment]
             shard_metadata.shard_sizes = [
                 curr_rank_rows if dim == 0 else param.size(dim)
+                # pyrefly: ignore[bad-argument-type]
                 for dim in range(len(param.size()))
             ]
             shard_metadata.shard_offsets = [
-                offset if dim == 0 else 0 for dim in range(len(param.size()))
+                offset if dim == 0 else 0
+                # pyrefly: ignore[bad-argument-type]
+                for dim in range(len(param.size()))
             ]
         offset += curr_rank_rows
 
     metadata.size = torch.Size(
+        # pyrefly: ignore[bad-argument-type]
         [offset if dim == 0 else param.size(dim) for dim in range(len(param.size()))]
     )
 
@@ -310,6 +326,7 @@ def create_virtual_sharded_tensors(
             f"placement is None for local_metadata of emb table: {embedding_table.name}",
         )
 
+        # pyrefly: ignore[bad-argument-type]
         key_to_local_shards[key].append(Shard(param, local_metadata))
 
     result: List[ShardedTensor] = []
@@ -341,6 +358,7 @@ def get_state_dict(
 ) -> Dict[str, Any]:
     if destination is None:
         destination = OrderedDict()
+        # pyrefly: ignore[missing-attribute]
         destination._metadata = OrderedDict()
     """
     It is possible for there to be multiple shards from a table on a single rank.
@@ -354,6 +372,7 @@ def get_state_dict(
 
     # validate on the function input for kv zch cases
     use_virtual_size = None
+    # pyrefly: ignore[bad-assignment]
     for emb_table in embedding_tables:
         if use_virtual_size is None:
             use_virtual_size = emb_table.use_virtual_table
@@ -381,11 +400,14 @@ def get_state_dict(
             param = param[0]
 
         if not embedding_table.use_virtual_table:
+            # pyrefly: ignore[missing-attribute]
             assert embedding_table.local_rows == param.size(
                 0
+                # pyrefly: ignore[missing-attribute]
             ), f"{embedding_table.local_rows=}, {param.size(0)=}, {param.shape=}"
 
         if qscale is not None:
+            # pyrefly: ignore[missing-attribute]
             assert embedding_table.local_cols == param.size(1)
 
         if embedding_table.dtensor_metadata is not None and pg is not None:
@@ -394,13 +416,16 @@ def get_state_dict(
             key_to_local_tensor_shards[weights_key].append(
                 [
                     param,
+                    # pyrefly: ignore[missing-attribute]
                     embedding_table.local_metadata.shard_offsets,
                 ]
             )
         elif embedding_table.global_metadata is not None and pg is not None:
             # set additional field of sharded tensor based on local tensor properties
+            # pyrefly: ignore[missing-attribute]
             embedding_table.global_metadata.tensor_properties.dtype = param.dtype
             embedding_table.global_metadata.tensor_properties.requires_grad = (
+                # pyrefly: ignore[missing-attribute]
                 param.requires_grad
             )
             local_metadata = embedding_table.local_metadata
@@ -408,10 +433,13 @@ def get_state_dict(
             if use_virtual_size:
                 assert local_metadata is not None and glb_metadata is not None
                 local_metadata = copy.deepcopy(embedding_table.local_metadata)
+                # pyrefly: ignore[missing-attribute]
                 local_metadata.shard_sizes = list(param.size())
+                # pyrefly: ignore[missing-attribute]
                 local_metadata.shard_offsets = [0, 0]
 
                 glb_metadata = copy.deepcopy(embedding_table.global_metadata)
+                # pyrefly: ignore[missing-attribute]
                 glb_metadata.size = param.size()
                 my_rank = dist.get_rank()
                 for rank, shards_metadata in enumerate(glb_metadata.shards_metadata):
@@ -419,10 +447,13 @@ def get_state_dict(
                         shards_metadata.shard_offsets = [0, 0]
                         shards_metadata.shard_sizes = [0, 0]
                     elif rank == my_rank:
+                        # pyrefly: ignore[missing-attribute]
                         shards_metadata.shard_offsets = local_metadata.shard_offsets
+                        # pyrefly: ignore[missing-attribute]
                         shards_metadata.shard_sizes = local_metadata.shard_sizes
                     else:
                         shards_metadata.shard_offsets = [
+                            # pyrefly: ignore[missing-attribute]
                             local_metadata.shard_sizes[0],
                             0,
                         ]
@@ -434,6 +465,7 @@ def get_state_dict(
             key_to_local_shards[weights_key].append(
                 #  `Union[Module, Tensor]`.
                 #  `Optional[ShardMetadata]`.
+                # pyrefly: ignore[bad-argument-type]
                 Shard(param, local_metadata)
             )
 
@@ -459,6 +491,7 @@ def get_state_dict(
         for key in key_to_local_tensor_shards:
             dtensor_metadata = key_to_dtensor_metadata[key]
             destination[key] = DTensor.from_local(
+                # pyrefly: ignore[no-matching-overload]
                 local_tensor=LocalShardsWrapper(
                     local_shards=[
                         tensor_shards[0]
@@ -471,6 +504,7 @@ def get_state_dict(
                 ),
                 device_mesh=dtensor_metadata.mesh,
                 placements=dtensor_metadata.placements,
+                # pyrefly: ignore[bad-argument-type]
                 shape=torch.Size(dtensor_metadata.size),
                 stride=dtensor_metadata.stride,
                 run_check=False,

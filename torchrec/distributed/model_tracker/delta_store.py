@@ -155,6 +155,7 @@ class DeltaStoreTrec(DeltaStore):
     """
 
     def __init__(self, updateMode: UpdateMode = UpdateMode.NONE) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__(updateMode)
         self.updateMode = updateMode
         self.per_fqn_lookups: Dict[str, List[IndexedLookup]] = {}
@@ -187,7 +188,10 @@ class DeltaStoreTrec(DeltaStore):
             for table_fqn, lookups in self.per_fqn_lookups.items():
                 # remove all lookups up to up_to_idx
                 self.per_fqn_lookups[table_fqn] = [
-                    lookup for lookup in lookups if lookup.batch_idx >= up_to_idx
+                    lookup
+                    for lookup in lookups
+                    # pyrefly: ignore[unsupported-operation]
+                    if lookup.batch_idx >= up_to_idx
                 ]
 
     def compact(self, start_idx: int, end_idx: int) -> None:
@@ -275,6 +279,7 @@ class RawIdTrackerStore(DeltaStore):
     """
 
     def __init__(self, updateMode: UpdateMode = UpdateMode.NONE) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__(updateMode)
         self.updateMode = updateMode
         self.per_fqn_lookups: Dict[str, List[RawIndexedLookup]] = {}
@@ -309,7 +314,10 @@ class RawIdTrackerStore(DeltaStore):
             for table_fqn, lookups in self.per_fqn_lookups.items():
                 # remove all lookups up to up_to_idx
                 self.per_fqn_lookups[table_fqn] = [
-                    lookup for lookup in lookups if lookup.batch_idx >= up_to_idx
+                    lookup
+                    for lookup in lookups
+                    # pyrefly: ignore[unsupported-operation]
+                    if lookup.batch_idx >= up_to_idx
                 ]
 
     def compact(self, start_idx: int, end_idx: int) -> None:

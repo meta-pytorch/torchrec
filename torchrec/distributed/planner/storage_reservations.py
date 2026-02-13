@@ -156,6 +156,7 @@ def _get_batch_inputs_and_shardable_parameters(
                 )
                 input_lengths.extend(pooling_factors)
                 batch_sizes.extend(
+                    # pyrefly: ignore[bad-argument-type]
                     constraints[name].batch_sizes
                     if constraints
                     and constraints.get(name)
@@ -372,5 +373,6 @@ class InferenceStorageReservation(StorageReservation):
 
         return reserved_topology
 
+    # pyrefly: ignore[bad-override]
     def last_reserved_topology(self) -> Optional[Topology]:
         return copy.deepcopy(self._last_reserved_topology)

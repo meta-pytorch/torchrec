@@ -310,12 +310,14 @@ class PredictModule(nn.Module):
         with torch.inference_mode():
             return self.predict_forward(batch)
 
+    # pyrefly: ignore[bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
         prefix: str = "",
         keep_vars: bool = False,
     ) -> Dict[str, Any]:
+        # pyrefly: ignore[no-matching-overload]
         return self._module.state_dict(destination, prefix, keep_vars)
 
 
@@ -427,6 +429,7 @@ def quantize_inference_model(
             model, [FeatureProcessedEmbeddingBagCollection]
         )
         #  `qconfig`.
+        # pyrefly: ignore[bad-argument-type]
         fp_module.qconfig = QuantConfig(
             activation=quant.PlaceholderObserver.with_args(dtype=output_dtype),
             weight=quant.PlaceholderObserver.with_args(dtype=weight_dtype),
@@ -552,6 +555,7 @@ def shard_quant_model(
                 # TODO: handle other cases/reduce hardcoding
                 if hasattr(module, "embedding_bags"):
                     #  is not a function.
+                    # pyrefly: ignore[not-iterable]
                     for table in module.embedding_bags:
                         table_fqns.append(table)
 
@@ -572,6 +576,7 @@ def shard_quant_model(
     else:
         hbm_cap = None
 
+    # pyrefly: ignore[implicit-import]
     topology = trec_dist.planner.Topology(
         world_size=world_size,
         compute_device=compute_device,
@@ -580,6 +585,7 @@ def shard_quant_model(
         ddr_cap=ddr_cap,
     )
     batch_size = 1
+    # pyrefly: ignore[implicit-import]
     model_plan = trec_dist.planner.EmbeddingShardingPlanner(
         topology=topology,
         batch_size=batch_size,
@@ -598,8 +604,11 @@ def shard_quant_model(
         storage_reservation=FixedPercentageStorageReservation(
             percentage=0.0,
         ),
+        # pyrefly: ignore[missing-argument]
     ).plan(
+        # pyrefly: ignore[bad-argument-type]
         model,
+        # pyrefly: ignore[bad-argument-type]
         sharders if sharders else DEFAULT_SHARDERS,
     )
 
@@ -628,6 +637,7 @@ def get_table_to_weights_from_tbe(
             for i, spec in enumerate(module.embedding_specs):
                 table_to_weight[spec[0]] = weights[i]
 
+    # pyrefly: ignore[bad-return]
     return table_to_weight
 
 
@@ -642,6 +652,7 @@ def assign_weights_to_tbe(
                 assert spec[0] in table_to_weight, f"{spec[0]} not in table_to_weight"
                 q_weights.append(table_to_weight[spec[0]])
 
+            # pyrefly: ignore[bad-argument-type]
             module.assign_embedding_weights(q_weights)
 
     return

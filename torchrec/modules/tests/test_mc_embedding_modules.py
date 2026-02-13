@@ -320,17 +320,28 @@ class MCHManagedCollisionEmbeddingBagCollectionTest(unittest.TestCase):
             _, remapped_kjt1 = mc_module.forward(update_one)
             _, remapped_kjt2 = mc_module.forward(update_one)
 
+            # pyrefly: ignore[no-matching-overload]
             assert torch.all(
-                remapped_kjt1["f1"].values() == zch_size - 1
+                # pyrefly: ignore[unsupported-operation]
+                remapped_kjt1["f1"].values()
+                == zch_size - 1
             ), "all remapped ids should be mapped to end of range"
+            # pyrefly: ignore[no-matching-overload]
             assert torch.all(
-                remapped_kjt1["f2"].values() == zch_size - 1
+                # pyrefly: ignore[unsupported-operation]
+                remapped_kjt1["f2"].values()
+                == zch_size - 1
             ), "all remapped ids should be mapped to end of range"
 
+            # pyrefly: ignore[no-matching-overload]
             assert torch.all(
-                remapped_kjt2["f1"].values() == torch.arange(0, 10, dtype=torch.int64)
+                # pyrefly: ignore[unsupported-operation]
+                remapped_kjt2["f1"].values()
+                == torch.arange(0, 10, dtype=torch.int64)
             )
+            # pyrefly: ignore[no-matching-overload]
             assert torch.all(
+                # pyrefly: ignore[unsupported-operation]
                 remapped_kjt2["f2"].values()
                 == torch.cat(
                     [
@@ -361,20 +372,34 @@ class MCHManagedCollisionEmbeddingBagCollectionTest(unittest.TestCase):
             _, remapped_kjt3 = mc_module.forward(update_two)
             _, remapped_kjt4 = mc_module.forward(update_two)
 
+            # pyrefly: ignore[no-matching-overload]
             assert torch.all(
-                remapped_kjt3["f1"].values() == zch_size - 1
+                # pyrefly: ignore[unsupported-operation]
+                remapped_kjt3["f1"].values()
+                == zch_size - 1
             ), "all remapped ids should be mapped to end of range"
 
+            # pyrefly: ignore[no-matching-overload]
             assert torch.all(
-                remapped_kjt3["f2"].values() == remapped_kjt2["f2"].values()
+                # pyrefly: ignore[unsupported-operation]
+                remapped_kjt3["f2"].values()
+                # pyrefly: ignore[unsupported-operation]
+                == remapped_kjt2["f2"].values()
             )
 
+            # pyrefly: ignore[no-matching-overload]
             assert torch.all(
-                remapped_kjt4["f1"].values() == zch_size - 1
+                # pyrefly: ignore[unsupported-operation]
+                remapped_kjt4["f1"].values()
+                == zch_size - 1
             ), "all remapped ids should be mapped to end of range"
 
+            # pyrefly: ignore[no-matching-overload]
             assert torch.all(
-                remapped_kjt4["f2"].values() == remapped_kjt2["f2"].values()
+                # pyrefly: ignore[unsupported-operation]
+                remapped_kjt4["f2"].values()
+                # pyrefly: ignore[unsupported-operation]
+                == remapped_kjt2["f2"].values()
             )
 
     def test_mc_collection_traceable(self) -> None:

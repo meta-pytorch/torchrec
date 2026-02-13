@@ -316,6 +316,7 @@ def rec_metric_value_test_helper(
                 weights = torch.stack(list(weights.values()))
 
             if timestamps is not None:
+                # pyrefly: ignore[missing-attribute]
                 time_mock.return_value = timestamps[i]
             target_metric_obj.update(
                 predictions=predictions,
@@ -473,6 +474,7 @@ def sync_test_helper(
     tasks = gen_test_tasks(task_names)
 
     if n_classes:
+        # pyrefly: ignore[unsupported-operation]
         kwargs["number_of_classes"] = n_classes
 
     target_metric_obj = target_clazz(
@@ -482,6 +484,7 @@ def sync_test_helper(
         compute_on_all_ranks=compute_on_all_ranks,
         tasks=tasks,
         window_size=batch_window_size * world_size,
+        # pyrefly: ignore[bad-argument-type]
         **kwargs,
     ).to(device)
 

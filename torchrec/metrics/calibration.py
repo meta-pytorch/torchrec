@@ -108,5 +108,6 @@ class CalibrationMetricComputation(RecMetricComputation):
 
 
 class CalibrationMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.CALIBRATION
     _computation_class: Type[RecMetricComputation] = CalibrationMetricComputation

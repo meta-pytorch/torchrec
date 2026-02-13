@@ -28,9 +28,11 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 try:
 
     # @manual=//torchrec/github/examples/retrieval:knn_index
+    # pyrefly: ignore[missing-import]
     from knn_index import get_index
 
     # @manual=//torchrec/github/examples/retrieval/modules:two_tower
+    # pyrefly: ignore[missing-import]
     from modules.two_tower import (  # noqa F811
         convert_TwoTower_to_TwoTowerRetrieval,
         TwoTowerRetrieval,
@@ -152,6 +154,7 @@ def infer(
         index.add(embeddings)
 
     retrieval_model = TwoTowerRetrieval(
+        # pyrefly: ignore[bad-argument-type]
         index,
         ebcs[0],
         ebcs[1],

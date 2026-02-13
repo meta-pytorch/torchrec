@@ -74,6 +74,7 @@ def create_quant_and_sharded_ebc_models(
     pruning_ebc_dict = {"table_0": num_rows_post_pruned}
     quant_model = prune_and_quantize_model(mi.model, pruning_ebc_dict)
 
+    # pyrefly: ignore[bad-index]
     quant_model = quant_model[0]
     mi.quant_model = quant_model
 
@@ -97,9 +98,11 @@ class QuantPruneTest(unittest.TestCase):
         for module in sharded_model.modules():
             if module.__class__.__name__ == "IntNBitTableBatchedEmbeddingBagsCodegen":
                 #  `Union[Tensor, Module]`.
+                # pyrefly: ignore[bad-argument-type]
                 for i, spec in enumerate(module.embedding_specs):
                     if spec[0] in pruned_dict:
                         self.assertEqual(
+                            # pyrefly: ignore[not-callable]
                             module.split_embedding_weights()[i][0].size(0),
                             pruned_dict[spec[0]],
                         )

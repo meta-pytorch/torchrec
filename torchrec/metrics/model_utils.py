@@ -135,6 +135,7 @@ def parse_required_inputs(
         # convert feature defined from config only
         if ndcg_transform_input:
             model_out[feature] = (
+                # pyrefly: ignore[bad-argument-type]
                 session_ids_to_tensor(model_out[feature], device=device)
                 if isinstance(model_out[feature], list)
                 else model_out[feature]
@@ -181,6 +182,7 @@ def parse_task_model_outputs(
             model_out,
             required_inputs_list,
             ndcg_transform_input,
+            # pyrefly: ignore[unbound-name]
             device=labels.device,
         )
 

@@ -159,5 +159,7 @@ class NMSEMetricComputation(MSEMetricComputation):
 
 
 class NMSEMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.NMSE
+    # pyrefly: ignore[bad-override]
     _computation_class: Type[NMSEMetricComputation] = NMSEMetricComputation

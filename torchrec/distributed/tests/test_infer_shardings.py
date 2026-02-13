@@ -120,6 +120,7 @@ class TimeGapPoolingCollectionModule(FeatureProcessorsCollection):
             )
             indices = torch.floor(torch.pow(scores, self.feature_pow))
             indices = indices.to(torch.int32)
+            # pyrefly: ignore[no-matching-overload]
             scores = torch.index_select(self.w, 0, indices)
             scores_list.append(scores)
 
@@ -256,6 +257,7 @@ class InferShardingsTest(unittest.TestCase):
         self.assertEqual(
             len(
                 #  attribute `sparse`.
+                # pyrefly: ignore[missing-attribute]
                 sharded_model._module.sparse.ebc._lookups[0]._embedding_lookups_per_rank
             ),
             2,
@@ -263,6 +265,7 @@ class InferShardingsTest(unittest.TestCase):
         self.assertEqual(
             len(
                 #  attribute `sparse`.
+                # pyrefly: ignore[missing-attribute]
                 sharded_model._module.sparse.weighted_ebc._lookups[
                     0
                 ]._embedding_lookups_per_rank
@@ -508,10 +511,12 @@ class InferShardingsTest(unittest.TestCase):
 
             module_plan = construct_module_sharding_plan(
                 #  attribute `sparse`.
+                # pyrefly: ignore[missing-attribute]
                 non_sharded_model._module.sparse.ebc,
                 per_param_sharding={
                     "table_0": column_wise(ranks=[1, 0, 1, 0]),
                 },
+                # pyrefly: ignore[bad-argument-type]
                 sharder=sharder,
                 local_size=local_size,
                 world_size=world_size,
@@ -613,10 +618,12 @@ class InferShardingsTest(unittest.TestCase):
         )
         module_plan = construct_module_sharding_plan(
             #  attribute `sparse`.
+            # pyrefly: ignore[missing-attribute]
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
                 "table_0": column_wise(size_per_rank=[dim_1, dim_2, dim_3, dim_4]),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -828,11 +835,13 @@ class InferShardingsTest(unittest.TestCase):
 
         module_plan = construct_module_sharding_plan(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
                 "table_0": column_wise(ranks=[1, 0]),
                 "table_1": column_wise(ranks=[0, 1]),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -953,12 +962,14 @@ class InferShardingsTest(unittest.TestCase):
 
         module_plan = construct_module_sharding_plan(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
                 "table_0": column_wise(ranks=[2, 1]),
                 "table_1": column_wise(ranks=[0, 3]),
                 "table_2": column_wise(ranks=[0, 2, 3]),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1491,6 +1502,7 @@ class InferShardingsTest(unittest.TestCase):
         )
 
         module_plan = construct_module_sharding_plan(
+            # pyrefly: ignore[bad-argument-type, bad-index]
             non_sharded_model._module_kjt_input[0],
             per_param_sharding={
                 "table_0": row_wise(
@@ -1500,6 +1512,7 @@ class InferShardingsTest(unittest.TestCase):
                 "table_2": row_wise(([256, 128, 128, 0], device)),
                 "table_3": row_wise(([0, 128, 128, 256], device)),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1531,6 +1544,7 @@ class InferShardingsTest(unittest.TestCase):
         gm_script_output = gm_script(*inputs[0])
         assert_close(sharded_output, gm_script_output)
 
+        # pyrefly: ignore[bad-argument-type, bad-index]
         tbes = get_tbes_from_sharded_module(sharded_model._module_kjt_input[0])
         for tbe in tbes:
             self.assertTrue(tbe.weight_initialized)
@@ -1613,12 +1627,14 @@ class InferShardingsTest(unittest.TestCase):
         sharder = QuantEmbeddingCollectionSharder()
 
         module_plan = construct_module_sharding_plan(
+            # pyrefly: ignore[bad-argument-type, bad-index]
             non_sharded_model._module_kjt_input[0],
             per_param_sharding={
                 "table_0": row_wise(),
                 "table_1": table_wise(rank=0),
                 "table_2": table_wise(rank=1),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1722,11 +1738,13 @@ class InferShardingsTest(unittest.TestCase):
         sharder = QuantEmbeddingCollectionSharder()
 
         module_plan = construct_module_sharding_plan(
+            # pyrefly: ignore[bad-argument-type, bad-index]
             non_sharded_model._module_kjt_input[0],
             per_param_sharding={
                 "table_0": row_wise(),
                 "table_1": table_wise(rank=1),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1823,10 +1841,12 @@ class InferShardingsTest(unittest.TestCase):
 
         module_plan = construct_module_sharding_plan(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
                 "table_0": row_wise(([size0, size1, size2], device)),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1973,6 +1993,7 @@ class InferShardingsTest(unittest.TestCase):
 
         module_plan = construct_module_sharding_plan(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
                 "table_0": row_wise(
@@ -1982,6 +2003,7 @@ class InferShardingsTest(unittest.TestCase):
                 "table_2": row_wise(([256, 128, 128, 0], device)),
                 "table_3": row_wise(([0, 128, 128, 256], device)),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -2050,6 +2072,7 @@ class InferShardingsTest(unittest.TestCase):
 
         module_plan = construct_module_sharding_plan(
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
                 "table_0": row_wise(
@@ -2059,6 +2082,7 @@ class InferShardingsTest(unittest.TestCase):
                 "table_2": column_wise(ranks=[0, 1]),
                 "table_3": table_wise(rank=0),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -2204,8 +2228,11 @@ class InferShardingsTest(unittest.TestCase):
             ),
         )
         sharder = QuantFeatureProcessedEmbeddingBagCollectionSharder()
+        # pyrefly: ignore[missing-argument]
         plan = mi.planner.plan(
+            # pyrefly: ignore[bad-argument-type]
             mi.quant_model,
+            # pyrefly: ignore[bad-argument-type]
             [sharder],
         )
 
@@ -2213,9 +2240,11 @@ class InferShardingsTest(unittest.TestCase):
             module=quant_model,
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[QuantFeatureProcessedEmbeddingBagCollectionSharder]`.
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=local_device,
             plan=plan,
+            # pyrefly: ignore[missing-attribute]
             env=ShardingEnv.from_local(world_size=mi.topology.world_size, rank=0),
         )
         print(f"sharded_model:\n{sharded_model}")
@@ -2378,8 +2407,11 @@ class InferShardingsTest(unittest.TestCase):
             ),
         )
         sharder = QuantEmbeddingCollectionSharder()
+        # pyrefly: ignore[missing-argument]
         plan = mi.planner.plan(
+            # pyrefly: ignore[bad-argument-type]
             mi.quant_model,
+            # pyrefly: ignore[bad-argument-type]
             [sharder],
         )
 
@@ -2514,8 +2546,11 @@ class InferShardingsTest(unittest.TestCase):
             ),
         )
         sharder = QuantFeatureProcessedEmbeddingBagCollectionSharder()
+        # pyrefly: ignore[missing-argument]
         plan = mi.planner.plan(
+            # pyrefly: ignore[bad-argument-type]
             mi.quant_model,
+            # pyrefly: ignore[bad-argument-type]
             [sharder],
         )
 
@@ -2523,6 +2558,7 @@ class InferShardingsTest(unittest.TestCase):
             module=quant_model,
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[QuantFeatureProcessedEmbeddingBagCollectionSharder]`.
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             # shard on meta to simulate device movement from cpu -> meta QFPEBC
             device=torch.device("meta"),

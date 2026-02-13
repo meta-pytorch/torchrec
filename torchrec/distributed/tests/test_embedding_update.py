@@ -157,6 +157,7 @@ def sharded_embedding_update(
             local_size=local_size,
             world_size=world_size,
             device_type=ctx.device.type,
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
         )
 
@@ -165,6 +166,7 @@ def sharded_embedding_update(
             model,
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=ShardingPlan({"ec": sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=ctx.device,
         )
@@ -172,6 +174,7 @@ def sharded_embedding_update(
         kjts = inputs_per_rank[rank]
         sharded_model(kjts.to(ctx.device))
         torch.cuda.synchronize()
+        # pyrefly: ignore[missing-attribute]
         sharded_model._dmp_wrapped_module.ec.write(
             embeddings_per_rank[rank].to(ctx.device)
         )

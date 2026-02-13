@@ -24,6 +24,7 @@ class TestModelInput(unittest.TestCase):
 
     def setUp(self) -> None:
         # Fix seeds for reproducibility
+        # pyrefly: ignore [implicit-import]
         np.random.seed(42)
         torch.manual_seed(42)
 

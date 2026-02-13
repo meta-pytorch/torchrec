@@ -223,18 +223,26 @@ class sharded_model_copy:
                 _copy_or_not(param, memo), requires_grad=param.requires_grad
             )
 
+        # pyrefly: ignore[bad-assignment]
         torch.Tensor.__deepcopy__ = _copy_or_not
+        # pyrefly: ignore[bad-assignment]
         torch.nn.Parameter.__deepcopy__ = _param_copy
+        # pyrefly: ignore[implicit-import]
         torch._C._distributed_c10d.ProcessGroupNCCL.__deepcopy__ = _no_copy
+        # pyrefly: ignore[implicit-import]
         torch._C._distributed_c10d.ProcessGroupGloo.__deepcopy__ = _no_copy
+        # pyrefly: ignore[implicit-import]
         torch._C._distributed_c10d.Work.__deepcopy__ = _no_copy
         torch.cuda.streams.Stream.__deepcopy__ = _no_copy
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         torch.Tensor.__deepcopy__ = self.t_copy_save_
         torch.nn.Parameter.__deepcopy__ = self.p_copy_save_
+        # pyrefly: ignore[implicit-import]
         torch._C._distributed_c10d.ProcessGroupNCCL.__deepcopy__ = None
+        # pyrefly: ignore[implicit-import]
         torch._C._distributed_c10d.ProcessGroupGloo.__deepcopy__ = None
+        # pyrefly: ignore[implicit-import]
         torch._C._distributed_c10d.Work.__deepcopy__ = None
         torch.cuda.streams.Stream.__deepcopy__ = None
 
@@ -548,6 +556,7 @@ def init_parameters(module: nn.Module, device: torch.device) -> None:
 
             def maybe_reset_parameters(m: nn.Module) -> None:
                 if hasattr(m, "reset_parameters"):
+                    # pyrefly: ignore[not-callable]
                     m.reset_parameters()
 
             module.apply(maybe_reset_parameters)
@@ -600,8 +609,10 @@ def create_global_tensor_shape_stride_from_metadata(
     """
     size = None
     if parameter_sharding.sharding_type == ShardingType.COLUMN_WISE.value:
+        # pyrefly: ignore[missing-attribute]
         row_dim = parameter_sharding.sharding_spec.shards[0].shard_sizes[0]
         col_dim = 0
+        # pyrefly: ignore[missing-attribute]
         for shard in parameter_sharding.sharding_spec.shards:
             col_dim += shard.shard_sizes[1]
         size = torch.Size([row_dim, col_dim])
@@ -610,22 +621,29 @@ def create_global_tensor_shape_stride_from_metadata(
         or parameter_sharding.sharding_type == ShardingType.TABLE_ROW_WISE.value
     ):
         row_dim = 0
+        # pyrefly: ignore[missing-attribute]
         col_dim = parameter_sharding.sharding_spec.shards[0].shard_sizes[1]
+        # pyrefly: ignore[missing-attribute]
         for shard in parameter_sharding.sharding_spec.shards:
             row_dim += shard.shard_sizes[0]
         size = torch.Size([row_dim, col_dim])
     elif parameter_sharding.sharding_type == ShardingType.TABLE_WISE.value:
+        # pyrefly: ignore[missing-attribute]
         size = torch.Size(parameter_sharding.sharding_spec.shards[0].shard_sizes)
     elif parameter_sharding.sharding_type == ShardingType.GRID_SHARD.value:
         # we need node group size to appropriately calculate global shape from shard
         assert devices_per_node is not None
         row_dim, col_dim = 0, 0
+        # pyrefly: ignore[missing-attribute]
         num_cw_shards = len(parameter_sharding.sharding_spec.shards) // devices_per_node
         for _ in range(num_cw_shards):
+            # pyrefly: ignore[missing-attribute]
             col_dim += parameter_sharding.sharding_spec.shards[0].shard_sizes[1]
         for _ in range(devices_per_node):
+            # pyrefly: ignore[missing-attribute]
             row_dim += parameter_sharding.sharding_spec.shards[0].shard_sizes[0]
         size = torch.Size([row_dim, col_dim])
+    # pyrefly: ignore[bad-return]
     return size, (size[1], 1) if size else (torch.Size([0, 0]), (0, 1))
 
 
@@ -684,6 +702,7 @@ def _group_sharded_modules(
             sharded_modules.append(module)
         if hasattr(module, "_lookups"):
             #  not a function.
+            # pyrefly: ignore[not-iterable]
             for lookup in module._lookups:
                 _find_sharded_modules(lookup)
             return
@@ -706,8 +725,11 @@ def _convert_weights(
 
 def weights_bytes_in_emb_kernel(emb: nn.Module) -> int:
     total_bytes = (
+        # pyrefly: ignore[not-callable]
         emb.weights_dev.element_size() * emb.weights_dev.numel()
+        # pyrefly: ignore[not-callable]
         + emb.weights_host.element_size() * emb.weights_host.numel()
+        # pyrefly: ignore[not-callable]
         + emb.weights_uvm.element_size() * emb.weights_uvm.numel()
     )
     return total_bytes
@@ -731,21 +753,26 @@ class EmbeddingQuantizationUtils:
 
         for emb_kernel in sharded_embs:
             emb_kernel.weights_dev = _convert_weights(
+                # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_dev,
                 converted_sparse_dtype,
             )
             emb_kernel.weights_host = _convert_weights(
+                # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_host,
                 converted_sparse_dtype,
             )
             emb_kernel.weights_uvm = _convert_weights(
+                # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_uvm,
                 converted_sparse_dtype,
             )
+            # pyrefly: ignore[no-matching-overload]
             self._emb_kernel_to_sparse_dtype.setdefault(
                 emb_kernel, emb_kernel.weights_precision
             )
 
+            # pyrefly: ignore[bad-argument-type]
             emb_kernel.weights_precision = converted_sparse_dtype
 
     def recreate_embedding_modules(
@@ -756,17 +783,21 @@ class EmbeddingQuantizationUtils:
         sharded_embs.sort(key=weights_bytes_in_emb_kernel)
 
         for emb_kernel in sharded_embs:
+            # pyrefly: ignore[bad-index]
             converted_sparse_dtype = self._emb_kernel_to_sparse_dtype[emb_kernel]
 
             emb_kernel.weights_dev = _convert_weights(
+                # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_dev,
                 converted_sparse_dtype,
             )
             emb_kernel.weights_host = _convert_weights(
+                # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_host,
                 converted_sparse_dtype,
             )
             emb_kernel.weights_uvm = _convert_weights(
+                # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_uvm,
                 converted_sparse_dtype,
             )
@@ -778,6 +809,7 @@ class EmbeddingQuantizationUtils:
         ) -> None:
             if hasattr(module, "_lookups") or hasattr(module, "_lookup"):
                 #  not a function.
+                # pyrefly: ignore[not-callable]
                 module._initialize_torch_state(skip_registering=True)
                 return
             for _, child in module.named_children():
@@ -804,6 +836,7 @@ def modify_input_for_feature_processor(
 
         if is_collection:
             if hasattr(feature_processors, "pre_process_input"):
+                # pyrefly: ignore[not-callable]
                 feature_processors.pre_process_input(features)
             else:
                 logging.info(
@@ -812,9 +845,12 @@ def modify_input_for_feature_processor(
         else:
             # per feature process
             for feature in features.keys():
+                # pyrefly: ignore[unsupported-operation]
                 if feature in feature_processors:
+                    # pyrefly: ignore[bad-index]
                     feature_processor = feature_processors[feature]
                     if hasattr(feature_processor, "pre_process_input"):
+                        # pyrefly: ignore[not-callable]
                         feature_processor.pre_process_input(features[feature])
                     else:
                         logging.info(

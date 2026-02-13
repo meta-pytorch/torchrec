@@ -174,11 +174,13 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
     fused_params = config.fused_params or {}
     # read and clean up the fused_params that are not in the constructor
     if RES_STORE_SHARDS_STR in fused_params:
+        # pyrefly: ignore [bad-assignment]
         res_params.res_store_shards = fused_params.get(RES_STORE_SHARDS_STR)
         del fused_params[RES_STORE_SHARDS_STR]
     res_enabled_tables: Optional[List[str]] = None
     if RES_ENABLED_TABLES_STR in fused_params:
         res_enabled_tables = (
+            # pyrefly: ignore [missing-attribute]
             fused_params.get(RES_ENABLED_TABLES_STR).split(",")
             if fused_params.get(RES_ENABLED_TABLES_STR) is not None
             else None
@@ -253,7 +255,9 @@ def _populate_ssd_tbe_params(config: GroupedEmbeddingConfig) -> Dict[str, Any]:
 
         local_rows_sum: int = sum(table.local_rows for table in config.embedding_tables)
         ssd_tbe_params["cache_sets"] = max(
-            int(cache_load_factor * local_rows_sum / ASSOC), 1
+            # pyrefly: ignore [unsupported-operation]
+            int(cache_load_factor * local_rows_sum / ASSOC),
+            1,
         )
 
     # populate init min and max
@@ -623,6 +627,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         embedding_weights_by_table, _, _, _ = emb_module.split_embedding_weights()
         emb_tables_copy = copy.deepcopy(config.embedding_tables)
         for emb_table in emb_tables_copy:
+            # pyrefly: ignore [missing-attribute]
             emb_table.local_metadata.placement._device = torch.device("cpu")
 
         # [Step 1] Create ShardParams for every embedding table
@@ -656,21 +661,27 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
                     )
                 # Saving the optimizer keys for every table
                 table_to_shard_params[table_config.name].optimizer_states_keys.append(
+                    # pyrefly: ignore [bad-argument-type]
                     optimizer_states.keys()
                 )
 
             # Adding data to the shard params for every table
             table_to_shard_params[table_config.name].optimizer_states.append(
+                # pyrefly: ignore [bad-argument-type]
                 optimizer_state_values
             )
             table_to_shard_params[table_config.name].local_metadata.append(
+                # pyrefly: ignore [bad-argument-type]
                 table_config.local_metadata
             )
             table_to_shard_params[table_config.name].dtensor_metadata.append(
+                # pyrefly: ignore [bad-argument-type]
                 table_config.dtensor_metadata
             )
+            # pyrefly: ignore [bad-argument-type]
             table_to_shard_params[table_config.name].embedding_weights.append(weight)
             table_to_shard_params[table_config.name].global_metadata = (
+                # pyrefly: ignore [bad-assignment]
                 table_config.global_metadata
             )
 
@@ -725,6 +736,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
             ):
                 # Number of optimizers for the table
                 num_states: int = min(
+                    # pyrefly: ignore [bad-argument-type]
                     [len(opt_state) for opt_state in shard_params.optimizer_states]
                 )
                 optimizer_state_keys = []
@@ -744,7 +756,11 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
                     # Creating the ShardedTensor for the optimizer weights for the table
                     state[weight][f"{table_config.name}.{cur_state_key}"] = (
                         self.get_sharded_optim_state(
-                            cur_state_idx + 1, cur_state_key, shard_params, table_config
+                            cur_state_idx + 1,
+                            # pyrefly: ignore [bad-argument-type]
+                            cur_state_key,
+                            shard_params,
+                            table_config,
                         )
                     )
 
@@ -763,6 +779,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         optimizer_sharded_tensor_metadata: ShardedTensorMetadata
 
         # Momentum idx is minimum 1
+        # pyrefly: ignore [unsupported-operation]
         optim_state = shard_params.optimizer_states[0][momentum_idx - 1]
         if (
             optim_state.nelement() == 1 and state_key != "momentum1"
@@ -806,6 +823,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
             )
             momentum_local_shards.append(
                 Shard(
+                    # pyrefly: ignore [unsupported-operation]
                     optimizer_state[momentum_idx - 1],
                     local_optimizer_shard_metadata,
                 )
@@ -833,6 +851,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
             return DTensor.from_local(
                 local_tensor=LocalShardsWrapper(
                     local_shards=[x.tensor for x in momentum_local_shards],
+                    # pyrefly: ignore [bad-argument-type]
                     local_offsets=[
                         x.metadata.shard_offsets for x in momentum_local_shards
                     ],
@@ -863,6 +882,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         table_shard_metadata_to_optimizer_shard_metadata = {}
         for offset, table_shard_metadata in enumerate(table_global_shards_metadata):
 
+            # pyrefly: ignore [missing-attribute]
             table_shard_metadata.placement._device = optimizer_state.device
             # Creating shardMetaData
             table_shard_metadata_to_optimizer_shard_metadata[table_shard_metadata] = (
@@ -926,6 +946,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
                 # manually create a row-wise offset
                 offset = idx * table_shard_metadata.shard_sizes[0]
 
+            # pyrefly: ignore [missing-attribute]
             table_shard_metadata.placement._device = optimizer_state.device
             table_shard_metadata_to_optimizer_shard_metadata[table_shard_metadata] = (
                 ShardMetadata(
@@ -978,6 +999,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         table_shard_metadata_to_optimizer_shard_metadata = {}
 
         for table_shard_metadata in table_global_shards_metadata:
+            # pyrefly: ignore [missing-attribute]
             table_shard_metadata.placement._device = optimizer_state.device
             table_shard_metadata_to_optimizer_shard_metadata[table_shard_metadata] = (
                 ShardMetadata(
@@ -1005,9 +1027,11 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         )
 
     def zero_grad(self, set_to_none: bool = False) -> None:
+        # pyrefly: ignore [bad-index]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
     def step(self, closure: Any = None) -> None:
+        # pyrefly: ignore [bad-index]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
 
@@ -1069,6 +1093,7 @@ class ZeroCollisionKeyValueEmbeddingFusedOptimizer(FusedOptimizer):
 
         emb_table_config_copy = copy.deepcopy(self._config.embedding_tables)
         for emb_table in emb_table_config_copy:
+            # pyrefly: ignore [missing-attribute]
             emb_table.local_metadata.placement._device = torch.device("cpu")
 
         for emb_config, sharded_weight, opt_state in zip(
@@ -1089,9 +1114,11 @@ class ZeroCollisionKeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         super().__init__(params, state, [param_group])
 
     def zero_grad(self, set_to_none: bool = False) -> None:
+        # pyrefly: ignore [bad-index]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
     def step(self, closure: Any = None) -> None:
+        # pyrefly: ignore [bad-index]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
     def set_sharded_embedding_weight_ids(
@@ -1116,6 +1143,7 @@ class ZeroCollisionKeyValueEmbeddingFusedOptimizer(FusedOptimizer):
         )
         emb_table_config_copy = copy.deepcopy(self._config.embedding_tables)
         for emb_table in emb_table_config_copy:
+            # pyrefly: ignore [missing-attribute]
             emb_table.local_metadata.placement._device = torch.device("cpu")
 
         # The order of table_config is determined so put it as outer-loop for consistent traverse order across ranks
@@ -1134,6 +1162,7 @@ class ZeroCollisionKeyValueEmbeddingFusedOptimizer(FusedOptimizer):
                         )
                         sharded_t.local_shards()[0].tensor = opt_state_t
                         create_virtual_table_local_metadata(
+                            # pyrefly: ignore [bad-argument-type]
                             table_config.local_metadata,
                             opt_state_t,
                             self._my_rank,
@@ -1366,18 +1395,22 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         table_config.local_rows == optimizer_state_value.size(0)
                         or optimizer_state_value.nelement() == 1  # single value state
                     )
+                # pyrefly: ignore [no-matching-overload]
                 optimizer_states_keys_by_table[table_config.name] = list(
                     optimizer_states.keys()
                 )
             local_metadata = table_config.local_metadata
 
             table_to_shard_params[table_config.name].optimizer_states.append(
+                # pyrefly: ignore [bad-argument-type]
                 optimizer_state_values
             )
             table_to_shard_params[table_config.name].local_metadata.append(
+                # pyrefly: ignore [bad-argument-type]
                 local_metadata
             )
             table_to_shard_params[table_config.name].dtensor_metadata.append(
+                # pyrefly: ignore [bad-argument-type]
                 table_config.dtensor_metadata
             )
             table_to_shard_params[table_config.name].embedding_weights.append(weight)
@@ -1448,6 +1481,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                     momentum_local_shards: List[Shard] = []
                     optimizer_sharded_tensor_metadata: ShardedTensorMetadata
 
+                    # pyrefly: ignore [unsupported-operation]
                     optim_state = shard_params.optimizer_states[0][momentum_idx - 1]
                     if (
                         optim_state.nelement() == 1 and state_key != "momentum1"
@@ -1457,6 +1491,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                             table_shard_metadata_to_optimizer_shard_metadata,
                             optimizer_sharded_tensor_metadata,
                         ) = get_optimizer_single_value_shard_metadata_and_global_metadata(
+                            # pyrefly: ignore [bad-argument-type]
                             table_config.global_metadata,
                             optim_state,
                         )
@@ -1466,6 +1501,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                             table_shard_metadata_to_optimizer_shard_metadata,
                             optimizer_sharded_tensor_metadata,
                         ) = get_optimizer_rowwise_shard_metadata_and_global_metadata(
+                            # pyrefly: ignore [bad-argument-type]
                             table_config.global_metadata,
                             optim_state,
                             sharding_dim,
@@ -1477,6 +1513,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                             table_shard_metadata_to_optimizer_shard_metadata,
                             optimizer_sharded_tensor_metadata,
                         ) = get_optimizer_pointwise_shard_metadata_and_global_metadata(
+                            # pyrefly: ignore [bad-argument-type]
                             table_config.global_metadata,
                             optim_state,
                         )
@@ -1491,6 +1528,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         )
                         momentum_local_shards.append(
                             Shard(
+                                # pyrefly: ignore [unsupported-operation]
                                 optimizer_state[momentum_idx - 1],
                                 local_optimizer_shard_metadata,
                             )
@@ -1503,6 +1541,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                             stride = (1,)
                             placements = (
                                 (Replicate(), DTensorShard(0))
+                                # pyrefly: ignore [missing-attribute]
                                 if table_config.dtensor_metadata.mesh.ndim == 2
                                 else (DTensorShard(0),)
                             )
@@ -1513,6 +1552,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         return DTensor.from_local(
                             local_tensor=LocalShardsWrapper(
                                 local_shards=[x.tensor for x in momentum_local_shards],
+                                # pyrefly: ignore [bad-argument-type]
                                 local_offsets=[
                                     x.metadata.shard_offsets
                                     for x in momentum_local_shards
@@ -1533,6 +1573,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         )
 
                 num_states: int = min(
+                    # pyrefly: ignore [bad-argument-type]
                     [len(opt_state) for opt_state in shard_params.optimizer_states]
                 )
                 optimizer_state_keys = []
@@ -1548,15 +1589,18 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         cur_state_key = optimizer_state_keys[cur_state_idx]
 
                     state[weight][f"{table_config.name}.{cur_state_key}"] = (
+                        # pyrefly: ignore [bad-argument-type]
                         get_sharded_optim_state(cur_state_idx + 1, cur_state_key)
                     )
 
         super().__init__(params, state, [param_group])
 
     def zero_grad(self, set_to_none: bool = False) -> None:
+        # pyrefly: ignore [bad-index]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
     def step(self, closure: Any = None) -> None:
+        # pyrefly: ignore [bad-index]
         self._emb_module.set_learning_rate(self.param_groups[0]["lr"])
 
     def set_optimizer_step(self, step: int) -> None:
@@ -1581,7 +1625,9 @@ def _gen_named_parameters_by_table_ssd_pmt(
     for table_config, pmt in zip(config.embedding_tables, pmts):
         table_name = table_config.name
         emb_table = pmt
+        # pyrefly: ignore [bad-argument-type]
         weight: nn.Parameter = nn.Parameter(emb_table)
+        # pyrefly: ignore [missing-attribute]
         weight._in_backward_optimizers = [EmptyFusedOptimizer()]
         yield (table_name, weight)
 
@@ -1604,22 +1650,29 @@ def _gen_named_parameters_by_table_fused(
         table_count = table_name_to_count.pop(table_name)
         if emb_module.weights_precision == SparseType.INT8:
             dim += emb_module.int8_emb_row_dim_offset
+        # pyrefly: ignore [bad-index]
         offset = emb_module.weights_physical_offsets[t_idx]
         weights: torch.Tensor
         if location == EmbeddingLocation.DEVICE.value:
+            # pyrefly: ignore [bad-assignment]
             weights = emb_module.weights_dev
         elif location == EmbeddingLocation.HOST.value:
+            # pyrefly: ignore [bad-assignment]
             weights = emb_module.weights_host
         else:
+            # pyrefly: ignore [bad-assignment]
             weights = emb_module.weights_uvm
         weight = TableBatchedEmbeddingSlice(
             data=weights,
+            # pyrefly: ignore [bad-argument-type]
             start_offset=offset,
+            # pyrefly: ignore [bad-argument-type]
             end_offset=offset + table_count * rows * dim,
             num_embeddings=-1,
             embedding_dim=dim,
         )
         # this reuses logic in EmbeddingFusedOptimizer but is per table
+        # pyrefly: ignore [missing-attribute]
         weight._in_backward_optimizers = [
             EmbeddingFusedOptimizer(
                 config=config,
@@ -1717,17 +1770,23 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
             self._weight_init_maxs,
             self.split_embedding_weights(),
         ):
+            # pyrefly: ignore [missing-attribute]
             assert param.shape == (rows, emb_dim)
+            # pyrefly: ignore [missing-attribute]
             if param.data.dtype in [
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             ]:
+                # pyrefly: ignore [missing-attribute, no-matching-overload]
                 tmp_param = torch.zeros(param.shape, device=param.device)
                 tmp_param.uniform_(weight_init_min, weight_init_max).to(
+                    # pyrefly: ignore [missing-attribute]
                     param.data.dtype
                 )
+                # pyrefly: ignore [missing-attribute]
                 param.data.copy_(tmp_param)
             else:
+                # pyrefly: ignore [missing-attribute]
                 param.data.uniform_(
                     weight_init_min,
                     weight_init_max,
@@ -1757,6 +1816,7 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
                 **forward_args,
             )
 
+    # pyrefly: ignore [bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -1766,6 +1826,7 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
         self.flush()
         return get_state_dict(
             self._config.embedding_tables,
+            # pyrefly: ignore [bad-argument-type]
             self.split_embedding_weights(),
             self._pg,
             destination,
@@ -1773,6 +1834,7 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
         )
 
     def split_embedding_weights(self) -> List[SplitWeightType]:
+        # pyrefly: ignore [bad-return]
         return self.emb_module.split_embedding_weights()
 
     @property
@@ -1806,6 +1868,7 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
             self.emb_module.split_embedding_weights(),
         ):
             key = append_prefix(prefix, f"{config.name}.weight")
+            # pyrefly: ignore [invalid-yield]
             yield key, param
 
     def named_parameters_by_table(
@@ -1863,6 +1926,7 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
             self._emb_module,
             pg,
         )
+        # pyrefly: ignore [bad-override]
         self._param_per_table: Dict[str, nn.Parameter] = dict(
             _gen_named_parameters_by_table_ssd_pmt(
                 emb_module=self._emb_module,
@@ -1880,6 +1944,7 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
         pass
 
     @property
+    # pyrefly: ignore [bad-override]
     def emb_module(
         self,
     ) -> SSDTableBatchedEmbeddingBags:
@@ -1913,6 +1978,7 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
         emb_tables, _, _, _ = self.split_embedding_weights(no_snapshot=no_snapshot)
         emb_table_config_copy = copy.deepcopy(self._config.embedding_tables)
         for emb_table in emb_table_config_copy:
+            # pyrefly: ignore [missing-attribute]
             emb_table.local_metadata.placement._device = torch.device("cpu")
         ret = get_state_dict(
             emb_table_config_copy,
@@ -1934,10 +2000,13 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
         ):
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
+            # pyrefly: ignore [bad-argument-type]
             param = nn.Parameter(tensor)
+            # pyrefly: ignore [missing-attribute]
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
+    # pyrefly: ignore [bad-override]
     def named_split_embedding_weights(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, PartiallyMaterializedTensor]]:
@@ -1996,12 +2065,14 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
         """
         self.emb_module.create_rocksdb_hard_link_snapshot()
 
+    # pyrefly: ignore [bad-override]
     def split_embedding_weights(self, no_snapshot: bool = True) -> Tuple[
         List[PartiallyMaterializedTensor],
         Optional[List[torch.Tensor]],
         Optional[List[torch.Tensor]],
         Optional[List[torch.Tensor]],
     ]:
+        # pyrefly: ignore [bad-return]
         return self.emb_module.split_embedding_weights(no_snapshot)
 
 
@@ -2088,12 +2159,15 @@ class ZeroCollisionKeyValueEmbedding(
             ZeroCollisionKeyValueEmbeddingFusedOptimizer(
                 config,
                 self._emb_module,
+                # pyrefly: ignore [unsupported-operation]
                 sharded_embedding_weights_by_table=self._split_weights_res[0],
                 table_name_to_weight_count_per_rank=self._table_name_to_weight_count_per_rank,
+                # pyrefly: ignore [unsupported-operation]
                 sharded_embedding_weight_ids=self._split_weights_res[1],
                 pg=pg,
             )
         )
+        # pyrefly: ignore [bad-override]
         self._param_per_table: Dict[str, nn.Parameter] = dict(
             _gen_named_parameters_by_table_ssd_pmt(
                 emb_module=self._emb_module,
@@ -2111,6 +2185,7 @@ class ZeroCollisionKeyValueEmbedding(
         pass
 
     @property
+    # pyrefly: ignore [bad-override]
     def emb_module(
         self,
     ) -> SSDTableBatchedEmbeddingBags:
@@ -2144,6 +2219,7 @@ class ZeroCollisionKeyValueEmbedding(
         emb_tables, _, _, _ = self.split_embedding_weights(no_snapshot=no_snapshot)
         emb_table_config_copy = copy.deepcopy(self._config.embedding_tables)
         for emb_table in emb_table_config_copy:
+            # pyrefly: ignore [missing-attribute]
             emb_table.local_metadata.placement._device = torch.device("cpu")
         ret = get_state_dict(
             emb_table_config_copy,
@@ -2165,10 +2241,13 @@ class ZeroCollisionKeyValueEmbedding(
         ):
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
+            # pyrefly: ignore [bad-argument-type]
             param = nn.Parameter(tensor)
+            # pyrefly: ignore [missing-attribute]
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
+    # pyrefly: ignore [bad-override]
     def named_split_embedding_weights(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, Union[PartiallyMaterializedTensor, torch.Tensor]]]:
@@ -2218,6 +2297,7 @@ class ZeroCollisionKeyValueEmbedding(
         )
         weight_id_sharded_t_list = create_virtual_sharded_tensors(
             emb_table_config_copy,
+            # pyrefly: ignore [bad-argument-type]
             weight_ids_list,
             self._pg,
             prefix,
@@ -2225,6 +2305,7 @@ class ZeroCollisionKeyValueEmbedding(
         )
         bucket_cnt_sharded_t_list = create_virtual_sharded_tensors(
             emb_table_config_copy,
+            # pyrefly: ignore [bad-argument-type]
             bucket_cnt_list,
             self._pg,
             prefix,
@@ -2241,6 +2322,7 @@ class ZeroCollisionKeyValueEmbedding(
                 self._table_name_to_weight_count_per_rank,
             )
 
+        # pyrefly: ignore [bad-argument-type]
         assert len(pmt_list) == len(weight_ids_list) == len(bucket_cnt_list)
         assert (
             len(pmt_sharded_t_list)
@@ -2277,11 +2359,16 @@ class ZeroCollisionKeyValueEmbedding(
         optional ShardedTensor for metadata
         """
         self._init_sharded_split_embedding_weights()
+        # pyrefly: ignore [unsupported-operation]
         self._optim.set_sharded_embedding_weight_ids(self._split_weights_res[1])
 
+        # pyrefly: ignore [unsupported-operation]
         pmt_sharded_t_list = self._split_weights_res[0]
+        # pyrefly: ignore [unsupported-operation]
         weight_id_sharded_t_list = self._split_weights_res[1]
+        # pyrefly: ignore [unsupported-operation]
         bucket_cnt_sharded_t_list = self._split_weights_res[2]
+        # pyrefly: ignore [unsupported-operation]
         metadata_sharded_t_list = self._split_weights_res[3]
         for table_idx, pmt_sharded_t in enumerate(pmt_sharded_t_list):
             table_config = self._config.embedding_tables[table_idx]
@@ -2314,6 +2401,7 @@ class ZeroCollisionKeyValueEmbedding(
         """
         self.emb_module.create_rocksdb_hard_link_snapshot()
 
+    # pyrefly: ignore [bad-override]
     def split_embedding_weights(
         self, no_snapshot: bool = True, should_flush: bool = False
     ) -> Tuple[
@@ -2431,6 +2519,7 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
         self.init_parameters()
 
     @property
+    # pyrefly: ignore [bad-override]
     def _param_per_table(self) -> Dict[str, TableBatchedEmbeddingSlice]:
         return dict(
             _gen_named_parameters_by_table_fused(
@@ -2474,6 +2563,7 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
             # hack before we support optimizer on sharded parameter level
             # can delete after SEA deprecation
             param = nn.Parameter(tensor)
+            # pyrefly: ignore [missing-attribute]
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
@@ -2513,8 +2603,11 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
 
         self.weights_sharded = False
         self._input_tensor = None
+        # pyrefly: ignore [not-callable]
         self._element_size = self._emb_module.weights_dev.element_size()
+        # pyrefly: ignore [bad-assignment]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
+        # pyrefly: ignore [bad-assignment]
         self._unsharded_param: torch.Tensor = self._emb_module.weights_dev
         self._shard_buf_nbytes: int = 0
         self._shard_buf: Optional[torch.Tensor] = None
@@ -2527,6 +2620,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
 
         self.register_full_backward_pre_hook(
+            # pyrefly: ignore [bad-argument-type]
             self._hybird_sharded_backward_hook,
         )
 
@@ -2543,6 +2637,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         if not self.weights_sharded:
             return
         self.ensure_reduce_scatter_complete()
+        # pyrefly: ignore [missing-attribute]
         shard_size = self._shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
 
@@ -2561,6 +2656,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
                 dtype=self._unsharded_param.dtype,
                 device=self._unsharded_param.device,
             )
+            # pyrefly: ignore [no-matching-overload]
             output_tensor.set_(
                 self._unsharded_param.untyped_storage(),
                 0,  # storage_offset
@@ -2577,6 +2673,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         self._emb_module.weights_dev = self._unsharded_param[
             : self._original_shape.numel()
         ]
+        # pyrefly: ignore [missing-attribute]
         self._shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
@@ -2627,6 +2724,7 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         with torch.no_grad():
             self.weights_sharded = True
 
+            # pyrefly: ignore [not-callable]
             total_size = self._emb_module.weights_dev.numel()
 
             num_groups = self._env.num_sharding_groups()
@@ -2634,16 +2732,19 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size
 
+            # pyrefly: ignore [not-callable]
             self._input_tensor = self._emb_module.weights_dev.contiguous()
             if padding_size > 0:
                 # ideally, we want to avoid padding as this has will cause a short 2x emb memory spike
                 self._input_tensor = torch.nn.functional.pad(
+                    # pyrefly: ignore [not-callable]
                     self._emb_module.weights_dev.contiguous(),
                     (0, padding_size),
                     value=0.0,
                 )
 
             if self._shard_buf is None:
+                # pyrefly: ignore [no-matching-overload]
                 self._shard_buf = torch.empty(
                     shard_size,
                     dtype=self._emb_module.weights_dev.dtype,
@@ -2666,9 +2767,12 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             self._async_event.record(self._async_stream)
 
             def resize_callback() -> None:
+                # pyrefly: ignore [not-callable]
                 self._emb_module.weights_dev.untyped_storage().resize_(0)
+                # pyrefly: ignore [bad-argument-type]
                 self._emb_module.weights_dev = self._shard_buf
                 # padding tensor we resize to 0 and set pointer to None, no op if no padding
+                # pyrefly: ignore [missing-attribute]
                 self._input_tensor.untyped_storage().resize_(0)
                 self._input_tensor = None
 
@@ -2751,7 +2855,9 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         self._pg = pg
 
         self._pooling: PoolingMode = pooling_type_to_pooling_mode(
-            config.pooling, sharding_type
+            config.pooling,
+            # pyrefly: ignore [bad-argument-type]
+            sharding_type,
         )
 
         self._local_rows: List[int] = []
@@ -2802,17 +2908,23 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
             self._weight_init_maxs,
             self.split_embedding_weights(),
         ):
+            # pyrefly: ignore [missing-attribute]
             assert param.shape == (rows, emb_dim)
+            # pyrefly: ignore [missing-attribute]
             if param.data.dtype in [
                 torch.float8_e4m3fn,
                 torch.float8_e5m2,
             ]:
+                # pyrefly: ignore [missing-attribute, no-matching-overload]
                 tmp_param = torch.zeros(param.shape, device=param.device)
                 tmp_param.uniform_(weight_init_min, weight_init_max).to(
+                    # pyrefly: ignore [missing-attribute]
                     param.data.dtype
                 )
+                # pyrefly: ignore [missing-attribute]
                 param.data.copy_(tmp_param)
             else:
+                # pyrefly: ignore [missing-attribute]
                 param.data.uniform_(
                     weight_init_min,
                     weight_init_max,
@@ -2868,6 +2980,7 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
                 **forward_args,
             )
 
+    # pyrefly: ignore [bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -2877,6 +2990,7 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         self.flush()
         return get_state_dict(
             self._config.embedding_tables,
+            # pyrefly: ignore [bad-argument-type]
             self.split_embedding_weights(),
             self._pg,
             destination,
@@ -2884,6 +2998,7 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         )
 
     def split_embedding_weights(self) -> List[SplitWeightType]:
+        # pyrefly: ignore [bad-return]
         return self.emb_module.split_embedding_weights()
 
     @property
@@ -2917,6 +3032,7 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
             self.emb_module.split_embedding_weights(),
         ):
             key = append_prefix(prefix, f"{config.name}.weight")
+            # pyrefly: ignore [invalid-yield]
             yield key, tensor
 
     def named_parameters_by_table(
@@ -2972,6 +3088,7 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
             self._emb_module,
             pg,
         )
+        # pyrefly: ignore [bad-override]
         self._param_per_table: Dict[str, nn.Parameter] = dict(
             _gen_named_parameters_by_table_ssd_pmt(
                 emb_module=self._emb_module,
@@ -2990,6 +3107,7 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         pass
 
     @property
+    # pyrefly: ignore [bad-override]
     def emb_module(
         self,
     ) -> SSDTableBatchedEmbeddingBags:
@@ -3023,6 +3141,7 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         emb_tables, _, _, _ = self.split_embedding_weights(no_snapshot=no_snapshot)
         emb_table_config_copy = copy.deepcopy(self._config.embedding_tables)
         for emb_table in emb_table_config_copy:
+            # pyrefly: ignore [missing-attribute]
             emb_table.local_metadata.placement._device = torch.device("cpu")
         ret = get_state_dict(
             emb_table_config_copy,
@@ -3044,10 +3163,13 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         ):
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
+            # pyrefly: ignore [bad-argument-type]
             param = nn.Parameter(tensor)
+            # pyrefly: ignore [missing-attribute]
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
+    # pyrefly: ignore [bad-override]
     def named_split_embedding_weights(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, PartiallyMaterializedTensor]]:
@@ -3105,12 +3227,14 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         """
         self.emb_module.create_rocksdb_hard_link_snapshot()
 
+    # pyrefly: ignore [bad-override]
     def split_embedding_weights(self, no_snapshot: bool = True) -> Tuple[
         List[PartiallyMaterializedTensor],
         Optional[List[torch.Tensor]],
         Optional[List[torch.Tensor]],
         Optional[List[torch.Tensor]],
     ]:
+        # pyrefly: ignore [bad-return]
         return self.emb_module.split_embedding_weights(no_snapshot)
 
 
@@ -3185,12 +3309,15 @@ class ZeroCollisionKeyValueEmbeddingBag(
             ZeroCollisionKeyValueEmbeddingFusedOptimizer(
                 config,
                 self._emb_module,
+                # pyrefly: ignore [unsupported-operation]
                 sharded_embedding_weights_by_table=self._split_weights_res[0],
                 table_name_to_weight_count_per_rank=self._table_name_to_weight_count_per_rank,
+                # pyrefly: ignore [unsupported-operation]
                 sharded_embedding_weight_ids=self._split_weights_res[1],
                 pg=pg,
             )
         )
+        # pyrefly: ignore [bad-override]
         self._param_per_table: Dict[str, nn.Parameter] = dict(
             _gen_named_parameters_by_table_ssd_pmt(
                 emb_module=self._emb_module,
@@ -3208,6 +3335,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
         pass
 
     @property
+    # pyrefly: ignore [bad-override]
     def emb_module(
         self,
     ) -> SSDTableBatchedEmbeddingBags:
@@ -3241,6 +3369,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
         emb_tables, _, _, _ = self.split_embedding_weights(no_snapshot=no_snapshot)
         emb_table_config_copy = copy.deepcopy(self._config.embedding_tables)
         for emb_table in emb_table_config_copy:
+            # pyrefly: ignore [missing-attribute]
             emb_table.local_metadata.placement._device = torch.device("cpu")
         ret = get_state_dict(
             emb_table_config_copy,
@@ -3262,10 +3391,13 @@ class ZeroCollisionKeyValueEmbeddingBag(
         ):
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
+            # pyrefly: ignore [bad-argument-type]
             param = nn.Parameter(tensor)
+            # pyrefly: ignore [missing-attribute]
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
+    # pyrefly: ignore [bad-override]
     def named_split_embedding_weights(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, Union[PartiallyMaterializedTensor, torch.Tensor]]]:
@@ -3315,6 +3447,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
         )
         weight_id_sharded_t_list = create_virtual_sharded_tensors(
             emb_table_config_copy,
+            # pyrefly: ignore [bad-argument-type]
             weight_ids_list,
             self._pg,
             prefix,
@@ -3322,6 +3455,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
         )
         bucket_cnt_sharded_t_list = create_virtual_sharded_tensors(
             emb_table_config_copy,
+            # pyrefly: ignore [bad-argument-type]
             bucket_cnt_list,
             self._pg,
             prefix,
@@ -3338,6 +3472,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
                 self._table_name_to_weight_count_per_rank,
             )
 
+        # pyrefly: ignore [bad-argument-type]
         assert len(pmt_list) == len(weight_ids_list) == len(bucket_cnt_list)
         assert (
             len(pmt_sharded_t_list)
@@ -3374,11 +3509,16 @@ class ZeroCollisionKeyValueEmbeddingBag(
         optional ShardedTensor for metadata
         """
         self._init_sharded_split_embedding_weights()
+        # pyrefly: ignore [unsupported-operation]
         self._optim.set_sharded_embedding_weight_ids(self._split_weights_res[1])
 
+        # pyrefly: ignore [unsupported-operation]
         pmt_sharded_t_list = self._split_weights_res[0]
+        # pyrefly: ignore [unsupported-operation]
         weight_id_sharded_t_list = self._split_weights_res[1]
+        # pyrefly: ignore [unsupported-operation]
         bucket_cnt_sharded_t_list = self._split_weights_res[2]
+        # pyrefly: ignore [unsupported-operation]
         metadata_sharded_t_list = self._split_weights_res[3]
         for table_idx, pmt_sharded_t in enumerate(pmt_sharded_t_list):
             table_config = self._config.embedding_tables[table_idx]
@@ -3411,6 +3551,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
         """
         self.emb_module.create_rocksdb_hard_link_snapshot()
 
+    # pyrefly: ignore [bad-override]
     def split_embedding_weights(
         self, no_snapshot: bool = True, should_flush: bool = False
     ) -> Tuple[
@@ -3510,6 +3651,7 @@ class BatchedFusedEmbeddingBag(
         self.init_parameters()
 
     @property
+    # pyrefly: ignore [bad-override]
     def _param_per_table(self) -> Dict[str, TableBatchedEmbeddingSlice]:
         return dict(
             _gen_named_parameters_by_table_fused(
@@ -3553,6 +3695,7 @@ class BatchedFusedEmbeddingBag(
             # hack before we support optimizer on sharded parameter level
             # can delete after PEA deprecation
             param = nn.Parameter(tensor)
+            # pyrefly: ignore [missing-attribute]
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
@@ -3631,6 +3774,7 @@ class TritonBatchedFusedEmbeddingBag(
         self.init_parameters()
 
     @property
+    # pyrefly: ignore [bad-override]
     def _param_per_table(self) -> Dict[str, TableBatchedEmbeddingSlice]:
         # For Triton TBE, combine multiple shards of the same table (e.g. CW)
         # into a single TableBatchedEmbeddingSlice to match fused TBE behavior.
@@ -3648,11 +3792,14 @@ class TritonBatchedFusedEmbeddingBag(
             dim = config.local_cols
             weight = TableBatchedEmbeddingSlice(
                 data=self._emb_module.weight,
+                # pyrefly: ignore [bad-argument-type]
                 start_offset=offset,
+                # pyrefly: ignore [bad-argument-type]
                 end_offset=offset + table_count * rows * dim,
                 num_embeddings=-1,
                 embedding_dim=dim,
             )
+            # pyrefly: ignore [missing-attribute]
             weight._in_backward_optimizers = [
                 TritonEmbeddingFusedOptimizer(
                     config=self._config,
@@ -3672,6 +3819,7 @@ class TritonBatchedFusedEmbeddingBag(
         self.__dict__["_param_per_table"] = v
 
     @property
+    # pyrefly: ignore [bad-override]
     def emb_module(
         self,
     ) -> "TritonTableBatchedEmbeddingBags":
@@ -3708,6 +3856,7 @@ class TritonBatchedFusedEmbeddingBag(
             prefix, recurse, remove_duplicate
         ):
             param = nn.Parameter(tensor)
+            # pyrefly: ignore [missing-attribute]
             param._in_backward_optimizers = [EmptyFusedOptimizer()]
             yield name, param
 
@@ -3939,9 +4088,11 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                 optimizer_state_values
             )
             table_to_shard_params[table_config.name].local_metadata.append(
+                # pyrefly: ignore [bad-argument-type]
                 local_metadata
             )
             table_to_shard_params[table_config.name].dtensor_metadata.append(
+                # pyrefly: ignore [bad-argument-type]
                 table_config.dtensor_metadata
             )
             table_to_shard_params[table_config.name].embedding_weights.append(weight)
@@ -4007,6 +4158,7 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                     assert momentum_idx > 0
                     momentum_local_shards: List[Shard] = []
 
+                    # pyrefly: ignore [unsupported-operation]
                     optim_state = shard_params.optimizer_states[0][momentum_idx - 1]
                     if optim_state.nelement() == 1 and state_key != "momentum1":
                         # single value state: one value per table
@@ -4014,6 +4166,7 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                             table_shard_metadata_to_optimizer_shard_metadata,
                             optimizer_sharded_tensor_metadata,
                         ) = get_optimizer_single_value_shard_metadata_and_global_metadata(
+                            # pyrefly: ignore [bad-argument-type]
                             table_config.global_metadata,
                             optim_state,
                         )
@@ -4023,6 +4176,7 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                             table_shard_metadata_to_optimizer_shard_metadata,
                             optimizer_sharded_tensor_metadata,
                         ) = get_optimizer_rowwise_shard_metadata_and_global_metadata(
+                            # pyrefly: ignore [bad-argument-type]
                             table_config.global_metadata,
                             optim_state,
                             sharding_dim,
@@ -4033,6 +4187,7 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                             table_shard_metadata_to_optimizer_shard_metadata,
                             optimizer_sharded_tensor_metadata,
                         ) = get_optimizer_pointwise_shard_metadata_and_global_metadata(
+                            # pyrefly: ignore [bad-argument-type]
                             table_config.global_metadata,
                             optim_state,
                         )
@@ -4047,6 +4202,7 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                         )
                         momentum_local_shards.append(
                             Shard(
+                                # pyrefly: ignore [unsupported-operation]
                                 optimizer_state[momentum_idx - 1],
                                 local_optimizer_shard_metadata,
                             )
@@ -4059,6 +4215,7 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                             stride = (1,)
                             placements = (
                                 (Replicate(), DTensorShard(0))
+                                # pyrefly: ignore [missing-attribute]
                                 if table_config.dtensor_metadata.mesh.ndim == 2
                                 else (DTensorShard(0),)
                             )
@@ -4069,6 +4226,7 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                         return DTensor.from_local(
                             local_tensor=LocalShardsWrapper(
                                 local_shards=[x.tensor for x in momentum_local_shards],
+                                # pyrefly: ignore [bad-argument-type]
                                 local_offsets=[
                                     x.metadata.shard_offsets
                                     for x in momentum_local_shards
@@ -4089,6 +4247,7 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
                         )
 
                 num_states: int = min(
+                    # pyrefly: ignore [bad-argument-type]
                     [len(opt_state) for opt_state in shard_params.optimizer_states]
                 )
                 optimizer_state_keys = []
@@ -4111,10 +4270,12 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
 
     def zero_grad(self, set_to_none: bool = False) -> None:
         # Learning rate is updated directly on the module
+        # pyrefly: ignore [bad-index]
         self._emb_module.learning_rate = self.param_groups[0]["lr"]
 
     def step(self, closure: Any = None) -> None:
         # Learning rate is updated directly on the module
+        # pyrefly: ignore [bad-index]
         self._emb_module.learning_rate = self.param_groups[0]["lr"]
 
 
@@ -4147,8 +4308,11 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
 
         self.weights_sharded = False
         self._input_tensor = None
+        # pyrefly: ignore [not-callable]
         self._element_size = self._emb_module.weights_dev.element_size()
+        # pyrefly: ignore [bad-assignment]
         self._original_shape: torch.Size = self._emb_module.weights_dev.shape
+        # pyrefly: ignore [bad-assignment]
         self._unsharded_param: torch.Tensor = self._emb_module.weights_dev
         self._shard_buf_nbytes: int = 0
         self._shard_buf: Optional[torch.Tensor] = None
@@ -4161,6 +4325,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
 
         self.register_full_backward_pre_hook(
+            # pyrefly: ignore [bad-argument-type]
             self._hybird_sharded_backward_hook,
         )
 
@@ -4178,6 +4343,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             return
         self.ensure_reduce_scatter_complete()
 
+        # pyrefly: ignore [missing-attribute]
         shard_size = self._shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
 
@@ -4196,6 +4362,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
                 dtype=self._unsharded_param.dtype,
                 device=self._unsharded_param.device,
             )
+            # pyrefly: ignore [no-matching-overload]
             output_tensor.set_(
                 self._unsharded_param.untyped_storage(),
                 0,  # storage_offset
@@ -4212,6 +4379,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self._emb_module.weights_dev = self._unsharded_param[
             : self._original_shape.numel()
         ]
+        # pyrefly: ignore [missing-attribute]
         self._shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
@@ -4241,6 +4409,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             self._rs_awaitable.wait()
             self._rs_awaitable = None
 
+    # pyrefly: ignore [bad-override]
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         embs = super().forward(features)
         self._async_stream.wait_stream(torch.cuda.current_stream())
@@ -4262,6 +4431,7 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         with torch.no_grad():
             self.weights_sharded = True
 
+            # pyrefly: ignore [not-callable]
             total_size = self._emb_module.weights_dev.numel()
 
             num_groups = self._env.num_sharding_groups()
@@ -4269,16 +4439,19 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             padded_total_size = shard_size * num_groups
             padding_size = padded_total_size - total_size
 
+            # pyrefly: ignore [not-callable]
             self._input_tensor = self._emb_module.weights_dev.contiguous()
             if padding_size > 0:
                 # ideally, we want to avoid padding as this has will cause a short 2x emb memory spike
                 self._input_tensor = torch.nn.functional.pad(
+                    # pyrefly: ignore [not-callable]
                     self._emb_module.weights_dev.contiguous(),
                     (0, padding_size),
                     value=0.0,
                 )
 
             if self._shard_buf is None:
+                # pyrefly: ignore [no-matching-overload]
                 self._shard_buf = torch.empty(
                     shard_size,
                     dtype=self._emb_module.weights_dev.dtype,
@@ -4301,9 +4474,12 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             self._async_event.record(self._async_stream)
 
             def resize_callback() -> None:
+                # pyrefly: ignore [not-callable]
                 self._emb_module.weights_dev.untyped_storage().resize_(0)
+                # pyrefly: ignore [bad-argument-type]
                 self._emb_module.weights_dev = self._shard_buf
                 # padding tensor we resize to 0 and set pointer to None
+                # pyrefly: ignore [missing-attribute]
                 self._input_tensor.untyped_storage().resize_(0)
                 self._input_tensor = None
 

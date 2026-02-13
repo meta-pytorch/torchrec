@@ -113,5 +113,6 @@ class MAEMetricComputation(RecMetricComputation):
 
 
 class MAEMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.MAE
     _computation_class: Type[RecMetricComputation] = MAEMetricComputation

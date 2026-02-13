@@ -28,6 +28,7 @@ T = TypeVar("T")
 
 
 try:
+    # pyrefly: ignore[missing-import]
     import torch_package_importer  # @manual
 except ImportError:
     pass
@@ -65,7 +66,11 @@ class PredictFactoryPackager:
         extra_files: Dict[str, Union[str, bytes]],
         loader_code: str = LOADER_CODE,
         package_importer: Union[
-            torch.package.Importer, List[torch.package.Importer]
+            # pyrefly: ignore[implicit-import]
+            torch.package.Importer,
+            # pyrefly: ignore[implicit-import]
+            List[torch.package.Importer],
+            # pyrefly: ignore[implicit-import]
         ] = torch.package.sys_importer,
     ) -> None:
         with PackageExporter(output, importer=package_importer) as pe:

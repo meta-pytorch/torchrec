@@ -100,6 +100,7 @@ class LocalShardsWrapper(torch.Tensor):
 
     # necessary for ops dispatching from this subclass to its local shards
     @classmethod
+    # pyrefly: ignore[bad-param-name-override]
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
 
@@ -266,6 +267,7 @@ class LocalShardsWrapper(torch.Tensor):
     def is_pinned(self) -> bool:  # type: ignore[override]
         return self._storage_meta.properties.pin_memory
 
+    # pyrefly: ignore[bad-param-name-override]
     def requires_grad_(self, requires_grad: bool = True) -> "LocalShardsWrapper":
         self._storage_meta.properties.requires_grad = requires_grad
         [shard.requires_grad_(requires_grad) for shard in self._local_shards]
@@ -382,6 +384,7 @@ class LocalShardsWrapper(torch.Tensor):
     def __hash__(self):
         return id(self)
 
+    # pyrefly: ignore[bad-override]
     def __repr__(self):
         return f"LocalShardsWrapper:{self._local_shards} {self._storage_meta}"
 

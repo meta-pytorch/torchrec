@@ -114,10 +114,12 @@ class ScalarLogger(torch.nn.Module):
         # We only need to report metrics from rank0 (start_bucket = 0)
 
         return (
+            # pyrefly: ignore[bad-return]
             self._start_bucket == 0
             and self._total_cnt > 0
             and
             #  Module]` is not a function.
+            # pyrefly: ignore[unsupported-operation]
             self._scalar_logger_steps % self._frequency == 0
         )
 
@@ -241,4 +243,5 @@ class ScalarLogger(torch.nn.Module):
             self._opt_in_cnt = 0
             self._sum_eviction_age = 0.0
 
+        # pyrefly: ignore [bad-argument-type, unsupported-operation]
         self._scalar_logger_steps += 1

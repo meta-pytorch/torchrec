@@ -140,6 +140,7 @@ class PipelinedPostproc(torch.nn.Module):
             f"## input_postproc {type(self.postproc_module)} {self._context.index} ##"
         ):
             # should be no-op as we call this in dist stream
+            # pyrefly: ignore[bad-argument-type]
             with self._stream_context(self._dist_stream):
                 res = self._postproc_module(*args, **kwargs)
 
@@ -165,6 +166,7 @@ class PipelinedPostproc(torch.nn.Module):
                         "into NaNs or CUDA Illegal Memory issues during training!"
                     )
 
+            # pyrefly: ignore[bad-argument-type]
             with self._stream_context(self._default_stream):
                 # Cache results, only during _start_data_dist
                 self._context.postproc_fwd_results[self._fqn] = res
@@ -216,6 +218,7 @@ class PipelinedPostproc(torch.nn.Module):
             prefix, recurse, remove_duplicate
         )
 
+    # pyrefly: ignore[bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -225,12 +228,14 @@ class PipelinedPostproc(torch.nn.Module):
         # super().state_dict(destination, prefix, keep_vars)
         if destination is None:
             destination = OrderedDict()
+            # pyrefly: ignore[missing-attribute]
             destination._metadata = OrderedDict()
         self._postproc_module.state_dict(
             destination=destination, prefix=prefix, keep_vars=keep_vars
         )
         return destination
 
+    # pyrefly: ignore[bad-override]
     def load_state_dict(
         self,
         state_dict: OrderedDict[str, torch.Tensor],

@@ -138,6 +138,7 @@ class KJTList(Multistreamable):
 
     @torch.jit._drop
     #  inconsistently.
+    # pyrefly: ignore[bad-override]
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         for feature in self.features:
             feature.record_stream(stream)
@@ -163,6 +164,7 @@ class InputDistOutputs(Multistreamable):
 
     def record_stream(self, stream: torch.Stream) -> None:
         for feature in self.features:
+            # pyrefly: ignore[bad-argument-type]
             feature.record_stream(stream)
         if self.unbucketize_permute_tensor is not None:
             self.unbucketize_permute_tensor.record_stream(stream)
@@ -192,6 +194,7 @@ class ListOfKJTList(Multistreamable):
     @torch.jit._drop
     def record_stream(self, stream: torch.Stream) -> None:
         for feature in self.features_list:
+            # pyrefly: ignore[bad-argument-type]
             feature.record_stream(stream)
 
     @torch.jit._drop
@@ -382,6 +385,7 @@ class ShardedEmbeddingModule(
     def __init__(
         self, qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None
     ) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__(qcomm_codecs_registry)
 
         self._input_dists: List[nn.Module] = []
@@ -413,6 +417,7 @@ class ShardedEmbeddingModule(
         for feature, emb_lookup in zip(dist_input, self._lookups):
             while isinstance(emb_lookup, DistributedDataParallel):
                 emb_lookup = emb_lookup.module
+            # pyrefly: ignore[not-callable]
             emb_lookup.prefetch(sparse_features=feature, forward_stream=forward_stream)
 
     def extra_repr(self) -> str:

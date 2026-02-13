@@ -43,6 +43,7 @@ def _sort_devices_by_perf(
 ) -> List[List[DeviceHardware]]:
     def _get_perf_sum(device_list: List[DeviceHardware]) -> float:
         perf = 0
+        # pyrefly: ignore[bad-assignment]
         for device in device_list:
             perf += device.perf.total
         return perf

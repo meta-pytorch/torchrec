@@ -35,6 +35,7 @@ class RecalibratedNEMetricMetricTest(unittest.TestCase):
             my_rank=0,
             batch_size=BATCH_SIZE,
             tasks=[DefaultTaskInfo],
+            # pyrefly: ignore[bad-argument-type]
             recalibration_coefficient=0.1,
         )
 

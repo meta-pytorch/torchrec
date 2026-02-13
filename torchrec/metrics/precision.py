@@ -139,5 +139,6 @@ class PrecisionMetricComputation(RecMetricComputation):
 
 
 class PrecisionMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.PRECISION
     _computation_class: Type[RecMetricComputation] = PrecisionMetricComputation

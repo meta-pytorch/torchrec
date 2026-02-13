@@ -89,6 +89,7 @@ def initialize_and_test_parameters(
         model = DistributedModelParallel(
             module=embedding_tables,
             plan=ShardingPlan({"": module_sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=sharders,
             device=ctx.device,

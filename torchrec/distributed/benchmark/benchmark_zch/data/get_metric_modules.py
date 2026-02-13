@@ -57,6 +57,7 @@ def get_metric_modules(
                 window_size=sys.maxsize,
                 compute_on_all_ranks=True,
             ).to(device)
+            # pyrefly: ignore[unsupported-operation]
             metric_modules["mse"] = MSEMetricComputation(
                 my_rank=rank,
                 batch_size=(
@@ -69,6 +70,7 @@ def get_metric_modules(
                 compute_on_all_ranks=True,
             ).to(device)
         elif task_type == "classification":
+            # pyrefly: ignore[unsupported-operation]
             metric_modules["ne"] = NEMetricComputation(
                 my_rank=rank,
                 batch_size=(
@@ -80,6 +82,7 @@ def get_metric_modules(
                 window_size=sys.maxsize,
                 compute_on_all_ranks=True,
             ).to(device)
+            # pyrefly: ignore[unsupported-operation]
             metric_modules["auc"] = AUCMetricComputation(
                 my_rank=rank,
                 batch_size=(
@@ -93,4 +96,5 @@ def get_metric_modules(
             ).to(device)
         else:
             raise ValueError(f"Unknown task_type: {task_type}")
+    # pyrefly: ignore[bad-return]
     return metric_modules

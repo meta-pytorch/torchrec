@@ -272,6 +272,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         Returns:
             future: Pre-created future where the computed metrics will be set.
         """
+        # pyrefly: ignore[implicit-import]
         metrics_future = concurrent.futures.Future()
         if self._shutdown_event.is_set():
             metrics_future.set_exception(
@@ -496,6 +497,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         logger.info("CPUOffloadedRecMetricModule synced.")
 
     @override
+    # pyrefly: ignore[bad-override]
     def state_dict(
         self,
         *args: Any,
@@ -510,6 +512,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         Args are identical to torch.nn.Module.state_dict().
         """
+        # pyrefly: ignore[no-matching-overload]
         return self.comms_module.state_dict(
             *args, destination=destination, prefix=prefix, keep_vars=keep_vars
         )

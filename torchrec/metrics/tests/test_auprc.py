@@ -279,8 +279,11 @@ class GroupedAUPRCValueTest(unittest.TestCase):
                 weight_name="weight",
             )
             task_list.append(task_info)
+            # pyrefly: ignore[unsupported-operation]
             inputs["predictions"][task_info.name] = predictions[i]
+            # pyrefly: ignore[unsupported-operation]
             inputs["labels"][task_info.name] = labels[i]
+            # pyrefly: ignore[unsupported-operation]
             inputs["weights"][task_info.name] = weights[i]
 
         auprc = AUPRCMetric(
@@ -288,6 +291,7 @@ class GroupedAUPRCValueTest(unittest.TestCase):
             my_rank=0,
             batch_size=batch_size,
             tasks=task_list,
+            # pyrefly: ignore[bad-argument-type]
             grouped_auprc=True,
         )
         auprc.update(**inputs)
@@ -340,6 +344,7 @@ class GroupedAUPRCValueTest(unittest.TestCase):
                     weight_name="weight",
                 )
             ],
+            # pyrefly: ignore[bad-argument-type]
             grouped_auprc=True,
         )
 

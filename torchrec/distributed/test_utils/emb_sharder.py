@@ -150,6 +150,7 @@ class TestEBCSharderMCH(
         return ShardedManagedCollisionEmbeddingBagCollection(
             module,
             params,
+            # pyrefly: ignore[bad-argument-type]
             ebc_sharder=self._e_sharder,
             mc_sharder=self._mc_sharder,
             env=env,

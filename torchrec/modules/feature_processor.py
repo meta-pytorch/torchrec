@@ -314,6 +314,7 @@ class PositionWeightedProcessor(BaseGroupedFeatureProcessor):
     ) -> Iterator[Tuple[str, torch.Tensor]]:
         yield from ()
 
+    # pyrefly: ignore[bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -322,6 +323,7 @@ class PositionWeightedProcessor(BaseGroupedFeatureProcessor):
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
+            # pyrefly: ignore[missing-attribute]
             destination._metadata = OrderedDict()
         for name, param in self.position_weights.items():
             destination[prefix + f"position_weights.{name}"] = (

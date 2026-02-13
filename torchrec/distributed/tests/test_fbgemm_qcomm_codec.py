@@ -75,6 +75,7 @@ class QuantizationCommCodecTest(unittest.TestCase):
         )
         ctx = quant_codec.forward.create_context()
         if comm_precision == CommType.INT8:
+            # pyrefly: ignore[missing-attribute]
             assume(row_size * col_size % ctx.row_dim == 0)
             input_tensor = input_tensor.view(-1)
 
@@ -123,6 +124,7 @@ class QuantizationCommCodecTest(unittest.TestCase):
         quant_codec.forward.padded_size(input_tensor, dim_sum_per_rank, rank, ctx)
         quant_tensor = quant_codec.forward.encode(input_tensor, ctx)
         output_tensor = quant_codec.forward.decode(quant_tensor, ctx)
+        # pyrefly: ignore[missing-attribute]
         output_tensor = output_tensor.view(shape[0], ctx.padded_dim_sum_per_rank[rank])
         output_tensor = output_tensor[:, : shape[1]]
 

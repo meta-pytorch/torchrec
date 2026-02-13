@@ -36,6 +36,7 @@ from torchrec.distributed.types import ModuleSharder, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
+# pyrefly: ignore[inconsistent-inheritance]
 class TWvsRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.ROW_WISE.value, ShardingType.TABLE_WISE.value]
@@ -65,6 +66,7 @@ class TestEmbeddingStats(unittest.TestCase):
 
     def test_embedding_stats_runs(self) -> None:
         planner = EmbeddingShardingPlanner(topology=self.topology)
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         _ = planner.plan(module=self.model, sharders=[TWvsRWSharder()])
         self.assertEqual(len(planner._stats), 1)
         stats_data = planner._stats[0]
@@ -75,6 +77,7 @@ class TestEmbeddingStats(unittest.TestCase):
 
     def test_empty_embedding_stats_runs(self) -> None:
         planner = EmbeddingShardingPlanner(topology=self.topology, stats=[])
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         _ = planner.plan(module=self.model, sharders=[TWvsRWSharder()])
         self.assertEqual(len(planner._stats), 0)
 
@@ -82,11 +85,13 @@ class TestEmbeddingStats(unittest.TestCase):
         planner = EmbeddingShardingPlanner(
             topology=self.topology, stats=NoopEmbeddingStats()
         )
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         _ = planner.plan(module=self.model, sharders=[TWvsRWSharder()])
         self.assertEqual(len(planner._stats), 1)
 
     def test_embedding_stats_output_with_top_hbm_usage(self) -> None:
         planner = EmbeddingShardingPlanner(topology=self.topology)
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         _ = planner.plan(module=self.model, sharders=[TWvsRWSharder()])
         self.assertEqual(len(planner._stats), 1)
         stats_data = planner._stats[0]

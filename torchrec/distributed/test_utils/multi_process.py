@@ -208,6 +208,7 @@ class MultiProcessTestBase(unittest.TestCase):
             kwargs["rank"] = rank
             kwargs["world_size"] = world_size
             kwargs.update(kwargs_per_rank[rank])
+            # pyrefly: ignore[missing-attribute]
             p = ctx.Process(
                 target=callable,
                 kwargs=kwargs,
@@ -230,6 +231,7 @@ def _wrapper_func_for_multiprocessing(args):
 
 def run_multi_process_func(
     func: Callable[
+        # pyrefly: ignore[invalid-argument]
         [int, int, ...],  # rank, world_size, ...
         Any,  # Changed from None to Any to allow return values
     ],

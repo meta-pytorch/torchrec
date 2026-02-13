@@ -817,5 +817,6 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     and delta_result[table_fqn].states is not None
                 ):
                     self.assertTrue(
+                        # pyrefly: ignore[missing-attribute]
                         delta_result[table_fqn].states.allclose(delta_rows.states)
                     )

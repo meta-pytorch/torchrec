@@ -84,4 +84,5 @@ def experimental(
             _issue_warning()
             return obj(*args, **kwargs)
 
+        # pyrefly: ignore[bad-return]
         return wrapper

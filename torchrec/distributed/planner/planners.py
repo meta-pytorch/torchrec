@@ -133,6 +133,7 @@ def to_sharding_plan(
             key_value_params=sharding_option.key_value_params,
         )
         plan[sharding_option.path] = module_plan
+    # pyrefly: ignore[bad-argument-type]
     return ShardingPlan(plan)
 
 
@@ -152,6 +153,7 @@ def validate_rank_assignment(sharding_plan: ShardingPlan, topology: Topology) ->
         PlannerError: If any shard has an invalid rank assignment or if a sharding spec is missing.
     """
     for module_name, module_plan in sharding_plan.plan.items():
+        # pyrefly: ignore[missing-attribute]
         for param_name, param_plan in module_plan.items():
             if param_plan.sharding_spec is not None:
                 for shard in param_plan.sharding_spec.shards:
@@ -356,6 +358,7 @@ class EmbeddingPlannerBase(ShardingPlanner):
         if sharders is None:
             sharders = get_default_sharders()
         return invoke_on_rank_and_broadcast_result(
+            # pyrefly: ignore[bad-argument-type]
             pg,
             0,
             self.plan,
@@ -509,6 +512,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         if sharders is None:
             sharders = get_default_sharders()
         return invoke_on_rank_and_broadcast_result(
+            # pyrefly: ignore[bad-argument-type]
             pg,
             0,
             self.plan,
@@ -517,6 +521,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         )
 
     @_torchrec_method_logger()
+    # pyrefly: ignore[bad-param-name-override]
     def plan(
         self,
         module: nn.Module,
@@ -592,6 +597,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         # Loaded plan is validated successfully and can be used for generate the sharding plan, skipping new plan generation.
         if loaded_best_plan:
             logger.info(
+                # pyrefly: ignore[missing-attribute]
                 f"Loded sharding options from Storage with plan id: {self.plan_loader.get_plan_id()} skipping new plan generation"
             )
             best_plan = copy.deepcopy(loaded_best_plan)
@@ -722,6 +728,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     f"\n\t  Per rank reservation for kjt storage: {storage_repr_in_gb(self._storage_reservation._kjt_storage)}, "
                 )
                 if isinstance(self._storage_reservation, HeuristicalStorageReservation)
+                # pyrefly: ignore[missing-attribute]
                 else f"\n\t  Storage reservation percentage: {self._storage_reservation._percentage}, "
             )
             no_plan_solution = (
@@ -792,6 +799,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             PlannerError: If hashes don't match
         """
         if loaded_plan_hash is not None and current_planner_hash != loaded_plan_hash:
+            # pyrefly: ignore[missing-attribute]
             plan_id = self.plan_loader.get_plan_id() if self.plan_loader else None
             error_msg = (
                 f"Planner input context mismatch detected for {plan_id} and current planner set up:"
@@ -871,6 +879,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
         )
 
         if proposers:
+            # pyrefly: ignore[bad-assignment]
             self._proposers: Dict[str, List[Proposer]] = proposers
         else:
             self._proposers = {
@@ -895,6 +904,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
         self._stats: Dict[str, List[Stats]] = {}
 
         if stats is not None:
+            # pyrefly: ignore[bad-assignment]
             self._stats = stats
         else:
             self._stats = {
@@ -930,6 +940,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
         if sharders is None:
             sharders = get_default_sharders()
         return invoke_on_rank_and_broadcast_result(
+            # pyrefly: ignore[bad-argument-type]
             pg,
             0,
             self.plan,
@@ -970,6 +981,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
             search_space = [
                 s_o
                 for s_o in search_space
+                # pyrefly: ignore[unsupported-operation]
                 if self._constraints[s_o.name].device_group == group
             ]
 
@@ -1087,13 +1099,17 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                 )
                 storage_reservation_solution = (
                     (
+                        # pyrefly: ignore[missing-attribute]
                         f"\n\t  Storage reservation percentage: {self._storage_reservations[group]._percentage}, "
+                        # pyrefly: ignore[missing-attribute]
                         f"\n\t  Per rank reservation for dense storage: {storage_repr_in_gb(self._storage_reservations[group]._dense_storage)}, "
+                        # pyrefly: ignore[missing-attribute]
                         f"\n\t  Per rank reservation for kjt storage: {storage_repr_in_gb(self._storage_reservations[group]._kjt_storage)}, "
                     )
                     if isinstance(
                         self._storage_reservations[group], HeuristicalStorageReservation
                     )
+                    # pyrefly: ignore[missing-attribute]
                     else f"\n\t  Storage reservation percentage: {self._storage_reservations[group]._percentage}, "
                 )
                 no_plan_solution = (

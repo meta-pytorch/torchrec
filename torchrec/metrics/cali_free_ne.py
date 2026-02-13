@@ -222,5 +222,6 @@ class CaliFreeNEMetricComputation(RecMetricComputation):
 
 
 class CaliFreeNEMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.CALI_FREE_NE
     _computation_class: Type[RecMetricComputation] = CaliFreeNEMetricComputation

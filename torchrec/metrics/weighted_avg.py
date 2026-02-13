@@ -82,5 +82,6 @@ class WeightedAvgMetricComputation(RecMetricComputation):
 
 
 class WeightedAvgMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.WEIGHTED_AVG
     _computation_class: Type[RecMetricComputation] = WeightedAvgMetricComputation

@@ -69,6 +69,7 @@ class SemisyncOptimizer(KeyedOptimizer):
         # Determine parameters for global optimizer
         global_params_list = list(global_params)
         self._worker_model_params: list[torch.Tensor] = (
+            # pyrefly: ignore[bad-index]
             [param for pgroup in global_params_list for param in pgroup["params"]]
             if isinstance(global_params_list[0], dict)
             else global_params_list
@@ -104,6 +105,7 @@ class SemisyncOptimizer(KeyedOptimizer):
         )
 
     @property
+    # pyrefly: ignore[bad-override]
     def param_groups(self) -> Collection[Mapping[str, Any]]:
         """
         Combine param_groups from both local and global optimizers.
@@ -115,6 +117,7 @@ class SemisyncOptimizer(KeyedOptimizer):
         ]
 
     @property
+    # pyrefly: ignore[bad-override]
     def params(self) -> Mapping[str, Union[torch.Tensor, ShardedTensor]]:
         """
         Combine params from both local and global optimizers.
@@ -138,6 +141,7 @@ class SemisyncOptimizer(KeyedOptimizer):
         return ret
 
     @property
+    # pyrefly: ignore[bad-override]
     def state(self) -> Mapping[torch.Tensor, Any]:
         """
         Combine state from both local and global optimizers.
@@ -176,6 +180,7 @@ class SemisyncOptimizer(KeyedOptimizer):
         return ret
 
     @torch.no_grad()
+    # pyrefly: ignore[bad-override]
     def step(self, closure: Any = None) -> None:
         """
         Perform semi-sync optimization step:
@@ -204,6 +209,7 @@ class SemisyncOptimizer(KeyedOptimizer):
             self._global_optimizer.zero_grad()
 
             # Step 1: perform global optimizer step
+            # pyrefly: ignore[missing-attribute]
             self._global_optimizer._optimizer.global_step(
                 self._local_step_counter, closure
             )
@@ -254,7 +260,9 @@ class SemisyncOptimizer(KeyedOptimizer):
             (self._global_optimizer, global_state, "global"),
         ]:
             if state:
+                # pyrefly: ignore[missing-attribute]
                 opt.state.clear()
+                # pyrefly: ignore[missing-attribute]
                 opt.state.update(state)
                 logger.info(
                     f"SemisyncOptimizer: Set state on {name} optimizer for {len(state)} parameters"

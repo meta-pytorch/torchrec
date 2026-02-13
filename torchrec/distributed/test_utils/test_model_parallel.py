@@ -177,6 +177,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
                 pod_size=pod_size,
                 world_size_2D=world_size_2D,
                 node_group_size=node_group_size,
+                # pyrefly: ignore[bad-argument-type]
                 model_class=model_class,
                 tables=self.tables if pooling == PoolingType.SUM else self.mean_tables,
                 weighted_tables=self.weighted_tables if has_weighted_tables else None,
@@ -262,6 +263,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
         indices_dtype: torch.dtype = torch.int64,
         offsets_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
+        # pyrefly: ignore[bad-function-definition]
         sharding_type: ShardingType = None,
         random_seed: int = 0,
         skip_passing_resharding_fqn: bool = False,
@@ -327,6 +329,7 @@ class ModelParallelBase(ModelParallelTestShared):
         if cls.backend not in ("nccl", "gloo"):
             raise unittest.SkipTest(f"No valid backend specified: {cls.backend}")
 
+    # pyrefly: ignore[bad-override]
     def setUp(self) -> None:
         super().setUp(backend=self.backend)
 
@@ -438,6 +441,7 @@ class ModelParallelBase(ModelParallelTestShared):
     ) -> None:
         sharding_type = ShardingType.DATA_PARALLEL.value
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(sharder_type, sharding_type, kernel_type),
             ],
@@ -505,6 +509,7 @@ class ModelParallelBase(ModelParallelTestShared):
             or not variable_batch_size
         )
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     sharder_type,
@@ -583,6 +588,7 @@ class ModelParallelBase(ModelParallelTestShared):
             or not variable_batch_size
         )
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     sharder_type,
@@ -661,6 +667,7 @@ class ModelParallelBase(ModelParallelTestShared):
             or not variable_batch_size
         )
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     sharder_type,
@@ -741,6 +748,7 @@ class ModelParallelBase(ModelParallelTestShared):
             or not variable_batch_size
         )
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     sharder_type,
@@ -793,6 +801,7 @@ class ModelParallelBase(ModelParallelTestShared):
             else EmbeddingComputeKernel.FUSED.value
         )
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     sharder_type=SharderType.EMBEDDING_BAG_COLLECTION.value,
@@ -851,6 +860,7 @@ class ModelParallelBase(ModelParallelTestShared):
         mock_jk.return_value = is_jk_enabled
 
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[EmbeddingBagCollectionSharder(fused_params=fused_params)],
             backend=self.backend,
             constraints=constraints,
@@ -905,6 +915,7 @@ class ModelParallelBase(ModelParallelTestShared):
         pooling: PoolingType,
     ) -> None:
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     sharder_type,
@@ -994,6 +1005,7 @@ class ModelParallelBase(ModelParallelTestShared):
         pooling: PoolingType,
     ) -> None:
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     sharder_type,

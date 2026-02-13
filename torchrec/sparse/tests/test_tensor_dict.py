@@ -55,12 +55,14 @@ class TestTensorDict(unittest.TestCase):
                 lengths=torch.tensor([1, 2], device=device),
             ),
         }
+        # pyrefly: ignore[bad-specialization]
         td = TensorDict(
             data,  # type: ignore[arg-type]
             device=device,
             batch_size=[2],
         )
 
+        # pyrefly: ignore[bad-argument-type]
         features = maybe_td_to_kjt(td, ["f1", "f2", "f3"])
         torch.testing.assert_close(features.values(), values)
         torch.testing.assert_close(features.lengths(), lengths)

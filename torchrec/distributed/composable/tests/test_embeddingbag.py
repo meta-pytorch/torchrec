@@ -77,6 +77,7 @@ def _test_sharding(  # noqa C901
     is_data_parallel: bool = False,
     use_apply_optimizer_in_backward: bool = False,
 ) -> None:
+    # pyrefly: ignore[implicit-import]
     trec_dist.comm_ops.set_gradient_division(False)
 
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
@@ -122,6 +123,7 @@ def _test_sharding(  # noqa C901
                 {"lr": 4.0},
             )
         plan: ShardingPlan = planner.collective_plan(model, [sharder], ctx.pg)
+        # pyrefly: ignore[invalid-param-spec]
         sharded_model = shard(
             module=model,
             #  `Optional[ProcessGroup]`.
@@ -152,7 +154,9 @@ def _test_sharding(  # noqa C901
             unsharded_model_params = dict(unsharded_model.named_parameters())
 
             if not use_apply_optimizer_in_backward:
+                # pyrefly: ignore[unbound-name]
                 unsharded_model_optimizer.zero_grad()
+                # pyrefly: ignore[unbound-name]
                 sharded_model_optimizer.zero_grad()
 
             if is_data_parallel:
@@ -201,7 +205,9 @@ def _test_sharding(  # noqa C901
             # their model. output from sharded_pred is correctly on the correct device.
             # Compare predictions of sharded vs unsharded models.
             torch.testing.assert_close(
-                sharded_model_pred.cpu(), unsharded_model_pred.cpu()
+                sharded_model_pred.cpu(),
+                # pyrefly: ignore[unbound-name]
+                unsharded_model_pred.cpu(),
             )
 
             sharded_model_pred.sum().backward()
@@ -219,7 +225,9 @@ def _test_sharding(  # noqa C901
                     )
 
             if not use_apply_optimizer_in_backward:
+                # pyrefly: ignore[unbound-name]
                 unsharded_model_optimizer.step()
+                # pyrefly: ignore[unbound-name]
                 sharded_model_optimizer.step()
 
         # check nn.Module APIs look the same
@@ -333,9 +341,11 @@ class LookupOrderByShardTypeTest(unittest.TestCase):
             pg=None,
         )
 
+    # pyrefly: ignore[implicit-import]
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_lookups", lambda self: None
     )
+    # pyrefly: ignore[implicit-import]
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_output_dist", lambda self: None
     )
@@ -375,9 +385,11 @@ class LookupOrderByShardTypeTest(unittest.TestCase):
             ],
         )
 
+    # pyrefly: ignore[implicit-import]
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_lookups", lambda self: None
     )
+    # pyrefly: ignore[implicit-import]
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_output_dist", lambda self: None
     )
@@ -413,9 +425,11 @@ class LookupOrderByShardTypeTest(unittest.TestCase):
         self.assertIn(ShardingType.TABLE_WISE.value, sharded_ebc._sharding_types)
         self.assertIn(ShardingType.ROW_WISE.value, sharded_ebc._sharding_types)
 
+    # pyrefly: ignore[implicit-import]
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_lookups", lambda self: None
     )
+    # pyrefly: ignore[implicit-import]
     @unittest.mock.patch.object(
         ShardedEmbeddingBagCollection, "_create_output_dist", lambda self: None
     )

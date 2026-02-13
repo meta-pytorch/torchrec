@@ -53,8 +53,10 @@ def _flatten(iterable: Iterable[T]) -> Generator[T, None, None]:
             iterator = stack.pop()
         else:
             try:
+                # pyrefly: ignore[no-matching-overload]
                 new_iterator = iter(value)
             except TypeError:
+                # pyrefly: ignore[invalid-yield]
                 yield value
             else:
                 stack.append(iterator)
@@ -318,6 +320,7 @@ class KJTAllToAllTest(MultiProcessTestBase):
         pg = dist.group.WORLD
         lengths_a2a = KJTAllToAll(
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=pg,
             splits=splits,
         )
@@ -464,6 +467,7 @@ class PooledEmbeddingsAllToAllTest(MultiProcessTestBase):
 
         a2a = PooledEmbeddingsAllToAll(
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=pg,
             dim_sum_per_rank=dim_sum_per_rank,
             device=device,
@@ -490,6 +494,7 @@ class PooledEmbeddingsAllToAllTest(MultiProcessTestBase):
 
         torch.testing.assert_close(
             _input.cpu().detach().div_(world_size),
+            # pyrefly: ignore[missing-attribute]
             _input.grad.cpu().detach(),
             atol=atol,
             rtol=rtol,
@@ -606,6 +611,7 @@ class PooledEmbeddingsReduceScatterTest(MultiProcessTestBase):
 
         rs = PooledEmbeddingsReduceScatter(
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg,
             codecs=codecs,
         ).cuda(rank)
@@ -624,6 +630,7 @@ class PooledEmbeddingsReduceScatterTest(MultiProcessTestBase):
         )
         if qcomms_config is None:
             torch.testing.assert_close(
+                # pyrefly: ignore[missing-attribute]
                 input.grad.cpu().detach(),
                 torch.ones(input.size()).div_(world_size),
             )
@@ -725,6 +732,7 @@ class PooledEmbeddingsReduceScatterVTest(MultiProcessTestBase):
 
         rs = PooledEmbeddingsReduceScatter(
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg,
             codecs=codecs,
         ).cuda(rank)
@@ -743,6 +751,7 @@ class PooledEmbeddingsReduceScatterVTest(MultiProcessTestBase):
         )
         if qcomms_config is None:
             torch.testing.assert_close(
+                # pyrefly: ignore[missing-attribute]
                 input.grad.cpu().detach(),
                 torch.ones(input.size()).div_(world_size),
             )
@@ -839,6 +848,7 @@ class PooledEmbeddingsAllGatherTest(MultiProcessTestBase):
             actual_output.cpu().detach(), expected_output.cpu().detach()
         )
         torch.testing.assert_close(
+            # pyrefly: ignore[missing-attribute]
             input.grad.cpu().detach(),
             torch.ones(input.size()),
         )
@@ -856,6 +866,7 @@ class PooledEmbeddingsAllGatherTest(MultiProcessTestBase):
         input = input.cuda(rank)
         input.requires_grad = True
         #  `Optional[_distributed_c10d.ProcessGroup]`.
+        # pyrefly: ignore[bad-argument-type]
         ag = PooledEmbeddingsAllGather(pg).cuda(rank)
         actual_output = ag(input).wait()
         s = torch.sum(actual_output)
@@ -975,6 +986,7 @@ class SeqEmbeddingsAllToAllTest(MultiProcessTestBase):
 
         a2a = SequenceEmbeddingsAllToAll(
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=pg,
             features_per_rank=features_per_rank,
             device=device,
@@ -1015,6 +1027,7 @@ class SeqEmbeddingsAllToAllTest(MultiProcessTestBase):
         grad = _input.grad
         torch.testing.assert_close(
             _input.cpu().detach(),
+            # pyrefly: ignore[missing-attribute]
             grad.cpu().detach() * world_size,
         )
 
@@ -1079,7 +1092,9 @@ class SeqEmbeddingsAllToAllTest(MultiProcessTestBase):
             }
 
             lengths_after_a2a_per_rank = [
+                # pyrefly: ignore[bad-argument-type]
                 torch.tensor([3, 0, 2, 4, 3], dtype=int),
+                # pyrefly: ignore[bad-argument-type]
                 torch.tensor([4, 1, 2, 1, 0, 1, 2, 0, 5, 0], dtype=int),
             ]
 
@@ -1098,7 +1113,9 @@ class SeqEmbeddingsAllToAllTest(MultiProcessTestBase):
 
             lengths_before_a2a_per_rank = {0: [3, 4, 1, 2, 6, 0], 1: [4, 0, 2, 3, 1, 2]}
             lengths_after_a2a_per_rank = [
+                # pyrefly: ignore[bad-argument-type]
                 torch.tensor([[3, 4, 4, 0]], dtype=int),
+                # pyrefly: ignore[bad-argument-type]
                 torch.tensor([[1, 2, 2, 3], [6, 0, 1, 2]], dtype=int),
             ]
 
@@ -1172,6 +1189,7 @@ class VariableBatchPooledEmbeddingsAllToAllTest(MultiProcessTestBase):
 
         a2a = VariableBatchPooledEmbeddingsAllToAll(
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=pg,
             emb_dim_per_rank_per_feature=emb_dim_per_rank_per_feature,
             device=device,
@@ -1198,6 +1216,7 @@ class VariableBatchPooledEmbeddingsAllToAllTest(MultiProcessTestBase):
 
         torch.testing.assert_close(
             _input.cpu().detach().div_(world_size),
+            # pyrefly: ignore[missing-attribute]
             _input.grad.cpu().detach(),
             atol=atol,
             rtol=rtol,
@@ -1439,6 +1458,7 @@ class TestJaggedTensorAllToAll(MultiProcessTestBase):
             num_items_to_send=input_splits,
             num_items_to_receive=output_splits,
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=ctx.pg,
         )
 

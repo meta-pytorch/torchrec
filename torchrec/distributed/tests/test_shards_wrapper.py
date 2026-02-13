@@ -89,6 +89,7 @@ def all_gather_object(
         )
         for i in range(world_size):
             torch.testing.assert_close(
+                # pyrefly: ignore[missing-attribute]
                 output[i]._local_shards[0],
                 shards_wrapper[i]._local_shards[0],
             )
@@ -115,7 +116,9 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
         offsets = [(0, 0)]
 
         # shards wrapper for rank 0 and rank 1, offsets don't matter
+        # pyrefly: ignore[bad-argument-type]
         ls_0 = LocalShardsWrapper(local_shards=shards_0, local_offsets=offsets)
+        # pyrefly: ignore[bad-argument-type]
         ls_1 = LocalShardsWrapper(local_shards=shards_1, local_offsets=offsets)
 
         self._run_multi_process_test(
@@ -143,7 +146,9 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
         offsets = [(0, 0)]
 
         # shards wrapper for rank 0 and rank 1, offsets don't matter
+        # pyrefly: ignore[bad-argument-type]
         ls_0 = LocalShardsWrapper(local_shards=shards_0, local_offsets=offsets)
+        # pyrefly: ignore[bad-argument-type]
         ls_1 = LocalShardsWrapper(local_shards=shards_1, local_offsets=offsets)
 
         self._run_multi_process_test(
@@ -171,7 +176,9 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
         offsets = [(0, 0)]
 
         # shards wrapper for rank 0 and rank 1, offsets don't matter
+        # pyrefly: ignore[bad-argument-type]
         ls_0 = LocalShardsWrapper(local_shards=shards_0, local_offsets=offsets)
+        # pyrefly: ignore[bad-argument-type]
         ls_1 = LocalShardsWrapper(local_shards=shards_1, local_offsets=offsets)
 
         self._run_multi_process_test(

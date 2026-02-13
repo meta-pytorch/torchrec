@@ -59,10 +59,12 @@ class StableCombinedOptimizer(KeyedOptimizer):
         return ""
 
     @property
+    # pyrefly: ignore[bad-override]
     def param_groups(self) -> Collection[Mapping[str, Any]]:
         return []
 
     @property
+    # pyrefly: ignore[bad-override]
     def params(self) -> Mapping[str, Union[torch.Tensor, ShardedTensor]]:
         return {}
 
@@ -72,6 +74,7 @@ class StableCombinedOptimizer(KeyedOptimizer):
     def save_param_groups(self, save: bool) -> None:
         pass
 
+    # pyrefly: ignore[bad-override]
     def step(self, closure: Any = None) -> None:
         pass
 

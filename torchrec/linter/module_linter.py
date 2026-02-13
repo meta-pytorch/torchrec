@@ -37,7 +37,9 @@ def print_error_message(
     """
     lint_item = {
         "path": python_path,
+        # pyrefly: ignore[missing-attribute]
         "line": node.lineno,
+        # pyrefly: ignore[missing-attribute]
         "char": node.col_offset + 1,
         "severity": severity,
         "name": name,

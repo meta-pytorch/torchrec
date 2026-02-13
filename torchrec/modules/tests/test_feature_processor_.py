@@ -140,9 +140,11 @@ class PositionWeightedCollectionModuleTest(unittest.TestCase):
         )
 
         #  not a function.
+        # pyrefly: ignore[not-callable]
         self.assertTrue(all(param.is_meta for param in res.position_weights.values()))
         self.assertTrue(
             #  is not a function.
+            # pyrefly: ignore[not-callable]
             all(param.is_meta for param in res.position_weights_dict.values())
         )
 

@@ -90,6 +90,7 @@ def get_embedding_shard_metadata(
             embed_sharding_per_feature = []
             total_rows = 0
             sizes = []
+            # pyrefly: ignore[missing-attribute]
             for metadata in table.global_metadata.shards_metadata:
                 embed_sharding_per_feature.append(metadata.shard_offsets[0])
                 total_rows += metadata.shard_sizes[0]
@@ -123,7 +124,10 @@ class BaseRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         self._env = env
         self._is_2D_parallel: bool = isinstance(env, ShardingEnv2D)
         self._pg: Optional[dist.ProcessGroup] = (
-            self._env.sharding_pg if self._is_2D_parallel else self._env.process_group
+            # pyrefly: ignore[missing-attribute]
+            self._env.sharding_pg
+            if self._is_2D_parallel
+            else self._env.process_group
         )
         self._world_size: int = self._env.world_size
         self._rank: int = self._env.rank
@@ -160,6 +164,7 @@ class BaseRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             [] for _ in range(self._world_size)
         ]
         for info in sharding_infos:
+            # pyrefly: ignore[missing-attribute]
             shards = info.param_sharding.sharding_spec.shards
 
             # construct the global sharded_tensor_metadata
@@ -483,8 +488,10 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         ) = bucketize_kjt_before_all2all(
             sparse_features,
             num_buckets=self._world_size,
+            # pyrefly: ignore[bad-argument-type]
             block_sizes=self._feature_block_sizes_tensor,
             total_num_blocks=(
+                # pyrefly: ignore[bad-argument-type]
                 self._feature_total_num_blocks_tensor
                 if self._has_multiple_blocks_per_shard
                 else None
@@ -647,6 +654,7 @@ class RwPooledEmbeddingSharding(
         )
         return RwSparseFeaturesDist(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=self._pg,
             num_features=num_features,
             feature_hash_sizes=feature_hash_sizes,
@@ -679,6 +687,7 @@ class RwPooledEmbeddingSharding(
     ) -> BaseEmbeddingDist[EmbeddingShardingContext, torch.Tensor, torch.Tensor]:
         return RwPooledEmbeddingDist(
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             self._pg,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
             embedding_dims=self.embedding_dims(),
@@ -778,8 +787,10 @@ class RwSparseFeaturesWriteDist(BaseSparseFeaturesWriteDist[KeyedJaggedTensor]):
         ) = bucketize_embeddings_before_all2all_write(
             embeddings,
             num_buckets=self._world_size,
+            # pyrefly: ignore[bad-argument-type]
             block_sizes=self._feature_block_sizes_tensor,
             total_num_blocks=(
+                # pyrefly: ignore[bad-argument-type]
                 self._feature_total_num_blocks_tensor
                 if self._has_multiple_blocks_per_shard
                 else None

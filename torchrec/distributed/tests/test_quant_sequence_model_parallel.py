@@ -143,7 +143,9 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             world_size=world_size,
             model_class=cast(TestSparseNNBase, TestSequenceSparseNN),
             embedding_groups=self.embedding_groups,
+            # pyrefly: ignore[bad-argument-type]
             tables=self.tables,
+            # pyrefly: ignore[bad-argument-type]
             sharders=sharders,
             quantize_callable=_quantize,
             quantize_callable_kwargs={
@@ -259,6 +261,7 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
         local_batch = local_batch.to(device)
         sharded_quant_model(local_batch.idlist_features)
         self.assertIsInstance(
+            # pyrefly: ignore[bad-index]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[0]
@@ -267,6 +270,7 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             KVEmbeddingInference,
         )
         self.assertIsInstance(
+            # pyrefly: ignore[bad-index]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[0]
@@ -275,6 +279,7 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             IntNBitTableBatchedEmbeddingBagsCodegen,
         )
         self.assertEqual(
+            # pyrefly: ignore[bad-index]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[0]
@@ -283,6 +288,7 @@ class QuantSequenceModelParallelTest(InferenceModelParallelTestBase):
             [0, 0],
         )
         self.assertEqual(
+            # pyrefly: ignore[bad-index]
             sharded_quant_model[0]
             ._lookups[0]
             ._embedding_lookups_per_rank[1]

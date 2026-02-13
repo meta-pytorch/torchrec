@@ -51,6 +51,7 @@ def main(rank: int, args: argparse.Namespace, queue: multiprocessing.Queue) -> N
         f"[rank {rank}] seed everything for reproducibility with seed {args.seed}"
     )
     torch.manual_seed(args.seed)
+    # pyrefly: ignore[implicit-import]
     np.random.seed(args.seed)
 
     # setup environment
@@ -89,6 +90,7 @@ def main(rank: int, args: argparse.Namespace, queue: multiprocessing.Queue) -> N
     if len(args.zch_method) == 0:
         logger.info(f"[rank {rank}] initialize the non-zch mod module")
         nonzch_remapper = NonZchModRemapperModule(
+            # pyrefly: ignore[bad-argument-type]
             table_configs=model.table_configs,
             input_hash_size=args.input_hash_size,
             device=device,
@@ -115,6 +117,7 @@ def main(rank: int, args: argparse.Namespace, queue: multiprocessing.Queue) -> N
     benchmark_probe = None
     if len(args.zch_method) > 0:
         benchmark_probe = BenchmarkMCProbe(
+            # pyrefly: ignore[bad-argument-type]
             mcec=get_module_from_instance(
                 model._dmp_wrapped_module,
                 model_configs["managed_collision_module_attribute_path"],
@@ -124,6 +127,7 @@ def main(rank: int, args: argparse.Namespace, queue: multiprocessing.Queue) -> N
         )
     else:
         benchmark_probe = BenchmarkMCProbe(
+            # pyrefly: ignore[missing-attribute]
             mcec=nonzch_remapper.mod_modules,
             mc_method="mpzch",  # because non-zch remapper simulates the behavior of mpzch
             rank=rank,
@@ -149,6 +153,7 @@ def main(rank: int, args: argparse.Namespace, queue: multiprocessing.Queue) -> N
             batch = batch.to(device)
             # remap the batch if needed
             if len(args.zch_method) == 0:
+                # pyrefly: ignore[missing-attribute]
                 batch = nonzch_remapper.remap(batch)
             starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
                 enable_timing=True

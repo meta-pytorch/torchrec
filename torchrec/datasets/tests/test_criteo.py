@@ -191,6 +191,7 @@ class TestBinaryCriteoUtils(CriteoTest):
             partial = BinaryCriteoUtils.load_npy_range(
                 dense_path, start_row=start_row, num_rows=num_rows_to_select
             )
+            # pyrefly: ignore[implicit-import]
             np.testing.assert_array_equal(
                 full[start_row : start_row + num_rows_to_select], partial
             )
@@ -482,7 +483,9 @@ class TestInMemoryBinaryCriteoIterDataPipe(CriteoTest):
                 datapipe_len = len(datapipe)
                 self.assertEqual(datapipe_len, num_batches)
 
+                # pyrefly: ignore[implicit-import]
                 np.random.seed(random_seed)
+                # pyrefly: ignore[implicit-import]
                 permutation_arr = np.random.permutation(num_rows)
                 src_arr = np.arange(num_rows)
                 target_shuffled_arr = np.empty(num_rows)
@@ -490,6 +493,7 @@ class TestInMemoryBinaryCriteoIterDataPipe(CriteoTest):
                 target_shuffled_arr_ = np.array(
                     [b for a, b in sorted(zip(permutation_arr, src_arr))]
                 )
+                # pyrefly: ignore[implicit-import]
                 np.testing.assert_array_equal(target_shuffled_arr, target_shuffled_arr_)
                 len_ = 0
                 for batch in datapipe:

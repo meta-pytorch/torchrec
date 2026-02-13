@@ -55,6 +55,7 @@ def _test_sharding(
     sharder: ModuleSharder[nn.Module],
     local_size: Optional[int] = None,
 ) -> None:
+    # pyrefly: ignore[implicit-import]
     trec_dist.comm_ops.set_gradient_division(False)
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         kjt_input_per_rank = [kjt.to(ctx.device) for kjt in kjt_input_per_rank]
@@ -76,8 +77,10 @@ def _test_sharding(
         unsharded_model = model
         sharded_model = sharder.shard(
             module=model,
+            # pyrefly: ignore[bad-argument-type]
             params=parameter_sharding_plan,
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             device=ctx.device,
         )
@@ -138,6 +141,7 @@ def _test_sharding(
             # Compare predictions of sharded vs unsharded models.
             torch.testing.assert_close(
                 sharded_model_pred.cpu(),
+                # pyrefly: ignore[unbound-name]
                 unsharded_model_pred.cpu(),
             )
 
@@ -241,6 +245,7 @@ class ConstructParameterShardingTest(MultiProcessTestBase):
             per_param_sharding=per_param_sharding,
             local_size=2,
             world_size=2,
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
         )
 

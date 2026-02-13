@@ -528,6 +528,7 @@ class MetricModuleTest(unittest.TestCase):
         tc.assertTrue(isinstance(metric_module.rec_metrics.rec_metrics[0], AUCMetric))
         tc.assertEqual(
             len(
+                # pyrefly: ignore[bad-index, missing-attribute]
                 metric_module.rec_metrics.rec_metrics[0]
                 ._metrics_computations[0]
                 .predictions
@@ -537,6 +538,7 @@ class MetricModuleTest(unittest.TestCase):
 
         # 1. After the metric module is created
         tc.assertEqual(
+            # pyrefly: ignore[bad-index, missing-attribute]
             metric_module.rec_metrics.rec_metrics[0]
             ._metrics_computations[0]
             .labels[0]
@@ -547,6 +549,7 @@ class MetricModuleTest(unittest.TestCase):
 
         metric_module.sync()
         tc.assertEqual(
+            # pyrefly: ignore[bad-index, missing-attribute]
             metric_module.rec_metrics.rec_metrics[0]
             ._metrics_computations[0]
             .labels[0]
@@ -556,6 +559,7 @@ class MetricModuleTest(unittest.TestCase):
 
         metric_module.unsync()
         tc.assertEqual(
+            # pyrefly: ignore[bad-index, missing-attribute]
             metric_module.rec_metrics.rec_metrics[0]
             ._metrics_computations[0]
             .labels[0]
@@ -569,6 +573,7 @@ class MetricModuleTest(unittest.TestCase):
         metric_module.sync()
         metric_module.unsync()
         tc.assertEqual(
+            # pyrefly: ignore[bad-index, missing-attribute]
             metric_module.rec_metrics.rec_metrics[0]
             ._metrics_computations[0]
             .labels[0]
@@ -1064,6 +1069,7 @@ class MetricsConfigPostInitTest(unittest.TestCase):
         # Execute & Assert: should raise ValueError about rec_tasks being None
         with self.assertRaises(ValueError) as context:
             _ = MetricsConfig(
+                # pyrefly: ignore[bad-argument-type]
                 rec_tasks=None,
                 rec_metrics={
                     RecMetricEnum.AUC: RecMetricDef(rec_task_indices=[0]),
@@ -1273,6 +1279,7 @@ def _test_get_metric_states_with_list_reduction(
         result = metric_module._get_metric_states(
             metric=mock_metric,
             world_size=world_size,
+            # pyrefly: ignore [bad-argument-type]
             process_group=ctx.pg or dist.group.WORLD,
         )
 
@@ -1330,6 +1337,7 @@ def _test_get_metric_states_with_tensor_reduction(
         result = metric_module._get_metric_states(
             metric=mock_metric,
             world_size=world_size,
+            # pyrefly: ignore [bad-argument-type]
             process_group=ctx.pg or dist.group.WORLD,
         )
 
@@ -1391,6 +1399,7 @@ def _test_get_metric_states_with_single_tensor(
         result = metric_module._get_metric_states(
             metric=mock_metric,
             world_size=world_size,
+            # pyrefly: ignore [bad-argument-type]
             process_group=ctx.pg or dist.group.WORLD,
         )
 
@@ -1425,6 +1434,7 @@ def _test_get_metric_states_with_reduction_fn_none(
             batch_size=10,
             tasks=tasks,
             is_tensor_list=True,
+            # pyrefly: ignore [bad-argument-type]
             reduction_fn=None,  # No reduction
             initial_states={"predictions": []},
         )
@@ -1450,6 +1460,7 @@ def _test_get_metric_states_with_reduction_fn_none(
         result = metric_module._get_metric_states(
             metric=mock_metric,
             world_size=world_size,
+            # pyrefly: ignore [bad-argument-type]
             process_group=ctx.pg or dist.group.WORLD,
         )
 
@@ -1539,6 +1550,7 @@ def _test_get_metric_states_with_asymmetric_batches(
         result = metric_module._get_metric_states(
             metric=mock_metric,
             world_size=world_size,
+            # pyrefly: ignore [bad-argument-type]
             process_group=ctx.pg or dist.group.WORLD,
         )
 

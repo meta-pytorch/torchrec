@@ -11,6 +11,7 @@ import argparse
 import sys
 from typing import List, Tuple
 
+# pyrefly: ignore[missing-import]
 import ebc_benchmarks_utils
 import torch
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import EmbeddingLocation

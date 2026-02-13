@@ -114,6 +114,7 @@ class WarmupOptimizer(OptimizerWrapper):
         self._lr_param: str = lr_param
         self._lr: float = lr
         self._warmup_param: torch.nn.Parameter = torch.nn.Parameter()
+        # pyrefly: ignore[unsupported-operation]
         self.params[param_name] = self._warmup_param
         # for fused optimizer we will do first backward() pass before calling step()
         self._set_lr(0, 0)
@@ -121,6 +122,7 @@ class WarmupOptimizer(OptimizerWrapper):
     def _set_lr(self, iter_: int, stage_id: int) -> None:
         lr = self._lr * _get_multiplier(self._stages[stage_id], iter_)
         for param_group in self.param_groups:
+            # pyrefly: ignore[unsupported-operation]
             param_group[self._lr_param] = lr
 
     def _get_warmup_state(self) -> Tuple[int, int]:
@@ -153,6 +155,7 @@ class WarmupOptimizer(OptimizerWrapper):
             )
         self._set_lr(iter_, stage_id)
 
+        # pyrefly: ignore[unsupported-operation]
         self.state[self._warmup_param] = {
             "warmup": torch.tensor([iter_, stage_id], dtype=torch.long)
         }

@@ -40,6 +40,7 @@ class FPModelParallelStateDictTest(ModelParallelSingleRankBase):
     def _generate_batch(self) -> ModelInput:
         kjt_input_per_rank = get_kjt_inputs()
         batch = kjt_input_per_rank[0].to(self.device)
+        # pyrefly: ignore[bad-return]
         return batch
 
     def _create_model(self) -> nn.Module:

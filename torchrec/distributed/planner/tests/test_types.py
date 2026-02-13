@@ -510,6 +510,7 @@ def _test_hashing_consistency(
             ),  # Using meta device for now since only getting search space
         )
         sharders = [EmbeddingBagCollectionSharder()]
+        # pyrefly: ignore[bad-argument-type]
         enumerator.enumerate(module, sharders)
         storage_reservation = HeuristicalStorageReservation(percentage=0.15)
         constraints = {"table1": ParameterConstraints()}
@@ -518,6 +519,7 @@ def _test_hashing_consistency(
             topology=topology,
             batch_size=batch_size,
             module=module,
+            # pyrefly: ignore[bad-argument-type]
             sharders=sharders,
             constraints=constraints,
         )

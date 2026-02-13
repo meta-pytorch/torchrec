@@ -67,7 +67,9 @@ class MultiLabelPrecisionMetricTest(unittest.TestCase):
             tasks=tasks,
             compute_mode=compute_mode,
             window_size=100,
+            # pyrefly: ignore[bad-argument-type]
             num_labels=num_labels,
+            # pyrefly: ignore[bad-argument-type]
             label_names=label_names,
         )
 
@@ -154,9 +156,13 @@ class MultiLabelPrecisionMetricTest(unittest.TestCase):
 
         computation.update(predictions=predictions, labels=labels, weights=weights)
 
+        # pyrefly: ignore[not-callable]
         self.assertEqual(computation.true_pos_sum_label_0.item(), 2.0)
+        # pyrefly: ignore[not-callable]
         self.assertEqual(computation.false_pos_sum_label_0.item(), 0.0)
+        # pyrefly: ignore[not-callable]
         self.assertEqual(computation.true_pos_sum_label_1.item(), 1.0)
+        # pyrefly: ignore[not-callable]
         self.assertEqual(computation.false_pos_sum_label_1.item(), 1.0)
 
     def test_update_with_weights(self) -> None:
@@ -169,9 +175,13 @@ class MultiLabelPrecisionMetricTest(unittest.TestCase):
 
         computation.update(predictions=predictions, labels=labels, weights=weights)
 
+        # pyrefly: ignore[not-callable]
         self.assertEqual(computation.true_pos_sum_label_0.item(), 2.0)
+        # pyrefly: ignore[not-callable]
         self.assertEqual(computation.false_pos_sum_label_0.item(), 1.0)
+        # pyrefly: ignore[not-callable]
         self.assertEqual(computation.true_pos_sum_label_1.item(), 1.0)
+        # pyrefly: ignore[not-callable]
         self.assertEqual(computation.false_pos_sum_label_1.item(), 2.0)
 
     # =========================================================================
@@ -360,6 +370,7 @@ class MultiLabelPrecisionMetricTest(unittest.TestCase):
             tasks=tasks,
             compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
             window_size=2,  # Only keep last 2 batches in window
+            # pyrefly: ignore[bad-argument-type]
             num_labels=num_labels,
         )
 

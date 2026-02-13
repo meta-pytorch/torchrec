@@ -105,12 +105,15 @@ class PlannerConfig:
                 key_value_params["kvzch_tbe_config"] = KVZCHTBEConfig(
                     **key_value_params["kvzch_tbe_config"]
                 )
+            # pyrefly: ignore[bad-unpacking, unsupported-operation]
             kwargs["key_value_params"] = KeyValueParams(**key_value_params)
 
         # Convert cache_params dict to CacheParams object if present
         if "cache_params" in kwargs:
+            # pyrefly: ignore[bad-unpacking, unsupported-operation]
             kwargs["cache_params"] = CacheParams(**kwargs["cache_params"])
 
+        # pyrefly: ignore[bad-argument-type]
         constraint = ParameterConstraints(**kwargs)
         return table.name, constraint
 
@@ -163,7 +166,7 @@ class PlannerConfig:
                 topology_groups=topology_groups,
                 batch_size=self.batch_size,
                 constraints=constraints if constraints else None,
-                storage_reservation=storage_reservation,
+                storage_reservation=storage_reservation,  # pyrefly: ignore[unexpected-keyword]
             )
         else:
             raise RuntimeError(f"Unknown planner type: {self.planner_type}")

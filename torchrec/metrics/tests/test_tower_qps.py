@@ -297,6 +297,7 @@ class TowerQPSMetricTest(unittest.TestCase):
                 batch_size * (warmup_steps + extra_steps) * (i + 1),
             )
             # Mimic trainer crashing and loading a checkpoint.
+            # pyrefly: ignore[bad-argument-type]
             qps._metrics_computations[0]._steps = 0
 
     def test_mtml_empty_update(self) -> None:
@@ -418,6 +419,7 @@ class TowerQPSMetricTest(unittest.TestCase):
         )
 
         data = _gen_data_with_batch_size(batch_size_stages[0].batch_size)
+        # pyrefly: ignore[bad-argument-type]
         metric.update(**data)
 
         self.assertEqual(
@@ -436,6 +438,7 @@ class TowerQPSMetricTest(unittest.TestCase):
         )
 
         data = _gen_data_with_batch_size(batch_size_stages[1].batch_size)
+        # pyrefly: ignore[bad-argument-type]
         metric.update(**data)
 
         self.assertEqual(

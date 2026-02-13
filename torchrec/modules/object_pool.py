@@ -31,5 +31,6 @@ class ObjectPool(abc.ABC, torch.nn.Module, Generic[T]):
         pass
 
     @abc.abstractproperty
+    # pyrefly: ignore[bad-return]
     def pool_size(self) -> int:
         pass

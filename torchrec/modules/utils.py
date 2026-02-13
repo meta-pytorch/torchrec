@@ -59,6 +59,7 @@ def extract_module_or_tensor_callable(
     ],
 ) -> Union[torch.nn.Module, Callable[[torch.Tensor], torch.Tensor]]:
     try:
+        # pyrefly: ignore[bad-argument-count]
         module = module_or_callable()
         if isinstance(module, torch.nn.Module):
             return module
@@ -69,6 +70,7 @@ def extract_module_or_tensor_callable(
             )
     except TypeError as e:
         if "required positional argument" in str(e):
+            # pyrefly: ignore[bad-return]
             return module_or_callable
         raise
 
@@ -100,6 +102,7 @@ def check_module_output_dimension(
     else:
         #  torch.Tensor], torch.nn.Module]` for 1st param but got
         #  `Union[Iterable[torch.nn.Module], torch.nn.Module]`.
+        # pyrefly: ignore[bad-argument-type]
         return get_module_output_dimension(module, in_features) == out_features
 
 
@@ -138,9 +141,11 @@ def convert_list_of_modules_to_modulelist(
 ) -> torch.nn.Module:
     assert (
         #  `Iterable[torch.nn.Module]`.
+        # pyrefly: ignore[bad-argument-type]
         len(modules)
         == sizes[0]
         #  but got `Iterable[Module]`.
+        # pyrefly: ignore[bad-argument-type]
     ), f"the counts of modules ({len(modules)}) do not match with the required counts {sizes}"
     if len(sizes) == 1:
         return torch.nn.ModuleList(modules)
@@ -148,6 +153,7 @@ def convert_list_of_modules_to_modulelist(
         # recursively create nested list
         return torch.nn.ModuleList(
             #  `Module`.
+            # pyrefly: ignore[bad-argument-type]
             convert_list_of_modules_to_modulelist(m, sizes[1:])
             for m in modules
         )
@@ -344,6 +350,7 @@ def construct_jagged_tensors_inference(
                     if len(indices) == 1
                     else torch.cat([embeddings_list[i] for i in indices], dim=1)
                 ),
+                # pyrefly: ignore[unsupported-operation]
                 weights=values_list[indices[0]] if need_indices else None,
             )
         return ret

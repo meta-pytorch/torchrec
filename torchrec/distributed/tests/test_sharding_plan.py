@@ -84,6 +84,7 @@ def _test_sharding(
     module_sharding_plan: EmbeddingModuleShardingPlan,
     local_size: Optional[int] = None,
 ) -> None:
+    # pyrefly: ignore[implicit-import]
     trec_dist.comm_ops.set_gradient_division(False)
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         kjt_input_per_rank = [kjt.to(ctx.device) for kjt in kjt_input_per_rank]
@@ -103,6 +104,7 @@ def _test_sharding(
             module=model,
             params=module_sharding_plan,
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             device=ctx.device,
         )
@@ -720,6 +722,7 @@ class ConstructParameterShardingTest(unittest.TestCase):
 
         # Make sure per_param_sharding setting override the default device_type
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             module_sharding_plan["table_0"]
             .sharding_spec.shards[0]
             .placement.device()
@@ -728,6 +731,7 @@ class ConstructParameterShardingTest(unittest.TestCase):
         )
 
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             module_sharding_plan["table_1"]
             .sharding_spec.shards[0]
             .placement.device()
@@ -769,7 +773,10 @@ class ConstructParameterShardingTest(unittest.TestCase):
 
         # Make sure per_param_sharding setting override the default device_type
         device_table_0_shard_0 = (
-            module_sharding_plan["table_0"].sharding_spec.shards[0].placement
+            # pyrefly: ignore[missing-attribute]
+            module_sharding_plan["table_0"]
+            .sharding_spec.shards[0]
+            .placement
         )
         self.assertEqual(
             device_table_0_shard_0.device().type,
@@ -782,7 +789,10 @@ class ConstructParameterShardingTest(unittest.TestCase):
         )
         for i in range(1, 3):
             device_table_0_shard_i = (
-                module_sharding_plan["table_0"].sharding_spec.shards[i].placement
+                # pyrefly: ignore[missing-attribute]
+                module_sharding_plan["table_0"]
+                .sharding_spec.shards[i]
+                .placement
             )
             self.assertEqual(
                 device_table_0_shard_i.device().type,
@@ -799,7 +809,10 @@ class ConstructParameterShardingTest(unittest.TestCase):
             )
         for i in range(3):
             device_table_1_shard_i = (
-                module_sharding_plan["table_1"].sharding_spec.shards[i].placement
+                # pyrefly: ignore[missing-attribute]
+                module_sharding_plan["table_1"]
+                .sharding_spec.shards[i]
+                .placement
             )
             self.assertEqual(
                 device_table_1_shard_i.device().type,

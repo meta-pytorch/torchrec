@@ -77,6 +77,7 @@ class SequenceModelParallelHierarchicalTest(MultiProcessTestBase):
         ],
     ) -> None:
         self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     SharderType.EMBEDDING_TOWER.value, sharding_type, kernel_type

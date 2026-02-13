@@ -237,5 +237,6 @@ class TwoTowerRetrieval(nn.Module):
         return (query_embedding * candidate_embedding).sum(dim=1).squeeze()
 
     #  inconsistently.
+    # pyrefly: ignore[bad-override]
     def load_state_dict(self, state_dict: Mapping[str, Any], strict: bool) -> None:
         super().load_state_dict(state_dict, strict)

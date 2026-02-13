@@ -88,8 +88,8 @@ class RowWiseAdagrad(Optimizer):
                 )
                 state["sum"] = (
                     torch.full_like(p, init_value, memory_format=torch.preserve_format)
-                    .mean(axis=1)
-                    .view(-1, 1)
+                    # pyrefly: ignore[no-matching-overload]
+                    .mean(axis=1).view(-1, 1)
                 )
 
     def __setstate__(self, state: Dict[str, Any]) -> None:
@@ -112,6 +112,7 @@ class RowWiseAdagrad(Optimizer):
                 state["sum"].share_memory_()
 
     @torch.no_grad()
+    # pyrefly: ignore[bad-override]
     def step(self, closure=None) -> torch.Tensor:
         """Performs a single optimization step.
         Args:
@@ -150,6 +151,7 @@ class RowWiseAdagrad(Optimizer):
                 maximize=group["maximize"],
             )
 
+        # pyrefly: ignore[bad-return]
         return loss
 
 
@@ -220,6 +222,7 @@ def _single_tensor_adagrad(
         if weight_decay != 0:
             grad = grad.add(param, alpha=weight_decay)
 
+        # pyrefly: ignore[no-matching-overload]
         state_sum += grad.pow(2).mean(axis=1).view(-1, 1)
         std = state_sum.sqrt().add_(eps)
 

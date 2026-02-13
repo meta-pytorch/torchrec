@@ -85,12 +85,14 @@ class UtilsTest(unittest.TestCase):
         )
 
         module_plan = construct_module_sharding_plan(
+            # pyrefly: ignore[bad-index]
             quant_model[0],
             per_param_sharding={
                 "table_0": table_wise(rank=1),
                 "table_1": table_wise(rank=0),
                 "table_2": table_wise(rank=0),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=2,
             world_size=2,
@@ -99,9 +101,11 @@ class UtilsTest(unittest.TestCase):
         plan = ShardingPlan(plan={"": module_plan})
 
         sharded_model = _shard_modules(
+            # pyrefly: ignore[bad-index]
             module=quant_model[0],
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[TestQuantEBCSharder]`.
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=device,
             plan=plan,
@@ -159,12 +163,14 @@ class UtilsTest(unittest.TestCase):
         )
 
         module_plan = construct_module_sharding_plan(
+            # pyrefly: ignore[bad-index]
             quant_model[0],
             per_param_sharding={
                 "table_0": table_wise(rank=1),
                 "table_1": table_wise(rank=0),
                 "table_2": table_wise(rank=0),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=2,
             world_size=2,
@@ -173,9 +179,11 @@ class UtilsTest(unittest.TestCase):
         plan = ShardingPlan(plan={"": module_plan})
 
         sharded_model = _shard_modules(
+            # pyrefly: ignore[bad-index]
             module=quant_model[0],
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[TestQuantECSharder]`.
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=device,
             plan=plan,
@@ -237,11 +245,13 @@ class UtilsTest(unittest.TestCase):
         )
 
         module_plan = construct_module_sharding_plan(
+            # pyrefly: ignore[bad-index]
             quant_model[0],
             per_param_sharding={
                 "table_0": table_wise(rank=0),
                 "table_1": table_wise(rank=1),
             },
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
             local_size=2,
             world_size=2,
@@ -250,9 +260,11 @@ class UtilsTest(unittest.TestCase):
         plan = ShardingPlan(plan={"": module_plan})
 
         sharded_model = _shard_modules(
+            # pyrefly: ignore[bad-index]
             module=quant_model[0],
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[TestQuantEBCSharder]`.
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=device,
             plan=plan,
@@ -339,8 +351,10 @@ class UtilsTest(unittest.TestCase):
 
         expected_all_trec_modules = {
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             "_module.sparse.ebc": sharded_model._module.sparse.ebc,
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             "_module.sparse.weighted_ebc": sharded_model._module.sparse.weighted_ebc,
         }
 
@@ -357,6 +371,7 @@ class UtilsTest(unittest.TestCase):
             all_trec_mdoules,
             {
                 #  attribute `sparse`.
+                # pyrefly: ignore[missing-attribute]
                 "_module.sparse.ebc": sharded_model._module.sparse.ebc,
             },
         )

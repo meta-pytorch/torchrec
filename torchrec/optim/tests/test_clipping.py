@@ -437,6 +437,7 @@ class TestClipGradNorm(unittest.TestCase):
         expected_norm = (3.0**2 + 4.0**2) ** 0.5
         self.assertTrue(
             torch.allclose(
+                # pyrefly: ignore[bad-argument-type]
                 total_norm,
                 torch.tensor(expected_norm),
             )
@@ -534,4 +535,5 @@ class TestClipGradNorm(unittest.TestCase):
             total_norm = gradient_clipping_optimizer.clip_grad_norm_()
 
         self.assertIsNotNone(total_norm)
+        # pyrefly: ignore[missing-attribute]
         self.assertGreater(total_norm.item(), 0)

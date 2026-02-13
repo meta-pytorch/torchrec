@@ -652,6 +652,7 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertTrue(torch.equal(kjt_expected.lengths(), kjt_actual.lengths()))
         self.assertTrue(torch.equal(kjt_expected.offsets(), kjt_actual.offsets()))
         self.assertTrue(torch.equal(kjt_expected.values(), kjt_actual.values()))
+        # pyrefly: ignore[bad-argument-type]
         self.assertListEqual(kjt_expected._length_per_key, kjt_actual._length_per_key)
 
     def test_concat_fxable(self) -> None:
@@ -745,8 +746,10 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         keys = ["f1", "f2"]
         # torch.Tensor([3, 4]) also fails
         #  param but got `Type[float]`.
+        # pyrefly: ignore[bad-argument-type]
         lengths = torch.tensor([3, 4], dtype=float)
         #  param but got `Type[float]`.
+        # pyrefly: ignore[bad-argument-type]
         offsets = torch.tensor([0, 3, 7], dtype=float)
 
         with self.assertRaises(AssertionError):
@@ -1229,6 +1232,7 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 empty_kjt._stride_per_key_per_rank,
+                # pyrefly: ignore[bad-argument-type]
                 kjt._stride_per_key_per_rank,
             )
         )

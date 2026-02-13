@@ -19,6 +19,7 @@ class RowWiseAdagradTest(unittest.TestCase):
         embedding_bag = torch.nn.EmbeddingBag(
             num_embeddings=4, embedding_dim=4, mode="sum"
         )
+        # pyrefly: ignore[implicit-import]
         opt = torchrec.optim.RowWiseAdagrad(embedding_bag.parameters())
         index, offsets = torch.tensor([0, 3]), torch.tensor([0, 1])
         embedding_bag_out = embedding_bag(index, offsets)
@@ -42,6 +43,7 @@ class RowWiseAdagradTest(unittest.TestCase):
         rowwise_embedding_bag.load_state_dict(state_dict)
         embedding_bag.load_state_dict(state_dict)
 
+        # pyrefly: ignore[implicit-import]
         row_wise_opt = torchrec.optim.RowWiseAdagrad(rowwise_embedding_bag.parameters())
         opt = torch.optim.Adagrad(embedding_bag.parameters())
 

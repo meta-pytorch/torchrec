@@ -202,6 +202,7 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
                 dtype=dtype,
             )
             if device is None:
+                # pyrefly: ignore[bad-assignment]
                 device = self.embedding_bags[embedding_config.name].weight.device
 
             if not embedding_config.feature_names:
@@ -296,6 +297,7 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
         for table_config in self._embedding_bag_configs:
             assert table_config.init_fn is not None
             param = self.embedding_bags[f"{table_config.name}"].weight
+            # pyrefly: ignore[bad-argument-type]
             table_config.init_fn(param)
 
 
@@ -444,6 +446,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
             )
             if config.init_fn is not None:
                 #  `Union[Module, Tensor]`.
+                # pyrefly: ignore[bad-argument-type]
                 config.init_fn(self.embeddings[config.name].weight)
 
             if not config.feature_names:
@@ -538,6 +541,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         for table_config in self._embedding_configs:
             assert table_config.init_fn is not None
             param = self.embeddings[f"{table_config.name}"].weight
+            # pyrefly: ignore[bad-argument-type]
             table_config.init_fn(param)
 
     def use_gather_select(self) -> bool:

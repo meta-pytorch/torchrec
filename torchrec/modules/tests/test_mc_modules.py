@@ -36,14 +36,18 @@ class TestEvictionPolicy(unittest.TestCase):
         # check initial state
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_sorted_raw_ids), [torch.iinfo(torch.int64).max] * 5)
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [0] * 5)
 
         # insert some values to zch
         # we have 10 counts of 4 and 1 count of 5
+        # pyrefly: ignore[unsupported-operation]
         mc_module._mch_sorted_raw_ids[0:2] = torch.tensor([4, 5])
+        # pyrefly: ignore[unsupported-operation]
         mc_module._mch_counts[0:2] = torch.tensor([10, 1])
 
         ids = [3, 4, 5, 6, 6, 6, 7, 7, 7, 8, 8, 8, 9, 10]
@@ -60,12 +64,14 @@ class TestEvictionPolicy(unittest.TestCase):
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         self.assertEqual(
             #  `Union[Tensor, Module]`.
+            # pyrefly: ignore[no-matching-overload]
             list(_mch_sorted_raw_ids),
             [4, 6, 7, 8, torch.iinfo(torch.int64).max],
         )
         # 11 counts of 5, 3 counts of 6, 3 counts of 7, 3 counts of 8
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [11, 3, 3, 3, torch.iinfo(torch.int64).max])
 
     def test_lru_eviction(self) -> None:
@@ -80,9 +86,11 @@ class TestEvictionPolicy(unittest.TestCase):
         # check initial state
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_sorted_raw_ids), [torch.iinfo(torch.int64).max] * 5)
         _mch_last_access_iter = mc_module._mch_last_access_iter
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_last_access_iter), [0] * 5)
 
         ids = [5, 6, 7]
@@ -116,11 +124,13 @@ class TestEvictionPolicy(unittest.TestCase):
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         self.assertEqual(
             #  `Union[Tensor, Module]`.
+            # pyrefly: ignore[no-matching-overload]
             list(_mch_sorted_raw_ids),
             [3, 4, 7, 8, torch.iinfo(torch.int64).max],
         )
         _mch_last_access_iter = mc_module._mch_last_access_iter
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_last_access_iter), [2, 2, 3, 3, 3])
         self.assertEqual(mc_module.open_slots().item(), 0)
 
@@ -136,12 +146,15 @@ class TestEvictionPolicy(unittest.TestCase):
         # check initial state
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_sorted_raw_ids), [torch.iinfo(torch.int64).max] * 5)
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [0] * 5)
         _mch_last_access_iter = mc_module._mch_last_access_iter
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_last_access_iter), [0] * 5)
 
         ids = [5, 5, 5, 5, 5, 6]
@@ -174,14 +187,17 @@ class TestEvictionPolicy(unittest.TestCase):
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         self.assertEqual(
             #  `Union[Tensor, Module]`.
+            # pyrefly: ignore[no-matching-overload]
             list(_mch_sorted_raw_ids),
             [3, 5, 7, 8, torch.iinfo(torch.int64).max],
         )
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [1, 5, 1, 1, torch.iinfo(torch.int64).max])
         _mch_last_access_iter = mc_module._mch_last_access_iter
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_last_access_iter), [2, 1, 3, 3, 3])
 
     def test_distance_lfu_eviction_fast_decay(self) -> None:
@@ -196,12 +212,15 @@ class TestEvictionPolicy(unittest.TestCase):
         # check initial state
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_sorted_raw_ids), [torch.iinfo(torch.int64).max] * 5)
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [0] * 5)
         _mch_last_access_iter = mc_module._mch_last_access_iter
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_last_access_iter), [0] * 5)
 
         ids = [5, 5, 5, 5, 5, 6]
@@ -234,14 +253,17 @@ class TestEvictionPolicy(unittest.TestCase):
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         self.assertEqual(
             #  `Union[Tensor, Module]`.
+            # pyrefly: ignore[no-matching-overload]
             list(_mch_sorted_raw_ids),
             [3, 4, 7, 8, torch.iinfo(torch.int64).max],
         )
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [1, 1, 1, 1, torch.iinfo(torch.int64).max])
         _mch_last_access_iter = mc_module._mch_last_access_iter
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_last_access_iter), [2, 2, 3, 3, 3])
 
     def test_dynamic_threshold_filter(self) -> None:
@@ -260,9 +282,11 @@ class TestEvictionPolicy(unittest.TestCase):
         # check initial state
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_sorted_raw_ids), [torch.iinfo(torch.int64).max] * 5)
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [0] * 5)
 
         ids = [5, 5, 5, 5, 5, 4, 4, 4, 4, 3, 3, 3, 2, 2, 1]
@@ -279,11 +303,13 @@ class TestEvictionPolicy(unittest.TestCase):
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         self.assertEqual(
             #  `Union[Tensor, Module]`.
+            # pyrefly: ignore[no-matching-overload]
             list(_mch_sorted_raw_ids),
             [3, 4, 5, torch.iinfo(torch.int64).max, torch.iinfo(torch.int64).max],
         )
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [3, 4, 5, 0, torch.iinfo(torch.int64).max])
 
     def test_average_threshold_filter(self) -> None:
@@ -300,14 +326,18 @@ class TestEvictionPolicy(unittest.TestCase):
         # check initial state
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_sorted_raw_ids), [torch.iinfo(torch.int64).max] * 5)
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [0] * 5)
 
         # insert some values to zch
         # we have 10 counts of 4 and 1 count of 5
+        # pyrefly: ignore[unsupported-operation]
         mc_module._mch_sorted_raw_ids[0:2] = torch.tensor([4, 5])
+        # pyrefly: ignore[unsupported-operation]
         mc_module._mch_counts[0:2] = torch.tensor([10, 1])
 
         ids = [3, 4, 5, 6, 6, 6, 7, 8, 8, 9, 10]
@@ -326,12 +356,14 @@ class TestEvictionPolicy(unittest.TestCase):
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         self.assertEqual(
             #  `Union[Tensor, Module]`.
+            # pyrefly: ignore[no-matching-overload]
             list(_mch_sorted_raw_ids),
             [4, 5, 6, 8, torch.iinfo(torch.int64).max],
         )
         # count for 4 is not updated since it's below the average threshold
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [10, 1, 3, 2, torch.iinfo(torch.int64).max])
 
     def test_probabilistic_threshold_filter(self) -> None:
@@ -351,9 +383,11 @@ class TestEvictionPolicy(unittest.TestCase):
         # check initial state
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_sorted_raw_ids), [torch.iinfo(torch.int64).max] * 5)
         _mch_counts = mc_module._mch_counts
         #  `Union[Tensor, Module]`.
+        # pyrefly: ignore[no-matching-overload]
         self.assertEqual(list(_mch_counts), [0] * 5)
 
         unique_ids = [5, 4, 3, 2, 1]
@@ -374,6 +408,7 @@ class TestEvictionPolicy(unittest.TestCase):
         _mch_sorted_raw_ids = mc_module._mch_sorted_raw_ids
         self.assertEqual(
             #  Module]` is not a function.
+            # pyrefly: ignore[not-callable]
             sorted(_mch_sorted_raw_ids.tolist()),
             [2, 3, 4, 5, torch.iinfo(torch.int64).max],
         )

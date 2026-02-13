@@ -380,6 +380,7 @@ class AUPRCMetricComputation(RecMetricComputation):
 
 
 class AUPRCMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.AUPRC
     _computation_class: Type[RecMetricComputation] = AUPRCMetricComputation
 

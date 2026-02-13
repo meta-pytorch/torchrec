@@ -155,6 +155,7 @@ class Request(Awaitable[W]):
         Calls the wait function for this request.
         """
 
+        # pyrefly: ignore[missing-attribute]
         ret = self.wait_function.apply(self.pg, self, self.dummy_tensor)
         if isinstance(ret, torch.Tensor) and ret.device.type == "cuda":
             ret.record_stream(torch.get_device_module(ret.device).current_stream())
@@ -534,6 +535,7 @@ def alltoall_pooled(
 
 
 def pg_name(pg: dist.ProcessGroup) -> str:
+    # pyrefly: ignore[implicit-import]
     return dist._functional_collectives._resolve_group_name(pg, "")
 
 
@@ -926,6 +928,7 @@ def reduce_scatter_sync(
     *inputs: Any,
 ) -> Tensor:
     if rsi.codecs is not None:
+        # pyrefly: ignore[bad-assignment]
         inputs = [rsi.codecs.forward.encode(input) for input in inputs]
 
     with record_function("## reduce_scatter ##"):
@@ -1271,6 +1274,7 @@ def _recat_seq_embedding(
 
 class All2All_Pooled_Req(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -1393,6 +1397,7 @@ class All2All_Pooled_Req(Function):
 
 class All2All_Pooled_Wait(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -1409,12 +1414,16 @@ class All2All_Pooled_Wait(Function):
         myreq.tensor = None
         ctx.pg = pg
         ctx.myreq = myreq
+        # pyrefly: ignore[missing-attribute]
         dim_sum_per_rank = a2ai.dim_sum_per_rank
+        # pyrefly: ignore[missing-attribute]
         batch_size_per_rank = a2ai.batch_size_per_rank
         B_local = batch_size_per_rank[my_rank]
 
+        # pyrefly: ignore[missing-attribute]
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
+            # pyrefly: ignore[missing-attribute]
             sharded_output_embeddings = codecs.forward.decode(
                 sharded_output_embeddings,
                 myreq.qcomm_ctx,
@@ -1426,6 +1435,7 @@ class All2All_Pooled_Wait(Function):
             and myreq.qcomm_ctx.padded_dim_sum_per_rank is not None
             else dim_sum_per_rank
         )
+        # pyrefly: ignore[missing-attribute]
         outputs_by_rank = sharded_output_embeddings.split(
             [B_local * D_rank_sum for D_rank_sum in padded_dim_sum_per_rank]
         )
@@ -1450,6 +1460,7 @@ class All2All_Pooled_Wait(Function):
         return result
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         a2ai = ctx.a2ai
@@ -1520,6 +1531,7 @@ class All2All_Pooled_Wait(Function):
 
 class Variable_Batch_All2All_Pooled_Req(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -1639,6 +1651,7 @@ class Variable_Batch_All2All_Pooled_Req(Function):
 
 class Variable_Batch_All2All_Pooled_Wait(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -1656,17 +1669,21 @@ class Variable_Batch_All2All_Pooled_Wait(Function):
         ctx.pg = pg
         ctx.myreq = myreq
 
+        # pyrefly: ignore[missing-attribute]
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
+            # pyrefly: ignore[missing-attribute]
             sharded_output_embeddings = codecs.forward.decode(
                 sharded_output_embeddings,
                 myreq.qcomm_ctx,
             )
         # the return result is a 1-d tensor, like: f_0_s_0, f_0_s1, ..., f_n_s_0, f_n_s_k
         # f_0, f_1, ... , f_n are ordered by features on each rank
+        # pyrefly: ignore[bad-return]
         return sharded_output_embeddings
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         a2ai = ctx.a2ai
@@ -1725,6 +1742,7 @@ class Variable_Batch_All2All_Pooled_Wait(Function):
 
 class All2All_Seq_Req(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -1869,6 +1887,7 @@ class All2All_Seq_Req(Function):
 
 class All2All_Seq_Req_Wait(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -1876,6 +1895,7 @@ class All2All_Seq_Req_Wait(Function):
         *dummy_tensor: torch.Tensor,
     ) -> Tensor:
         a2ai = myreq.a2ai
+        # pyrefly: ignore[missing-attribute]
         D = a2ai.embedding_dim
         ctx.a2ai = a2ai
         assert myreq.req is not None
@@ -1885,14 +1905,18 @@ class All2All_Seq_Req_Wait(Function):
         myreq.tensor = None
         ctx.pg = pg
         ctx.myreq = myreq
+        # pyrefly: ignore[missing-attribute]
         if a2ai.codecs is not None:
             codecs = none_throws(a2ai.codecs)
+            # pyrefly: ignore[missing-attribute]
             sharded_output_embeddings = codecs.forward.decode(
                 sharded_output_embeddings, myreq.qcomm_ctx
             )
+        # pyrefly: ignore[missing-attribute]
         return sharded_output_embeddings.view(-1, D)
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def backward(ctx, sharded_grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         a2ai = ctx.a2ai
@@ -1940,6 +1964,7 @@ class All2All_Seq_Req_Wait(Function):
 
 class All2Allv_Req(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -1996,6 +2021,7 @@ class All2Allv_Req(Function):
 
 class All2Allv_Wait(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -2012,11 +2038,15 @@ class All2Allv_Wait(Function):
         ctx.pg = pg
         ctx.myreq = myreq
 
+        # pyrefly: ignore[missing-attribute]
         if a2ai.codecs is not None:
+            # pyrefly: ignore[missing-attribute]
             output = a2ai.codecs.forward.decode(output)
         outputs = tuple(
             [
+                # pyrefly: ignore[missing-attribute]
                 out.view([a2ai.B_local, -1])
+                # pyrefly: ignore[missing-attribute]
                 for out in output.split(a2ai.output_split_sizes)
             ]
         )
@@ -2050,6 +2080,7 @@ class All2Allv_Wait(Function):
 
 class ReduceScatter_Req(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -2060,6 +2091,7 @@ class ReduceScatter_Req(Function):
         my_rank = dist.get_rank(pg)
 
         if rsi.codecs is not None:
+            # pyrefly: ignore[bad-assignment]
             inputs = [rsi.codecs.forward.encode(input) for input in inputs]
 
         output = inputs[my_rank].new_empty(
@@ -2106,6 +2138,7 @@ class ReduceScatter_Req(Function):
 
 class ReduceScatter_Wait(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -2121,11 +2154,15 @@ class ReduceScatter_Wait(Function):
         ctx.pg = pg
 
         rsi = myreq.rsi
+        # pyrefly: ignore[missing-attribute]
         if rsi.codecs is not None:
+            # pyrefly: ignore[missing-attribute]
             output = rsi.codecs.forward.decode(output)
+        # pyrefly: ignore[bad-return]
         return output
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         rsi = myreq.rsi
@@ -2155,6 +2192,7 @@ class ReduceScatter_Wait(Function):
 
 class ReduceScatterBase_Req(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -2203,6 +2241,7 @@ class ReduceScatterBase_Req(Function):
 
 class ReduceScatterBase_Wait(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -2218,11 +2257,15 @@ class ReduceScatterBase_Wait(Function):
         ctx.pg = pg
         rsi = myreq.rsi
 
+        # pyrefly: ignore[missing-attribute]
         if rsi.codecs is not None:
+            # pyrefly: ignore[missing-attribute]
             output = rsi.codecs.forward.decode(output)
+        # pyrefly: ignore[bad-return]
         return output
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         rsi = myreq.rsi
@@ -2244,6 +2287,7 @@ class ReduceScatterBase_Wait(Function):
 
 class AllGatherBase_Req(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -2293,6 +2337,7 @@ class AllGatherBase_Req(Function):
 
 class AllGatherBase_Wait(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -2308,11 +2353,15 @@ class AllGatherBase_Wait(Function):
         ctx.pg = pg
 
         agi = myreq.agi
+        # pyrefly: ignore[missing-attribute]
         if agi.codecs is not None:
+            # pyrefly: ignore[missing-attribute]
             outputs = agi.codecs.forward.decode(outputs)
+        # pyrefly: ignore[bad-return]
         return outputs
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def backward(ctx, grad_outputs: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         agi = myreq.agi
@@ -2335,6 +2384,7 @@ class AllGatherBase_Wait(Function):
 
 class ReduceScatterV_Req(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -2397,6 +2447,7 @@ class ReduceScatterV_Req(Function):
 
 class ReduceScatterV_Wait(Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         pg: dist.ProcessGroup,
@@ -2406,6 +2457,7 @@ class ReduceScatterV_Wait(Function):
         assert myreq.req is not None
         myreq.req.wait()
         myreq.req = None
+        # pyrefly: ignore[bad-assignment]
         output: torch.Tensor = myreq.tensor
         myreq.tensor = None
 
@@ -2413,12 +2465,15 @@ class ReduceScatterV_Wait(Function):
         ctx.pg = pg
 
         rsi = myreq.rsi
+        # pyrefly: ignore[missing-attribute]
         if rsi.codecs is not None:
+            # pyrefly: ignore[missing-attribute]
             output = rsi.codecs.forward.decode(output)
 
         return output
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def backward(ctx, grad_output: Tensor) -> Tuple[None, None, Tensor]:
         myreq = ctx.myreq
         rsi = myreq.rsi
@@ -2449,6 +2504,7 @@ class ReduceScatterV_Wait(Function):
 
 class AllToAllSingle(torch.autograd.Function):
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(
         ctx,
         input: Tensor,
@@ -2464,10 +2520,15 @@ class AllToAllSingle(torch.autograd.Function):
         ctx.group_size = group_size
         ctx.gradient_division = gradient_division
         return torch.distributed._functional_collectives.all_to_all_single(
-            input, output_split_sizes, input_split_sizes, group_name
+            input,
+            output_split_sizes,
+            input_split_sizes,
+            # pyrefly: ignore[bad-argument-type]
+            group_name,
         )
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def backward(ctx, grad):
         grad = torch.distributed._functional_collectives.all_to_all_single(
             grad,

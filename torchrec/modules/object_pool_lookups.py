@@ -255,7 +255,9 @@ class TensorJaggedIndexSelectLookup(KeyedJaggedTensorPoolLookup):
 
         with record_function("## TensorPool update ##"):
             key_lengths = (
-                values.lengths().view(-1, len(self._feature_max_lengths)).sum(axis=1)
+                values.lengths().view(-1, len(self._feature_max_lengths))
+                # pyrefly: ignore[no-matching-overload]
+                .sum(axis=1)
             )
             key_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(key_lengths)
 
@@ -402,7 +404,9 @@ class UVMCachingInt64Lookup(KeyedJaggedTensorPoolLookup):
     def update(self, ids: torch.Tensor, values: JaggedTensor) -> None:
         with record_function("## UVMCachingInt64Lookup update ##"):
             key_lengths = (
-                values.lengths().view(-1, len(self._feature_max_lengths)).sum(axis=1)
+                values.lengths().view(-1, len(self._feature_max_lengths))
+                # pyrefly: ignore[no-matching-overload]
+                .sum(axis=1)
             )
             key_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(key_lengths)
             padded_values: torch.Tensor = torch.ops.fbgemm.jagged_to_padded_dense(
@@ -539,7 +543,9 @@ class UVMCachingInt32Lookup(KeyedJaggedTensorPoolLookup):
     def update(self, ids: torch.Tensor, values: JaggedTensor) -> None:
         with record_function("## UVMCachingInt32Lookup update##"):
             key_lengths = (
-                values.lengths().view(-1, len(self._feature_max_lengths)).sum(axis=1)
+                values.lengths().view(-1, len(self._feature_max_lengths))
+                # pyrefly: ignore[no-matching-overload]
+                .sum(axis=1)
             )
             key_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(key_lengths)
             state = torch.ops.fbgemm.jagged_to_padded_dense(

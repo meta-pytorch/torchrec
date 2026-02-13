@@ -144,6 +144,7 @@ def get_device_from_parameter_sharding(
         raise ValueError("Expected EnumerableShardingSpec as input to the function")
 
     device_type_list: Tuple[str, ...] = tuple(
+        # pyrefly: ignore [missing-attribute]
         [shard.placement.device().type for shard in ps.sharding_spec.shards]
     )
     if len(set(device_type_list)) == 1:
@@ -305,6 +306,7 @@ def create_sharding_infos_by_sharding_device_group(
                         # TODO: Need to check if attribute exists for BC
                     ),
                     use_virtual_table=(
+                        # pyrefly: ignore [bad-argument-type]
                         getattr(config, "use_virtual_table", None)
                         # TODO: Need to check if attribute exists for BC
                     ),
@@ -617,6 +619,7 @@ class ShardedEmbeddingBagCollection(
         module_fqn: Optional[str] = None,
         sharded_module_order_overwrite: Optional[List[str]] = None,
     ) -> None:
+        # pyrefly: ignore [missing-attribute]
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
         self._module_fqn = module_fqn
         # Normalize to lowercase for case-insensitive matching
@@ -744,9 +747,11 @@ class ShardedEmbeddingBagCollection(
                     # modify param keys to match EmbeddingBagCollection
                     params: Mapping[str, Union[torch.Tensor, ShardedTensor]] = {}
                     for param_key, weight in tbe_module.fused_optimizer.params.items():
+                        # pyrefly: ignore [unsupported-operation]
                         params["embedding_bags." + param_key] = weight
                     tbe_module.fused_optimizer.params = params
                     optims.append(("", tbe_module.fused_optimizer))
+        # pyrefly: ignore [bad-argument-type]
         self._optim: CombinedOptimizer = CombinedOptimizer(optims)
         self._skip_missing_weight_key: List[str] = []
 
@@ -883,6 +888,7 @@ class ShardedEmbeddingBagCollection(
                         # TODO: Need to check if attribute exists for BC
                     ),
                     use_virtual_table=(
+                        # pyrefly: ignore [bad-argument-type]
                         getattr(config, "use_virtual_table", None)
                         # TODO: Need to check if attribute exists for BC
                     ),
@@ -977,6 +983,7 @@ class ShardedEmbeddingBagCollection(
         for lookup in self._lookups:
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
+            # pyrefly: ignore [not-callable]
             lookup.flush()
 
     @staticmethod
@@ -1098,6 +1105,7 @@ class ShardedEmbeddingBagCollection(
         for lookup in self._lookups:
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
+            # pyrefly: ignore [not-callable]
             lookup.purge()
 
     def _initialize_torch_state(self, skip_registering: bool = False) -> None:  # noqa
@@ -1168,9 +1176,11 @@ class ShardedEmbeddingBagCollection(
                         ]
                         local_shards_wrapper = v._local_tensor
                         shards_wrapper["local_tensors"].extend(
+                            # pyrefly: ignore [missing-attribute]
                             local_shards_wrapper.local_shards()
                         )
                         shards_wrapper["local_offsets"].extend(
+                            # pyrefly: ignore [missing-attribute]
                             local_shards_wrapper.local_offsets()
                         )
                         shards_wrapper["global_size"] = v.size()
@@ -1186,6 +1196,7 @@ class ShardedEmbeddingBagCollection(
                 table_name,
                 tbe_slice,
                 #  `named_parameters_by_table`.
+                # pyrefly: ignore [missing-attribute]
             ) in lookup.named_parameters_by_table():
                 # for virtual table, currently we don't expose id tensor and bucket tensor
                 # because they are not updated in real time, and they are created on the fly
@@ -1207,6 +1218,7 @@ class ShardedEmbeddingBagCollection(
                 ):
                     #  `_in_backward_optimizers`.
                     #  `_in_backward_optimizers`.
+                    # pyrefly: ignore [bad-argument-type, missing-attribute]
                     self.embedding_bags[table_name].weight._in_backward_optimizers = [
                         EmptyFusedOptimizer()
                     ]
@@ -1218,6 +1230,7 @@ class ShardedEmbeddingBagCollection(
                 if shards_wrapper_map["local_tensors"]:
                     self._model_parallel_name_to_dtensor[table_name] = (
                         DTensor.from_local(
+                            # pyrefly: ignore [no-matching-overload]
                             local_tensor=LocalShardsWrapper(
                                 local_shards=shards_wrapper_map["local_tensors"],
                                 local_offsets=shards_wrapper_map["local_offsets"],
@@ -1241,6 +1254,7 @@ class ShardedEmbeddingBagCollection(
                     # empty shard case
                     self._model_parallel_name_to_dtensor[table_name] = (
                         DTensor.from_local(
+                            # pyrefly: ignore [no-matching-overload]
                             local_tensor=LocalShardsWrapper(
                                 local_shards=[],
                                 local_offsets=[],
@@ -1372,6 +1386,7 @@ class ShardedEmbeddingBagCollection(
                         weight_ids_sharded_t,
                         id_cnt_per_bucket_sharded_t,
                         metadata_sharded_t,
+                        # pyrefly: ignore [not-callable]
                     ) in lookup.get_named_split_embedding_weights_snapshot():
                         assert table_name in sharded_kvtensors_copy
                         if self._table_name_to_config[table_name].use_virtual_table:
@@ -1385,6 +1400,7 @@ class ShardedEmbeddingBagCollection(
                             # The logic here assumes there is only one shard per table on any particular rank
                             # if there are cases each rank has >1 shards, we need to update here accordingly
                             sharded_kvtensors_copy[table_name] = weights_t
+                            # pyrefly: ignore [unsupported-operation]
                             virtual_table_sharded_t_map[table_name] = (
                                 weight_ids_sharded_t,
                                 id_cnt_per_bucket_sharded_t,
@@ -1401,6 +1417,7 @@ class ShardedEmbeddingBagCollection(
                             # if there are cases each rank has >1 shards, we need to update here accordingly
                             sharded_kvtensors_copy[table_name].local_shards()[
                                 0
+                                # pyrefly: ignore [bad-assignment]
                             ].tensor = weights_t
 
             def update_destination(
@@ -1433,11 +1450,13 @@ class ShardedEmbeddingBagCollection(
                         destination,
                         virtual_table_sharded_t_map[table_name][1],
                     )
+                    # pyrefly: ignore [bad-index]
                     if virtual_table_sharded_t_map[table_name][2] is not None:
                         update_destination(
                             table_name,
                             "metadata",
                             destination,
+                            # pyrefly: ignore [bad-index]
                             virtual_table_sharded_t_map[table_name][2],
                         )
 
@@ -1476,10 +1495,14 @@ class ShardedEmbeddingBagCollection(
             assert table_config.init_fn is not None
             param = self.embedding_bags[f"{table_config.name}"].weight
             if param.data.dtype in [torch.float8_e4m3fn, torch.float8_e5m2]:
+                # pyrefly: ignore [no-matching-overload]
                 tmp_param = torch.zeros(param.shape, device=param.device)
+                # pyrefly: ignore [missing-attribute]
                 table_config.init_fn(tmp_param).to(param.data.dtype)
+                # pyrefly: ignore [not-callable]
                 param.data.copy_(tmp_param)
             else:
+                # pyrefly: ignore [bad-argument-type]
                 table_config.init_fn(param)
 
             sharding_type = self.module_sharding_plan[table_config.name].sharding_type
@@ -1487,6 +1510,7 @@ class ShardedEmbeddingBagCollection(
                 pg = self._env.process_group
                 with torch.no_grad():
                     #  `Union[Module, Tensor]`.
+                    # pyrefly: ignore [bad-argument-type]
                     dist.broadcast(param.data, src=0, group=pg)
 
     def _create_input_dist(
@@ -1662,6 +1686,7 @@ class ShardedEmbeddingBagCollection(
         dist.all_reduce(flag, op=dist.ReduceOp.MAX, group=env.process_group)
         return bool(flag.item())
 
+    # pyrefly: ignore [bad-override]
     def input_dist(
         self,
         ctx: EmbeddingBagCollectionContext,
@@ -1672,10 +1697,12 @@ class ShardedEmbeddingBagCollection(
         in advance
         """
         if isinstance(features, TensorDict):
+            # pyrefly: ignore [no-matching-overload]
             feature_keys = list(features.keys())
             if len(self._features_order) > 0:
                 feature_keys = [feature_keys[i] for i in self._features_order]
                 self._has_features_permute = False  # feature_keys are in order
+            # pyrefly: ignore [bad-argument-type]
             features = maybe_td_to_kjt(features, feature_keys)
         ctx.variable_batch_per_feature = features.variable_stride_per_key()
         ctx.inverse_indices = features.inverse_indices_or_none()
@@ -1696,6 +1723,7 @@ class ShardedEmbeddingBagCollection(
                 features = features.permute(
                     self._features_order,
                     #  but got `Union[Module, Tensor]`.
+                    # pyrefly: ignore [bad-argument-type]
                     self._features_order_tensor,
                 )
             if self._has_mean_pooling_callback:
@@ -1706,12 +1734,15 @@ class ShardedEmbeddingBagCollection(
                     offsets=features.offsets(),
                     pooling_type_to_rs_features=self._pooling_type_to_rs_features,
                     stride_per_key=features.stride_per_key(),
+                    # pyrefly: ignore [bad-argument-type]
                     dim_per_key=self._dim_per_key,
                     embedding_names=self._embedding_names,
                     embedding_dims=self._embedding_dims,
                     variable_batch_per_feature=ctx.variable_batch_per_feature,
+                    # pyrefly: ignore [bad-argument-type]
                     kjt_inverse_order=self._kjt_inverse_order,
                     kjt_key_indices=self._kjt_key_indices,
+                    # pyrefly: ignore [bad-argument-type]
                     kt_key_ordering=self._kt_key_ordering,
                     inverse_indices=ctx.inverse_indices,
                     weights=features.weights_or_none(),
@@ -1828,6 +1859,7 @@ class ShardedEmbeddingBagCollection(
                 # with fully sharded 2D enabled, it returns an awaitable for the reduce scatter and resize operation
                 embs = lookup(features)
                 if hasattr(lookup, "get_resize_awaitables"):
+                    # pyrefly: ignore [not-callable]
                     resize_awaitables.extend(lookup.get_resize_awaitables())
                 if self.post_lookup_tracker_fn is not None:
                     self.post_lookup_tracker_fn(features, embs, self, None)
@@ -1908,6 +1940,7 @@ class ShardedEmbeddingBagCollection(
         """
         if env.output_dtensor:
             raise RuntimeError("We do not yet support DTensor for resharding yet")
+            # pyrefly: ignore [unreachable]
             return
 
         current_state = self.state_dict()
@@ -1982,10 +2015,12 @@ class ShardedEmbeddingBagCollection(
                         param_key,
                         weight,
                     ) in tbe_module.fused_optimizer.params.items():
+                        # pyrefly: ignore [unsupported-operation]
                         params["embedding_bags." + param_key] = weight
                     tbe_module.fused_optimizer.params = params
                     optims.append(("", tbe_module.fused_optimizer))
 
+        # pyrefly: ignore [bad-argument-type]
         self._optim: CombinedOptimizer = CombinedOptimizer(optims)
         new_state = self.state_dict()
 
@@ -2070,8 +2105,10 @@ class ShardedEmbeddingBagCollection(
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
             if hasattr(lookup, "create_rocksdb_hard_link_snapshot") and callable(
+                # pyrefly: ignore [not-callable]
                 lookup.create_rocksdb_hard_link_snapshot()
             ):
+                # pyrefly: ignore [not-callable]
                 lookup.create_rocksdb_hard_link_snapshot()
 
     @property
@@ -2190,6 +2227,7 @@ class ShardedEmbeddingBag(
         fused_params: Optional[Dict[str, Any]] = None,
         device: Optional[torch.device] = None,
     ) -> None:
+        # pyrefly: ignore [missing-attribute]
         super().__init__()
 
         assert (
@@ -2247,9 +2285,11 @@ class ShardedEmbeddingBag(
                 # modify param keys to match EmbeddingBag
                 params: Mapping[str, Union[torch.Tensor, ShardedTensor]] = {}
                 for param_key, weight in module.fused_optimizer.params.items():
+                    # pyrefly: ignore [unsupported-operation]
                     params[param_key.split(".")[-1]] = weight
                 module.fused_optimizer.params = params
                 optims.append(("", module.fused_optimizer))
+        # pyrefly: ignore [bad-argument-type]
         self._optim: CombinedOptimizer = CombinedOptimizer(optims)
 
     @classmethod
@@ -2271,6 +2311,7 @@ class ShardedEmbeddingBag(
             qcomm_codecs_registry=qcomm_codecs_registry,
         )
 
+    # pyrefly: ignore [bad-override]
     def input_dist(
         self,
         ctx: NullShardedModuleContext,
@@ -2300,6 +2341,7 @@ class ShardedEmbeddingBag(
             awaitable=self._output_dist(output),
         )
 
+    # pyrefly: ignore [bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -2308,7 +2350,9 @@ class ShardedEmbeddingBag(
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
+            # pyrefly: ignore [missing-attribute]
             destination._metadata = OrderedDict()
+        # pyrefly: ignore [no-matching-overload]
         lookup_state_dict = self._lookup.state_dict(None, "", keep_vars)
         # update key to match embeddingBag state_dict key
         for key, item in lookup_state_dict.items():
@@ -2347,6 +2391,7 @@ class ShardedEmbeddingBag(
             yield append_prefix(prefix, name.split(".")[-1]), buffer
 
     #  inconsistently.
+    # pyrefly: ignore [bad-override]
     def load_state_dict(
         self,
         state_dict: "OrderedDict[str, torch.Tensor]",
@@ -2435,11 +2480,17 @@ def _create_mean_pooling_divisor(
 
         if variable_batch_per_feature:
             inverse_indices = none_throws(inverse_indices)
+            # pyrefly: ignore [unsupported-operation]
             device = inverse_indices[1].device
+            # pyrefly: ignore [unsupported-operation]
             inverse_indices_t = inverse_indices[1]
+            # pyrefly: ignore [unsupported-operation]
             if len(keys) != len(inverse_indices[0]):
                 inverse_indices_t = torch.index_select(
-                    inverse_indices[1], 0, kjt_inverse_order
+                    # pyrefly: ignore [unsupported-operation]
+                    inverse_indices[1],
+                    0,
+                    kjt_inverse_order,
                 )
             offsets = _to_offsets(torch.tensor(stride_per_key, device=device))[
                 :-1

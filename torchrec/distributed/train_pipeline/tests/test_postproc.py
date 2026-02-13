@@ -183,20 +183,28 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         pipelined_weighted_ebc = pipeline._pipelined_modules[1]
 
         # Check pipelined args
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_ebc.forward._args.args), 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_ebc.forward._args.kwargs), 0)
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             pipelined_ebc.forward._args.args[0].steps,
             [
+                # pyrefly: ignore[missing-attribute]
                 PostprocArgInfoStep(pipelined_model.module.postproc_nonweighted),
                 GetItemArgInfoStep(0),
             ],
         )
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_weighted_ebc.forward._args.args), 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_weighted_ebc.forward._args.kwargs), 0)
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             pipelined_weighted_ebc.forward._args.args[0].steps,
             [
+                # pyrefly: ignore[missing-attribute]
                 PostprocArgInfoStep(pipelined_model.module.postproc_weighted),
                 GetItemArgInfoStep(0),
             ],
@@ -221,6 +229,7 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         self.assertIsInstance(postproc2_args.args[0].steps[1], GetAttrArgInfoStep)
 
         get_arg_infos = {
+            # pyrefly: ignore[missing-attribute]
             postproc._args.args[0].steps[1].attr_name
             for postproc in pipeline._pipelined_postprocs
         }
@@ -269,20 +278,28 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         pipelined_weighted_ebc = pipeline._pipelined_modules[1]
 
         # Check pipelined args
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_ebc.forward._args.args), 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_ebc.forward._args.kwargs), 0)
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             pipelined_ebc.forward._args.args[0].steps,
             [
+                # pyrefly: ignore[missing-attribute]
                 PostprocArgInfoStep(pipelined_model.module.postproc_nonweighted),
                 GetItemArgInfoStep(0),
             ],
         )
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_weighted_ebc.forward._args.args), 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_weighted_ebc.forward._args.kwargs), 0)
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             pipelined_weighted_ebc.forward._args.args[0].steps,
             [
+                # pyrefly: ignore[missing-attribute]
                 PostprocArgInfoStep(pipelined_model.module.postproc_weighted),
                 GetItemArgInfoStep(0),
             ],
@@ -291,10 +308,12 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         # postproc args
         self.assertEqual(len(pipeline._pipelined_postprocs), 3)
 
+        # pyrefly: ignore[missing-attribute]
         parent_postproc_mod = pipelined_model.module._postproc_module
 
         for postproc_mod in pipeline._pipelined_postprocs:
             #  `postproc_nonweighted`.
+            # pyrefly: ignore[missing-attribute]
             if postproc_mod == pipelined_model.module.postproc_nonweighted:
                 self.assertEqual(len(postproc_mod._args.args), 1)
                 self.assertEqual(len(postproc_mod._args.kwargs), 0)
@@ -307,6 +326,7 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
                 )
 
             #  `postproc_weighted`.
+            # pyrefly: ignore[missing-attribute]
             elif postproc_mod == pipelined_model.module.postproc_weighted:
                 self.assertEqual(len(postproc_mod._args.args), 1)
                 self.assertEqual(len(postproc_mod._args.kwargs), 0)
@@ -473,6 +493,7 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(
             pipeline._pipelined_postprocs[0],
             #  `postproc_weighted`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.postproc_weighted,
         )
 

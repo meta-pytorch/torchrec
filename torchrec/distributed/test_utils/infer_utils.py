@@ -161,11 +161,13 @@ class KJTInputExportDynamicShapeWrapper(torch.nn.Module):
         values_size = values[0].item()
         torch._check_is_size(values_size)
         torch._check(values_size >= lengths.shape[0])
+        # pyrefly: ignore[no-matching-overload]
         values = torch.ones(values_size).to(values.device)
         if weights is not None:
             weights_size = weights.int()[0].item()
             torch._check_is_size(weights_size)
             torch._check(weights_size >= lengths.shape[0])
+            # pyrefly: ignore[no-matching-overload]
             weights = torch.ones(weights_size).to(weights.device)
 
         return self.kjt_input_wrapper(values, lengths, weights, *args, **kwargs)
@@ -327,8 +329,11 @@ def quantize(
     per_table_weight_dtypes: Optional[Dict[str, torch.dtype]] = None,
 ) -> torch.nn.Module:
     module_types: List[Type[torch.nn.Module]] = [
+        # pyrefly: ignore[implicit-import]
         torchrec.modules.embedding_modules.EmbeddingBagCollection,
+        # pyrefly: ignore[implicit-import]
         torchrec.modules.embedding_modules.EmbeddingCollection,
+        # pyrefly: ignore[implicit-import]
         torchrec.modules.mc_embedding_modules.ManagedCollisionEmbeddingCollection,
     ]
     if register_tbes:
@@ -376,6 +381,7 @@ def quantize_fpebc(
     per_table_weight_dtypes: Optional[Dict[str, torch.dtype]] = None,
 ) -> torch.nn.Module:
     module_types: List[Type[torch.nn.Module]] = [
+        # pyrefly: ignore[implicit-import]
         torchrec.modules.fp_embedding_modules.FeatureProcessedEmbeddingBagCollection,
     ]
     if register_tbes:
@@ -441,9 +447,11 @@ class TestQuantFPEBCSharder(QuantFeatureProcessedEmbeddingBagCollectionSharder):
         fused_params["output_dtype"] = data_type_to_sparse_type(
             dtype_to_data_type(module.output_dtype())
         )
+        # pyrefly: ignore[unsupported-operation]
         fused_params[FUSED_PARAM_REGISTER_TBE_BOOL] = getattr(
             module, MODULE_ATTR_REGISTER_TBES_BOOL, False
         )
+        # pyrefly: ignore[unsupported-operation]
         fused_params[FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS] = getattr(
             module, MODULE_ATTR_QUANT_STATE_DICT_SPLIT_SCALE_BIAS, False
         )
@@ -489,9 +497,11 @@ class TestQuantEBCSharder(QuantEmbeddingBagCollectionSharder):
         fused_params["output_dtype"] = data_type_to_sparse_type(
             dtype_to_data_type(module.output_dtype())
         )
+        # pyrefly: ignore[unsupported-operation]
         fused_params[FUSED_PARAM_REGISTER_TBE_BOOL] = getattr(
             module, MODULE_ATTR_REGISTER_TBES_BOOL, False
         )
+        # pyrefly: ignore[unsupported-operation]
         fused_params[FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS] = getattr(
             module, MODULE_ATTR_QUANT_STATE_DICT_SPLIT_SCALE_BIAS, False
         )
@@ -536,9 +546,11 @@ class TestQuantECSharder(QuantEmbeddingCollectionSharder):
         fused_params["output_dtype"] = data_type_to_sparse_type(
             dtype_to_data_type(module.output_dtype())
         )
+        # pyrefly: ignore[unsupported-operation]
         fused_params[FUSED_PARAM_REGISTER_TBE_BOOL] = getattr(
             module, MODULE_ATTR_REGISTER_TBES_BOOL, False
         )
+        # pyrefly: ignore[unsupported-operation]
         fused_params[FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS] = getattr(
             module, MODULE_ATTR_QUANT_STATE_DICT_SPLIT_SCALE_BIAS, False
         )
@@ -868,6 +880,7 @@ def shard_qebc(
             ),
         )
     if not plan:
+        # pyrefly: ignore[missing-attribute]
         plan = mi.planner.plan(
             mi.quant_model,
             [sharder],
@@ -876,11 +889,14 @@ def shard_qebc(
     if expected_shards is not None:
         msp = plan.plan[ebc_fqn]
         for i in range(mi.num_features):
+            # pyrefly: ignore[bad-index]
             ps: ParameterSharding = msp[f"table_{i}"]
             assert ps.sharding_type == sharding_type.value
             assert ps.sharding_spec is not None
             sharding_spec: ShardingSpec = ps.sharding_spec
+            # pyrefly: ignore[missing-attribute]
             assert len(sharding_spec.shards) == len(expected_shards[i])
+            # pyrefly: ignore[no-matching-overload]
             for shard, ((offset_r, offset_c, size_r, size_c), placement) in zip(
                 sharding_spec.shards, expected_shards[i]
             ):
@@ -893,8 +909,10 @@ def shard_qebc(
     sharded_model, _ = shard_quant_model(
         model=quant_model_copy,
         #  `Optional[List[ModuleSharder[Module]]]` but got `List[TestQuantEBCSharder]`.
+        # pyrefly: ignore[bad-argument-type]
         sharders=[sharder],
         sharding_device=str(device),
+        # pyrefly: ignore[missing-attribute]
         world_size=mi.topology.world_size,
         sharding_plan=plan,
     )
@@ -914,6 +932,7 @@ def shard_qec(
     )
 
     if not plan:
+        # pyrefly: ignore[missing-attribute]
         plan = mi.planner.plan(
             mi.quant_model,
             [sharder],
@@ -922,11 +941,14 @@ def shard_qec(
     if expected_shards is not None:
         msp: ModuleShardingPlan = plan.plan["_module_kjt_input.0"]  # TODO: hardcoded
         for i in range(mi.num_features):
+            # pyrefly: ignore[bad-index]
             ps: ParameterSharding = msp[f"table_{i}"]
             assert ps.sharding_type == sharding_type.value
             assert ps.sharding_spec is not None
             sharding_spec: ShardingSpec = ps.sharding_spec
+            # pyrefly: ignore[missing-attribute]
             assert len(sharding_spec.shards) == len(expected_shards[i])
+            # pyrefly: ignore[no-matching-overload]
             for shard, ((offset_r, offset_c, size_r, size_c), placement) in zip(
                 sharding_spec.shards, expected_shards[i]
             ):
@@ -939,9 +961,11 @@ def shard_qec(
     sharded_model = _shard_modules(
         module=quant_model_copy,
         #  `Optional[List[ModuleSharder[Module]]]` but got `List[TestQuantECSharder]`.
+        # pyrefly: ignore[bad-argument-type]
         sharders=[sharder],
         device=device,
         plan=plan,
+        # pyrefly: ignore[missing-attribute]
         env=ShardingEnv.from_local(world_size=mi.topology.world_size, rank=0),
     )
     return sharded_model
@@ -1058,6 +1082,7 @@ class MockTBE(nn.Module):
         self, split_scale_bias_mode: int = 1
     ) -> List[Tuple[Tensor, Optional[Tensor], Optional[Tensor]]]:
         if split_scale_bias_mode == 2:
+            # pyrefly: ignore[bad-return]
             return self.split_embedding_weights
         raise NotImplementedError()
 
@@ -1088,5 +1113,6 @@ def replace_sharded_quant_modules_tbes_with_mock_tbes(M: torch.nn.Module) -> Non
         if isinstance(m, ShardedQuantEmbeddingBagCollection):
             for lookup in m._lookups:
                 #  not a function.
+                # pyrefly: ignore[not-iterable]
                 for lookup_per_rank in lookup._embedding_lookups_per_rank:
                     replace_registered_tbes_with_mock_tbes(lookup_per_rank)

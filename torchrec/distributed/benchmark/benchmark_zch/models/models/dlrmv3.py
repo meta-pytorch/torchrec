@@ -107,6 +107,7 @@ class DLRMv3(nn.Module):
             mt_target_weights.detach(),
         )
 
+    # pyrefly: ignore[bad-override]
     def eval(self) -> None:
         self.dlrm_hstu.eval()
 
@@ -132,6 +133,7 @@ def make_model_dlrmv3(
     hstu_config.item_embedding_feature_names = configs["item_embedding_feature_names"]
     hstu_config.uih_post_id_feature_name = configs["uih_post_id_feature_name"]
     hstu_config.uih_weight_feature_name = (
+        # pyrefly: ignore[bad-assignment]
         configs["uih_weight_feature_name"]
         if "uih_weight_feature_name" in configs
         else None
@@ -147,6 +149,7 @@ def make_model_dlrmv3(
         "candidates_querytime_feature_name"
     ]
     hstu_config.contextual_feature_to_min_uih_length = (
+        # pyrefly: ignore[bad-assignment]
         configs["contextual_feature_to_min_uih_length"]
         if "contextual_feature_to_min_uih_length" in configs
         else None
@@ -218,6 +221,7 @@ def make_model_dlrmv3(
         )
         # This is because we want to implement managed collision functions without changing the DLRM_HSTU class. The EmbeddingCollectionAdapter will simulate all the
         # APIs for EmbeddingCollection, and we can use it to replace the EmbeddingCollection in DLRM_HSTU for managed collision functions.
+        # pyrefly: ignore[bad-assignment]
         model.dlrm_hstu._embedding_collection = ec_adapter
 
     return model

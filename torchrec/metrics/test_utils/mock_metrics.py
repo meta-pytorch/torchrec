@@ -114,6 +114,7 @@ class MockRecMetric(RecMetric):
             batch_size=batch_size,
             tasks=tasks,
             compute_mode=compute_mode,
+            # pyrefly: ignore[bad-argument-type]
             **{
                 **kwargs,
                 "initial_states": default_states,

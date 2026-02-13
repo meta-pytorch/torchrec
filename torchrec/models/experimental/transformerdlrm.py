@@ -175,6 +175,7 @@ class DLRM_Transformer(DLRM):
             0
         ].embedding_dim
         num_sparse_features: int = len(self.sparse_arch.sparse_feature_names)
+        # pyrefly: ignore[bad-assignment]
         self.inter_arch = InteractionTransformerArch(
             num_sparse_features=num_sparse_features,
             embedding_dim=embedding_dim,

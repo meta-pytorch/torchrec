@@ -102,11 +102,13 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
             ),
             constraints=constraints,
         )
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         plan = planner.plan(unsharded_model, sharders)
 
         ### apply Rowwise Adagrad optimizer to fused TBEs ###
         # fused TBE optimizer needs to be configured before initializing
         #  `named_parameters`.
+        # pyrefly: ignore[missing-attribute]
         for _, param in unsharded_model.sparse.named_parameters():
             apply_optimizer_in_backward(
                 RowWiseAdagrad,
@@ -129,10 +131,12 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
             dict(
                 in_backward_optimizer_filter(
                     #  attribute `named_parameters`.
+                    # pyrefly: ignore[missing-attribute]
                     sharded_model.module.sparse.named_parameters()
                 )
             ),
             lambda params: RowWiseAdagrad(
+                # pyrefly: ignore[bad-argument-type]
                 params,
                 lr=non_fused_learning_rate,
                 eps=1e-8,  # to match with FBGEMM
@@ -162,11 +166,14 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
 
         # record signatures
         #  `dhn_arch`.
+        # pyrefly: ignore[missing-attribute]
         dense_signature = sharded_model.module.over.dhn_arch.linear0.weight.sum().item()
         non_fused_table_signature = (
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.embedding_bags.table_0.weight.sum().item()
         )
         fused_table_signature = (
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.embedding_bags.table_1.weight.sum().item()
         )
 
@@ -184,17 +191,20 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
         dense_opt.step()
 
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.embedding_bags.table_1.weight.sum().item()
             != fused_table_signature,
             bool(fused_learning_rate),
         )
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.embedding_bags.table_0.weight.sum().item()
             != non_fused_table_signature,
             bool(non_fused_learning_rate),
         )
         self.assertEqual(
             #  `dhn_arch`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.over.dhn_arch.linear0.weight.sum().item()
             != dense_signature,
             bool(dense_learning_rate),

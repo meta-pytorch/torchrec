@@ -308,7 +308,9 @@ class TestCombinedOptimizer(unittest.TestCase):
         # param_groups updated.
         self.assertEqual(keyed_optimizer_1.state[param_1], {"one": 999})
         self.assertEqual(keyed_optimizer_2.state[param_2], {"two": 998})
+        # pyrefly: ignore[bad-index]
         self.assertEqual(keyed_optimizer_1.param_groups[0]["param_group_val_0"], 997)
+        # pyrefly: ignore[bad-index]
         self.assertEqual(keyed_optimizer_2.param_groups[0]["param_group_val_0"], 996)
 
 
@@ -333,5 +335,7 @@ class TestOptimizerWrapper(unittest.TestCase):
         # param_groups updated.
         self.assertEqual(keyed_optimizer.state[param_1], {"one": 999})
         self.assertEqual(optimizer_wrapper.state[param_1], {"one": 999})
+        # pyrefly: ignore[bad-index]
         self.assertEqual(keyed_optimizer.param_groups[0]["param_group_val_0"], 998)
+        # pyrefly: ignore[bad-index]
         self.assertEqual(optimizer_wrapper.param_groups[0]["param_group_val_0"], 998)

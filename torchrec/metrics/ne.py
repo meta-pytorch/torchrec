@@ -220,5 +220,6 @@ class NEMetricComputation(RecMetricComputation):
 
 
 class NEMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.NE
     _computation_class: Type[RecMetricComputation] = NEMetricComputation

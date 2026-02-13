@@ -528,6 +528,7 @@ class KJTBucketizeTest(unittest.TestCase):
         block_bucketize_row_pos = [] if variable_bucket_pos else None
         if variable_bucket_pos:
             for block_size in block_sizes_list:
+                # pyrefly: ignore[missing-attribute]
                 block_bucketize_row_pos.append(
                     torch.tensor(
                         [w * block_size for w in range(world_size + 1)],
