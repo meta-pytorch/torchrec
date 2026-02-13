@@ -8,6 +8,10 @@
 # pyre-strict
 
 
+from torchrec.distributed.train_pipeline.gradient_accumulation import (  # noqa
+    GradientAccumulationConfig,  # noqa
+    GradientAccumulationWrapper,  # noqa
+)
 from torchrec.distributed.train_pipeline.pipeline_context import (  # noqa
     In,
     Out,
