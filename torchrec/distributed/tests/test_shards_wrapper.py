@@ -89,7 +89,8 @@ def all_gather_object(
         )
         for i in range(world_size):
             torch.testing.assert_close(
-                output[i]._local_shards[0],  # pyre-ignore[16]
+                # pyrefly: ignore[missing-attribute]
+                output[i]._local_shards[0],
                 shards_wrapper[i]._local_shards[0],
             )
 
@@ -99,7 +100,6 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
     def setUp(self, backend: str = "nccl") -> None:
         super().setUp()
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -116,7 +116,9 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
         offsets = [(0, 0)]
 
         # shards wrapper for rank 0 and rank 1, offsets don't matter
+        # pyrefly: ignore[bad-argument-type]
         ls_0 = LocalShardsWrapper(local_shards=shards_0, local_offsets=offsets)
+        # pyrefly: ignore[bad-argument-type]
         ls_1 = LocalShardsWrapper(local_shards=shards_1, local_offsets=offsets)
 
         self._run_multi_process_test(
@@ -130,7 +132,6 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
             backend=backend,
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -145,7 +146,9 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
         offsets = [(0, 0)]
 
         # shards wrapper for rank 0 and rank 1, offsets don't matter
+        # pyrefly: ignore[bad-argument-type]
         ls_0 = LocalShardsWrapper(local_shards=shards_0, local_offsets=offsets)
+        # pyrefly: ignore[bad-argument-type]
         ls_1 = LocalShardsWrapper(local_shards=shards_1, local_offsets=offsets)
 
         self._run_multi_process_test(
@@ -159,7 +162,6 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
             backend=backend,
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -174,7 +176,9 @@ class LocalShardsWrapperDistributedTest(MultiProcessTestBase):
         offsets = [(0, 0)]
 
         # shards wrapper for rank 0 and rank 1, offsets don't matter
+        # pyrefly: ignore[bad-argument-type]
         ls_0 = LocalShardsWrapper(local_shards=shards_0, local_offsets=offsets)
+        # pyrefly: ignore[bad-argument-type]
         ls_1 = LocalShardsWrapper(local_shards=shards_1, local_offsets=offsets)
 
         self._run_multi_process_test(

@@ -120,7 +120,7 @@ def create_test_initial_state_dict(
 
     initial_state_dict = {}
     for i in range(num_tables):
-        # pyre-ignore
+        # pyrefly: ignore[not-callable]
         extended_name = sharded_module_type.extend_shard_name(table_name(i))
         initial_state_dict[extended_name] = torch.tensor(
             [[j + (i * 100)] * embedding_dim for j in range(num_embeddings)],
@@ -225,6 +225,7 @@ def _test_ebc_resharding(
 
     TODO: modify to include other modules once dynamic sharding is built out.
     """
+    # pyrefly: ignore[implicit-import]
     trec_dist.comm_ops.set_gradient_division(False)
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         kjt_input_per_rank = [kjt.to(ctx.device) for kjt in kjt_input_per_rank]
@@ -260,7 +261,7 @@ def _test_ebc_resharding(
 
         sharder = get_module_to_default_sharders()[type(m1)]
 
-        # pyre-ignore
+        # pyrefly: ignore[bad-argument-type]
         env = ShardingEnv.from_process_group(ctx.pg)
 
         sharded_m1 = sharder.shard(
@@ -281,7 +282,7 @@ def _test_ebc_resharding(
             module_sharding_plan, new_module_sharding_plan
         )
 
-        # pyre-ignore
+        # pyrefly: ignore[missing-attribute]
         resharded_m2 = sharder.reshard(
             sharded_module=sharded_m2,
             changed_shard_to_params=new_module_sharding_plan_delta,
@@ -289,6 +290,7 @@ def _test_ebc_resharding(
             device=ctx.device,
         )
 
+        # pyrefly: ignore[bad-argument-type]
         are_sharded_ebc_modules_identical(sharded_m1, resharded_m2)
 
         feature_keys = []
@@ -344,7 +346,7 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
 
         module_sharding_plan = construct_module_sharding_plan(
             EmbeddingBagCollection(tables=embedding_bag_config),
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             per_param_sharding=per_param_sharding,
             local_size=world_size,
             world_size=world_size,
@@ -353,7 +355,7 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
 
         new_module_sharding_plan = construct_module_sharding_plan(
             EmbeddingBagCollection(tables=embedding_bag_config),
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             per_param_sharding=new_per_param_sharding,
             local_size=world_size,
             world_size=world_size,
@@ -380,7 +382,8 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
         if use_debug_state_dict:
             # initial_state_dict filled with deterministic dummy values
             initial_state_dict = create_test_initial_state_dict(
-                ShardedEmbeddingBagCollection,  # pyre-ignore
+                # pyrefly: ignore[bad-argument-type]
+                ShardedEmbeddingBagCollection,
                 num_tables,
                 data_type,
                 embedding_dim,
@@ -402,7 +405,7 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
         torch.cuda.device_count() < 4,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    @given(  # pyre-ignore
+    @given(
         num_tables=st.sampled_from([2, 3, 4]),
         data_type=st.sampled_from([DataType.FP32, DataType.FP16]),
         world_size=st.sampled_from([2, 4]),
@@ -440,7 +443,9 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
             new_per_param_sharding[table_name(i)] = table_wise(rank=new_ranks[i][0])
 
         self._run_ebc_resharding_test(
+            # pyrefly: ignore[bad-argument-type]
             per_param_sharding,
+            # pyrefly: ignore[bad-argument-type]
             new_per_param_sharding,
             num_tables,
             world_size,
@@ -451,7 +456,7 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    @given(  # pyre-ignore
+    @given(
         num_tables=st.sampled_from([2, 3, 4]),
         data_type=st.sampled_from([DataType.FP32, DataType.FP16]),
         world_size=st.sampled_from([3, 4]),
@@ -501,7 +506,9 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
             new_per_param_sharding[table_name(i)] = column_wise(ranks=new_ranks[i])
 
         self._run_ebc_resharding_test(
+            # pyrefly: ignore[bad-argument-type]
             per_param_sharding,
+            # pyrefly: ignore[bad-argument-type]
             new_per_param_sharding,
             num_tables,
             world_size,
@@ -516,7 +523,7 @@ class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    @given(  # Pyre-ignore
+    @given(
         sharder_type=st.sampled_from(
             [
                 SharderType.EMBEDDING_BAG_COLLECTION.value,
@@ -610,7 +617,8 @@ class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
         sharding_type_e = ShardingType(sharding_type)
 
         self._test_dynamic_sharding(
-            sharders=[  # Pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[
                 create_test_sharder(
                     sharder_type,
                     sharding_type,
@@ -621,7 +629,7 @@ class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
             ],
             backend=self.backend,
             qcomms_config=qcomms_config,
-            # Pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
             variable_batch_size=variable_batch_size,
             data_type=data_type,

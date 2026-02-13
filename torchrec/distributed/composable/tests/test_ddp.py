@@ -71,6 +71,7 @@ class DDPTest(MultiProcessTestBase):
                         requires_grad=param.requires_grad,
                     )
 
+            # pyrefly: ignore[invalid-param-spec]
             shard_modules(m, device=ctx.device, init_params=True)
             # init_params should move m to `device`
             for p in m.parameters():
@@ -105,19 +106,21 @@ class DDPTest(MultiProcessTestBase):
                 weighted_tables=weighted_tables,
                 dense_device=ctx.device,
             )
-            # pyre-ignore
+            # pyrefly: ignore[invalid-param-spec]
             m.sparse.ebc = trec_shard(
                 module=m.sparse.ebc,
                 device=ctx.device,
                 plan=column_wise(ranks=list(range(world_size))),
             )
-            # pyre-ignore
+            # pyrefly: ignore[invalid-param-spec]
             m.sparse.weighted_ebc = trec_shard(
                 module=m.sparse.weighted_ebc,
                 device=ctx.device,
                 plan=column_wise(ranks=list(range(world_size))),
             )
+            # pyrefly: ignore[invalid-param-spec]
             m.over = replicate(m.over)
+            # pyrefly: ignore[bad-assignment, invalid-param-spec]
             m.dense = replicate(m.dense)
 
             ######## run one iteration ########
@@ -161,7 +164,6 @@ class DDPTest(MultiProcessTestBase):
             # assert p_sum.allclose(p_sum_loaded)
 
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     #  `torch.cuda.device_count() <= 1` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
@@ -175,7 +177,6 @@ class DDPTest(MultiProcessTestBase):
             )
 
     @skip_if_asan
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     #  `torch.cuda.device_count() <= 1` to decorator factory `unittest.skipIf`.
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,

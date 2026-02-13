@@ -224,10 +224,12 @@ def runner(
     fn_kwargs = {"keyed_tensors": kts, "groups": groups}
 
     # Initial call to warm up
+    # pyrefly: ignore[not-callable]
     fn(**fn_kwargs)
 
     def _func_to_benchmark(
         _bench_inputs: List[Any],
+        # pyrefly: ignore[bad-function-definition]
         fn: Callable[..., List[torch.Tensor]] = fn,
         fn_kwargs: Dict[str, Any] = fn_kwargs,
         run_backward: bool = run_option.run_backward,
@@ -254,7 +256,7 @@ def runner(
     return result
 
 
-@cmd_conf  # pyre-ignore [56]
+@cmd_conf
 def main(
     run_option: RunOptions,
 ) -> None:
@@ -266,6 +268,7 @@ def main(
     """
     run_option.set_log_level()
     if run_option.debug_mode:
+        # pyrefly: ignore[missing-module-attribute]
         from fbvscode import attach_debugger
 
         attach_debugger()
@@ -278,4 +281,5 @@ def main(
 
 
 if __name__ == "__main__":
+    # pyrefly: ignore[not-callable]
     main()

@@ -53,8 +53,8 @@ class TestShardedTensorPool(MultiProcessTestBase):
                 module=tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
-                # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
                 #  `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
 
@@ -120,7 +120,6 @@ class TestShardedTensorPool(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore
     @given(
         enable_uvm=st.booleans(),
     )
@@ -160,8 +159,8 @@ class TestShardedTensorPool(MultiProcessTestBase):
                 module=tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
-                # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
                 #  `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
 
@@ -197,7 +196,6 @@ class TestShardedTensorPool(MultiProcessTestBase):
                 ),
             )
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

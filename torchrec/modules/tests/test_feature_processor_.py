@@ -115,7 +115,6 @@ class PositionWeightedCollectionModuleTest(unittest.TestCase):
             empty_fp_kjt.length_per_key(), empty_fp_kjt_gm_script.length_per_key()
         )
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "Not enough GPUs available",
@@ -140,12 +139,12 @@ class PositionWeightedCollectionModuleTest(unittest.TestCase):
             pwmc, current_device=torch.device("cpu"), to_device=torch.device("meta")
         )
 
-        # pyre-fixme[29]: `Union[(self: TensorBase) -> Tensor, Tensor, Module]` is
         #  not a function.
+        # pyrefly: ignore[not-callable]
         self.assertTrue(all(param.is_meta for param in res.position_weights.values()))
         self.assertTrue(
-            # pyre-fixme[29]: `Union[(self: TensorBase) -> Tensor, Tensor, Module]`
             #  is not a function.
+            # pyrefly: ignore[not-callable]
             all(param.is_meta for param in res.position_weights_dict.values())
         )
 

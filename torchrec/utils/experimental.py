@@ -55,7 +55,7 @@ def experimental(
         ... class HybridDistributedModelParallel:
         ...     ...
     """
-    tag: str = feature or obj.__name__  # pyre-ignore[16]
+    tag: str = feature or obj.__name__
     message_parts: list[str] = [
         f"`{tag}` is *experimental* and may change or be removed without notice."
     ]
@@ -71,7 +71,7 @@ def experimental(
         orig_init: Callable[..., None] = obj.__init__
 
         @functools.wraps(orig_init)
-        def new_init(self, *args: Any, **kwargs: Any) -> Any:  # pyre-ignore[2, 3]
+        def new_init(self, *args: Any, **kwargs: Any) -> Any:
             _issue_warning()
             return orig_init(self, *args, **kwargs)
 
@@ -79,9 +79,10 @@ def experimental(
         return obj
     else:
 
-        @functools.wraps(obj)  # pyre-ignore[6]
-        def wrapper(*args: Any, **kwargs: Any) -> Any:  # pyre-ignore[3]
+        @functools.wraps(obj)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             _issue_warning()
-            return obj(*args, **kwargs)  # pyre-ignore[29]
+            return obj(*args, **kwargs)
 
+        # pyrefly: ignore[bad-return]
         return wrapper

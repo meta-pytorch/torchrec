@@ -110,7 +110,7 @@ def _get_recat(
             batch_size_per_feature = list(
                 itertools.chain.from_iterable(
                     itertools.repeat(x, local_split)
-                    # pyre-ignore
+                    # pyrefly: ignore[not-iterable]
                     for x in batch_size_per_rank
                 )
             )
@@ -251,6 +251,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                     ].repeat(2)
                 else:
                     self._output_tensor = (
+                        # pyrefly: ignore[implicit-import]
                         dist._functional_collectives.all_to_all_single(
                             input_tensor,
                             output_split_sizes=None,
@@ -259,7 +260,6 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                         )
                     )
             # To avoid hasattr in _wait_impl to check self._splits_awaitable
-            # pyre-ignore
             self._splits_awaitable = None
         else:
             with record_function("## all2all_data:kjt splits ##"):
@@ -387,6 +387,7 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
                             input_tensor[_l:_r].repeat(self._world_size)
                         )
                     else:
+                        # pyrefly: ignore[implicit-import]
                         output_tensor = dist._functional_collectives.all_to_all_single(
                             input_tensor,
                             output_split,
@@ -530,9 +531,7 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
                         self._output_splits[i][rank] == self._input_splits[i][rank]
                     )
                 if self._stride_per_rank is not None:
-                    # pyre-ignore
                     for i in range(len(self._stride_per_rank)):
-                        # pyre-ignore
                         torch._check_is_size(self._stride_per_rank[i])
 
         return KJTAllToAllTensorsAwaitable(
@@ -944,7 +943,9 @@ class PooledEmbeddingsAllToAll(nn.Module):
             a2a_pooled_embs_tensor=local_embs,
             batch_size_per_rank=batch_size_per_rank,
             dim_sum_per_rank=self._dim_sum_per_rank,
+            # pyrefly: ignore[bad-argument-type]
             dim_sum_per_rank_tensor=self._dim_sum_per_rank_tensor,
+            # pyrefly: ignore[bad-argument-type]
             cumsum_dim_sum_per_rank_tensor=self._cumsum_dim_sum_per_rank_tensor,
             group=self._pg,
             codecs=self._codecs,
@@ -1594,7 +1595,9 @@ class SequenceEmbeddingsAllToAll(nn.Module):
 
         tensor_awaitable = alltoall_sequence(
             a2a_sequence_embs_tensor=local_embs,
+            # pyrefly: ignore[bad-argument-type]
             forward_recat_tensor=forward_recat_tensor,
+            # pyrefly: ignore[bad-argument-type]
             backward_recat_tensor=backward_recat_tensor,
             lengths_after_sparse_data_all2all=lengths,
             input_splits=input_splits,

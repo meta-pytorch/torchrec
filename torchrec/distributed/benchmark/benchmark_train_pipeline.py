@@ -138,6 +138,7 @@ def runner(
 
     # debug mode only works with vscode for now.
     if debug_mode:
+        # pyrefly: ignore[missing-module-attribute]
         from fbvscode import attach_debugger
 
         attach_debugger()
@@ -183,7 +184,7 @@ def runner(
 
         sharded_model, optimizer = generate_sharded_model_and_optimizer(
             model=unsharded_model,
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             pg=ctx.pg,
             device=ctx.device,
             fused_params=fused_params,
@@ -219,8 +220,10 @@ def runner(
             type(pipeline).__name__ if run_option.name == "" else run_option.name
         )
         result = benchmark_func(
-            bench_inputs=bench_inputs,  # pyre-ignore
-            prof_inputs=bench_inputs,  # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
+            bench_inputs=bench_inputs,
+            # pyrefly: ignore[bad-argument-type]
+            prof_inputs=bench_inputs,
             func_to_benchmark=_func_to_benchmark,
             benchmark_func_kwargs={"model": sharded_model, "pipeline": pipeline},
             **run_option.benchmark_func_kwargs(rank=rank)
@@ -283,7 +286,7 @@ def run_pipeline(
 
 
 # command-line interface
-@cmd_conf  # pyre-ignore [56]
+@cmd_conf
 def main(
     run_option: RunOptions,
     table_config: EmbeddingTablesConfig,
@@ -293,6 +296,7 @@ def main(
     planner_config: PlannerConfig,
 ) -> None:
     if run_option.debug_mode:
+        # pyrefly: ignore[missing-module-attribute]
         from fbvscode import attach_debugger
 
         attach_debugger()
@@ -320,4 +324,5 @@ def main(
 
 
 if __name__ == "__main__":
+    # pyrefly: ignore[not-callable]
     main()

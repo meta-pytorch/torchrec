@@ -40,6 +40,7 @@ from torchrec.distributed.test_utils.multi_process import (
 )
 from torchrec.distributed.types import DeviceToHostTensorAwaitable
 
+# pyrefly: ignore[missing-argument]
 _cc = cmd_conf()
 
 
@@ -619,10 +620,12 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
             print(result)
 
 
+# pyrefly: ignore[missing-attribute]
 @_cc.register
 def a2a_single(arg: AllToAllSingleRunConfig) -> None:
     run_multi_process_func(func=a2a_single_runner, world_size=arg.world_size, arg=arg)
 
 
 if __name__ == "__main__":
+    # pyrefly: ignore[missing-attribute]
     _cc.main()

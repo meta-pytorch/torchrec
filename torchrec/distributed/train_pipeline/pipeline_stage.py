@@ -199,12 +199,12 @@ class SparseDataDistUtil(Generic[In]):
         self._stream_context: Callable[
             [Optional[torch.Stream]], torch.cuda.StreamContext
         ] = (
+            # pyrefly: ignore[bad-assignment]
             torch.get_device_module(self._device).stream
             if self._device.type in ["cuda", "mtia"]
             else torch.cuda.stream
         )
 
-        # pyre-ignore
         self._original_forwards: List[Callable[..., Any]] = []
         self._original_kjt_dist_forwards: List[
             Callable[[KeyedJaggedTensor], Awaitable[KJTAllToAllTensorsAwaitable]]
@@ -268,6 +268,7 @@ class SparseDataDistUtil(Generic[In]):
         return len(self._pipelined_postprocs) > 0
 
     def _pipelined_modules_fqns(self) -> Set[str]:
+        # pyrefly: ignore[missing-attribute]
         return {module.forward._name for module in self._pipelined_modules}
 
     def _pipelined_postprocs_fqns(self) -> Set[str]:
@@ -323,6 +324,7 @@ class SparseDataDistUtil(Generic[In]):
 
     def _set_module_context(self, context: TrainPipelineContext) -> None:
         for module in self._pipelined_modules:
+            # pyrefly: ignore[missing-attribute]
             module.forward.set_context(context)
 
         for postproc_module in self._pipelined_postprocs:
@@ -602,9 +604,13 @@ class SparseDataDistUtil(Generic[In]):
             # so need to check how memory behaves with different streams
             for sharded_module in self._pipelined_modules:
                 forward = sharded_module.forward
+                # pyrefly: ignore[missing-attribute]
                 data = data_per_pipelined_module[forward._name]
+                # pyrefly: ignore[missing-attribute]
                 ctx.module_input_post_prefetch[forward._name] = data
+                # pyrefly: ignore[missing-attribute]
                 ctx.module_contexts_post_prefetch[forward._name] = (
+                    # pyrefly: ignore[missing-attribute]
                     ctx.module_contexts.pop(forward._name)
                 )
         return batch

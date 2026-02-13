@@ -70,6 +70,7 @@ class TestFusedOptim(unittest.TestCase):
             ebc,
             apply_to_all(ebc, table_wise(rank=0)),
         )
+        # pyrefly: ignore[invalid-param-spec]
         ebc = shard(
             module=ebc,
             plan=plan,
@@ -78,10 +79,12 @@ class TestFusedOptim(unittest.TestCase):
         for name, param in ebc.named_parameters():
             table_name = name[len("embedding_bags.") : -len("weight") - 1]
             self.assertEqual(
+                # pyrefly: ignore[missing-attribute]
                 param._in_backward_optimizers[0]
                 .state_dict()["state"][""][f"{table_name}.momentum1"]
                 .local_tensor()
                 .data_ptr(),
+                # pyrefly: ignore[missing-attribute]
                 ebc._optim.state_dict()["state"][f"embedding_bags.{table_name}.weight"][
                     f"{table_name}.momentum1"
                 ]
@@ -111,12 +114,14 @@ class TestFusedOptim(unittest.TestCase):
             ebc,
             apply_to_all(ebc, table_wise(rank=0)),
         )
+        # pyrefly: ignore[invalid-param-spec]
         ebc = shard(
             module=ebc,
             plan=plan,
             device=self.curr_device,
         )
         for param in ebc.parameters():
+            # pyrefly: ignore[missing-attribute]
             param._in_backward_optimizers = [
                 WarmupOptimizer(
                     param._in_backward_optimizers[0],
@@ -131,13 +136,18 @@ class TestFusedOptim(unittest.TestCase):
                     param_name="__warmup_state",
                 )
             ]
+            # pyrefly: ignore[missing-attribute]
             param._in_backward_optimizers[0].step()
+            # pyrefly: ignore[missing-attribute]
             param._in_backward_optimizers[0].step()
+            # pyrefly: ignore[missing-attribute]
             warmup_state = param._in_backward_optimizers[0].state_dict()["state"][
                 "__warmup_state"
             ]
             _iter, _ = warmup_state["warmup"]
             self.assertEqual(_iter, 2)
             self.assertEqual(
-                param._in_backward_optimizers[0].param_groups[0]["lr"], 0.05001
+                # pyrefly: ignore[missing-attribute]
+                param._in_backward_optimizers[0].param_groups[0]["lr"],
+                0.05001,
             )

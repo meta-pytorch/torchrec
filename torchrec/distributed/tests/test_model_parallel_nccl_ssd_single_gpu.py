@@ -104,7 +104,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         """
         Util function to compare optimizer weights from SSD TBE and DistributedModelParallel.
         """
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+        # pyrefly: ignore[missing-attribute]
         for lookup1 in m1.module.sparse.ebc._lookups:
             for emb_module1 in lookup1._emb_modules:
                 ssd_emb_modules = {KeyValueEmbeddingBag, KeyValueEmbedding}
@@ -167,9 +167,9 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         requires both DMP modules to have the same sharding plan.
         """
         for lookup1, lookup2 in zip(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             m1.module.sparse.ebc._lookups,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             m2.module.sparse.ebc._lookups,
         ):
             for emb_module1, emb_module2 in zip(
@@ -208,7 +208,6 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -273,7 +272,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
 
-        # pyre-ignore
+        # pyrefly: ignore[bad-argument-type]
         models, batch = self._generate_dmps_and_batch(sharders, constraints=constraints)
         m1, m2 = models
 
@@ -290,7 +289,6 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -380,16 +378,16 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         )
 
         # for this to work, we expect the order of lookups to be the same
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+        # pyrefly: ignore[missing-attribute]
         assert len(fused_model.module.sparse.ebc._lookups) == len(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups
         ), "Expect same number of lookups"
 
         for fused_lookup, ssd_lookup in zip(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             fused_model.module.sparse.ebc._lookups,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups,
         ):
             assert len(fused_lookup._emb_modules) == len(
@@ -416,7 +414,6 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -481,7 +478,8 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, batch = self._generate_dmps_and_batch(
-            base_sharders,  # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
+            base_sharders,
             constraints=constraints,
         )
         base_model, _ = models
@@ -498,7 +496,8 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, _ = self._generate_dmps_and_batch(
-            test_sharders,  # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
+            test_sharders,
             constraints=constraints,
         )
         test_model, _ = models
@@ -515,7 +514,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
 
         # change learning rate for test_model
         fused_opt = test_model.fused_optimizer
-        # pyre-ignore
+        # pyrefly: ignore[bad-index]
         fused_opt.param_groups[0]["lr"] = 0.2
         fused_opt.zero_grad()
 
@@ -530,7 +529,6 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -589,7 +587,8 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, _ = self._generate_dmps_and_batch(
-            base_sharders,  # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
+            base_sharders,
             constraints=constraints,
         )
         model, _ = models
@@ -600,7 +599,6 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -667,7 +665,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             EmbeddingBagCollectionSharder(fused_params=fused_params),
         ]
 
-        # pyre-ignore
+        # pyrefly: ignore[bad-argument-type]
         models, batch = self._generate_dmps_and_batch(sharders, constraints=constraints)
         m1, m2 = models
 
@@ -684,7 +682,6 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -741,11 +738,11 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
                 device=self.device,
                 rank=0,
                 world_size=1,
-                # pyre-fixme[6]: The intake type should be `type[TestSparseNNBase]`
+                # pyrefly: ignore[bad-argument-type]
                 model_class=TestSparseNN,
                 embedding_groups={},
                 tables=self.tables,
-                # pyre-fixme[6]
+                # pyrefly: ignore[bad-argument-type]
                 sharders=[EmbeddingBagCollectionSharder()],
                 optim=EmbOptimType.EXACT_SGD,
                 # The optimizer config here will overwrite the SGD optimizer above
@@ -774,7 +771,6 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -829,7 +825,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             EmbeddingBagCollectionSharder(fused_params=fused_params),
         ]
 
-        # pyre-ignore
+        # pyrefly: ignore[bad-argument-type]
         models, batch = self._generate_dmps_and_batch(sharders, constraints=constraints)
         m1, m2 = models
 
@@ -901,9 +897,9 @@ class KeyValueSequenceModelParallelStateDictTest(ModelParallelSingleRankBase):
         requires both DMP modules to have the same sharding plan.
         """
         for lookup1, lookup2 in zip(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             m1.module.sparse.ec._lookups,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             m2.module.sparse.ec._lookups,
         ):
             for emb_module1, emb_module2 in zip(
@@ -942,7 +938,6 @@ class KeyValueSequenceModelParallelStateDictTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -1039,9 +1034,9 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         requires both DMP modules to have the same sharding plan.
         """
         for lookup1, lookup2 in zip(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             m1.module.sparse.ebc._lookups,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             m2.module.sparse.ebc._lookups,
         ):
             for emb_module1, emb_module2 in zip(
@@ -1097,9 +1092,9 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         """
 
         for fused_lookup, ssd_lookup in zip(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             fused_m.module.sparse.ebc._lookups,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             ssd_m.module.sparse.ebc._lookups,
         ):
             for fused_emb_module, ssd_emb_module in zip(
@@ -1137,7 +1132,6 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1197,7 +1191,7 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
 
-        # pyre-ignore
+        # pyrefly: ignore[bad-argument-type]
         models, batch = self._generate_dmps_and_batch(sharders, constraints=constraints)
         m1, m2 = models
 
@@ -1222,7 +1216,6 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1314,16 +1307,16 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         )
 
         # for this to work, we expect the order of lookups to be the same
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+        # pyrefly: ignore[missing-attribute]
         assert len(fused_model.module.sparse.ebc._lookups) == len(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups
         ), "Expect same number of lookups"
 
         for fused_lookup, ssd_lookup in zip(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             fused_model.module.sparse.ebc._lookups,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups,
         ):
             assert len(fused_lookup._emb_modules) == len(
@@ -1342,7 +1335,6 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1401,7 +1393,8 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, batch = self._generate_dmps_and_batch(
-            base_sharders,  # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
+            base_sharders,
             constraints=constraints,
         )
         base_model, _ = models
@@ -1418,7 +1411,8 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
             ),
         ]
         models, _ = self._generate_dmps_and_batch(
-            test_sharders,  # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
+            test_sharders,
             constraints=constraints,
         )
         test_model, _ = models
@@ -1435,7 +1429,7 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
 
         # change learning rate for test_model
         fused_opt = test_model.fused_optimizer
-        # pyre-ignore
+        # pyrefly: ignore[bad-index]
         fused_opt.param_groups[0]["lr"] = 0.2
         fused_opt.zero_grad()
 
@@ -1517,9 +1511,9 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
         requires both DMP modules to have the same sharding plan.
         """
         for lookup1, lookup2 in zip(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             m1.module.sparse.ec._lookups,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             m2.module.sparse.ec._lookups,
         ):
             for emb_module1, emb_module2 in zip(
@@ -1578,9 +1572,9 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
         """
 
         for fused_lookup, ssd_lookup in zip(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             fused_m.module.sparse.ec._lookups,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             ssd_m.module.sparse.ec._lookups,
         ):
             for fused_emb_module, ssd_emb_module in zip(
@@ -1615,7 +1609,6 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -1689,7 +1682,6 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1780,16 +1772,16 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
         )
 
         # for this to work, we expect the order of lookups to be the same
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+        # pyrefly: ignore[missing-attribute]
         assert len(fused_model.module.sparse.ec._lookups) == len(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ec._lookups
         ), "Expect same number of lookups"
 
         for fused_lookup, ssd_lookup in zip(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             fused_model.module.sparse.ec._lookups,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ec`.
+            # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ec._lookups,
         ):
             assert len(fused_lookup._emb_modules) == len(

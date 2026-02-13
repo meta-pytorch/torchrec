@@ -58,6 +58,7 @@ def _test_sharding(
     constraints: Optional[Dict[str, ParameterConstraints]] = None,
     local_size: Optional[int] = None,
 ) -> None:
+    # pyrefly: ignore[implicit-import]
     trec_dist.comm_ops.set_gradient_division(False)
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         kjt_input_per_rank = [kjt.to(ctx.device) for kjt in kjt_input_per_rank]
@@ -93,8 +94,8 @@ def _test_sharding(
         plan: ShardingPlan = planner.collective_plan(model, [sharder], ctx.pg)
         sharded_model = DistributedModelParallel(
             module=model,
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=plan,
             sharders=[sharder],
@@ -151,7 +152,9 @@ def _test_sharding(
 
             # Compare predictions of sharded vs unsharded models.
             torch.testing.assert_close(
-                sharded_model_pred.cpu(), unsharded_model_pred.cpu()
+                sharded_model_pred.cpu(),
+                # pyrefly: ignore[unbound-name]
+                unsharded_model_pred.cpu(),
             )
 
             sharded_model_pred.sum().backward()
@@ -192,7 +195,6 @@ class ShardedEmbeddingBagCollectionApplyOptimPerParamTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -288,6 +290,7 @@ def _test_sharding_ec(
     constraints: Optional[Dict[str, ParameterConstraints]] = None,
     local_size: Optional[int] = None,
 ) -> None:
+    # pyrefly: ignore[implicit-import]
     trec_dist.comm_ops.set_gradient_division(False)
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         kjt_input_per_rank = [kjt.to(ctx.device) for kjt in kjt_input_per_rank]
@@ -323,8 +326,8 @@ def _test_sharding_ec(
         plan: ShardingPlan = planner.collective_plan(model, [sharder], ctx.pg)
         sharded_model = DistributedModelParallel(
             module=model,
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             plan=plan,
             sharders=[sharder],
@@ -410,7 +413,6 @@ class ShardedEmbeddingCollectionApplyOptimPerParamTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [

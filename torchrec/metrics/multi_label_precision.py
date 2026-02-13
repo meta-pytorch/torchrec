@@ -137,11 +137,15 @@ class MultiLabelPrecisionMetricComputation(RecMetricComputation):
         """
         # predictions and labels are integer-encoded [batch_size] or [batch_size, 1]
         predictions = self._decode_integer_to_labels(
-            predictions.flatten(), self._num_labels
+            predictions.flatten(),
+            # pyrefly: ignore[bad-argument-type]
+            self._num_labels,
         )
+        # pyrefly: ignore[bad-argument-type]
         labels = self._decode_integer_to_labels(labels.flatten(), self._num_labels)
         # Expand weights to match
         if weights is not None:
+            # pyrefly: ignore[no-matching-overload]
             weights = weights.flatten().unsqueeze(-1).expand(-1, self._num_labels)
         else:
             weights = torch.ones_like(predictions, dtype=torch.float32)
@@ -186,11 +190,15 @@ class MultiLabelPrecisionMetricComputation(RecMetricComputation):
         **kwargs: Dict[str, Any],
     ) -> None:
         """Update metric states with a new batch of integer-encoded data."""
+        # pyrefly: ignore[missing-attribute]
         device = predictions.device
         self.to(device)
 
         predictions, labels, weights = self._prepare_inputs(
-            predictions, labels, weights
+            # pyrefly: ignore[bad-argument-type]
+            predictions,
+            labels,
+            weights,
         )
 
         for i, label_name in enumerate(self._label_names):
@@ -230,6 +238,7 @@ class MultiLabelPrecisionMetricComputation(RecMetricComputation):
 
 
 class MultiLabelPrecisionMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.MULTI_LABEL_PRECISION
     _computation_class: Type[RecMetricComputation] = (
         MultiLabelPrecisionMetricComputation

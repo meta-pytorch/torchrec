@@ -40,7 +40,7 @@ class FPModelParallelStateDictTest(ModelParallelSingleRankBase):
     def _generate_batch(self) -> ModelInput:
         kjt_input_per_rank = get_kjt_inputs()
         batch = kjt_input_per_rank[0].to(self.device)
-        # pyre-ignore
+        # pyrefly: ignore[bad-return]
         return batch
 
     def _create_model(self) -> nn.Module:
@@ -54,7 +54,6 @@ class FPModelParallelStateDictTest(ModelParallelSingleRankBase):
         torch.cuda.device_count() <= 0,
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -109,7 +108,6 @@ class FPModelParallelStateDictTest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [

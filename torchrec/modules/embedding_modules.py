@@ -202,6 +202,7 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
                 dtype=dtype,
             )
             if device is None:
+                # pyrefly: ignore[bad-assignment]
                 device = self.embedding_bags[embedding_config.name].weight.device
 
             if not embedding_config.feature_names:
@@ -210,7 +211,6 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
                 len(embedding_config.feature_names) * [embedding_config.embedding_dim]
             )
 
-        # pyre-fixme[8]: Attribute has type `device`; used as `Union[Module, device,
         #  Tensor]`.
         self._device: torch.device = device or torch.device("cpu")
         self._embedding_names: List[str] = [
@@ -297,7 +297,7 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface):
         for table_config in self._embedding_bag_configs:
             assert table_config.init_fn is not None
             param = self.embedding_bags[f"{table_config.name}"].weight
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             table_config.init_fn(param)
 
 
@@ -445,8 +445,8 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
                 dtype=dtype,
             )
             if config.init_fn is not None:
-                # pyre-fixme[6]: For 1st argument expected `Tensor` but got
                 #  `Union[Module, Tensor]`.
+                # pyrefly: ignore[bad-argument-type]
                 config.init_fn(self.embeddings[config.name].weight)
 
             if not config.feature_names:
@@ -541,7 +541,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         for table_config in self._embedding_configs:
             assert table_config.init_fn is not None
             param = self.embeddings[f"{table_config.name}"].weight
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             table_config.init_fn(param)
 
     def use_gather_select(self) -> bool:

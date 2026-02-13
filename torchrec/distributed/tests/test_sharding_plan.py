@@ -84,6 +84,7 @@ def _test_sharding(
     module_sharding_plan: EmbeddingModuleShardingPlan,
     local_size: Optional[int] = None,
 ) -> None:
+    # pyrefly: ignore[implicit-import]
     trec_dist.comm_ops.set_gradient_division(False)
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         kjt_input_per_rank = [kjt.to(ctx.device) for kjt in kjt_input_per_rank]
@@ -102,8 +103,8 @@ def _test_sharding(
         sharded_model = sharder.shard(
             module=model,
             params=module_sharding_plan,
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             device=ctx.device,
         )
@@ -128,7 +129,6 @@ class ConstructParameterShardingAndShardTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         per_param_sharding=st.sampled_from(
             [
@@ -249,7 +249,6 @@ class ConstructParameterShardingAndShardTest(MultiProcessTestBase):
 
 
 class ConstructParameterShardingTest(unittest.TestCase):
-    # pyre-fixme[56]
     @given(data_type=st.sampled_from([DataType.FP32, DataType.FP16]))
     @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
     def test_construct_module_sharding_plan(self, data_type: DataType) -> None:
@@ -696,7 +695,6 @@ class ConstructParameterShardingTest(unittest.TestCase):
         )
         self.assertDictEqual(expected, module_sharding_plan)
 
-    # pyre-fixme[56]
     @given(data_type=st.sampled_from([DataType.FP32, DataType.FP16]))
     @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
     def test_table_wise_set_device(self, data_type: DataType) -> None:
@@ -724,7 +722,7 @@ class ConstructParameterShardingTest(unittest.TestCase):
 
         # Make sure per_param_sharding setting override the default device_type
         self.assertEqual(
-            # pyre-ignore[16]
+            # pyrefly: ignore[missing-attribute]
             module_sharding_plan["table_0"]
             .sharding_spec.shards[0]
             .placement.device()
@@ -733,6 +731,7 @@ class ConstructParameterShardingTest(unittest.TestCase):
         )
 
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             module_sharding_plan["table_1"]
             .sharding_spec.shards[0]
             .placement.device()
@@ -740,7 +739,6 @@ class ConstructParameterShardingTest(unittest.TestCase):
             "cpu",
         )
 
-    # pyre-fixme[56]
     @given(data_type=st.sampled_from([DataType.FP32, DataType.FP16]))
     @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
     def test_row_wise_set_heterogenous_device(self, data_type: DataType) -> None:
@@ -775,7 +773,7 @@ class ConstructParameterShardingTest(unittest.TestCase):
 
         # Make sure per_param_sharding setting override the default device_type
         device_table_0_shard_0 = (
-            # pyre-ignore[16]
+            # pyrefly: ignore[missing-attribute]
             module_sharding_plan["table_0"]
             .sharding_spec.shards[0]
             .placement
@@ -791,7 +789,10 @@ class ConstructParameterShardingTest(unittest.TestCase):
         )
         for i in range(1, 3):
             device_table_0_shard_i = (
-                module_sharding_plan["table_0"].sharding_spec.shards[i].placement
+                # pyrefly: ignore[missing-attribute]
+                module_sharding_plan["table_0"]
+                .sharding_spec.shards[i]
+                .placement
             )
             self.assertEqual(
                 device_table_0_shard_i.device().type,
@@ -808,7 +809,10 @@ class ConstructParameterShardingTest(unittest.TestCase):
             )
         for i in range(3):
             device_table_1_shard_i = (
-                module_sharding_plan["table_1"].sharding_spec.shards[i].placement
+                # pyrefly: ignore[missing-attribute]
+                module_sharding_plan["table_1"]
+                .sharding_spec.shards[i]
+                .placement
             )
             self.assertEqual(
                 device_table_1_shard_i.device().type,
@@ -820,7 +824,6 @@ class ConstructParameterShardingTest(unittest.TestCase):
                 0,
             )
 
-    # pyre-fixme[56]
     @given(data_type=st.sampled_from([DataType.FP32, DataType.FP16]))
     @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
     def test_column_wise(self, data_type: DataType) -> None:
@@ -887,7 +890,6 @@ class ConstructParameterShardingTest(unittest.TestCase):
         }
         self.assertDictEqual(expected, module_sharding_plan)
 
-    # pyre-fixme[56]
     @given(data_type=st.sampled_from([DataType.FP32, DataType.FP16]))
     @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
     def test_column_wise_size_per_rank(self, data_type: DataType) -> None:
@@ -942,7 +944,6 @@ class ConstructParameterShardingTest(unittest.TestCase):
         }
         self.assertDictEqual(expected, module_sharding_plan)
 
-    # pyre-fixme[56]
     @given(data_type=st.sampled_from([DataType.FP32, DataType.FP16]))
     @settings(verbosity=Verbosity.verbose, max_examples=8, deadline=None)
     def test_column_wise_device_types(self, data_type: DataType) -> None:

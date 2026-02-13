@@ -53,8 +53,10 @@ def _flatten(iterable: Iterable[T]) -> Generator[T, None, None]:
             iterator = stack.pop()
         else:
             try:
+                # pyrefly: ignore[no-matching-overload]
                 new_iterator = iter(value)
             except TypeError:
+                # pyrefly: ignore[invalid-yield]
                 yield value
             else:
                 stack.append(iterator)
@@ -317,8 +319,8 @@ class KJTAllToAllTest(MultiProcessTestBase):
         output = output.to(device=device)
         pg = dist.group.WORLD
         lengths_a2a = KJTAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=pg,
             splits=splits,
         )
@@ -329,7 +331,6 @@ class KJTAllToAllTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         backend=st.sampled_from(["nccl"]),
         B=st.integers(min_value=1, max_value=2),
@@ -384,7 +385,6 @@ class KJTAllToAllTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         backend=st.sampled_from(["nccl"]),
         B=st.integers(min_value=1, max_value=2),
@@ -466,8 +466,8 @@ class PooledEmbeddingsAllToAllTest(MultiProcessTestBase):
         codecs = get_qcomm_codecs(qcomms_config)
 
         a2a = PooledEmbeddingsAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=pg,
             dim_sum_per_rank=dim_sum_per_rank,
             device=device,
@@ -494,7 +494,7 @@ class PooledEmbeddingsAllToAllTest(MultiProcessTestBase):
 
         torch.testing.assert_close(
             _input.cpu().detach().div_(world_size),
-            # pyre-ignore
+            # pyrefly: ignore[missing-attribute]
             _input.grad.cpu().detach(),
             atol=atol,
             rtol=rtol,
@@ -504,7 +504,6 @@ class PooledEmbeddingsAllToAllTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         # backend=st.sampled_from(["gloo", "nccl"]),
         backend=st.sampled_from(["nccl"]),
@@ -611,8 +610,8 @@ class PooledEmbeddingsReduceScatterTest(MultiProcessTestBase):
         codecs = get_qcomm_codecs(qcomms_config)
 
         rs = PooledEmbeddingsReduceScatter(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg,
             codecs=codecs,
         ).cuda(rank)
@@ -631,7 +630,7 @@ class PooledEmbeddingsReduceScatterTest(MultiProcessTestBase):
         )
         if qcomms_config is None:
             torch.testing.assert_close(
-                # pyre-ignore
+                # pyrefly: ignore[missing-attribute]
                 input.grad.cpu().detach(),
                 torch.ones(input.size()).div_(world_size),
             )
@@ -640,7 +639,6 @@ class PooledEmbeddingsReduceScatterTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore
     @given(
         qcomms_config=st.sampled_from(
             [
@@ -733,8 +731,8 @@ class PooledEmbeddingsReduceScatterVTest(MultiProcessTestBase):
         codecs = get_qcomm_codecs(qcomms_config)
 
         rs = PooledEmbeddingsReduceScatter(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg,
             codecs=codecs,
         ).cuda(rank)
@@ -753,7 +751,7 @@ class PooledEmbeddingsReduceScatterVTest(MultiProcessTestBase):
         )
         if qcomms_config is None:
             torch.testing.assert_close(
-                # pyre-ignore
+                # pyrefly: ignore[missing-attribute]
                 input.grad.cpu().detach(),
                 torch.ones(input.size()).div_(world_size),
             )
@@ -762,7 +760,6 @@ class PooledEmbeddingsReduceScatterVTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore
     @given(
         qcomms_config=st.sampled_from(
             [
@@ -851,7 +848,7 @@ class PooledEmbeddingsAllGatherTest(MultiProcessTestBase):
             actual_output.cpu().detach(), expected_output.cpu().detach()
         )
         torch.testing.assert_close(
-            # pyre-fixme[16]: Optional type has no attribute `cpu`.
+            # pyrefly: ignore[missing-attribute]
             input.grad.cpu().detach(),
             torch.ones(input.size()),
         )
@@ -868,15 +865,14 @@ class PooledEmbeddingsAllGatherTest(MultiProcessTestBase):
         pg = dist.group.WORLD
         input = input.cuda(rank)
         input.requires_grad = True
-        # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
         #  `Optional[_distributed_c10d.ProcessGroup]`.
+        # pyrefly: ignore[bad-argument-type]
         ag = PooledEmbeddingsAllGather(pg).cuda(rank)
         actual_output = ag(input).wait()
         s = torch.sum(actual_output)
         s.backward()
         cls._validate(actual_output, expected_output, input, world_size)
 
-    # pyre-fixme[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -909,7 +905,7 @@ def _generate_sequence_embedding_batch(
     dim: int,
     splits: List[int],
     batch_size_per_rank: List[int],
-    lengths_before_a2a_per_rank: Dict[int, List],  # pyre-ignore [24]
+    lengths_before_a2a_per_rank: Dict[int, List],
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     world_size = len(splits)
 
@@ -989,8 +985,8 @@ class SeqEmbeddingsAllToAllTest(MultiProcessTestBase):
         lengths_after_sdd_a2a = lengths_after_sdd_a2a.to(device=device)
 
         a2a = SequenceEmbeddingsAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=pg,
             features_per_rank=features_per_rank,
             device=device,
@@ -1031,7 +1027,7 @@ class SeqEmbeddingsAllToAllTest(MultiProcessTestBase):
         grad = _input.grad
         torch.testing.assert_close(
             _input.cpu().detach(),
-            # pyre-fixme[16]: Optional type has no attribute `cpu`.
+            # pyrefly: ignore[missing-attribute]
             grad.cpu().detach() * world_size,
         )
 
@@ -1039,7 +1035,6 @@ class SeqEmbeddingsAllToAllTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         variable_batch_size=st.booleans(),
         qcomms_config=st.sampled_from(
@@ -1097,10 +1092,10 @@ class SeqEmbeddingsAllToAllTest(MultiProcessTestBase):
             }
 
             lengths_after_a2a_per_rank = [
-                torch.tensor([3, 0, 2, 4, 3], dtype=int),  # pyre-ignore [6]
-                torch.tensor(
-                    [4, 1, 2, 1, 0, 1, 2, 0, 5, 0], dtype=int  # pyre-ignore [6]
-                ),
+                # pyrefly: ignore[bad-argument-type]
+                torch.tensor([3, 0, 2, 4, 3], dtype=int),
+                # pyrefly: ignore[bad-argument-type]
+                torch.tensor([4, 1, 2, 1, 0, 1, 2, 0, 5, 0], dtype=int),
             ]
 
             input_splits_per_rank = {}
@@ -1118,10 +1113,10 @@ class SeqEmbeddingsAllToAllTest(MultiProcessTestBase):
 
             lengths_before_a2a_per_rank = {0: [3, 4, 1, 2, 6, 0], 1: [4, 0, 2, 3, 1, 2]}
             lengths_after_a2a_per_rank = [
-                torch.tensor([[3, 4, 4, 0]], dtype=int),  # pyre-ignore [6]
-                torch.tensor(
-                    [[1, 2, 2, 3], [6, 0, 1, 2]], dtype=int  # pyre-ignore [6]
-                ),
+                # pyrefly: ignore[bad-argument-type]
+                torch.tensor([[3, 4, 4, 0]], dtype=int),
+                # pyrefly: ignore[bad-argument-type]
+                torch.tensor([[1, 2, 2, 3], [6, 0, 1, 2]], dtype=int),
             ]
 
             input_splits_per_rank = {}
@@ -1193,8 +1188,8 @@ class VariableBatchPooledEmbeddingsAllToAllTest(MultiProcessTestBase):
         codecs = get_qcomm_codecs(qcomms_config)
 
         a2a = VariableBatchPooledEmbeddingsAllToAll(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[_distributed_c10d.ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=pg,
             emb_dim_per_rank_per_feature=emb_dim_per_rank_per_feature,
             device=device,
@@ -1221,7 +1216,7 @@ class VariableBatchPooledEmbeddingsAllToAllTest(MultiProcessTestBase):
 
         torch.testing.assert_close(
             _input.cpu().detach().div_(world_size),
-            # pyre-ignore
+            # pyrefly: ignore[missing-attribute]
             _input.grad.cpu().detach(),
             atol=atol,
             rtol=rtol,
@@ -1231,7 +1226,6 @@ class VariableBatchPooledEmbeddingsAllToAllTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         backend=st.sampled_from(["nccl"]),
         features=st.integers(min_value=3, max_value=4),
@@ -1463,8 +1457,8 @@ class TestJaggedTensorAllToAll(MultiProcessTestBase):
             jt,
             num_items_to_send=input_splits,
             num_items_to_receive=output_splits,
-            # pyre-fixme[6]: For 4th argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=ctx.pg,
         )
 
@@ -1492,7 +1486,6 @@ class TestJaggedTensorAllToAll(MultiProcessTestBase):
             ),
         )
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

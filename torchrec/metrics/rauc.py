@@ -205,7 +205,6 @@ def _state_reduction(state: List[torch.Tensor], dim: int = 1) -> List[torch.Tens
     return [torch.cat(state, dim=dim)]
 
 
-# pyre-ignore
 _grouping_keys_state_reduction = partial(_state_reduction, dim=0)
 
 
@@ -399,8 +398,8 @@ class RAUCMetricComputation(RecMetricComputation):
 
     def _sync_dist(
         self,
-        dist_sync_fn: Callable = gather_all_tensors,  # pyre-ignore[24]
-        process_group: Optional[Any] = None,  # pyre-ignore[2]
+        dist_sync_fn: Callable = gather_all_tensors,
+        process_group: Optional[Any] = None,
     ) -> None:
         """
         This function is overridden from torchmetric.Metric, since for RAUC we want to concat the tensors
@@ -419,6 +418,7 @@ class RAUCMetricComputation(RecMetricComputation):
 
 
 class RAUCMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.RAUC
     _computation_class: Type[RecMetricComputation] = RAUCMetricComputation
 

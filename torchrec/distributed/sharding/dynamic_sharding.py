@@ -154,16 +154,15 @@ def _generate_shard_allocation_metadata(
     assert destination_params.sharding_spec is not None
 
     # Initialize dictionary keys for all source ranks
-    # Pyre-ignore
     for rank in source_params.ranks:
         shard_to_rank_mapping[rank] = []
 
-    # Pyre-ignore
     while src_rank_index < len(source_params.ranks) and dst_rank_index < len(
-        destination_params.ranks  # Pyre-ignore
+        destination_params.ranks
     ):
-        # Pyre-ignore
+        # pyrefly: ignore[missing-attribute]
         src_shard_size = source_params.sharding_spec.shards[src_rank_index].shard_sizes
+        # pyrefly: ignore[missing-attribute]
         dst_shard_size = destination_params.sharding_spec.shards[
             dst_rank_index
         ].shard_sizes
@@ -176,7 +175,6 @@ def _generate_shard_allocation_metadata(
         next_dst_offset = curr_dst_offset + shard_dim
 
         # Greedy way of allocating shards to ranks
-        # Pyre-ignore
         shard_to_rank_mapping[source_params.ranks[src_rank_index]].append(
             (
                 src_rank_index,
@@ -309,7 +307,7 @@ def _prepare_shard_distribution_comm_ops(
             if src_rank == rank:
                 if has_local_optimizer:
                     momentun_name = _tmp_momentum_extender(shard_name)
-                    # Pyre-ignore
+                    # pyrefly: ignore[unsupported-operation]
                     local_optimizer_shards = current_opt_state["state"][
                         extended_shard_name
                     ][momentun_name].local_shards()
@@ -408,6 +406,7 @@ def _prepare_shard_distribution_comm_ops(
                 comm_ops[CommStrategy.STATE_INTER_NODE_COMM].append(comm_ops_obj)
             if has_optimizer:
                 momentum_name = _tmp_momentum_extender(shard_name)
+                # pyrefly: ignore[unsupported-operation]
                 new_opt_state_state = new_opt_state["state"]
                 sharded_t_opt = new_opt_state_state[extended_shard_name][momentum_name]
                 local_tensor_opt_dst = sharded_t_opt._local_shards[0].tensor
@@ -693,7 +692,6 @@ def move_sharded_tensors_to_cpu(state_dict: Dict[str, Any]) -> Dict[str, Any]:
         The modified state dictionary with tensors moved to CPU
     """
 
-    # Pyre-ignore
     def _process_item(item: Any) -> Any:
         if isinstance(item, ShardedTensor):
             # For ShardedTensor, move all local shards to CPU
@@ -832,7 +830,7 @@ def transfer_data(
 
 
 def update_module_sharding_plan(
-    module: ShardedModule[Any, Any, Any, Any],  # pyre-ignore
+    module: ShardedModule[Any, Any, Any, Any],
     changed_sharding_params: Dict[str, ParameterSharding],
     sharding_type_to_sharding_infos: Dict[str, List[EmbeddingShardingInfo]],
 ) -> None:
@@ -860,7 +858,7 @@ def update_module_sharding_plan(
 
     module_sharding_plan = module.module_sharding_plan
     for name, param in changed_sharding_params.items():
-        # pyre-ignore
+        # pyrefly: ignore[unsupported-operation]
         module_sharding_plan[name] = param
         # TODO: Support detecting old sharding type when sharding type is changing
         for sharding_info in sharding_type_to_sharding_infos[param.sharding_type]:
@@ -893,7 +891,7 @@ def output_sharding_plan_delta_single(
     data_volume: float = 0
     if return_data_volume:
         for _, v in diff.items():
-            # Pyre-ignore
+            # pyrefly: ignore[missing-attribute]
             for shard in v.sharding_spec.shards:
                 data_volume += (
                     shard.shard_sizes[0] * shard.shard_sizes[1] * 4 / (1024 * 1024)

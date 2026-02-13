@@ -22,6 +22,7 @@ def maybe_td_to_kjt(
         return features
     if isinstance(features, TensorDict):
         if keys is None:
+            # pyrefly: ignore[no-matching-overload]
             keys = list(features.keys())
         values = torch.cat([features[key]._values for key in keys], dim=0)
         lengths = torch.cat(

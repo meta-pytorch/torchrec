@@ -86,16 +86,13 @@ class CriteoIterDataPipe(IterDataPipe):
         self,
         paths: Iterable[str],
         *,
-        # pyre-ignore[2]
         row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
-        # pyre-ignore[2]
         **open_kw,
     ) -> None:
         self.paths = paths
         self.row_mapper = row_mapper
-        self.open_kw: Any = open_kw  # pyre-ignore[4]
+        self.open_kw: Any = open_kw
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         worker_info = torch.utils.data.get_worker_info()
         paths = self.paths
@@ -115,9 +112,7 @@ class CriteoIterDataPipe(IterDataPipe):
 def criteo_terabyte(
     paths: Iterable[str],
     *,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
-    # pyre-ignore[2]
     **open_kw,
 ) -> IterDataPipe:
     """`Criteo 1TB Click Logs <https://ailab.criteo.com/download-criteo-1tb-click-logs-dataset/>`_ Dataset
@@ -145,9 +140,7 @@ def criteo_terabyte(
 def criteo_kaggle(
     path: str,
     *,
-    # pyre-ignore[2]
     row_mapper: Optional[Callable[[List[str]], Any]] = _default_row_mapper,
-    # pyre-ignore[2]
     **open_kw,
 ) -> IterDataPipe:
     """`Kaggle/Criteo Display Advertising <https://www.kaggle.com/c/criteo-display-ad-challenge/>`_ Dataset
@@ -290,7 +283,9 @@ class BinaryCriteoUtils:
         """
         path_manager = PathManagerFactory().get(path_manager_key)
         with path_manager.open(path, "rb") as fin:
+            # pyrefly: ignore[implicit-import]
             np.lib.format.read_magic(fin)
+            # pyrefly: ignore[implicit-import]
             shape, _order, _dtype = np.lib.format.read_array_header_1_0(fin)
             return shape
 
@@ -389,7 +384,9 @@ class BinaryCriteoUtils:
         """
         path_manager = PathManagerFactory().get(path_manager_key)
         with path_manager.open(fname, "rb") as fin:
+            # pyrefly: ignore[implicit-import]
             np.lib.format.read_magic(fin)
+            # pyrefly: ignore[implicit-import]
             shape, _order, dtype = np.lib.format.read_array_header_1_0(fin)
             if len(shape) == 2:
                 total_rows, row_size = shape
@@ -618,7 +615,9 @@ class BinaryCriteoUtils:
                 np.save(fout, full_dataset)
 
         print(f"Shuffling dataset with random_seed={random_seed}")
+        # pyrefly: ignore[implicit-import]
         np.random.seed(random_seed)
+        # pyrefly: ignore[implicit-import]
         np.random.shuffle(full_dataset)
 
         # Slice and save each portion into dense, sparse and labels
@@ -746,6 +745,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         self.drop_last = drop_last
         self.shuffle_batches = shuffle_batches
         self.shuffle_training_set = shuffle_training_set
+        # pyrefly: ignore[implicit-import]
         np.random.seed(shuffle_training_set_random_seed)
         self.mmap_mode = mmap_mode
         self.hashes: np.ndarray = np.array(hashes).reshape((1, CAT_FEATURE_COUNT))
@@ -872,6 +872,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         labels_arrs = [np.load(f, mmap_mode="r") for f in self.labels_paths]
         num_rows_per_file = list(map(len, dense_arrs))
         total_rows = sum(num_rows_per_file)
+        # pyrefly: ignore[implicit-import]
         permutation_arr = np.random.permutation(total_rows)
         self.remainder = total_rows % world_size
         rows_per_rank = total_rows // world_size
@@ -912,6 +913,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
     ) -> Batch:
         if self.shuffle_batches:
             # Shuffle all 3 in unison
+            # pyrefly: ignore[implicit-import]
             shuffler = np.random.permutation(len(dense))
             dense = dense[shuffler]
             sparse = sparse[shuffler]

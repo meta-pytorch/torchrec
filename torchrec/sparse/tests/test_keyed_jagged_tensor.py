@@ -652,7 +652,7 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertTrue(torch.equal(kjt_expected.lengths(), kjt_actual.lengths()))
         self.assertTrue(torch.equal(kjt_expected.offsets(), kjt_actual.offsets()))
         self.assertTrue(torch.equal(kjt_expected.values(), kjt_actual.values()))
-        # pyre-ignore[6]
+        # pyrefly: ignore[bad-argument-type]
         self.assertListEqual(kjt_expected._length_per_key, kjt_actual._length_per_key)
 
     def test_concat_fxable(self) -> None:
@@ -745,11 +745,11 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         values = torch.rand((7, 3))
         keys = ["f1", "f2"]
         # torch.Tensor([3, 4]) also fails
-        # pyre-fixme[6]: Expected `Optional[typing.Type[torch._dtype]]` for 2nd
         #  param but got `Type[float]`.
+        # pyrefly: ignore[bad-argument-type]
         lengths = torch.tensor([3, 4], dtype=float)
-        # pyre-fixme[6]: Expected `Optional[typing.Type[torch._dtype]]` for 2nd
         #  param but got `Type[float]`.
+        # pyrefly: ignore[bad-argument-type]
         offsets = torch.tensor([0, 3, 7], dtype=float)
 
         with self.assertRaises(AssertionError):
@@ -875,7 +875,6 @@ class TestKeyedJaggedTensor(unittest.TestCase):
             '"weights": [[1.5], [1.0], [0.5], [1.0, 1.0, 1.5]]\n    }\n})\n',
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1119,7 +1118,6 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         # Assert: Verify stride_per_key_per_rank is None (since original KJT doesn't have it)
         self.assertIsNone(empty_kjt._stride_per_key_per_rank)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1155,7 +1153,6 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertEqual(empty_kjt.weights().size(), kjt.weights().size())
         self.assertEqual(empty_kjt.lengths().size(), kjt.lengths().size())
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1234,13 +1231,12 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertIsNotNone(empty_kjt._stride_per_key_per_rank)
         self.assertTrue(
             torch.equal(
-                # pyre-ignore[6]
                 empty_kjt._stride_per_key_per_rank,
+                # pyrefly: ignore[bad-argument-type]
                 kjt._stride_per_key_per_rank,
             )
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1284,7 +1280,6 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertTrue(result_kjt.weights().is_cuda)
         self.assertTrue(result_kjt.lengths().is_cuda)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1321,7 +1316,6 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertTrue(result_kjt.values().is_cuda)
         self.assertTrue(result_kjt.lengths().is_cuda)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1357,7 +1351,6 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertTrue(result_kjt.values().is_cuda)
         self.assertTrue(result_kjt.offsets().is_cuda)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1714,7 +1707,6 @@ class TestKeyedJaggedTensorGPU(unittest.TestCase):
         super().setUp()
         self.device = torch.cuda.current_device()
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "Not enough GPUs, this test requires at least one GPUs",
@@ -1748,7 +1740,6 @@ class TestKeyedJaggedTensorGPU(unittest.TestCase):
         )
         self.assertEqual(permuted_jag_tensor.weights_or_none(), None)
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "Not enough GPUs, this test requires at least one GPUs",
@@ -1785,7 +1776,6 @@ class TestKeyedJaggedTensorGPU(unittest.TestCase):
         )
         self.assertEqual(permuted_jag_tensor.weights_or_none(), None)
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "Not enough GPUs, this test requires at least one GPUs",
@@ -1845,7 +1835,6 @@ class TestKeyedJaggedTensorGPU(unittest.TestCase):
         )
         self.assertEqual(permuted_jag_tensor.weights_or_none(), None)
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "Not enough GPUs, this test requires at least one GPUs",

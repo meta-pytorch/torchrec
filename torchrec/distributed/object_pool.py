@@ -36,6 +36,7 @@ class ShardedObjectPool(
     """
 
     def __init__(self) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__()
 
     @abstractmethod
@@ -75,7 +76,7 @@ class ShardedObjectPool(
     def create_context(self) -> ShrdCtx:
         pass
 
-    # pyre-ignore override *input/**kwargs
+    # pyrefly: ignore[bad-override]
     def forward(self, ids: torch.Tensor) -> LazyAwaitable[Out]:
         """
         Perform distributed lookup on the pool using `ids`
@@ -96,9 +97,11 @@ class ShardedObjectPool(
         dist_values = self._lookup_values_dist(ctx, local_lookup)
         return dist_values
 
+    # pyrefly: ignore[bad-override]
     def lookup(self, ids: torch.Tensor) -> LazyAwaitable[Out]:
         return self.forward(ids)
 
+    # pyrefly: ignore[bad-param-name-override]
     def update(self, ids: torch.Tensor, values: Out) -> None:
         """
         Perform distributed update on the pool mapping `ids` to `values`
@@ -127,21 +130,19 @@ class ShardedObjectPool(
     def input_dist(
         self,
         ctx: ShrdCtx,
-        # pyre-ignore[2]
         *input,
-        # pyre-ignore[2]
         **kwargs,
-        # pyre-fixme[7]: Expected `Awaitable[Awaitable[Tensor]]` but got implicit return
         #  value of `None`.
+        # pyrefly: ignore[bad-return]
     ) -> Awaitable[Awaitable[torch.Tensor]]:
         pass
 
-    # pyre-fixme[7]: Expected `DistOut` but got implicit return value of `None`.
+    # pyrefly: ignore[bad-return]
     def compute(self, ctx: ShrdCtx, dist_input: torch.Tensor) -> DistOut:
         pass
 
-    # pyre-fixme[7]: Expected `LazyAwaitable[Out]` but got implicit return value of
     #  `None`.
+    # pyrefly: ignore[bad-return]
     def output_dist(self, ctx: ShrdCtx, output: DistOut) -> LazyAwaitable[Out]:
         pass
 

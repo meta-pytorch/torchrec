@@ -122,11 +122,13 @@ MODEL_METRIC_LABEL: str = "model"
 
 MetricValue = Union[torch.Tensor, float]
 MetricsResult = Dict[str, MetricValue]
+# pyrefly: ignore[implicit-import]
 MetricsFuture = concurrent.futures.Future[MetricsResult]
 MetricsOutput = Union[MetricsResult, MetricsFuture]
 
 # Looser types for publishing metrics with additional metadata
 PublishableMetrics = Dict[str, Any]
+# pyrefly: ignore[implicit-import]
 PublishableMetricsFuture = concurrent.futures.Future[PublishableMetrics]
 PublishableMetricsOutput = Union[PublishableMetrics, PublishableMetricsFuture]
 
@@ -211,6 +213,7 @@ class RecMetricModule(nn.Module):
     ) -> None:
         super().__init__()
         self.rec_tasks = rec_tasks if rec_tasks else []
+        # pyrefly: ignore[not-callable]
         self.rec_metrics = rec_metrics if rec_metrics else RecMetricList([])
         self.throughput_metric = throughput_metric
         self.state_metrics = state_metrics if state_metrics else {}
@@ -267,6 +270,7 @@ class RecMetricModule(nn.Module):
         Override this function if the implementation cannot support
         the model output format.
         """
+        # pyrefly: ignore[not-callable]
         if self.rec_metrics and self.rec_tasks:
             labels, predictions, weights, required_inputs = parse_task_model_outputs(
                 self.rec_tasks, model_out, self.get_required_inputs()
@@ -320,6 +324,7 @@ class RecMetricModule(nn.Module):
                     # is set to infinite, adding 1.0 to the `min_compute_interval`
                     # increase the chance that the final compute interval is
                     # indeed larger than `min_compute_interval`.
+                    # pyrefly: ignore[unsupported-operation]
                     self._compute_interval_steps[0] = int(
                         (self.min_compute_interval + 1.0) / per_step_time
                     )
@@ -329,16 +334,19 @@ class RecMetricModule(nn.Module):
                     # can increase the chance that the final compute interval
                     # is indeed smaller than `max_compute_interval`
                     offset = 0.0 if self.max_compute_interval <= 1.0 else 1.0
+                    # pyrefly: ignore[unsupported-operation]
                     self._compute_interval_steps[0] = int(
                         (self.max_compute_interval - offset) / per_step_time
                     )
                 else:
+                    # pyrefly: ignore[unsupported-operation]
                     self._compute_interval_steps[0] = int(
                         (self.max_compute_interval + self.min_compute_interval)
                         / 2
                         / per_step_time
                     )
                 dist.all_reduce(self._compute_interval_steps, op=dist.ReduceOp.MAX)
+            # pyrefly: ignore[not-callable]
             self.compute_interval_steps = int(self._compute_interval_steps.item())
             self.min_compute_interval = -1.0
             self.max_compute_interval = -1.0
@@ -398,6 +406,7 @@ class RecMetricModule(nn.Module):
         # this doesn't use `state_dict` as some buffers are not persistent
         for name, buf in metric.named_buffers():
             states[name] = buf
+        # pyrefly: ignore[bad-return]
         return {metric._metric_name.value: states}
 
     def _get_metric_states(
@@ -422,8 +431,8 @@ class RecMetricModule(nn.Module):
         """
         result = defaultdict(dict)
         for task, computation in zip(metric._tasks, metric._metrics_computations):
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `items`.
+            # pyrefly: ignore[missing-attribute]
             for state_name, reduction_fn in computation._reductions.items():
                 with record_function(f"## RecMetricModule: {state_name} all gather ##"):
                     tensor_or_list: Union[List[torch.Tensor], torch.Tensor] = getattr(
@@ -488,8 +497,11 @@ class RecMetricModule(nn.Module):
             Dict[str, Dict[str, Dict[str, torch.Tensor]]]: the states for each metric to be saved
         """
         pg = pg if pg is not None else dist.group.WORLD
-        process_group: dist.ProcessGroup = (  # pyre-ignore[9]
-            pg.get_group(mesh_dim="shard") if isinstance(pg, DeviceMesh) else pg
+        process_group: dist.ProcessGroup = (
+            # pyrefly: ignore[bad-assignment]
+            pg.get_group(mesh_dim="shard")
+            if isinstance(pg, DeviceMesh)
+            else pg
         )
 
         aggregated_states = {}
@@ -498,10 +510,10 @@ class RecMetricModule(nn.Module):
         )  # Under 2D parallel context, this should be sharding world size
 
         for metric in self.rec_metrics.rec_metrics:
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `value`.
+            # pyrefly: ignore[missing-attribute]
             aggregated_states[metric._namespace.value] = self._get_metric_states(
-                # pyre-fixme[6]: For 1st argument expected `RecMetric` but got `Module`.
+                # pyrefly: ignore[bad-argument-type]
                 metric,
                 world_size,
                 process_group,
@@ -511,6 +523,7 @@ class RecMetricModule(nn.Module):
         throughput_metric = self.throughput_metric
         if throughput_metric is not None:
             # Merge in case there are rec metric namespaces that overlap with throughput metric namespace
+            # pyrefly: ignore [no-matching-overload]
             aggregated_states.setdefault(throughput_metric._namespace.value, {}).update(
                 self._get_throughput_metric_states(throughput_metric)
             )
@@ -534,16 +547,14 @@ class RecMetricModule(nn.Module):
             None
         """
         for metric in self.rec_metrics.rec_metrics:
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `value`.
+            # pyrefly: ignore[missing-attribute]
             states = source[metric._namespace.value]
+            # pyrefly: ignore[no-matching-overload]
             for task, metric_computation in zip(
-                # pyre-fixme[6]: For 1st argument expected `Iterable[_T1]` but got
                 #  `Union[Module, Tensor]`.
-                # pyre-fixme[6]: For 2nd argument expected `Iterable[_T2]` but got
                 #  `Union[Module, Tensor]`.
                 metric._tasks,
-                # pyre-fixme[6]: For 2nd argument expected `Iterable[_T2]` but got
                 #  `Union[Module, Tensor]`.
                 metric._metrics_computations,
             ):
@@ -552,10 +563,13 @@ class RecMetricModule(nn.Module):
                     setattr(metric_computation, attr, tensor)
 
         if self.throughput_metric is not None:
+            # pyrefly: ignore[bad-index]
             states = source[self.throughput_metric._namespace.value][
-                self.throughput_metric._metric_name.value  # pyre-ignore[16]
+                # pyrefly: ignore[bad-index]
+                self.throughput_metric._metric_name.value
             ]
-            for name, buf in self.throughput_metric.named_buffers():  # pyre-ignore[16]
+            for name, buf in self.throughput_metric.named_buffers():
+                # pyrefly: ignore[bad-argument-type]
                 buf.copy_(states[name])
 
     def shutdown(self) -> None:

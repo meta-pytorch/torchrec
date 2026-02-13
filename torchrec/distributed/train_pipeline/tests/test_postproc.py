@@ -118,7 +118,6 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
 
         return sharded_model_pipelined, pipeline
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -155,7 +154,6 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(len(pipeline._pipelined_modules), 2)
         self.assertEqual(len(pipeline._pipelined_postprocs), 1)
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -185,22 +183,28 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         pipelined_weighted_ebc = pipeline._pipelined_modules[1]
 
         # Check pipelined args
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_ebc.forward._args.args), 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_ebc.forward._args.kwargs), 0)
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             pipelined_ebc.forward._args.args[0].steps,
             [
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `_postproc_module`.
+                # pyrefly: ignore[missing-attribute]
                 PostprocArgInfoStep(pipelined_model.module.postproc_nonweighted),
                 GetItemArgInfoStep(0),
             ],
         )
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_weighted_ebc.forward._args.args), 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_weighted_ebc.forward._args.kwargs), 0)
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             pipelined_weighted_ebc.forward._args.args[0].steps,
             [
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `_postproc_module`.
+                # pyrefly: ignore[missing-attribute]
                 PostprocArgInfoStep(pipelined_model.module.postproc_weighted),
                 GetItemArgInfoStep(0),
             ],
@@ -225,13 +229,12 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         self.assertIsInstance(postproc2_args.args[0].steps[1], GetAttrArgInfoStep)
 
         get_arg_infos = {
-            # pyre-fixme[16]: assertions above ensure that steps[1] is a GetAttrArgInfoStep
+            # pyrefly: ignore[missing-attribute]
             postproc._args.args[0].steps[1].attr_name
             for postproc in pipeline._pipelined_postprocs
         }
         self.assertEqual(get_arg_infos, {"idlist_features", "idscore_features"})
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -275,22 +278,28 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         pipelined_weighted_ebc = pipeline._pipelined_modules[1]
 
         # Check pipelined args
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_ebc.forward._args.args), 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_ebc.forward._args.kwargs), 0)
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             pipelined_ebc.forward._args.args[0].steps,
             [
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `_postproc_module`.
+                # pyrefly: ignore[missing-attribute]
                 PostprocArgInfoStep(pipelined_model.module.postproc_nonweighted),
                 GetItemArgInfoStep(0),
             ],
         )
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_weighted_ebc.forward._args.args), 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(len(pipelined_weighted_ebc.forward._args.kwargs), 0)
         self.assertEqual(
+            # pyrefly: ignore[missing-attribute]
             pipelined_weighted_ebc.forward._args.args[0].steps,
             [
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `_postproc_module`.
+                # pyrefly: ignore[missing-attribute]
                 PostprocArgInfoStep(pipelined_model.module.postproc_weighted),
                 GetItemArgInfoStep(0),
             ],
@@ -299,12 +308,12 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         # postproc args
         self.assertEqual(len(pipeline._pipelined_postprocs), 3)
 
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `_postproc_module`.
+        # pyrefly: ignore[missing-attribute]
         parent_postproc_mod = pipelined_model.module._postproc_module
 
         for postproc_mod in pipeline._pipelined_postprocs:
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `postproc_nonweighted`.
+            # pyrefly: ignore[missing-attribute]
             if postproc_mod == pipelined_model.module.postproc_nonweighted:
                 self.assertEqual(len(postproc_mod._args.args), 1)
                 self.assertEqual(len(postproc_mod._args.kwargs), 0)
@@ -316,8 +325,8 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
                     ],
                 )
 
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `postproc_weighted`.
+            # pyrefly: ignore[missing-attribute]
             elif postproc_mod == pipelined_model.module.postproc_weighted:
                 self.assertEqual(len(postproc_mod._args.args), 1)
                 self.assertEqual(len(postproc_mod._args.kwargs), 0)
@@ -333,7 +342,6 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
                 self.assertEqual(len(postproc_mod._args.kwargs), 0)
                 self.assertEqual(postproc_mod._args.args[0].steps, [NoopArgInfoStep()])
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -385,7 +393,6 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(len(pipeline._pipelined_modules), 0)
         self.assertEqual(len(pipeline._pipelined_postprocs), 0)
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -439,7 +446,6 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(len(pipeline._pipelined_modules), 0)
         self.assertEqual(len(pipeline._pipelined_postprocs), 0)
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -486,12 +492,11 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(pipeline._pipelined_modules[0]._is_weighted, True)
         self.assertEqual(
             pipeline._pipelined_postprocs[0],
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `postproc_weighted`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.postproc_weighted,
         )
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -566,7 +571,6 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
             ["_postproc_module", "postproc_nonweighted", "postproc_weighted"],
         )
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -614,7 +618,6 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(len(pipeline._pipelined_modules), 2)
         self.assertEqual(len(pipeline._pipelined_postprocs), 1)
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",

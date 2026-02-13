@@ -54,6 +54,7 @@ class MetricComputeJob:
 
     def __init__(
         self,
+        # pyrefly: ignore[implicit-import]
         future: concurrent.futures.Future[Dict[str, MetricValue]],
         metric_state_snapshot: MetricStateSnapshot,
     ) -> None:
@@ -62,6 +63,7 @@ class MetricComputeJob:
             future: future to set the result of the compute job. Contains the computed metrics.
             metric_state_snapshot: snapshot of metric state tensors across all metrics types.
         """
+        # pyrefly: ignore[implicit-import]
         self.future: concurrent.futures.Future[Dict[str, MetricValue]] = future
         self.metric_state_snapshot: MetricStateSnapshot = metric_state_snapshot
 
@@ -80,10 +82,12 @@ class SynchronizationMarker:
 
     def __init__(
         self,
+        # pyrefly: ignore[implicit-import]
         future: concurrent.futures.Future[Dict[str, MetricValue]],
     ) -> None:
         """
         Args:
             future: future to set the result of the compute job. Passed to the MetricComputeJob.
         """
+        # pyrefly: ignore[implicit-import]
         self.future: concurrent.futures.Future[Dict[str, MetricValue]] = future

@@ -147,11 +147,14 @@ class TestInferenceSchema(unittest.TestCase):
             found = False
             for default_sharder in DEFAULT_SHARDERS:
                 if isinstance(default_sharder, type(sharder)):
-                    # pyre-ignore[16]
+                    # pyrefly: ignore[missing-attribute]
                     for key in sharder.fused_params.keys():
+                        # pyrefly: ignore[missing-attribute]
                         self.assertTrue(key in default_sharder.fused_params)
                         self.assertTrue(
+                            # pyrefly: ignore[missing-attribute]
                             default_sharder.fused_params[key]
+                            # pyrefly: ignore[missing-attribute]
                             == sharder.fused_params[key]
                         )
                     found = True

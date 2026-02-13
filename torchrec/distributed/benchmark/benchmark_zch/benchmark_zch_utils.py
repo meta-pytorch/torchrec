@@ -150,7 +150,7 @@ class BenchmarkMCProbe(nn.Module):
                 # save t
             elif self._mc_method == "mpzch" or self._mc_method == "":
                 self.mcec_state[stage]["table_state"][table_name]["remapping_table"] = (
-                    # pyre-ignore [29] # NOTE: here we did not specify the type of mc_module._hash_zch_identities, but we know it is a parameter of nn.module without gradients
+                    # pyrefly: ignore[not-callable]
                     mc_module._hash_zch_identities.clone()
                     .to_dense()
                     .squeeze()
@@ -182,7 +182,7 @@ class BenchmarkMCProbe(nn.Module):
             ):  # when using mpzch mc modules
                 # record the remapped feature values first
                 self.mcec_state[stage]["feature_values"][table_name] = (
-                    # pyre-ignore [29] # NOTE: here we did not specify the type of mc_module.table_name_on_device_remapped_ids_dict[table_name], but we know it is a tensor for remapped ids
+                    # pyrefly: ignore[bad-index]
                     mc_module.table_name_on_device_remapped_ids_dict[table_name]
                     .cpu()
                     .numpy()
@@ -190,7 +190,7 @@ class BenchmarkMCProbe(nn.Module):
                 )
                 # record the input feature values
                 self.mcec_state["before_fwd"]["feature_values"][table_name] = (
-                    # pyre-ignore [29] # NOTE: here we did not specify the type of mc_module.table_name_on_device_input_ids_dict[table_name], but we know it is a tensor for input ids
+                    # pyrefly: ignore[bad-index]
                     mc_module.table_name_on_device_input_ids_dict[table_name]
                     .cpu()
                     .numpy()

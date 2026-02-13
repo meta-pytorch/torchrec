@@ -51,6 +51,7 @@ def _test_sharding(  # noqa C901
     use_apply_optimizer_in_backward: bool = False,
     use_index_dedup: bool = False,
 ) -> None:
+    # pyrefly: ignore[implicit-import]
     trec_dist.comm_ops.set_gradient_division(False)
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         sharder = EmbeddingCollectionSharder(use_index_dedup=use_index_dedup)
@@ -89,19 +90,19 @@ def _test_sharding(  # noqa C901
             local_size=local_size,
             world_size=world_size,
             device_type=ctx.device.type,
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             sharder=sharder,
         )
 
         sharded_model = _shard_modules(
             module=unsharded_model,
             plan=ShardingPlan({"": module_sharding_plan}),
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
-            # pyre-fixme[6]: For 4th argument expected
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[EmbeddingCollectionSharder]`.
+            # pyrefly: ignore[bad-argument-type]
             sharders=[sharder],
             device=ctx.device,
         )
@@ -114,7 +115,9 @@ def _test_sharding(  # noqa C901
         assert isinstance(sharded_model, ShardedEmbeddingCollection)
 
         if not use_apply_optimizer_in_backward:
+            # pyrefly: ignore[unbound-name]
             unsharded_model_optimizer.zero_grad()
+            # pyrefly: ignore[unbound-name]
             sharded_model_optimizer.zero_grad()
 
         unsharded_model_pred_jt_dict = []
@@ -164,7 +167,9 @@ def _test_sharding(  # noqa C901
         torch.cat(unsharded_loss).sum().backward()
 
         if not use_apply_optimizer_in_backward:
+            # pyrefly: ignore[unbound-name]
             unsharded_model_optimizer.step()
+            # pyrefly: ignore[unbound-name]
             sharded_model_optimizer.step()
 
         for fqn in unsharded_model.state_dict():
@@ -198,7 +203,6 @@ class ShardedEmbeddingCollectionParallelTest(MultiProcessTestBase):
         "Not enough GPUs, this test requires at least two GPUs",
     )
     @settings(verbosity=Verbosity.verbose, max_examples=10, deadline=None)
-    # pyre-ignore
     @given(
         use_apply_optimizer_in_backward=st.booleans(),
         use_index_dedup=st.booleans(),

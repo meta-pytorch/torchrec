@@ -53,6 +53,7 @@ def get_tbes_to_register_from_iterable(
 
 def is_fused_param_register_tbe(fused_params: Optional[Dict[str, Any]]) -> bool:
     return (
+        # pyrefly: ignore[bad-return]
         fused_params
         and FUSED_PARAM_REGISTER_TBE_BOOL in fused_params
         and fused_params[FUSED_PARAM_REGISTER_TBE_BOOL]
@@ -93,6 +94,7 @@ def is_fused_param_quant_state_dict_split_scale_bias(
     fused_params: Optional[Dict[str, Any]],
 ) -> bool:
     return (
+        # pyrefly: ignore[bad-return]
         fused_params
         and FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS in fused_params
         and fused_params[FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS]

@@ -6,7 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-strict
-# pyre-ignore-all-errors[16]
 
 #!/usr/bin/env python3
 
@@ -364,7 +363,6 @@ def multi_process_benchmark(
         ...,
         None,
     ],
-    # pyre-ignore
     **kwargs,
 ) -> BenchmarkResult:
 
@@ -507,11 +505,9 @@ class cmd_conf:
     """
 
     def __init__(self) -> None:
-        # pyre-ignore [24]
         self.programs: Dict[str, Callable] = {}
 
     @classmethod
-    # pyre-ignore [24]
     def __new__(cls, _, func: Optional[Callable] = None) -> Union["cmd_conf", Callable]:
         if not func:
             return super().__new__(cls)
@@ -519,7 +515,7 @@ class cmd_conf:
             return cmd_conf.call(func)
 
     @staticmethod
-    def call(func: Callable) -> Callable:  # pyre-ignore [24]
+    def call(func: Callable) -> Callable:
 
         def _load_config_file(
             config_path: str, is_json: bool = False
@@ -534,7 +530,7 @@ class cmd_conf:
                     return yaml.safe_load(f) or {}
 
         @functools.wraps(func)
-        def wrapper() -> Any:  # pyre-ignore [3]
+        def wrapper() -> Any:
             sig = inspect.signature(func)
             parser = argparse.ArgumentParser(func.__doc__)
 
@@ -601,7 +597,7 @@ class cmd_conf:
                         merged_defaults.get(cls.__name__, {}).get(  # hierarchy lookup
                             arg_name,
                             (
-                                f.default_factory()  # pyre-ignore [29]
+                                f.default_factory()
                                 if f.default_factory is not MISSING
                                 else f.default
                             ),
@@ -635,7 +631,7 @@ class cmd_conf:
                 cls = param.annotation
                 if is_dataclass(cls):
                     data = {f.name: getattr(args, f.name) for f in fields(cls)}
-                    config_instance = cls(**data)  # pyre-ignore [29]
+                    config_instance = cls(**data)
                     kwargs[name] = config_instance
                     logger.info(config_instance)
 
@@ -651,7 +647,6 @@ class cmd_conf:
 
         return wrapper
 
-    # pyre-ignore [24]
     def register(self, func: Callable) -> Callable:
         wrapper = cmd_conf.call(func)
         self.programs[func.__name__] = wrapper
@@ -695,7 +690,7 @@ def init_argparse_and_args() -> argparse.Namespace:
 def _run_benchmark_core(
     name: str,
     run_iter_fn: Callable[[], None],
-    profile_iter_fn: Optional[Callable[[Any], None]],  # pyre-ignore [2]
+    profile_iter_fn: Optional[Callable[[Any], None]],
     world_size: int,
     rank: int,
     num_benchmarks: int,
@@ -839,6 +834,7 @@ def _run_benchmark_core(
     if output_dir and profile_iter_fn and device_type == "cuda":
 
         def _trace_handler(prof: torch.profiler.profile) -> None:
+            # pyrefly: ignore[missing-attribute]
             total_avg = prof.profiler.total_average()
             logger.info(f" TOTAL_AVERAGE:\n{name}\n{total_avg}")
             if not all_rank_traces and rank > 0:
@@ -915,7 +911,6 @@ def benchmark_model_with_warmup(
     world_size: int,
     output_dir: str,
     num_benchmarks: int,
-    # pyre-ignore[2]
     func_to_benchmark: Any,
     benchmark_func_kwargs: Optional[Dict[str, Any]],
     rank: int,
@@ -973,7 +968,6 @@ class BenchFuncConfig:
     memory_snapshot: bool = False
     loglevel: str = "WARNING"
 
-    # pyre-ignore [2]
     def benchmark_func_kwargs(self, **kwargs_to_override) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -997,7 +991,7 @@ def benchmark_func(
     name: str,
     rank: int,
     world_size: int,
-    func_to_benchmark: Any,  # pyre-ignore[2]
+    func_to_benchmark: Any,
     bench_inputs: List[Dict[str, Any]],
     prof_inputs: List[Dict[str, Any]],
     benchmark_func_kwargs: Optional[Dict[str, Any]],

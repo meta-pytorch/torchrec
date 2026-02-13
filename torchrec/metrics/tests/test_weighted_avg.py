@@ -174,15 +174,15 @@ class WeightedAvgValueTest(unittest.TestCase):
                 weight_name="weight",
             )
             task_list.append(task_info)
-            # pyre-ignore
+            # pyrefly: ignore[unsupported-operation]
             inputs["predictions"][task_info.name] = predictions[i]
-            # pyre-ignore
+            # pyrefly: ignore[unsupported-operation]
             inputs["labels"][task_info.name] = labels[i]
             if weights is None:
-                # pyre-ignore
+                # pyrefly: ignore[unsupported-operation]
                 inputs["weights"] = None
             else:
-                # pyre-ignore
+                # pyrefly: ignore[unsupported-operation]
                 inputs["weights"][task_info.name] = weights[i]
 
         weighted_avg = WeightedAvgMetric(
@@ -215,7 +215,7 @@ class WeightedAvgValueTest(unittest.TestCase):
         test_data = generate_model_outputs_cases()
         for inputs in test_data:
             try:
-                # pyre-ignore
+                # pyrefly: ignore[bad-argument-type]
                 self._test_weighted_avg_helper(**inputs)
             except AssertionError:
                 print("Assertion error caught with data set ", inputs)

@@ -36,20 +36,20 @@ from tqdm import tqdm
 # OSS import
 try:
 
-    # pyre-ignore[21]
     # @manual=//torchrec/github/examples/bert4rec:bert4rec_metrics
+    # pyrefly: ignore[missing-import]
     from bert4rec_metrics import recalls_and_ndcgs_for_ks
 
-    # pyre-ignore[21]
     # @manual=//torchrec/github/examples/bert4rec/data:bert4rec_movielens_datasets
+    # pyrefly: ignore[missing-import]
     from data.bert4rec_movielens_datasets import Bert4RecPreprocsser, get_raw_dataframe
 
-    # pyre-ignore[21]
     # @manual=//torchrec/github/examples/bert4rec/dataloader:bert4rec_movielens_dataloader
+    # pyrefly: ignore[missing-import]
     from dataloader.bert4rec_movielens_dataloader import Bert4RecDataloader
 
-    # pyre-ignore[21]
     # @manual=//torchrec/github/examples/bert4rec/models:bert4rec
+    # pyrefly: ignore[missing-import]
     from models.bert4rec import BERT4Rec
 except ImportError:
     pass
@@ -303,8 +303,8 @@ def _train_one_epoch(
             break
     dist.all_gather_object(outputs, sum(loss_logs) / len(loss_logs))
     if dist.get_rank() == 0:
-        # pyre-fixme[6]: For 1st param expected `Iterable[Variable[_SumT (bound to
         #  _SupportsSum)]]` but got `List[None]`.
+        # pyrefly: ignore[no-matching-overload]
         print(f"Epoch {epoch + 1}, average loss { (sum(outputs) or 0) /len(outputs)}")
     lr_scheduler.step()
 
@@ -354,7 +354,7 @@ def _validate(
     dist.all_gather_object(outputs, metrics_avg)
     if dist.get_rank() == 0:
         print(
-            # pyre-fixme[6] for 1st positional only parameter expected `List[Dict[str, float]]` but got `List[None]`
+            # pyrefly: ignore[bad-argument-type]
             f"{'Epoch ' + str(epoch + 1) if not is_testing else 'Test'}, metrics {_dict_mean(outputs)}"
         )
 
@@ -392,7 +392,7 @@ def train_val_test(
     """
     _validate(model, val_loader, device, -1, metric_ks)
     for epoch in range(num_epochs):
-        # pyre-fixme[16] Undefined attribute [16]: has no attribute `set_epoch`
+        # pyrefly: ignore[missing-attribute]
         train_loader.sampler.set_epoch(epoch)
         _train_one_epoch(
             model,
@@ -551,8 +551,8 @@ def main(argv: List[str]) -> None:
         val_loader,
         test_loader,
         device,
-        # pyre-fixme[6]: For 6th param expected `Adam` but got
         #  `Union[CombinedOptimizer, Adam]`.
+        # pyrefly: ignore[bad-argument-type]
         optimizer,
         lr_scheduler,
         args.num_epochs,

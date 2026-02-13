@@ -132,11 +132,11 @@ class PipelineConfig:
             )
         else:
             Pipeline = _pipeline_cls[self.pipeline]
-            # pyre-ignore[28]
             return Pipeline(
                 model=model,
                 optimizer=opt,
                 device=device,
+                # pyrefly: ignore[unexpected-keyword]
                 apply_jit=self.apply_jit,
                 inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
             )

@@ -69,7 +69,6 @@ logger.setLevel(logging.DEBUG)
     default=",".join(DEFTAULT_BENCHMARK_FUNCS),
     help="kjt functions to benchmark",
 )
-# pyre-ignore [56]
 @click.option(
     "--run-modes",
     type=str,

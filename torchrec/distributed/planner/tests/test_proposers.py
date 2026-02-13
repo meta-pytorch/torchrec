@@ -116,7 +116,7 @@ def make_sharding_option(
     return ShardingOption(
         name=name,
         tensor=torch.zeros(1),
-        # pyre-ignore
+        # pyrefly: ignore[bad-argument-type]
         module=("model", None),
         input_lengths=[],
         batch_size=8,
@@ -619,6 +619,7 @@ class TestProposers(unittest.TestCase):
             + budget,
         )
 
+    # pyrefly: ignore[implicit-import]
     @unittest.mock.patch(
         "torchrec.distributed.planner.shard_estimators._calculate_storage_specific_sizes",
         side_effect=mock_calculate_storage_specific_sizes,
@@ -828,6 +829,7 @@ class TestProposers(unittest.TestCase):
             ["fused", "fused", "fused_uvm_caching"],
         )
 
+    # pyrefly: ignore[implicit-import]
     @unittest.mock.patch(
         "torchrec.distributed.planner.shard_estimators._calculate_storage_specific_sizes",
         side_effect=mock_calculate_storage_specific_sizes,
@@ -884,6 +886,7 @@ class TestProposers(unittest.TestCase):
         best_perf = 1e99
         proposals = -1
         initial_mem = None
+        # pyrefly: ignore[bad-assignment]
         while proposal is not None:
             proposals += 1
             mem = sum(so.total_storage.hbm for so in proposal)
@@ -920,7 +923,7 @@ class TestProposers(unittest.TestCase):
                 ShardingOption(
                     name=name,
                     tensor=torch.zeros(1),
-                    # pyre-ignore
+                    # pyrefly: ignore[bad-argument-type]
                     module=("model", None),
                     input_lengths=[],
                     batch_size=8,
@@ -1031,6 +1034,7 @@ class TestProposers(unittest.TestCase):
         self.assertEqual(p.starting_proposal[1].total_storage.hbm, 50)
         self.assertEqual(p.starting_proposal[1].total_storage.ddr, 0)
 
+    # pyrefly: ignore[implicit-import]
     @unittest.mock.patch("torchrec.distributed.planner.proposers.logger")
     def test_build_proposal_from_sharding_options(self, mock_logger: MagicMock) -> None:
         table_4_sharding_option = make_sharding_option("table-4", 1, 0.1)

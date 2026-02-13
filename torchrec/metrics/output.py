@@ -77,16 +77,16 @@ class OutputMetricComputation(RecMetricComputation):
             MetricComputationReport(
                 name=MetricName.OUTPUT,
                 metric_prefix=MetricPrefix.DEFAULT,
-                # pyre-fixme[6]: For 3rd argument expected `Tensor` but got
                 #  `Union[Tensor, Module]`.
+                # pyrefly: ignore[bad-argument-type]
                 value=self.latest_imp,
                 description="_latest_imp",
             ),
             MetricComputationReport(
                 name=MetricName.OUTPUT,
                 metric_prefix=MetricPrefix.DEFAULT,
-                # pyre-fixme[6]: For 3rd argument expected `Tensor` but got
                 #  `Union[Tensor, Module]`.
+                # pyrefly: ignore[bad-argument-type]
                 value=self.total_latest_imp,
                 description="_total_latest_imp",
             ),
@@ -94,6 +94,7 @@ class OutputMetricComputation(RecMetricComputation):
 
 
 class OutputMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.OUTPUT
     _computation_class: Type[RecMetricComputation] = OutputMetricComputation
 

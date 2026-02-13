@@ -64,6 +64,7 @@ class XAUCMetricTest(unittest.TestCase):
             my_rank=0,
             batch_size=BATCH_SIZE,
             tasks=[DefaultTaskInfo],
+            # pyrefly: ignore[bad-argument-type]
             enable_pt2_compile=True,
             window_size=200,
         )
@@ -73,6 +74,7 @@ class XAUCMetricTest(unittest.TestCase):
             my_rank=0,
             batch_size=BATCH_SIZE,
             tasks=[DefaultTaskInfo],
+            # pyrefly: ignore[bad-argument-type]
             enable_pt2_compile=False,
             window_size=200,
         )

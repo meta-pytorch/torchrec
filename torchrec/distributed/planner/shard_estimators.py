@@ -82,7 +82,7 @@ def _is_prefetch_pipelined(
     # TODO: remove after deprecating fused_params in sharder
     if not prefetch_pipeline:
         prefetch_pipeline = (
-            sharder.fused_params.get("prefetch_pipeline", False)  # pyre-ignore[16]
+            sharder.fused_params.get("prefetch_pipeline", False)
             if hasattr(sharder, "fused_params") and sharder.fused_params
             else False
         )
@@ -135,7 +135,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
             # TODO: remove after deprecating fused_params in sharder
             if caching_ratio is None:
                 caching_ratio = (
-                    sharder.fused_params.get("cache_load_factor")  # pyre-ignore[16]
+                    sharder.fused_params.get("cache_load_factor")
                     if hasattr(sharder, "fused_params") and sharder.fused_params
                     else None
                 )
@@ -163,13 +163,11 @@ class EmbeddingPerfEstimator(ShardEstimator):
                 hasattr(module, "_feature_processor")
                 and hasattr(module._feature_processor, "feature_processor_modules")
                 and isinstance(
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                     #  attribute `feature_processor_modules`.
                     module._feature_processor.feature_processor_modules,
                     nn.ModuleDict,
                 )
                 and sharding_option.name
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `feature_processor_modules`.
                 in module._feature_processor.feature_processor_modules.keys()
             ):
@@ -1084,7 +1082,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
             # TODO: remove after deprecating fused_params in sharder
             if caching_ratio is None:
                 caching_ratio = (
-                    sharder.fused_params.get("cache_load_factor")  # pyre-ignore[16]
+                    sharder.fused_params.get("cache_load_factor")
                     if hasattr(sharder, "fused_params") and sharder.fused_params
                     else None
                 )
@@ -1107,7 +1105,9 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 else None
             )
             kv_cache_load_factor: float = (
+                # pyrefly: ignore[missing-attribute]
                 sharder.fused_params.get("cache_load_factor", KV_CACHING_RATIO)
+                # pyrefly: ignore[missing-attribute]
                 if sharder.fused_params
                 else KV_CACHING_RATIO
             )

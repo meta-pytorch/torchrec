@@ -134,8 +134,8 @@ class RwSequenceEmbeddingSharding(
             self._get_virtual_table_feature_num_buckets()
         )
         return RwSparseFeaturesDist(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=self._pg,
             num_features=num_features,
             feature_hash_sizes=feature_hash_sizes,
@@ -165,8 +165,8 @@ class RwSequenceEmbeddingSharding(
         device: Optional[torch.device] = None,
     ) -> BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]:
         return RwSequenceEmbeddingDist(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             self._pg,
             self._get_num_features(),
             device if device is not None else self._device,
@@ -179,8 +179,8 @@ class RwSequenceEmbeddingSharding(
         num_features = self._get_num_writable_features()
         feature_hash_sizes = self._get_writable_feature_hash_sizes()
         return RwSparseFeaturesWriteDist(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=self._pg,
             num_features=num_features,
             feature_hash_sizes=feature_hash_sizes,
@@ -188,7 +188,7 @@ class RwSequenceEmbeddingSharding(
             is_sequence=True,
         )
 
-    # pyre-ignore [14]
+    # pyrefly: ignore[bad-override]
     def create_update(
         self,
         grouped_embeddings_lookup: GroupedEmbeddingsLookup,
@@ -256,7 +256,6 @@ class InferRwSequenceEmbeddingDist(
                         _get_batching_hinted_output(
                             _fx_trec_get_feature_length(
                                 sharding_ctx.features[i],
-                                # pyre-fixme [16]
                                 sharding_ctx.embedding_names_per_rank[i],
                             ),
                             local_embs[i],

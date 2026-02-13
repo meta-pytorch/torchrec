@@ -97,7 +97,6 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
 
         # test forward
         if not per_table_weight_dtype:
-            # pyre-fixme[16]: `EmbeddingBagCollection` has no attribute `qconfig`.
             ebc.qconfig = torch.quantization.QConfig(
                 activation=torch.quantization.PlaceholderObserver.with_args(
                     dtype=output_type
@@ -107,6 +106,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
                 ),
             )
         else:
+            # pyrefly: ignore[bad-argument-type]
             ebc.qconfig = QuantConfig(
                 activation=torch.quantization.PlaceholderObserver.with_args(
                     dtype=output_type
@@ -131,7 +131,6 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
             set(state_dict.keys()).issubset(set(quantized_state_dict.keys()))
         )
 
-    # pyre-fixme[56]
     @given(
         data_type=st.sampled_from(
             [
@@ -273,7 +272,6 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         )
         self._test_ebc([eb1_config, eb2_config], features)
 
-    # pyre-ignore: Invalid decoration [56]
     @unittest.skipIf(
         not load_required_dram_kv_embedding_libraries(),
         "Skip when required libraries are not available",
@@ -307,7 +305,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         )
         self.assertTrue(isinstance(qebc.m, QuantEmbeddingBagCollection))
         # feature name should be consistent with the order of grouped embeddings
-        self.assertEqual(qebc.m._feature_names, ["f1", "f3", "f2"])  # pyre-ignore[16]
+        self.assertEqual(qebc.m._feature_names, ["f1", "f3", "f2"])
 
         features = KeyedJaggedTensor(
             keys=["f1", "f2", "f3"],
@@ -316,7 +314,6 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         )
         self._test_ebc([eb1_config, eb2_config, eb3_config], features)
 
-    # pyre-ignore
     @given(
         data_type=st.sampled_from(
             [
@@ -363,7 +360,6 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         ebc = EmbeddingBagCollection(tables=tables)
 
         # test forward
-        # pyre-fixme[16]: `EmbeddingBagCollection` has no attribute `qconfig`.
         ebc.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -400,7 +396,6 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         embeddings_2 = qebc_2(features)
         self._asserting_same_embeddings(embeddings, embeddings_2)
 
-    # pyre-ignore
     @given(
         data_type=st.sampled_from(
             [
@@ -463,7 +458,6 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
 
         ebc = EmbeddingBagCollection(tables=tables)
         # test forward
-        # pyre-fixme[16]: `EmbeddingBagCollection` has no attribute `qconfig`.
         ebc.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -474,6 +468,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         test_model = TestModel(ebc)
 
         before_quant_state_dict = test_model.state_dict()
+        # pyrefly: ignore[bad-assignment]
         test_model.ebc = QuantEmbeddingBagCollection.from_float(ebc)
 
         state_dict = test_model.state_dict()
@@ -503,7 +498,6 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         )
 
         ebc = EmbeddingBagCollection(tables=[eb1_config, eb2_config])
-        # pyre-fixme[16]: `EmbeddingBagCollection` has no attribute `qconfig`.
         ebc.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -591,7 +585,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
         embeddings = ec(features)
 
         # test forward
-        # pyre-fixme[16]: `EmbeddingCollection` has no attribute `qconfig`.
+        # pyrefly: ignore[bad-argument-type]
         ec.qconfig = QuantConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -615,7 +609,6 @@ class EmbeddingCollectionTest(unittest.TestCase):
         quantized_state_dict = ec.state_dict()
         self.assertEqual(state_dict.keys(), quantized_state_dict.keys())
 
-    # pyre-fixme[56]
     @given(
         data_type=st.sampled_from(
             [
@@ -787,7 +780,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
             inplace=True,
             per_table_weight_dtype={"t1": torch.float16},
         )
-        # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
+        # pyrefly: ignore[not-callable]
         configs = model.m.embedding_configs()
         self.assertEqual(len(configs), 2)
         self.assertNotEqual(configs[0].name, configs[1].name)
@@ -798,7 +791,6 @@ class EmbeddingCollectionTest(unittest.TestCase):
                 self.assertEqual(config.name, "t2")
                 self.assertEqual(config.data_type, DataType.INT8)
 
-    # pyre-ignore: Invalid decoration [56]
     @unittest.skipIf(
         not load_required_dram_kv_embedding_libraries(),
         "Skip when required libraries are not available",
@@ -845,8 +837,9 @@ class EmbeddingCollectionTest(unittest.TestCase):
         )
         self.assertTrue(isinstance(qec.m, QuantEmbeddingCollection))
         # feature name should be consistent with the order of grouped embeddings
-        self.assertEqual(qec.m._feature_names, ["f1", "f3", "f2"])  # pyre-ignore[16]
+        self.assertEqual(qec.m._feature_names, ["f1", "f3", "f2"])
 
+        # pyrefly: ignore[not-callable]
         configs = model.m.embedding_configs()
         self.assertEqual(len(configs), 3)
         features = KeyedJaggedTensor(
@@ -909,7 +902,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
             inplace=True,
             per_table_weight_dtype={"t1": torch.float16},
         )
-        # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
+        # pyrefly: ignore[not-callable]
         configs = model.m.embedding_bag_configs()
         self.assertEqual(len(configs), 2)
         self.assertNotEqual(configs[0].name, configs[1].name)
@@ -941,7 +934,6 @@ class EmbeddingCollectionTest(unittest.TestCase):
         )
 
         ec = EmbeddingCollection(tables=[ec1_config, ec2_config])
-        # pyre-fixme[16]: `EmbeddingCollection` has no attribute `qconfig`.
         ec.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -973,7 +965,6 @@ class EmbeddingCollectionTest(unittest.TestCase):
         torch.cuda.device_count() < 1,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]
     @given(
         offsets_dtype=st.sampled_from(
             [
@@ -1044,7 +1035,6 @@ class EmbeddingCollectionTest(unittest.TestCase):
         )
 
         ec = EmbeddingCollection(tables=[ec1_config, ec2_config])
-        # pyre-fixme[16]: `EmbeddingCollection` has no attribute `qconfig`.
         ec.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type

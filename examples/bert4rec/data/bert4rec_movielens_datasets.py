@@ -216,8 +216,10 @@ class Bert4RecPreprocsser:
                 seen.update(df["test"][user])
                 test_negative_samples[user] = []
                 for _ in range(test_set_sample_size):
+                    # pyrefly: ignore[implicit-import]
                     t = np.random.randint(1, self.item_count + 1)
                     while t in seen:
+                        # pyrefly: ignore[implicit-import]
                         t = np.random.randint(1, self.item_count + 1)
                     test_negative_samples[user].append(t)
         else:
@@ -239,6 +241,7 @@ class Bert4RecPreprocsser:
                 seen.update(df["test"][user])
                 samples = []
                 while len(samples) < test_set_sample_size:
+                    # pyrefly: ignore[implicit-import]
                     sampled_ids = np.random.choice(
                         items_list, test_set_sample_size * 2, replace=False, p=prob
                     )

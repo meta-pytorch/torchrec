@@ -58,6 +58,7 @@ class GroupedPositionWeightedModule(BaseGroupedFeatureProcessor):
                 )
             else:
                 weights_list.append(
+                    # pyrefly: ignore[bad-index]
                     self._dummy_weights[: self.max_feature_lengths[key]]
                 )
         weights = torch.cat(weights_list)
@@ -88,7 +89,7 @@ class GroupedPositionWeightedModule(BaseGroupedFeatureProcessor):
     ) -> Iterator[Tuple[str, torch.Tensor]]:
         yield from ()
 
-    # pyre-fixme[14]: `state_dict` overrides method defined in `Module` inconsistently.
+    # pyrefly: ignore[bad-override]
     def state_dict(
         self,
         destination: Optional[Dict[str, Any]] = None,
@@ -97,7 +98,7 @@ class GroupedPositionWeightedModule(BaseGroupedFeatureProcessor):
     ) -> Dict[str, Any]:
         if destination is None:
             destination = OrderedDict()
-            # pyre-ignore [16]
+            # pyrefly: ignore[missing-attribute]
             destination._metadata = OrderedDict()
         for name, param in self.position_weights.items():
             destination[prefix + f"position_weights.{name}"] = (

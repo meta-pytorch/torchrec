@@ -124,8 +124,8 @@ class TwSequenceEmbeddingSharding(
         device: Optional[torch.device] = None,
     ) -> BaseSparseFeaturesDist[KeyedJaggedTensor]:
         return TwSparseFeaturesDist(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             self._pg,
             self.features_per_rank(),
         )
@@ -220,7 +220,7 @@ class InferTwSequenceEmbeddingDist(
                 _get_batching_hinted_output(
                     _fx_trec_get_feature_length(
                         sharding_ctx.features[i],
-                        # pyre-fixme [16]
+                        # pyrefly: ignore[unsupported-operation]
                         sharding_ctx.embedding_names_per_rank[i],
                     ),
                     local_emb,
@@ -277,7 +277,7 @@ class InferTwSequenceEmbeddingSharding(
     ]:
         device = device if device is not None else self._device
         return InferTwSequenceEmbeddingDist(
-            # pyre-fixme [6]
+            # pyrefly: ignore[bad-argument-type]
             device,
             self._world_size,
             self._storage_device_type_from_sharding_infos,

@@ -23,35 +23,34 @@ ShrdCtx = EmbeddingBagCollectionContext
 
 class FakeShardedEmbeddingModule(ShardedEmbeddingModule[CompIn, DistOut, Out, ShrdCtx]):
     def __init__(self) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__()
         self._lookups = [
             torch.nn.Module(),
             torch.nn.Module(),
         ]
 
-    # pyre-fixme[7]: Expected `EmbeddingBagCollectionContext` but got implicit
     #  return value of `None`.
+    # pyrefly: ignore[bad-return]
     def create_context(self) -> ShrdCtx:
         pass
 
     def input_dist(
         self,
         ctx: ShrdCtx,
-        # pyre-ignore[2]
         *input,
-        # pyre-ignore[2]
         **kwargs,
-        # pyre-fixme[7]: Expected `Awaitable[Awaitable[KJTList]]` but got implicit
         #  return value of `None`.
+        # pyrefly: ignore[bad-return]
     ) -> Awaitable[Awaitable[CompIn]]:
         pass
 
-    # pyre-fixme[7]: Expected `List[Tensor]` but got implicit return value of `None`.
+    # pyrefly: ignore[bad-return]
     def compute(self, ctx: ShrdCtx, dist_input: CompIn) -> DistOut:
         pass
 
-    # pyre-fixme[7]: Expected `LazyAwaitable[Dict[str, Tensor]]` but got implicit
     #  return value of `None`.
+    # pyrefly: ignore[bad-return]
     def output_dist(self, ctx: ShrdCtx, output: DistOut) -> LazyAwaitable[Out]:
         pass
 

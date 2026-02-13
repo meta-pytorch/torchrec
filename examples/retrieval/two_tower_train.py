@@ -37,17 +37,17 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 # OSS import
 try:
-    # pyre-ignore[21]
     # @manual=//torchrec/github/examples/retrieval/data:dataloader
-    from data.dataloader import get_dataloader
+    from data.dataloader import get_dataloader  # pyrefly: ignore[missing-import]
 
-    # pyre-ignore[21]
     # @manual=//torchrec/github/examples/retrieval:knn_index
-    from knn_index import get_index
+    from knn_index import get_index  # pyrefly: ignore[missing-import]
 
-    # pyre-ignore[21]
     # @manual=//torchrec/github/examples/retrieval/modules:two_tower
-    from modules.two_tower import TwoTower, TwoTowerTrainTask
+    from modules.two_tower import (  # pyrefly: ignore[missing-import]
+        TwoTower,
+        TwoTowerTrainTask,
+    )
 except ImportError:
     pass
 

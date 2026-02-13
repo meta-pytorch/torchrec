@@ -40,6 +40,6 @@ class EagerModelProcessingTests(unittest.TestCase):
         quantized_model = quantize_inference_model(model)
         sharded_model, _ = shard_quant_model(quantized_model)
 
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `sparse`.
+        # pyrefly: ignore[missing-attribute]
         sharded_qebc = sharded_model._module.sparse.ebc
         self.assertEqual(len(sharded_qebc.tbes), 1)

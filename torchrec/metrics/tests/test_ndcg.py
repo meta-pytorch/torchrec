@@ -192,20 +192,20 @@ class NDCGMetricValueTest(unittest.TestCase):
             my_rank=my_rank,
             batch_size=batch_size,
             tasks=tasks,
-            # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
             session_key=session_key,
-            # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
             exponential_gain=exponential_gain,
-            # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
             remove_single_length_sessions=remove_single_length_sessions,
-            # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
             scale_by_weights_tensor=scale_by_weights_tensor,
-            # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
             report_ndcg_as_decreasing_curve=report_ndcg_as_decreasing_curve,
-            # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
             k=k,
             compute_mode=compute_mode,
-            # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
             **kwargs,
         )
 

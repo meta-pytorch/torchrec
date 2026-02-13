@@ -21,7 +21,7 @@ class FusedOptimizer(KeyedOptimizer, abc.ABC):
     """
 
     @abc.abstractmethod
-    # pyre-ignore [2]
+    # pyrefly: ignore[bad-override]
     def step(self, closure: Any = None) -> None: ...
 
     @abc.abstractmethod
@@ -39,7 +39,6 @@ class EmptyFusedOptimizer(FusedOptimizer):
     def __init__(self) -> None:
         super().__init__({}, {}, {})
 
-    # pyre-ignore
     def step(self, closure: Any = None) -> None:
         pass
 

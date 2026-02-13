@@ -105,15 +105,19 @@ class CriteoTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
 
             if filenames is None:
+                # pyrefly: ignore[bad-assignment]
                 filenames = [filename]
 
             paths = []
+            # pyrefly: ignore[not-iterable]
             for filename in filenames:
                 filename = none_throws(filename)
 
                 if generate_dense:
+                    # pyrefly: ignore[unsupported-operation]
                     dense_path = os.path.join(tmpdir, filename + "_dense.npy")
                     if dense is None:
+                        # pyrefly: ignore[implicit-import]
                         dense = np.random.random((num_rows, INT_FEATURE_COUNT)).astype(
                             np.float32
                         )
@@ -121,8 +125,10 @@ class CriteoTest(unittest.TestCase):
                     paths.append(dense_path)
 
                 if generate_sparse:
+                    # pyrefly: ignore[unsupported-operation]
                     sparse_path = os.path.join(tmpdir, filename + "_sparse.npy")
                     if sparse is None:
+                        # pyrefly: ignore[implicit-import, no-matching-overload]
                         sparse = np.random.randint(
                             cls.CAT_VAL_RANGE[0],
                             cls.CAT_VAL_RANGE[1] + 1,
@@ -133,8 +139,10 @@ class CriteoTest(unittest.TestCase):
                     paths.append(sparse_path)
 
                 if generate_labels:
+                    # pyrefly: ignore[unsupported-operation]
                     labels_path = os.path.join(tmpdir, filename + "_labels.npy")
                     if labels is None:
+                        # pyrefly: ignore[implicit-import, no-matching-overload]
                         labels = np.random.randint(
                             cls.LABEL_VAL_RANGE[0],
                             cls.LABEL_VAL_RANGE[1] + 1,

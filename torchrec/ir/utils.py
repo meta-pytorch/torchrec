@@ -195,7 +195,6 @@ def decapsulate_ir_modules(
     if finalize_interpreter_modules:
         for mod in module.modules():
             if isinstance(mod, InterpreterModule):
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 mod.finalize()
 
     return module
@@ -298,7 +297,7 @@ def move_to_copy_nodes_to_device(
     """
     Moves all the copy nodes to the given device.
     """
-    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `nodes`.
+    # pyrefly: ignore[missing-attribute]
     for nodes in unflattened_module.graph.nodes:
         if "_to_copy" in nodes.name:
             new_kwargs = {}
@@ -312,7 +311,7 @@ def move_to_copy_nodes_to_device(
 
 
 def _check_graph_node(mod: nn.Module, fqn: str) -> bool:
-    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `nodes`.
+    # pyrefly: ignore[missing-attribute]
     for node in mod.graph.nodes:
         if node.op == "call_module" and node.target == fqn:
             return True
@@ -377,7 +376,7 @@ def prune_pytree_flatten_unflatten(
     """
 
     def _get_graph_node(mod: nn.Module, fqn: str) -> Tuple[nn.Module, Node, str]:
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `nodes`.
+        # pyrefly: ignore[missing-attribute]
         for node in mod.graph.nodes:
             if node.op == "call_module" and node.target == fqn:
                 return mod, node, fqn
@@ -423,6 +422,7 @@ def prune_pytree_flatten_unflatten(
         tree_unflatten = cast(Node, tree_unflatten_getitem.args[0])
         assert (
             tree_unflatten.op == "call_function"
+            # pyrefly: ignore[implicit-import]
             and tree_unflatten.target == torch.utils._pytree.tree_unflatten
         )
         logger.info(f"Removing tree_unflatten from {fqn}")
@@ -431,8 +431,8 @@ def prune_pytree_flatten_unflatten(
             node.args = (input_nodes,)
         else:
             node.kwargs = {list(node.kwargs.keys())[0]: input_nodes}
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
         #  `eliminate_dead_code`.
+        # pyrefly: ignore[missing-attribute]
         submodule.graph.eliminate_dead_code()
 
     # remove tree_flatten_spec from the out_fqns (out-going nodes)
@@ -442,6 +442,7 @@ def prune_pytree_flatten_unflatten(
         assert (
             len(users) == 1
             and users[0].op == "call_function"
+            # pyrefly: ignore[implicit-import]
             and users[0].target == torch.fx._pytree.tree_flatten_spec
         )
         tree_flatten_users = list(users[0].users.keys())
@@ -453,7 +454,7 @@ def prune_pytree_flatten_unflatten(
         logger.info(f"Removing tree_flatten_spec from {fqn}")
         getitem_node = tree_flatten_users[0]
         getitem_node.replace_all_uses_with(node)
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
         #  `eliminate_dead_code`.
+        # pyrefly: ignore[missing-attribute]
         submodule.graph.eliminate_dead_code()
     return module

@@ -100,11 +100,10 @@ def share_tensor_via_shm(
         # Register reducers for moving the tensor storage to shared memory
         for t in torch._storage_classes:
             if t.__name__ == "_UntypedStorage":
-                # pyre-ignore [16]
                 shm_pickler.dispatch_table[t] = reduce_storage
             else:
                 shm_pickler.dispatch_table[t] = reduce_typed_storage_child
-        # pyre-fixme[16]: Module `storage` has no attribute `_TypedStorage`.
+        # pyrefly: ignore[missing-attribute]
         shm_pickler.dispatch_table[torch.storage._TypedStorage] = reduce_typed_storage
 
         tensor.share_memory_()

@@ -57,6 +57,7 @@ class MetricStateSnapshotTest(unittest.TestCase):
             batch_size=self.batch_size,
             tasks=self.tasks,
             initial_states=initial_states,
+            # pyrefly: ignore[bad-argument-type]
             reduction_fn=torch.sum,
         )
 

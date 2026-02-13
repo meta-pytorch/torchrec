@@ -180,7 +180,6 @@ class ModelTraceScriptTest(unittest.TestCase):
         world_size: int,
         sharding_type: str,
         quant_state_dict_split_scale_bias: bool,
-        # pyre-ignore
     ) -> Tuple[torch.nn.Module, torch.nn.Module, List[Tuple]]:
         model_info = self._set_up_qebc(sharding_type, quant_state_dict_split_scale_bias)
         sharded_model = _shard_modules(
@@ -206,7 +205,6 @@ class ModelTraceScriptTest(unittest.TestCase):
         world_size: int,
         sharding_type: str,
         quant_state_dict_split_scale_bias: bool,
-        # pyre-ignore
     ) -> Tuple[torch.nn.Module, torch.nn.Module, List[Tuple]]:
         model_info = self._set_up_qec(sharding_type, quant_state_dict_split_scale_bias)
         sharded_model = _shard_modules(
@@ -233,7 +231,6 @@ class ModelTraceScriptTest(unittest.TestCase):
         sharding_type: str,
         quant_state_dict_split_scale_bias: bool,
         unwrap_dmp: bool,
-        # pyre-ignore
     ) -> Tuple[torch.nn.Module, torch.nn.Module, List[Tuple]]:
         model_info = self._set_up_qebc(sharding_type, quant_state_dict_split_scale_bias)
         topology = Topology(world_size=world_size, compute_device="cuda")
@@ -248,6 +245,7 @@ class ModelTraceScriptTest(unittest.TestCase):
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
+            # pyrefly: ignore[bad-argument-type, missing-argument]
         ).plan(model_info.quant_model, model_info.sharders)
 
         dmp = DistributedModelParallel(
@@ -279,7 +277,6 @@ class ModelTraceScriptTest(unittest.TestCase):
         sharding_type: str,
         quant_state_dict_split_scale_bias: bool,
         sharding_enabled: bool,
-        # pyre-ignore
     ) -> Tuple[torch.nn.Module, torch.nn.Module, List[Tuple]]:
         model_info = self._set_up_qec(sharding_type, quant_state_dict_split_scale_bias)
 
@@ -296,6 +293,7 @@ class ModelTraceScriptTest(unittest.TestCase):
                         EmbeddingStorageEstimator(topology=topology),
                     ],
                 ),
+                # pyrefly: ignore[bad-argument-type, missing-argument]
             ).plan(model_info.quant_model, model_info.sharders)
             m = DistributedModelParallel(
                 model_info.quant_model,
@@ -320,11 +318,8 @@ class ModelTraceScriptTest(unittest.TestCase):
 
     def _models_with_inputs(
         self,
-        # pyre-ignore
         *args,
-        # pyre-ignore
         **kwargs,
-        # pyre-ignore
     ) -> List[Tuple[torch.nn.Module, torch.nn.Module, List[Tuple], FxJitTestType]]:
         return [
             (*fn(*args, **kwargs), test_type)
@@ -450,7 +445,6 @@ class ModelTraceScriptTest(unittest.TestCase):
             ]
         ]
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
@@ -473,7 +467,6 @@ class ModelTraceScriptTest(unittest.TestCase):
             tracer = TorchrecFxTracer()
             graph = tracer.trace(model)
 
-            # pyre-ignore
             gm = torch.fx.GraphModule(tracer.root, graph)
 
             if test_type == FxJitTestType.FX_JIT:

@@ -38,9 +38,9 @@ class Batch(Pipelineable):
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
-        # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+        # pyrefly: ignore[bad-argument-type]
         self.uih_features.record_stream(stream)
-        # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+        # pyrefly: ignore[bad-argument-type]
         self.candidates_features.record_stream(stream)
 
     def pin_memory(self) -> "Batch":
@@ -213,6 +213,7 @@ class MovieLens1MDataset(Dataset):
         self.unload_query_samples(indices)
         return samples
 
+    # pyrefly: ignore[bad-param-name-override]
     def __getitem__(self, idx: int) -> Batch:
         self.load_query_samples([idx])
         sample = self.get_sample(idx)

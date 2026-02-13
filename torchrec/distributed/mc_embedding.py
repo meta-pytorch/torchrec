@@ -52,13 +52,12 @@ class ManagedCollisionEmbeddingCollectionContext(EmbeddingCollectionContext):
     def record_stream(self, stream: torch.Stream) -> None:
         super().record_stream(stream)
         if self.evictions_per_table:
-            #  pyre-ignore
             for value in self.evictions_per_table.values():
                 if value is None:
                     continue
                 value.record_stream(stream)
         if self.remapped_kjt is not None:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+            # pyrefly: ignore[bad-argument-type]
             self.remapped_kjt.record_stream(stream)
 
 
@@ -132,7 +131,7 @@ class ManagedCollisionEmbeddingCollectionSharder(
         return ShardedManagedCollisionEmbeddingCollection(
             module,
             params,
-            # pyre-ignore [6]
+            # pyrefly: ignore[bad-argument-type]
             ec_sharder=self._e_sharder,
             mc_sharder=self._mc_sharder,
             env=env,

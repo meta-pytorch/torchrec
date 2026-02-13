@@ -43,7 +43,7 @@ class Batch(Pipelineable):
 
     def record_stream(self, stream: torch.Stream) -> None:
         self.dense_features.record_stream(stream)
-        # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+        # pyrefly: ignore[bad-argument-type]
         self.sparse_features.record_stream(stream)
         self.labels.record_stream(stream)
 
@@ -63,7 +63,6 @@ class _IdxFilter(IterDataPipe):
         self.datapipe = datapipe
         self.filter_fn = filter_fn
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         for idx, data in enumerate(self.datapipe):
             if self.filter_fn(idx):
@@ -117,10 +116,8 @@ class _RandFilter(IterDataPipe):
         self.datapipe = datapipe
         self.filter_fn = filter_fn
         self.rand_gen = rand_gen
-        # pyre-ignore[4]
         self.rand_gen_init_state: Tuple[Any, ...] = rand_gen.getstate()
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         self.rand_gen.setstate(self.rand_gen_init_state)
         for data in self.datapipe:
@@ -190,7 +187,6 @@ class Limit(IterDataPipe):
         self.datapipe = datapipe
         self.limit = limit
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         for idx, data in enumerate(self.datapipe):
             if idx >= self.limit:
@@ -203,17 +199,16 @@ class ReadLinesFromCSV(IterDataPipe):
         self,
         datapipe: IterDataPipe[Tuple[str, "IOBase"]],
         skip_first_line: bool = False,
-        # pyre-ignore[2]
         **kw,
     ) -> None:
         super().__init__()
         self.datapipe = datapipe
         self.skip_first_line = skip_first_line
-        # pyre-ignore[4]
         self.kw = kw
 
     def __iter__(self) -> Iterator[List[str]]:
         for _, data in self.datapipe:
+            # pyrefly: ignore[bad-argument-type]
             reader = csv.reader(data, **self.kw)
             if self.skip_first_line:
                 next(reader, None)
@@ -235,7 +230,6 @@ class LoadFiles(IterDataPipe[Tuple[str, "IOBase"]]):
         mode: str = "b",
         length: int = -1,
         path_manager_key: str = PATH_MANAGER_KEY,
-        # pyre-ignore[2]
         **open_kw,
     ) -> None:
         super().__init__()
@@ -246,7 +240,6 @@ class LoadFiles(IterDataPipe[Tuple[str, "IOBase"]]):
         # TODO: enforce typing for each instance based on mode, otherwise
         #       `argument_validation` with this DataPipe may be potentially broken
         self.length: int = length
-        # pyre-ignore[4]
         self.open_kw = open_kw
         self.path_manager: PathManager = PathManagerFactory().get(path_manager_key)
         self.path_manager.set_strict_kwargs_checking(False)
@@ -254,7 +247,6 @@ class LoadFiles(IterDataPipe[Tuple[str, "IOBase"]]):
     # Remove annotation due to 'IOBase' is a general type and true type
     # is determined at runtime based on mode. Some `DataPipe` requiring
     # a subtype would cause mypy error.
-    # pyre-ignore[3]
     def __iter__(self):
         if self.mode in ("b", "t"):
             self.mode = "r" + self.mode
@@ -332,7 +324,6 @@ class ParallelReadConcat(IterDataPipe):
         self.datapipes: Tuple[IterDataPipe, ...] = datapipes
         self.dp_selector = dp_selector
 
-    # pyre-ignore[3]
     def __iter__(self) -> Iterator[Any]:
         selected_dps = self.dp_selector(self.datapipes)
         for dp in selected_dps:

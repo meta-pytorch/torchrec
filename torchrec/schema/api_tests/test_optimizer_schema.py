@@ -22,7 +22,6 @@ class StableKeyedOptimizer(optim.Optimizer):
     def __init__(
         self,
         params: Mapping[str, Union[torch.Tensor, ShardedTensor]],
-        # pyre-ignore [2]
         state: Mapping[Any, Any],
         param_groups: Collection[Mapping[str, Any]],
     ) -> None:
@@ -37,7 +36,6 @@ class StableKeyedOptimizer(optim.Optimizer):
     def save_param_groups(self, save: bool) -> None:
         pass
 
-    # pyre-ignore [2]
     def add_param_group(self, param_group: Any) -> None:
         pass
 
@@ -61,10 +59,12 @@ class StableCombinedOptimizer(KeyedOptimizer):
         return ""
 
     @property
+    # pyrefly: ignore[bad-override]
     def param_groups(self) -> Collection[Mapping[str, Any]]:
         return []
 
     @property
+    # pyrefly: ignore[bad-override]
     def params(self) -> Mapping[str, Union[torch.Tensor, ShardedTensor]]:
         return {}
 
@@ -74,7 +74,7 @@ class StableCombinedOptimizer(KeyedOptimizer):
     def save_param_groups(self, save: bool) -> None:
         pass
 
-    # pyre-ignore [2]
+    # pyrefly: ignore[bad-override]
     def step(self, closure: Any = None) -> None:
         pass
 

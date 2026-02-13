@@ -56,7 +56,6 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         fused_learning_rate=st.sampled_from([0, 0.1]),
         non_fused_learning_rate=st.sampled_from([0, 0.1]),
@@ -103,12 +102,13 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
             ),
             constraints=constraints,
         )
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         plan = planner.plan(unsharded_model, sharders)
 
         ### apply Rowwise Adagrad optimizer to fused TBEs ###
         # fused TBE optimizer needs to be configured before initializing
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
         #  `named_parameters`.
+        # pyrefly: ignore[missing-attribute]
         for _, param in unsharded_model.sparse.named_parameters():
             apply_optimizer_in_backward(
                 RowWiseAdagrad,
@@ -130,12 +130,13 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
         non_fused_tables_optimizer = KeyedOptimizerWrapper(
             dict(
                 in_backward_optimizer_filter(
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                     #  attribute `named_parameters`.
+                    # pyrefly: ignore[missing-attribute]
                     sharded_model.module.sparse.named_parameters()
                 )
             ),
             lambda params: RowWiseAdagrad(
+                # pyrefly: ignore[bad-argument-type]
                 params,
                 lr=non_fused_learning_rate,
                 eps=1e-8,  # to match with FBGEMM
@@ -164,15 +165,15 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
         batch = local_batch[0].to(self.device)
 
         # record signatures
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
         #  `dhn_arch`.
+        # pyrefly: ignore[missing-attribute]
         dense_signature = sharded_model.module.over.dhn_arch.linear0.weight.sum().item()
         non_fused_table_signature = (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.embedding_bags.table_0.weight.sum().item()
         )
         fused_table_signature = (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.embedding_bags.table_1.weight.sum().item()
         )
 
@@ -190,20 +191,20 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
         dense_opt.step()
 
         self.assertEqual(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.embedding_bags.table_1.weight.sum().item()
             != fused_table_signature,
             bool(fused_learning_rate),
         )
         self.assertEqual(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute `ebc`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.sparse.ebc.embedding_bags.table_0.weight.sum().item()
             != non_fused_table_signature,
             bool(non_fused_learning_rate),
         )
         self.assertEqual(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `dhn_arch`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model.module.over.dhn_arch.linear0.weight.sum().item()
             != dense_signature,
             bool(dense_learning_rate),

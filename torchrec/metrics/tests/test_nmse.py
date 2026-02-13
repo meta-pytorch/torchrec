@@ -329,7 +329,7 @@ class NMSEThresholdValueTest(unittest.TestCase):
         test_data = generate_model_outputs_cases()
         for inputs in test_data:
             try:
-                # pyre-ignore[6]: All values in generate_model_outputs_cases are torch.Tensor
+                # pyrefly: ignore[bad-argument-type]
                 self._test_nmse_helper(**inputs)
             except AssertionError:
                 print("Assertion error caught with data set ", inputs)

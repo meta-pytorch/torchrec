@@ -189,7 +189,7 @@ class EmbeddingStats(Stats):
         shard_by_fqn = {
             module_name + "." + param_name: value
             for module_name, param_dict in sharding_plan.plan.items()
-            # pyre-ignore - this is a EmbeddingShardingPlan below
+            # pyrefly: ignore[missing-attribute]
             for param_name, value in param_dict.items()
         }
         stats: Dict[int, Dict[str, Any]] = {
@@ -293,6 +293,7 @@ class EmbeddingStats(Stats):
         if debug:
             self._stats_table.append(f"#{'' : ^{self._width-2}}#")
             self._stats_table.append(f"# {'Parameter Info:' : <{self._width-3}}#")
+            # pyrefly: ignore[unbound-name]
             for row in formatted_param_table:
                 self._stats_table.append(f"# {row: <{self._width-3}}#")
 
@@ -768,7 +769,7 @@ class EmbeddingStats(Stats):
             sharder: Optional[ModuleSharder[nn.Module]], so: ShardingOption
         ) -> str:
             sharder_cache_load_factor = (
-                sharder.fused_params.get("cache_load_factor")  # pyre-ignore[16]
+                sharder.fused_params.get("cache_load_factor")
                 if hasattr(sharder, "fused_params") and sharder.fused_params
                 else None
             )
@@ -831,7 +832,7 @@ class EmbeddingStats(Stats):
 
         sharder_map: Dict[str, ModuleSharder[nn.Module]] = {
             get_sharder_name(sharder.module_type): sharder
-            # pyre-ignore - this is a ModuleSharder below
+            # pyrefly: ignore[not-iterable]
             for sharder in sharders
             if sharders
         }
@@ -870,7 +871,7 @@ class EmbeddingStats(Stats):
             cache_load_factor = _get_cache_load_factor(sharder, so)
             hash_size = so.tensor.shape[0]
             param_table.append(
-                # pyre-ignore[6]
+                # pyrefly: ignore[bad-argument-type]
                 [
                     so.fqn,
                     _get_sharding_type_abbr(so.sharding_type),
@@ -893,7 +894,8 @@ class EmbeddingStats(Stats):
             if include_batch_sizes:
                 bs = feat_batch_sizes[i]
                 param_table[-1].append(_reduce_int_list(bs) if bs else "n/a")
-        formatted_param_table = _format_table(param_table)  # pyre-ignore[6]
+        # pyrefly: ignore[bad-argument-type]
+        formatted_param_table = _format_table(param_table)
         self._width = max(self._width, len(formatted_param_table[0]) + 6)
         return formatted_param_table
 

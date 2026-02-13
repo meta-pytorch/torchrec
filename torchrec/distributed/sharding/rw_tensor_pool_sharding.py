@@ -111,7 +111,7 @@ class TensorPoolRwSharding(ObjectPoolSharding):
         device: torch.device,
     ) -> None:
         self._env = env
-        # pyre-ignore
+        # pyrefly: ignore[bad-assignment]
         self._pg: dist.ProcessGroup = self._env.process_group
         self._world_size: int = self._env.world_size
         self._rank: int = self._env.rank
@@ -161,6 +161,7 @@ class TensorPoolRwSharding(ObjectPoolSharding):
         """
         return RwTensorPoolValuesDist(self._pg, is_update=False)
 
+    # pyrefly: ignore[bad-override]
     def get_sharded_states_to_register(
         self, lookup: TensorPoolLookup
     ) -> Iterable[Tuple[str, torch.Tensor]]:

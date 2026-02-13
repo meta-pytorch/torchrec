@@ -95,7 +95,7 @@ class TestHeuristicalStorageReservation(unittest.TestCase):
 
         self.assertEqual(
             _get_module_size(model.dense_arch, multiplier=6),
-            # pyre-ignore
+            # pyrefly: ignore[missing-attribute]
             heuristical_storage_reservation._dense_storage.hbm,
         )
 
@@ -135,7 +135,7 @@ class TestHeuristicalStorageReservation(unittest.TestCase):
 
         self.assertEqual(
             _get_module_size(model.dense_arch, multiplier=6),
-            # pyre-ignore
+            # pyrefly: ignore[missing-attribute]
             heuristical_storage_reservation._dense_storage.hbm,
         )
 
@@ -176,7 +176,7 @@ class TestHeuristicalStorageReservation(unittest.TestCase):
 
         self.assertEqual(
             _get_module_size(model.dense_arch, multiplier=6),
-            # pyre-ignore
+            # pyrefly: ignore[missing-attribute]
             heuristical_storage_reservation._dense_storage.hbm,
         )
 
@@ -209,7 +209,7 @@ class TestHeuristicalStorageReservation(unittest.TestCase):
 
         self.assertEqual(
             dense_tensor_estimate,
-            # pyre-ignore
+            # pyrefly: ignore[missing-attribute]
             heuristical_storage_reservation._dense_storage.hbm,
         )
 
@@ -409,9 +409,7 @@ class TestFixedPercentageStorageReservation(unittest.TestCase):
         )
 
         self.assertIsNotNone(fixed_storage_reservation._kjt_storage)
-        # pyre-ignore
         self.assertGreater(fixed_storage_reservation._kjt_storage.hbm, 0)
-        # pyre-ignore
         self.assertEqual(fixed_storage_reservation._kjt_storage.ddr, 0)
 
     def test_fixed_percentage_reserves_kjt_storage_cpu(self) -> None:
@@ -442,9 +440,7 @@ class TestFixedPercentageStorageReservation(unittest.TestCase):
         )
 
         self.assertIsNotNone(fixed_storage_reservation._kjt_storage)
-        # pyre-ignore
         self.assertEqual(fixed_storage_reservation._kjt_storage.hbm, 0)
-        # pyre-ignore
         self.assertGreater(fixed_storage_reservation._kjt_storage.ddr, 0)
 
     def test_fixed_percentage_kjt_storage_not_reserved_from_topology(self) -> None:

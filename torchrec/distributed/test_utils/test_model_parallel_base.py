@@ -101,7 +101,7 @@ class InferenceModelParallelTestBase(unittest.TestCase):
         dedup_tables: Optional[List[EmbeddingTableConfig]] = None,
         weighted_tables: Optional[List[EmbeddingTableConfig]] = None,
         constraints: Optional[Dict[str, ParameterConstraints]] = None,
-        # pyre-ignore [9]
+        # pyrefly: ignore[bad-function-definition]
         generate: ModelInputCallable = ModelInput.generate,
     ) -> None:
         default_rank = 0
@@ -159,6 +159,7 @@ class InferenceModelParallelTestBase(unittest.TestCase):
             topology=Topology(world_size, "cuda"),
             constraints=constraints,
         )
+        # pyrefly: ignore[bad-argument-type, missing-argument]
         plan: ShardingPlan = planner.plan(local_model, sharders)
 
         # Generate a sharded model on a default rank.
@@ -362,6 +363,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
     def _generate_dmps_and_batch(
         self,
         sharders: Optional[List[ModuleSharder[nn.Module]]] = None,
+        # pyrefly: ignore[implicit-import]
         constraints: Optional[Dict[str, trec_dist.planner.ParameterConstraints]] = None,
     ) -> Tuple[List[DistributedModelParallel], ModelInput]:
 
@@ -392,6 +394,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
             if pg is not None:
                 plan = planner.collective_plan(m, sharders, pg)
             else:
+                # pyrefly: ignore[bad-argument-type, missing-argument]
                 plan = planner.plan(m, sharders)
 
             dmp = DistributedModelParallel(
@@ -499,11 +502,16 @@ class ModelParallelSingleRankBase(unittest.TestCase):
             elif isinstance(value, DTensor):
                 assert isinstance(v2, DTensor)
                 self.assertEqual(
-                    len(value._local_tensor.local_shards()),  # pyre-ignore[16]
+                    # pyrefly: ignore[missing-attribute]
+                    len(value._local_tensor.local_shards()),
+                    # pyrefly: ignore[missing-attribute]
                     len(v2._local_tensor.local_shards()),
                 )
                 for dst, src in zip(
-                    value._local_tensor.local_shards(), v2._local_tensor.local_shards()
+                    # pyrefly: ignore[missing-attribute]
+                    value._local_tensor.local_shards(),
+                    # pyrefly: ignore[missing-attribute]
+                    v2._local_tensor.local_shards(),
                 ):
                     if is_deterministic:
                         self.assertTrue(torch.equal(src, dst))
@@ -537,6 +545,7 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         if cls.backend not in ("nccl", "gloo"):
             raise unittest.SkipTest(f"No valid backend specified: {cls.backend}")
 
+    # pyrefly: ignore[bad-override]
     def setUp(self) -> None:
         super().setUp(backend=self.backend)
 
@@ -577,12 +586,14 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                 nn.init.constant_(self.p, self.val)
 
         # Check that already allocated parameters are left 'as is'.
+        # pyrefly: ignore[bad-argument-type]
         unsharded_model = MyModel(device=self.device, val=3.2)
         sharded_model = DistributedModelParallel(
             unsharded_model,
             device=self.device,
         )
         sharded_param = next(sharded_model.parameters())
+        # pyrefly: ignore[implicit-import]
         np.testing.assert_array_equal(
             np.array([3.2, 3.2, 3.2], dtype=np.float32),
             sharded_param.detach().cpu().numpy(),
@@ -595,14 +606,15 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
             device=self.device,
         )
         sharded_param = next(sharded_model.parameters())
+        # pyrefly: ignore[implicit-import]
         np.testing.assert_array_equal(
             np.array([7.5, 7.5, 7.5], dtype=np.float32),
             sharded_param.detach().cpu().numpy(),
         )
 
     def test_meta_device_dmp_state_dict(self) -> None:
-        # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
         #  `Optional[ProcessGroup]`.
+        # pyrefly: ignore[bad-argument-type]
         env = ShardingEnv.from_process_group(dist.GroupMember.WORLD)
 
         m1 = self._create_model()
@@ -618,6 +630,7 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                 topology=Topology(
                     world_size=env.world_size, compute_device=self.device.type
                 )
+                # pyrefly: ignore[bad-argument-type, missing-argument]
             ).plan(m1, get_default_sharders()),
         )
 
@@ -634,6 +647,7 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                 topology=Topology(
                     world_size=env.world_size, compute_device=self.device.type
                 )
+                # pyrefly: ignore[bad-argument-type, missing-argument]
             ).plan(m2, get_default_sharders()),
         )
 
@@ -650,7 +664,9 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                 dst = v2.local_shards()[0].tensor
             elif isinstance(v2, DTensor):
                 self.assertTrue(isinstance(v1, DTensor))
-                assert len(v2._local_tensor.local_shards()) == 1  # pyre-ignore[16]
+                # pyrefly: ignore[missing-attribute]
+                assert len(v2._local_tensor.local_shards()) == 1
+                # pyrefly: ignore[missing-attribute]
                 dst = v2._local_tensor.local_shards()[0]
             else:
                 dst = v2
@@ -658,13 +674,14 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                 assert len(v1.local_shards()) == 1
                 src = v1.local_shards()[0].tensor
             elif isinstance(v1, DTensor):
+                # pyrefly: ignore[missing-attribute]
                 assert len(v1._local_tensor.local_shards()) == 1
+                # pyrefly: ignore[missing-attribute]
                 src = v1._local_tensor.local_shards()[0]
             else:
                 src = v1
             self.assertEqual(src.size(), dst.size())
 
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -724,7 +741,6 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         self._eval_models(m1, m2, batch)
         self._compare_models(m1, m2)
 
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -797,7 +813,6 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         self._eval_models(m1, m2, batch)
         self._compare_models(m1, m2)
 
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -842,7 +857,6 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         self._eval_models(m1, m2, batch)
         self._compare_models(m1, m2)
 
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -896,7 +910,6 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         self._eval_models(m1, m2, batch)
         self._compare_models(m1, m2)
 
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -933,7 +946,7 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         sharders = [
             create_test_sharder(sharder_type, sharding_type, kernel_type),
         ]
-        # pyre-ignore[6]
+        # pyrefly: ignore[bad-argument-type]
         (m, _), batch = self._generate_dmps_and_batch(sharders=sharders)
         print(f"Sharding Plan: {m._plan}")
         state_dict_keys = set(m.state_dict().keys())
@@ -941,7 +954,6 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         buffer_keys = set(dict(m.named_buffers()).keys())
         self.assertEqual(state_dict_keys, {*param_keys, *buffer_keys})
 
-    # pyre-ignore
     @given(
         sharder_type=st.sampled_from(
             [
@@ -986,6 +998,7 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
             ),
         ]
 
+        # pyrefly: ignore[implicit-import]
         constraints = defaultdict(lambda: trec_dist.planner.ParameterConstraints())
         num_cw_shards_per_table = {}
         for table in self.tables + self.weighted_tables:
@@ -1026,9 +1039,11 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                     dst = value.local_shards()[0].tensor
                 elif isinstance(value, DTensor):
                     self.assertEqual(
-                        len(value._local_tensor.local_shards()),  # pyre-ignore[16]
+                        # pyrefly: ignore[missing-attribute]
+                        len(value._local_tensor.local_shards()),
                         num_cw_shards_per_table[table_name],
                     )
+                    # pyrefly: ignore[missing-attribute]
                     dst = value._local_tensor.local_shards()[0]
                 else:
                     dst = value
@@ -1052,6 +1067,7 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
 
                     for src_local_shard, dst_local_shard in zip(
                         value._local_tensor.local_shards(),
+                        # pyrefly: ignore[missing-attribute]
                         v2._local_tensor.local_shards(),
                     ):
                         self.assertTrue(torch.equal(src_local_shard, dst_local_shard))
@@ -1088,6 +1104,7 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                     self.assertIsInstance(src_opt_state, DTensor)
 
                     self.assertEqual(
+                        # pyrefly: ignore[missing-attribute]
                         len(dst_opt_state._local_tensor.local_shards()),
                         num_cw_shards_per_table[table_name],
                     )
@@ -1099,6 +1116,7 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
 
                     for src_local_shard, dst_local_shard in zip(
                         src_opt_state._local_tensor.local_shards(),
+                        # pyrefly: ignore[missing-attribute]
                         dst_opt_state._local_tensor.local_shards(),
                     ):
                         self.assertTrue(torch.equal(src_local_shard, dst_local_shard))
@@ -1109,7 +1127,6 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1195,7 +1212,6 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1252,8 +1268,8 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
         (dense_model, _), batch = self._generate_dmps_and_batch(dense_sharders)
 
         dense_opt = RowWiseAdagrad(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `parameters`.
+            # pyrefly: ignore[missing-attribute]
             dense_model.module.sparse.parameters(),
             lr=learning_rate,
             eps=1e-8,  # TBE has default eps 1e-8

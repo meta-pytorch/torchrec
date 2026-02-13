@@ -27,11 +27,13 @@ class _GradCheck(torch.autograd.Function):
     """
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def forward(ctx, x: torch.Tensor, tag: str):
         ctx.tag = tag
         return x
 
     @staticmethod
+    # pyrefly: ignore[bad-override]
     def backward(ctx, g: torch.Tensor) -> Tuple[torch.Tensor, None]:
         check = g.values() if getattr(g, "is_sparse", False) and g.is_sparse else g
         if torch.isnan(check).any() or torch.isinf(check).any():

@@ -80,7 +80,7 @@ class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         self._env: ShardingEnv = env
         self._is_2D_parallel: bool = isinstance(env, ShardingEnv2D)
         self._pg: Optional[dist.ProcessGroup] = (
-            # pyre-ignore[16]
+            # pyrefly: ignore[missing-attribute]
             self._env.sharding_pg
             if self._is_2D_parallel
             else self._env.process_group
@@ -98,7 +98,7 @@ class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
 
         if self._is_2D_parallel:
             intra_pg, cross_pg = intra_and_cross_node_pg_2D(
-                # pyre-fixme[6]
+                # pyrefly: ignore[bad-argument-type]
                 self._env,
                 device=device,
             )
@@ -217,7 +217,7 @@ class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             [] for _ in range(world_size)
         ]
         for info in sharding_infos:
-            # pyre-fixme [16]
+            # pyrefly: ignore[missing-attribute]
             shards = info.param_sharding.sharding_spec.shards
 
             # construct the global sharded_tensor_metadata
@@ -247,10 +247,10 @@ class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                 )
 
             # Expectation is planner CW shards across a node, so each CW shard will have local_size number of row shards
-            # pyre-fixme [6]
+            # pyrefly: ignore[bad-argument-type]
             for i, rank in enumerate(info.param_sharding.ranks):
                 rank = (
-                    # pyre-ignore[16]
+                    # pyrefly: ignore[missing-attribute]
                     self._env.remap_rank(rank, ShardingType.GRID_SHARD)
                     if self._is_2D_parallel
                     else rank

@@ -82,6 +82,7 @@ class ShardedITEPEmbeddingBagCollection(
         env: ShardingEnv,
         device: torch.device,
     ) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__()
 
         self._device = device
@@ -148,7 +149,7 @@ class ShardedITEPEmbeddingBagCollection(
         ctx.is_reindexed = True
         self._embedding_bag_collection.prefetch(dist_input, forward_stream, ctx)
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def input_dist(
         self,
         ctx: ITEPEmbeddingBagCollectionContext,
@@ -224,8 +225,8 @@ class ShardedITEPEmbeddingBagCollection(
     def create_context(self) -> ITEPEmbeddingBagCollectionContext:
         return ITEPEmbeddingBagCollectionContext()
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
+    # pyrefly: ignore[bad-override]
     def load_state_dict(
         self,
         state_dict: "OrderedDict[str, torch.Tensor]",
@@ -272,6 +273,7 @@ class ShardedITEPEmbeddingBagCollection(
             # group table_name_to_unpruned_hash_sizes
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
+            # pyrefly: ignore[not-iterable]
             for emb_config in lookup.grouped_configs:
                 for table in emb_config.embedding_tables:
                     if table.name in table_name_to_unpruned_hash_sizes.keys():
@@ -361,6 +363,7 @@ class ShardedITEPEmbeddingCollection(
         env: ShardingEnv,
         device: torch.device,
     ) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__()
 
         self._device = device
@@ -415,7 +418,7 @@ class ShardedITEPEmbeddingCollection(
             pg=env.process_group,
         )
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def input_dist(
         self,
         ctx: ITEPEmbeddingCollectionContext,
@@ -485,8 +488,8 @@ class ShardedITEPEmbeddingCollection(
     def create_context(self) -> ITEPEmbeddingCollectionContext:
         return ITEPEmbeddingCollectionContext()
 
-    # pyre-fixme[14]: `load_state_dict` overrides method defined in `Module`
     #  inconsistently.
+    # pyrefly: ignore[bad-override]
     def load_state_dict(
         self,
         state_dict: "OrderedDict[str, torch.Tensor]",
@@ -533,6 +536,7 @@ class ShardedITEPEmbeddingCollection(
             # group table_name_to_unpruned_hash_sizes
             while isinstance(lookup, DistributedDataParallel):
                 lookup = lookup.module
+            # pyrefly: ignore[not-iterable]
             for emb_config in lookup.grouped_configs:
                 for table in emb_config.embedding_tables:
                     if table.name in table_name_to_unpruned_hash_sizes.keys():

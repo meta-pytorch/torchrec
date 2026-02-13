@@ -401,8 +401,7 @@ def _jagged_values_string(
         "["
         + ", ".join(
             [
-                # pyre-fixme[6]: For 2nd param expected `int` but got `Tensor`.
-                # pyre-fixme[6]: For 3rd param expected `int` but got `Tensor`.
+                # pyrefly: ignore[bad-argument-type]
                 _values_string(values, offsets[index], offsets[index + 1])
                 for index in range(offset_start, offset_end)
             ]
@@ -420,7 +419,6 @@ def _optional_mask(
 
 
 @torch.fx.wrap
-# pyre-ignore
 def _arange(*args, **kwargs) -> torch.Tensor:
     return torch.arange(*args, **kwargs)
 
@@ -1088,8 +1086,8 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         )
 
     @torch.jit.unused
-    # pyre-fixme[14]: `record_stream` overrides method defined in `Multistreamable`
     #  inconsistently.
+    # pyrefly: ignore[bad-override]
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         self._values.record_stream(stream)
         weights = self._weights
@@ -1135,12 +1133,12 @@ def _jt_flatten_with_keys(
 ) -> Tuple[List[Tuple[KeyEntry, Optional[torch.Tensor]]], None]:
     values, context = _jt_flatten(t)
     # pyre can't tell that GetAttrKey implements the KeyEntry protocol
-    return [  # pyre-ignore[7]
-        (GetAttrKey(k), v) for k, v in zip(JaggedTensor._fields, values)
-    ], context
+    # pyrefly: ignore[bad-return]
+    return [(GetAttrKey(k), v) for k, v in zip(JaggedTensor._fields, values)], context
 
 
 def _jt_unflatten(values: List[Optional[torch.Tensor]], context: None) -> JaggedTensor:
+    # pyrefly: ignore[bad-argument-type]
     return JaggedTensor(*values)
 
 
@@ -1151,6 +1149,7 @@ def _jt_flatten_spec(t: JaggedTensor, spec: TreeSpec) -> List[Optional[torch.Ten
 register_pytree_node(
     JaggedTensor,
     _jt_flatten,
+    # pyrefly: ignore[bad-argument-type]
     _jt_unflatten,
     flatten_with_keys_fn=_jt_flatten_with_keys,
     serialized_type_name="torchrec.sparse.jagged_tensor.JaggedTensor",
@@ -1536,13 +1535,15 @@ def _maybe_compute_kjt_to_jt_dict(
 
         split_lengths = torch.unbind(strided_lengths, dim=0)
         if compute_offsets:
-            split_offsets = torch.unbind(  # pyre-ignore
+            # pyrefly: ignore[bad-assignment]
+            split_offsets = torch.unbind(
                 _batched_lengths_to_offsets(strided_lengths), dim=0
             )
     else:
         split_lengths = torch.unbind(lengths, dim=0)
         if compute_offsets:
-            split_offsets = split_lengths  # pyre-ignore
+            # pyrefly: ignore[bad-assignment]
+            split_offsets = split_lengths
 
     if weights is not None:
         weights_list = torch.split(weights, length_per_key)
@@ -1756,7 +1757,7 @@ def _force_length_offset_computation(
 def _check_attributes(
     attr_1: Union[torch.Tensor, List[int], List[str], int, None],
     attr_2: Union[torch.Tensor, List[int], List[str], int, None],
-    comparison_func: Callable[[Any, Any], bool],  # pyre-ignore[2]
+    comparison_func: Callable[[Any, Any], bool],
 ) -> bool:
     """Helper function to check if two attributes are equal.
 
@@ -1770,10 +1771,8 @@ def _check_attributes(
     """
     if attr_1 is not None and attr_2 is not None:
         # allclose throws error for different tensor sizes, we check manually for this
-        if (
-            comparison_func == torch.allclose
-            and attr_1.size() != attr_2.size()  # pyre-ignore[16]
-        ):
+        # pyrefly: ignore[missing-attribute]
+        if comparison_func == torch.allclose and attr_1.size() != attr_2.size():
             return False
         if not comparison_func(attr_1, attr_2):
             return False
@@ -2259,6 +2258,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             weights=kjt_weights,
             lengths=kjt_lens,
             stride=kjt_stride,
+            # pyrefly: ignore[bad-argument-type]
             stride_per_key_per_rank=kjt_stride_per_key_per_rank,
         ).sync()
         return kjt
@@ -2628,6 +2628,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                             empty_int_list, device=self.device(), dtype=torch.int
                         ),
                         stride=self._stride,
+                        # pyrefly: ignore[bad-argument-type]
                         stride_per_key_per_rank=stride_per_key_per_rank,
                         stride_per_key=None,
                         length_per_key=None,
@@ -2674,6 +2675,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                             lengths=_lengths,
                             offsets=None,
                             stride=self._stride,
+                            # pyrefly: ignore[bad-argument-type]
                             stride_per_key_per_rank=stride_per_key_per_rank,
                             stride_per_key=None,
                             length_per_key=split_length_per_key,
@@ -2710,6 +2712,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                             ],
                             offsets=None,
                             stride=self._stride,
+                            # pyrefly: ignore[bad-argument-type]
                             stride_per_key_per_rank=stride_per_key_per_rank,
                             stride_per_key=None,
                             length_per_key=split_length_per_key,
@@ -2821,6 +2824,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             lengths=permuted_lengths.view(-1),
             offsets=None,
             stride=self._stride,
+            # pyrefly: ignore[bad-argument-type]
             stride_per_key_per_rank=permuted_stride_per_key_per_rank,
             stride_per_key=permuted_stride_per_key,
             length_per_key=permuted_length_per_key if len(permuted_keys) > 0 else None,
@@ -2965,8 +2969,8 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         return _jt_dict
 
     @torch.jit.unused
-    # pyre-fixme[14]: `record_stream` overrides method defined in `Multistreamable`
     #  inconsistently.
+    # pyrefly: ignore[bad-override]
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         self._values.record_stream(stream)
         weights = self._weights
@@ -3200,6 +3204,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                 values=values,
                 weights=weights,
                 lengths=lengths,
+                # pyrefly: ignore[bad-argument-type]
                 stride_per_key_per_rank=stride_per_key_per_rank,
             )
             return kjt.sync()
@@ -3297,7 +3302,8 @@ def _kjt_flatten_with_keys(
 ) -> Tuple[List[Tuple[KeyEntry, Optional[torch.Tensor]]], List[str]]:
     values, context = _kjt_flatten(t)
     # pyre can't tell that GetAttrKey implements the KeyEntry protocol
-    return [  # pyre-ignore[7]
+    # pyrefly: ignore[bad-return]
+    return [
         (GetAttrKey(k), v) for k, v in zip(KeyedJaggedTensor._fields, values)
     ], context
 
@@ -3314,8 +3320,11 @@ def _kjt_unflatten(
         )
     return KeyedJaggedTensor(
         context,
+        # pyrefly: ignore[bad-argument-type]
         *values[:-2],
+        # pyrefly: ignore[bad-argument-type, bad-keyword-argument]
         stride_per_key_per_rank=values[-2],
+        # pyrefly: ignore[bad-argument-type, bad-keyword-argument]
         inverse_indices=(context, values[-1]) if values[-1] is not None else None,
     )
 
@@ -3332,6 +3341,7 @@ def _kjt_flatten_spec(
 register_pytree_node(
     KeyedJaggedTensor,
     _kjt_flatten,
+    # pyrefly: ignore[bad-argument-type]
     _kjt_unflatten,
     flatten_with_keys_fn=_kjt_flatten_with_keys,
     serialized_type_name="torchrec.sparse.jagged_tensor.KeyedJaggedTensor",
@@ -3611,8 +3621,8 @@ class KeyedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         return ret
 
     @torch.jit.unused
-    # pyre-fixme[14]: `record_stream` overrides method defined in `Multistreamable`
     #  inconsistently.
+    # pyrefly: ignore[bad-override]
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         self._values.record_stream(stream)
 
@@ -3679,6 +3689,10 @@ def _kt_flatten_spec(kt: KeyedTensor, spec: TreeSpec) -> List[torch.Tensor]:
 
 # The assumption here in torch.exporting KeyedTensor is that _length_per_key is static
 register_pytree_node(
-    KeyedTensor, _kt_flatten, _kt_unflatten, serialized_type_name="KeyedTensor"
+    KeyedTensor,
+    _kt_flatten,
+    # pyrefly: ignore[bad-argument-type]
+    _kt_unflatten,
+    serialized_type_name="KeyedTensor",
 )
 register_pytree_flatten_spec(KeyedTensor, _kt_flatten_spec)

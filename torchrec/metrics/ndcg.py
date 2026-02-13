@@ -430,6 +430,7 @@ class NDCGComputation(RecMetricComputation):
 
 
 class NDCGMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.NDCG
     _computation_class: Type[RecMetricComputation] = NDCGComputation
 
@@ -467,7 +468,7 @@ class NDCGMetric(RecMetric):
         if "session_key" not in kwargs:
             self._required_inputs.add(SESSION_KEY)
         else:
-            # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
             self._required_inputs.add(kwargs["session_key"])
 
     def _get_task_kwargs(

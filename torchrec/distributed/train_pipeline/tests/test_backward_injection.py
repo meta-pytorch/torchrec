@@ -49,7 +49,7 @@ class BackwardHookRegistryTest(unittest.TestCase):
         def work_fn(_p: TrainPipelineSparseDist) -> None:
             pass
 
-        registry.add_hook(site, work_fn)
+        registry.add_hook(site, work_fn)  # pyrefly: ignore[bad-argument-type]
 
         self.assertEqual(registry.work(site), [work_fn])
 
@@ -64,8 +64,8 @@ class BackwardHookRegistryTest(unittest.TestCase):
         def work_fn_2(_p: TrainPipelineSparseDist) -> None:
             pass
 
-        registry.add_hook(site, work_fn_1)
-        registry.add_hook(site, work_fn_2)
+        registry.add_hook(site, work_fn_1)  # pyrefly: ignore[bad-argument-type]
+        registry.add_hook(site, work_fn_2)  # pyrefly: ignore[bad-argument-type]
 
         self.assertEqual(registry.work(site), [work_fn_1, work_fn_2])
 
@@ -81,8 +81,8 @@ class BackwardHookRegistryTest(unittest.TestCase):
         def work_fn_2(_p: TrainPipelineSparseDist) -> None:
             pass
 
-        registry.add_hook(site_1, work_fn_1)
-        registry.add_hook(site_2, work_fn_2)
+        registry.add_hook(site_1, work_fn_1)  # pyrefly: ignore[bad-argument-type]
+        registry.add_hook(site_2, work_fn_2)  # pyrefly: ignore[bad-argument-type]
 
         self.assertEqual(registry.work(site_1), [work_fn_1])
         self.assertEqual(registry.work(site_2), [work_fn_2])
@@ -103,8 +103,8 @@ class BackwardHookRegistryTest(unittest.TestCase):
         def work_fn(_p: TrainPipelineSparseDist) -> None:
             pass
 
-        registry.add_hook(site_1, work_fn)
-        registry.add_hook(site_2, work_fn)
+        registry.add_hook(site_1, work_fn)  # pyrefly: ignore[bad-argument-type]
+        registry.add_hook(site_2, work_fn)  # pyrefly: ignore[bad-argument-type]
 
         self.assertEqual(registry.work(site_1), [work_fn])
         self.assertEqual(registry.work(site_2), [work_fn])
@@ -136,7 +136,9 @@ def _create_pipeline(
 
     sharded_model = DistributedModelParallel(
         module=copy.deepcopy(unsharded_model),
-        env=ShardingEnv.from_process_group(ctx.pg),
+        env=ShardingEnv.from_process_group(
+            ctx.pg  # pyrefly: ignore[bad-argument-type]
+        ),
         device=ctx.device,
         sharders=[cast(ModuleSharder[nn.Module], sharder)],
     )
@@ -193,7 +195,7 @@ def _run_backward_hook_test(
                 site=InjectionSite(
                     fqn=site_fqn, sharding_type=ShardingType(sharding_type)
                 ),
-                work=make_work_fn(i),
+                work=make_work_fn(i),  # pyrefly: ignore[bad-argument-type]
             )
 
         dataloader = iter(data)
@@ -330,7 +332,6 @@ class RegisterHooksTest(MultiProcessTestBase):
         "Not enough GPUs, this test requires at least 2 GPUs",
     )
     @settings(max_examples=6, deadline=None)
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [

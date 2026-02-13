@@ -438,7 +438,7 @@ class ManagedCollisionCollection(nn.Module):
             table,
             managed_collision_module,
         ) in self._managed_collision_modules.items():
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            # pyrefly: ignore[not-callable]
             evictions[table] = managed_collision_module.evict()
         return evictions
 
@@ -448,7 +448,7 @@ class ManagedCollisionCollection(nn.Module):
             table,
             managed_collision_module,
         ) in self._managed_collision_modules.items():
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            # pyrefly: ignore[not-callable]
             open_slots[table] = managed_collision_module.open_slots()
         return open_slots
 
@@ -1121,7 +1121,6 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
         self._input_history_buffer_size = int(
             input_batch_value_size_cumsum * self._eviction_interval * 1.25
         )
-        # pyre-fixme[16]: `MCHManagedCollisionModule` has no attribute
         #  `_history_accumulator`.
         self._history_accumulator: torch.Tensor = torch.empty(
             self._input_history_buffer_size,
@@ -1151,7 +1150,6 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
         preprocessed_features: Dict[str, JaggedTensor] = {}
         for name, feature in features.items():
             preprocessed_features[name] = JaggedTensor(
-                # pyre-ignore [29]
                 values=self._input_hash_func(feature.values(), self._input_hash_size),
                 lengths=feature.lengths(),
                 offsets=feature.offsets(),
@@ -1175,19 +1173,19 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
 
     @torch.no_grad()
     def _sort_mch_buffers(self) -> None:
-        # pyre-fixme[6]: For 1st argument expected `Tensor` but got `Union[Module,
         #  Tensor]`.
+        # pyrefly: ignore[no-matching-overload]
         argsorted_sorted_raw_ids = torch.argsort(self._mch_sorted_raw_ids, stable=True)
-        # pyre-fixme[29]: `Union[(self: TensorBase, src: Tensor, non_blocking: bool
         #  = ...) -> Tensor, Module, Tensor]` is not a function.
+        # pyrefly: ignore[not-callable]
         self._mch_sorted_raw_ids.copy_(
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
+            # pyrefly: ignore[bad-index]
             self._mch_sorted_raw_ids[argsorted_sorted_raw_ids]
         )
-        # pyre-fixme[29]: `Union[(self: TensorBase, src: Tensor, non_blocking: bool
         #  = ...) -> Tensor, Module, Tensor]` is not a function.
+        # pyrefly: ignore[not-callable]
         self._mch_remapped_ids_mapping.copy_(
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
+            # pyrefly: ignore[bad-index]
             self._mch_remapped_ids_mapping[argsorted_sorted_raw_ids]
         )
         for mch_metadata_buffer in self._mch_metadata.values():
@@ -1207,8 +1205,8 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
         frequency_sorted_uniq_ids_counts = uniq_ids_counts[argsorted_uniq_ids_counts]
 
         matching_eles, matched_indices = self._match_indices(
-            # pyre-fixme[6]: For 1st argument expected `Tensor` but got
             #  `Union[Module, Tensor]`.
+            # pyrefly: ignore[bad-argument-type]
             self._mch_sorted_raw_ids,
             frequency_sorted_uniq_ids,
         )
@@ -1231,7 +1229,7 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
             self._mch_metadata,
             uniq_ids_metadata,
         )
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
+        # pyrefly: ignore[unsupported-operation]
         self._mch_sorted_raw_ids[evicted_indices] = new_frequency_sorted_uniq_ids[
             selected_new_indices
         ]
@@ -1244,13 +1242,13 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
                 torch.cat(
                     [
                         self._evicted_emb_indices,
-                        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[No...
+                        # pyrefly: ignore[bad-index]
                         self._mch_remapped_ids_mapping[evicted_indices],
                     ]
                 )
             )
         else:
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
+            # pyrefly: ignore[bad-index]
             self._evicted_emb_indices = self._mch_remapped_ids_mapping[evicted_indices]
         self._evicted = True
 
@@ -1259,7 +1257,6 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
 
     @torch.no_grad()
     def _coalesce_history(self) -> None:
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
         current_history_accumulator = self._history_accumulator[
             : self._current_history_buffer_offset
         ]
@@ -1306,9 +1303,11 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
             return features
 
         if self._current_iter == -1:
+            # pyrefly: ignore[not-callable]
             self._current_iter = int(self._current_iter_tensor.item())
             self._last_eviction_iter = self._current_iter
         self._current_iter += 1
+        # pyrefly: ignore [bad-argument-type, bad-assignment, missing-attribute, unsupported-operation]
         self._current_iter_tensor.data += 1
 
         # init history buffers if needed
@@ -1321,7 +1320,6 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
                 self._input_history_buffer_size - self._current_history_buffer_offset
             )
             values = values[:free_elements]
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             self._history_accumulator[
                 self._current_history_buffer_offset : self._current_history_buffer_offset
                 + values.shape[0]
@@ -1379,15 +1377,12 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
         return self._input_hash_size
 
     def open_slots(self) -> torch.Tensor:
-        # pyre-fixme[29]: `Union[(self: TensorBase, other: Any) -> Tensor, Module,
         #  Tensor]` is not a function.
+        # pyrefly: ignore[no-matching-overload]
         return self._mch_slots - torch.searchsorted(
-            # pyre-fixme[6]: For 1st argument expected `Tensor` but got
             #  `Union[Module, Tensor]`.
-            # pyre-fixme[6]: For 2nd argument expected `Tensor` but got
             #  `Union[Module, Tensor]`.
             self._mch_sorted_raw_ids,
-            # pyre-fixme[6]: For 2nd argument expected `Tensor` but got
             #  `Union[Module, Tensor]`.
             self._delimiter,
         )

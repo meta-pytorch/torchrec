@@ -137,8 +137,8 @@ class KJTList(Multistreamable):
         return iter(self.features)
 
     @torch.jit._drop
-    # pyre-fixme[14]: `record_stream` overrides method defined in `Multistreamable`
     #  inconsistently.
+    # pyrefly: ignore[bad-override]
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         for feature in self.features:
             feature.record_stream(stream)
@@ -164,7 +164,7 @@ class InputDistOutputs(Multistreamable):
 
     def record_stream(self, stream: torch.Stream) -> None:
         for feature in self.features:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+            # pyrefly: ignore[bad-argument-type]
             feature.record_stream(stream)
         if self.unbucketize_permute_tensor is not None:
             self.unbucketize_permute_tensor.record_stream(stream)
@@ -194,7 +194,7 @@ class ListOfKJTList(Multistreamable):
     @torch.jit._drop
     def record_stream(self, stream: torch.Stream) -> None:
         for feature in self.features_list:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+            # pyrefly: ignore[bad-argument-type]
             feature.record_stream(stream)
 
     @torch.jit._drop
@@ -385,6 +385,7 @@ class ShardedEmbeddingModule(
     def __init__(
         self, qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None
     ) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__(qcomm_codecs_registry)
 
         self._input_dists: List[nn.Module] = []
@@ -416,6 +417,7 @@ class ShardedEmbeddingModule(
         for feature, emb_lookup in zip(dist_input, self._lookups):
             while isinstance(emb_lookup, DistributedDataParallel):
                 emb_lookup = emb_lookup.module
+            # pyrefly: ignore[not-callable]
             emb_lookup.prefetch(sparse_features=feature, forward_stream=forward_stream)
 
     def extra_repr(self) -> str:
@@ -440,7 +442,7 @@ class ShardedEmbeddingModule(
 
         return "\n ".join(rep)
 
-    def train(self, mode: bool = True):  # pyre-ignore[3]
+    def train(self, mode: bool = True):
         r"""Set the module in training mode."""
         super().train(mode)
 

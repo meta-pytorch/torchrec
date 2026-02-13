@@ -82,6 +82,7 @@ class GradientClippingOptimizer(OptimizerWrapper):
 
                 # Group parameters by model parallelism process group.
                 if param in param_to_pgs and len(param_to_pgs[param]) != 0:
+                    # pyrefly: ignore[bad-index]
                     self._sharded_params[tuple(param_to_pgs[param])].append(param)
                     sharded_param_cnt += 1
                 else:
@@ -97,7 +98,6 @@ class GradientClippingOptimizer(OptimizerWrapper):
                     "clip_grad_value_ for sharded parameters is not supported yet"
                 )
 
-    # pyre-ignore [2]
     def step(self, closure: Any = None) -> None:
         if self._check_meta:
             # skip gradient clipping and early return
@@ -163,7 +163,7 @@ class GradientClippingOptimizer(OptimizerWrapper):
             max_grad_norm=self._max_gradient,
         )
 
-        # pyre-ignore [58]: / is not supported for operand types float and Union[float, torch._tensor.Tensor].
+        # pyrefly: ignore[redundant-cast]
         clip_coef = cast(torch.Tensor, self._max_gradient / (total_grad_norm + 1e-6))
         clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
         torch._foreach_mul_(all_grads, clip_coef_clamped)

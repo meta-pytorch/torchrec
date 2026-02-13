@@ -50,11 +50,13 @@ def embedding_bag_config_to_metadata(
         num_embeddings=table_config.num_embeddings,
         embedding_dim=table_config.embedding_dim,
         name=table_config.name,
+        # pyrefly: ignore[bad-argument-type]
         data_type=table_config.data_type.value,
         feature_names=table_config.feature_names,
         weight_init_max=table_config.weight_init_max,
         weight_init_min=table_config.weight_init_min,
         need_pos=table_config.need_pos,
+        # pyrefly: ignore[bad-argument-type]
         pooling=table_config.pooling.value,
     )
 
@@ -242,8 +244,8 @@ class EBCJsonSerializer(JsonSerializer):
 
     @classmethod
     def swap_meta_forward(cls, module: nn.Module) -> None:
+        # pyrefly: ignore[bad-argument-type]
         assert isinstance(module, cls._module_cls)
-        # pyre-ignore
         module.forward = ebc_meta_forward.__get__(module, cls._module_cls)
 
     @classmethod
@@ -254,10 +256,10 @@ class EBCJsonSerializer(JsonSerializer):
         ebc_metadata = EBCMetadata(
             tables=[
                 embedding_bag_config_to_metadata(table_config)
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+                # pyrefly: ignore[not-callable]
                 for table_config in module.embedding_bag_configs()
             ],
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            # pyrefly: ignore[not-callable]
             is_weighted=module.is_weighted(),
             device=str(module.device),
         )
@@ -300,6 +302,7 @@ class PWMJsonSerializer(JsonSerializer):
     @classmethod
     def serialize_to_dict(cls, module: nn.Module) -> Dict[str, Any]:
         metadata = PositionWeightedModuleMetadata(
+            # pyrefly: ignore[bad-argument-type, bad-index]
             max_feature_length=module.position_weight.shape[0],
         )
         return metadata.__dict__
@@ -328,8 +331,8 @@ class PWMCJsonSerializer(JsonSerializer):
         metadata = PositionWeightedModuleCollectionMetadata(
             max_feature_lengths=[  # convert to list of tuples to preserve the order
                 (feature, len)
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `items`.
+                # pyrefly: ignore[missing-attribute]
                 for feature, len in module.max_feature_lengths.items()
             ],
         )
@@ -371,8 +374,8 @@ class FPEBCJsonSerializer(JsonSerializer):
         else:
             metadata = FPEBCMetadata(
                 is_fp_collection=False,
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `keys`.
+                # pyrefly: ignore[missing-attribute]
                 features=list(module._feature_processors.keys()),
             )
         return metadata.__dict__
@@ -387,6 +390,7 @@ class FPEBCJsonSerializer(JsonSerializer):
         metadata = FPEBCMetadata(**metadata_dict)
         assert unflatten_ep is not None
         if metadata.is_fp_collection:
+            # pyrefly: ignore[bad-assignment]
             feature_processors = unflatten_ep._feature_processors
             assert isinstance(feature_processors, FeatureProcessorsCollection)
         else:
@@ -413,8 +417,8 @@ class KTRegroupAsDictJsonSerializer(JsonSerializer):
 
     @classmethod
     def swap_meta_forward(cls, module: nn.Module) -> None:
+        # pyrefly: ignore[bad-argument-type]
         assert isinstance(module, cls._module_cls)
-        # pyre-ignore
         module.forward = kt_regroup_meta_forward.__get__(module, cls._module_cls)
 
     @classmethod
@@ -423,14 +427,15 @@ class KTRegroupAsDictJsonSerializer(JsonSerializer):
         module: nn.Module,
     ) -> Dict[str, Any]:
         metadata = KTRegroupAsDictMetadata(
-            # pyre-fixme[6]: For 1st argument expected `List[str]` but got
             #  `Union[Module, Tensor]`.
+            # pyrefly: ignore[bad-argument-type]
             keys=module._keys,
-            # pyre-fixme[6]: For 2nd argument expected `List[List[str]]` but got
             #  `Union[Module, Tensor]`.
+            # pyrefly: ignore[bad-argument-type]
             groups=module._groups,
             emb_dtype=(
-                module._emb_dtype.value  # pyre-ignore[16]
+                # pyrefly: ignore[missing-attribute]
+                module._emb_dtype.value
                 if module._emb_dtype is not None
                 else None
             ),

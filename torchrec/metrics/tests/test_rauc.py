@@ -367,11 +367,11 @@ class GroupedRAUCValueTest(unittest.TestCase):
                 weight_name="weight",
             )
             task_list.append(task_info)
-            # pyre-ignore
+            # pyrefly: ignore[unsupported-operation]
             inputs["predictions"][task_info.name] = predictions[i]
-            # pyre-ignore
+            # pyrefly: ignore[unsupported-operation]
             inputs["labels"][task_info.name] = labels[i]
-            # pyre-ignore
+            # pyrefly: ignore[unsupported-operation]
             inputs["weights"][task_info.name] = weights[i]
 
         rauc = RAUCMetric(
@@ -379,7 +379,7 @@ class GroupedRAUCValueTest(unittest.TestCase):
             my_rank=0,
             batch_size=batch_size,
             tasks=task_list,
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             grouped_rauc=True,
         )
         rauc.update(**inputs)
@@ -432,7 +432,7 @@ class GroupedRAUCValueTest(unittest.TestCase):
                     weight_name="weight",
                 )
             ],
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             grouped_rauc=True,
         )
 

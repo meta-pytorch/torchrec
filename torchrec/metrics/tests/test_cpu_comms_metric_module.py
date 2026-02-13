@@ -122,15 +122,22 @@ class CPUCommsRecMetricModuleTest(unittest.TestCase):
         )
 
         cloned_metric = cpu_comms_module.rec_metrics.rec_metrics[0]
+        # pyrefly: ignore[bad-index]
         cloned_computation = cloned_metric._metrics_computations[0]
 
         cpu_comms_module._load_metric_states(
-            "test_prefix", cloned_computation, metric_states
+            "test_prefix",
+            # pyrefly: ignore[bad-argument-type]
+            cloned_computation,
+            metric_states,
         )
 
+        # pyrefly: ignore[missing-attribute]
         self.assertTrue(cloned_computation._update_called)
+        # pyrefly: ignore[missing-attribute]
         self.assertIsNone(cloned_computation._computed)
         assert_tensor_dict_equals(
+            # pyrefly: ignore[not-callable]
             cloned_metric.get_computation_states(),
             initial_states,
         )
@@ -200,23 +207,33 @@ class CPUCommsRecMetricModuleTest(unittest.TestCase):
         )
 
         cloned_metric = cpu_comms_module.rec_metrics.rec_metrics[0]
+        # pyrefly: ignore[bad-index]
         cloned_computation = cloned_metric._metrics_computations[0]
 
         cpu_comms_module._load_metric_states(
-            "test_prefix", cloned_computation, metric_states
+            "test_prefix",
+            # pyrefly: ignore[bad-argument-type]
+            cloned_computation,
+            metric_states,
         )
 
         torch.testing.assert_close(
-            cloned_metric.get_computation_states()["state_1"], torch.tensor(5.0)
+            # pyrefly: ignore[not-callable]
+            cloned_metric.get_computation_states()["state_1"],
+            torch.tensor(5.0),
         )
         self.assertFalse(
             torch.allclose(
-                cloned_metric.get_computation_states()["state_2"], torch.tensor(2.0)
+                # pyrefly: ignore[not-callable]
+                cloned_metric.get_computation_states()["state_2"],
+                torch.tensor(2.0),
             )
         )
         self.assertFalse(
             torch.allclose(
-                cloned_metric.get_computation_states()["state_2"], torch.tensor(3.0)
+                # pyrefly: ignore[not-callable]
+                cloned_metric.get_computation_states()["state_2"],
+                torch.tensor(3.0),
             )
         )
 

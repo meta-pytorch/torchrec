@@ -50,7 +50,6 @@ class KeyedOptimizer(optim.Optimizer):
     def __init__(
         self,
         params: Mapping[str, Union[torch.Tensor, ShardedTensor]],
-        # pyre-ignore [2]
         state: Mapping[Any, Any],
         param_groups: Collection[Mapping[str, Any]],
     ) -> None:
@@ -59,13 +58,12 @@ class KeyedOptimizer(optim.Optimizer):
         # TODO: remove these and call super().__init__()
         # super().__init__ calls add_param_group, which we've explicitly marked as not implemented.
         # However, we need to ensure that all Optimizer member variables are created.
-        # pyre-ignore
         self._optimizer_step_pre_hooks: Dict[int, Callable] = OrderedDict()
-        # pyre-ignore
         self._optimizer_step_post_hooks: Dict[int, Callable] = OrderedDict()
 
-        # pyre-ignore
+        # pyrefly: ignore[bad-override]
         self.state: Mapping[Any, Any] = state
+        # pyrefly: ignore[bad-override]
         self.param_groups: Collection[Mapping[str, Any]] = param_groups
         self.params = params
         self.defaults: Dict[str, Any] = {"_save_param_groups": False}
@@ -99,6 +97,7 @@ class KeyedOptimizer(optim.Optimizer):
             if isinstance(v, dict):
                 result[k] = KeyedOptimizer._extract_state_dict_content(v)
             elif hasattr(v, "state_dict") and callable(v.state_dict):
+                # pyrefly: ignore[unsupported-operation]
                 result[k] = v.state_dict()
             else:
                 result[k] = v
@@ -143,14 +142,19 @@ class KeyedOptimizer(optim.Optimizer):
                 assert isinstance(new_v, DTensor)
                 if isinstance(v.to_local(), LocalShardsWrapper):
                     assert isinstance(new_v.to_local(), LocalShardsWrapper)
-                    num_shards = len(v.to_local().local_shards())  # pyre-ignore[16]
+                    # pyrefly: ignore[missing-attribute]
+                    num_shards = len(v.to_local().local_shards())
+                    # pyrefly: ignore[missing-attribute]
                     num_new_shards = len(new_v.to_local().local_shards())
                     if num_shards != num_new_shards:
                         raise ValueError(
                             f"Different number of shards {num_shards} vs {num_new_shards} for the path of {json.dumps(parent_keys)}"
                         )
                     for shard, new_shard in zip(
-                        v.to_local().local_shards(), new_v.to_local().local_shards()
+                        # pyrefly: ignore[missing-attribute]
+                        v.to_local().local_shards(),
+                        # pyrefly: ignore[missing-attribute]
+                        new_v.to_local().local_shards(),
                     ):
                         shard.detach().copy_(new_shard)
                 else:
@@ -275,11 +279,11 @@ class KeyedOptimizer(optim.Optimizer):
                             f"Group key {k} not found for group {group_key}"
                         )
                     if k != "params":
+                        # pyrefly: ignore[unsupported-operation]
                         group[k] = deepcopy(new_group[k])
 
         self.post_load_state_dict()
 
-    # pyre-ignore [2]
     def add_param_group(self, param_group: Any) -> None:
         raise NotImplementedError()
 
@@ -346,9 +350,7 @@ class CombinedOptimizer(KeyedOptimizer):
                     raise ValueError(f"Duplicate param key {new_param}")
                 all_keys.add(new_param)
 
-        # pyre-ignore
         self._optimizer_step_pre_hooks: Dict[int, Callable] = OrderedDict()
-        # pyre-ignore
         self._optimizer_step_post_hooks: Dict[int, Callable] = OrderedDict()
 
         self._patch_step_function()
@@ -363,7 +365,7 @@ class CombinedOptimizer(KeyedOptimizer):
         for _, opt in self._optims:
             opt.zero_grad(set_to_none=set_to_none)
 
-    # pyre-ignore [2]
+    # pyrefly: ignore[bad-override]
     def step(self, closure: Any = None) -> None:
         for _, opt in self._optims:
             opt.step(closure=closure)
@@ -379,12 +381,14 @@ class CombinedOptimizer(KeyedOptimizer):
         return opt_key + ("." if opt_key else "") + name
 
     @property
+    # pyrefly: ignore[bad-override]
     def param_groups(self) -> Collection[Mapping[str, Any]]:
         return [
             param_group for _, opt in self._optims for param_group in opt.param_groups
         ]
 
     @property
+    # pyrefly: ignore[bad-override]
     def params(self) -> Mapping[str, Union[torch.Tensor, ShardedTensor]]:
         ret = {}
         for opt_key, opt in self._optims:
@@ -393,7 +397,7 @@ class CombinedOptimizer(KeyedOptimizer):
         return ret
 
     @property
-    # pyre-ignore [3]
+    # pyrefly: ignore[bad-override]
     def state(self) -> Mapping[torch.Tensor, Any]:
         ret = {}
         for _, opt in self._optims:
@@ -413,13 +417,11 @@ class CombinedOptimizer(KeyedOptimizer):
     def set_optimizer_step(self, step: int) -> None:
         for _, opt in self._optims:
             if hasattr(opt, "set_optimizer_step"):
-                # pyre-ignore [16]: Undefined attribute [16]: `KeyedOptimizer` has no attribute `set_optimizer_step`.
                 opt.set_optimizer_step(step)
 
     def update_hyper_parameters(self, params_dict: Dict[str, Any]) -> None:
         for _, opt in self._optims:
             if hasattr(opt, "update_hyper_parameters"):
-                # pyre-ignore [16].
                 opt.update_hyper_parameters(params_dict)
 
 
@@ -438,24 +440,23 @@ class KeyedOptimizerWrapper(KeyedOptimizer):
     ) -> None:
 
         pass_params = params if pass_params_dict else list(params.values())
+        # pyrefly: ignore[bad-argument-type]
         self._optimizer: optim.Optimizer = optim_factory(pass_params)
         super().__init__(params, self._optimizer.state, self._optimizer.param_groups)
 
     def zero_grad(self, set_to_none: bool = False) -> None:
         self._optimizer.zero_grad()
 
-    # pyre-ignore [2]
+    # pyrefly: ignore[bad-override]
     def step(self, closure: Any = None) -> None:
         self._optimizer.step(closure=closure)
 
     def set_optimizer_step(self, step: int) -> None:
         if hasattr(self._optimizer, "set_optimizer_step"):
-            # pyre-ignore [16].
             self._optimizer.set_optimizer_step(step)
 
     def update_hyper_parameters(self, params_dict: Dict[str, Any]) -> None:
         if hasattr(self._optimizer, "update_hyper_parameters"):
-            # pyre-ignore [16].
             self._optimizer.update_hyper_parameters(params_dict)
 
 
@@ -469,7 +470,6 @@ class OptimizerWrapper(KeyedOptimizer):
     def __init__(self, optimizer: KeyedOptimizer) -> None:
         self._optimizer = optimizer
         self.params: Mapping[str, Union[torch.Tensor, ShardedTensor]] = optimizer.params
-        # pyre-ignore [4]
         self.state: Mapping[Any, Any] = optimizer.state
         self.param_groups: Collection[Mapping[str, Any]] = optimizer.param_groups
         self.defaults: Dict[str, Any] = {"_save_param_groups": False}
@@ -480,11 +480,10 @@ class OptimizerWrapper(KeyedOptimizer):
     def zero_grad(self, set_to_none: bool = False) -> None:
         self._optimizer.zero_grad(set_to_none=set_to_none)
 
-    # pyre-ignore [2]
+    # pyrefly: ignore[bad-override]
     def step(self, closure: Any = None) -> None:
         self._optimizer.step(closure=closure)
 
-    # pyre-ignore [2]
     def add_param_group(self, param_group: Any) -> None:
         raise NotImplementedError()
 
@@ -508,10 +507,8 @@ class OptimizerWrapper(KeyedOptimizer):
 
     def set_optimizer_step(self, step: int) -> None:
         if hasattr(self._optimizer, "set_optimizer_step"):
-            # pyre-ignore [16].
             self._optimizer.set_optimizer_step(step)
 
     def update_hyper_parameters(self, params_dict: Dict[str, Any]) -> None:
         if hasattr(self._optimizer, "update_hyper_parameters"):
-            # pyre-ignore [16].
             self._optimizer.update_hyper_parameters(params_dict)

@@ -354,7 +354,7 @@ class SimpleDeepFMNN(nn.Module):
 
 
 class SimpleDeepFMNNWrapper(SimpleDeepFMNN):
-    # pyre-ignore[14, 15]
+    # pyrefly: ignore[bad-param-name-override]
     def forward(
         self, model_input: ModelInput
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -370,7 +370,8 @@ class SimpleDeepFMNNWrapper(SimpleDeepFMNN):
         """
         pred = super().forward(
             dense_features=model_input.float_features,
-            sparse_features=model_input.idlist_features,  # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
+            sparse_features=model_input.idlist_features,
         )
 
         if self.training:

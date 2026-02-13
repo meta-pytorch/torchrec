@@ -24,7 +24,6 @@ from torchrec.distributed.model_tracker.types import (
 
 
 class DeltaStoreTrecTest(unittest.TestCase):
-    # pyre-fixme[2]: Parameter must be annotated.
     def __init__(self, methodName="runTest") -> None:
         super().__init__(methodName)
 
@@ -818,6 +817,6 @@ class DeltaStoreTrecTest(unittest.TestCase):
                     and delta_result[table_fqn].states is not None
                 ):
                     self.assertTrue(
-                        # pyre-ignore
+                        # pyrefly: ignore[missing-attribute]
                         delta_result[table_fqn].states.allclose(delta_rows.states)
                     )

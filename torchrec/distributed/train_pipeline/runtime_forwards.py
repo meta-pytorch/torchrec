@@ -69,7 +69,6 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
     This pipeline is used in TrainPipelineSparseDist
     """
 
-    # pyre-ignore [2, 24]
     def __call__(self, *input, **kwargs) -> Awaitable:
         assert (
             self._name in self._context.input_dist_tensors_requests
@@ -112,9 +111,7 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
 
     def __call__(
         self,
-        # pyre-ignore
         *input,
-        # pyre-ignore
         **kwargs,
     ) -> Union[
         Awaitable[EmbeddingModuleRetType],
@@ -139,6 +136,7 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
 
         awaitable = self._context.embedding_a2a_requests.pop(self._name)
         # in case of MC modules
+        # pyrefly: ignore[unsafe-overlap]
         is_mc_module: bool = isinstance(awaitable, Iterable)
         remapped_kjts: Optional[KeyedJaggedTensor] = None
 
@@ -151,11 +149,14 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
                 awaitable.wait()
             )  # trigger awaitable manually for type checking
 
+        # pyrefly: ignore[bad-argument-type]
         self.detach_embeddings(embeddings=embeddings, cur_stream=cur_stream)
 
         if is_mc_module:
+            # pyrefly: ignore[bad-argument-type]
             return (LazyNoWait(embeddings), LazyNoWait(remapped_kjts))
         else:
+            # pyrefly: ignore[bad-argument-type]
             return LazyNoWait(embeddings)
 
     def detach_embeddings(
@@ -186,7 +187,7 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
         else:
             # in case of EBC, embeddings are KeyedTensor
             assert isinstance(embeddings, KeyedTensor)
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+            # pyrefly: ignore[bad-argument-type]
             embeddings.record_stream(cur_stream)
             tensor = embeddings.values()
             detached_tensor = tensor.detach().requires_grad_()
@@ -243,7 +244,6 @@ class PrefetchPipelinedForward(BaseForward[PrefetchTrainPipelineContext]):
             stream=prefetch_stream,
         )
 
-    # pyre-ignore [2, 24]
     def __call__(self, *input, **kwargs) -> Awaitable:
         assert (
             self._name in self._context.module_input_post_prefetch
@@ -321,7 +321,6 @@ class PrefetchEmbeddingPipelinedForward(PrefetchPipelinedForward):
             ctx, data
         )
 
-    # pyre-ignore [2, 24]
     def __call__(self, *input, **kwargs) -> Awaitable:
         if not self._compute_and_output_dist_awaitable:
             raise Exception(

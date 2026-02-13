@@ -226,11 +226,11 @@ class ThresholdValueTest(unittest.TestCase):
                 weight_name="weight",
             )
             task_list.append(task_info)
-            # pyre-ignore
+            # pyrefly: ignore[unsupported-operation]
             inputs["predictions"][task_info.name] = predictions[i]
-            # pyre-ignore
+            # pyrefly: ignore[unsupported-operation]
             inputs["labels"][task_info.name] = labels[i]
-            # pyre-ignore
+            # pyrefly: ignore[unsupported-operation]
             inputs["weights"][task_info.name] = weights[i]
 
         accuracy = AccuracyMetric(
@@ -238,7 +238,7 @@ class ThresholdValueTest(unittest.TestCase):
             my_rank=0,
             batch_size=batch_size,
             tasks=task_list,
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             threshold=threshold,  # threshold is one of the kwargs
         )
         accuracy.update(**inputs)
@@ -263,9 +263,8 @@ class ThresholdValueTest(unittest.TestCase):
         test_data = generate_model_outputs_cases()
         for inputs in test_data:
             try:
-                self._test_accuracy_helper(
-                    **inputs  # pyre-ignore, surpressing a type hint error
-                )
+                # pyrefly: ignore[bad-argument-type]
+                self._test_accuracy_helper(**inputs)
             except AssertionError:
                 print("Assertion error caught with data set ", inputs)
                 raise

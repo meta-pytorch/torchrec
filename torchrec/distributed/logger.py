@@ -138,6 +138,7 @@ def _get_logging_handler(
     return log_handler
 
 
+# pyrefly: ignore[unknown-name]
 global unfiltered_logger, single_rank_logger, all_rank_logger, capped_logger, method_logger
 unfiltered_logger = _get_or_create_logger(UnfilteredLogger)
 method_logger = _get_or_create_logger(MethodLogger)
@@ -167,7 +168,7 @@ _P = ParamSpec("_P")
 
 def _torchrec_method_logger(
     **wrapper_kwargs: Any,
-) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:  # pyre-ignore
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
     """
     A method decorator that provides comprehensive logging for TorchRec functions.
 
@@ -203,7 +204,7 @@ def _torchrec_method_logger(
           via functools.wraps.
     """
 
-    def decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:  # pyre-ignore
+    def decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:
         """
         Inner decorator that wraps the actual function.
 
@@ -245,6 +246,7 @@ def _torchrec_method_logger(
             except BaseException as error:
                 # On exception: log error details and re-raise
                 msg_dict["error"] = f"{error}"
+                # pyrefly: ignore[bad-argument-type]
                 msg_dict["input"] = _get_input_from_func(
                     func, msg_dict, *args, **kwargs
                 )
@@ -253,6 +255,7 @@ def _torchrec_method_logger(
 
             # On success: log function input and output at DEBUG level
             try:
+                # pyrefly: ignore[bad-argument-type]
                 msg_dict["input"] = _get_input_from_func(
                     func, msg_dict, *args, **kwargs
                 )

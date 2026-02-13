@@ -71,6 +71,10 @@ def _reserve_dense_storage(
             f"with user-provided dense tensor estimate ({dense_tensor_estimate} bytes)."
         )
         dense_tensor_size = dense_tensor_estimate
+    else:
+        logger.warning(
+            "There is a known issue with TorchRec's dense tensor size calculation in dry run scenarios, where tensors are not materialized. Consider passing in a dense_tensor_estimate to planner input if you are running in dry run environment."
+        )
 
     dense_tensor_storage = Storage(
         hbm=dense_tensor_size if topology.compute_device in {"cuda", "mtia"} else 0,
@@ -152,7 +156,8 @@ def _get_batch_inputs_and_shardable_parameters(
                 )
                 input_lengths.extend(pooling_factors)
                 batch_sizes.extend(
-                    constraints[name].batch_sizes  # pyre-ignore[6]
+                    # pyrefly: ignore[bad-argument-type]
+                    constraints[name].batch_sizes
                     if constraints
                     and constraints.get(name)
                     and constraints[name].batch_sizes
@@ -278,7 +283,9 @@ class HeuristicalStorageReservation(StorageReservation):
                 "after taking into account of the reserved hbm percentage, "
                 "the storage for dense modules, and the kjt storages. Hence "
                 "it is not possible to find a valid sharding plan. "
-                "\nPossible solutions:"
+                "\n \n Note: There is a known issue with dense storage estimation in dry run scenario where tensors are not fully materialized."
+                f"If the dense storage ({storage_repr_in_gb(self._dense_storage)}) looks higher than expected, consider passing in dense_storage_estimate as a Planner input to override torchrec dense tensor size calculation while we resolve this issue."
+                "\n \n Other Possible solutions:"
                 "\n  1) If FSDP is used, consider switching to FixedPercentageStorageReservation, since "
                 f"HeuristicalStorageReservation would not be able to calculate the "
                 f"dense storage ({storage_repr_in_gb(self._dense_storage)}) correctly. "
@@ -366,5 +373,6 @@ class InferenceStorageReservation(StorageReservation):
 
         return reserved_topology
 
+    # pyrefly: ignore[bad-override]
     def last_reserved_topology(self) -> Optional[Topology]:
         return copy.deepcopy(self._last_reserved_topology)

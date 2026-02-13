@@ -119,29 +119,30 @@ class DummyShardedModule(
     ShardedModule[torch.Tensor, torch.Tensor, torch.Tensor, NullShardedModuleContext]
 ):
     def __init__(self, alpha: float = 1) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__()
         self.alpha = alpha
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.alpha * x
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def compute(self) -> torch.Tensor:
         return torch.empty(0)
 
     def create_context(self) -> NullShardedModuleContext:
         return NullShardedModuleContext()
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def input_dist(self, ctx: NullShardedModuleContext):
         pass
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def output_dist(self):
         pass
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def unsharded_module_type(self):
         pass
 

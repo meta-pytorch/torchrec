@@ -41,8 +41,8 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
             ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
             apply_optimizer_in_backward(
                 RowWiseAdagrad,
-                # pyre-fixme[6]: For 2nd argument expected `Iterable[Parameter]` but
                 #  got `Iterable[Union[Tensor, Module]]`.
+                # pyrefly: ignore[bad-argument-type]
                 [
                     ebc.embedding_bags["table_0"].weight,
                     ebc.embedding_bags["table_1"].weight,
@@ -51,8 +51,8 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
             )
             apply_optimizer_in_backward(
                 PartialRowWiseAdam,
-                # pyre-fixme[6]: For 2nd argument expected `Iterable[Parameter]` but
                 #  got `Iterable[Union[Tensor, Module]]`.
+                # pyrefly: ignore[bad-argument-type]
                 [
                     ebc.embedding_bags["table_2"].weight,
                     ebc.embedding_bags["table_3"].weight,
@@ -73,12 +73,14 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
                 device_type=ctx.device.type,
             )
 
+            # pyrefly: ignore[invalid-param-spec]
             ebc = shard(
                 module=ebc,
                 plan=parameter_sharding_plan,
                 device=ctx.device,
             )
 
+            # pyrefly: ignore[bad-index, missing-attribute]
             ebc.embedding_bags["table_0"].weight._in_backward_optimizers[
                 0
             ].state_dict()["state"][""]["table_0.momentum1"].gather(
@@ -91,6 +93,7 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
                 ),
             )
 
+            # pyrefly: ignore[bad-index, missing-attribute]
             ebc.embedding_bags["table_1"].weight._in_backward_optimizers[
                 0
             ].state_dict()["state"][""]["table_1.momentum1"].gather(
@@ -103,6 +106,7 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
                 ),
             )
 
+            # pyrefly: ignore[bad-index, missing-attribute]
             ebc.embedding_bags["table_2"].weight._in_backward_optimizers[
                 0
             ].state_dict()["state"][""]["table_2.momentum1"].gather(
@@ -118,6 +122,7 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
                 ),
             )
 
+            # pyrefly: ignore[bad-index, missing-attribute]
             ebc.embedding_bags["table_2"].weight._in_backward_optimizers[
                 0
             ].state_dict()["state"][""]["table_2.exp_avg_sq"].gather(
@@ -130,6 +135,7 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
                 ),
             )
 
+            # pyrefly: ignore[bad-index, missing-attribute]
             ebc.embedding_bags["table_3"].weight._in_backward_optimizers[
                 0
             ].state_dict()["state"][""]["table_3.momentum1"].gather(
@@ -145,6 +151,7 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
                 ),
             )
 
+            # pyrefly: ignore[bad-index, missing-attribute]
             ebc.embedding_bags["table_3"].weight._in_backward_optimizers[
                 0
             ].state_dict()["state"][""]["table_3.exp_avg_sq"].gather(
@@ -157,7 +164,6 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
                 ),
             )
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

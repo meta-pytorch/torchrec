@@ -40,8 +40,11 @@ class TestGPU(unittest.TestCase):
         auc.to(device)
         # Mimic that reset is called when checkpointing.
         auc.reset()
+        # pyrefly: ignore[bad-argument-type]
         self.assertEqual(len(auc._metrics_computations[0].predictions), 1)
+        # pyrefly: ignore[bad-argument-type]
         self.assertEqual(len(auc._metrics_computations[0].labels), 1)
+        # pyrefly: ignore[bad-argument-type]
         self.assertEqual(len(auc._metrics_computations[0].weights), 1)
         model_output = gen_test_batch(batch_size)
         model_output = {k: v.to(device) for k, v in model_output.items()}
@@ -50,11 +53,17 @@ class TestGPU(unittest.TestCase):
             labels={"DefaultTask": model_output["label"]},
             weights={"DefaultTask": model_output["weight"]},
         )
+        # pyrefly: ignore[bad-argument-type]
         self.assertEqual(len(auc._metrics_computations[0].predictions), 1)
+        # pyrefly: ignore[bad-argument-type]
         self.assertEqual(len(auc._metrics_computations[0].labels), 1)
+        # pyrefly: ignore[bad-argument-type]
         self.assertEqual(len(auc._metrics_computations[0].weights), 1)
+        # pyrefly: ignore[bad-index]
         self.assertEqual(auc._metrics_computations[0].predictions[0].device, device)
+        # pyrefly: ignore[bad-index]
         self.assertEqual(auc._metrics_computations[0].labels[0].device, device)
+        # pyrefly: ignore[bad-index]
         self.assertEqual(auc._metrics_computations[0].weights[0].device, device)
 
     @unittest.skipIf(_CUDA_UNAVAILABLE, "Test needs to run on GPU")
@@ -94,10 +103,12 @@ class TestGPU(unittest.TestCase):
         ne_computation = ne._metrics_computations[0]
         # test RecMetricComputation._add_window_state
         torch.allclose(
+            # pyrefly: ignore[bad-argument-type]
             ne_computation.window_cross_entropy_sum,
             torch.tensor([0.0], dtype=torch.double, device=device),
         )
         torch.allclose(
+            # pyrefly: ignore[bad-argument-type]
             ne_computation.window_weighted_num_samples,
             torch.tensor([[0.0]], dtype=torch.double, device=device),
         )
@@ -126,11 +137,15 @@ class TestGPU(unittest.TestCase):
                 )
             else:
                 self.assertEqual(
-                    ne_computation.window_cross_entropy_sum.size(), torch.Size([1])
+                    # pyrefly: ignore[not-callable]
+                    ne_computation.window_cross_entropy_sum.size(),
+                    torch.Size([1]),
                 )
                 self.assertEqual(
                     len(
+                        # pyrefly: ignore[bad-index, missing-attribute]
                         ne_computation._batch_window_buffers[
+                            # pyrefly: ignore[bad-index]
                             "window_cross_entropy_sum"
                         ].buffers
                     ),

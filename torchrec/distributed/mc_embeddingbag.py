@@ -46,13 +46,12 @@ class ManagedCollisionEmbeddingBagCollectionContext(EmbeddingBagCollectionContex
     def record_stream(self, stream: torch.Stream) -> None:
         super().record_stream(stream)
         if self.evictions_per_table:
-            #  pyre-ignore
             for value in self.evictions_per_table.values():
                 if value is None:
                     continue
                 value.record_stream(stream)
         if self.remapped_kjt is not None:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+            # pyrefly: ignore[bad-argument-type]
             self.remapped_kjt.record_stream(stream)
 
 
@@ -83,6 +82,7 @@ class ShardedManagedCollisionEmbeddingBagCollection(
     # For backwards compat, some references still to self._embedding_bag_collection
     @property
     def _embedding_bag_collection(self) -> ShardedEmbeddingBagCollection:
+        # pyrefly: ignore[redundant-cast]
         return cast(ShardedEmbeddingBagCollection, self._embedding_module)
 
     def create_context(
@@ -96,7 +96,9 @@ class ShardedManagedCollisionEmbeddingBagCollection(
         features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KJTList]]:
 
+        # pyrefly: ignore[missing-attribute]
         ctx.variable_batch_per_feature = features.variable_stride_per_key()
+        # pyrefly: ignore[missing-attribute]
         ctx.inverse_indices = features.inverse_indices_or_none()
 
         if self._managed_collision_collection._has_uninitialized_input_dists:
@@ -105,20 +107,20 @@ class ShardedManagedCollisionEmbeddingBagCollection(
             )
             self._managed_collision_collection._has_uninitialized_input_dists = False
 
-            # pyre-ignore [16]
+            # pyrefly: ignore[missing-attribute]
             if ctx.variable_batch_per_feature:
                 if self._return_remapped_features:
                     raise NotImplementedError(
                         "VBE is not supported currently for return_remapped_features=True."
                     )
 
-                # pyre-ignore
                 self._embedding_module._create_inverse_indices_permute_indices(
-                    ctx.inverse_indices  # pyre-ignore [16]
+                    # pyrefly: ignore[missing-attribute]
+                    ctx.inverse_indices
                 )
 
         return self._managed_collision_collection.input_dist(
-            # pyre-fixme [6]
+            # pyrefly: ignore[bad-argument-type]
             ctx,
             features,
         )
@@ -160,7 +162,7 @@ class ManagedCollisionEmbeddingBagCollectionSharder(
         return ShardedManagedCollisionEmbeddingBagCollection(
             module,
             params,
-            # pyre-ignore [6]
+            # pyrefly: ignore[bad-argument-type]
             ebc_sharder=self._e_sharder,
             mc_sharder=self._mc_sharder,
             env=env,

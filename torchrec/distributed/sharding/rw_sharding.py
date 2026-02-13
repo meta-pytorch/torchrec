@@ -90,7 +90,7 @@ def get_embedding_shard_metadata(
             embed_sharding_per_feature = []
             total_rows = 0
             sizes = []
-            # pyre-ignore [16]: `Optional` has no attribute `shards_metadata`
+            # pyrefly: ignore[missing-attribute]
             for metadata in table.global_metadata.shards_metadata:
                 embed_sharding_per_feature.append(metadata.shard_offsets[0])
                 total_rows += metadata.shard_sizes[0]
@@ -124,7 +124,8 @@ class BaseRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         self._env = env
         self._is_2D_parallel: bool = isinstance(env, ShardingEnv2D)
         self._pg: Optional[dist.ProcessGroup] = (
-            self._env.sharding_pg  # pyre-ignore[16]
+            # pyrefly: ignore[missing-attribute]
+            self._env.sharding_pg
             if self._is_2D_parallel
             else self._env.process_group
         )
@@ -163,7 +164,7 @@ class BaseRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             [] for _ in range(self._world_size)
         ]
         for info in sharding_infos:
-            # pyre-fixme [16]
+            # pyrefly: ignore[missing-attribute]
             shards = info.param_sharding.sharding_spec.shards
 
             # construct the global sharded_tensor_metadata
@@ -318,9 +319,7 @@ class BaseRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                         * embedding_table.num_features()
                     )
                     has_uneven_virtual_tables = has_uneven_virtual_tables or (
-                        # pyre-ignore[58]
-                        embedding_table.total_num_buckets % self._world_size
-                        != 0
+                        embedding_table.total_num_buckets % self._world_size != 0
                     )
                 else:
                     feature_num_buckets.extend(
@@ -489,8 +488,10 @@ class RwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
         ) = bucketize_kjt_before_all2all(
             sparse_features,
             num_buckets=self._world_size,
+            # pyrefly: ignore[bad-argument-type]
             block_sizes=self._feature_block_sizes_tensor,
             total_num_blocks=(
+                # pyrefly: ignore[bad-argument-type]
                 self._feature_total_num_blocks_tensor
                 if self._has_multiple_blocks_per_shard
                 else None
@@ -652,8 +653,8 @@ class RwPooledEmbeddingSharding(
             self._get_virtual_table_feature_num_buckets()
         )
         return RwSparseFeaturesDist(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             pg=self._pg,
             num_features=num_features,
             feature_hash_sizes=feature_hash_sizes,
@@ -685,8 +686,8 @@ class RwPooledEmbeddingSharding(
         device: Optional[torch.device] = None,
     ) -> BaseEmbeddingDist[EmbeddingShardingContext, torch.Tensor, torch.Tensor]:
         return RwPooledEmbeddingDist(
-            # pyre-fixme[6]: For 1st param expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             self._pg,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
             embedding_dims=self.embedding_dims(),
@@ -786,8 +787,10 @@ class RwSparseFeaturesWriteDist(BaseSparseFeaturesWriteDist[KeyedJaggedTensor]):
         ) = bucketize_embeddings_before_all2all_write(
             embeddings,
             num_buckets=self._world_size,
+            # pyrefly: ignore[bad-argument-type]
             block_sizes=self._feature_block_sizes_tensor,
             total_num_blocks=(
+                # pyrefly: ignore[bad-argument-type]
                 self._feature_total_num_blocks_tensor
                 if self._has_multiple_blocks_per_shard
                 else None
@@ -870,7 +873,6 @@ class InferRwSparseFeaturesDist(BaseSparseFeaturesDist[InputDistOutputs]):
             self.register_buffer(f"row_pos_{i}", torch.tensor(row_pos))
         self.embedding_shard_metadata_len: int = len(embedding_shard_metadata)
         self._keep_original_indices = keep_original_indices
-        # pyre-ignore[8]
         self.register_buffer(
             "feature_total_num_buckets",
             (

@@ -6,7 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 # @nolint
-# pyre-ignore-all-errors
 
 import unittest
 from argparse import Namespace
@@ -176,9 +175,11 @@ class InferenceTest(unittest.TestCase):
                             pruning_dict[config.name],
                         )
             elif module.__class__.__name__ == "IntNBitTableBatchedEmbeddingBagsCodegen":
+                # pyrefly: ignore[bad-argument-type]
                 for i, spec in enumerate(module.embedding_specs):
                     if spec[0] in pruning_dict:
                         self.assertEqual(
+                            # pyrefly: ignore[not-callable]
                             module.split_embedding_weights()[i][0].size(0),
                             pruning_dict[spec[0]],
                         )
@@ -219,6 +220,7 @@ class InferenceTest(unittest.TestCase):
         for module in quantized_model.modules():
             if module.__class__.__name__ == "IntNBitTableBatchedEmbeddingBagsCodegen":
                 num_tbes += 1
+                # pyrefly: ignore[bad-argument-type]
                 for i, spec in enumerate(module.embedding_specs):
                     self.assertEqual(spec[3], SparseType.INT4)
 
@@ -276,7 +278,9 @@ class InferenceTest(unittest.TestCase):
         sharded_quant_output = sharded_quant_model(local_batch[0])
 
         # When world_size = 1, we should have 1 TBE per sharded, quantized ebc
+        # pyrefly: ignore[missing-attribute]
         self.assertTrue(len(sharded_quant_model.sparse.ebc.tbes) == 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertTrue(len(sharded_quant_model.sparse.weighted_ebc.tbes) == 1)
 
         # Check the weights are close
@@ -291,6 +295,7 @@ class InferenceTest(unittest.TestCase):
 
         for module in quantized_model.modules():
             if module.__class__.__name__ == "IntNBitTableBatchedEmbeddingBagsCodegen":
+                # pyrefly: ignore[bad-argument-type]
                 for i, spec in enumerate(module.embedding_specs):
                     if spec[0] in expected_num_embeddings:
                         # We only expect the first table to be quantized to int4 due to test set up
@@ -301,6 +306,7 @@ class InferenceTest(unittest.TestCase):
 
                         # Check sizes are equal
                         self.assertEqual(
+                            # pyrefly: ignore[not-callable]
                             module.split_embedding_weights()[i][0].size(0),
                             expected_num_embeddings[spec[0]],
                         )
@@ -358,7 +364,9 @@ class InferenceTest(unittest.TestCase):
         sharded_quant_output = sharded_quant_model(local_batch[0])
 
         # When world_size = 1, we should have 1 TBE per sharded, quantized ebc
+        # pyrefly: ignore[missing-attribute]
         self.assertTrue(len(sharded_quant_model.sparse.ebc.tbes) == 1)
+        # pyrefly: ignore[missing-attribute]
         self.assertTrue(len(sharded_quant_model.sparse.weighted_ebc.tbes) == 1)
 
         # Check the weights are close
@@ -392,7 +400,9 @@ class InferenceTest(unittest.TestCase):
         # Quantize the model and collect quantized weights
         quantized_model = quantize_inference_model(model)
         # We should have 2 TBEs for unweighted ebc as the 2 tables here have different pooling types
+        # pyrefly: ignore[missing-attribute]
         self.assertTrue(len(quantized_model.sparse.ebc.tbes) == 2)
+        # pyrefly: ignore[missing-attribute]
         self.assertTrue(len(quantized_model.sparse.weighted_ebc.tbes) == 1)
         # Changing this back
         self.tables[0].pooling = PoolingType.SUM
@@ -402,10 +412,12 @@ class InferenceTest(unittest.TestCase):
 
         sharders = DEFAULT_SHARDERS
         ebc_sharder = sharders[0]
+        # pyrefly: ignore[missing-attribute]
         ebc_fused_params = ebc_sharder.fused_params
         ebc_fused_params[FUSED_PARAM_REGISTER_TBE_BOOL] = -1
 
         ec_sharder = sharders[1]
+        # pyrefly: ignore[missing-attribute]
         ec_fused_params = ec_sharder.fused_params
 
         # Make sure that overwrite of ebc_fused_params is not reflected in ec_fused_params

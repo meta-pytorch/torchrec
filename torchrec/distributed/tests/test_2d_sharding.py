@@ -64,7 +64,6 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -161,7 +160,6 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -259,7 +257,6 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -379,7 +376,6 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -473,7 +469,6 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -622,7 +617,6 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.ROW_WISE.value),
         kernel_type=st.sampled_from(
@@ -690,7 +684,6 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.COLUMN_WISE.value),
         kernel_type=st.sampled_from(
@@ -762,7 +755,6 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.TABLE_WISE.value),
         kernel_type=st.sampled_from(
@@ -915,7 +907,6 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.ROW_WISE.value),
         kernel_type=st.sampled_from(
@@ -968,13 +959,15 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         ec_submodule_config = DMPCollectionConfig(
             module=EmbeddingCollection,
             sharding_group_size=2,
-            plan=None,  # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
+            plan=None,
         )
 
         self._test_sharding(
             world_size=self.WORLD_SIZE,
             world_size_2D=self.WORLD_SIZE_2D,
-            sharders=[  # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[
                 cast(
                     ModuleSharder[nn.Module],
                     create_test_sharder(
@@ -1001,7 +994,6 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.ROW_WISE.value),
         kernel_type=st.sampled_from(
@@ -1054,14 +1046,16 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         ec_submodule_config = DMPCollectionConfig(
             module=EmbeddingCollection,
             sharding_group_size=2,
-            plan=None,  # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
+            plan=None,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,
         )
 
         self._test_sharding(
             world_size=self.WORLD_SIZE,
             world_size_2D=self.WORLD_SIZE_2D,
-            sharders=[  # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[
                 cast(
                     ModuleSharder[nn.Module],
                     create_test_sharder(
@@ -1090,7 +1084,6 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.ROW_WISE.value),
         kernel_type=st.sampled_from(
@@ -1143,14 +1136,16 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         ec_submodule_config = DMPCollectionConfig(
             module=EmbeddingCollection,
             sharding_group_size=2,
-            plan=None,  # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
+            plan=None,
             sharding_strategy=ShardingStrategy.FULLY_SHARDED,  # only apply fully sharded to EC tables
         )
 
         self._test_sharding(
             world_size=self.WORLD_SIZE,
             world_size_2D=self.WORLD_SIZE_2D,
-            sharders=[  # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[
                 cast(
                     ModuleSharder[nn.Module],
                     create_test_sharder(
@@ -1232,7 +1227,6 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1330,7 +1324,6 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1428,7 +1421,6 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1527,7 +1519,6 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1626,7 +1617,6 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         torch.cuda.device_count() <= 5,
         "Not enough GPUs, this test requires at least six GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharder_type=st.sampled_from(
             [
@@ -1770,7 +1760,6 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.COLUMN_WISE.value),
         kernel_type=st.sampled_from(
@@ -1844,7 +1833,6 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.ROW_WISE.value),
         kernel_type=st.sampled_from(
@@ -1991,7 +1979,6 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         torch.cuda.device_count() <= 5,
         "Not enough GPUs, this test requires at least six GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.COLUMN_WISE.value),
         kernel_type=st.sampled_from(

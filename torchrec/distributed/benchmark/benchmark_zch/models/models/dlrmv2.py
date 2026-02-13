@@ -79,6 +79,7 @@ class DLRMv2(nn.Module):
         dummy_weights = torch.ones_like(pred_logits)
         return loss, (loss_values, pred_logits, labels, dummy_weights)
 
+    # pyrefly: ignore[bad-override]
     def eval(self) -> None:
         self.train_model.eval()
 
@@ -134,9 +135,9 @@ def make_model_dlrmv2(
         raise NotImplementedError(f"ZCH method {args.zch_method} is not supported yet.")
 
     dlrm_model = DLRMv2(
-        # pyre-ignore [6] # NOTE: Pyre reports that DLRM model's _embedding_bag_collection is EmbeddingBagCollection, but here we assign it with an EmbeddingBagCollectionAdapter.
         # This is because we want to implement managed collision functions without changing the DLRM class. The EmbeddingBagCollectionAdapter will simulate all the
         # APIs for EmbeddingBagCollection, and we can use it to replace the EmbeddingBagCollection in DLRM for managed collision functions.
+        # pyrefly: ignore[bad-argument-type]
         embedding_bag_collection=ebc,
         dense_in_features=len(DEFAULT_INT_NAMES),
         dense_arch_layer_sizes=[int(x) for x in configs["dense_arch_layer_sizes"]],

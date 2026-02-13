@@ -195,7 +195,6 @@ class KTRegroupAsDictTest(unittest.TestCase):
         for key in out.keys():
             torch.allclose(out[key], eager_out[key])
 
-    # pyre-ignore[56]
     @given(data_type=st.sampled_from([DataType.BF16, DataType.FP16]))
     @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
     def test_regroup_cast(self, data_type: DataType) -> None:

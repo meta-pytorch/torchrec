@@ -28,7 +28,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 class NoopArgInfoStep(BaseArgInfoStep):
-    # pyre-ignore
     def process(self, arg) -> Any:
         return arg
 
@@ -38,7 +37,6 @@ class GetAttrArgInfoStep(BaseArgInfoStep):
         super().__init__()
         self.attr_name = attr_name
 
-    # pyre-ignore
     def process(self, arg) -> Any:
         return getattr(arg, self.attr_name)
 
@@ -48,7 +46,6 @@ class GetItemArgInfoStep(BaseArgInfoStep):
         super().__init__()
         self.item_index = item_index
 
-    # pyre-ignore
     def process(self, arg) -> Any:
         return arg[self.item_index]
 
@@ -58,7 +55,6 @@ class PostprocArgInfoStep(BaseArgInfoStep):
         super().__init__()
         self.postproc_module = postproc_module
 
-    # pyre-ignore
     def process(self, arg) -> Any:
         return self.postproc_module(arg)
 
@@ -68,7 +64,7 @@ class ScalarArgInfoStep(BaseArgInfoStep):
         super().__init__()
         self.value = value
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-param-name-override]
     def process(self, _arg) -> Any:
         return self.value
 
@@ -78,7 +74,6 @@ class ListArgInfoStep(BaseArgInfoStep):
         super().__init__()
         self.value = value
 
-    # pyre-ignore
     def process(self, arg) -> Any:
         return [
             (v if not isinstance(v, ArgInfo) else v.process_steps(arg))
@@ -91,7 +86,6 @@ class DictArgInfoStep(BaseArgInfoStep):
         super().__init__()
         self.value = value
 
-    # pyre-ignore
     def process(self, arg) -> Any:
         return {
             k: (v if not isinstance(v, ArgInfo) else v.process_steps(arg))
@@ -226,7 +220,7 @@ class NodeArgsHelper:
 
     def _handle_constant(
         self,
-        arg: Any,  # pyre-ignore
+        arg: Any,
         arg_info: ArgInfo,
         for_postproc_module: bool = False,
     ) -> Optional[ArgInfo]:
@@ -249,10 +243,8 @@ class NodeArgsHelper:
         arg_info.add_step(step)
         return arg_info
 
-    # pyre-ignore[3]
     def _handle_collection_element(
         self,
-        # pyre-ignore[2]
         arg: Any,
         for_postproc_module: bool = False,
     ) -> Any:
@@ -270,7 +262,6 @@ class NodeArgsHelper:
     ) -> ArgInfo:
         # note: mutates arg_info
         if hasattr(child_node, "ph_key"):
-            # pyre-fixme[16]
             ph_key: str = child_node.ph_key
             # example: ph_key = 'event_id_list_features_seqs[marketplace]'
             ph_key = ph_key.replace("[", ".")
@@ -371,7 +362,6 @@ class NodeArgsHelper:
 
     def _get_node_args_helper_inner(
         self,
-        # pyre-ignore
         arg,
         for_postproc_module: bool = False,
     ) -> Optional[ArgInfo]:
@@ -389,29 +379,25 @@ class NodeArgsHelper:
             elif (
                 child_node.op == "call_function"
                 and child_node.target.__module__ == "builtins"
-                # pyre-fixme[16]
+                # pyrefly: ignore[missing-attribute]
                 and child_node.target.__name__ == "getattr"
             ):
-                arg_info.add_step(
-                    # pyre-fixme[6]: For 2nd argument expected `str` but got Unknown
-                    ArgInfoStepFactory.get_attr(child_node.args[1])
-                )
+                # pyrefly: ignore[bad-argument-type]
+                arg_info.add_step(ArgInfoStepFactory.get_attr(child_node.args[1]))
                 arg = child_node.args[0]
             elif (
                 child_node.op == "call_function"
                 and child_node.target.__module__ == "_operator"
-                # pyre-fixme[16]
+                # pyrefly: ignore[missing-attribute]
                 and child_node.target.__name__ == "getitem"
             ):
-                arg_info.add_step(
-                    # pyre-fixme[6]: For 2nd argument expected `str` but got Unknown
-                    ArgInfoStepFactory.get_item(child_node.args[1])
-                )
+                # pyrefly: ignore[bad-argument-type]
+                arg_info.add_step(ArgInfoStepFactory.get_item(child_node.args[1]))
                 arg = child_node.args[0]
             elif (
                 child_node.op == "call_function"
                 and child_node.target.__module__ == "torch.utils._pytree"
-                # pyre-fixme[16]
+                # pyrefly: ignore[missing-attribute]
                 and child_node.target.__name__ == "tree_unflatten"
             ):
                 """
@@ -420,12 +406,12 @@ class NodeArgsHelper:
                 """
                 step = arg_info.steps[0]
                 assert isinstance(step, GetItemArgInfoStep)
-                # pyre-fixme[16]
+                # pyrefly: ignore[bad-index, unsupported-operation]
                 arg = child_node.args[0][step.item_index]
             elif (
                 child_node.op == "call_function"
                 and child_node.target.__module__ == "torchrec.sparse.jagged_tensor"
-                # pyre-fixme[16]
+                # pyrefly: ignore[missing-attribute]
                 and child_node.target.__name__ == "KeyedJaggedTensor"
             ):
                 call_module_found = False
@@ -446,7 +432,7 @@ class NodeArgsHelper:
                     arg = child_node.args[1]
 
             elif child_node.op == "call_method" and child_node.target == "get":
-                # pyre-ignore[6]
+                # pyrefly: ignore[bad-argument-type]
                 arg_info.add_step(ArgInfoStepFactory.get_item(child_node.args[1]))
                 arg = child_node.args[0]
             else:
@@ -461,7 +447,7 @@ class NodeArgsHelper:
 
     def _get_node_args_helper(
         self,
-        arguments,  # pyre-ignore[2]
+        arguments,
         # Add `None` constants to arg info only for postproc modules
         # Defaults to False for backward compatibility
         for_postproc_module: bool = False,

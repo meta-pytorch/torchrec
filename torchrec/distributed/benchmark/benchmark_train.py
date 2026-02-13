@@ -85,7 +85,7 @@ def benchmark_ebc(
     # and we don't want to create an extra CUDA context on GPU0 for each subprocess.
     # we also need to release the memory in the parent process (empty_cache)
     module = EmbeddingBagCollection(
-        # pyre-ignore [6]
+        # pyrefly: ignore[bad-argument-type]
         tables=table_configs,
         is_weighted=False,
         device=torch.device("cuda"),

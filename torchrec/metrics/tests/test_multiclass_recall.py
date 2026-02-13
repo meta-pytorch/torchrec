@@ -136,6 +136,6 @@ class MulticlassRecallGPUSyncTest(unittest.TestCase):
             batch_size=5,
             batch_window_size=20,
             entry_point=sync_test_helper,
-            # pyre-ignore[6] Incompatible parameter type
+            # pyrefly: ignore[bad-argument-type]
             n_classes=N_CLASSES,
         )

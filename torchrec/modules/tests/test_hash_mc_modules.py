@@ -36,7 +36,6 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 class TestMCH(unittest.TestCase):
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -91,16 +90,16 @@ class TestMCH(unittest.TestCase):
 
             self.assertTrue(
                 torch.equal(
-                    # pyre-fixme[6]: For 1st argument expected `Tensor` but got
                     #  `Union[Tensor, Module]`.
+                    # pyrefly: ignore[bad-argument-type]
                     none_throws(m_infer.input_mapper._zch_size_per_training_rank),
                     torch.tensor([10, 10], dtype=torch.int64, device=device_str),
                 )
             )
             self.assertTrue(
                 torch.equal(
-                    # pyre-fixme[6]: For 1st argument expected `Tensor` but got
                     #  `Union[Tensor, Module]`.
+                    # pyrefly: ignore[bad-argument-type]
                     none_throws(m_infer.input_mapper._train_rank_offsets),
                     torch.tensor([0, 10], dtype=torch.int64, device=device_str),
                 )
@@ -223,7 +222,6 @@ class TestMCH(unittest.TestCase):
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore [56]
     @given(hash_size=st.sampled_from([0, 80]), keep_original_indices=st.booleans())
     @settings(max_examples=6, deadline=None)
     def test_zch_hash_train_to_inf_block_bucketize_disabled_in_oss_compatibility(
@@ -302,7 +300,6 @@ class TestMCH(unittest.TestCase):
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore [56]
     @given(hash_size=st.sampled_from([0, 80]))
     @settings(max_examples=5, deadline=None)
     def test_zch_hash_train_rescales_two_disabled_in_oss_compatibility(
@@ -416,7 +413,6 @@ class TestMCH(unittest.TestCase):
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least one GPUs",
     )
-    # pyre-ignore [56]
     @given(hash_size=st.sampled_from([0, 80]))
     @settings(max_examples=5, deadline=None)
     def test_zch_hash_train_rescales_one(self, hash_size: int) -> None:
@@ -546,7 +542,6 @@ class TestMCH(unittest.TestCase):
             )
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "This test requires at least one GPU",
@@ -562,7 +557,6 @@ class TestMCH(unittest.TestCase):
         bucket2 = m.rebuild_with_output_id_range((5, 10))
         self.assertIsNotNone(bucket2._output_global_offset_tensor)
         self.assertTrue(
-            # pyre-ignore [6]
             torch.equal(bucket2._output_global_offset_tensor, torch.tensor([5]))
         )
         self.assertEqual(bucket2._start_bucket, 1)
@@ -571,12 +565,10 @@ class TestMCH(unittest.TestCase):
         bucket3 = m.rebuild_with_output_id_range((10, 15))
         self.assertIsNotNone(bucket3._output_global_offset_tensor)
         self.assertTrue(
-            # pyre-ignore [6]
             torch.equal(bucket3._output_global_offset_tensor, torch.tensor([10]))
         )
         self.assertEqual(bucket3._start_bucket, 2)
         self.assertEqual(
-            # pyre-ignore [16]
             bucket3._output_global_offset_tensor.device.type,
             "cpu",
         )
@@ -621,7 +613,6 @@ class TestMCH(unittest.TestCase):
         self.assertTrue(bucket5._output_global_offset_tensor.device.type == "cpu")
         self.assertEqual(bucket5._output_global_offset_tensor, torch.tensor([15]))
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "This test requires at least one GPU",
@@ -649,7 +640,9 @@ class TestMCH(unittest.TestCase):
 
         self.assertTrue(m.training)
         self.assertFalse(m._is_inference)
+        # pyrefly: ignore[missing-attribute]
         self.assertEqual(m._hash_zch_metadata.shape[0], 4)
+        # pyrefly: ignore[no-matching-overload]
         self.assertTrue(torch.all(m._hash_zch_metadata == 110))
         self.assertEqual(
             m._eviction_policy_name, HashZchEvictionPolicyName.SINGLE_TTL_EVICTION
@@ -658,6 +651,7 @@ class TestMCH(unittest.TestCase):
         m.reset_intrainer_bulk_eval_mode()
         self.assertFalse(m.training)
         self.assertTrue(m._is_inference)
+        # pyrefly: ignore[unnecessary-comparison]
         self.assertTrue(m._eviction_policy_name is None)
         self.assertTrue(m._eviction_module is None)
 
@@ -666,6 +660,7 @@ class TestMCH(unittest.TestCase):
             m.remap({"test": jt})
 
         # check self._hash_zch_metadata is frozen
+        # pyrefly: ignore[no-matching-overload]
         self.assertTrue(torch.all(m._hash_zch_metadata == 110))
 
         m.reset_training_mode()
@@ -680,6 +675,7 @@ class TestMCH(unittest.TestCase):
             mock_time.return_value = 540000
             m.remap({"test": jt})
             # check self._hash_zch_metadata is updated
+            # pyrefly: ignore[no-matching-overload]
             self.assertTrue(torch.all(m._hash_zch_metadata == 160))
 
         m.reset_inference_mode()
@@ -689,7 +685,6 @@ class TestMCH(unittest.TestCase):
         self.assertTrue(m._eviction_module is None)
 
     # Skipping this test because it is flaky on CI. TODO: T240185573 T240185565 investigate the flakiness and re-enable the test.
-    # Pyre-ignore [56]: Pyre was not able to infer the type of argument `torch.cuda.device_count() < 1` to decorator factory `unittest.skipIf`
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -799,7 +794,6 @@ class TestMCH(unittest.TestCase):
             )
         )
 
-    # Pyre-ignore [56]: Pyre was not able to infer the type of argument `torch.cuda.device_count() < 1` to decorator factory `unittest.skipIf`
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -864,7 +858,7 @@ class TestMCH(unittest.TestCase):
         )
         # Run once to insert ids
         res = mcebc.forward(features)
-        # Pyre-ignore [6]: In call `torch._C._VariableFunctions.abs`, for 1st positional argument, expected `Tensor` but got `Union[JaggedTensor, Tensor]`
+        # pyrefly: ignore[bad-argument-type]
         mask = torch.abs(res[0]["table_0"]) == 0
         # For each row, check if all elements are True (i.e., close to zero)
         row_mask = mask.all(dim=1)
@@ -873,7 +867,6 @@ class TestMCH(unittest.TestCase):
         self.assertIsNotNone(res[1])
         self.assertTrue(
             torch.equal(
-                # Pyre-ignore [16]: Optional type has no attribute `__getitem__`.
                 res[1]["table_0"].values(),
                 torch.tensor([1, 2, 8, 9, 3], dtype=torch.int64, device="cuda:0"),
             )
@@ -884,7 +877,7 @@ class TestMCH(unittest.TestCase):
                 torch.tensor([1, 1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
             )
         )
-        # Pyre-ignore [29]: `typing.Union[torch._tensor.Tensor, torch.nn.modules.module.Module]` is not a function
+        # pyrefly: ignore[not-callable]
         mcebc._managed_collision_collection._managed_collision_modules[
             "table_0"
         ].reset_inference_mode()
@@ -905,17 +898,19 @@ class TestMCH(unittest.TestCase):
         res = mcebc.forward(features)
         self.assertTrue(
             torch.equal(
+                # pyrefly: ignore[unsupported-operation]
                 res[1]["table_0"].values(),
                 torch.tensor([2, 8, 3], dtype=torch.int64, device="cuda:0"),
             )
         )
         self.assertTrue(
             torch.equal(
+                # pyrefly: ignore[unsupported-operation]
                 res[1]["table_0"].lengths(),
                 torch.tensor([0, 1, 1, 0, 0, 1], dtype=torch.int64, device="cuda:0"),
             )
         )
-        # Pyre-ignore [6]: In call `torch._C._VariableFunctions.abs`, for 1st positional argument, expected `Tensor` but got `Union[JaggedTensor, Tensor]`
+        # pyrefly: ignore[bad-argument-type]
         mask = torch.abs(res[0]["table_0"]) == 0
         # For each row, check if all elements are True (i.e., close to zero)
         row_mask = mask.all(dim=1)
@@ -974,6 +969,7 @@ class TestVBEWithManagedCollision(unittest.TestCase):
 
         # Create ManagedCollisionCollection
         self.mcc = ManagedCollisionCollection(
+            # pyrefly: ignore[bad-argument-type]
             managed_collision_modules=self.hash_modules,
             embedding_configs=self.embedding_configs,
         )
@@ -987,6 +983,7 @@ class TestVBEWithManagedCollision(unittest.TestCase):
             lengths=torch.tensor([3, 3, 2]),
             stride_per_key_per_rank=[[2], [1]],
             inverse_indices=(["user", "product"], torch.tensor([[0, 1, 0], [0, 0, 0]])),
+            # pyrefly: ignore[bad-argument-type]
         ).to("cuda")
 
     def test_mcc_preserves_kjt_attributes(self) -> None:
@@ -999,6 +996,7 @@ class TestVBEWithManagedCollision(unittest.TestCase):
             weights=torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]),
             stride_per_key_per_rank=self.kjt.stride_per_key_per_rank(),
             inverse_indices=self.kjt.inverse_indices(),
+            # pyrefly: ignore[bad-argument-type]
         ).to("cuda")
 
         # Pass through MCC
@@ -1007,6 +1005,7 @@ class TestVBEWithManagedCollision(unittest.TestCase):
         # Verify ID remapping on values is correct for each table
         for i, table in enumerate(["user_table", "product_table"]):
             mapping = torch.ravel(
+                # pyrefly: ignore[bad-argument-type]
                 self.mcc._managed_collision_modules[table]._hash_zch_identities
             )
             original_inds = kjt_with_weights.values()[
@@ -1065,6 +1064,7 @@ class TestVBEWithManagedCollision(unittest.TestCase):
         """Test that MCEBC correctly handles VBE  using inverse_indices."""
         # Set up MCEBC
         ebc = EmbeddingBagCollection(
+            # pyrefly: ignore[bad-argument-type]
             device="cuda",
             tables=self.embedding_configs,
         )
@@ -1093,6 +1093,7 @@ class TestVBEWithManagedCollision(unittest.TestCase):
             mcc_table = mcebc._managed_collision_collection._managed_collision_modules[
                 table
             ]
+            # pyrefly: ignore[bad-argument-type]
             remapped_indices = torch.ravel(mcc_table._hash_zch_identities)
 
             original_inds_per_key = self.kjt.values()[
@@ -1103,6 +1104,7 @@ class TestVBEWithManagedCollision(unittest.TestCase):
 
             # Process each unique pooled group
             offset_per_key_per_pool = 0
+            # pyrefly: ignore[bad-assignment]
             for i_pooled in range(stride_per_key[i_table]):
                 length_of_pool = self.kjt.lengths()[i_length]
 
@@ -1120,7 +1122,10 @@ class TestVBEWithManagedCollision(unittest.TestCase):
 
                 # Sum embeddings for the pooled group from new_indices
                 pooled_embeddings[table][i_pooled] = (
-                    tables[table][new_indices, :].sum(axis=0).to("cpu")
+                    # pyrefly: ignore[bad-index]
+                    tables[table][new_indices, :]
+                    # pyrefly: ignore[no-matching-overload]
+                    .sum(axis=0).to("cpu")
                 )
 
                 i_length += 1

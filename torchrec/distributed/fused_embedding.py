@@ -52,7 +52,7 @@ class ShardedFusedEmbeddingCollection(
         fused_params.update(emb_opt_kwargs)
 
         super().__init__(
-            # pyre-ignore
+            # pyrefly: ignore[bad-argument-type]
             module=module,
             table_name_to_parameter_sharding=table_name_to_parameter_sharding,
             fused_params=fused_params,
@@ -72,6 +72,7 @@ class ShardedFusedEmbeddingCollection(
                     broadcast_buffers=False,
                     static_graph=True,
                 )
+                # pyrefly: ignore[not-callable]
                 self._lookups[index]._register_fused_optim(
                     optimizer_type, **optimizer_kwargs
                 )

@@ -231,5 +231,6 @@ class HindsightTargetPRMetricComputation(RecMetricComputation):
 
 
 class HindsightTargetPRMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.HINDSIGHT_TARGET_PR
     _computation_class: Type[RecMetricComputation] = HindsightTargetPRMetricComputation

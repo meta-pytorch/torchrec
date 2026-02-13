@@ -24,6 +24,7 @@ class TestModelInput(unittest.TestCase):
 
     def setUp(self) -> None:
         # Fix seeds for reproducibility
+        # pyrefly: ignore [implicit-import]
         np.random.seed(42)
         torch.manual_seed(42)
 
@@ -172,7 +173,6 @@ class TestModelInput(unittest.TestCase):
         self.assertTrue(torch.all(model_input.float_features == 0))
         self.assertTrue(torch.all(model_input.label == 0))
         self.assertIsNotNone(model_input.idlist_features)
-        # pyre-ignore[16]: idlist_features is not None
         self.assertTrue(torch.all(model_input.idlist_features.values() == 0))
 
     def test_generate_with_use_offsets(self) -> None:
@@ -186,7 +186,6 @@ class TestModelInput(unittest.TestCase):
 
         self.assertIsNotNone(model_input.idlist_features)
         kjt = model_input.idlist_features
-        # pyre-ignore[16]: kjt is not None
         self.assertIsNotNone(kjt.offsets_or_none())
         self.assertIsNone(kjt.lengths_or_none())
 
@@ -214,7 +213,6 @@ class TestModelInput(unittest.TestCase):
         )
 
         self.assertIsNotNone(model_input.idlist_features)
-        # pyre-ignore[16]: idlist_features is not None
         self.assertEqual(
             model_input.idlist_features.keys(), ["feature_0", "feature_1", "feature_2"]
         )
@@ -231,10 +229,8 @@ class TestModelInput(unittest.TestCase):
 
         self.assertIsNotNone(model_input.idlist_features)
         kjt = model_input.idlist_features
-        # pyre-ignore[16]: kjt is not None
         self.assertEqual(kjt.values().dtype, torch.int32)
         self.assertIsNotNone(kjt.lengths_or_none())
-        # pyre-ignore[16]: lengths is not None
         self.assertEqual(kjt.lengths().dtype, torch.int32)
 
     def test_generate_with_tables_pooling(self) -> None:
@@ -249,7 +245,6 @@ class TestModelInput(unittest.TestCase):
 
         self.assertIsNotNone(model_input.idlist_features)
         kjt = model_input.idlist_features
-        # pyre-ignore[16]: kjt is not None
         avg_pooling = kjt.values().numel() / 32
         # Average pooling should be close to the specified value (within 50% tolerance)
         self.assertGreater(avg_pooling, high_pooling * 0.5)
@@ -268,9 +263,7 @@ class TestModelInput(unittest.TestCase):
 
         self.assertIsNotNone(model_input.idlist_features)
         kjt = model_input.idlist_features
-        # pyre-ignore[16]: kjt is not None
         lengths = kjt.lengths()
-        # pyre-ignore[16]: lengths is not None
         self.assertTrue(torch.all(lengths <= max_length))
 
     def test_generate_without_tables(self) -> None:
@@ -360,7 +353,6 @@ class TestModelInput(unittest.TestCase):
         self.assertEqual(result.float_features.device, cpu_device)
         self.assertEqual(result.label.device, cpu_device)
         self.assertIsNotNone(result.idlist_features)
-        # pyre-ignore[16]: idlist_features is not None
         self.assertEqual(result.idlist_features.device(), cpu_device)
 
     def test_to_preserves_data(self) -> None:
@@ -502,7 +494,6 @@ class TestModelInput(unittest.TestCase):
         )
 
         self.assertIsNotNone(kjt.weights_or_none())
-        # pyre-ignore[16]: weights is not None
         self.assertEqual(kjt.weights().numel(), kjt.values().numel())
 
     def test_create_standard_kjt_with_offsets(self) -> None:

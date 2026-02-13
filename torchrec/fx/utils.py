@@ -17,17 +17,14 @@ from torch.fx._symbolic_trace import is_fx_tracing
 # def dmp_fx_trace_forward(dmp: DistributedModelParallel)
 
 
-# pyre-ignore
 def fake_range():
-    # pyre-fixme[16]: Module `_C` has no attribute `_jit_tree_views`.
+    # pyrefly: ignore[missing-attribute]
     return torch._C._jit_tree_views.SourceRangeFactory("", None, 0, 0).make_raw_range(
         0, 1
     )
 
 
-# pyre-ignore
 def dmp_fx_trace_forward(  # noqa: C901
-    # pyre-ignore
     dmp,
     tracer: torch.fx.Tracer,
 ):
@@ -72,6 +69,7 @@ def dmp_fx_trace_forward(  # noqa: C901
         for p in sign.parameters.values():
             pann = p.annotation
 
+            # pyrefly: ignore[implicit-import]
             ptype = torch.jit.annotations.try_ann_to_type(pann, fake_range())
             types.append(ptype)
             args_decls.append(f"{p.name}: {ptype}")
@@ -90,11 +88,13 @@ def dmp_fx_trace_forward(  # noqa: C901
                     add_if_missing(f"{m}", f"{t}".split("[")[0])
 
             if hasattr(t, "containedTypes"):
+                # pyrefly: ignore[not-callable]
                 contained_types = getattr(t, "containedTypes", None)()
                 for ctype in contained_types:
                     types.append(ctype)
 
             if hasattr(t, "getElementType"):
+                # pyrefly: ignore[not-callable]
                 el_type = getattr(t, "getElementType", None)()
 
         args_decl = ", ".join(args_decls)
@@ -126,12 +126,10 @@ def dmp_fx_trace_forward(  # noqa: C901
 
 
 @torch.fx.wrap
-# pyre-ignore
 def _fx_marker(s: str, any_proxy_unused: Any) -> None:
     pass
 
 
-# pyre-ignore
 def fx_marker(s: str, any_proxy_unused: Any) -> None:
     if is_fx_tracing():
         _fx_marker(s, any_proxy_unused)

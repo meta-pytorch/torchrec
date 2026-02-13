@@ -90,6 +90,7 @@ class McEmbeddingCollectionAdapter(nn.Module):
             elif (
                 zch_method == "sort_zch"
             ):  # if not use MPZCH, create a MCHManagedCollisionModule using the sort ZCH algorithm
+                # pyrefly: ignore[unsupported-operation]
                 mc_modules[table_name] = MCHManagedCollisionModule(  # sort ZCH
                     zch_size=table_config.num_embeddings,
                     device=device,
@@ -102,16 +103,15 @@ class McEmbeddingCollectionAdapter(nn.Module):
                     f"zc method {zch_method} is not supported yet"
                 )
         # create the mcebc module with the mc modules and the original ebc
-        self.mc_embedding_collection = (
-            ManagedCollisionEmbeddingCollection(  # ZCH or not
-                embedding_collection=ec,
-                managed_collision_collection=ManagedCollisionCollection(
-                    managed_collision_modules=mc_modules,
-                    embedding_configs=ec.embedding_configs(),
-                ),
-                allow_in_place_embed_weight_update=allow_in_place_embed_weight_update,
-                return_remapped_features=False,  # not return remapped features
-            )
+        self.mc_embedding_collection = ManagedCollisionEmbeddingCollection(  # ZCH or not
+            embedding_collection=ec,
+            managed_collision_collection=ManagedCollisionCollection(
+                # pyrefly: ignore[bad-argument-type]
+                managed_collision_modules=mc_modules,
+                embedding_configs=ec.embedding_configs(),
+            ),
+            allow_in_place_embed_weight_update=allow_in_place_embed_weight_update,
+            return_remapped_features=False,  # not return remapped features
         )
         self.remapped_ids: Optional[Dict[str, torch.Tensor]] = (
             None  # to store remapped ids
@@ -143,7 +143,7 @@ class McEmbeddingCollectionAdapter(nn.Module):
         Returns:
             Dict[str, EmbeddingConfig]: dictionary of {'feature_name': EmbeddingConfig}
         """
-        # pyre-ignore [29] # NOTE: the function "embedding_configs" returns the _embedding_module attribute of the EmbeddingCollection
+        # pyrefly: ignore[not-callable]
         return self.mc_embedding_collection._embedding_module.embedding_configs()
 
 
@@ -213,6 +213,7 @@ class McEmbeddingBagCollectionAdapter(nn.Module):
             elif (
                 zch_method == "sort_zch"
             ):  # if not use MPZCH, create a MCHManagedCollisionModule using the sort ZCH algorithm
+                # pyrefly: ignore[unsupported-operation]
                 mc_modules[table_name] = MCHManagedCollisionModule(  # sort ZCH
                     zch_size=table_config.num_embeddings,
                     device=device,
@@ -226,16 +227,15 @@ class McEmbeddingBagCollectionAdapter(nn.Module):
                 )
 
         # create the mcebc module with the mc modules and the original ebc
-        self.mc_embedding_bag_collection = (
-            ManagedCollisionEmbeddingBagCollection(  # ZCH or not
-                embedding_bag_collection=ebc,
-                managed_collision_collection=ManagedCollisionCollection(
-                    managed_collision_modules=mc_modules,
-                    embedding_configs=ebc.embedding_bag_configs(),
-                ),
-                allow_in_place_embed_weight_update=allow_in_place_embed_weight_update,
-                return_remapped_features=False,  # not return remapped features
-            )
+        self.mc_embedding_bag_collection = ManagedCollisionEmbeddingBagCollection(  # ZCH or not
+            embedding_bag_collection=ebc,
+            managed_collision_collection=ManagedCollisionCollection(
+                # pyrefly: ignore[bad-argument-type]
+                managed_collision_modules=mc_modules,
+                embedding_configs=ebc.embedding_bag_configs(),
+            ),
+            allow_in_place_embed_weight_update=allow_in_place_embed_weight_update,
+            return_remapped_features=False,  # not return remapped features
         )
 
     def forward(self, input_kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
@@ -261,6 +261,6 @@ class McEmbeddingBagCollectionAdapter(nn.Module):
             Dict[str, EmbeddingConfig]: dictionary of {'feature_name': EmbeddingConfig}
         """
         return (
-            # pyre-ignore[29]: `Union[BoundMethod[typing.Callable(EmbeddingBagCollection.embedding_bag_configs)[[Named(self, EmbeddingBagCollection)], List[EmbeddingBagConfig]], EmbeddingBagCollection], nn.modules.module.Module, torch._tensor.Tensor]` is not a function. # NOTE: the function "embedding_configs" returns the _embedding_module attribute of the EmbeddingCollection
+            # pyrefly: ignore[not-callable]
             self.mc_embedding_bag_collection._embedding_module.embedding_bag_configs()
         )

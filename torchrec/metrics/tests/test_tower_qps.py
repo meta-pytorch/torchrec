@@ -9,9 +9,9 @@
 
 
 import unittest
-from functools import partial, update_wrapper
-from typing import Any, Callable, Dict, List, Optional, OrderedDict, Tuple, Type, Union
 from collections import OrderedDict
+from functools import partial, update_wrapper
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 from unittest.mock import Mock, patch
 
 import torch
@@ -297,6 +297,7 @@ class TowerQPSMetricTest(unittest.TestCase):
                 batch_size * (warmup_steps + extra_steps) * (i + 1),
             )
             # Mimic trainer crashing and loading a checkpoint.
+            # pyrefly: ignore[bad-argument-type]
             qps._metrics_computations[0]._steps = 0
 
     def test_mtml_empty_update(self) -> None:
@@ -418,7 +419,8 @@ class TowerQPSMetricTest(unittest.TestCase):
         )
 
         data = _gen_data_with_batch_size(batch_size_stages[0].batch_size)
-        metric.update(**data)  # pyre-ignore[6]
+        # pyrefly: ignore[bad-argument-type]
+        metric.update(**data)
 
         self.assertEqual(
             metric.compute(),
@@ -436,7 +438,8 @@ class TowerQPSMetricTest(unittest.TestCase):
         )
 
         data = _gen_data_with_batch_size(batch_size_stages[1].batch_size)
-        metric.update(**data)  # pyre-ignore[6]
+        # pyrefly: ignore[bad-argument-type]
+        metric.update(**data)
 
         self.assertEqual(
             metric.compute(),

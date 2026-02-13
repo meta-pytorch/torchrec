@@ -24,7 +24,7 @@ from torch.distributed.checkpoint.planner import (
     WriteItemType,
 )
 
-aten = torch.ops.aten  # pyre-ignore[5]
+aten = torch.ops.aten
 
 
 class LocalShardsWrapper(torch.Tensor):
@@ -35,9 +35,7 @@ class LocalShardsWrapper(torch.Tensor):
     """
 
     __slots__ = ["_local_shards", "_storage_meta"]
-    # pyre-fixme[13]: Attribute `_local_shards` is never initialized.
     _local_shards: List[torch.Tensor]
-    # pyre-fixme[13]: Attribute `_storage_meta` is never initialized.
     _storage_meta: TensorStorageMetadata
 
     @staticmethod
@@ -102,8 +100,7 @@ class LocalShardsWrapper(torch.Tensor):
 
     # necessary for ops dispatching from this subclass to its local shards
     @classmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
+    # pyrefly: ignore[bad-param-name-override]
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
 
@@ -122,15 +119,13 @@ class LocalShardsWrapper(torch.Tensor):
         }
 
         if func in dispatcher:
-            return dispatcher[func](args, kwargs)  # pyre-ignore [29]
+            return dispatcher[func](args, kwargs)
         else:
             raise NotImplementedError(
                 f"{func} is not supported for LocalShardsWrapper!"
             )
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_zeros_like(args, kwargs):
         return LocalShardsWrapper(
             [torch.zeros_like(shard, **kwargs) for shard in args[0].local_shards()],
@@ -138,8 +133,6 @@ class LocalShardsWrapper(torch.Tensor):
         )
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_empty_like(args, kwargs):
         return LocalShardsWrapper(
             [torch.empty_like(shard, **kwargs) for shard in args[0].local_shards()],
@@ -147,8 +140,6 @@ class LocalShardsWrapper(torch.Tensor):
         )
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_copy_(args, kwargs):
         src = args[1]
         dst = args[0]
@@ -159,8 +150,6 @@ class LocalShardsWrapper(torch.Tensor):
         return args[0]
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_all_gather_into_tensor(args, kwargs):
         dim = args[0].local_sizes()[0][1]
         cat_tensor = torch.cat(
@@ -171,14 +160,10 @@ class LocalShardsWrapper(torch.Tensor):
         )
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_wait_tensor(args, kwargs):
         return torch.ops._c10d_functional.wait_tensor(args[0])
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_to_copy(args, kwargs):
         res_shards_list = [
             aten._to_copy.default(shard, *args[1:], **kwargs)
@@ -187,8 +172,6 @@ class LocalShardsWrapper(torch.Tensor):
         return LocalShardsWrapper(res_shards_list, args[0].local_offsets())
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_view(args, kwargs):
         view_shape = args[1]
         res_shards_list = []
@@ -223,8 +206,6 @@ class LocalShardsWrapper(torch.Tensor):
         return LocalShardsWrapper(res_shards_list, args[0].local_offsets())
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_equal(args, kwargs):
         """
         LocalShardsWrapper equal impl also checks for equality of storage metadata
@@ -242,8 +223,6 @@ class LocalShardsWrapper(torch.Tensor):
         return True
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_detach(args, kwargs):
         self_ls = args[0]
         deatched_local_shards = [
@@ -254,8 +233,6 @@ class LocalShardsWrapper(torch.Tensor):
         return self_ls
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_clone(args, kwargs):
         self_ls = args[0]
         desired_memory_format = kwargs.get("memory_format", None)
@@ -270,8 +247,6 @@ class LocalShardsWrapper(torch.Tensor):
         return LocalShardsWrapper(cloned_local_shards, self_ls.local_offsets())
 
     @staticmethod
-    # pyre-fixme[3]: Return type must be annotated.
-    # pyre-fixme[2]: Parameter must be annotated.
     def handle_new_empty(args, kwargs):
         self_ls = args[0]
         return LocalShardsWrapper(
@@ -289,11 +264,10 @@ class LocalShardsWrapper(torch.Tensor):
     def is_meta(self) -> bool:  # type: ignore[override]
         return self._local_shards[0].is_meta if self._local_shards else True
 
-    # pyre-ignore[14]
     def is_pinned(self) -> bool:  # type: ignore[override]
         return self._storage_meta.properties.pin_memory
 
-    # pyre-ignore[14]
+    # pyrefly: ignore[bad-param-name-override]
     def requires_grad_(self, requires_grad: bool = True) -> "LocalShardsWrapper":
         self._storage_meta.properties.requires_grad = requires_grad
         [shard.requires_grad_(requires_grad) for shard in self._local_shards]
@@ -345,9 +319,7 @@ class LocalShardsWrapper(torch.Tensor):
         """
         return self._storage_meta.size[0] == 0 and self._storage_meta.size[1] == 0
 
-    def __create_write_items__(
-        self, fqn: str, object: Any  # pyre-ignore[2]
-    ) -> List[WriteItem]:
+    def __create_write_items__(self, fqn: str, object: Any) -> List[WriteItem]:
         """
         For compatibility with DCP, we support creation of WriteItems
         such that they can be saved properly.
@@ -409,12 +381,10 @@ class LocalShardsWrapper(torch.Tensor):
             object_size += shard.nelement() * shard.element_size()
         return object_size
 
-    # pyre-fixme[3]: Return type must be annotated.
     def __hash__(self):
         return id(self)
 
-    # pyre-fixme[14]: `__repr__` overrides method defined in `torch._tensor.Tensor` inconsistently.
-    # pyre-fixme[3]: Return type must be annotated.
+    # pyrefly: ignore[bad-override]
     def __repr__(self):
         return f"LocalShardsWrapper:{self._local_shards} {self._storage_meta}"
 

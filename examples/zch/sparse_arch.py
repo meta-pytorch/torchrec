@@ -104,6 +104,7 @@ class SparseArch(nn.Module):
                 ),
             )
         else:  # if not using the MPZCH module, we create a MCHManagedCollisionModule for each table
+            # pyrefly: ignore[unsupported-operation]
             mc_modules["table_0"] = MCHManagedCollisionModule(
                 zch_size=(tables[0].num_embeddings),
                 input_hash_size=input_hash_size,
@@ -111,6 +112,7 @@ class SparseArch(nn.Module):
                 eviction_interval=2,
                 eviction_policy=DistanceLFU_EvictionPolicy(),
             )
+            # pyrefly: ignore[unsupported-operation]
             mc_modules["table_1"] = MCHManagedCollisionModule(
                 zch_size=(tables[1].num_embeddings),
                 device=device,
@@ -126,6 +128,7 @@ class SparseArch(nn.Module):
                     device=device,
                 ),
                 ManagedCollisionCollection(
+                    # pyrefly: ignore[bad-argument-type]
                     managed_collision_modules=mc_modules,
                     embedding_configs=tables,
                 ),

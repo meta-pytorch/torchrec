@@ -183,6 +183,7 @@ class SparseArch(nn.Module):
                 is_inference=is_inference,
             )
         else:
+            # pyrefly: ignore[unsupported-operation]
             mc_modules["table_0"] = MCHManagedCollisionModule(
                 zch_size=tables[0].num_embeddings,
                 input_hash_size=4000,
@@ -191,6 +192,7 @@ class SparseArch(nn.Module):
                 eviction_policy=DistanceLFU_EvictionPolicy(),
             )
 
+            # pyrefly: ignore[unsupported-operation]
             mc_modules["table_1"] = MCHManagedCollisionModule(
                 zch_size=tables[1].num_embeddings,
                 device=device,
@@ -206,6 +208,7 @@ class SparseArch(nn.Module):
                     device=device,
                 ),
                 ManagedCollisionCollection(
+                    # pyrefly: ignore[bad-argument-type]
                     managed_collision_modules=mc_modules,
                     embedding_configs=tables,
                 ),
@@ -250,8 +253,8 @@ def _test_sharding(  # noqa C901
 
         apply_optimizer_in_backward(
             RowWiseAdagrad,
-            # pyre-fixme[6]: For 2nd argument expected `Iterable[Parameter]` but got
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ebc._embedding_bag_collection.embedding_bags[
                     "table_0"
@@ -274,8 +277,8 @@ def _test_sharding(  # noqa C901
         sharded_sparse_arch = _shard_modules(
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ebc": module_sharding_plan}),
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -285,7 +288,6 @@ def _test_sharding(  # noqa C901
             sharded_sparse_arch._mc_ebc, ShardedManagedCollisionEmbeddingBagCollection
         )
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `_managed_collision_collection`.
             sharded_sparse_arch._mc_ebc._managed_collision_collection,
             ShardedManagedCollisionCollection,
@@ -318,8 +320,8 @@ def _test_sharding_and_remapping(  # noqa C901
 
         apply_optimizer_in_backward(
             RowWiseAdagrad,
-            # pyre-fixme[6]: For 2nd argument expected `Iterable[Parameter]` but got
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ebc._embedding_bag_collection.embedding_bags[
                     "table_0"
@@ -342,8 +344,8 @@ def _test_sharding_and_remapping(  # noqa C901
         sharded_sparse_arch = _shard_modules(
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ebc": module_sharding_plan}),
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -353,32 +355,27 @@ def _test_sharding_and_remapping(  # noqa C901
             sharded_sparse_arch._mc_ebc, ShardedManagedCollisionEmbeddingBagCollection
         )
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `_embedding_bag_collection`.
             sharded_sparse_arch._mc_ebc._embedding_bag_collection,
             ShardedEmbeddingBagCollection,
         )
         assert (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `_embedding_bag_collection`.
             sharded_sparse_arch._mc_ebc._embedding_bag_collection._has_uninitialized_input_dist
             is False
         )
         assert (
             not hasattr(
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `_embedding_bag_collection`.
                 sharded_sparse_arch._mc_ebc._embedding_bag_collection,
                 "_input_dists",
             )
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `_embedding_bag_collection`.
             or len(sharded_sparse_arch._mc_ebc._embedding_bag_collection._input_dists)
             == 0
         )
 
         assert isinstance(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `_managed_collision_collection`.
             sharded_sparse_arch._mc_ebc._managed_collision_collection,
             ShardedManagedCollisionCollection,
@@ -430,8 +427,8 @@ def _test_in_place_embd_weight_update(  # noqa C901
         )
         apply_optimizer_in_backward(
             RowWiseAdagrad,
-            # pyre-fixme[6]: For 2nd argument expected `Iterable[Parameter]` but got
             #  `Iterable[Union[Module, Tensor]]`.
+            # pyrefly: ignore[bad-argument-type]
             [
                 sparse_arch._mc_ebc._embedding_bag_collection.embedding_bags[
                     "table_0"
@@ -454,8 +451,8 @@ def _test_in_place_embd_weight_update(  # noqa C901
         sharded_sparse_arch = _shard_modules(
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"_mc_ebc": module_sharding_plan}),
-            # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but got
             #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -564,6 +561,7 @@ def _run_single_rank_training_step(
         sharded_train_model = _shard_modules(
             module=copy.deepcopy(train_model),
             plan=ShardingPlan({"_mc_ebc": train_sharding_plan}),
+            # pyrefly: ignore[bad-argument-type]
             env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
@@ -575,7 +573,7 @@ def _run_single_rank_training_step(
 
         # Store managed collision module state
         mc_state = (
-            # pyre-ignore
+            # pyrefly: ignore[missing-attribute]
             sharded_train_model._mc_ebc._managed_collision_collection._managed_collision_modules.state_dict()
         )
         for key, value in mc_state.items():
@@ -584,9 +582,8 @@ def _run_single_rank_training_step(
             ] = value.cpu()
 
         # Store embedding bag collection state
-        ebc_state = (
-            sharded_train_model._mc_ebc._embedding_bag_collection.state_dict()
-        )  # pyre-ignore
+        # pyrefly: ignore[missing-attribute]
+        ebc_state = sharded_train_model._mc_ebc._embedding_bag_collection.state_dict()
         for key, value in ebc_state.items():
             tensors = []
             for i in range(len(value.local_shards())):
@@ -604,7 +601,6 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore
     @given(backend=st.sampled_from(["nccl"]))
     @settings(deadline=None)
     def test_uneven_sharding(self, backend: str) -> None:
@@ -637,7 +633,6 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore
     @given(backend=st.sampled_from(["nccl"]))
     @settings(deadline=None)
     def test_even_sharding(self, backend: str) -> None:
@@ -654,7 +649,6 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore
     @given(backend=st.sampled_from(["nccl"]))
     @settings(deadline=None)
     def test_sharding_zch_mc_ebc(self, backend: str) -> None:
@@ -673,7 +667,6 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore
     @given(
         backend=st.sampled_from(["nccl"]),
         allow_in_place_embed_weight_update=st.booleans(),
@@ -762,7 +755,9 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         )
 
         merged_state_dict = _merge_sharded_return_state_dict(
-            train_state_dict, is_with_metadata=False
+            # pyrefly: ignore[bad-argument-type]
+            train_state_dict,
+            is_with_metadata=False,
         )
 
         # Global model that loads sharded model state

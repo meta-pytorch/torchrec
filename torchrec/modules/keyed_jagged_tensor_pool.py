@@ -144,15 +144,12 @@ class KeyedJaggedTensorPool(ObjectPool[KeyedJaggedTensor]):
         super().__init__()
         self._pool_size = pool_size
         self._feature_max_lengths: Dict[str, int] = feature_max_lengths
-        # pyre-fixme[4]: Attribute must be annotated.
         self._total_lengths = sum(self._feature_max_lengths.values())
         self._values_dtype = values_dtype
         self._is_weighted = is_weighted
-        # pyre-fixme[4]: Attribute must be annotated.
         self._device = device if device is not None else torch.device("meta")
         self._enable_uvm = enable_uvm
 
-        # pyre-fixme[4]: Attribute must be annotated.
         self._permute_feature = None
         self.register_buffer(
             "_feature_max_lengths_t",
@@ -164,9 +161,8 @@ class KeyedJaggedTensorPool(ObjectPool[KeyedJaggedTensor]):
             persistent=False,
         )
 
-        # pyre-fixme[4]: Attribute must be annotated.
         self._keys = list(self._feature_max_lengths.keys())
-        # pyre-ignore
+        # pyrefly: ignore[bad-assignment]
         self._lookup: KeyedJaggedTensorPoolLookup = None
         if self._enable_uvm and values_dtype == torch.int64:
             self._lookup = UVMCachingInt64Lookup(
@@ -212,7 +208,6 @@ class KeyedJaggedTensorPool(ObjectPool[KeyedJaggedTensor]):
             error_msgs,
         )
 
-        # pyre-fixme[16]: `KeyedJaggedTensorPoolLookup` has no attribute `_values`.
         self._lookup._values = state_dict[prefix + "values"]
         self._lookup._key_lengths = state_dict[prefix + "key_lengths"]
 
@@ -263,6 +258,7 @@ class KeyedJaggedTensorPool(ObjectPool[KeyedJaggedTensor]):
             valid_input.lengths().reshape(len(self._keys), -1).max(dim=1)
         )
 
+        # pyrefly: ignore[no-matching-overload]
         assert torch.all(
             max_elements <= self._feature_max_lengths_t
         ).item(), "input KJT has a feature that exceeds specified max lengths"

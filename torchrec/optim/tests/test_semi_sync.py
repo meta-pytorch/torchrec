@@ -95,7 +95,8 @@ class TestSemisyncOptimizer(unittest.TestCase):
         for expected in expected_groups:
             with self.subTest(optimizer=expected["name"]):
                 index = expected["index"]
-                group = param_groups_list[index]  # pyre-ignore[6]
+                # pyrefly: ignore [bad-index]
+                group = param_groups_list[index]
                 self.assertIn("params", group)
                 self.assertEqual(group["lr"], expected["lr"])
 
@@ -307,14 +308,17 @@ class TestSemisyncOptimizer(unittest.TestCase):
         for case in test_cases:
             with self.subTest(prefix=case["prefix"]):
                 result = SemisyncOptimizer._extract_prefixed_state(
-                    param_state, case["prefix"]  # pyre-ignore[6]
+                    param_state,
+                    # pyrefly: ignore [bad-argument-type]
+                    case["prefix"],
                 )
                 self.assertEqual(set(result.keys()), case["expected_keys"])
 
                 # Verify tensor values for non-empty results
                 if case["expected_keys"]:
                     for key in case["expected_keys"]:
-                        original_key = case["prefix"] + key  # pyre-ignore
+                        # pyrefly: ignore [unsupported-operation]
+                        original_key = case["prefix"] + key
                         self.assertTrue(
                             torch.equal(result[key], param_state[original_key])
                         )

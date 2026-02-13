@@ -255,7 +255,6 @@ class TestJaggedTensor(unittest.TestCase):
             torch.equal(j1.weights(), torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]))
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -312,6 +311,7 @@ class TestJaggedTensor(unittest.TestCase):
             torch.tensor([0.5]),
             torch.tensor([0.6, 0.7, 0.8]),
         ]
+        # pyrefly: ignore[no-matching-overload]
         for t0, expected_t0 in zip(weights_list, expected_weights_list):
             self.assertTrue(torch.equal(t0, expected_t0))
 
@@ -418,6 +418,7 @@ class TestJaggedTensor(unittest.TestCase):
         ]
 
         expected_t0_weights = torch.tensor(expected_t0_weights)
+        # pyrefly: ignore[bad-argument-type]
         self.assertTrue(torch.equal(t0_weights, expected_t0_weights))
 
         t1_weights = jt.to_padded_dense_weights(desired_length=2, padding_value=1.0)
@@ -430,6 +431,7 @@ class TestJaggedTensor(unittest.TestCase):
             [0.6, 0.7],
         ]
         expected_t1_weights = torch.tensor(expected_t1_weights)
+        # pyrefly: ignore[bad-argument-type]
         self.assertTrue(torch.equal(t1_weights, expected_t1_weights))
 
         values = torch.Tensor(
@@ -477,6 +479,7 @@ class TestJaggedTensor(unittest.TestCase):
             ],
         ]
         expected_t2_weights = torch.tensor(expected_t2_weights)
+        # pyrefly: ignore[bad-argument-type]
         self.assertTrue(torch.equal(t2_weights, expected_t2_weights))
 
         jt = JaggedTensor(
@@ -621,7 +624,6 @@ class TestJaggedTensor(unittest.TestCase):
         self.assertTrue(torch.equal(j.values(), j2.values()))
         self.assertTrue(torch.equal(j.weights(), j2.weights()))
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1054,7 +1056,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertEqual(empty_jt.lengths().numel(), 0)
         self.assertIsNone(empty_jt.weights_or_none())
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1087,7 +1088,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertEqual(empty_jt.weights().size(), jt.weights().size())
         self.assertEqual(empty_jt.lengths().size(), jt.lengths().size())
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1128,7 +1128,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertTrue(result_jt.weights().is_cuda)
         self.assertTrue(result_jt.lengths().is_cuda)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1162,7 +1161,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertTrue(result_jt.values().is_cuda)
         self.assertTrue(result_jt.lengths().is_cuda)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",
@@ -1195,7 +1193,6 @@ class TestJaggedTensorTracing(unittest.TestCase):
         self.assertTrue(result_jt.values().is_cuda)
         self.assertTrue(result_jt.offsets().is_cuda)
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
         "CUDA is not available",

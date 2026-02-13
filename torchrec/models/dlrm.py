@@ -216,6 +216,7 @@ class InteractionArch(nn.Module):
         interactions = torch.bmm(
             combined_values, torch.transpose(combined_values, 1, 2)
         )
+        # pyrefly: ignore[bad-index]
         interactions_flat = interactions[:, self.triu_indices[0], self.triu_indices[1]]
 
         return torch.cat((dense_features, interactions_flat), dim=1)
@@ -712,6 +713,7 @@ class DLRM_Projection(DLRM):
             device=dense_device,
         )
 
+        # pyrefly: ignore[bad-assignment]
         self.inter_arch = InteractionProjectionArch(
             num_sparse_features=num_sparse_features,
             interaction_branch1=interaction_branch1,
@@ -834,6 +836,7 @@ class DLRM_DCN(DLRM):
             low_rank=dcn_low_rank_dim,
         )
 
+        # pyrefly: ignore[bad-assignment]
         self.inter_arch = InteractionDCNArch(
             num_sparse_features=num_sparse_features,
             crossnet=crossnet,
@@ -903,7 +906,7 @@ class DLRMTrain(nn.Module):
 
 
 class DLRMWrapper(DLRM):
-    # pyre-ignore[14, 15]
+    # pyrefly: ignore[bad-param-name-override]
     def forward(
         self, model_input: ModelInput
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -919,7 +922,8 @@ class DLRMWrapper(DLRM):
         """
         pred = super().forward(
             dense_features=model_input.float_features,
-            sparse_features=model_input.idlist_features,  # pyre-ignore[6]
+            # pyrefly: ignore[bad-argument-type]
+            sparse_features=model_input.idlist_features,
         )
 
         if self.training:

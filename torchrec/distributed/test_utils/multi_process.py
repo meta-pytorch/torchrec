@@ -84,7 +84,6 @@ class MultiProcessContext:
         )
         return self
 
-    # pyre-ignore
     def __exit__(self, exc_type, exc_instance, traceback) -> None:
         if _INTRA_PG is not None:
             dist.destroy_process_group(_INTRA_PG)
@@ -150,7 +149,6 @@ class MultiProcessTestBase(unittest.TestCase):
             None,
         ],
         world_size: int = 2,
-        # pyre-ignore
         **kwargs,
     ) -> None:
         ctx = multiprocessing.get_context(self._mp_init_mode)
@@ -210,6 +208,7 @@ class MultiProcessTestBase(unittest.TestCase):
             kwargs["rank"] = rank
             kwargs["world_size"] = world_size
             kwargs.update(kwargs_per_rank[rank])
+            # pyrefly: ignore[missing-attribute]
             p = ctx.Process(
                 target=callable,
                 kwargs=kwargs,
@@ -222,7 +221,7 @@ class MultiProcessTestBase(unittest.TestCase):
             self.assertEqual(0, p.exitcode)
 
 
-def _wrapper_func_for_multiprocessing(args):  # pyre-ignore[2, 3]
+def _wrapper_func_for_multiprocessing(args):
     """Wrapper function that unpacks arguments and calls the original func"""
     func, rank, world_size, kwargs = args
     kwargs["rank"] = rank
@@ -230,17 +229,15 @@ def _wrapper_func_for_multiprocessing(args):  # pyre-ignore[2, 3]
     return func(**kwargs)
 
 
-# pyre-ignore[3]
 def run_multi_process_func(
-    # pyre-ignore[2]
     func: Callable[
+        # pyrefly: ignore[invalid-argument]
         [int, int, ...],  # rank, world_size, ...
         Any,  # Changed from None to Any to allow return values
     ],
     multiprocessing_method: str = "spawn",
     use_deterministic_algorithms: bool = True,
     world_size: int = 2,
-    # pyre-ignore
     **kwargs,
 ) -> List[Any]:
     """ """

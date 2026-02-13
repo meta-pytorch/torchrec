@@ -137,6 +137,7 @@ class CPUCommsRecMetricModule(RecMetricModule):
                 # window size is set as the local window size.
                 window_size=metric._window_size * metric._world_size,
                 fused_update_limit=metric._fused_update_limit,
+                # pyrefly: ignore[bad-argument-type]
                 compute_on_all_ranks=metric._metrics_computations[
                     0
                 ]._compute_on_all_ranks,
@@ -159,5 +160,4 @@ def set_update_called(computation: RecMetricComputation) -> None:
     try:
         computation._update_called = True
     except AttributeError:
-        # pyre-ignore
         computation._update_count = 1

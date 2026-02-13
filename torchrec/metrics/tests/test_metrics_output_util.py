@@ -228,5 +228,7 @@ class UpdateMetricsOutputTest(unittest.TestCase):
         future.set_result(metrics)
 
         self.assertDictEqual(
-            captured_metrics, {"loss": torch.tensor(0.5), "exception": "error"}
+            # pyrefly: ignore[bad-argument-type]
+            captured_metrics,
+            {"loss": torch.tensor(0.5), "exception": "error"},
         )

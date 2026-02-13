@@ -84,11 +84,14 @@ def is_asan_or_tsan() -> bool:
 
 
 def skip_if_asan(
+    # pyrefly: ignore[bad-specialization, not-a-type]
     func: Callable[TParams, TReturn],
+    # pyrefly: ignore[bad-specialization, not-a-type]
 ) -> Callable[TParams, Optional[TReturn]]:
     """Skip test run if we are in ASAN mode."""
 
     @wraps(func)
+    # pyrefly: ignore[not-a-type]
     def wrapper(*args: TParams.args, **kwargs: TParams.kwargs) -> Optional[TReturn]:
         if is_asan_or_tsan():
             raise unittest.SkipTest("Skipping test run since we are in ASAN mode.")
@@ -99,7 +102,9 @@ def skip_if_asan(
 
 def skip_if_asan_class(cls: TReturn) -> Optional[TReturn]:
     if is_asan_or_tsan():
+        # pyrefly: ignore[missing-attribute]
         cls.__unittest_skip__ = True
+        # pyrefly: ignore[missing-attribute]
         cls.__unittest_skip_why__ = "Skipping test run since we are in ASAN mode."
     return cls
 
@@ -112,19 +117,18 @@ def init_distributed_single_host(
     if dist.is_initialized():
         dist.destroy_process_group()
     dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
-    # pyre-fixme[7]: Expected `ProcessGroup` but got
     #  `Optional[_distributed_c10d.ProcessGroup]`.
+    # pyrefly: ignore[bad-return]
     return dist.group.WORLD
 
 
-# pyre-ignore [24]
 def seed_and_log(wrapped_func: Callable) -> Callable:
-    # pyre-ignore [2, 3]
     def _wrapper(*args, **kwargs):
         seed = int(time.time() * 1000) % (1 << 31)
         print(f"Using random seed: {seed}")
         torch.manual_seed(seed)
         random.seed(seed)
+        # pyrefly: ignore[implicit-import]
         np.random.seed(seed)
         return wrapped_func(*args, **kwargs)
 

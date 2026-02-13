@@ -139,5 +139,6 @@ class RecallMetricComputation(RecMetricComputation):
 
 
 class RecallMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.RECALL
     _computation_class: Type[RecMetricComputation] = RecallMetricComputation

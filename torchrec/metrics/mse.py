@@ -202,5 +202,6 @@ class MSEMetricComputation(RecMetricComputation):
 
 
 class MSEMetric(RecMetric):
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.MSE
     _computation_class: Type[RecMetricComputation] = MSEMetricComputation

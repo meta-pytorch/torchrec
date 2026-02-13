@@ -139,6 +139,7 @@ class TestLazyAwaitable(unittest.TestCase):
                 self.lazy_awaitable = NeedWaitNoInit(torch.ones(2, 3))
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
+                # pyrefly: ignore [unsupported-operation]
                 return x + self.lazy_awaitable
 
         m = Model()
@@ -289,5 +290,6 @@ class TestLazyAwaitable(unittest.TestCase):
         self.assertIsNone(a._result)
 
         # The use of a torch op should trigger exactly one wait on the parent object.
+        # pyrefly: ignore[no-matching-overload]
         result = torch.add(lazy_foo, lazy_bar)
         self.assertEqual(result, torch.tensor(1 * 3 + 2 * 3))

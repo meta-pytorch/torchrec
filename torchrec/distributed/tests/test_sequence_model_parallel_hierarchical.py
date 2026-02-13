@@ -45,7 +45,6 @@ class SequenceModelParallelHierarchicalTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-ignore [56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -78,7 +77,7 @@ class SequenceModelParallelHierarchicalTest(MultiProcessTestBase):
         ],
     ) -> None:
         self._test_sharding(
-            # pyre-ignore [6]
+            # pyrefly: ignore[bad-argument-type]
             sharders=[
                 create_test_sharder(
                     SharderType.EMBEDDING_TOWER.value, sharding_type, kernel_type

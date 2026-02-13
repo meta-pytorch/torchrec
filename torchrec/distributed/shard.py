@@ -51,7 +51,6 @@ def _join_module_path(path: str, name: str) -> str:
     return (path + "." + name) if path else name
 
 
-# pyre-ignore
 @contract()
 def shard(
     module: nn.Module,
@@ -127,6 +126,7 @@ def _shard(
                 device = torch.device("cpu")
 
     if isinstance(plan, ModuleShardingPlan):
+        # pyrefly: ignore[bad-argument-type]
         return sharder.shard(module, plan, env, device)
 
     # Run sharding generators.
@@ -135,6 +135,7 @@ def _shard(
         gen = plan
         plan = {}
         for table_name, param in shardable_parameters.items():
+            # pyrefly: ignore[unsupported-operation]
             plan[table_name] = gen(
                 param,
                 get_local_size(env.world_size),
@@ -146,9 +147,9 @@ def _shard(
         for table_name, sharding in plan.items():
             if isinstance(sharding, Callable):
                 param = shardable_parameters[table_name]
-                # pyre-fixme[6]: For 2nd argument expected `(Parameter, int, int,
                 #  str, ModuleSharder[Module]) -> ParameterSharding` but got
                 #  `ParameterSharding`.
+                # pyrefly: ignore[unsupported-operation]
                 plan[table_name] = sharding(
                     param,
                     get_local_size(env.world_size),
@@ -157,10 +158,10 @@ def _shard(
                     sharder,
                 )
 
+    # pyrefly: ignore[bad-argument-type]
     return sharder.shard(module, plan, env, device)
 
 
-# pyre-ignore
 @contract()
 @_torchrec_method_logger()
 def shard_modules(
@@ -269,13 +270,20 @@ def _shard_modules(  # noqa: C901
         if pg is not None:
             plan = planner.collective_plan(module, sharders, pg)
         else:
+            # pyrefly: ignore[bad-argument-type, missing-argument]
             plan = planner.plan(module, sharders)
 
     if type(module) in sharder_map:
         # If the top level module is itself a shardable module, return the sharded variant.
         # Note, we cannot do an inplace replacement in this case.
         return sharder_map[type(module)].shard(
-            module, plan.get_plan_for_module(""), env, device, ""
+            module,
+            # pyrefly: ignore[bad-argument-type]
+            plan.get_plan_for_module(""),
+            # pyrefly: ignore[bad-argument-type]
+            env,
+            device,
+            "",
         )
 
     def _replace(_model: nn.Module, path: str = "") -> None:
@@ -287,6 +295,7 @@ def _shard_modules(  # noqa: C901
                 if sharded_params is not None:
                     sharded_module = sharder_map[type(child)].shard(
                         child,
+                        # pyrefly: ignore[bad-argument-type]
                         sharded_params,
                         env,
                         device,

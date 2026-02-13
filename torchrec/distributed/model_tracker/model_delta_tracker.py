@@ -351,11 +351,11 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
     ) -> None:
         # FIXME: this is the momentum from last iteration, use momentum from current iter
         # for correctness.
-        # pyre-ignore Undefined attribute [16]:
+        # pyrefly: ignore[missing-attribute]
         momentum = emb_module._emb_module.momentum1_dev
         # FIXME: support multiple tables per group, information can be extracted from
         # module._config (i.e., GroupedEmbeddingConfig)
-        # pyre-ignore Undefined attribute [16]:
+        # pyrefly: ignore[missing-attribute]
         states = momentum.view(-1, emb_module._config.embedding_dims()[0])[
             kjt.values()
         ].norm(dim=1)
@@ -383,8 +383,8 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
         kjt: KeyedJaggedTensor,
     ) -> None:
         opt_states: List[List[torch.Tensor]] = (
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `split_optimizer_states`.
+            # pyrefly: ignore[missing-attribute]
             emb_module._emb_module.split_optimizer_states()
         )
         proxy: torch.Tensor = torch.cat([state[0] for state in opt_states])
@@ -408,7 +408,7 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
     def get_latest(self) -> Dict[str, torch.Tensor]:
         ret: Dict[str, torch.Tensor] = {}
         for module in self.tracked_modules.values():
-            # pyre-fixme[29]:
+            # pyrefly: ignore[not-iterable]
             for lookup in module._lookups:
                 if isinstance(lookup, DistributedDataParallel):
                     continue
@@ -482,7 +482,7 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
                 assert (
                     fqn in square_sum_map
                 ), f"{fqn} not found in {square_sum_map.keys()}"
-                # pyre-fixme[58]: `-` is not supported for operand types `Tensor` and `Optional[Tensor]`.
+                # pyrefly: ignore[unsupported-operation]
                 rows.states = square_sum_map[fqn][rows.ids] - rows.states
 
         return tracker_rows
@@ -611,10 +611,10 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
                 or self._mode == TrackingMode.EMBEDDING
             ):
                 # register post lookup function
-                # pyre-ignore[29]
+                # pyrefly: ignore[not-callable]
                 module.register_post_lookup_tracker_fn(self.record_lookup)
             elif self._mode == TrackingMode.MOMENTUM_LAST:
-                # pyre-ignore[29]:
+                # pyrefly: ignore[not-iterable]
                 for lookup in module._lookups:
                     assert isinstance(
                         lookup,
@@ -625,7 +625,7 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
                 self._mode == TrackingMode.ROWWISE_ADAGRAD
                 or self._mode == TrackingMode.MOMENTUM_DIFF
             ):
-                # pyre-ignore[29]:
+                # pyrefly: ignore[not-iterable]
                 for lookup in module._lookups:
                     if isinstance(
                         lookup,
@@ -649,5 +649,5 @@ class ModelDeltaTrackerTrec(ModelDeltaTracker):
                 )
             # register auto compaction function at odist
             if self._auto_compact:
-                # pyre-ignore[29]
+                # pyrefly: ignore[not-callable]
                 module.register_post_odist_tracker_fn(self.trigger_compaction)

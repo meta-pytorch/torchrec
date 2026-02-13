@@ -182,6 +182,7 @@ class TowerQPSMetric(RecMetric):
         tower_qps = torch.sum(num_examples) / torch.max(time_lapse) = 2.80
     """
 
+    # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.TOWER_QPS
     _computation_class: Type[RecMetricComputation] = TowerQPSMetricComputation
 
@@ -257,6 +258,7 @@ class TowerQPSMetric(RecMetric):
                 if self._should_validate_update:
                     # Set the default value to be all True. When weights is None, it's considered
                     # to be a valid input, and we'll use the default value
+                    # pyrefly: ignore[no-matching-overload]
                     has_valid_weights = torch.ones(
                         len(self._tasks),
                         dtype=torch.bool,
@@ -280,13 +282,16 @@ class TowerQPSMetric(RecMetric):
                         )
 
                     if torch.any(has_valid_weights):
+                        # pyrefly: ignore[not-callable]
                         self._metrics_computations[0].update(
                             predictions=None, labels=labels, weights=None
                         )
+                        # pyrefly: ignore[not-callable]
                         self._metrics_computations[0].has_valid_update.logical_or_(
                             has_valid_weights
                         )
                 else:
+                    # pyrefly: ignore[not-callable]
                     self._metrics_computations[0].update(
                         predictions=None, labels=labels, weights=None
                     )
@@ -294,15 +299,15 @@ class TowerQPSMetric(RecMetric):
                 for task, metric_ in zip(self._tasks, self._metrics_computations):
                     if task.name not in labels:
                         continue
-                    # pyre-fixme[6]: For 1st argument expected `Union[None,
                     #  List[typing.Any], int, slice, Tensor, typing.Tuple[typing.Any,
                     #  ...]]` but got `str`.
+                    # pyrefly: ignore[bad-index]
                     task_labels = labels[task.name].view(1, -1)
                     if self._should_validate_update:
+                        # pyrefly: ignore[no-matching-overload]
                         has_valid_weights = torch.ones(
                             1,
                             dtype=torch.bool,
-                            # pyre-fixme[6]: For 3rd argument expected `Union[None,
                             #  int, str, device]` but got `Union[device, Tensor,
                             #  Module]`.
                             device=metric_.has_valid_update.device,
@@ -310,22 +315,22 @@ class TowerQPSMetric(RecMetric):
                         if weights is not None and task.name in weights:
                             has_valid_weights = torch.gt(
                                 torch.count_nonzero(
-                                    # pyre-fixme[6]: For 1st argument expected
                                     #  `Union[None, List[typing.Any], int, slice,
                                     #  Tensor, typing.Tuple[typing.Any, ...]]` but got
                                     #  `str`.
+                                    # pyrefly: ignore[bad-index]
                                     weights[task.name].view(1, -1),
                                     dim=-1,
                                 ),
                                 0,
                             )
                         if has_valid_weights[0]:
-                            # pyre-fixme[29]: `Union[(self: TensorBase, other:
                             #  Tensor) -> Tensor, Tensor, Module]` is not a function.
+                            # pyrefly: ignore[not-callable]
                             metric_.has_valid_update.logical_or_(has_valid_weights)
                         else:
                             continue
-                    # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
+                    # pyrefly: ignore[not-callable]
                     metric_.update(
                         predictions=None,
                         labels=task_labels,

@@ -149,7 +149,6 @@ class TrainPipelineBaseTest(unittest.TestCase):
         torch.backends.cudnn.allow_tf32 = False
         torch.backends.cuda.matmul.allow_tf32 = False
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -218,6 +217,7 @@ class TrainPipelinePT2Test(unittest.TestCase):
 
             def forward(self, x: KeyedJaggedTensor) -> List[JaggedTensor]:
                 kt: KeyedTensor = self.model(x)
+                # pyrefly: ignore[no-matching-overload]
                 return list(kt.to_dict().values())
 
         return M_ebc(
@@ -227,7 +227,6 @@ class TrainPipelinePT2Test(unittest.TestCase):
             )
         )
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -259,7 +258,6 @@ class TrainPipelinePT2Test(unittest.TestCase):
             self.assertEqual(pred_gpu.device, self.device)
             self.assertTrue(torch.isclose(pred_gpu.cpu(), pred))
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -278,7 +276,7 @@ class TrainPipelinePT2Test(unittest.TestCase):
         ]
 
         def pre_compile_fn(model: nn.Module) -> None:
-            # pyre-fixme[16]: `Module` has no attribute `_dummy_setting`.
+            # pyrefly: ignore[bad-argument-type]
             model._dummy_setting = "dummy modified"
 
         dataloader = iter(data)
@@ -290,7 +288,6 @@ class TrainPipelinePT2Test(unittest.TestCase):
             pipeline.progress(dataloader)
         self.assertEqual(model_gpu._dummy_setting, "dummy modified")
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -313,11 +310,11 @@ class TrainPipelinePT2Test(unittest.TestCase):
         )
 
         model_gpu.load_state_dict(model_cpu.state_dict())
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
         #  `parameters`.
+        # pyrefly: ignore[missing-attribute]
         optimizer_cpu = optim.SGD(model_cpu.model.parameters(), lr=0.01)
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
         #  `parameters`.
+        # pyrefly: ignore[missing-attribute]
         optimizer_gpu = optim.SGD(model_gpu.model.parameters(), lr=0.01)
 
         data = [
@@ -342,7 +339,6 @@ class TrainPipelinePT2Test(unittest.TestCase):
 
 
 class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -486,7 +482,6 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
         "Not enough GPUs, this test requires at least one GPU",
     )
     @settings(max_examples=4, deadline=None)
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -561,7 +556,6 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(execute_all_batches=st.booleans())
     @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
     def test_pipelining_fsdp_pre_trace(self, execute_all_batches: bool) -> None:
@@ -609,7 +603,6 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
             self.assertEqual(pred_gpu.device, self.device)
             self.assertEqual(pred_gpu.cpu().size(), pred.size())
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -654,7 +647,6 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
             )
         )
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -689,6 +681,7 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
             batch_size = pred.size(0)
             return loss, pred.expand(batch_size * 2, -1)
 
+        # pyrefly: ignore[bad-specialization]
         pipeline = self.pipeline_class(
             model=sharded_model_pipelined,
             optimizer=optim_pipelined,
@@ -730,7 +723,8 @@ def fp_ebc_rw_sharding_test_runner(
         max_feature_lengths = [10, 10, 12, 12]
         sparse_arch = DummyWrapper(
             create_module_and_freeze(
-                tables=tables,  # pyre-ignore[6]
+                # pyrefly: ignore[bad-argument-type]
+                tables=tables,
                 device=ctx.device,
                 use_fp_collection=False,
                 max_feature_lengths=max_feature_lengths,
@@ -753,14 +747,14 @@ def fp_ebc_rw_sharding_test_runner(
         sharded_sparse_arch_pipeline = DistributedModelParallel(
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"m._fp_ebc": module_sharding_plan}),
-            env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore[6]
+            env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
         )
         sharded_sparse_arch_no_pipeline = DistributedModelParallel(
             module=copy.deepcopy(sparse_arch),
             plan=ShardingPlan({"m._fp_ebc": module_sharding_plan}),
-            env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore[6]
+            env=ShardingEnv.from_process_group(ctx.pg),
             sharders=[sharder],
             device=ctx.device,
         )
@@ -888,7 +882,7 @@ def fp_ebc_jk_disabled_pipelined_test_runner(
         max_feature_lengths = [10, 10, 12, 12]
         sparse_arch = DummyWrapper(
             create_module_and_freeze(
-                tables=tables,  # pyre-ignore[6]
+                tables=tables,
                 device=ctx.device,
                 use_fp_collection=False,
                 max_feature_lengths=max_feature_lengths,
@@ -896,6 +890,7 @@ def fp_ebc_jk_disabled_pipelined_test_runner(
         )
 
         module_sharding_plan = construct_module_sharding_plan(
+            # pyrefly: ignore[bad-argument-type]
             sparse_arch.m._fp_ebc,
             per_param_sharding={
                 "table_0": row_wise(),
@@ -922,7 +917,7 @@ def fp_ebc_jk_disabled_pipelined_test_runner(
             sharded_model_pipeline = DistributedModelParallel(
                 module=copy.deepcopy(sparse_arch),
                 plan=ShardingPlan({"m._fp_ebc": module_sharding_plan}),
-                env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore[6]
+                env=ShardingEnv.from_process_group(ctx.pg),
                 sharders=[sharder],
                 device=ctx.device,
             )
@@ -1045,7 +1040,7 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
         data_iter = MagicMock()
         mock_data: MagicMock = MagicMock(spec=Pipelineable)
 
-        def _add_context(pipeline: TrainPipelineSparseDist) -> None:  # pyre-ignore
+        def _add_context(pipeline: TrainPipelineSparseDist) -> None:
             context = TrainPipelineContext()
             context.index = 10
             for _ in range(3):
@@ -1117,7 +1112,6 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         with_postproc=st.booleans(),
         pipeline_class=st.sampled_from(
@@ -1131,7 +1125,6 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
     def test_model_detach_during_train(
         self,
         with_postproc: bool,
-        # pyre-ignore
         pipeline_class: Union[TrainPipelineSparseDist, TrainPipelineSemiSync],
     ) -> None:
         """
@@ -1190,7 +1183,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
             sharded_model.state_dict(), sharded_model_pipelined.state_dict()
         )
 
-        # pyre-ignore
+        # pyrefly: ignore[not-callable]
         pipeline = pipeline_class(
             model=sharded_model_pipelined,
             optimizer=optim_pipelined,
@@ -1213,11 +1206,11 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
 
         # Check internal states
         ebcs = [
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.ebc,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.weighted_ebc,
         ]
         for ebc in ebcs:
@@ -1225,7 +1218,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
 
         if with_postproc:
             self.assertIsInstance(
-                # pyre-ignore
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 PipelinedPostproc,
             )
@@ -1235,7 +1228,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         if with_postproc:
             # Check we removed pipelined postproc wrapping after detach
             self.assertIsInstance(
-                # pyre-ignore
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 TestNegSamplingModule,
             )
@@ -1270,7 +1263,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         if with_postproc:
             # Check we have pipelined postproc after re-attaching
             self.assertIsInstance(
-                # pyre-ignore
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 PipelinedPostproc,
             )
@@ -1282,7 +1275,6 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    # pyre-ignore[56]
     @given(
         with_postproc=st.booleans(),
         pipeline_class=st.sampled_from(
@@ -1296,7 +1288,6 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
     def test_model_detach_after_train(
         self,
         with_postproc: bool,
-        # pyre-ignore
         pipeline_class: Union[TrainPipelineSparseDist, TrainPipelineSemiSync],
     ) -> None:
         """
@@ -1356,7 +1347,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
             sharded_model.state_dict(), sharded_model_pipelined.state_dict()
         )
 
-        # pyre-ignore
+        # pyrefly: ignore[not-callable]
         pipeline = pipeline_class(
             model=sharded_model_pipelined,
             optimizer=optim_pipelined,
@@ -1382,7 +1373,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
 
         if with_postproc:
             self.assertIsInstance(
-                # pyre-ignore
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 PipelinedPostproc,
             )
@@ -1392,18 +1383,18 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
         if with_postproc:
             # Check we removed pipelined postproc wrapping after detach
             self.assertIsInstance(
-                # pyre-ignore
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 TestNegSamplingModule,
             )
 
         # Check internal states
         ebcs = [
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.ebc,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.weighted_ebc,
         ]
         for ebc in ebcs:
@@ -1437,7 +1428,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
 
         if with_postproc:
             self.assertIsInstance(
-                # pyre-ignore
+                # pyrefly: ignore[missing-attribute]
                 sharded_model_pipelined.module.postproc_module,
                 PipelinedPostproc,
             )
@@ -1452,7 +1443,6 @@ class EmbeddingTrainPipelineTest(TrainPipelineSparseDistTestBase):
         "Not enough GPUs, this test requires at least one GPU",
     )
     @settings(max_examples=8, deadline=None)
-    # pyre-ignore[56]
     @given(
         start_batch=st.sampled_from([0, 6]),
         stash_gradients=st.booleans(),
@@ -1520,8 +1510,8 @@ class EmbeddingTrainPipelineTest(TrainPipelineSparseDistTestBase):
             stash_gradients=stash_gradients,
         )
 
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
         #  `sparse_forward`.
+        # pyrefly: ignore[missing-attribute]
         prior_sparse_out = sharded_model._dmp_wrapped_module.sparse_forward(
             data[0].to(self.device)
         )
@@ -1534,14 +1524,14 @@ class EmbeddingTrainPipelineTest(TrainPipelineSparseDistTestBase):
             # Forward + backward w/o pipelining
             batch = batch.to(self.device)
 
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `dense_forward`.
+            # pyrefly: ignore[missing-attribute]
             loss, pred = sharded_model._dmp_wrapped_module.dense_forward(
                 prior_batch, prior_sparse_out
             )
             if batch_index - 1 >= start_batch:
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `sparse_forward`.
+                # pyrefly: ignore[missing-attribute]
                 sparse_out = sharded_model._dmp_wrapped_module.sparse_forward(batch)
 
             loss.backward()
@@ -1564,8 +1554,8 @@ class EmbeddingTrainPipelineTest(TrainPipelineSparseDistTestBase):
             optim.zero_grad()
 
             if batch_index - 1 < start_batch:
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `sparse_forward`.
+                # pyrefly: ignore[missing-attribute]
                 sparse_out = sharded_model._dmp_wrapped_module.sparse_forward(batch)
 
             prior_stashed_grads = stashed_grads
@@ -1596,7 +1586,6 @@ class PrefetchTrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
         "Not enough GPUs, this test requires at least one GPU",
     )
     @settings(max_examples=4, deadline=None)
-    # pyre-ignore[56]
     @given(
         execute_all_batches=st.booleans(),
         weight_precision=st.sampled_from(
@@ -1710,7 +1699,6 @@ class TrainPipelineFusedSparseDistTest(TrainPipelineSparseDistTestBase):
         "Not enough GPUs, this test requires at least one GPU",
     )
     @settings(max_examples=4, deadline=None)
-    # pyre-ignore[56]
     @given(
         enqueue_batch_after_forward=st.booleans(),
         embedding_lookup_after_data_dist=st.booleans(),
@@ -1789,7 +1777,6 @@ class TrainPipelineSparseDistLiteTest(TrainPipelineSparseDistTestBase):
         "Not enough GPUs, this test requires at least one GPU",
     )
     @settings(max_examples=4, deadline=None)
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -1861,10 +1848,12 @@ class DataLoadingThreadTest(unittest.TestCase):
         for i in range(7):
             data.append(torch.tensor([i]))
         data_iter = iter(data)
+        # pyrefly: ignore[bad-specialization]
         data_loader = DataLoadingThread(torch.device("cpu"), data_iter, True)
         data_loader.start()
         for i in range(7):
             item = data_loader.get_next_batch()
+            # pyrefly: ignore[missing-attribute]
             self.assertEqual(item.item(), i)
 
         self.assertIsNone(data_loader.get_next_batch(False))
@@ -1889,6 +1878,7 @@ class EvalPipelineSparseDistTest(unittest.TestCase):
             def __init__(self, model, optimizer, device: torch.device) -> None:
                 super().__init__(model, optimizer, device)
 
+            # pyrefly: ignore[bad-param-name-override]
             def _init_pipelined_modules(
                 self,
                 item: Pipelineable,
@@ -1897,11 +1887,13 @@ class EvalPipelineSparseDistTest(unittest.TestCase):
             ) -> None:
                 pass
 
+            # pyrefly: ignore[bad-param-name-override]
             def _start_sparse_data_dist(
                 self, item: Pipelineable, context: TrainPipelineContext
             ) -> None:
                 pass
 
+            # pyrefly: ignore[bad-override]
             def _wait_sparse_data_dist(self, context: TrainPipelineContext) -> None:
                 pass
 
@@ -1920,7 +1912,6 @@ class EvalPipelineSparseDistTest(unittest.TestCase):
 
 
 class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -2020,7 +2011,6 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
         for out, ref_out in zip(pipelined_out, non_pipelined_outputs):
             torch.testing.assert_close(out, ref_out)
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -2099,7 +2089,6 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
         for out, ref_out in zip(pipelined_out, non_pipelined_outputs):
             torch.testing.assert_close(out, ref_out)
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -2210,7 +2199,6 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
         # Flush end not called this time
         self.assertEqual(flush_end_called, 1)
 
-    # pyre-ignore
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
@@ -2288,11 +2276,11 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
 
         # Check internal states
         ebcs = [
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.ebc,
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
+            # pyrefly: ignore[missing-attribute]
             sharded_model_pipelined.module.sparse.weighted_ebc,
         ]
         for ebc in ebcs:
@@ -2354,7 +2342,6 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
         "Not enough GPUs, this test requires at least one GPU",
     )
     @settings(max_examples=4, deadline=None)
-    # pyre-ignore[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -2453,7 +2440,7 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
             PipelineStage(
                 name="prefetch",
                 runnable=sdd.prefetch,
-                # pyre-ignore
+                # pyrefly: ignore[bad-argument-type]
                 stream=sdd.prefetch_stream,
                 fill_callback=sdd.load_prefetch,
             ),
@@ -2504,7 +2491,6 @@ class TrainPipelineSparseDistCompAutogradTest(TrainPipelineSparseDistTest):
         return super().tearDown()
 
     @unittest.skip("Dynamo only supports FSDP with use_orig_params=True")
-    # pyre-ignore[56]
     @given(execute_all_batches=st.booleans())
     def test_pipelining_fsdp_pre_trace(self, execute_all_batches: bool) -> None:
         super().test_pipelining_fsdp_pre_trace()

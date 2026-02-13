@@ -7,7 +7,6 @@
 
 # pyre-strict
 
-# pyre-ignore-all-errors[56]
 
 import unittest
 from collections import OrderedDict
@@ -151,10 +150,12 @@ class ThroughputMetricTest(unittest.TestCase):
             for _ in range(warmup_steps + extra_steps):
                 throughput_metric.update()
             self.assertEqual(
+                # pyrefly: ignore[not-callable]
                 throughput_metric.warmup_examples.item(),
                 warmup_steps * (i + 1) * self.batch_size * self.world_size,
             )
             self.assertEqual(
+                # pyrefly: ignore[not-callable]
                 throughput_metric.total_examples.item(),
                 (warmup_steps + extra_steps)
                 * (i + 1)
@@ -163,10 +164,12 @@ class ThroughputMetricTest(unittest.TestCase):
             )
 
             self.assertEqual(
+                # pyrefly: ignore[not-callable]
                 throughput_metric.attempt_warmup_examples.item(),
                 warmup_steps * self.batch_size * self.world_size,
             )
             self.assertEqual(
+                # pyrefly: ignore[not-callable]
                 throughput_metric.attempt_examples.item(),
                 (warmup_steps + extra_steps) * self.batch_size * self.world_size,
             )

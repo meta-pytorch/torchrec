@@ -131,7 +131,7 @@ class ManagedCollisionEmbeddingCollectionContext(EmbeddingCollectionContext):
         evictions_per_table: Optional[Dict[str, Optional[torch.Tensor]]] = None,
         remapped_kjt: Optional[KJTList] = None,
     ) -> None:
-        # pyre-ignore
+        # pyrefly: ignore[bad-argument-type]
         super().__init__(sharding_contexts)
         self.evictions_per_table: Optional[Dict[str, Optional[torch.Tensor]]] = (
             evictions_per_table
@@ -141,13 +141,12 @@ class ManagedCollisionEmbeddingCollectionContext(EmbeddingCollectionContext):
     def record_stream(self, stream: torch.Stream) -> None:
         super().record_stream(stream)
         if self.evictions_per_table:
-            #  pyre-ignore
             for value in self.evictions_per_table.values():
                 if value is None:
                     continue
                 value.record_stream(stream)
         if self.remapped_kjt is not None:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
+            # pyrefly: ignore[bad-argument-type]
             self.remapped_kjt.record_stream(stream)
 
 
@@ -162,7 +161,7 @@ def get_device_from_parameter_sharding(
         raise ValueError("Expected EnumerableShardingSpec as input to the function")
 
     device_type_list: Tuple[str, ...] = tuple(
-        # pyre-fixme[16]: `Optional` has no attribute `device`
+        # pyrefly: ignore[missing-attribute]
         [shard.placement.device().type for shard in ps.sharding_spec.shards]
     )
     if len(set(device_type_list)) == 1:
@@ -186,6 +185,7 @@ def get_device_from_sharding_infos(
             res_set.add("ssd")
         else:
             res_set.add(
+                # pyrefly: ignore[bad-argument-type]
                 get_device_from_parameter_sharding(emb_shard_info.param_sharding)
             )
     res = list(res_set)
@@ -404,7 +404,7 @@ def _construct_jagged_tensors_rw(
     lengths_list = torch.unbind(feature_length_2d, dim=0)
     values_list: List[torch.Tensor] = []
     if need_indices:
-        # pyre-ignore
+        # pyrefly: ignore[bad-assignment]
         values_list = torch.split(
             _fx_trec_unwrap_optional_tensor(feature_indices),
             length_per_key,
@@ -435,8 +435,8 @@ def _construct_jagged_tensors_cw(
     for i in range(len(features)):
         embedding = embeddings[i]
         feature = features[i]
-        # pyre-fixme[6]: For 1st argument expected `List[Tensor]` but got
         #  `Tuple[Tensor, ...]`.
+        # pyrefly: ignore[bad-argument-type]
         lengths_lists.append(torch.unbind(feature.lengths().view(-1, stride), dim=0))
         embeddings_lists.append(
             list(torch.split(embedding, feature.length_per_key(), dim=0))
@@ -614,6 +614,7 @@ class ShardedQuantEmbeddingCollection(
         fused_params: Optional[Dict[str, Any]] = None,
         device: Optional[torch.device] = None,
     ) -> None:
+        # pyrefly: ignore[missing-attribute]
         super().__init__()
 
         self._embedding_configs: List[EmbeddingConfig] = module.embedding_configs()
@@ -693,6 +694,7 @@ class ShardedQuantEmbeddingCollection(
         self._create_lookups(fused_params, device)
 
         # Ensure output dist is set for post processing from an inference runtime (ie. setting device from runtime).
+        # pyrefly: ignore[bad-override]
         self._output_dists: torch.nn.ModuleList = torch.nn.ModuleList()
 
         self._feature_splits: List[int] = []
@@ -860,15 +862,13 @@ class ShardedQuantEmbeddingCollection(
         for sharding in self._sharding_type_device_group_to_sharding.values():
             self._output_dists.append(sharding.create_output_dist(device))
 
-    # pyre-ignore [14]
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def input_dist(
         self,
         ctx: EmbeddingCollectionContext,
         features: KeyedJaggedTensor,
     ) -> ListOfKJTList:
         if self._has_uninitialized_input_dist:
-            # pyre-fixme[16]: `ShardedQuantEmbeddingCollection` has no attribute
             #  `_input_dist`.
             self._input_dist = ShardedQuantEcInputDist(
                 input_feature_names=features.keys() if features is not None else [],
@@ -887,7 +887,6 @@ class ShardedQuantEmbeddingCollection(
             unbucketize_permute_tensor_list,
             bucket_mapping_tensor_list,
             bucketized_length_list,
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
         ) = self._input_dist(features)
 
         with torch.no_grad():
@@ -926,7 +925,7 @@ class ShardedQuantEmbeddingCollection(
             ret.append(lookup.forward(features))
         return ret
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def output_dist(
         self, ctx: EmbeddingCollectionContext, output: List[List[torch.Tensor]]
     ) -> Dict[str, JaggedTensor]:
@@ -962,7 +961,7 @@ class ShardedQuantEmbeddingCollection(
                 else None
             )
             features_before_input_dist_per_sharding.append(
-                # pyre-ignore
+                # pyrefly: ignore[bad-argument-type]
                 sharding_ctx.features_before_input_dist
             )
         return self.output_jt_dict(
@@ -1040,13 +1039,13 @@ class ShardedQuantEmbeddingCollection(
 
         return jt_dict_res
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def compute_and_output_dist(
         self, ctx: EmbeddingCollectionContext, input: ListOfKJTList
     ) -> Dict[str, JaggedTensor]:
         return self.output_dist(ctx, self.compute(ctx, input))
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def forward(self, *input, **kwargs) -> Dict[str, JaggedTensor]:
         ctx = self.create_context()
         dist_input = self.input_dist(ctx, *input, **kwargs)
@@ -1062,10 +1061,11 @@ class ShardedQuantEmbeddingCollection(
         return EmbeddingCollectionContext(sharding_contexts=[])
 
     @property
+    # pyrefly: ignore[bad-override]
     def shardings(
         self,
     ) -> Dict[Tuple[str, Union[str, Tuple[str, ...]]], FeatureShardingMixIn]:
-        # pyre-ignore [7]
+        # pyrefly: ignore[bad-return]
         return self._sharding_type_device_group_to_sharding
 
 
@@ -1089,10 +1089,12 @@ class QuantEmbeddingCollectionSharder(
             dtype_to_data_type(module.output_dtype())
         )
         if FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS not in fused_params:
+            # pyrefly: ignore[unsupported-operation]
             fused_params[FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS] = getattr(
                 module, MODULE_ATTR_QUANT_STATE_DICT_SPLIT_SCALE_BIAS, False
             )
         if FUSED_PARAM_REGISTER_TBE_BOOL not in fused_params:
+            # pyrefly: ignore[unsupported-operation]
             fused_params[FUSED_PARAM_REGISTER_TBE_BOOL] = getattr(
                 module, FUSED_PARAM_REGISTER_TBE_BOOL, False
             )
@@ -1329,7 +1331,7 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
                 table_name_to_parameter_sharding,
                 env=env,
                 device=device,
-                # pyre-ignore
+                # pyrefly: ignore[bad-argument-type]
                 embedding_shardings=embedding_shardings,
             )
         )
@@ -1347,7 +1349,8 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
             ec_sharding_lookups = self._lookups[sharding]
             sharding_mcec_lookups: List[ShardedMCECLookup] = []
             for j, ec_lookup in enumerate(
-                ec_sharding_lookups._embedding_lookups_per_rank  # pyre-ignore
+                # pyrefly: ignore[bad-argument-type]
+                ec_sharding_lookups._embedding_lookups_per_rank
             ):
                 sharding_mcec_lookups.append(
                     ShardedMCECLookup(
@@ -1379,7 +1382,7 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
             self._has_uninitialized_output_dist = False
 
         return self._managed_collision_collection.input_dist(
-            # pyre-fixme [6]
+            # pyrefly: ignore[bad-argument-type]
             ctx,
             features,
         )
@@ -1395,6 +1398,7 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
             dist_input_i = dist_input[i]
             lookups = self._mcec_lookup[i]
             sharding_ret: List[torch.Tensor] = []
+            # pyrefly: ignore[bad-argument-type]
             for j, lookup in enumerate(lookups):
                 embedding_result, remapped_kjt = lookup(
                     features=dist_input_i[j],
@@ -1406,11 +1410,12 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
             ret.append(sharding_ret)
         # Store remapped features in context for output_dist
         if self._return_remapped_features and remapped_kjts:
-            # pyre-ignore[16]
-            ctx.remapped_kjt = KJTList(remapped_kjts)
+            ctx.remapped_kjt = KJTList(  # pyrefly: ignore[missing-attribute]
+                remapped_kjts
+            )
         return ret
 
-    # pyre-ignore
+    # pyrefly: ignore[bad-override]
     def output_dist(
         self,
         ctx: ShrdCtx,
@@ -1419,16 +1424,15 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
         Union[KeyedTensor, Dict[str, JaggedTensor]], Optional[KeyedJaggedTensor]
     ]:
 
-        # pyre-ignore [6]
+        # pyrefly: ignore[bad-argument-type]
         ebc_out = super().output_dist(ctx, output)
 
         kjt_out: Optional[KeyedJaggedTensor] = None
         if self._return_remapped_features:
-            # pyre-ignore[16]
             remapped_kjt = getattr(ctx, "remapped_kjt", None)
             if remapped_kjt is not None:
                 kjt_out = self._managed_collision_collection.output_dist(
-                    ctx,
+                    ctx,  # pyrefly: ignore[bad-argument-type]
                     remapped_kjt,
                 )
 
@@ -1497,12 +1501,14 @@ class QuantManagedCollisionEmbeddingCollectionSharder(
             dtype_to_data_type(module.output_dtype())
         )
         if FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS not in fused_params:
+            # pyrefly: ignore[unsupported-operation]
             fused_params[FUSED_PARAM_QUANT_STATE_DICT_SPLIT_SCALE_BIAS] = getattr(
                 module,
                 MODULE_ATTR_QUANT_STATE_DICT_SPLIT_SCALE_BIAS,
                 False,
             )
         if FUSED_PARAM_REGISTER_TBE_BOOL not in fused_params:
+            # pyrefly: ignore[unsupported-operation]
             fused_params[FUSED_PARAM_REGISTER_TBE_BOOL] = getattr(
                 module, FUSED_PARAM_REGISTER_TBE_BOOL, False
             )

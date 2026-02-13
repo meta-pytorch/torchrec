@@ -70,5 +70,6 @@ class NoOpMetricModule(RecMetricModule):
     def shutdown(self) -> None:
         pass
 
+    # pyrefly: ignore[bad-override]
     def async_compute(self, future: Future[Dict[str, MetricValue]]) -> None:
         pass
