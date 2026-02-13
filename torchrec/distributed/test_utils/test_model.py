@@ -270,7 +270,6 @@ class ModelInput(Pipelineable):
                 else:
                     indices = torch.randint(
                         0,
-                        # pyre-ignore [6]
                         ind_range,
                         (num_indices,),
                         dtype=indices_dtype,
@@ -942,10 +941,8 @@ class ModelInput(Pipelineable):
     def record_stream(self, stream: torch.Stream) -> None:
         self.float_features.record_stream(stream)
         if isinstance(self.idlist_features, KeyedJaggedTensor):
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             self.idlist_features.record_stream(stream)
         if isinstance(self.idscore_features, KeyedJaggedTensor):
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             self.idscore_features.record_stream(stream)
         self.label.record_stream(stream)
 
@@ -1603,7 +1600,6 @@ class TestEBCSparseArch(nn.Module):
         """
         fp_features = features
         if self.fps:
-            # pyre-ignore[16]: Undefined attribute [16]: `Optional` has no attribute `__iter__`.
             for fp in self.fps:
                 fp_features = fp(fp_features)
         ebc = self.ebc(features)
@@ -1700,7 +1696,7 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
         )
         if zch_kwargs is not None:
             self.sparse: nn.Module = TestEBCSparseArchZCH(
-                tables,  # pyre-ignore
+                tables,
                 weighted_tables,
                 torch.device("meta"),
                 zch_kwargs=zch_kwargs,
@@ -1708,13 +1704,13 @@ class TestSparseNN(TestSparseNNBase, CopyableMixin):
             )
         elif len(tables) > 0 and isinstance(tables[0], EmbeddingConfig):
             self.sparse = TestECSparseArch(
-                tables,  # pyre-ignore [6]
+                tables,
                 sparse_device,
                 **(submodule_kwargs or {}),
             )
         else:
             self.sparse = TestEBCSparseArch(
-                tables,  # pyre-ignore
+                tables,
                 weighted_tables,
                 sparse_device,
                 max_feature_lengths,
@@ -1882,7 +1878,6 @@ class TestTowerSparseNN(TestSparseNNBase):
         )
         self.sparse_arch = TestEBCSparseArch(
             [tables[1]],
-            # pyre-ignore [16]
             [weighted_tables[0]],
             sparse_device,
         )
@@ -1892,11 +1887,7 @@ class TestTowerSparseNN(TestSparseNNBase):
 
         self.over = nn.Linear(
             in_features=8
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `out_features`.
             + self.tower_0.interaction.linear.out_features
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `out_features`.
             + self.tower_1.interaction.linear.out_features
             + tables[1].embedding_dim * len(tables[1].feature_names)
             + weighted_tables[0].embedding_dim * len(weighted_tables[0].feature_names),
@@ -1979,7 +1970,6 @@ class TestTowerCollectionSparseNN(TestSparseNNBase):
         )
         tower_2 = EmbeddingTower(
             embedding_module=EmbeddingBagCollection(
-                # pyre-ignore [16]
                 tables=[weighted_tables[0]],
                 is_weighted=True,
             ),
@@ -1988,14 +1978,8 @@ class TestTowerCollectionSparseNN(TestSparseNNBase):
         self.tower_arch = EmbeddingTowerCollection(towers=[tower_0, tower_1, tower_2])
         self.over = nn.Linear(
             in_features=8
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `out_features`.
             + tower_0.interaction.linear.out_features
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `out_features`.
             + tower_1.interaction.linear.out_features
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
-            #  `out_features`.
             + tower_2.interaction.linear.out_features,
             out_features=16,
             device=dense_device,
@@ -2146,9 +2130,9 @@ class TestModelWithPreproc(nn.Module):
         elif self._run_postproc_inline:
             idlist_features = modified_input.idlist_features
             modified_input.idlist_features = KeyedJaggedTensor.from_lengths_sync(
-                idlist_features.keys(),  # pyre-ignore [6]
-                idlist_features.values(),  # pyre-ignore [6]
-                idlist_features.lengths(),  # pyre-ignore [16]
+                idlist_features.keys(),
+                idlist_features.values(),
+                idlist_features.lengths(),
             )
 
         modified_idlist_features = self.postproc_nonweighted(
@@ -2317,7 +2301,6 @@ class TestNegSamplingModule(torch.nn.Module):
         if self._extra_input.idscore_features is not None:
             # stride will be smae but features will be joined
             modified_input.idscore_features = KeyedJaggedTensor.concat(
-                # pyre-ignore
                 [modified_input.idscore_features, self._extra_input.idscore_features]
             )
 
@@ -2635,7 +2618,7 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
                 tables=ec_tables,
                 device=device,
             )
-            self.ec_embedding_dim = self.ec.embedding_dim()  # pyre-ignore[4, 16]
+            self.ec_embedding_dim = self.ec.embedding_dim()
 
         self._ebc_features: List[str] = (
             [feature for table in ebc_tables for feature in table.feature_names]
@@ -2707,13 +2690,13 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
         # Process EmbeddingBagCollection features
         # EBC internally filters features based on its configured table feature names
         if self.ebc is not None and self._ebc_features:
-            ebc_result = self.ebc(features)  # pyre-ignore[29]
+            ebc_result = self.ebc(features)
             ebc_embeddings = ebc_result.values()
 
         # Process EmbeddingCollection features
         # EC internally filters features based on its configured table feature names
         if self.ec is not None and self._ec_features:
-            ec_result = self.ec(features)  # pyre-ignore[29]
+            ec_result = self.ec(features)
             padded_embeddings = [
                 torch.ops.fbgemm.jagged_2d_to_dense(
                     values=ec_result[e].values(),

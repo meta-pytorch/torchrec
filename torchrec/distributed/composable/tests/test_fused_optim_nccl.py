@@ -41,7 +41,6 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
             ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
             apply_optimizer_in_backward(
                 RowWiseAdagrad,
-                # pyre-fixme[6]: For 2nd argument expected `Iterable[Parameter]` but
                 #  got `Iterable[Union[Tensor, Module]]`.
                 [
                     ebc.embedding_bags["table_0"].weight,
@@ -51,7 +50,6 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
             )
             apply_optimizer_in_backward(
                 PartialRowWiseAdam,
-                # pyre-fixme[6]: For 2nd argument expected `Iterable[Parameter]` but
                 #  got `Iterable[Union[Tensor, Module]]`.
                 [
                     ebc.embedding_bags["table_2"].weight,
@@ -157,7 +155,6 @@ class ShardedFusedOptimizerStateDictTest(MultiProcessTestBase):
                 ),
             )
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

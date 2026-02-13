@@ -102,11 +102,9 @@ def main(args: argparse.Namespace) -> None:
         model.eval()
         if args.use_mpzch:
             # when using MPZCH modules, we need to manually set the modules to be in inference mode
-            # pyre-ignore
             model._mc_ec._managed_collision_collection._managed_collision_modules[
                 "table_0"
             ].reset_inference_mode()
-            # pyre-ignore
             model._mc_ec._managed_collision_collection._managed_collision_modules[
                 "table_1"
             ].reset_inference_mode()

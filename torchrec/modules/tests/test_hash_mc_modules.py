@@ -36,7 +36,6 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 class TestMCH(unittest.TestCase):
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -91,7 +90,6 @@ class TestMCH(unittest.TestCase):
 
             self.assertTrue(
                 torch.equal(
-                    # pyre-fixme[6]: For 1st argument expected `Tensor` but got
                     #  `Union[Tensor, Module]`.
                     none_throws(m_infer.input_mapper._zch_size_per_training_rank),
                     torch.tensor([10, 10], dtype=torch.int64, device=device_str),
@@ -99,7 +97,6 @@ class TestMCH(unittest.TestCase):
             )
             self.assertTrue(
                 torch.equal(
-                    # pyre-fixme[6]: For 1st argument expected `Tensor` but got
                     #  `Union[Tensor, Module]`.
                     none_throws(m_infer.input_mapper._train_rank_offsets),
                     torch.tensor([0, 10], dtype=torch.int64, device=device_str),
@@ -223,7 +220,6 @@ class TestMCH(unittest.TestCase):
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore [56]
     @given(hash_size=st.sampled_from([0, 80]), keep_original_indices=st.booleans())
     @settings(max_examples=6, deadline=None)
     def test_zch_hash_train_to_inf_block_bucketize_disabled_in_oss_compatibility(
@@ -302,7 +298,6 @@ class TestMCH(unittest.TestCase):
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore [56]
     @given(hash_size=st.sampled_from([0, 80]))
     @settings(max_examples=5, deadline=None)
     def test_zch_hash_train_rescales_two_disabled_in_oss_compatibility(
@@ -416,7 +411,6 @@ class TestMCH(unittest.TestCase):
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least one GPUs",
     )
-    # pyre-ignore [56]
     @given(hash_size=st.sampled_from([0, 80]))
     @settings(max_examples=5, deadline=None)
     def test_zch_hash_train_rescales_one(self, hash_size: int) -> None:
@@ -546,7 +540,6 @@ class TestMCH(unittest.TestCase):
             )
         )
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "This test requires at least one GPU",
@@ -562,7 +555,6 @@ class TestMCH(unittest.TestCase):
         bucket2 = m.rebuild_with_output_id_range((5, 10))
         self.assertIsNotNone(bucket2._output_global_offset_tensor)
         self.assertTrue(
-            # pyre-ignore [6]
             torch.equal(bucket2._output_global_offset_tensor, torch.tensor([5]))
         )
         self.assertEqual(bucket2._start_bucket, 1)
@@ -571,12 +563,10 @@ class TestMCH(unittest.TestCase):
         bucket3 = m.rebuild_with_output_id_range((10, 15))
         self.assertIsNotNone(bucket3._output_global_offset_tensor)
         self.assertTrue(
-            # pyre-ignore [6]
             torch.equal(bucket3._output_global_offset_tensor, torch.tensor([10]))
         )
         self.assertEqual(bucket3._start_bucket, 2)
         self.assertEqual(
-            # pyre-ignore [16]
             bucket3._output_global_offset_tensor.device.type,
             "cpu",
         )
@@ -621,7 +611,6 @@ class TestMCH(unittest.TestCase):
         self.assertTrue(bucket5._output_global_offset_tensor.device.type == "cpu")
         self.assertEqual(bucket5._output_global_offset_tensor, torch.tensor([15]))
 
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "This test requires at least one GPU",
@@ -689,7 +678,6 @@ class TestMCH(unittest.TestCase):
         self.assertTrue(m._eviction_module is None)
 
     # Skipping this test because it is flaky on CI. TODO: T240185573 T240185565 investigate the flakiness and re-enable the test.
-    # Pyre-ignore [56]: Pyre was not able to infer the type of argument `torch.cuda.device_count() < 1` to decorator factory `unittest.skipIf`
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -799,7 +787,6 @@ class TestMCH(unittest.TestCase):
             )
         )
 
-    # Pyre-ignore [56]: Pyre was not able to infer the type of argument `torch.cuda.device_count() < 1` to decorator factory `unittest.skipIf`
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -864,7 +851,6 @@ class TestMCH(unittest.TestCase):
         )
         # Run once to insert ids
         res = mcebc.forward(features)
-        # Pyre-ignore [6]: In call `torch._C._VariableFunctions.abs`, for 1st positional argument, expected `Tensor` but got `Union[JaggedTensor, Tensor]`
         mask = torch.abs(res[0]["table_0"]) == 0
         # For each row, check if all elements are True (i.e., close to zero)
         row_mask = mask.all(dim=1)
@@ -873,7 +859,6 @@ class TestMCH(unittest.TestCase):
         self.assertIsNotNone(res[1])
         self.assertTrue(
             torch.equal(
-                # Pyre-ignore [16]: Optional type has no attribute `__getitem__`.
                 res[1]["table_0"].values(),
                 torch.tensor([1, 2, 8, 9, 3], dtype=torch.int64, device="cuda:0"),
             )
@@ -884,7 +869,6 @@ class TestMCH(unittest.TestCase):
                 torch.tensor([1, 1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
             )
         )
-        # Pyre-ignore [29]: `typing.Union[torch._tensor.Tensor, torch.nn.modules.module.Module]` is not a function
         mcebc._managed_collision_collection._managed_collision_modules[
             "table_0"
         ].reset_inference_mode()
@@ -915,7 +899,6 @@ class TestMCH(unittest.TestCase):
                 torch.tensor([0, 1, 1, 0, 0, 1], dtype=torch.int64, device="cuda:0"),
             )
         )
-        # Pyre-ignore [6]: In call `torch._C._VariableFunctions.abs`, for 1st positional argument, expected `Tensor` but got `Union[JaggedTensor, Tensor]`
         mask = torch.abs(res[0]["table_0"]) == 0
         # For each row, check if all elements are True (i.e., close to zero)
         row_mask = mask.all(dim=1)

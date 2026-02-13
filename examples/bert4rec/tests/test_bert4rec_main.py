@@ -213,7 +213,6 @@ class MainTest(unittest.TestCase):
         )
 
     @test_utils.skip_if_asan
-    # pyre-ignore [56]
     @unittest.skipIf(
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least 2 GPUs",
@@ -236,7 +235,6 @@ class MainTest(unittest.TestCase):
             elastic_launch(config=lc, entrypoint=self._run_trainer_random_ddp)()
 
     @test_utils.skip_if_asan
-    # pyre-ignore [56]
     @unittest.skipIf(
         torch.cuda.device_count() < 2,
         "Not enough GPUs, this test requires at least 2 GPUs",

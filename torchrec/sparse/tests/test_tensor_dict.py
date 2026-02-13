@@ -18,7 +18,6 @@ from torchrec.sparse.tensor_dict import maybe_td_to_kjt
 
 
 class TestTensorDict(unittest.TestCase):
-    # pyre-ignore[56]
     @given(device_str=st.sampled_from(["cpu", "meta", "cuda"]))
     @settings(verbosity=Verbosity.verbose, max_examples=5, deadline=None)
     def test_kjt_input(self, device_str: str) -> None:
@@ -34,7 +33,6 @@ class TestTensorDict(unittest.TestCase):
         features = maybe_td_to_kjt(kjt)
         self.assertEqual(features, kjt)
 
-    # pyre-ignore[56]
     @given(device_str=st.sampled_from(["cpu", "meta", "cuda"]))
     @settings(verbosity=Verbosity.verbose, max_examples=5, deadline=None)
     def test_td_kjt(self, device_str: str) -> None:
@@ -63,6 +61,6 @@ class TestTensorDict(unittest.TestCase):
             batch_size=[2],
         )
 
-        features = maybe_td_to_kjt(td, ["f1", "f2", "f3"])  # pyre-ignore[6]
+        features = maybe_td_to_kjt(td, ["f1", "f2", "f3"])
         torch.testing.assert_close(features.values(), values)
         torch.testing.assert_close(features.lengths(), lengths)

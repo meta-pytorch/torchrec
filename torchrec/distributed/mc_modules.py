@@ -88,7 +88,6 @@ class EmbeddingCollectionContext(Multistreamable):
         for ctx in self.sharding_contexts:
             ctx.record_stream(stream)
         for f in self.input_features:
-            # pyre-fixme[6]: For 1st argument expected `Stream` but got `Stream`.
             f.record_stream(stream)
         if self.inverse_indices is not None:
             self.inverse_indices[1].record_stream(stream)
@@ -371,13 +370,10 @@ class ShardedManagedCollisionCollection(
             num_sharding_features = 0
             for group_config in grouped_embedding_configs:
                 for table in group_config.embedding_tables:
-                    # pyre-ignore [16]
                     new_min_output_id = table.local_metadata.shard_offsets[0]
-                    # pyre-ignore [16]
                     new_range_size = table.local_metadata.shard_sizes[0]
                     output_segments = [
                         x.shard_offsets[0]
-                        # pyre-ignore [16]
                         for x in table.global_metadata.shards_metadata
                     ] + [table.num_embeddings]
                     mc_module = module._managed_collision_modules[table.name]
@@ -386,7 +382,6 @@ class ShardedManagedCollisionCollection(
                     self._sharding_features[-1].extend(table.feature_names)
                     self._feature_names.extend(table.feature_names)
                     self._managed_collision_modules[table.name] = (
-                        # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                         mc_module.rebuild_with_output_id_range(
                             output_id_range=(
                                 new_min_output_id,
@@ -396,9 +391,7 @@ class ShardedManagedCollisionCollection(
                             device=self._device,
                         )
                     )
-                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                     zch_size = self._managed_collision_modules[table.name].output_size()
-                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                     input_size = self._managed_collision_modules[
                         table.name
                     ].input_size()
@@ -428,7 +421,6 @@ class ShardedManagedCollisionCollection(
                     zch_size_sum_before_this_rank = (
                         zch_size_cumsum[self._env.rank] - zch_size
                     )
-                    # pyre-fixme[6]: For 2nd argument expected `int`
                     self._mc_module_name_shard_metadata[table.name] = (
                         zch_size_sum_before_this_rank,
                         zch_size,
@@ -473,13 +465,11 @@ class ShardedManagedCollisionCollection(
         ):
             assert isinstance(sharding, BaseRwEmbeddingSharding)
             feature_num_buckets: List[int] = [
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 self._managed_collision_modules[self._feature_to_table[f]].buckets()
                 for f in sharding_features
             ]
 
             input_sizes: List[int] = [
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 self._managed_collision_modules[self._feature_to_table[f]].input_size()
                 for f in sharding_features
             ]
@@ -494,7 +484,6 @@ class ShardedManagedCollisionCollection(
                 feature_total_num_buckets.append(num_buckets)
 
             input_dist = RwSparseFeaturesDist(
-                # pyre-ignore [6]
                 pg=sharding._pg,
                 num_features=sharding._get_num_features(),
                 feature_hash_sizes=feature_hash_sizes,
@@ -507,11 +496,9 @@ class ShardedManagedCollisionCollection(
             )
             self._input_dists.append(input_dist)
 
-        # pyre-fixme[16]: `ShardedManagedCollisionCollection` has no attribute
         #  `_features_order`.
         self._features_order: List[int] = []
         for f in self._feature_names:
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `append`.
             self._features_order.append(input_feature_names.index(f))
         self._features_order = (
@@ -534,7 +521,6 @@ class ShardedManagedCollisionCollection(
             assert isinstance(sharding, BaseRwEmbeddingSharding)
             self._output_dists.append(
                 RwSequenceEmbeddingDist(
-                    # pyre-ignore [6]
                     sharding._pg,
                     sharding._get_num_features(),
                     sharding._device,
@@ -615,12 +601,11 @@ class ShardedManagedCollisionCollection(
                 values=unique_indices,
             )
 
-            ctx.input_features.append(kjt)  # pyre-ignore
-            ctx.reverse_indices.append(reverse_indices)  # pyre-ignore
+            ctx.input_features.append(kjt)
+            ctx.reverse_indices.append(reverse_indices)
             features_by_sharding.append(dedup_features)
         return features_by_sharding
 
-    # pyre-ignore [14]
     def input_dist(
         self,
         ctx: ManagedCollisionCollectionContext,
@@ -633,10 +618,8 @@ class ShardedManagedCollisionCollection(
         with torch.no_grad():
             if self._features_order:
                 features = features.permute(
-                    # pyre-fixme[6]: For 1st argument expected `List[int]` but got
                     #  `Union[Module, Tensor]`.
                     self._features_order,
-                    # pyre-fixme[6]: For 2nd argument expected `Optional[Tensor]`
                     #  but got `Union[Module, Tensor]`.
                     self._features_order_tensor,
                 )
@@ -662,7 +645,6 @@ class ShardedManagedCollisionCollection(
                                 lengths=kjt.lengths(),
                             )
                         }
-                        # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                         mc_input = mc_module.preprocess(mc_input)
                         output.update(mc_input)
                         stride_per_key_per_rank_list += kjt.stride_per_key_per_rank()
@@ -773,9 +755,7 @@ class ShardedManagedCollisionCollection(
         if mcm._enable_per_feature_lookups and include_readonly_suffix_feature:
             # In the original lookup call, it will not distinct feature values and do remapper at one call for all features. In that way we can not define read-only feature, so here we pass in per key KJT to provide more control
             mc_input = features.to_dict()
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             mc_input = mcm.profile(mc_input)
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             mc_input = mcm.remap(mc_input)
             # This is for the purpose of remap the global index back to local index since the offset is key by table
             mc_input_unify = {
@@ -795,9 +775,7 @@ class ShardedManagedCollisionCollection(
                     weights=torch.tensor(features.length_per_key()),
                 )
             }
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             mc_input = mcm.profile(mc_input)
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             mc_input = mcm.remap(mc_input)
             mc_input = self.global_to_local_index(mc_input)
         self._retrieve_and_track_hash_zch_identities_and_metadata(
@@ -859,7 +837,6 @@ class ShardedManagedCollisionCollection(
             table,
             managed_collision_module,
         ) in self._managed_collision_modules.items():
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             global_indices_to_evict = managed_collision_module.evict()
             local_indices_to_evict = None
             if global_indices_to_evict is not None:
@@ -875,7 +852,6 @@ class ShardedManagedCollisionCollection(
             table,
             managed_collision_module,
         ) in self._managed_collision_modules.items():
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
             open_slots[table] = managed_collision_module.open_slots()
         return open_slots
 
@@ -895,7 +871,6 @@ class ShardedManagedCollisionCollection(
         ):
             awaitables_per_sharding.append(odist(remapped_ids, sharding_ctx))
             features_before_all2all_per_sharding.append(
-                # pyre-fixme[6]: For 1st argument expected `KeyedJaggedTensor` but
                 #  got `Optional[KeyedJaggedTensor]`.
                 sharding_ctx.features_before_input_dist
             )
@@ -1121,9 +1096,7 @@ class ShardedQuantManagedCollisionCollection(
     ) -> None:
         super().__init__()
         self._env: ShardingEnv = (
-            env
-            if not isinstance(env, Dict)
-            else embedding_shardings[0]._env  # pyre-ignore[16]
+            env if not isinstance(env, Dict) else embedding_shardings[0]._env
         )
         self._device = device
         self.need_preprocess: bool = module.need_preprocess
@@ -1193,14 +1166,12 @@ class ShardedQuantManagedCollisionCollection(
             num_sharding_features = 0
             for group_config in grouped_embedding_configs:
                 for table in group_config.embedding_tables:
-                    # pyre-ignore
                     global_meta_data = table.global_metadata.shards_metadata
                     output_segments = [
                         x.shard_offsets[0]
                         for x in table.global_metadata.shards_metadata
                     ] + [table.num_embeddings]
                     mc_module = module._managed_collision_modules[table.name]
-                    # pyre-fixme[16]: `Module` has no attribute `_is_inference`.
                     mc_module._is_inference = True
                     self._managed_collision_modules[table.name] = mc_module
                     self._sharding_tables[-1].append(table.name)
@@ -1214,7 +1185,6 @@ class ShardedQuantManagedCollisionCollection(
                         new_min_output_id = global_meta_data[i].shard_offsets[0]
                         new_range_size = global_meta_data[i].shard_sizes[0]
                         self._managed_collision_modules_per_rank[i][table.name] = (
-                            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                             mc_module.rebuild_with_output_id_range(
                                 output_id_range=(
                                     new_min_output_id,
@@ -1237,7 +1207,6 @@ class ShardedQuantManagedCollisionCollection(
                             new_range_size,
                         ]
 
-                    # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                     input_size = self._managed_collision_modules[
                         table.name
                     ].input_size()
@@ -1288,10 +1257,8 @@ class ShardedQuantManagedCollisionCollection(
                 for table in embedding_table_group.embedding_tables:
                     shard_split_offsets = [
                         shard.shard_offsets[0]
-                        # pyre-fixme[16]: `Optional` has no attribute `shards_metadata`.
                         for shard in table.global_metadata.shards_metadata
                     ]
-                    # pyre-fixme[16]: Optional has no attribute size.
                     shard_split_offsets.append(table.global_metadata.size[0])
                     emb_sharding.extend(
                         [shard_split_offsets] * len(table.embedding_names)
@@ -1299,13 +1266,11 @@ class ShardedQuantManagedCollisionCollection(
                     sharding_features.extend(table.feature_names)
 
             feature_num_buckets: List[int] = [
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 self._managed_collision_modules[self._feature_to_table[f]].buckets()
                 for f in sharding_features
             ]
 
             input_sizes: List[int] = [
-                # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                 self._managed_collision_modules[self._feature_to_table[f]].input_size()
                 for f in sharding_features
             ]
@@ -1350,7 +1315,6 @@ class ShardedQuantManagedCollisionCollection(
             persistent=False,
         )
 
-    # pyre-ignore
     def input_dist(
         self,
         ctx: Union[ManagedCollisionCollectionContext, NullShardedModuleContext],
@@ -1367,7 +1331,7 @@ class ShardedQuantManagedCollisionCollection(
             if self._features_order:
                 features = features.permute(
                     self._features_order,
-                    self._features_order_tensor,  # pyre-ignore
+                    self._features_order_tensor,
                 )
 
             feature_splits: List[KeyedJaggedTensor] = []
@@ -1390,7 +1354,6 @@ class ShardedQuantManagedCollisionCollection(
                                 lengths=kjt.lengths(),
                             )
                         }
-                        # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
                         mc_input = mc_module.preprocess(mc_input)
                         output.update(mc_input)
                         ti += 1
@@ -1452,7 +1415,6 @@ class ShardedQuantManagedCollisionCollection(
     ) -> KJTList:
         raise NotImplementedError()
 
-    # pyre-ignore
     def output_dist(
         self,
         ctx: ManagedCollisionCollectionContext,
@@ -1518,7 +1480,6 @@ class ShardedQuantManagedCollisionCollection(
 
 
 class InferManagedCollisionCollectionSharder(ManagedCollisionCollectionSharder):
-    # pyre-ignore
     def shard(
         self,
         module: ManagedCollisionCollection,

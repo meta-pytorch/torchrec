@@ -166,7 +166,6 @@ def _gen_model(test_model_type: _ModelType, mi: TestModelInfo) -> torch.nn.Modul
 
         return M_ebc(
             EmbeddingBagCollection(
-                # pyre-ignore
                 tables=mi.tables,
                 device=mi.sparse_device,
             )
@@ -190,7 +189,6 @@ def _gen_model(test_model_type: _ModelType, mi: TestModelInfo) -> torch.nn.Modul
         return M_fpebc(
             FeatureProcessedEmbeddingBagCollection(
                 embedding_bag_collection=EmbeddingBagCollection(
-                    # pyre-ignore
                     tables=mi.tables,
                     device=mi.sparse_device,
                     is_weighted=True,
@@ -215,7 +213,6 @@ def _gen_model(test_model_type: _ModelType, mi: TestModelInfo) -> torch.nn.Modul
 
         return M_ec(
             EmbeddingCollection(
-                # pyre-ignore
                 tables=mi.tables,
                 device=mi.sparse_device,
             )
@@ -279,7 +276,6 @@ def _test_compile_rank_fn(
             else EmbeddingConfig
         )
 
-        # pyre-ignore
         mi.tables = [
             config_type(
                 num_embeddings=num_embeddings,
@@ -290,7 +286,6 @@ def _test_compile_rank_fn(
             for i in range(mi.num_features)
         ]
 
-        # pyre-ignore
         mi.weighted_tables = [
             config_type(
                 num_embeddings=num_embeddings,
@@ -318,20 +313,17 @@ def _test_compile_rank_fn(
 
         plan: ShardingPlan = planner.collective_plan(
             model,
-            # pyre-ignore
             sharders,
             pg,
         )
 
-        # pyre-ignore
         def _dmp(m: torch.nn.Module) -> DistributedModelParallel:
             return DistributedModelParallel(
                 m,
-                # pyre-ignore
                 env=ShardingEnv.from_process_group(pg),
                 plan=plan,
                 sharders=sharders,
-                device=device,  # pyre-ignore
+                device=device,
                 init_data_parallel=False,
             )
 
@@ -387,7 +379,6 @@ def _test_compile_rank_fn(
             tbe = None
             if test_model_type == _ModelType.EBC:
                 tbe = (
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                     #  attribute `_lookups`.
                     dmp._dmp_wrapped_module._ebc._lookups[0]
                     ._emb_modules[0]
@@ -395,7 +386,6 @@ def _test_compile_rank_fn(
                 )
             elif test_model_type == _ModelType.FPEBC:
                 tbe = (
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                     #  attribute `_lookups`.
                     dmp._dmp_wrapped_module._fpebc._lookups[0]
                     ._emb_modules[0]
@@ -403,7 +393,6 @@ def _test_compile_rank_fn(
                 )
             elif test_model_type == _ModelType.EC:
                 tbe = (
-                    # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                     #  attribute `_lookups`.
                     dmp._dmp_wrapped_module._ec._lookups[0]
                     ._emb_modules[0]
@@ -411,7 +400,6 @@ def _test_compile_rank_fn(
                 )
             assert isinstance(tbe, SplitTableBatchedEmbeddingBagsCodegen)
 
-            # pyre-fixme[29]: `Union[(self: TensorBase, memory_format:
             #  Optional[memory_format] = ...) -> Tensor, Tensor, Module]` is not a
             #  function.
             return tbe.weights_dev.clone().detach()
@@ -588,15 +576,15 @@ def _test_compile_fake_pg_fn(
         ECSharderFixedShardingType(sharding_type),
     ]
 
-    plan: ShardingPlan = planner.plan(model, sharders)  # pyre-ignore
+    plan: ShardingPlan = planner.plan(model, sharders)
 
-    def _dmp(m: torch.nn.Module) -> DistributedModelParallel:  # pyre-ignore
+    def _dmp(m: torch.nn.Module) -> DistributedModelParallel:
         return DistributedModelParallel(
             m,
             env=ShardingEnv(world_size, rank, pg),
             plan=plan,
             sharders=sharders,
-            device=device,  # pyre-ignore
+            device=device,
             init_data_parallel=False,
         )
 
@@ -638,11 +626,9 @@ def _test_compile_fake_pg_fn(
     dmp_compile.train(True)
 
     def get_weights(dmp: DistributedModelParallel) -> torch.Tensor:
-        # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
         #  `_lookups`.
         tbe = dmp._dmp_wrapped_module._ebc._lookups[0]._emb_modules[0]._emb_module
         assert isinstance(tbe, SplitTableBatchedEmbeddingBagsCodegen)
-        # pyre-fixme[29]: `Union[(self: TensorBase, memory_format:
         #  Optional[memory_format] = ...) -> Tensor, Tensor, Module]` is not a
         #  function.
         return tbe.weights_dev.clone().detach()
@@ -684,7 +670,6 @@ class TestPt2Train(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-ignore
     @given(
         kernel_type=st.sampled_from(
             [
@@ -758,7 +743,6 @@ class TestPt2Train(MultiProcessTestBase):
             torch_compile_backend=compile_backend,
         )
 
-    # pyre-ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires one GPU",

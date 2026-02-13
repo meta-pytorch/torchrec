@@ -132,10 +132,8 @@ class BaseShardedManagedCollisionEmbeddingCollection(
             module._allow_in_place_embed_weight_update
         )
 
-        # pyre-ignore
         self._table_to_tbe_and_index = {}
         for lookup in self._embedding_module._lookups:
-            # pyre-fixme[29]: `Union[(self: Tensor) -> Any, Tensor, Module]` is not
             #  a function.
             for emb_module in lookup._emb_modules:
                 for table_idx, table in enumerate(emb_module._config.embedding_tables):
@@ -147,7 +145,6 @@ class BaseShardedManagedCollisionEmbeddingCollection(
             [0], device=self._device, dtype=torch.int
         )
 
-    # pyre-ignore
     def input_dist(
         self,
         ctx: ShrdCtx,
@@ -155,7 +152,6 @@ class BaseShardedManagedCollisionEmbeddingCollection(
     ) -> Awaitable[Awaitable[KJTList]]:
         # TODO: resolve incompatiblity with different contexts
         return self._managed_collision_collection.input_dist(
-            # pyre-fixme [6]
             ctx,
             features,
         )
@@ -186,7 +182,6 @@ class BaseShardedManagedCollisionEmbeddingCollection(
 
                     if self.bagged:
                         table_weight_param = (
-                            # pyre-fixme[16]: Item `Tensor` of `Tensor | ModuleDict
                             #  | Module` has no attribute `get_parameter`.
                             self._embedding_module.embedding_bags.get_parameter(
                                 f"{table}.weight"
@@ -194,7 +189,6 @@ class BaseShardedManagedCollisionEmbeddingCollection(
                         )
                     else:
                         table_weight_param = (
-                            # pyre-fixme[16]: Item `Tensor` of `Tensor | ModuleDict
                             #  | Module` has no attribute `get_parameter`.
                             self._embedding_module.embeddings.get_parameter(
                                 f"{table}.weight"
@@ -211,12 +205,10 @@ class BaseShardedManagedCollisionEmbeddingCollection(
                         # is already created. Direct tensor modification would trigger PyTorch's in-place operation
                         # checks and invalidate gradients, while .data allows safe reinitialization of evicted
                         # embeddings without affecting the computational graph.
-                        # pyre-ignore [29]
                         table_weight_param.data[evictions_indices_for_table] = init_fn(
                             table_weight_param[evictions_indices_for_table]
                         )
                     else:
-                        # pyre-ignore [29]
                         table_weight_param[evictions_indices_for_table] = init_fn(
                             table_weight_param[evictions_indices_for_table]
                         )
@@ -228,7 +220,6 @@ class BaseShardedManagedCollisionEmbeddingCollection(
     ) -> List[torch.Tensor]:
         with record_function("## compute:mcc ##"):
             remapped_kjt = self._managed_collision_collection.compute(
-                # pyre-fixme [6]
                 ctx,
                 dist_input,
             )
@@ -238,30 +229,24 @@ class BaseShardedManagedCollisionEmbeddingCollection(
             ctx.remapped_kjt = remapped_kjt
             ctx.evictions_per_table = evictions_per_table
 
-            # pyre-ignore
             return self._embedding_module.compute(ctx, remapped_kjt)
 
-    # pyre-ignore
     def output_dist(
         self,
         ctx: ShrdCtx,
         output: List[torch.Tensor],
     ) -> Tuple[LazyAwaitable[KeyedTensor], LazyAwaitable[Optional[KeyedJaggedTensor]]]:
 
-        # pyre-ignore [6]
         ebc_awaitable = self._embedding_module.output_dist(ctx, output)
 
         if self._return_remapped_features:
             kjt_awaitable = self._managed_collision_collection.output_dist(
-                # pyre-fixme [6]
                 ctx,
-                # pyre-ignore [16]
                 ctx.remapped_kjt,
             )
         else:
             kjt_awaitable = NoWait(None)
 
-        # pyre-ignore
         return ebc_awaitable, kjt_awaitable
 
     def sharded_parameter_names(self, prefix: str = "") -> Iterator[str]:
@@ -290,7 +275,6 @@ class BaseManagedCollisionEmbeddingCollectionSharder(BaseEmbeddingSharder[M]):
     def shardable_parameters(
         self, module: BaseManagedCollisionEmbeddingCollection
     ) -> Dict[str, torch.nn.Parameter]:
-        # pyre-ignore
         return self._e_sharder.shardable_parameters(module._embedding_module)
 
     def compute_kernels(

@@ -44,7 +44,6 @@ class TensorPoolTest(unittest.TestCase):
         lookup_values = dense_pool.lookup(ids=lookup_ids)
         for i in range(batch_size):
             if lookup_ids[i] in update_ids:
-                # pyre-ignore
                 lookup_id: int = lookup_ids[i].int().item()
                 torch.testing.assert_close(
                     reference_values[ids_to_row[lookup_id]],
@@ -90,7 +89,6 @@ class TensorPoolTest(unittest.TestCase):
         lookup_values = dense_pool.lookup(ids=lookup_ids)
         for i in range(batch_size):
             if lookup_ids[i] in update_ids:
-                # pyre-ignore
                 lookup_id: int = lookup_ids[i].int().item()
                 torch.testing.assert_close(
                     reference_values[ids_to_row[lookup_id]],

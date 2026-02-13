@@ -39,7 +39,6 @@ class _CompileConfig:
 
 def compile_config_to_fn_transform(
     compile_config: Optional[_CompileConfig],
-    # pyre-ignore
 ) -> Callable:
     if compile_config is None:
         return lambda x: x
@@ -52,7 +51,6 @@ def compile_config_to_fn_transform(
     )
 
 
-# pyre-ignore
 def _copy_input_tensors(t, device):
     if isinstance(t, torch.Tensor):
         ret = t.detach().clone().to(device)
@@ -65,10 +63,8 @@ def _copy_input_tensors(t, device):
         raise ValueError(f"Unsupported type {type(t)}")
 
 
-# pyre-ignore
 def _grad_detach_clone(t):
     if isinstance(t, torch.Tensor):
-        # pyre-ignore
         return t.grad.detach().clone()
     elif isinstance(t, list):
         return [_grad_detach_clone(_t) for _t in t]
@@ -76,7 +72,6 @@ def _grad_detach_clone(t):
         raise ValueError(f"Unsupported type {type(t)}")
 
 
-# pyre-ignore
 def _assert_close(actual, expected) -> None:
     if isinstance(expected, torch.Tensor):
         assert isinstance(actual, torch.Tensor)
@@ -90,15 +85,12 @@ def _assert_close(actual, expected) -> None:
 
 
 def _test_async_sync_compile(
-    # pyre-ignore
     fn,
     input_tensor: Union[torch.Tensor, List[torch.Tensor]],
     device: torch.device,
     compile_config: _CompileConfig,
     rank: int,
-    # pyre-ignore
     *args,
-    # pyre-ignore
     **kwargs,
 ) -> None:
     input_tensor_async = _copy_input_tensors(input_tensor, device)
@@ -155,7 +147,6 @@ def _test_async_sync_compile(
                 out.backward(out)
                 compile_bwd_out = _grad_detach_clone(input_tensor_compile)
 
-                # pyre-ignore
                 _assert_close(compile_bwd_out, sync_bwd_out)
 
 
@@ -178,9 +169,7 @@ class TestAllToAll(unittest.TestCase):
         world_size: int,
         backend: str,
         callable: Callable[[], None],
-        # pyre-ignore
         *args,
-        # pyre-ignore
         **kwargs,
     ) -> None:
         processes = []
@@ -278,7 +267,6 @@ class TestAllToAll(unittest.TestCase):
         )
         lengths_after_sparse_data_all2all = torch.IntTensor(lengths_mp[rank])
 
-        # pyre-ignore
         def fn(*args, **kwargs) -> torch.Tensor:
             return comm_ops.alltoall_sequence(*args, **kwargs).wait()
 
@@ -301,7 +289,6 @@ class TestAllToAll(unittest.TestCase):
     @unittest.skipIf(
         torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
     )
-    # pyre-ignore
     @given(
         specify_pg=st.sampled_from([True]),
         gradient_division=st.sampled_from([True, False]),
@@ -315,7 +302,6 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
-            # pyre-ignore [6]
             callable=self._test_alltoall_sequence,
             compile_config=_CompileConfig(),
             specify_pg=specify_pg,
@@ -358,7 +344,6 @@ class TestAllToAll(unittest.TestCase):
             device
         )
 
-        # pyre-ignore
         def fn(*args, **kwargs) -> torch.Tensor:
             return comm_ops.alltoall_pooled(*args, **kwargs).wait()
 
@@ -379,7 +364,6 @@ class TestAllToAll(unittest.TestCase):
     @unittest.skipIf(
         torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
     )
-    # pyre-ignore
     @given(
         specify_pg=st.sampled_from([True]),
         test_compiled_with_noncompiled_ranks=st.sampled_from([False, True]),
@@ -395,7 +379,6 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
-            # pyre-ignore [6]
             callable=self._test_alltoall_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -436,7 +419,6 @@ class TestAllToAll(unittest.TestCase):
             input.retain_grad()
             inputs.append(input)
 
-        # pyre-ignore
         def fn(*args, **kwargs) -> torch.Tensor:
             return comm_ops.reduce_scatter_pooled(*args, **kwargs).wait()
 
@@ -455,7 +437,6 @@ class TestAllToAll(unittest.TestCase):
     @unittest.skipIf(
         torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
     )
-    # pyre-ignore
     @given(
         specify_pg=st.sampled_from([True]),
         test_compiled_with_noncompiled_ranks=st.sampled_from([False, True]),
@@ -471,7 +452,6 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
-            # pyre-ignore [6]
             callable=self._test_reduce_scatter_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -506,7 +486,6 @@ class TestAllToAll(unittest.TestCase):
 
         input: torch.Tensor = torch.randn(inputs_dim, 2, requires_grad=True).to(device)
 
-        # pyre-ignore
         def fn(*args, **kwargs) -> torch.Tensor:
             return comm_ops.reduce_scatter_v_pooled(*args, **kwargs).wait()
 
@@ -526,7 +505,6 @@ class TestAllToAll(unittest.TestCase):
     @unittest.skipIf(
         torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
     )
-    # pyre-ignore
     @given(
         specify_pg=st.sampled_from([True]),
         test_compiled_with_noncompiled_ranks=st.sampled_from([False, True]),
@@ -542,7 +520,6 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
-            # pyre-ignore [6]
             callable=self._test_reduce_scatter_v_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -583,7 +560,6 @@ class TestAllToAll(unittest.TestCase):
         )
         input: torch.Tensor = torch.randn(n, requires_grad=True).to(device)
 
-        # pyre-ignore
         def fn(*args, **kwargs) -> torch.Tensor:
             return comm_ops.reduce_scatter_v_per_feature_pooled(*args, **kwargs).wait()
 
@@ -603,7 +579,6 @@ class TestAllToAll(unittest.TestCase):
     @unittest.skipIf(
         torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
     )
-    # pyre-ignore
     @given(
         specify_pg=st.sampled_from([True]),
         test_compiled_with_noncompiled_ranks=st.sampled_from([False, True]),
@@ -619,7 +594,6 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
-            # pyre-ignore [6]
             callable=self._test_reduce_scatter_v_per_feature_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -650,7 +624,6 @@ class TestAllToAll(unittest.TestCase):
 
         input = torch.randn([4, 4], requires_grad=True).to(device)
 
-        # pyre-ignore
         def fn(*args, **kwargs) -> torch.Tensor:
             return comm_ops.all_gather_base_pooled(*args, **kwargs).wait()
 
@@ -664,7 +637,6 @@ class TestAllToAll(unittest.TestCase):
     @unittest.skipIf(
         torch.cuda.device_count() < 2, "Need at least two ranks to run this test"
     )
-    # pyre-ignore
     @given(
         specify_pg=st.sampled_from([True]),
         test_compiled_with_noncompiled_ranks=st.sampled_from([False, True]),
@@ -680,7 +652,6 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="nccl",
-            # pyre-ignore [6]
             callable=self._test_all_gather_base_pooled,
             compile_config=_CompileConfig(
                 test_compiled_with_noncompiled_ranks=test_compiled_with_noncompiled_ranks
@@ -712,6 +683,5 @@ class TestAllToAll(unittest.TestCase):
         self._run_multi_process_test(
             world_size=self.WORLD_SIZE,
             backend="gloo",
-            # pyre-ignore [6]
             callable=self._test_all_gather_base_pooled_cpu,
         )

@@ -150,7 +150,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device_type=st.sampled_from(["cuda", "cpu"]),
@@ -218,7 +217,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8]),
         device_type=st.sampled_from(["cuda"]),
@@ -257,7 +255,6 @@ class InferShardingsTest(unittest.TestCase):
 
         self.assertEqual(
             len(
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `sparse`.
                 sharded_model._module.sparse.ebc._lookups[0]._embedding_lookups_per_rank
             ),
@@ -265,7 +262,6 @@ class InferShardingsTest(unittest.TestCase):
         )
         self.assertEqual(
             len(
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `sparse`.
                 sharded_model._module.sparse.weighted_ebc._lookups[
                     0
@@ -294,7 +290,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device_type=st.sampled_from(["cuda", "cpu"]),
@@ -364,7 +359,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device_type=st.sampled_from(["cuda", "cpu"]),
@@ -396,7 +390,6 @@ class InferShardingsTest(unittest.TestCase):
         for t in mi.tables:
             self.assertIsNotNone(t.virtual_table_eviction_policy)
             self.assertEqual(
-                # pyre-ignore [16]
                 t.virtual_table_eviction_policy.get_embedding_dim(),
                 emb_dim,
             )
@@ -445,7 +438,6 @@ class InferShardingsTest(unittest.TestCase):
             ].virtual_table_dim_offsets
         )
         self.assertEqual(
-            # pyre-ignore [16]
             weights_spec[
                 "_module.sparse.ebc.tbes.0.0.table_0.weight"
             ].virtual_table_dim_offsets[0],
@@ -456,7 +448,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]Pyre was not able to infer the type of argument `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(
         test_permute=st.booleans(),
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
@@ -516,13 +507,11 @@ class InferShardingsTest(unittest.TestCase):
             )
 
             module_plan = construct_module_sharding_plan(
-                # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
                 #  attribute `sparse`.
                 non_sharded_model._module.sparse.ebc,
                 per_param_sharding={
                     "table_0": column_wise(ranks=[1, 0, 1, 0]),
                 },
-                # pyre-ignore
                 sharder=sharder,
                 local_size=local_size,
                 world_size=world_size,
@@ -569,7 +558,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]Pyre was not able to infer the type of argument `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(
         weight_dtype=st.sampled_from([torch.qint8]),
         device_type=st.sampled_from(["cuda"]),
@@ -624,13 +612,11 @@ class InferShardingsTest(unittest.TestCase):
             shardable_params=[table.name for table in mi.tables],
         )
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no
             #  attribute `sparse`.
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
                 "table_0": column_wise(size_per_rank=[dim_1, dim_2, dim_3, dim_4]),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -692,7 +678,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]Pyre was not able to infer the type of argument `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(
         emb_dim=st.sampled_from([192, 128]),
         test_permute=st.booleans(),
@@ -784,7 +769,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device_type=st.sampled_from(["cuda", "cpu"]),
@@ -843,14 +827,12 @@ class InferShardingsTest(unittest.TestCase):
         )
 
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
                 "table_0": column_wise(ranks=[1, 0]),
                 "table_1": column_wise(ranks=[0, 1]),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -897,7 +879,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device_type=st.sampled_from(["cuda", "cpu"]),
@@ -971,7 +952,6 @@ class InferShardingsTest(unittest.TestCase):
         )
 
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
@@ -979,7 +959,6 @@ class InferShardingsTest(unittest.TestCase):
                 "table_1": column_wise(ranks=[0, 3]),
                 "table_2": column_wise(ranks=[0, 2, 3]),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1016,7 +995,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         device_type_weight_dtype=st.sampled_from(
             [
@@ -1140,7 +1118,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device_type=st.sampled_from(["cuda", "cpu"]),
@@ -1253,7 +1230,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         device_type_weight_dtype=st.sampled_from(
             [
@@ -1371,7 +1347,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device=st.sampled_from(["cuda", "cpu"]),
@@ -1516,7 +1491,6 @@ class InferShardingsTest(unittest.TestCase):
         )
 
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             non_sharded_model._module_kjt_input[0],
             per_param_sharding={
                 "table_0": row_wise(
@@ -1526,7 +1500,6 @@ class InferShardingsTest(unittest.TestCase):
                 "table_2": row_wise(([256, 128, 128, 0], device)),
                 "table_3": row_wise(([0, 128, 128, 256], device)),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1558,7 +1531,6 @@ class InferShardingsTest(unittest.TestCase):
         gm_script_output = gm_script(*inputs[0])
         assert_close(sharded_output, gm_script_output)
 
-        # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedSeque...
         tbes = get_tbes_from_sharded_module(sharded_model._module_kjt_input[0])
         for tbe in tbes:
             self.assertTrue(tbe.weight_initialized)
@@ -1572,7 +1544,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device_type=st.sampled_from(["cuda", "cpu"]),
@@ -1642,14 +1613,12 @@ class InferShardingsTest(unittest.TestCase):
         sharder = QuantEmbeddingCollectionSharder()
 
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             non_sharded_model._module_kjt_input[0],
             per_param_sharding={
                 "table_0": row_wise(),
                 "table_1": table_wise(rank=0),
                 "table_2": table_wise(rank=1),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1684,7 +1653,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device_type=st.sampled_from(["cuda", "cpu"]),
@@ -1754,13 +1722,11 @@ class InferShardingsTest(unittest.TestCase):
         sharder = QuantEmbeddingCollectionSharder()
 
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[29]: `Union[(self: TensorBase, indices: Union[None, _NestedS...
             non_sharded_model._module_kjt_input[0],
             per_param_sharding={
                 "table_0": row_wise(),
                 "table_1": table_wise(rank=1),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1795,7 +1761,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 2,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]Pyre was not able to infer the type of argument `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         uneven_shard_pattern=st.sampled_from(
@@ -1857,13 +1822,11 @@ class InferShardingsTest(unittest.TestCase):
         )
 
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
                 "table_0": row_wise(([size0, size1, size2], device)),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -1898,7 +1861,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]Pyre was not able to infer the type of argument `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device=st.sampled_from(["cuda", "cpu"]),
@@ -2010,7 +1972,6 @@ class InferShardingsTest(unittest.TestCase):
         )
 
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
@@ -2021,7 +1982,6 @@ class InferShardingsTest(unittest.TestCase):
                 "table_2": row_wise(([256, 128, 128, 0], device)),
                 "table_3": row_wise(([0, 128, 128, 256], device)),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -2056,7 +2016,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs available",
     )
-    # pyre-fixme[56]Pyre was not able to infer the type of argument `hypothesis.strategies.booleans()` to decorator factory `hypothesis.given`.
     @given(
         weight_dtype=st.sampled_from([torch.qint8, torch.quint4x2]),
         device=st.sampled_from(["cuda", "cpu"]),
@@ -2090,7 +2049,6 @@ class InferShardingsTest(unittest.TestCase):
         sharder = QuantEmbeddingBagCollectionSharder()
 
         module_plan = construct_module_sharding_plan(
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `sparse`.
             non_sharded_model._module.sparse.ebc,
             per_param_sharding={
@@ -2101,7 +2059,6 @@ class InferShardingsTest(unittest.TestCase):
                 "table_2": column_wise(ranks=[0, 1]),
                 "table_3": table_wise(rank=0),
             },
-            # pyre-ignore
             sharder=sharder,
             local_size=local_size,
             world_size=world_size,
@@ -2136,7 +2093,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8]),
         device_type=st.sampled_from(["cuda", "cpu"]),
@@ -2248,7 +2204,6 @@ class InferShardingsTest(unittest.TestCase):
             ),
         )
         sharder = QuantFeatureProcessedEmbeddingBagCollectionSharder()
-        # pyre-ignore
         plan = mi.planner.plan(
             mi.quant_model,
             [sharder],
@@ -2256,13 +2211,11 @@ class InferShardingsTest(unittest.TestCase):
 
         sharded_model = _shard_modules(
             module=quant_model,
-            # pyre-fixme[6]: For 2nd argument expected
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[QuantFeatureProcessedEmbeddingBagCollectionSharder]`.
             sharders=[sharder],
             device=local_device,
             plan=plan,
-            # pyre-ignore
             env=ShardingEnv.from_local(world_size=mi.topology.world_size, rank=0),
         )
         print(f"sharded_model:\n{sharded_model}")
@@ -2310,7 +2263,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         weight_dtype=st.sampled_from([torch.qint8]),
         device_type=st.sampled_from(["cpu", "cuda"]),
@@ -2426,7 +2378,6 @@ class InferShardingsTest(unittest.TestCase):
             ),
         )
         sharder = QuantEmbeddingCollectionSharder()
-        # pyre-ignore
         plan = mi.planner.plan(
             mi.quant_model,
             [sharder],
@@ -2466,7 +2417,6 @@ class InferShardingsTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
-    # pyre-ignore
     @given(
         compute_device=st.sampled_from(["cuda", "cpu"]),
     )
@@ -2564,7 +2514,6 @@ class InferShardingsTest(unittest.TestCase):
             ),
         )
         sharder = QuantFeatureProcessedEmbeddingBagCollectionSharder()
-        # pyre-ignore
         plan = mi.planner.plan(
             mi.quant_model,
             [sharder],
@@ -2572,7 +2521,6 @@ class InferShardingsTest(unittest.TestCase):
 
         sharded_model = _shard_modules(
             module=quant_model,
-            # pyre-fixme[6]: For 2nd argument expected
             #  `Optional[List[ModuleSharder[Module]]]` but got
             #  `List[QuantFeatureProcessedEmbeddingBagCollectionSharder]`.
             sharders=[sharder],

@@ -159,5 +159,4 @@ def set_update_called(computation: RecMetricComputation) -> None:
     try:
         computation._update_called = True
     except AttributeError:
-        # pyre-ignore
         computation._update_count = 1

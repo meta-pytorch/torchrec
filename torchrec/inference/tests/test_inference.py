@@ -6,7 +6,6 @@
 # LICENSE file in the root directory of this source tree.
 
 # @nolint
-# pyre-ignore-all-errors
 
 import unittest
 from argparse import Namespace

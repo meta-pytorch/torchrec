@@ -198,10 +198,8 @@ class TestSequenceTowerSparseNN(TestSparseNNBase):
         )
         self.over = nn.Linear(
             in_features=8
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `out_features`.
             + self.tower_0.interaction.linear.out_features
-            # pyre-fixme[16]: Item `Tensor` of `Tensor | Module` has no attribute
             #  `out_features`.
             + self.tower_1.interaction.linear.out_features,
             out_features=16,

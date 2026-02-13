@@ -117,7 +117,6 @@ class ScalarLogger(torch.nn.Module):
             self._start_bucket == 0
             and self._total_cnt > 0
             and
-            # pyre-fixme[29]: `Union[(self: TensorBase, other: Any) -> Tensor, Tensor,
             #  Module]` is not a function.
             self._scalar_logger_steps % self._frequency == 0
         )
@@ -242,6 +241,4 @@ class ScalarLogger(torch.nn.Module):
             self._opt_in_cnt = 0
             self._sum_eviction_age = 0.0
 
-        # pyre-ignore[16]: `ScalarLogger` has no attribute `_scalar_logger_steps`.
-        # pyre-ignore[29]: `Union[(self: TensorBase, other: Any) -> Tensor, Tensor, Module]` is not a function.
         self._scalar_logger_steps += 1

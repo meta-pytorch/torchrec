@@ -54,11 +54,8 @@ class SegementedNEValueTest(unittest.TestCase):
                 weight_name="weight",
             )
             task_list.append(task_info)
-            # pyre-ignore
             inputs["predictions"][task_info.name] = predictions[i]
-            # pyre-ignore
             inputs["labels"][task_info.name] = labels[i]
-            # pyre-ignore
             inputs["weights"][task_info.name] = weights[i]
 
         ne = SegmentedNEMetric(
@@ -66,11 +63,8 @@ class SegementedNEValueTest(unittest.TestCase):
             my_rank=0,
             batch_size=batch_size,
             tasks=task_list,
-            # pyre-ignore
             num_groups=max(2, torch.unique(grouping_keys)[-1].item() + 1),
-            # pyre-ignore
             grouping_keys=grouping_key_tensor_name,
-            # pyre-ignore
             cast_keys_to_int=cast_keys_to_int,
             compute_mode=compute_mode,
         )

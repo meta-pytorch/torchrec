@@ -401,8 +401,6 @@ def _jagged_values_string(
         "["
         + ", ".join(
             [
-                # pyre-fixme[6]: For 2nd param expected `int` but got `Tensor`.
-                # pyre-fixme[6]: For 3rd param expected `int` but got `Tensor`.
                 _values_string(values, offsets[index], offsets[index + 1])
                 for index in range(offset_start, offset_end)
             ]
@@ -420,7 +418,6 @@ def _optional_mask(
 
 
 @torch.fx.wrap
-# pyre-ignore
 def _arange(*args, **kwargs) -> torch.Tensor:
     return torch.arange(*args, **kwargs)
 
@@ -1088,7 +1085,6 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         )
 
     @torch.jit.unused
-    # pyre-fixme[14]: `record_stream` overrides method defined in `Multistreamable`
     #  inconsistently.
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         self._values.record_stream(stream)
@@ -1135,9 +1131,7 @@ def _jt_flatten_with_keys(
 ) -> Tuple[List[Tuple[KeyEntry, Optional[torch.Tensor]]], None]:
     values, context = _jt_flatten(t)
     # pyre can't tell that GetAttrKey implements the KeyEntry protocol
-    return [  # pyre-ignore[7]
-        (GetAttrKey(k), v) for k, v in zip(JaggedTensor._fields, values)
-    ], context
+    return [(GetAttrKey(k), v) for k, v in zip(JaggedTensor._fields, values)], context
 
 
 def _jt_unflatten(values: List[Optional[torch.Tensor]], context: None) -> JaggedTensor:
@@ -1536,13 +1530,13 @@ def _maybe_compute_kjt_to_jt_dict(
 
         split_lengths = torch.unbind(strided_lengths, dim=0)
         if compute_offsets:
-            split_offsets = torch.unbind(  # pyre-ignore
+            split_offsets = torch.unbind(
                 _batched_lengths_to_offsets(strided_lengths), dim=0
             )
     else:
         split_lengths = torch.unbind(lengths, dim=0)
         if compute_offsets:
-            split_offsets = split_lengths  # pyre-ignore
+            split_offsets = split_lengths
 
     if weights is not None:
         weights_list = torch.split(weights, length_per_key)
@@ -1756,7 +1750,7 @@ def _force_length_offset_computation(
 def _check_attributes(
     attr_1: Union[torch.Tensor, List[int], List[str], int, None],
     attr_2: Union[torch.Tensor, List[int], List[str], int, None],
-    comparison_func: Callable[[Any, Any], bool],  # pyre-ignore[2]
+    comparison_func: Callable[[Any, Any], bool],
 ) -> bool:
     """Helper function to check if two attributes are equal.
 
@@ -1770,10 +1764,7 @@ def _check_attributes(
     """
     if attr_1 is not None and attr_2 is not None:
         # allclose throws error for different tensor sizes, we check manually for this
-        if (
-            comparison_func == torch.allclose
-            and attr_1.size() != attr_2.size()  # pyre-ignore[16]
-        ):
+        if comparison_func == torch.allclose and attr_1.size() != attr_2.size():
             return False
         if not comparison_func(attr_1, attr_2):
             return False
@@ -2965,7 +2956,6 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         return _jt_dict
 
     @torch.jit.unused
-    # pyre-fixme[14]: `record_stream` overrides method defined in `Multistreamable`
     #  inconsistently.
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         self._values.record_stream(stream)
@@ -3297,7 +3287,7 @@ def _kjt_flatten_with_keys(
 ) -> Tuple[List[Tuple[KeyEntry, Optional[torch.Tensor]]], List[str]]:
     values, context = _kjt_flatten(t)
     # pyre can't tell that GetAttrKey implements the KeyEntry protocol
-    return [  # pyre-ignore[7]
+    return [
         (GetAttrKey(k), v) for k, v in zip(KeyedJaggedTensor._fields, values)
     ], context
 
@@ -3611,7 +3601,6 @@ class KeyedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         return ret
 
     @torch.jit.unused
-    # pyre-fixme[14]: `record_stream` overrides method defined in `Multistreamable`
     #  inconsistently.
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         self._values.record_stream(stream)

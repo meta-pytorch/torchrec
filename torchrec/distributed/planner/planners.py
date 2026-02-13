@@ -152,7 +152,6 @@ def validate_rank_assignment(sharding_plan: ShardingPlan, topology: Topology) ->
         PlannerError: If any shard has an invalid rank assignment or if a sharding spec is missing.
     """
     for module_name, module_plan in sharding_plan.plan.items():
-        # pyre-ignore
         for param_name, param_plan in module_plan.items():
             if param_plan.sharding_spec is not None:
                 for shard in param_plan.sharding_spec.shards:
@@ -580,10 +579,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             # validate plan before loading
             self._loader_plan_validation(
                 current_planner_hash=self.hash_planner_context_inputs_str(),
-                # pyre-fixme[16]: `Optional` has no attribute `plan_context_hash`.
                 loaded_plan_hash=self.plan_loader.plan_context_hash(),
             )
-            # pyre-ignore
             loaded_sharding_options = self.plan_loader.load()
             if loaded_sharding_options is not None:
                 # Merging sharding options from loaded plan with enumerated search space
@@ -595,7 +592,6 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         # Loaded plan is validated successfully and can be used for generate the sharding plan, skipping new plan generation.
         if loaded_best_plan:
             logger.info(
-                # pyre-ignore
                 f"Loded sharding options from Storage with plan id: {self.plan_loader.get_plan_id()} skipping new plan generation"
             )
             best_plan = copy.deepcopy(loaded_best_plan)
@@ -723,10 +719,10 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 (
                     f"\n\t  Storage reservation percentage: {self._storage_reservation._percentage}, "
                     f"\n\t  Per rank reservation for dense storage: {storage_repr_in_gb(self._storage_reservation._dense_storage)}, "
-                    f"\n\t  Per rank reservation for kjt storage: {storage_repr_in_gb(self._storage_reservation._kjt_storage)}, "  # pyre-ignore[16]
+                    f"\n\t  Per rank reservation for kjt storage: {storage_repr_in_gb(self._storage_reservation._kjt_storage)}, "
                 )
                 if isinstance(self._storage_reservation, HeuristicalStorageReservation)
-                else f"\n\t  Storage reservation percentage: {self._storage_reservation._percentage}, "  # pyre-ignore[16]
+                else f"\n\t  Storage reservation percentage: {self._storage_reservation._percentage}, "
             )
             no_plan_solution = (
                 f"Planner evaluated {self._num_proposals} proposals."
@@ -796,7 +792,6 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             PlannerError: If hashes don't match
         """
         if loaded_plan_hash is not None and current_planner_hash != loaded_plan_hash:
-            # pyre-fixme[16]: `Optional` has no attribute `get_plan_id`.
             plan_id = self.plan_loader.get_plan_id() if self.plan_loader else None
             error_msg = (
                 f"Planner input context mismatch detected for {plan_id} and current planner set up:"
@@ -844,7 +839,6 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
         self._topology_groups: Dict[str, Topology] = topology_groups
         self._batch_size: int = batch_size if batch_size else BATCH_SIZE
         self._constraints = constraints
-        # pyre-ignore
         self._enumerators: Dict[str, Enumerator] = (
             enumerators
             if enumerators
@@ -858,7 +852,6 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                 for group in self._topology_groups.keys()
             }
         )
-        # pyre-ignore
         self._storage_reservations: Dict[str, StorageReservation] = (
             storage_reservations
             if storage_reservations
@@ -868,7 +861,6 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
             }
         )
 
-        # pyre-ignore
         self._partitioners: Dict[str, Partitioner] = (
             partitioners
             if partitioners
@@ -879,10 +871,8 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
         )
 
         if proposers:
-            # pyre-ignore
             self._proposers: Dict[str, List[Proposer]] = proposers
         else:
-            # pyre-ignore
             self._proposers = {
                 group: [
                     GridSearchProposer(),
@@ -893,7 +883,6 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                 for group in self._topology_groups.keys()
             }
 
-        # pyre-ignore
         self._perf_models: Dict[str, PerfModel] = (
             performance_models
             if performance_models
@@ -906,10 +895,8 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
         self._stats: Dict[str, List[Stats]] = {}
 
         if stats is not None:
-            # pyre-ignore [8]
             self._stats = stats
         else:
-            # pyre-ignore [8]
             self._stats = {
                 group: [EmbeddingStats()] for group in self._topology_groups.keys()
             }
@@ -983,7 +970,6 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
             search_space = [
                 s_o
                 for s_o in search_space
-                # pyre-ignore [16]
                 if self._constraints[s_o.name].device_group == group
             ]
 
@@ -1101,10 +1087,9 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                 )
                 storage_reservation_solution = (
                     (
-                        # pyre-ignore [16]
                         f"\n\t  Storage reservation percentage: {self._storage_reservations[group]._percentage}, "
                         f"\n\t  Per rank reservation for dense storage: {storage_repr_in_gb(self._storage_reservations[group]._dense_storage)}, "
-                        f"\n\t  Per rank reservation for kjt storage: {storage_repr_in_gb(self._storage_reservations[group]._kjt_storage)}, "  # pyre-ignore[16]
+                        f"\n\t  Per rank reservation for kjt storage: {storage_repr_in_gb(self._storage_reservations[group]._kjt_storage)}, "
                     )
                     if isinstance(
                         self._storage_reservations[group], HeuristicalStorageReservation

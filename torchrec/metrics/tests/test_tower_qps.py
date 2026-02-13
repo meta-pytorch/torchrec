@@ -418,7 +418,7 @@ class TowerQPSMetricTest(unittest.TestCase):
         )
 
         data = _gen_data_with_batch_size(batch_size_stages[0].batch_size)
-        metric.update(**data)  # pyre-ignore[6]
+        metric.update(**data)
 
         self.assertEqual(
             metric.compute(),
@@ -436,7 +436,7 @@ class TowerQPSMetricTest(unittest.TestCase):
         )
 
         data = _gen_data_with_batch_size(batch_size_stages[1].batch_size)
-        metric.update(**data)  # pyre-ignore[6]
+        metric.update(**data)
 
         self.assertEqual(
             metric.compute(),

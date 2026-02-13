@@ -197,7 +197,6 @@ def gen_model_and_input(
     tables: List[EmbeddingTableConfig],
     embedding_groups: Dict[str, List[str]],
     world_size: int,
-    # pyre-ignore [9]
     generate: Union[
         ModelInputCallable, VariableBatchModelInputCallable
     ] = ModelInput.generate,
@@ -339,7 +338,7 @@ def dynamic_sharding_test(
     indices_dtype: torch.dtype = torch.int64,
     offsets_dtype: torch.dtype = torch.int64,
     lengths_dtype: torch.dtype = torch.int64,
-    sharding_type: ShardingType = None,  # pyre-ignore
+    sharding_type: ShardingType = None,
     random_seed: int = 0,
     skip_passing_resharding_fqn: bool = False,
 ) -> None:
@@ -370,7 +369,6 @@ def dynamic_sharding_test(
         (global_model, inputs) = gen_model_and_input(
             model_class=model_class,
             tables=tables,
-            # pyre-ignore [6]
             generate=(
                 cast(
                     VariableBatchModelInputCallable,
@@ -482,7 +480,6 @@ def dynamic_sharding_test(
                 ):
                     sharding_spec = parameter_sharding.sharding_spec
                     if sharding_spec is not None:
-                        # pyre-ignore
                         for shard in sharding_spec.shards:
                             placement = shard.placement
                             rank: Optional[int] = placement.rank()
@@ -516,12 +513,11 @@ def dynamic_sharding_test(
         new_per_param_sharding = {}
 
         assert len(sharders) == 1
-        # pyre-ignore
         kernel_type = sharders[0]._kernel_type
         # Construct parameter shardings
         for i in range(num_tables):
             table_name = tables[i].name
-            table_constraint = constraints[table_name]  # pyre-ignore
+            table_constraint = constraints[table_name]
             assert hasattr(table_constraint, "sharding_types")
             assert (
                 len(table_constraint.sharding_types) == 1
@@ -558,7 +554,7 @@ def dynamic_sharding_test(
 
         local_m1_dmp = DistributedModelParallel(
             local_m1,
-            env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore
+            env=ShardingEnv.from_process_group(ctx.pg),
             plan=plan,
             sharders=sharders,
             device=ctx.device,
@@ -566,7 +562,7 @@ def dynamic_sharding_test(
 
         local_m2_dmp = DistributedModelParallel(
             local_m2,
-            env=ShardingEnv.from_process_group(ctx.pg),  # pyre-ignore
+            env=ShardingEnv.from_process_group(ctx.pg),
             plan=plan_1,
             sharders=sharders,
             device=ctx.device,
@@ -592,7 +588,7 @@ def dynamic_sharding_test(
         )
 
         new_module_sharding_plan_delta = output_sharding_plans_delta(
-            plan.plan, plan_1.plan  # pyre-ignore
+            plan.plan, plan_1.plan
         )
 
         dense_m1_optim = KeyedOptimizerWrapper(
@@ -679,7 +675,6 @@ def copy_state_dict(
         if isinstance(global_tensor, ShardedTensor):
             global_tensor = global_tensor.local_shards()[0].tensor
         if isinstance(global_tensor, DTensor):
-            # pyre-ignore[16]
             global_tensor = global_tensor.to_local().local_shards()[0]
 
         if isinstance(tensor, ShardedTensor):
@@ -720,7 +715,7 @@ def copy_state_dict(
         elif isinstance(tensor, DTensor):
             for local_shard, global_offset in zip(
                 tensor.to_local().local_shards(),
-                tensor.to_local().local_offsets(),  # pyre-ignore[16]
+                tensor.to_local().local_offsets(),
             ):
                 assert (
                     global_tensor.ndim == local_shard.ndim
@@ -751,8 +746,6 @@ def alter_global_ebc_dtype(model: nn.Module) -> None:
         if isinstance(ebc, EmbeddingBagCollection) and ebc._is_weighted:
             with torch.no_grad():
                 for bag in ebc.embedding_bags.values():
-                    # pyre-fixme[16]: `Module` has no attribute `weight`.
-                    # pyre-fixme[6]: For 1st argument expected `Tensor` but got
                     #  `Union[Module, Tensor]`.
                     bag.weight = torch.nn.Parameter(bag.weight.float())
 
@@ -802,7 +795,6 @@ def sharding_single_rank_test_single_process(
     (global_model, inputs) = gen_model_and_input(
         model_class=model_class,
         tables=tables,
-        # pyre-ignore [6]
         generate=(
             cast(
                 VariableBatchModelInputCallable,
@@ -891,10 +883,8 @@ def sharding_single_rank_test_single_process(
                 kernel_type=EmbeddingComputeKernel.FUSED.value,
                 qcomms_config=qcomms_config,
             )
-            sharders.append(sharder)  # pyre-ignore[6]
-            config.plan = planner.collective_plan(
-                local_model, [sharder], pg  # pyre-ignore[6]
-            )
+            sharders.append(sharder)
+            config.plan = planner.collective_plan(local_model, [sharder], pg)
 
     """
     Simulating multiple nodes on a single node. However, metadata information and
@@ -921,7 +911,6 @@ def sharding_single_rank_test_single_process(
             ):
                 sharding_spec = parameter_sharding.sharding_spec
                 if sharding_spec is not None:
-                    # pyre-ignore
                     for shard in sharding_spec.shards:
                         placement = shard.placement
                         rank: Optional[int] = placement.rank()
@@ -1212,7 +1201,6 @@ def compare_models_pred_one_step(
     Helper function to compare the model predictions of two models after one training step.
     Useful for debugging sharding tests to see which model weights are different
     """
-    # pyre-ignore
     compare_model_weights(model_1.module.sparse, model_2.module.sparse)
     # Run a single training step of the global model.
     output_1 = gen_full_pred_after_one_step(model_1, opt_1, input, skip_inference=True)
@@ -1220,9 +1208,7 @@ def compare_models_pred_one_step(
 
     torch.testing.assert_close(output_1, output_2)
     compare_model_weights(
-        # pyre-ignore
         model_1.module.sparse,
-        # pyre-ignore
         model_2.module.sparse,
     )  # Module weights are the same
 
@@ -1309,7 +1295,7 @@ def generate_rank_placements(
     world_size: int,
     num_tables: int,
     ranks_per_tables: List[int],
-    random_seed: int = None,  # pyre-ignore
+    random_seed: int = None,
 ) -> List[List[int]]:
     # Cannot include old/new rank generation with hypothesis library due to depedency on world_size
     if random_seed is None:

@@ -60,14 +60,12 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 enable_uvm=enable_uvm,
             )
 
-            # pyre-ignore
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
-                # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but
                 #  got `Optional[ProcessGroup]`.
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
@@ -155,7 +153,6 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    # pyre-ignore
     @given(
         enable_uvm=st.booleans(),
         values_dtype=st.sampled_from([torch.int32, torch.int64]),
@@ -214,14 +211,12 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 device=torch.device("meta"),
             )
 
-            # pyre-ignore
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
-                # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but
                 #  got `Optional[ProcessGroup]`.
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
@@ -294,7 +289,6 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 ),
             )
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
@@ -347,14 +341,12 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 device=torch.device("meta"),
             )
 
-            # pyre-ignore
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
-                # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but
                 #  got `Optional[ProcessGroup]`.
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
@@ -428,7 +420,6 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 ),
             )
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
@@ -481,14 +472,12 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 device=torch.device("meta"),
             )
 
-            # pyre-ignore
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
-                # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but
                 #  got `Optional[ProcessGroup]`.
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
@@ -558,7 +547,6 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 ),
             )
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
@@ -606,14 +594,12 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 device=torch.device("meta"),
             )
 
-            # pyre-ignore
             sharded_keyed_jagged_tensor_pool: (
                 ShardedKeyedJaggedTensorPool
             ) = KeyedJaggedTensorPoolSharder().shard(
                 keyed_jagged_tensor_pool,
                 plan=sharding_plan,
                 device=ctx.device,
-                # pyre-fixme[6]: For 1st argument expected `ProcessGroup` but
                 #  got `Optional[ProcessGroup]`.
                 env=ShardingEnv.from_process_group(ctx.pg),
             )
@@ -719,7 +705,6 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 "key_lengths",
             ]
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
@@ -743,7 +728,6 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
             backend="nccl",
         )
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
@@ -820,7 +804,6 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
         for input in input_cases:
             input = torch.tensor(input, dtype=torch.int64)
             ref = kjt_pool_orig.lookup(input)
-            # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
             val = sharded_inference_kjt_pool.lookup(input.to(cuda_device))
 
             torch.testing.assert_close(ref.values().cpu(), val.values().cpu())

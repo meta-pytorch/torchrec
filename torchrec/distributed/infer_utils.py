@@ -35,7 +35,6 @@ def get_tbes_from_sharded_module(
         ShardedQuantEmbeddingCollection,
     ], "Only support ShardedQuantEmbeddingBagCollection and ShardedQuantEmbeddingCollection for get TBEs"
     tbes = []
-    # pyre-fixme[29]: `Union[(self: Tensor) -> Any, Tensor, Module]` is not a function.
     for lookup in module._lookups:
         for lookup_per_rank in lookup._embedding_lookups_per_rank:
             for emb_module in lookup_per_rank._emb_modules:

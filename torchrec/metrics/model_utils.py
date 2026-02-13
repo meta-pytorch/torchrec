@@ -135,7 +135,6 @@ def parse_required_inputs(
         # convert feature defined from config only
         if ndcg_transform_input:
             model_out[feature] = (
-                # pyre-ignore[6]
                 session_ids_to_tensor(model_out[feature], device=device)
                 if isinstance(model_out[feature], list)
                 else model_out[feature]

@@ -39,7 +39,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.ROW_WISE.value),
         kernel_type=st.sampled_from(
@@ -100,7 +99,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.DATA_PARALLEL.value),
         kernel_type=st.just(EmbeddingComputeKernel.DENSE.value),
@@ -132,7 +130,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.TABLE_WISE.value),
         kernel_type=st.sampled_from(
@@ -193,7 +190,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.just(ShardingType.COLUMN_WISE.value),
         kernel_type=st.sampled_from(
@@ -247,7 +243,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    # pyre-fixme[56]
     @given(
         sharding_type=st.sampled_from(
             [
@@ -280,7 +275,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
             variable_batch_per_feature=True,
         )
 
-    # pyre-fixme[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -386,7 +380,6 @@ class DedupIndicesWeightAccumulationTest(unittest.TestCase):
     This tests the correctness of the new scatter_add_along_first_dim implementation.
     """
 
-    # pyre-fixme[56]: Pyre was not able to infer the type of argument
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",

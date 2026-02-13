@@ -109,7 +109,6 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
             self._is_collection = True
         else:
             self._feature_processors = torch.nn.ModuleDict(
-                # pyre-fixme[29]: `Union[(self: ModuleDict) -> ItemsView[str,
                 #  Module], Module, Tensor]` is not a function.
                 module._feature_processors.items()
             )
@@ -118,7 +117,6 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
         init_parameters(self._feature_processors, device)
         self._no_op_zero: torch.Tensor = torch.zeros((1,), device=self._device)
 
-    # pyre-ignore
     def input_dist(
         self, ctx: EmbeddingBagCollectionContext, features: KeyedJaggedTensor
     ) -> Awaitable[Awaitable[KJTList]]:

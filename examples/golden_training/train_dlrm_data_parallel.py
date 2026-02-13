@@ -130,9 +130,7 @@ def train(
     qcomm_codecs_registry = (
         get_qcomm_codecs_registry(
             qcomms_config=QCommsConfig(
-                # pyre-ignore
                 forward_precision=qcomm_forward_precision,
-                # pyre-ignore
                 backward_precision=qcomm_backward_precision,
             )
         )
@@ -145,7 +143,6 @@ def train(
         plan=plan,
         module=train_model,
         device=device,
-        # pyre-ignore
         sharders=[sharder],
     )
 

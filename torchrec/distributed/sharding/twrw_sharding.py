@@ -81,9 +81,7 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         self._env = env
         self._is_2D_parallel: bool = isinstance(env, ShardingEnv2D)
         self._pg: Optional[dist.ProcessGroup] = (
-            self._env.sharding_pg  # pyre-ignore[16]
-            if self._is_2D_parallel
-            else self._env.process_group
+            self._env.sharding_pg if self._is_2D_parallel else self._env.process_group
         )
         self._world_size: int = self._env.world_size
         self._rank: int = self._env.rank
@@ -91,7 +89,6 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         self._need_pos = need_pos
         if self._is_2D_parallel:
             intra_pg, cross_pg = intra_and_cross_node_pg_2D(
-                # pyre-fixme[6]
                 self._env,
                 device=device,
             )
@@ -138,13 +135,11 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         for info in sharding_infos:
             # Under 2D parallelism we transform rank to the logical ordering in a regular parallelism scheme
             rank = (
-                # pyre-ignore [16]
                 peer_group.index(info.param_sharding.ranks[0])
                 if peer_group is not None
                 else info.param_sharding.ranks[0]
             )
             table_node = rank // local_size
-            # pyre-fixme [16]
             shards = info.param_sharding.sharding_spec.shards
 
             # construct the global sharded_tensor_metadata

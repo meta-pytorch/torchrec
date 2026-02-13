@@ -1044,7 +1044,6 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                 self.assertEqual(bwd_computes_1[key], bwd_computes_2[key])
 
 
-# pyre-ignore[3]
 def calculate_storage_specific_size_data_provider():
     return (
         {
@@ -1618,7 +1617,7 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
             self.assertEqual(len(sharding_options), 1)
             self.assertEqual(len(sharding_options[0].shards), 1)
             self.assertIsNotNone(sharding_options[0].shards[0].storage)
-            hbms.append(sharding_options[0].shards[0].storage.hbm)  # pyre-ignore
+            hbms.append(sharding_options[0].shards[0].storage.hbm)
 
         self.assertEqual(hbms[0], hbms[1])
 

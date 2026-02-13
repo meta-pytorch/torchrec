@@ -82,19 +82,17 @@ class FullyShardTest(MultiProcessTestBase):
                 m.sparse.parameters(),
                 {"lr": 0.01},
             )
-            # pyre-ignore
             m.sparse.ebc = trec_shard(
                 module=m.sparse.ebc,
                 device=ctx.device,
                 plan=row_wise(),
             )
-            # pyre-ignore
             m.sparse.weighted_ebc = trec_shard(
                 module=m.sparse.weighted_ebc,
                 device=ctx.device,
                 plan=row_wise(),
             )
-            m.dense = FSDP(  # pyre-ignore
+            m.dense = FSDP(
                 m.dense,
                 auto_wrap_policy=ModuleWrapPolicy({nn.Linear}),
                 device_id=ctx.device.index,
@@ -122,7 +120,6 @@ class FullyShardTest(MultiProcessTestBase):
             ):
                 # Add learning rate scheduler
                 warmup = WarmupOptimizer(
-                    # pyre-ignore
                     p._in_backward_optimizers[0],
                     [
                         WarmupStage(
@@ -214,7 +211,7 @@ class FullyShardTest(MultiProcessTestBase):
                             continue
                         t = t.local_tensor()
                     if isinstance(t, DTensor):
-                        if not t.to_local().local_shards():  # pyre-ignore[16]
+                        if not t.to_local().local_shards():
                             continue
                         t = t.to_local().local_shards()[0]
                     o_sum += t.sum()
@@ -263,7 +260,6 @@ class FullyShardTest(MultiProcessTestBase):
             assert o_sum.allclose(o_sum_loaded)
 
     @skip_if_asan
-    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",

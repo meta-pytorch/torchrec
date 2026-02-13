@@ -116,7 +116,6 @@ def make_sharding_option(
     return ShardingOption(
         name=name,
         tensor=torch.zeros(1),
-        # pyre-ignore
         module=("model", None),
         input_lengths=[],
         batch_size=8,
@@ -920,7 +919,6 @@ class TestProposers(unittest.TestCase):
                 ShardingOption(
                     name=name,
                     tensor=torch.zeros(1),
-                    # pyre-ignore
                     module=("model", None),
                     input_lengths=[],
                     batch_size=8,

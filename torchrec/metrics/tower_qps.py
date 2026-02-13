@@ -294,7 +294,6 @@ class TowerQPSMetric(RecMetric):
                 for task, metric_ in zip(self._tasks, self._metrics_computations):
                     if task.name not in labels:
                         continue
-                    # pyre-fixme[6]: For 1st argument expected `Union[None,
                     #  List[typing.Any], int, slice, Tensor, typing.Tuple[typing.Any,
                     #  ...]]` but got `str`.
                     task_labels = labels[task.name].view(1, -1)
@@ -302,7 +301,6 @@ class TowerQPSMetric(RecMetric):
                         has_valid_weights = torch.ones(
                             1,
                             dtype=torch.bool,
-                            # pyre-fixme[6]: For 3rd argument expected `Union[None,
                             #  int, str, device]` but got `Union[device, Tensor,
                             #  Module]`.
                             device=metric_.has_valid_update.device,
@@ -310,7 +308,6 @@ class TowerQPSMetric(RecMetric):
                         if weights is not None and task.name in weights:
                             has_valid_weights = torch.gt(
                                 torch.count_nonzero(
-                                    # pyre-fixme[6]: For 1st argument expected
                                     #  `Union[None, List[typing.Any], int, slice,
                                     #  Tensor, typing.Tuple[typing.Any, ...]]` but got
                                     #  `str`.
@@ -320,12 +317,10 @@ class TowerQPSMetric(RecMetric):
                                 0,
                             )
                         if has_valid_weights[0]:
-                            # pyre-fixme[29]: `Union[(self: TensorBase, other:
                             #  Tensor) -> Tensor, Tensor, Module]` is not a function.
                             metric_.has_valid_update.logical_or_(has_valid_weights)
                         else:
                             continue
-                    # pyre-fixme[29]: `Union[Tensor, Module]` is not a function.
                     metric_.update(
                         predictions=None,
                         labels=task_labels,
