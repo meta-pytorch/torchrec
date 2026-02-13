@@ -211,6 +211,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         opt_in_prob: int = -1,
         percent_reserved_slots: float = 0,
         disable_fallback: bool = False,
+        no_bag: bool = False,
     ) -> None:
         if output_segments is None:
             assert (
@@ -349,6 +350,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self.table_name_on_device_input_ids_dict: Dict[str, torch.Tensor] = (
             {}
         )  # {table_name: input JT values that maps to the current rank}
+        self._no_bag = no_bag
 
         logger.info(
             f"HashZchManagedCollisionModule: {self._name=}, {self.device=}, "
@@ -358,7 +360,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._buckets=}, {self._start_bucket=}, {self._end_bucket=}, "
             f"{self._output_global_offset_tensor=}, {self._output_segments=}, "
             f"{inference_dispatch_div_train_world_size=}, "
-            f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}"
+            f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, {self._no_bag=}"
         )
 
     @property
@@ -472,7 +474,11 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             / (self._end_bucket - self._start_bucket)
         )
 
-    def remap(self, features: Dict[str, JaggedTensor]) -> Dict[str, JaggedTensor]:
+    def remap(
+        self,
+        features: Dict[str, JaggedTensor],
+        is_nro_feature: bool = True,
+    ) -> Dict[str, JaggedTensor]:
         readonly: bool = False
         if self._output_global_offset_tensor is not None:
             self._output_global_offset_tensor, _ = _tensor_may_to_device(
@@ -551,11 +557,19 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 # record the on-device remapped ids
                 self.table_name_on_device_remapped_ids_dict[name] = remapped_ids.clone()
                 lengths: torch.Tensor = feature.lengths()
-                hit_indices = remapped_ids != -1
+                hit_indices: torch.Tensor = remapped_ids != -1
                 if self._disable_fallback:
                     # Only works on GPU when read only is true.
-                    remapped_ids = remapped_ids[hit_indices]
-                    lengths = torch.masked_fill(lengths, ~hit_indices, 0)
+                    if self._no_bag:
+                        remapped_ids = torch.where(
+                            hit_indices,
+                            remapped_ids,
+                            0,
+                        )
+                    else:
+                        remapped_ids = remapped_ids[hit_indices]
+                    if is_nro_feature:
+                        lengths = torch.masked_fill(lengths, ~hit_indices, 0)
                 if self._scalar_logger is not None:
                     assert identities_0 is not None
                     self._scalar_logger.update(
@@ -594,8 +608,12 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
     def forward(
         self,
         features: Dict[str, JaggedTensor],
+        is_nro_feature: bool = True,
     ) -> Dict[str, JaggedTensor]:
-        return self.remap(features)
+        return self.remap(
+            features,
+            is_nro_feature=is_nro_feature,
+        )
 
     def output_size(self) -> int:
         return self._zch_size

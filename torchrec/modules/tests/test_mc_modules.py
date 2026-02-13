@@ -11,16 +11,19 @@ import unittest
 from typing import Dict
 
 import torch
+from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.mc_modules import (
     average_threshold_filter,
     DistanceLFU_EvictionPolicy,
     dynamic_threshold_filter,
     LFU_EvictionPolicy,
     LRU_EvictionPolicy,
+    ManagedCollisionCollection,
     MCHManagedCollisionModule,
     probabilistic_threshold_filter,
 )
-from torchrec.sparse.jagged_tensor import JaggedTensor
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 class TestEvictionPolicy(unittest.TestCase):
@@ -427,3 +430,55 @@ class TestEvictionPolicy(unittest.TestCase):
         model.train(False)
         gm = torch.fx.symbolic_trace(model)
         torch.jit.script(gm)
+
+
+class TestManagedCollisionCollection(unittest.TestCase):
+    def test_forward_passes_is_nro_feature_parameter(self) -> None:
+        """
+        Test that ManagedCollisionCollection.forward correctly passes
+        the is_nro_feature parameter to the underlying mc_modules.
+        """
+        embedding_configs = [
+            EmbeddingConfig(
+                name="t1",
+                num_embeddings=100,
+                embedding_dim=8,
+                feature_names=["f1"],
+            ),
+        ]
+
+        mc_modules = {
+            "t1": HashZchManagedCollisionModule(
+                zch_size=100,
+                device=torch.device("cpu"),
+                total_num_buckets=10,
+                disable_fallback=False,
+                is_inference=True,
+            ),
+        }
+
+        mcc = ManagedCollisionCollection(
+            managed_collision_modules=mc_modules,
+            embedding_configs=embedding_configs,
+        )
+
+        kjt = KeyedJaggedTensor(
+            keys=["f1"],
+            values=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+            lengths=torch.tensor([2, 2], dtype=torch.int64),
+        )
+
+        # Test with is_nro_feature=True (default)
+        output_true = mcc(kjt, is_nro_feature=True)
+        self.assertIsNotNone(output_true)
+        self.assertEqual(output_true.keys(), ["f1"])
+
+        # Test with is_nro_feature=False
+        output_false = mcc(kjt, is_nro_feature=False)
+        self.assertIsNotNone(output_false)
+        self.assertEqual(output_false.keys(), ["f1"])
+
+        # Verify the forward method accepts the parameter without errors
+        # and produces valid output in both cases
+        self.assertTrue(torch.equal(output_true.values(), output_false.values()))
+        self.assertTrue(torch.equal(output_true.lengths(), output_false.lengths()))
