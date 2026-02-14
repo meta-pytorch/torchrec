@@ -1883,6 +1883,17 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
             yield name, param
 
 
+def _assert_local_cols_divisible_by_4(config: GroupedEmbeddingConfig) -> None:
+    for table in config.embedding_tables:
+        assert table.local_cols % 4 == 0, (
+            f"table {table.name} has local_cols={table.local_cols} "
+            "not divisible by 4. "
+            "This is required by FBGEMM CUDA operations. "
+            "Consider adjusting min_partition or column shard dimensions "
+            "in your planner constraints so that local_cols is divisible by 4."
+        )
+
+
 class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule):
     def __init__(
         self,
@@ -1898,11 +1909,7 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
         assert (
             len({table.embedding_dim for table in config.embedding_tables}) == 1
         ), "Currently we expect all tables in SSD TBE to have the same embedding dimension."
-        for table in config.embedding_tables:
-            assert table.local_cols % 4 == 0, (
-                f"table {table.name} has local_cols={table.local_cols} "
-                "not divisible by 4. "
-            )
+        _assert_local_cols_divisible_by_4(config)
 
         ssd_tbe_params = _populate_ssd_tbe_params(config)
         compute_kernel = config.embedding_tables[0].compute_kernel
@@ -2102,11 +2109,7 @@ class ZeroCollisionKeyValueEmbedding(
             f"Embedding_cache kernel is {embedding_cache_mode} "
             f"but embedding config has enable_embedding_update {config.enable_embedding_update}"
         )
-        for table in config.embedding_tables:
-            assert table.local_cols % 4 == 0, (
-                f"table {table.name} has local_cols={table.local_cols} "
-                "not divisible by 4. "
-            )
+        _assert_local_cols_divisible_by_4(config)
 
         ssd_tbe_params = _populate_ssd_tbe_params(config)
         self._bucket_spec: List[Tuple[int, int, int]] = (
@@ -3060,11 +3063,7 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         assert (
             len(config.embedding_tables) > 0
         ), "Expected to see at least one table in SSD TBE, but found 0."
-        for table in config.embedding_tables:
-            assert table.local_cols % 4 == 0, (
-                f"table {table.name} has local_cols={table.local_cols} "
-                "not divisible by 4. "
-            )
+        _assert_local_cols_divisible_by_4(config)
 
         ssd_tbe_params = _populate_ssd_tbe_params(config)
         compute_kernel = config.embedding_tables[0].compute_kernel
@@ -3261,11 +3260,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
             config.is_using_virtual_table()
         ), "Try to create ZeroCollisionKeyValueEmbeddingBag for non virtual tables"
 
-        for table in config.embedding_tables:
-            assert table.local_cols % 4 == 0, (
-                f"table {table.name} has local_cols={table.local_cols} "
-                "not divisible by 4. "
-            )
+        _assert_local_cols_divisible_by_4(config)
 
         ssd_tbe_params = _populate_ssd_tbe_params(config)
         self._bucket_spec: List[Tuple[int, int, int]] = (
@@ -3592,11 +3587,8 @@ class BatchedFusedEmbeddingBag(
 
         managed: List[EmbeddingLocation] = []
         compute_devices: List[ComputeDevice] = []
+        _assert_local_cols_divisible_by_4(config)
         for table in config.embedding_tables:
-            assert table.local_cols % 4 == 0, (
-                f"table {table.name} has local_cols={table.local_cols} "
-                "not divisible by 4. "
-            )
             if device is not None and device.type == "cuda":
                 compute_devices.append(ComputeDevice.CUDA)
                 managed.append(
@@ -3738,11 +3730,7 @@ class TritonBatchedFusedEmbeddingBag(
             device is not None and device.type == "cuda"
         ), "TritonBatchedFusedEmbeddingBag only supports CUDA devices"
 
-        for table in config.embedding_tables:
-            assert table.local_cols % 4 == 0, (
-                f"table {table.name} has local_cols={table.local_cols} "
-                "not divisible by 4. "
-            )
+        _assert_local_cols_divisible_by_4(config)
 
         weights_precision = data_type_to_sparse_type(config.data_type)
         fused_params = config.fused_params or {}
