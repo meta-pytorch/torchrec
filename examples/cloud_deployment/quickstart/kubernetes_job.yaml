@@ -1,0 +1,188 @@
+# TorchRec Quickstart Kubernetes Job
+# Deploys TorchRec distributed training across multiple GPU nodes
+#
+# Deploy: kubectl apply -f kubernetes_job.yaml
+# Monitor: kubectl logs -f job/torchrec-quickstart-training
+# Delete: kubectl delete -f kubernetes_job.yaml
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: torchrec
+  labels:
+    app: torchrec-quickstart
+
+---
+# ConfigMap for training configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: torchrec-config
+  namespace: torchrec
+data:
+  # Number of training nodes
+  NUM_NODES: "2"
+  # GPUs per node
+  GPUS_PER_NODE: "8"
+  # Training hyperparameters
+  BATCH_SIZE: "2048"
+  LEARNING_RATE: "1.0"
+  EMBEDDING_DIM: "128"
+  NUM_EPOCHS: "10"
+  # NCCL settings for optimal distributed performance
+  NCCL_DEBUG: "INFO"
+  NCCL_IB_DISABLE: "0"
+  NCCL_NET_GDR_LEVEL: "2"
+
+---
+# Headless service for pod discovery (required for multi-node training)
+apiVersion: v1
+kind: Service
+metadata:
+  name: torchrec-headless
+  namespace: torchrec
+spec:
+  clusterIP: None
+  selector:
+    job-name: torchrec-quickstart-training
+  ports:
+    - name: nccl
+      port: 29500
+      targetPort: 29500
+
+---
+# Training Job
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: torchrec-quickstart-training
+  namespace: torchrec
+  labels:
+    app: torchrec-quickstart
+spec:
+  parallelism: 2  # Number of nodes
+  completions: 2  # Must match parallelism for distributed training
+  completionMode: Indexed
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: torchrec-quickstart
+    spec:
+      restartPolicy: OnFailure
+      subdomain: torchrec-headless
+      # Ensure pods are scheduled on different nodes
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            - labelSelector:
+                matchLabels:
+                  app: torchrec-quickstart
+              topologyKey: "kubernetes.io/hostname"
+      # GPU node selector (adjust based on your cluster)
+      nodeSelector:
+        # AWS EKS
+        # node.kubernetes.io/instance-type: p4d.24xlarge
+        # Azure AKS
+        # kubernetes.azure.com/agentpool: gpu
+        # GCP GKE
+        # cloud.google.com/gke-accelerator: nvidia-a100-80gb
+        nvidia.com/gpu.present: "true"
+      tolerations:
+        - key: "nvidia.com/gpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+
+      containers:
+        - name: torchrec-trainer
+          image: torchrec-quickstart:latest
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - -c
+            - |
+              # Wait for all pods to be ready
+              echo "Waiting for all pods to be ready..."
+              sleep 30
+
+              # Get pod index and total nodes
+              export RANK=$JOB_COMPLETION_INDEX
+              export WORLD_SIZE=$((NUM_NODES * GPUS_PER_NODE))
+              export LOCAL_RANK=0
+
+              # Find master node (pod with index 0)
+              export MASTER_ADDR="torchrec-quickstart-training-0.torchrec-headless.torchrec.svc.cluster.local"
+              export MASTER_PORT=29500
+
+              echo "Starting distributed training..."
+              echo "  RANK: $RANK"
+              echo "  WORLD_SIZE: $WORLD_SIZE"
+              echo "  MASTER_ADDR: $MASTER_ADDR"
+              echo "  MASTER_PORT: $MASTER_PORT"
+
+              # Launch training with torchrun
+              torchrun \
+                --nnodes=${NUM_NODES} \
+                --nproc_per_node=${GPUS_PER_NODE} \
+                --node_rank=${RANK} \
+                --rdzv_backend=c10d \
+                --rdzv_endpoint=${MASTER_ADDR}:${MASTER_PORT} \
+                train_torchrec_quickstart.py \
+                  --batch_size=${BATCH_SIZE} \
+                  --learning_rate=${LEARNING_RATE} \
+                  --embedding_dim=${EMBEDDING_DIM} \
+                  --num_epochs=${NUM_EPOCHS}
+
+          envFrom:
+            - configMapRef:
+                name: torchrec-config
+
+          resources:
+            requests:
+              cpu: "32"
+              memory: "256Gi"
+              nvidia.com/gpu: "8"
+            limits:
+              cpu: "64"
+              memory: "512Gi"
+              nvidia.com/gpu: "8"
+
+          ports:
+            - containerPort: 29500
+              name: nccl
+
+          # Shared memory for NCCL (critical for multi-GPU training)
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: data
+              mountPath: /data
+
+      volumes:
+        # Increase shared memory for NCCL
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: "64Gi"
+        # Mount data volume (configure based on your storage)
+        - name: data
+          emptyDir: {}
+          # For persistent storage, use PVC:
+          # persistentVolumeClaim:
+          #   claimName: torchrec-data-pvc
+
+---
+# Optional: PersistentVolumeClaim for data storage
+# Uncomment and configure based on your cloud provider
+# apiVersion: v1
+# kind: PersistentVolumeClaim
+# metadata:
+#   name: torchrec-data-pvc
+#   namespace: torchrec
+# spec:
+#   accessModes:
+#     - ReadWriteMany
+#   storageClassName: standard  # AWS: efs-sc, Azure: azurefile, GCP: filestore-sc
+#   resources:
+#     requests:
+#       storage: 1Ti
