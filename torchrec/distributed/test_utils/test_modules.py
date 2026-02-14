@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# pyre-strict
+
+"""
+OSS test modules for TorchRec distributed testing.
+
+distributed shampoo can be found in githb:
+https://github.com/facebookresearch/optimizers/blob/main/distributed_shampoo/README.md
+
+Usage:
+    from torchrec.distributed.test_utils.test_modules import DistributedShampoo
+"""
+
+# Try to import OSS DistributedShampoo
+# This will be available when installed via: pip install distributed-shampoo
+from distributed_shampoo import DistributedShampoo
+
+
+__all__ = ["DistributedShampoo"]

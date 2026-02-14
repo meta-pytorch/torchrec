@@ -19,16 +19,17 @@ To support a new model in pipeline benchmark:
 import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, cast, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.distributed as dist
 from torch import nn, optim
 from torch.optim import Optimizer
 from torchrec.distributed import DistributedModelParallel
+from torchrec.distributed.embedding import EmbeddingCollectionSharder
+from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
-from torchrec.distributed.sharding_plan import get_default_sharders
 from torchrec.distributed.test_utils.table_config import ManagedCollisionConfig
 from torchrec.distributed.test_utils.test_model import (
     TestMixedEmbeddingSparseArch,
@@ -37,7 +38,7 @@ from torchrec.distributed.test_utils.test_model import (
     TestTowerCollectionSparseNN,
     TestTowerSparseNN,
 )
-from torchrec.distributed.types import ShardingEnv
+from torchrec.distributed.types import ModuleSharder, ShardingEnv
 from torchrec.models.deepfm import SimpleDeepFMNNWrapper
 from torchrec.models.dlrm import DLRMWrapper
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
@@ -263,6 +264,34 @@ def create_model_config(model_name: str, **kwargs: Any) -> BaseModelConfig:
     return model_class(**filtered_kwargs)
 
 
+def get_sharders_with_fused_params(
+    fused_params: Optional[Dict[str, Any]] = None,
+) -> List[ModuleSharder[nn.Module]]:
+    """
+    Get EBC and EC sharders configured with fused parameters for sparse optimizers.
+
+    This function creates sharders that will use the specified fused_params
+    (including optimizer type like Shampoo) for embedding operations.
+
+    Args:
+        fused_params: Dictionary of fused parameters including optimizer settings.
+            Example: {"optimizer": EmbOptimType.SHAMPOO, "learning_rate": 0.01}
+
+    Returns:
+        List of sharders configured with the fused parameters
+    """
+    return [
+        cast(
+            ModuleSharder[nn.Module],
+            EmbeddingBagCollectionSharder(fused_params=fused_params),
+        ),
+        cast(
+            ModuleSharder[nn.Module],
+            EmbeddingCollectionSharder(fused_params=fused_params),
+        ),
+    ]
+
+
 def generate_sharded_model_and_optimizer(
     model: nn.Module,
     pg: dist.ProcessGroup,
@@ -284,12 +313,14 @@ def generate_sharded_model_and_optimizer(
 
     Args:
         model: The model to be sharded
-        sharding_type: Type of sharding strategy
-        kernel_type: Type of compute kernel
         pg: Process group for distributed training
         device: Device to place the model on
-        fused_params: Parameters for the fused optimizer
-        dense_optimizer: Optimizer type for dense parameters
+        fused_params: Parameters for the fused sparse optimizer. This includes
+            optimizer settings like {"optimizer": EmbOptimType.SHAMPOO, "learning_rate": 0.01}.
+            Supported optimizers include EXACT_ADAGRAD, EXACT_ROWWISE_ADAGRAD, SHAMPOO, etc.
+        dense_optimizer: Optimizer type for dense parameters. Supported values include
+            standard torch.optim optimizers (SGD, Adam, AdamW, etc.) and "Shampoo"
+            for the distributed Shampoo optimizer.
         dense_lr: Learning rate for dense parameters
         dense_momentum: Momentum for dense parameters (optional)
         dense_weight_decay: Weight decay for dense parameters (optional)
@@ -298,7 +329,8 @@ def generate_sharded_model_and_optimizer(
     Returns:
         Tuple of sharded model and optimizer
     """
-    sharders = get_default_sharders()
+    # Create sharders with fused_params so sparse optimizer (e.g., Shampoo) is used
+    sharders = get_sharders_with_fused_params(fused_params)
 
     # Use planner if provided
     plan = None
@@ -326,18 +358,28 @@ def generate_sharded_model_and_optimizer(
     ]
 
     # Create optimizer based on the specified type
-    optimizer_class = getattr(optim, dense_optimizer)
+    if dense_optimizer.lower() == "shampoo":
+        from torchrec.distributed.test_utils.test_modules import DistributedShampoo
 
-    # Create optimizer with momentum and/or weight_decay if provided
-    optimizer_kwargs = {"lr": dense_lr}
+        shampoo_kwargs: Dict[str, Any] = {"lr": dense_lr}
+        if dense_momentum is not None:
+            shampoo_kwargs["momentum"] = dense_momentum
+        if dense_weight_decay is not None:
+            shampoo_kwargs["weight_decay"] = dense_weight_decay
+        optimizer = DistributedShampoo(dense_params, **shampoo_kwargs)
+    else:
+        optimizer_class = getattr(optim, dense_optimizer)
 
-    if dense_momentum is not None:
-        optimizer_kwargs["momentum"] = dense_momentum
+        # Create optimizer with momentum and/or weight_decay if provided
+        optimizer_kwargs: Dict[str, Any] = {"lr": dense_lr}
 
-    if dense_weight_decay is not None:
-        optimizer_kwargs["weight_decay"] = dense_weight_decay
+        if dense_momentum is not None:
+            optimizer_kwargs["momentum"] = dense_momentum
 
-    optimizer = optimizer_class(dense_params, **optimizer_kwargs)
+        if dense_weight_decay is not None:
+            optimizer_kwargs["weight_decay"] = dense_weight_decay
+
+        optimizer = optimizer_class(dense_params, **optimizer_kwargs)
 
     return sharded_model, optimizer
 
