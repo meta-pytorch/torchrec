@@ -27,7 +27,6 @@ from typing import List, Optional
 logger: logging.Logger = logging.getLogger(__name__)
 
 import torch
-from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from torch import nn
 from torchrec.distributed.benchmark.base import (
     BenchFuncConfig,
@@ -40,7 +39,6 @@ from torchrec.distributed.benchmark.base import (
 from torchrec.distributed.test_utils.input_config import ModelInputConfig
 from torchrec.distributed.test_utils.model_config import (
     BaseModelConfig,
-    generate_sharded_model_and_optimizer,
     ModelSelectionConfig,
 )
 from torchrec.distributed.test_utils.model_input import ModelInput
@@ -49,13 +47,15 @@ from torchrec.distributed.test_utils.multi_process import (
     run_multi_process_func,
 )
 from torchrec.distributed.test_utils.pipeline_config import PipelineConfig
-from torchrec.distributed.test_utils.sharding_config import PlannerConfig
+from torchrec.distributed.test_utils.sharding_config import (
+    PlannerConfig,
+    ShardingConfig,
+)
 from torchrec.distributed.test_utils.table_config import (
     EmbeddingTablesConfig,
     TableExtendedConfigs,
 )
 from torchrec.distributed.train_pipeline import TrainPipeline
-from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
@@ -70,49 +70,28 @@ class RunOptions(BenchFuncConfig):
     Args:
         world_size (int): Number of processes/GPUs to use for distributed training.
             Default is 2.
+        batch_size (int): Batch size for training.
+            Default is 1024 * 32.
         num_batches (int): Number of batches to process during the benchmark.
             Default is 10.
-        sharding_type (ShardingType): Strategy for sharding embedding tables across devices.
-            Default is ShardingType.TABLE_WISE (entire tables are placed on single devices).
-        compute_kernel (EmbeddingComputeKernel): Compute kernel to use for embedding tables.
-            Default is EmbeddingComputeKernel.FUSED.
         input_type (str): Type of input format to use for the model.
             Default is "kjt" (KeyedJaggedTensor).
-        profile (str): Directory to save profiling results. If empty, profiling is disabled.
-            Default is "" (disabled).
-        name (str): Name of the profiling file. Default is pipeline classname.
-        planner_type (str): Type of sharding planner to use. Options are:
-            - "embedding": EmbeddingShardingPlanner (default)
-            - "hetero": HeteroEmbeddingShardingPlanner
-        pooling_factors (Optional[List[float]]): Pooling factors for each feature of the table.
-            This is the average number of values each sample has for the feature.
-        num_poolings (Optional[List[float]]): Number of poolings for each feature of the table.
-        dense_optimizer (str): Optimizer to use for dense parameters.
-            Default is "SGD".
-        dense_lr (float): Learning rate for dense parameters.
-            Default is 0.1.
-        sparse_optimizer (str): Optimizer to use for sparse parameters.
-            Default is "EXACT_ADAGRAD".
-        sparse_lr (float): Learning rate for sparse parameters.
-            Default is 0.1.
+        num_benchmarks (int): Number of benchmark iterations.
+            Default is 5.
+        num_profiles (int): Number of profiling iterations.
+            Default is 2.
+        export_stacks (bool): Whether to export stack traces.
+            Default is False.
+        debug_mode (bool): Whether to enable debug mode.
+            Default is False.
     """
 
     world_size: int = 2
     batch_size: int = 1024 * 32
     num_batches: int = 10
-    sharding_type: ShardingType = ShardingType.TABLE_WISE
     input_type: str = "kjt"
     num_benchmarks: int = 5
     num_profiles: int = 2
-    num_poolings: Optional[List[float]] = None
-    dense_optimizer: str = "SGD"
-    dense_lr: float = 0.1
-    dense_momentum: Optional[float] = None
-    dense_weight_decay: Optional[float] = None
-    sparse_optimizer: str = "EXACT_ADAGRAD"
-    sparse_lr: float = 0.1
-    sparse_momentum: Optional[float] = None
-    sparse_weight_decay: Optional[float] = None
     export_stacks: bool = False
     debug_mode: bool = False
 
@@ -128,6 +107,7 @@ def runner(
     pipeline_config: PipelineConfig,
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
+    sharding_config: ShardingConfig,
     table_related_configs: Optional[TableExtendedConfigs] = None,
     debug_mode: bool = False,
 ) -> BenchmarkResult:
@@ -169,29 +149,11 @@ def runner(
             weighted_tables=weighted_tables,
         )
 
-        # Prepare fused_params for sparse optimizer
-        fused_params = {
-            "optimizer": getattr(EmbOptimType, run_option.sparse_optimizer.upper()),
-            "learning_rate": run_option.sparse_lr,
-        }
-
-        # Add momentum and weight_decay to fused_params if provided
-        if run_option.sparse_momentum is not None:
-            fused_params["momentum"] = run_option.sparse_momentum
-
-        if run_option.sparse_weight_decay is not None:
-            fused_params["weight_decay"] = run_option.sparse_weight_decay
-
-        sharded_model, optimizer = generate_sharded_model_and_optimizer(
+        sharded_model, optimizer = sharding_config.generate_sharded_model_and_optimizer(
             model=unsharded_model,
             # pyrefly: ignore[bad-argument-type]
             pg=ctx.pg,
             device=ctx.device,
-            fused_params=fused_params,
-            dense_optimizer=run_option.dense_optimizer,
-            dense_lr=run_option.dense_lr,
-            dense_momentum=run_option.dense_momentum,
-            dense_weight_decay=run_option.dense_weight_decay,
             planner=planner,
         )
 
@@ -245,6 +207,7 @@ def run_pipeline(
     model_config: BaseModelConfig,
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
+    sharding_config: ShardingConfig,
 ) -> BenchmarkResult:
     tables, weighted_tables, *_ = table_config.generate_tables()
 
@@ -258,6 +221,7 @@ def run_pipeline(
         pipeline_config=pipeline_config,
         input_config=input_config,
         planner_config=planner_config,
+        sharding_config=sharding_config,
     )
 
     # Combine results from all ranks into a single BenchmarkResult
@@ -294,6 +258,7 @@ def main(
     pipeline_config: PipelineConfig,
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
+    sharding_config: ShardingConfig,
 ) -> None:
     if run_option.debug_mode:
         # pyrefly: ignore[missing-module-attribute]
@@ -318,6 +283,7 @@ def main(
         pipeline_config=pipeline_config,
         input_config=input_config,
         planner_config=planner_config,
+        sharding_config=sharding_config,
         table_related_configs=table_extended_config,
         debug_mode=run_option.debug_mode,
     )
