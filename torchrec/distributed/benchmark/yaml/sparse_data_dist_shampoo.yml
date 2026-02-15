@@ -7,15 +7,11 @@ RunOptions:
   num_batches: 10
   num_benchmarks: 1
   num_profiles: 1
-  sharding_type: table_wise
+  memory_snapshot: True
   profile_dir: "."
   name: "sparse_data_dist_shampoo"
   # export_stacks: True # enable this to export stack traces
   loglevel: "info"
-  dense_optimizer: "Shampoo"
-  dense_lr: 0.01
-  sparse_optimizer: "EXACT_ROWWISE_ADAGRAD"
-  sparse_lr: 0.01
 PipelineConfig:
   pipeline: "sparse"
 ModelInputConfig:
@@ -50,6 +46,13 @@ EmbeddingTablesConfig:
         num_embeddings: 100_000
         feature_names: ["additional_2_1"]
 PlannerConfig:
+  sharding_type: table_wise
   additional_constraints:
     large_table:
       sharding_types: [column_wise]
+ShardingConfig:
+  dense_optimizer: "Shampoo"
+  dense_lr: 0.01
+  fused_params:
+    optimizer: EXACT_ROWWISE_ADAGRAD
+    learning_rate: 0.01

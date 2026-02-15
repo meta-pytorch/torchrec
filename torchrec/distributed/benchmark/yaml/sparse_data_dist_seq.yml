@@ -20,7 +20,7 @@ ModelSelectionConfig:
     num_float_features: 100
 EmbeddingTablesConfig:
   num_unweighted_features: 70
-  num_weighted_features: 70
+  num_weighted_features: 0
   embedding_feature_dim: 256
   additional_tables:
     # First list: unweighted tables (EBC + EC mixed)
@@ -46,6 +46,6 @@ EmbeddingTablesConfig:
     # Second list: weighted tables (empty for this config)
     - []
 PlannerConfig:
-  pooling_factors: [30.0]
+  pooling_factors: [10.0]
   hardware:  # A100
     hbm_cap: 85899345920  # 80GB
