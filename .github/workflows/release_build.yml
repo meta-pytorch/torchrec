@@ -39,6 +39,11 @@ jobs:
             python-version: '3.14'
             python-tag: "py314"
             cuda-tag: "cu126"
+          - os: linux.2xlarge
+            python-version: '3.14'
+            python-tag: "py314"
+            cuda-tag: "cu126"
+            free-threaded: true
     steps:
       # Checkout the repository to the GitHub Actions runner
       - name: Check ldd --version
@@ -59,7 +64,11 @@ jobs:
           echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
       - name: create conda env
         run: |
-          conda create --name build_binary python=${{ matrix.python-version }}
+          if [[ "${{ matrix.free-threaded }}" == "true" ]]; then
+            conda create --name build_binary python-freethreading=${{ matrix.python-version }}
+          else
+            conda create --name build_binary python=${{ matrix.python-version }}
+          fi
           conda info
       - name: check python version no Conda
         run: |
@@ -104,7 +113,7 @@ jobs:
       - name: Upload wheel as GHA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: torchrec_${{ matrix.python-version }}_${{ matrix.cuda-tag }}.whl
+          name: torchrec_${{ matrix.python-version }}${{ matrix.free-threaded == true && 't' || '' }}_${{ matrix.cuda-tag }}.whl
           path: dist/torchrec-*.whl
 
   # download from GHA, sanity check on gpu and push to pypi
@@ -122,6 +131,11 @@ jobs:
           - "3.14"
         cuda-tag:
           - "cu126"
+        include:
+          - os: linux.g5.12xlarge.nvidia.gpu
+            python-version: "3.14"
+            cuda-tag: "cu126"
+            free-threaded: true
     needs: build_on_cpu
     # the glibc version should match the version of the one we used to build the binary
     # for this case, it's 2.26
@@ -171,7 +185,11 @@ jobs:
           echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
       - name: create conda env
         run: |
-          conda create --name build_binary python=${{ matrix.python-version }}
+          if [[ "${{ matrix.free-threaded }}" == "true" ]]; then
+            conda create --name build_binary python-freethreading=${{ matrix.python-version }}
+          else
+            conda create --name build_binary python=${{ matrix.python-version }}
+          fi
           conda info
       - name: check python version no Conda
         run: |
@@ -199,7 +217,7 @@ jobs:
       - name: Download wheel
         uses: actions/download-artifact@v4
         with:
-          name: torchrec_${{ matrix.python-version }}_${{ matrix.cuda-tag }}.whl
+          name: torchrec_${{ matrix.python-version }}${{ matrix.free-threaded == true && 't' || '' }}_${{ matrix.cuda-tag }}.whl
       - name: Display structure of downloaded files
         run: ls -R
       - name: Install TorchRec
