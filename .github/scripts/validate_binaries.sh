@@ -107,12 +107,11 @@ conda run -n "${CONDA_ENV}" python -c "import torch; print(torch.cuda.is_availab
 conda run -n "${CONDA_ENV}" python -c "import torch; print(torch.version.cuda)"
 
 # Finally run smoke test
-# python 3.11 needs torchx-nightly
-conda run -n "${CONDA_ENV}" pip install torchx-nightly iopath
+conda run -n "${CONDA_ENV}" pip install iopath
 if [[ ${MATRIX_GPU_ARCH_TYPE} = 'cuda' ]]; then
-    conda run -n "${CONDA_ENV}" torchx run -s local_cwd dist.ddp -j 1 --gpu 2 --script test_installation.py
+    conda run -n "${CONDA_ENV}" torchrun --nnodes=1 --nproc_per_node=gpu test_installation.py
 else
-    conda run -n "${CONDA_ENV}" torchx run -s local_cwd dist.ddp -j 1 --script test_installation.py -- --cpu_only
+    conda run -n "${CONDA_ENV}" torchrun --nnodes=1 --nproc_per_node=1 test_installation.py --cpu_only
 fi
 
 
@@ -173,8 +172,6 @@ conda run -n "${CONDA_ENV}" python -c "import torch; print(torch.cuda.is_availab
 # check cuda version
 conda run -n "${CONDA_ENV}" python -c "import torch; print(torch.version.cuda)"
 
-# python 3.11 needs torchx-nightly
-conda run -n "${CONDA_ENV}" pip install torchx-nightly iopath
-
 # Finally run smoke test
-conda run -n "${CONDA_ENV}" torchx run -s local_cwd dist.ddp -j 1 --gpu 2 --script test_installation.py
+conda run -n "${CONDA_ENV}" pip install iopath
+conda run -n "${CONDA_ENV}" torchrun --nnodes=1 --nproc_per_node=gpu test_installation.py
