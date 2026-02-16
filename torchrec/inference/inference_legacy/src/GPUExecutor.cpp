@@ -31,7 +31,6 @@
 #include <torch/csrc/deploy/deploy.h> // @manual
 #endif
 
-#include "ATen/cuda/CUDAEvent.h"
 #include "torchrec/inference/ExceptionHandler.h"
 #include "torchrec/inference/Observer.h"
 #include "torchrec/inference/Types.h"
