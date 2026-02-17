@@ -18,6 +18,7 @@ from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import (
     BATCHED_COPY_PERF_FACTOR,
     BIGINT_DTYPE,
+    DEFAULT_PERF_ESTIMATOR,
     DP_ELEMENTWISE_KERNELS_PERF_FACTOR,
     FULL_BLOCK_EMB_DIM,
     HALF_BLOCK_PENALTY,
@@ -27,6 +28,9 @@ from torchrec.distributed.planner.constants import (
     QUARTER_BLOCK_PENALTY,
     UVM_CACHING_RATIO,
     WEIGHTED_KERNEL_MULTIPLIER,
+)
+from torchrec.distributed.planner.estimator.estimator import (
+    EmbeddingPerfEstimatorFactory,
 )
 from torchrec.distributed.planner.types import (
     CollectiveType,
@@ -39,7 +43,12 @@ from torchrec.distributed.planner.types import (
     Storage,
     Topology,
 )
-from torchrec.distributed.planner.utils import prod, sharder_name
+from torchrec.distributed.planner.utils import (
+    extract_comm_data_type_size,
+    is_prefetch_pipelined,
+    prod,
+    sharder_name,
+)
 from torchrec.distributed.types import (
     CacheStatistics,
     CommOp,
@@ -110,6 +119,16 @@ class EmbeddingPerfEstimator(ShardEstimator):
         self._topology = topology
         self._constraints = constraints
         self._is_inference = is_inference
+        self._estimator = None
+        if torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:enable_config_based_fb_perf_estimators"
+        ):
+            self._estimator = EmbeddingPerfEstimatorFactory.create(
+                DEFAULT_PERF_ESTIMATOR,
+                topology=topology,
+                constraints=constraints,
+                is_inference=is_inference,
+            )
 
     def estimate(
         self,
@@ -123,6 +142,10 @@ class EmbeddingPerfEstimator(ShardEstimator):
             sharding_options (List[ShardingOption]): list of sharding options.
             sharder_map (Optional[Dict[str, ModuleSharder[nn.Module]]]): sharder map.
         """
+        if self._estimator is not None:
+            return self._estimator.estimate(sharding_options, sharder_map)
+
+        # TODO: remove rest of the  when cleaning up the Kill Switch
         if not sharder_map:
             assert not sharding_options, "sharder_map not provided for sharding_options"
             return
@@ -195,9 +218,9 @@ class EmbeddingPerfEstimator(ShardEstimator):
                 bwd_a2a_comm_data_type_size,
                 fwd_sr_comm_data_type_size,
                 bwd_sr_comm_data_type_size,
-            ) = _extract_comm_data_type_size(sharder, sharding_option)
+            ) = extract_comm_data_type_size(sharder, sharding_option)
 
-            prefetch_pipeline = _is_prefetch_pipelined(sharding_option, sharder)
+            prefetch_pipeline = is_prefetch_pipelined(sharding_option, sharder)
 
             # hardcoded as 8 bytes
             # input indices can be of int32, but in TBE they get converted to int64 anyway
@@ -959,64 +982,6 @@ class EmbeddingPerfEstimator(ShardEstimator):
             bwd_compute=bwd_compute + bwd_grad_indice_weights_kernel,
             bwd_comms=all_reduce + optimizer_kernels,
         )
-
-
-def _extract_comm_data_type_size(
-    sharder: ModuleSharder[nn.Module], sharding_option: ShardingOption
-) -> Tuple[float, float, float, float]:
-    table_data_type_size = sharding_option.tensor.element_size()
-
-    fwd_a2a_comm_data_type_size = table_data_type_size
-    bwd_a2a_comm_data_type_size = table_data_type_size
-    fwd_sr_comm_data_type_size = table_data_type_size
-    bwd_sr_comm_data_type_size = table_data_type_size
-
-    if sharder.qcomm_codecs_registry is not None:
-        qcomm_codecs_registry = sharder.qcomm_codecs_registry
-        if (
-            sharding_option.is_pooled
-            and CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name in qcomm_codecs_registry
-        ):
-            codecs = sharder.qcomm_codecs_registry[
-                CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name
-            ]
-            fwd_a2a_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.forward.quantized_dtype
-            ).element_size()
-            bwd_a2a_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.backward.quantized_dtype
-            ).element_size()
-
-        if (
-            not sharding_option.is_pooled
-            and CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name in qcomm_codecs_registry
-        ):
-            codecs = qcomm_codecs_registry[CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name]
-            fwd_a2a_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.forward.quantized_dtype
-            ).element_size()
-            bwd_a2a_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.backward.quantized_dtype
-            ).element_size()
-
-        if (
-            sharding_option.is_pooled
-            and CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name in qcomm_codecs_registry
-        ):
-            codecs = qcomm_codecs_registry[CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name]
-            fwd_sr_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.forward.quantized_dtype
-            ).element_size()
-            bwd_sr_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.backward.quantized_dtype
-            ).element_size()
-
-    return (
-        fwd_a2a_comm_data_type_size,
-        bwd_a2a_comm_data_type_size,
-        fwd_sr_comm_data_type_size,
-        bwd_sr_comm_data_type_size,
-    )
 
 
 class EmbeddingStorageEstimator(ShardEstimator):
