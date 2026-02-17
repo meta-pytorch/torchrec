@@ -1,0 +1,25 @@
+# TorchRec Quickstart Requirements
+# Install: pip install -r requirements.txt
+
+# Core PyTorch ecosystem
+torch>=2.1.0
+torchmetrics>=1.0.0
+
+# TorchRec and FBGEMM for distributed embeddings
+torchrec>=0.6.0
+fbgemm-gpu>=0.6.0
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Utilities
+tqdm>=4.65.0
+tensorboard>=2.14.0
+
+# Optional: TorchX for legacy job orchestration (no longer actively maintained)
+# torchx>=0.7.0
+
+# Optional: For loading real datasets
+# pyarrow>=14.0.0
+# criteo-tft>=0.3.0
