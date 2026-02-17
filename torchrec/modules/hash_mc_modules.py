@@ -184,6 +184,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
     IDENTITY_BUFFER: str = "_hash_zch_identities"
     METADATA_BUFFER: str = "_hash_zch_metadata"
     BUCKET_BUFFER: str = "_hash_zch_bucket"
+    RUNTIME_META_BUFFER: str = "_hash_zch_runtime_meta"
 
     table_name_on_device_remapped_ids_dict: Dict[
         str, torch.Tensor
@@ -211,6 +212,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         opt_in_prob: int = -1,
         percent_reserved_slots: float = 0,
         disable_fallback: bool = False,
+        track_id_freq: bool = False,
     ) -> None:
         if output_segments is None:
             assert (
@@ -274,6 +276,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 or self._eviction_policy_name != HashZchEvictionPolicyName.LRU_EVICTION
             ), "LRU eviction is not compatible with opt-in at this time"
         self._disable_fallback: bool = disable_fallback
+        self._track_id_freq: bool = track_id_freq
 
         if torch.jit.is_scripting() or self._is_inference or self._name is None:
             self._tb_logging_frequency = 0
@@ -304,6 +307,14 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
 
         self._hash_zch_identities = torch.nn.Parameter(identities, requires_grad=False)
         self.register_buffer(HashZchManagedCollisionModule.METADATA_BUFFER, metadata)
+        self._hash_zch_runtime_meta: Optional[torch.Tensor] = None
+        if self._track_id_freq:
+            self._hash_zch_runtime_meta = torch.nn.Parameter(
+                torch.zeros(
+                    (self._zch_size, 1), dtype=torch.int64, device=self._device
+                ),
+                requires_grad=False,
+            )
 
         self._max_probe = max_probe
         self._buckets = total_num_buckets
@@ -359,6 +370,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._output_global_offset_tensor=}, {self._output_segments=}, "
             f"{inference_dispatch_div_train_world_size=}, "
             f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}"
+            f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, {self._track_id_freq=}"
         )
 
     @property
@@ -374,10 +386,15 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, torch.Tensor]]:
         yield from super().named_buffers(prefix, recurse, remove_duplicate)
-        key: str = HashZchManagedCollisionModule.IDENTITY_BUFFER
+        identity_key: str = HashZchManagedCollisionModule.IDENTITY_BUFFER
+        runtime_buffer_key: str = HashZchManagedCollisionModule.RUNTIME_META_BUFFER
         if prefix:
-            key = f"{prefix}.{key}"
-        yield (key, self._hash_zch_identities.data)
+            identity_key = f"{prefix}.{identity_key}"
+            runtime_buffer_key = f"{prefix}.{runtime_buffer_key}"
+        yield (identity_key, self._hash_zch_identities.data)
+        if self._track_id_freq:
+            # pyrefly: ignore[missing-attribute]
+            yield (runtime_buffer_key, self._hash_zch_runtime_meta.data)
 
     def validate_state(self) -> None:
         raise NotImplementedError()
@@ -546,6 +563,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     opt_in_prob=self._opt_in_prob,
                     num_reserved_slots=num_reserved_slots,
                     opt_in_rands=opt_in_rands,
+                    runtime_meta=self._hash_zch_runtime_meta,
                 )
 
                 # record the on-device remapped ids
@@ -642,6 +660,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             opt_in_prob=self._opt_in_prob,
             percent_reserved_slots=self._percent_reserved_slots,
             disable_fallback=self._disable_fallback,
+            track_id_freq=self._track_id_freq,
         )
 
 
