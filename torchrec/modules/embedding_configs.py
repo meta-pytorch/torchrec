@@ -392,15 +392,23 @@ class BaseEmbeddingConfig:
 
     def get_weight_init_max(self) -> float:
         if self.weight_init_max is None:
+            if torch._utils_internal.justknobs_check(
+                "pytorch/torchrec:killswitch_use_embedding_dim_for_weight_norm"
+            ):
+                return sqrt(1 / self.embedding_dim)
             return sqrt(1 / self.num_embeddings)
-        else:
-            return self.weight_init_max
+
+        return self.weight_init_max
 
     def get_weight_init_min(self) -> float:
         if self.weight_init_min is None:
+            if torch._utils_internal.justknobs_check(
+                "pytorch/torchrec:killswitch_use_embedding_dim_for_weight_norm"
+            ):
+                return -sqrt(1 / self.embedding_dim)
             return -sqrt(1 / self.num_embeddings)
-        else:
-            return self.weight_init_min
+
+        return self.weight_init_min
 
     def num_features(self) -> int:
         return len(self.feature_names)
