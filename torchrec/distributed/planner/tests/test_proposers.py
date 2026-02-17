@@ -14,8 +14,9 @@ from unittest.mock import MagicMock
 import torch
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
-from torchrec.distributed.planner.constants import BATCH_SIZE
+from torchrec.distributed.planner.constants import BATCH_SIZE, DEFAULT_PERF_ESTIMATOR
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
+from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
 from torchrec.distributed.planner.proposers import (
     DynamicProgrammingProposer,
     EmbeddingOffloadScaleupProposer,
@@ -26,7 +27,6 @@ from torchrec.distributed.planner.proposers import (
 )
 from torchrec.distributed.planner.shard_estimators import (
     _calculate_storage_specific_sizes,
-    EmbeddingPerfEstimator,
     EmbeddingStorageEstimator,
 )
 from torchrec.distributed.planner.types import (
@@ -685,8 +685,10 @@ class TestProposers(unittest.TestCase):
             batch_size=BATCH_SIZE,
             constraints=constraints,
             estimator=[
-                EmbeddingPerfEstimator(
-                    topology=storage_constraint, constraints=constraints
+                EmbeddingPerfEstimatorFactory.create(
+                    DEFAULT_PERF_ESTIMATOR,
+                    topology=storage_constraint,
+                    constraints=constraints,
                 ),
                 EmbeddingStorageEstimator(
                     topology=storage_constraint,
@@ -863,8 +865,10 @@ class TestProposers(unittest.TestCase):
             batch_size=BATCH_SIZE,
             constraints=constraints,
             estimator=[
-                EmbeddingPerfEstimator(
-                    topology=storage_constraint, constraints=constraints
+                EmbeddingPerfEstimatorFactory.create(
+                    DEFAULT_PERF_ESTIMATOR,
+                    topology=storage_constraint,
+                    constraints=constraints,
                 ),
                 EmbeddingStorageEstimator(
                     topology=storage_constraint,

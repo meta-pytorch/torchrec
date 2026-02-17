@@ -29,11 +29,10 @@ from torchrec.distributed.infer_utils import (
     get_tbes_from_sharded_module,
 )
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.planner.constants import DEFAULT_PERF_ESTIMATOR
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
-from torchrec.distributed.planner.shard_estimators import (
-    EmbeddingPerfEstimator,
-    EmbeddingStorageEstimator,
-)
+from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
+from torchrec.distributed.planner.shard_estimators import EmbeddingStorageEstimator
 from torchrec.distributed.quant_embedding import QuantEmbeddingCollectionSharder
 from torchrec.distributed.quant_embeddingbag import (
     QuantEmbeddingBagCollectionSharder,
@@ -1045,7 +1044,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -1158,7 +1159,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -1279,7 +1282,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -1388,7 +1393,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -1590,7 +1597,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -1701,7 +1710,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -2146,7 +2157,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -2222,7 +2235,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -2322,7 +2337,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -2401,7 +2418,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -2540,7 +2559,9 @@ class InferShardingsTest(unittest.TestCase):
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),

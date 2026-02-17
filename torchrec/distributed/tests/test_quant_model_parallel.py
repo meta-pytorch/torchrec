@@ -17,11 +17,10 @@ from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel, ModuleSharder
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.planner.constants import DEFAULT_PERF_ESTIMATOR
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
-from torchrec.distributed.planner.shard_estimators import (
-    EmbeddingPerfEstimator,
-    EmbeddingStorageEstimator,
-)
+from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
+from torchrec.distributed.planner.shard_estimators import EmbeddingStorageEstimator
 from torchrec.distributed.shard import _shard_modules
 from torchrec.distributed.test_utils.infer_utils import quantize, TestQuantEBCSharder
 from torchrec.distributed.test_utils.test_model import (
@@ -509,7 +508,9 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
                 topology=topology,
                 batch_size=1,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -598,7 +599,9 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
                 topology=topology,
                 batch_size=1,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -682,7 +685,9 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
                 topology=topology,
                 batch_size=1,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),
@@ -773,7 +778,9 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
                     topology=topology,
                     batch_size=1,
                     estimator=[
-                        EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                        EmbeddingPerfEstimatorFactory.create(
+                            DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                        ),
                         EmbeddingStorageEstimator(topology=topology),
                     ],
                 ),

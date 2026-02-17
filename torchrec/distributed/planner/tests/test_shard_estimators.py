@@ -25,13 +25,14 @@ from torchrec.distributed.fbgemm_qcomm_codec import (
 from torchrec.distributed.planner.constants import (
     BATCH_SIZE,
     CROSS_NODE_BANDWIDTH,
+    DEFAULT_PERF_ESTIMATOR,
     INTRA_NODE_BANDWIDTH,
 )
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
+from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
 from torchrec.distributed.planner.shard_estimators import (
     _calculate_storage_specific_sizes,
     EmbeddingOffloadStats,
-    EmbeddingPerfEstimator,
     EmbeddingStorageEstimator,
 )
 from torchrec.distributed.planner.types import (
@@ -63,7 +64,9 @@ from torchrec.modules.embedding_configs import (
 class TestEmbeddingPerfEstimator(unittest.TestCase):
     def setUp(self) -> None:
         self.topology = Topology(world_size=2, compute_device="cuda")
-        self.estimator = EmbeddingPerfEstimator(topology=self.topology)
+        self.estimator = EmbeddingPerfEstimatorFactory.create(
+            DEFAULT_PERF_ESTIMATOR, topology=self.topology
+        )
         self.enumerator = EmbeddingEnumerator(
             topology=self.topology, batch_size=BATCH_SIZE, estimator=self.estimator
         )
@@ -800,8 +803,8 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
         model = TestSparseNN(tables=tables, weighted_tables=[])
         quant_model = quantize(model, inplace=True)
 
-        inference_estimator = EmbeddingPerfEstimator(
-            topology=self.topology, is_inference=True
+        inference_estimator = EmbeddingPerfEstimatorFactory.create(
+            DEFAULT_PERF_ESTIMATOR, topology=self.topology, is_inference=True
         )
         inference_enumerator = EmbeddingEnumerator(
             topology=self.topology, batch_size=BATCH_SIZE, estimator=inference_estimator
@@ -964,7 +967,9 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                 compute_device="cuda",
                 weighted_feature_bwd_compute_multiplier=weighted_feature_bwd_compute_multiplier,
             )
-            estimator = EmbeddingPerfEstimator(topology=topology)
+            estimator = EmbeddingPerfEstimatorFactory.create(
+                DEFAULT_PERF_ESTIMATOR, topology=topology
+            )
             enumerator = EmbeddingEnumerator(
                 topology=topology, batch_size=BATCH_SIZE, estimator=estimator
             )
@@ -1091,7 +1096,9 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
             inter_host_bw=40.0 * 1024**3 / 1000,
             intra_host_bw=300.0 * 1024**3 / 1000,
         )
-        self.estimator = EmbeddingPerfEstimator(topology=self.topology)
+        self.estimator = EmbeddingPerfEstimatorFactory.create(
+            DEFAULT_PERF_ESTIMATOR, topology=self.topology
+        )
         self.enumerator = EmbeddingEnumerator(
             topology=self.topology, batch_size=BATCH_SIZE, estimator=self.estimator
         )
@@ -1105,7 +1112,9 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                 intra_host_bw=300.0 * 1024**3 / 1000,
             ),
         )
-        self.estimator2 = EmbeddingPerfEstimator(topology=self.topology2)
+        self.estimator2 = EmbeddingPerfEstimatorFactory.create(
+            DEFAULT_PERF_ESTIMATOR, topology=self.topology2
+        )
         self.enumerator2 = EmbeddingEnumerator(
             topology=self.topology2, batch_size=BATCH_SIZE, estimator=self.estimator2
         )
