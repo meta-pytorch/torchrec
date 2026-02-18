@@ -38,6 +38,7 @@ from torchrec.distributed.planner.types import (
     CollectiveType,
     ParameterConstraints,
     Perf,
+    ShardEstimator,
     ShardingOption,
     Topology,
 )
@@ -1731,7 +1732,7 @@ def get_embedding_perf_sharding_evaluator(
 # =============================================================================
 
 
-class EmbeddingPerfEstimatorV2:  # TODO rename this later
+class EmbeddingPerfEstimatorV2(ShardEstimator):  # TODO rename this later
     """
     Embedding Performance Estimator using HardwarePerfConfig.
     This estimator uses :
