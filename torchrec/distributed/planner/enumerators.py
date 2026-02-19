@@ -13,7 +13,6 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
-from torch._utils_internal import justknobs_check
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import (
     DEFAULT_PERF_ESTIMATOR,
@@ -61,28 +60,10 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 # compute kernels that should only be used if users specified them
-def get_guarded_compute_kernels() -> Set[EmbeddingComputeKernel]:
-    """
-    Returns the set of guarded compute kernels.
-
-    When pytorch/torchrec:enable_ssd_offloading is enabled, KEY_VALUE is removed
-    from the guarded set, allowing SSD offloading to be considered by default.
-
-    NOTE: This is a temporary function for the SSD offloading rollout. It exists
-    because justknobs_check cannot be called at module import time (not fork-safe).
-    This function will be removed once the rollout is complete and the JustKnob
-    is cleaned up.
-    """
-    if justknobs_check("pytorch/torchrec:enable_ssd_offloading"):
-        return {
-            EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,
-            EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
-        }
-    return {
-        EmbeddingComputeKernel.KEY_VALUE,
-        EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,
-        EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
-    }
+GUARDED_COMPUTE_KERNELS: Set[EmbeddingComputeKernel] = {
+    EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,
+    EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
+}
 
 
 # sharding types that require explicit user specification for feature-processed modules
@@ -429,7 +410,7 @@ class EmbeddingEnumerator(Enumerator):
             constrained_compute_kernels: List[str] = [
                 compute_kernel.value
                 for compute_kernel in EmbeddingComputeKernel
-                if compute_kernel not in get_guarded_compute_kernels()
+                if compute_kernel not in GUARDED_COMPUTE_KERNELS
             ]
 
         # setup filtered_compute_kernels
