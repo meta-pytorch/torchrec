@@ -30,6 +30,7 @@ from torchrec.distributed.planner.constants import (
     DDR_MEM_BW,
     HBM_MEM_BW,
     kernel_bw_lookup,
+    SSD_MEM_BW,
     WEIGHTED_FEATURE_BWD_COMPUTE_MULTIPLIER,
     WEIGHTED_KERNEL_MULTIPLIER,
 )
@@ -257,6 +258,7 @@ class HardwarePerfConfig:
     # Hardware bandwidth defaults (can be overridden by decorators)
     hbm_mem_bw: float = HBM_MEM_BW
     ddr_mem_bw: float = DDR_MEM_BW
+    ssd_mem_bw: float = SSD_MEM_BW
 
     # Optional bandwidth overrides (None = use ctx/topology values)
     device_bw: Optional[float] = None
@@ -421,6 +423,7 @@ class HardwarePerfConfig:
         compute_kernel: str,
         hbm_mem_bw: float,
         ddr_mem_bw: float,
+        ssd_mem_bw: float,
         hbm_to_ddr_mem_bw: float,
         caching_ratio: Optional[float] = None,
         prefetch_pipeline: bool = False,
@@ -438,6 +441,7 @@ class HardwarePerfConfig:
             compute_kernel: The embedding compute kernel (e.g., "fused", "dense")
             hbm_mem_bw: HBM memory bandwidth
             ddr_mem_bw: DDR memory bandwidth
+            ssd_mem_bw: SSD memory bandwidth
             hbm_to_ddr_mem_bw: HBM to DDR bandwidth
             caching_ratio: Optional caching ratio for UVM caching
             prefetch_pipeline: Whether prefetch pipeline is enabled
@@ -472,6 +476,7 @@ class HardwarePerfConfig:
             hbm_to_ddr_mem_bw=hbm_to_ddr_mem_bw,
             caching_ratio=caching_ratio,
             prefetch_pipeline=prefetch_pipeline,
+            ssd_mem_bw=ssd_mem_bw,
         )
         if bw is None:
             raise ValueError(
@@ -711,6 +716,7 @@ class ShardPerfContext:
             sharding_option.compute_kernel,
             topology.hbm_mem_bw,
             topology.ddr_mem_bw,
+            topology.ssd_mem_bw,
             topology.hbm_to_ddr_mem_bw,
             caching_ratio,
             prefetch_pipeline,

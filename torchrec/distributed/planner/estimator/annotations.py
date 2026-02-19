@@ -282,6 +282,28 @@ def ddr_mem_bw(value: float) -> Callable[[Type[T]], Type[T]]:
     return decorator
 
 
+def ssd_mem_bw(value: float) -> Callable[[Type[T]], Type[T]]:
+    """
+    Decorator to set SSD memory bandwidth for a hardware config.
+
+    SSD storage is used for SSD offloading (KEY_VALUE compute kernel).
+
+    Args:
+        value: SSD memory bandwidth in bytes/second
+
+    Example:
+        @ssd_mem_bw(100 * 1024 * 1024)  # 100 MB/s
+        class MyHardwarePerfConfig(DefaultHardwarePerfConfig):
+            pass
+    """
+
+    def decorator(cls: Type[T]) -> Type[T]:
+        cls.ssd_mem_bw = value  # pyre-ignore[16]
+        return cls
+
+    return decorator
+
+
 def hbm_to_ddr_mem_bw(value: float) -> Callable[[Type[T]], Type[T]]:
     """
     Decorator to set HBM to DDR memory bandwidth for a hardware config.

@@ -25,6 +25,7 @@ from torchrec.distributed.planner.estimator.annotations import (
     fwd_coefficient as fwd_coefficient,  # noqa: F401
     output_write_size as output_write_size,  # noqa: F401
     prefetch_coefficient as prefetch_coefficient,  # noqa: F401
+    ssd_mem_bw as ssd_mem_bw,  # noqa: F401
     supported_sharding_types as supported_sharding_types,  # noqa: F401
 )
 from torchrec.distributed.planner.estimator.config import (

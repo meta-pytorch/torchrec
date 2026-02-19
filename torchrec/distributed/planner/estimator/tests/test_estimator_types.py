@@ -317,6 +317,7 @@ class HardwarePerfConfigTest(unittest.TestCase):
             compute_kernel="fused",
             hbm_mem_bw=900.0,
             ddr_mem_bw=100.0,
+            ssd_mem_bw=50.0,
             hbm_to_ddr_mem_bw=200.0,
         )
         self.assertEqual(bw, 1000.0)
@@ -334,6 +335,7 @@ class HardwarePerfConfigTest(unittest.TestCase):
             compute_kernel="dense",
             hbm_mem_bw=900.0,
             ddr_mem_bw=100.0,
+            ssd_mem_bw=50.0,
             hbm_to_ddr_mem_bw=200.0,
         )
         self.assertEqual(bw, 500.0)
@@ -346,6 +348,7 @@ class HardwarePerfConfigTest(unittest.TestCase):
             compute_kernel=EmbeddingComputeKernel.FUSED.value,
             hbm_mem_bw=900.0,
             ddr_mem_bw=100.0,
+            ssd_mem_bw=50.0,
             hbm_to_ddr_mem_bw=200.0,
         )
         self.assertEqual(bw, 900.0)
@@ -359,6 +362,7 @@ class HardwarePerfConfigTest(unittest.TestCase):
                 compute_kernel="invalid_kernel",
                 hbm_mem_bw=900.0,
                 ddr_mem_bw=100.0,
+                ssd_mem_bw=50.0,
                 hbm_to_ddr_mem_bw=200.0,
             )
         self.assertIn("invalid_kernel", str(ctx.exception))

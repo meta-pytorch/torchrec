@@ -261,7 +261,11 @@ class GreedyPerfPartitioner(Partitioner):
         devices = [
             DeviceHardware(
                 rank=d.rank,
-                storage=Storage(hbm=hbm_per_device or d.storage.hbm, ddr=d.storage.ddr),
+                storage=Storage(
+                    hbm=hbm_per_device or d.storage.hbm,
+                    ddr=d.storage.ddr,
+                    ssd=d.storage.ssd,
+                ),
                 perf=copy.deepcopy(d.perf),
             )
             for d in storage_constraint.devices
@@ -599,7 +603,7 @@ class GreedyPerfPartitioner(Partitioner):
         sorted_host_level_devices = _sort_devices_by_perf(_host_level_devices)
         for devices in sorted_host_level_devices:
             host_devices = copy.deepcopy(devices)
-            host_storage = Storage(hbm=0, ddr=0)
+            host_storage = Storage(hbm=0, ddr=0, ssd=0)
             for device in host_devices:
                 host_storage += device.storage
             if not sharding_option_group.storage_sum.fits_in(host_storage):

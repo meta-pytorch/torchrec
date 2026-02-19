@@ -267,6 +267,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
                 num_poolings=num_poolings,
                 hbm_mem_bw=self._topology.hbm_mem_bw,
                 ddr_mem_bw=self._topology.ddr_mem_bw,
+                ssd_mem_bw=self._topology.ssd_mem_bw,
                 hbm_to_ddr_mem_bw=self._topology.hbm_to_ddr_mem_bw,
                 comms_bandwidths=self._topology.comms_bandwidths,
                 bwd_compute_multiplier=self._topology.bwd_compute_multiplier,
@@ -306,6 +307,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
         num_poolings: List[float],
         hbm_mem_bw: float,
         ddr_mem_bw: float,
+        ssd_mem_bw: float,
         hbm_to_ddr_mem_bw: float,
         comms_bandwidths: GeneralizedCommsBandwidth,
         bwd_compute_multiplier: float,
@@ -372,6 +374,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
             hbm_to_ddr_mem_bw,
             caching_ratio,
             prefetch_pipeline,
+            ssd_mem_bw=ssd_mem_bw,
         )
         if device_bw is None:
             raise PlannerError(
@@ -1268,6 +1271,28 @@ def calculate_shard_storages(
         optimizer_class=optimizer_class,
         is_inference=is_inference,
     )
+    ssd_specific_sizes: List[int] = [
+        hbm_specific_size + ddr_specific_size
+        for hbm_specific_size, ddr_specific_size in zip(
+            _calculate_storage_specific_sizes(
+                storage=tensor_storage.get("hbm", 0),
+                shape=tensor.shape,
+                shard_sizes=shard_sizes,
+                sharding_type=sharding_type,
+                optimizer_class=optimizer_class,
+                is_inference=is_inference,
+                clf=caching_ratio if table_cached else None,
+            ),
+            _calculate_storage_specific_sizes(
+                storage=tensor_storage.get("ddr", 0),
+                shape=tensor.shape,
+                shard_sizes=shard_sizes,
+                sharding_type=sharding_type,
+                optimizer_class=optimizer_class,
+                is_inference=is_inference,
+            ),
+        )
+    ]
 
     if (
         compute_kernel
@@ -1335,13 +1360,25 @@ def calculate_shard_storages(
             ddr_specific_sizes,
         )
     ]
+    ssd_sizes: List[int] = [
+        (
+            ssd_specific_size
+            if compute_kernel
+            in {
+                EmbeddingComputeKernel.KEY_VALUE.value,
+            }
+            else 0
+        )
+        for ssd_specific_size in ssd_specific_sizes
+    ]
 
     return [
         Storage(
             hbm=hbm_size,
             ddr=ddr_size,
+            ssd=ssd_size,
         )
-        for hbm_size, ddr_size in zip(hbm_sizes, ddr_sizes)
+        for hbm_size, ddr_size, ssd_size in zip(hbm_sizes, ddr_sizes, ssd_sizes)
     ]
 
 
