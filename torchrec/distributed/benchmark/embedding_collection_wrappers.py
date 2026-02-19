@@ -44,11 +44,10 @@ from torchrec.distributed.benchmark.base import (
 from torchrec.distributed.embedding_types import ShardingType
 from torchrec.distributed.global_settings import set_propogate_device
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.planner.constants import DEFAULT_PERF_ESTIMATOR
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
-from torchrec.distributed.planner.shard_estimators import (
-    EmbeddingPerfEstimator,
-    EmbeddingStorageEstimator,
-)
+from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
+from torchrec.distributed.planner.shard_estimators import EmbeddingStorageEstimator
 from torchrec.distributed.shard import _shard_modules
 from torchrec.distributed.test_utils.multi_process import MultiProcessContext
 from torchrec.distributed.test_utils.test_model import ModelInput
@@ -306,7 +305,9 @@ def _transform_module(
                 topology=topology,
                 batch_size=batch_size,
                 estimator=[
-                    EmbeddingPerfEstimator(topology=topology),
+                    EmbeddingPerfEstimatorFactory.create(
+                        DEFAULT_PERF_ESTIMATOR, topology=topology
+                    ),
                     EmbeddingStorageEstimator(topology=topology),
                 ],
             ),

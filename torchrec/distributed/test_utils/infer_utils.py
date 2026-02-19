@@ -43,11 +43,10 @@ from torchrec.distributed.fused_params import (
     FUSED_PARAM_REGISTER_TBE_BOOL,
 )
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.planner.constants import DEFAULT_PERF_ESTIMATOR
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
-from torchrec.distributed.planner.shard_estimators import (
-    EmbeddingPerfEstimator,
-    EmbeddingStorageEstimator,
-)
+from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
+from torchrec.distributed.planner.shard_estimators import EmbeddingStorageEstimator
 from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.quant_embedding import (
     QuantEmbeddingCollectionSharder,
@@ -663,7 +662,9 @@ def create_test_model(
             topology=topology,
             batch_size=batch_size,
             estimator=[
-                EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                EmbeddingPerfEstimatorFactory.create(
+                    DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                ),
                 EmbeddingStorageEstimator(topology=topology),
             ],
             constraints=constraints,
@@ -752,7 +753,9 @@ def create_test_model_ebc_only_no_quantize(
             topology=topology,
             batch_size=batch_size,
             estimator=[
-                EmbeddingPerfEstimator(topology=topology, is_inference=True),
+                EmbeddingPerfEstimatorFactory.create(
+                    DEFAULT_PERF_ESTIMATOR, topology=topology, is_inference=True
+                ),
                 EmbeddingStorageEstimator(topology=topology),
             ],
         ),

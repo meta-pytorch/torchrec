@@ -21,6 +21,7 @@ OSS (external):
 see README.md for more details
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -564,6 +565,87 @@ def blocking_copy(
     )
 
 
+def threading_copy(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    multithreading: bool = True,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    num_tensors = 512
+    dummy_dim = 256
+
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        data_copy_stream = torch.cuda.Stream()
+
+        # create a list of small tensors on cpu, pinned for async H2D copy
+        host_tensors = [
+            torch.rand(dummy_dim, dummy_dim).pin_memory() for _ in range(num_tensors)
+        ]
+        # pre-allocate gpu memory so the copy thread only does .copy_()
+        device_tensors = [torch.empty_like(t, device=ctx.device) for t in host_tensors]
+
+        # large tensor on gpu for main-stream compute
+        irrelevant_data = torch.rand(dim, dim, device=ctx.device) - 0.5
+
+    def _copy_worker() -> None:
+        torch.cuda.set_device(ctx.device)
+        with torch.cuda.stream(data_copy_stream):
+            for i in range(num_tensors):
+                device_tensors[i].copy_(host_tensors[i], non_blocking=True)
+
+    # launch the copy via ThreadPoolExecutor
+    with record_function("## submit copy to executor ##"):
+        if multithreading:
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(_copy_worker)
+        else:
+            _copy_worker()
+
+    # run slow gpu operations on the main stream — these should overlap with the copies
+    with record_function("## main stream compute (should overlap with copy) ##"):
+        for _ in range(num_mul):
+            irrelevant_data = _compute(
+                dim=dim, num_mul=1, num_concat=1, ctx=ctx, x=irrelevant_data
+            )
+
+    with record_function("## wait for executor future ##"):
+        if multithreading:
+            future.result()
+            executor.shutdown(wait=False)
+
+    with record_function("## wait for copy stream ##"):
+        main_stream.wait_stream(data_copy_stream)
+
+    # use the copied data to prove it arrived correctly
+    with record_function("## use copied data ##"):
+        _ = _compute(
+            dim=dummy_dim, num_mul=1, num_concat=1, ctx=ctx, x=device_tensors[0]
+        )
+
+
+def single_thread_copy(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    multithreading: bool = True,
+    **_kwargs: Dict[str, Any],
+):
+    return threading_copy(
+        _batch_inputs=_batch_inputs,
+        dim=dim,
+        num_mul=num_mul,
+        num_concat=num_concat,
+        ctx=ctx,
+        multithreading=False,
+    )
+
+
 # single-rank runner
 def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) -> None:
     # Ensure GPUs are available and we have enough of them
@@ -599,6 +681,10 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = preallocated_non_blocking_copy
             case "blocking_copy":
                 func = blocking_copy
+            case "threading_copy":
+                func = threading_copy
+            case "single_thread_copy":
+                func = single_thread_copy
             case _:
                 raise ValueError(f"Unknown benchmark name: {arg.name}")
 

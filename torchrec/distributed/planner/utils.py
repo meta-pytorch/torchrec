@@ -13,12 +13,114 @@ from functools import reduce
 from typing import Any, cast, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 import torch
-from torchrec.distributed.planner.types import Perf, ShardingOption, Storage
-from torchrec.distributed.types import ShardingType
+from torch import nn
+from torchrec.distributed.planner.constants import NUM_POOLINGS
+from torchrec.distributed.planner.types import (
+    ParameterConstraints,
+    Perf,
+    ShardingOption,
+    Storage,
+)
+from torchrec.distributed.types import CommOp, ModuleSharder, ShardingType
 
 
 def sharder_name(t: Type[Any]) -> str:
     return t.__module__ + "." + t.__name__
+
+
+def is_prefetch_pipelined(
+    sharding_option: ShardingOption, sharder: ModuleSharder[nn.Module]
+) -> bool:
+    prefetch_pipeline = (
+        sharding_option.cache_params.prefetch_pipeline
+        if sharding_option.cache_params
+        else None
+    )
+    # TODO: remove after deprecating fused_params in sharder
+    if not prefetch_pipeline:
+        prefetch_pipeline = (
+            sharder.fused_params.get("prefetch_pipeline", False)  # pyre-ignore[16]
+            if hasattr(sharder, "fused_params") and sharder.fused_params
+            else False
+        )
+    return prefetch_pipeline
+
+
+def extract_comm_data_type_size(
+    sharder: ModuleSharder[nn.Module], sharding_option: ShardingOption
+) -> Tuple[float, float, float, float]:
+    table_data_type_size = sharding_option.tensor.element_size()
+
+    fwd_a2a_comm_data_type_size = table_data_type_size
+    bwd_a2a_comm_data_type_size = table_data_type_size
+    fwd_sr_comm_data_type_size = table_data_type_size
+    bwd_sr_comm_data_type_size = table_data_type_size
+
+    if sharder.qcomm_codecs_registry is not None:
+        qcomm_codecs_registry = sharder.qcomm_codecs_registry
+        if (
+            sharding_option.is_pooled
+            and CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name in qcomm_codecs_registry
+        ):
+            codecs = sharder.qcomm_codecs_registry[
+                CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name
+            ]
+            fwd_a2a_comm_data_type_size = torch.tensor(
+                [], dtype=codecs.forward.quantized_dtype
+            ).element_size()
+            bwd_a2a_comm_data_type_size = torch.tensor(
+                [], dtype=codecs.backward.quantized_dtype
+            ).element_size()
+
+        if (
+            not sharding_option.is_pooled
+            and CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name in qcomm_codecs_registry
+        ):
+            codecs = qcomm_codecs_registry[CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name]
+            fwd_a2a_comm_data_type_size = torch.tensor(
+                [], dtype=codecs.forward.quantized_dtype
+            ).element_size()
+            bwd_a2a_comm_data_type_size = torch.tensor(
+                [], dtype=codecs.backward.quantized_dtype
+            ).element_size()
+
+        if (
+            sharding_option.is_pooled
+            and CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name in qcomm_codecs_registry
+        ):
+            codecs = qcomm_codecs_registry[CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name]
+            fwd_sr_comm_data_type_size = torch.tensor(
+                [], dtype=codecs.forward.quantized_dtype
+            ).element_size()
+            bwd_sr_comm_data_type_size = torch.tensor(
+                [], dtype=codecs.backward.quantized_dtype
+            ).element_size()
+
+    return (
+        fwd_a2a_comm_data_type_size,
+        bwd_a2a_comm_data_type_size,
+        fwd_sr_comm_data_type_size,
+        bwd_sr_comm_data_type_size,
+    )
+
+
+def get_num_poolings(
+    constraints: Optional[Dict[str, ParameterConstraints]], so: ShardingOption
+) -> List[float]:
+    # first priority is given for sharding_option.num_poolings,
+    # otherwise Manifold planner configs will be overwritten by parameter constraints
+    # default path will use constraints
+    if so.num_poolings is not None:
+        num_poolings = so.num_poolings
+        if len(so.input_lengths) == len(num_poolings):
+            return num_poolings
+
+    # Second priority: use constraint-based num_poolings
+    if constraints and constraints.get(so.name) and constraints[so.name].num_poolings:
+        return cast(List[float], constraints[so.name].num_poolings)
+
+    # Fallback: use default NUM_POOLINGS constant
+    return [NUM_POOLINGS] * len(so.input_lengths)
 
 
 def bytes_to_gb(num_bytes: int) -> float:
