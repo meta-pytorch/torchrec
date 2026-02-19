@@ -24,6 +24,7 @@ ModelSelectionConfig:
       over_arch_out_size: 1024
       over_arch_hidden_layers: 5
       dense_arch_hidden_sizes: [128, 128, 128]
+      skip_regroup: true
 EmbeddingTablesConfig:
   num_unweighted_features: 90
   num_weighted_features: 80

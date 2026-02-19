@@ -8,8 +8,8 @@
 # pyre-strict
 
 import random
-from dataclasses import dataclass
-from typing import cast, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass, field
+from typing import cast, List, Optional, Tuple, Union
 
 import torch
 from tensordict import TensorDict
@@ -34,6 +34,7 @@ class ModelInput(Pipelineable):
     idlist_features: Optional[KeyedJaggedTensor]
     idscore_features: Optional[KeyedJaggedTensor]
     label: torch.Tensor
+    dummy: List[torch.Tensor] = field(default_factory=list)
 
     def to(
         self,
@@ -88,6 +89,7 @@ class ModelInput(Pipelineable):
                 device=device,
                 non_blocking=non_blocking,
             )
+            dummy = [d.to(device=device, non_blocking=non_blocking) for d in self.dummy]
         else:
             # Async copy using dedicated stream
             current_stream = torch.cuda.current_stream(device)
@@ -105,6 +107,7 @@ class ModelInput(Pipelineable):
                 if self.idscore_features is None
                 else KeyedJaggedTensor.empty_like(self.idscore_features, device=device)
             )
+            dummy = [torch.empty_like(d, device=device) for d in self.dummy]
 
             # Perform async copy in dedicated stream
             with data_copy_stream:
@@ -125,11 +128,17 @@ class ModelInput(Pipelineable):
                         self.idscore_features,
                         non_blocking=non_blocking,
                     )
+                dummy = [
+                    d.copy_(self.dummy[i], non_blocking=non_blocking)
+                    for (i, d) in enumerate(dummy)
+                ]
+
         return ModelInput(
             float_features=float_features,
             idlist_features=idlist_features,
             idscore_features=idscore_features,
             label=label,
+            dummy=dummy,
         )
 
     def record_stream(self, stream: torch.Stream) -> None:

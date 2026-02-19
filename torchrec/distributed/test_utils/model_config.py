@@ -25,7 +25,9 @@ from torch import nn
 from torchrec.distributed.test_utils.table_config import ManagedCollisionConfig
 from torchrec.distributed.test_utils.test_model import (
     TestMixedEmbeddingSparseArch,
+    TestOverArch,
     TestOverArchLarge,
+    TestOverArchRegroupModule,
     TestSparseNN,
     TestTowerCollectionSparseNN,
     TestTowerSparseNN,
@@ -71,6 +73,13 @@ class BaseModelConfig(ABC):
         pass
 
 
+OVER_ARCH_CLASSES: Dict[str, Type[nn.Module]] = {
+    "default": TestOverArch,
+    "large": TestOverArchLarge,
+    "regroup_module": TestOverArchRegroupModule,
+}
+
+
 @dataclass
 class TestSparseNNConfig(BaseModelConfig):
     """Configuration for TestSparseNN model."""
@@ -82,6 +91,15 @@ class TestSparseNNConfig(BaseModelConfig):
     postproc_module: Optional[nn.Module] = None
     mc_configs: Optional[Dict[str, ManagedCollisionConfig]] = None
     submodule_kwargs: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.over_arch_clazz, str):
+            if self.over_arch_clazz not in OVER_ARCH_CLASSES:
+                raise ValueError(
+                    f"Unknown over_arch_clazz: {self.over_arch_clazz}. "
+                    f"Available: {list(OVER_ARCH_CLASSES.keys())}"
+                )
+            self.over_arch_clazz = OVER_ARCH_CLASSES[self.over_arch_clazz]
 
     def generate_model(
         self,
