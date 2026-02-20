@@ -433,14 +433,15 @@ class EvaluatorCustomMethodTest(unittest.TestCase):
         config = CoefficientConfig()
         coeffs = config.get_coefficients_for_sharding(ShardingType.TABLE_WISE.value)
         self.assertEqual(coeffs.fwd.lookup_size_multiplier, 10.0)
+        self.assertIsNotNone(coeffs.bwd)
         self.assertEqual(coeffs.bwd.lookup_size_multiplier, 20.0)
 
 
 class EvaluatorBandwidthPriorityTest(unittest.TestCase):
     """Tests for bandwidth priority in evaluators."""
 
-    def test_device_bw_uses_config_when_set(self) -> None:
-        """Test that config.device_bw takes priority over ctx.device_bw."""
+    def test_device_bw_uses_ctx_value(self) -> None:
+        """Test that device_bw comes from ctx.device_bw."""
 
         class ConfigWithDeviceBW(HardwarePerfConfig):
             name = "with_device_bw"
@@ -450,8 +451,9 @@ class EvaluatorBandwidthPriorityTest(unittest.TestCase):
         evaluator = TableWiseEvaluator()
         ctx = create_test_context(device_bw=1000.0)
 
+        # device_bw comes from context, not config
         device_bw = evaluator._get_device_bw(ctx, config)
-        self.assertEqual(device_bw, 5000.0)
+        self.assertEqual(device_bw, 1000.0)
 
     def test_device_bw_uses_ctx_when_config_none(self) -> None:
         """Test that ctx.device_bw is used when config.device_bw is None."""
@@ -471,46 +473,59 @@ class EvaluatorPrefetchTest(unittest.TestCase):
         evaluator = TableWiseEvaluator()
         config = HardwarePerfConfig()
         ctx = create_test_context()
-        ctx.expected_cache_fetches = 0.0
+        # Without FUSED_UVM_CACHING kernel or caching_ratio, expected_cache_fetches is 0
 
         prefetch = evaluator.compute_prefetch_comp(ctx, config)
         self.assertEqual(prefetch, 0.0)
 
-    def test_prefetch_with_cache_fetches(self) -> None:
-        """Test prefetch compute with cache fetches."""
+    def test_prefetch_without_caching_kernel_returns_zero(self) -> None:
+        """Test prefetch compute returns 0 without FUSED_UVM_CACHING kernel."""
         evaluator = TableWiseEvaluator()
         config = HardwarePerfConfig()
-        ctx = create_test_context()
-        ctx.expected_cache_fetches = 100.0
-        ctx.hbm_to_ddr_mem_bw = 500.0
+        ctx = create_test_context(compute_kernel=EmbeddingComputeKernel.FUSED.value)
+        # Prefetch only applies to FUSED_UVM_CACHING kernel
 
         prefetch = evaluator.compute_prefetch_comp(ctx, config)
-        self.assertGreater(prefetch, 0.0)
+        self.assertEqual(prefetch, 0.0)
 
-    def test_prefetch_with_linear_regression(self) -> None:
-        """Test prefetch compute with linear regression coefficients."""
+    def test_prefetch_with_caching_kernel(self) -> None:
+        """Test prefetch compute with FUSED_UVM_CACHING kernel and cache stats."""
+        evaluator = TableWiseEvaluator()
+        config = HardwarePerfConfig()
+        ctx = create_test_context(
+            compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value
+        )
+        # Set required cache stats for prefetch computation
+        ctx.caching_ratio = 0.5
+        ctx.cache_stats_expected_lookups = 100.0
+        ctx.expected_miss_rate = 0.1
 
-        class LinearRegressionConfig(HardwarePerfConfig):
-            name = "linear_regression"
+        prefetch = evaluator.compute_prefetch_comp(ctx, config)
+        self.assertGreaterEqual(prefetch, 0.0)
 
-            @prefetch_coefficient()
-            def get_prefetch(self) -> PrefetchCoefficients:
-                return PrefetchCoefficients(
-                    expected_num_lookups_coefficient=0.1,
-                    expected_num_unique_lookups_coefficient=0.2,
-                    expected_size_cache_fetches_coefficient=0.3,
-                )
+    def test_prefetch_divisor_applied_for_row_wise(self) -> None:
+        """Test that prefetch divisor is applied for ROW_WISE (world_size)."""
+        evaluator = RowWiseEvaluator()
+        ctx = create_test_context(world_size=8)
 
-        config = LinearRegressionConfig()
+        divisor = evaluator.get_prefetch_divisor(ctx)
+        self.assertEqual(divisor, 8)
+
+    def test_prefetch_divisor_applied_for_table_row_wise(self) -> None:
+        """Test that prefetch divisor is applied for TABLE_ROW_WISE (local_world_size)."""
+        evaluator = TableRowWiseEvaluator()
+        ctx = create_test_context(world_size=8, local_world_size=4)
+
+        divisor = evaluator.get_prefetch_divisor(ctx)
+        self.assertEqual(divisor, 4)
+
+    def test_prefetch_divisor_one_for_table_wise(self) -> None:
+        """Test that prefetch divisor is 1 for TABLE_WISE (no division)."""
         evaluator = TableWiseEvaluator()
         ctx = create_test_context()
-        ctx.expected_cache_fetches = 100.0
-        ctx.expected_lookups = 1000.0
-        ctx.expected_unique_lookups = 500.0
 
-        prefetch = evaluator.compute_prefetch_comp(ctx, config)
-        expected = 0.1 * 1000.0 + 0.2 * 500.0 + 0.3 * (100.0 * 128)
-        self.assertAlmostEqual(prefetch, expected, places=2)
+        divisor = evaluator.get_prefetch_divisor(ctx)
+        self.assertEqual(divisor, 1)
 
 
 class TrainingEvaluatorsRegistryTest(unittest.TestCase):

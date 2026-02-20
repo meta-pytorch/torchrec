@@ -16,6 +16,7 @@ from torchrec.distributed.planner.constants import (
     HBM_MEM_BW,
     HBM_TO_DDR_MEM_BW,
     kernel_bw_lookup,
+    SSD_MEM_BW,
 )
 
 
@@ -34,6 +35,7 @@ class TestKernelBWLookup(unittest.TestCase):
                 DDR_MEM_BW,
                 HBM_TO_DDR_MEM_BW,
                 caching_ratio,
+                ssd_mem_bw=SSD_MEM_BW,
             )
             for caching_ratio in caching_ratios
         ]
@@ -62,6 +64,7 @@ class TestKernelBWLookup(unittest.TestCase):
                 HBM_TO_DDR_MEM_BW,
                 caching_ratio,
                 prefetch_pipeline,
+                ssd_mem_bw=SSD_MEM_BW,
             )
             for caching_ratio in caching_ratios
         ]

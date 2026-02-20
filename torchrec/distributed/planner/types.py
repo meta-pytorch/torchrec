@@ -28,6 +28,8 @@ from torchrec.distributed.planner.constants import (
     HUNDRED_GB,
     INTRA_NODE_BANDWIDTH,
     POOLING_FACTOR,
+    SSD_CAP,
+    SSD_MEM_BW,
     WEIGHTED_FEATURE_BWD_COMPUTE_MULTIPLIER,
 )
 from torchrec.distributed.types import (
@@ -116,24 +118,27 @@ class Storage:
 
     hbm: int
     ddr: int
+    ssd: int = 0
 
     def __add__(self, other: "Storage") -> "Storage":
         return Storage(
             hbm=self.hbm + other.hbm,
             ddr=self.ddr + other.ddr,
+            ssd=self.ssd + other.ssd,
         )
 
     def __sub__(self, other: "Storage") -> "Storage":
         return Storage(
             hbm=self.hbm - other.hbm,
             ddr=self.ddr - other.ddr,
+            ssd=self.ssd - other.ssd,
         )
 
     def __hash__(self) -> int:
-        return hash((self.hbm, self.ddr))
+        return hash((self.hbm, self.ddr, self.ssd))
 
     def fits_in(self, other: "Storage") -> bool:
-        return self.hbm <= other.hbm and self.ddr <= other.ddr
+        return self.hbm <= other.hbm and self.ddr <= other.ddr and self.ssd <= other.ssd
 
 
 @dataclass
@@ -285,10 +290,12 @@ class Topology:
         compute_device: str,
         hbm_cap: Optional[int] = None,
         ddr_cap: Optional[int] = None,
+        ssd_cap: Optional[int] = None,
         local_world_size: Optional[int] = None,
         pod_size: Optional[int] = None,
         hbm_mem_bw: float = HBM_MEM_BW,
         ddr_mem_bw: float = DDR_MEM_BW,
+        ssd_mem_bw: float = SSD_MEM_BW,
         hbm_to_ddr_mem_bw: float = HBM_TO_DDR_MEM_BW,
         intra_host_bw: float = INTRA_NODE_BANDWIDTH,
         inter_host_bw: float = CROSS_NODE_BANDWIDTH,
@@ -323,6 +330,7 @@ class Topology:
         if self._compute_device == "cuda" or self._compute_device == "mtia":
             hbm_per_device = [hbm_cap if hbm_cap else HBM_CAP] * world_size
         ddr_cap_per_rank = [ddr_cap if ddr_cap else DDR_CAP] * world_size
+        ssd_cap_per_rank = [ssd_cap if ssd_cap else SSD_CAP] * world_size
 
         if custom_topology_data:
             if custom_topology_data.has_data("hbm_cap"):
@@ -335,6 +343,11 @@ class Topology:
                 assert (
                     len(ddr_cap_per_rank) == world_size
                 ), "Must provide individual ddr_cap for each device"
+            if custom_topology_data.has_data("ssd_cap"):
+                ssd_cap_per_rank = custom_topology_data.get_data("ssd_cap")
+                assert (
+                    len(ssd_cap_per_rank) == world_size
+                ), "Must provide individual ssd_cap for each device"
 
         self._devices: List[DeviceHardware] = []
         for rank in range(world_size):
@@ -342,7 +355,9 @@ class Topology:
                 DeviceHardware(
                     rank=rank,
                     storage=Storage(
-                        hbm=hbm_per_device[rank], ddr=ddr_cap_per_rank[rank]
+                        hbm=hbm_per_device[rank],
+                        ddr=ddr_cap_per_rank[rank],
+                        ssd=ssd_cap_per_rank[rank],
                     ),
                     perf=Perf(fwd_compute=0, fwd_comms=0, bwd_compute=0, bwd_comms=0),
                 )
@@ -363,6 +378,7 @@ class Topology:
 
         self._hbm_mem_bw = hbm_mem_bw
         self._ddr_mem_bw = ddr_mem_bw
+        self._ssd_mem_bw = ssd_mem_bw
         self._hbm_to_ddr_mem_bw = hbm_to_ddr_mem_bw
 
         self._comms_bandwidths: GeneralizedCommsBandwidth = (
@@ -408,6 +424,10 @@ class Topology:
     @property
     def ddr_mem_bw(self) -> float:
         return self._ddr_mem_bw
+
+    @property
+    def ssd_mem_bw(self) -> float:
+        return self._ssd_mem_bw
 
     @property
     def hbm_to_ddr_mem_bw(self) -> float:
@@ -462,6 +482,7 @@ class Topology:
         # Compute hbms and ddrs from the decives
         hbms = [device.storage.hbm for device in self._devices]
         ddrs = [device.storage.ddr for device in self._devices]
+        ssds = [device.storage.ssd for device in self._devices]
 
         # Combine all attributes into a hashable tuple
         hashable_list = [
@@ -469,10 +490,12 @@ class Topology:
             self._compute_device,
             hbms,
             ddrs,
+            ssds,
             self._local_world_size,
             self._intra_group_size,
             self._hbm_mem_bw,
             self._ddr_mem_bw,
+            self._ssd_mem_bw,
             self._hbm_to_ddr_mem_bw,
             self._comms_bandwidths.intra_host_bw,
             self._comms_bandwidths.inter_host_bw,
@@ -637,7 +660,7 @@ class ShardingOption:
 
     @property
     def total_storage(self) -> Storage:
-        storage: Storage = Storage(hbm=0, ddr=0)
+        storage: Storage = Storage(hbm=0, ddr=0, ssd=0)
         for shard in self.shards:
             storage += cast(Storage, shard.storage)
         return storage
@@ -1142,7 +1165,8 @@ def hash_planner_context_inputs(
     for device in topology.devices:
         rounded_hbm = round_to_nearest(device.storage.hbm, HUNDRED_GB)
         rounded_ddr = round_to_nearest(device.storage.ddr, HUNDRED_GB)
-        rounded_devices.append((device.rank, rounded_hbm, rounded_ddr))
+        rounded_ssd = round_to_nearest(device.storage.ssd, HUNDRED_GB)
+        rounded_devices.append((device.rank, rounded_hbm, rounded_ddr, rounded_ssd))
 
     topology_hash_components = [
         topology.world_size,
@@ -1151,6 +1175,7 @@ def hash_planner_context_inputs(
         topology.local_world_size,
         topology.hbm_mem_bw,
         topology.ddr_mem_bw,
+        topology.ssd_mem_bw,
         topology.hbm_to_ddr_mem_bw,
         topology.comms_bandwidths.intra_host_bw,
         topology.comms_bandwidths.inter_host_bw,

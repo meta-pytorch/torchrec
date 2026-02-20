@@ -78,11 +78,15 @@ class BaseManagedCollisionEmbeddingCollection(nn.Module):
     def forward(
         self,
         features: KeyedJaggedTensor,
+        mutate_miss_lengths: bool = True,
     ) -> Tuple[
         Union[KeyedTensor, Dict[str, JaggedTensor]], Optional[KeyedJaggedTensor]
     ]:
 
-        features = self._managed_collision_collection(features)
+        features = self._managed_collision_collection(
+            features,
+            mutate_miss_lengths=mutate_miss_lengths,
+        )
 
         embedding_res = self._embedding_module(features)
 
@@ -96,7 +100,10 @@ class BaseManagedCollisionEmbeddingCollection(nn.Module):
         self,
         features: KeyedJaggedTensor,
     ) -> torch.Tensor:
-        features = self._managed_collision_collection(features)
+        features = self._managed_collision_collection(
+            features,
+            mutate_miss_lengths=True,
+        )
         remapped_lengths = return_remapped_lengths_as_mask(features)
         return remapped_lengths
 

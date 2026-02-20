@@ -684,6 +684,98 @@ class TestMCH(unittest.TestCase):
         self.assertTrue(m._eviction_policy_name is None)
         self.assertTrue(m._eviction_module is None)
 
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_zch_hash_disable_fallback_no_nro_features(self) -> None:
+        """
+        Test that when mutate_miss_lengths=False and disable_fallback=True,
+        the lengths are not mutated even though missed IDs are replaced with 0.
+        This is useful for EC (EmbeddingCollection) where we want to keep original lengths.
+        """
+        m = HashZchManagedCollisionModule(
+            zch_size=10,
+            device=torch.device("cuda"),
+            total_num_buckets=2,
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=10,
+            ),
+            max_probe=4,
+            start_bucket=0,
+            output_segments=None,
+            disable_fallback=True,
+            no_bag=True,
+        )
+        jt = JaggedTensor(
+            values=torch.arange(0, 4, dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda"),
+        )
+        # Run once to insert ids
+        output0 = m.remap({"test": jt}, mutate_miss_lengths=True)
+        # All values should be inserted, and lengths should remain unchanged
+        self.assertTrue(
+            torch.equal(
+                output0["test"].values(),
+                torch.tensor([3, 5, 4, 6], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output0["test"].lengths(),
+                torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+
+        m.reset_inference_mode()
+        jt = JaggedTensor(
+            values=torch.tensor([9, 0, 1, 4, 6, 8], dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([6], dtype=torch.int64, device="cuda"),
+        )
+        # Run again in inference mode: only values 0 and 1 exist in the table.
+        # With mutate_miss_lengths=False and no_bag=True:
+        # - Missed IDs should be replaced with 0 instead of being removed
+        # - Lengths should NOT be mutated to 0 for missed IDs
+        output1 = m.remap({"test": jt}, mutate_miss_lengths=False)
+        # For missed IDs (9, 4, 6, 8), remapped_ids should be 0 instead of being removed
+        # remapped_ids: [0, 3, 5, 0, 0, 0] (where 0 is the fallback for misses)
+        self.assertTrue(
+            torch.equal(
+                output1["test"].values(),
+                torch.tensor([0, 3, 5, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        # Lengths should remain unchanged (all 1s, not mutated to 0 for misses)
+        self.assertTrue(
+            torch.equal(
+                output1["test"].lengths(),
+                torch.tensor([6], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        jt = JaggedTensor(
+            values=torch.tensor([9, 0, 1, 4, 6, 8], dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([1, 1, 1, 1, 1, 1], dtype=torch.int64, device="cuda"),
+        )
+        output2 = m.remap({"test": jt}, mutate_miss_lengths=True)
+        # For missed IDs (9, 4, 6, 8), remapped_ids should be 0 instead of being removed
+        # remapped_ids: [0, 3, 5, 0, 0, 0] (where 0 is the fallback for misses)
+        self.assertTrue(
+            torch.equal(
+                output2["test"].values(),
+                torch.tensor([0, 3, 5, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        # Lengths should be mutated to 0 for misses
+        self.assertTrue(
+            torch.equal(
+                output2["test"].lengths(),
+                torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+
     # Skipping this test because it is flaky on CI. TODO: T240185573 T240185565 investigate the flakiness and re-enable the test.
     @unittest.skipIf(
         torch.cuda.device_count() < 1,

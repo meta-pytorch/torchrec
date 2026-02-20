@@ -199,7 +199,7 @@ class EmbeddingStats(Stats):
 
         used_sharding_types = set()
         compute_kernels_to_count = defaultdict(int)
-        compute_kernels_to_storage = defaultdict(lambda: Storage(0, 0))
+        compute_kernels_to_storage = defaultdict(lambda: Storage(0, 0, 0))
 
         reserved_hbm_percent, dense_storage, kjt_storage = _compute_storage(
             storage_reservation=storage_reservation
@@ -311,7 +311,7 @@ class EmbeddingStats(Stats):
         )
         self._log_compute_kernel_stats(
             {
-                k: f"HBM: {round(bytes_to_gb(s.hbm),3)} GB, DDR: {round(bytes_to_gb(s.ddr),3)} GB"
+                k: f"HBM: {round(bytes_to_gb(s.hbm),3)} GB, DDR: {round(bytes_to_gb(s.ddr),3)} GB, SSD: {round(bytes_to_gb(s.ssd),3)} GB"
                 for k, s in compute_kernels_to_storage.items()
             },
             description="Compute Kernels Storage",
@@ -789,7 +789,7 @@ class EmbeddingStats(Stats):
                 "Sharding",
                 "Compute Kernel",
                 "Perf (ms)",
-                "Storage (HBM, DDR)",
+                "Storage (HBM, DDR, SSD)",
                 "Cache Load Factor",
                 "Sum Pooling Factor",
                 "Sum Num Poolings",
@@ -807,7 +807,7 @@ class EmbeddingStats(Stats):
                 "----------",  # Sharding
                 "----------------",  # Compute Kernel
                 "-----------",  # Perf (ms)
-                "--------------------",  # Storage (HBM, DDR)
+                "-------------------------",  # Storage (HBM, DDR)
                 "-------------------",  # Cache Load Factor
                 "--------------------",  # Sum Pooling Factor
                 "------------------",  # Sum Num Poolings
@@ -850,7 +850,7 @@ class EmbeddingStats(Stats):
 
             shard_perfs = _format_perf_breakdown(so_perf)
 
-            so_storage = Storage(hbm=0, ddr=0)
+            so_storage = Storage(hbm=0, ddr=0, ssd=0)
             for shard in so.shards:
                 so_storage += cast(Storage, shard.storage)
 
@@ -983,7 +983,7 @@ def _compute_storage(
             (HeuristicalStorageReservation, InferenceStorageReservation),
         )
         and storage_reservation._dense_storage is not None
-        else Storage(0, 0)
+        else Storage(0, 0, 0)
     )
     assert dense_storage
     kjt_storage = (
@@ -997,7 +997,7 @@ def _compute_storage(
             ),
         )
         and storage_reservation._kjt_storage
-        else Storage(0, 0)
+        else Storage(0, 0, 0)
     )
     assert kjt_storage
     return reserved_hbm_percent, dense_storage, kjt_storage
@@ -1030,7 +1030,8 @@ def _compute_mem_usage_and_perf(
 def _format_storage_breakdown(storage: Storage) -> str:
     storage_hbm = round(bytes_to_gb(storage.hbm), 3)
     storage_ddr = round(bytes_to_gb(storage.ddr), 3)
-    return f"({storage_hbm} GB, {storage_ddr} GB)"
+    storage_ssd = round(bytes_to_gb(storage.ssd), 3)
+    return f"({storage_hbm} GB, {storage_ddr} GB, {storage_ssd} GB)"
 
 
 def round_to_one_sigfig(x: float) -> str:

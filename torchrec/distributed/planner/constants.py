@@ -24,8 +24,10 @@ BIGINT_DTYPE: int = 8
 
 HBM_CAP: int = 32 * 1024 * 1024 * 1024  # 32 GB
 DDR_CAP: int = 128 * 1024 * 1024 * 1024  # 128 GB
+SSD_CAP: int = 2 * 1024 * 1024 * 1024 * 1024  # 2 TB
 DDR_MEM_BW: float = 51 * 1024 * 1024 * 1024 / 1000  # bytes/ms
 HBM_MEM_BW: float = 897 * 1024 * 1024 * 1024 / 1000  # bytes/ms
+SSD_MEM_BW: float = 100 * 1024 * 1024 / 1000  # bytes/ms
 # This can be smaller than DDR_MEM_BW because the PCI channel maybe shared
 # with other devices such as the FE NIC.
 HBM_TO_DDR_MEM_BW: float = 32 * 1024 * 1024 * 1024 / 1000  # bytes/ms
@@ -57,6 +59,7 @@ def kernel_bw_lookup(
     hbm_to_ddr_mem_bw: float,
     caching_ratio: Optional[float] = None,
     prefetch_pipeline: bool = False,
+    ssd_mem_bw: float = SSD_MEM_BW,
 ) -> Optional[float]:
     """
     Calculates the device bandwidth based on given compute device, compute kernel, and
@@ -71,6 +74,9 @@ def kernel_bw_lookup(
         caching_ratio (Optional[float]): caching ratio used to determine device bandwidth
             if UVM caching is enabled.
         prefetch_pipeline (bool): whether prefetch pipeline is enabled.
+        ssd_mem_bw (float): the bandwidth of SSD storage. Added at the end of the
+            parameter list (with a default value) to maintain backward compatibility
+            with existing callers.
 
     Returns:
         Optional[float]: the device bandwidth.
@@ -102,7 +108,7 @@ def kernel_bw_lookup(
         )
         / 10,
         # TODO: revisit whether this estimation makes sense
-        ("cuda", EmbeddingComputeKernel.KEY_VALUE.value): hbm_to_ddr_mem_bw,
+        ("cuda", EmbeddingComputeKernel.KEY_VALUE.value): ssd_mem_bw,
         ("cuda", EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value): hbm_to_ddr_mem_bw,
         ("cuda", EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value): hbm_to_ddr_mem_bw,
     }

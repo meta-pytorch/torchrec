@@ -1142,69 +1142,6 @@ def _concat(
     return torch.cat([dense] + sparse_embeddings, dim=1)
 
 
-class TestOverArchRegroupModule(nn.Module):
-    """
-    Basic nn.Module for testing
-
-    Args:
-        device
-
-    Call Args:
-        dense: torch.Tensor,
-        sparse: KeyedTensor,
-
-    Returns:
-        torch.Tensor
-
-    Example::
-
-        TestOverArch()
-    """
-
-    def __init__(
-        self,
-        tables: List[EmbeddingBagConfig],
-        weighted_tables: List[EmbeddingBagConfig],
-        embedding_names: Optional[List[str]] = None,
-        device: Optional[torch.device] = None,
-    ) -> None:
-        super().__init__()
-        if device is None:
-            device = torch.device("cpu")
-        self._embedding_names: List[str] = (
-            embedding_names
-            if embedding_names
-            else [feature for table in tables for feature in table.feature_names]
-        )
-        self._weighted_features: List[str] = [
-            feature for table in weighted_tables for feature in table.feature_names
-        ]
-        in_features = (
-            8
-            + sum([table.embedding_dim * len(table.feature_names) for table in tables])
-            + sum(
-                [
-                    table.embedding_dim * len(table.feature_names)
-                    for table in weighted_tables
-                ]
-            )
-        )
-        self.dhn_arch: nn.Module = TestDHNArch(in_features, device)
-        self.regroup_module = KTRegroupAsDict(
-            [self._embedding_names, self._weighted_features],
-            ["unweighted", "weighted"],
-        )
-
-    def forward(
-        self,
-        dense: torch.Tensor,
-        sparse: KeyedTensor,
-    ) -> torch.Tensor:
-        pooled_emb = self.regroup_module([sparse])
-        values = list(pooled_emb.values())
-        return self.dhn_arch(_concat(dense, values))
-
-
 class TestOverArch(nn.Module):
     """
     A simple over arch to merge a dense arch and a sparse arch
@@ -1241,6 +1178,7 @@ class TestOverArch(nn.Module):
         device: Optional[torch.device] = None,
         dense_arch_out_size: Optional[int] = None,
         over_arch_out_size: Optional[int] = None,
+        **_kwargs: Any,
     ) -> None:
         """
         Args:
@@ -1269,6 +1207,11 @@ class TestOverArch(nn.Module):
             in_features, over_arch_out_size=over_arch_out_size, device=self.device
         )
 
+    def sparse_grouped(self, sparse: KeyedTensor) -> List[torch.Tensor]:
+        return KeyedTensor.regroup(
+            [sparse], [self._embedding_names, self._weighted_features]
+        )
+
     def forward(
         self,
         dense: torch.Tensor,
@@ -1282,11 +1225,55 @@ class TestOverArch(nn.Module):
         Returns:
             torch.Tensor
         """
-        sparse_regrouped: List[torch.Tensor] = KeyedTensor.regroup(
-            [sparse], [self._embedding_names, self._weighted_features]
+        sparse_regrouped = self.sparse_grouped(sparse)
+        return self.dhn_arch(_concat(dense, sparse_regrouped))
+
+
+class TestOverArchRegroupModule(TestOverArch):
+    """
+    Basic nn.Module for testing
+
+    Args:
+        device
+
+    Call Args:
+        dense: torch.Tensor,
+        sparse: KeyedTensor,
+
+    Returns:
+        torch.Tensor
+
+    Example::
+
+        TestOverArch()
+    """
+
+    def __init__(
+        self,
+        tables: List[EmbeddingBagConfig],
+        weighted_tables: List[EmbeddingBagConfig],
+        embedding_names: Optional[List[str]] = None,
+        device: Optional[torch.device] = None,
+        dense_arch_out_size: Optional[int] = None,
+        over_arch_out_size: Optional[int] = None,
+        **_kwargs: Any,
+    ) -> None:
+        super().__init__(
+            tables=tables,
+            weighted_tables=weighted_tables,
+            embedding_names=embedding_names,
+            device=device,
+            dense_arch_out_size=dense_arch_out_size,
+            over_arch_out_size=over_arch_out_size,
+        )
+        self.regroup_module = KTRegroupAsDict(
+            [self._embedding_names, self._weighted_features],
+            ["unweighted", "weighted"],
         )
 
-        return self.dhn_arch(_concat(dense, sparse_regrouped))
+    def sparse_grouped(self, sparse: KeyedTensor) -> List[torch.Tensor]:
+        pooled_emb = self.regroup_module([sparse])
+        return list(pooled_emb.values())
 
 
 class TestOverArchLarge(nn.Module):
@@ -1326,6 +1313,7 @@ class TestOverArchLarge(nn.Module):
         over_arch_out_size: Optional[int] = None,
         over_arch_hidden_layers: Optional[int] = None,
         over_arch_hidden_repeat: Optional[int] = None,
+        skip_regroup: bool = False,
         **_kwargs: Any,
     ) -> None:
         """
@@ -1377,9 +1365,13 @@ class TestOverArchLarge(nn.Module):
             layers += layers[1:]
         self.overarch = torch.nn.Sequential(*layers)
 
-        self.regroup_module = KTRegroupAsDict(
-            [embedding_names, weighted_features],
-            ["unweighted", "weighted"],
+        self.regroup_module: Optional[nn.Module] = (
+            KTRegroupAsDict(
+                [embedding_names, weighted_features],
+                ["unweighted", "weighted"],
+            )
+            if not skip_regroup
+            else None
         )
 
     def forward(
@@ -1395,8 +1387,11 @@ class TestOverArchLarge(nn.Module):
         Returns:
             torch.Tensor
         """
-        pooled_emb: Dict[str, torch.Tensor] = self.regroup_module([sparse])
-        values = list(pooled_emb.values())
+        if self.regroup_module is not None:
+            pooled_emb: Dict[str, torch.Tensor] = self.regroup_module([sparse])
+            values = list(pooled_emb.values())
+        else:
+            values = [sparse.values()]
         return self.overarch(_concat(dense, values))
 
 

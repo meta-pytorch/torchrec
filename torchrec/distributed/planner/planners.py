@@ -542,7 +542,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         self._num_plans = 0
         start_time = perf_counter()
         best_plan = None
-        lowest_storage = Storage(MAX_SIZE, MAX_SIZE)
+        lowest_storage = Storage(MAX_SIZE, MAX_SIZE, MAX_SIZE)
         last_planner_error: Optional[PlannerError] = None
         last_proposal: List[ShardingOption] = []
         best_perf_rating = MAX_SIZE
@@ -959,7 +959,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
             self._num_plans = 0
             start_time = perf_counter()
             best_plan = None
-            lowest_storage = Storage(MAX_SIZE, MAX_SIZE)
+            lowest_storage = Storage(MAX_SIZE, MAX_SIZE, MAX_SIZE)
             last_planner_error: Optional[PlannerError] = None
             last_proposal: List[ShardingOption] = []
             best_perf_rating = MAX_SIZE

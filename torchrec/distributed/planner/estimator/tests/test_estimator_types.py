@@ -72,10 +72,11 @@ class EstimatorPerfCoefficientsTest(unittest.TestCase):
     """Tests for EstimatorPerfCoefficients frozen dataclass."""
 
     def test_default_values(self) -> None:
-        """Test default fwd and bwd coefficients."""
+        """Test default fwd coefficient and bwd is None (for FB estimator compatibility)."""
         coeffs = EstimatorPerfCoefficients()
         self.assertEqual(coeffs.fwd.input_read_size_multiplier, 1.0)
-        self.assertEqual(coeffs.bwd.input_read_size_multiplier, 1.0)
+        # bwd is None by default to support FB estimators using fwd_compute * bwd_compute_multiplier
+        self.assertIsNone(coeffs.bwd)
 
     def test_custom_fwd_bwd(self) -> None:
         """Test creating with custom forward and backward coefficients."""
@@ -117,7 +118,8 @@ class PerfCoefficientConfigTest(unittest.TestCase):
         config = PerfCoefficientConfig()
         coeffs = config.get_coefficients(ShardingType.TABLE_WISE.value)
         self.assertEqual(coeffs.fwd.input_read_size_multiplier, 1.0)
-        self.assertEqual(coeffs.bwd.input_read_size_multiplier, 1.0)
+        # bwd is None by default - estimator will use fwd_compute * bwd_compute_multiplier approach
+        self.assertIsNone(coeffs.bwd)
 
     def test_get_coefficients_returns_sharding_specific(self) -> None:
         """Test that get_coefficients returns sharding-specific coefficients."""
@@ -315,6 +317,7 @@ class HardwarePerfConfigTest(unittest.TestCase):
             compute_kernel="fused",
             hbm_mem_bw=900.0,
             ddr_mem_bw=100.0,
+            ssd_mem_bw=50.0,
             hbm_to_ddr_mem_bw=200.0,
         )
         self.assertEqual(bw, 1000.0)
@@ -332,6 +335,7 @@ class HardwarePerfConfigTest(unittest.TestCase):
             compute_kernel="dense",
             hbm_mem_bw=900.0,
             ddr_mem_bw=100.0,
+            ssd_mem_bw=50.0,
             hbm_to_ddr_mem_bw=200.0,
         )
         self.assertEqual(bw, 500.0)
@@ -344,6 +348,7 @@ class HardwarePerfConfigTest(unittest.TestCase):
             compute_kernel=EmbeddingComputeKernel.FUSED.value,
             hbm_mem_bw=900.0,
             ddr_mem_bw=100.0,
+            ssd_mem_bw=50.0,
             hbm_to_ddr_mem_bw=200.0,
         )
         self.assertEqual(bw, 900.0)
@@ -357,6 +362,7 @@ class HardwarePerfConfigTest(unittest.TestCase):
                 compute_kernel="invalid_kernel",
                 hbm_mem_bw=900.0,
                 ddr_mem_bw=100.0,
+                ssd_mem_bw=50.0,
                 hbm_to_ddr_mem_bw=200.0,
             )
         self.assertIn("invalid_kernel", str(ctx.exception))
