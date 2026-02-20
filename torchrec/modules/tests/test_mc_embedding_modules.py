@@ -18,6 +18,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
+from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.mc_embedding_modules import (
     ManagedCollisionEmbeddingBagCollection,
     ManagedCollisionEmbeddingCollection,
@@ -449,4 +450,137 @@ class MCHManagedCollisionEmbeddingBagCollectionTest(unittest.TestCase):
                     [True, False, True, False, True, False, False, True, True, True]
                 ),
             )
+        )
+
+    def test_mc_ebc_ec_forward_mutate_miss_lengths_parameter(self) -> None:
+        """
+        Test that ManagedCollisionEmbeddingBagCollection and ManagedCollisionEmbeddingCollection
+        correctly accept and pass the mutate_miss_lengths parameter to the underlying
+        managed collision collection.
+        """
+        device = torch.device("cpu")
+        zch_size = 100
+
+        embedding_bag_configs = [
+            EmbeddingBagConfig(
+                name="t1",
+                num_embeddings=zch_size,
+                embedding_dim=8,
+                feature_names=["f1"],
+            ),
+        ]
+        embedding_configs = [
+            EmbeddingConfig(
+                name="t1",
+                num_embeddings=zch_size,
+                embedding_dim=8,
+                feature_names=["f1"],
+            ),
+        ]
+        ebc = EmbeddingBagCollection(
+            tables=embedding_bag_configs,
+            device=device,
+        )
+
+        ec = EmbeddingCollection(
+            tables=embedding_configs,
+            device=device,
+        )
+
+        mc_modules_ebc = {
+            "t1": cast(
+                ManagedCollisionModule,
+                HashZchManagedCollisionModule(
+                    zch_size=zch_size,
+                    device=torch.device("cpu"),
+                    total_num_buckets=10,
+                    disable_fallback=False,
+                    is_inference=True,
+                ),
+            ),
+        }
+        mc_modules_ec = {
+            "t1": cast(
+                ManagedCollisionModule,
+                HashZchManagedCollisionModule(
+                    zch_size=zch_size,
+                    device=torch.device("cpu"),
+                    total_num_buckets=10,
+                    disable_fallback=False,
+                    is_inference=True,
+                ),
+            ),
+        }
+        mcc_ebc = ManagedCollisionCollection(
+            managed_collision_modules=mc_modules_ebc,
+            embedding_configs=embedding_bag_configs,
+        )
+
+        mcc_ec = ManagedCollisionCollection(
+            managed_collision_modules=mc_modules_ec,
+            embedding_configs=embedding_configs,
+        )
+        mc_ebc = ManagedCollisionEmbeddingBagCollection(
+            ebc,
+            mcc_ebc,
+            return_remapped_features=True,
+        )
+        mc_ec = ManagedCollisionEmbeddingCollection(
+            ec,
+            mcc_ec,
+            return_remapped_features=True,
+        )
+
+        kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f1"],
+            values=torch.arange(1000, 1010, dtype=torch.int64),
+            lengths=torch.ones((10,), dtype=torch.int64),
+            weights=None,
+        )
+
+        # Test ManagedCollisionEmbeddingBagCollection with mutate_miss_lengths=True (default)
+        out_ebc_true, remapped_kjt_ebc_true = mc_ebc.forward(
+            kjt, mutate_miss_lengths=True
+        )
+        self.assertIsNotNone(out_ebc_true)
+        self.assertIsNotNone(remapped_kjt_ebc_true)
+
+        # Test ManagedCollisionEmbeddingBagCollection with mutate_miss_lengths=False
+        out_ebc_false, remapped_kjt_ebc_false = mc_ebc.forward(
+            kjt, mutate_miss_lengths=False
+        )
+        self.assertIsNotNone(out_ebc_false)
+        self.assertIsNotNone(remapped_kjt_ebc_false)
+
+        # Test ManagedCollisionEmbeddingCollection with mutate_miss_lengths=True (default)
+        out_ec_true, remapped_kjt_ec_true = mc_ec.forward(kjt, mutate_miss_lengths=True)
+        self.assertIsNotNone(out_ec_true)
+        self.assertIsNotNone(remapped_kjt_ec_true)
+
+        # Test ManagedCollisionEmbeddingCollection with mutate_miss_lengths=False
+        out_ec_false, remapped_kjt_ec_false = mc_ec.forward(
+            kjt, mutate_miss_lengths=False
+        )
+        self.assertIsNotNone(out_ec_false)
+        self.assertIsNotNone(remapped_kjt_ec_false)
+
+        # Verify the forward method accepts the parameter without errors
+        # and produces valid outputs in all cases
+        self.assertEqual(remapped_kjt_ebc_true.keys(), ["f1"])
+        self.assertEqual(remapped_kjt_ebc_false.keys(), ["f1"])
+        self.assertEqual(remapped_kjt_ec_true.keys(), ["f1"])
+        self.assertEqual(remapped_kjt_ec_false.keys(), ["f1"])
+        self.assertTrue(
+            torch.equal(remapped_kjt_ebc_true.values(), remapped_kjt_ebc_false.values())
+        )
+        self.assertTrue(
+            torch.equal(remapped_kjt_ec_true.values(), remapped_kjt_ec_false.values())
+        )
+        self.assertTrue(
+            torch.equal(
+                remapped_kjt_ebc_true.lengths(), remapped_kjt_ebc_false.lengths()
+            )
+        )
+        self.assertTrue(
+            torch.equal(remapped_kjt_ec_true.lengths(), remapped_kjt_ec_false.lengths())
         )

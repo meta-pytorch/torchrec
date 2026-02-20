@@ -278,6 +278,7 @@ class ManagedCollisionModule(nn.Module):
     def forward(
         self,
         features: Dict[str, JaggedTensor],
+        mutate_miss_lengths: bool = True,
     ) -> Dict[str, JaggedTensor]:
         pass
 
@@ -393,6 +394,7 @@ class ManagedCollisionCollection(nn.Module):
     def forward(
         self,
         features: KeyedJaggedTensor,
+        mutate_miss_lengths: bool = True,
     ) -> KeyedJaggedTensor:
         features = _mcc_lazy_init_inplace(
             features,
@@ -415,7 +417,7 @@ class ManagedCollisionCollection(nn.Module):
                     weights=_get_length_per_key(kjt),
                 )
             }
-            mc_input = mc_module(mc_input)
+            mc_input = mc_module(mc_input, mutate_miss_lengths=mutate_miss_lengths)
             output = _update(output, mc_input)
 
         assert output is not None
@@ -1355,6 +1357,7 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
     def forward(
         self,
         features: Dict[str, JaggedTensor],
+        mutate_miss_lengths: bool = True,
     ) -> Dict[str, JaggedTensor]:
         """
         Args:
