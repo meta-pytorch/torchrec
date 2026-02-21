@@ -9,7 +9,8 @@
 import contextlib
 import copy
 import logging
-from collections import defaultdict
+from collections import defaultdict, deque
+from concurrent.futures import Future
 from contextlib import AbstractContextManager
 from threading import Event, Thread
 from typing import (
@@ -653,3 +654,29 @@ def use_context_for_postprocs(
     # Restore context for model fwd
     for module, context in zip(pipelined_postprocs, original_contexts):
         module.set_context(context)
+
+
+class FutureDeque(deque):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        one_time_rank0_logger.info("Creating FutureDeque")
+
+    def __getitem__(self, index: Any) -> Any:
+        item = super().__getitem__(index)
+        if isinstance(item, Future):
+            resolved = item.result()
+            super().__setitem__(index, resolved)
+            return resolved
+        return item
+
+    def pop(self) -> Any:
+        item = super().pop()
+        if isinstance(item, Future):
+            return item.result()
+        return item
+
+    def popleft(self) -> Any:
+        item = super().popleft()
+        if isinstance(item, Future):
+            return item.result()
+        return item

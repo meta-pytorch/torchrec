@@ -11,6 +11,7 @@ import abc
 import contextlib
 import logging
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -77,6 +78,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _wait_for_batch,
     _wait_for_events,
     DataLoadingThread,
+    FutureDeque,
     use_context_for_postprocs,
 )
 from torchrec.distributed.types import Awaitable, NoWait, ShardingType  # noqa: F401
@@ -2844,3 +2846,106 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
 
         self.dequeue_batch()
         return output
+
+
+class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
+    """
+    Extends TrainPipelineSparseDist by running the inplace H2D copy (_to_device) in a
+    background thread so the CPU is not blocked while submitting non-blocking copy
+    operations to the memcpy stream.
+
+    The background result is resolved lazily before the batch is actually consumed
+    (in fill_pipeline before _init_pipelined_modules, and in progress before
+    start_sparse_data_dist).
+
+    All other pipeline behaviour is identical to TrainPipelineSparseDist.
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        execute_all_batches: bool = True,
+        apply_jit: bool = False,
+        context_type: Type[TrainPipelineContext] = TrainPipelineContext,
+        pipeline_postproc: bool = False,
+        custom_model_fwd: Optional[
+            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
+        ] = None,
+        dmp_collection_sync_interval_batches: Optional[int] = 1,
+        enqueue_batch_after_forward: bool = False,
+        inplace_copy_batch_to_gpu: bool = False,
+        backward_hook_registry: Optional[BackwardHookRegistry] = None,
+    ) -> None:
+        super().__init__(
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            execute_all_batches=execute_all_batches,
+            apply_jit=apply_jit,
+            context_type=context_type,
+            pipeline_postproc=pipeline_postproc,
+            custom_model_fwd=custom_model_fwd,
+            dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
+            enqueue_batch_after_forward=False,
+            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+            backward_hook_registry=backward_hook_registry,
+        )
+        self._copy_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
+        self.batches: Deque[Optional[In]] = cast(Deque[Optional[In]], FutureDeque())
+
+    def copy_batch_to_gpu(
+        self, dataloader_iter: Iterator[In]
+    ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
+        context = self._create_context()
+        with record_function(f"## copy_batch_to_gpu {context.index} ##"):
+            batch = self._next_batch(dataloader_iter)
+            if batch is not None:
+
+                def _copy_work() -> In:
+                    # pyrefly: ignore [bad-argument-type]
+                    with self._stream_context(self._memcpy_stream):
+                        return _to_device(cast(In, batch), self._device, True)
+
+                future_batch = self._copy_executor.submit(_copy_work)
+                return cast(In, future_batch), context
+            elif not self._execute_all_batches:
+                logger.info(
+                    "copy_batch_to_gpu: raising StopIteration for None Batch (execute_all_batches=False)"
+                )
+                raise StopIteration
+            else:
+                logger.info(
+                    "copy_batch_to_gpu: returning None batch (execute_all_batches=True)"
+                )
+            return batch, context
+
+    def inplace_copy_batch_to_gpu(
+        self,
+        dataloader_iter: Iterator[In],
+    ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
+        context = self._create_context()
+        with record_function(f"## inplace_copy_batch_to_gpu {context.index} ##"):
+            batch = self._next_batch(dataloader_iter)
+            if batch is not None:
+                future_batch = self._copy_executor.submit(
+                    _to_device,
+                    batch,
+                    self._device,
+                    True,
+                    self._memcpy_stream,
+                )
+                # Return the CPU batch as placeholder; _resolve_copy_future
+                # will replace it in self.batches before consumption.
+                return cast(In, future_batch), context
+            elif not self._execute_all_batches:
+                logger.info(
+                    "inplace_copy_batch_to_gpu: raising StopIteration for None Batch (execute_all_batches=False)"
+                )
+                raise StopIteration
+            else:
+                logger.info(
+                    "inplace_copy_batch_to_gpu: returning None batch (execute_all_batches=True)"
+                )
+            return batch, context
