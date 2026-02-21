@@ -12,7 +12,6 @@ from typing import cast, List
 from unittest.mock import MagicMock
 
 from pyre_extensions import none_throws
-from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.constants import BATCH_SIZE
@@ -35,12 +34,11 @@ from torchrec.distributed.planner.types import (
 )
 from torchrec.distributed.planner.utils import reset_shard_rank
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import ModuleSharder, ShardingType
+from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class RWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class RWSharder(EmbeddingBagCollectionSharder):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.ROW_WISE.value]
 
@@ -50,8 +48,7 @@ class RWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class TWSharder(EmbeddingBagCollectionSharder):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_WISE.value]
 
@@ -61,8 +58,7 @@ class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class TWRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class TWRWSharder(EmbeddingBagCollectionSharder):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_ROW_WISE.value]
 
@@ -72,8 +68,7 @@ class TWRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class TWCWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class TWCWSharder(EmbeddingBagCollectionSharder):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_COLUMN_WISE.value]
 
@@ -83,8 +78,7 @@ class TWCWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class HostLevelSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class HostLevelSharder(EmbeddingBagCollectionSharder):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_ROW_WISE.value, ShardingType.TABLE_COLUMN_WISE.value]
 

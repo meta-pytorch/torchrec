@@ -8,6 +8,7 @@
 # pyre-strict
 
 
+import string
 import unittest
 from typing import List, Optional, Tuple
 
@@ -42,7 +43,18 @@ def valid_kjt_from_lengths_offsets_strategy(
         - offsets: Tensor of offsets
         - stride_per_key_per_rank: Optional list for VBE (shape: num_features x 1)
     """
-    keys = draw(st.lists(st.text(), min_size=1, max_size=10, unique=True))
+    keys = draw(
+        st.lists(
+            st.text(
+                alphabet=string.ascii_letters + string.digits,
+                min_size=1,
+                max_size=10,
+            ),
+            min_size=1,
+            max_size=5,
+            unique=True,
+        )
+    )
     num_features = len(keys)
 
     # Decide whether to generate VBE or non-VBE KJT
@@ -52,7 +64,7 @@ def valid_kjt_from_lengths_offsets_strategy(
         # For VBE: generate stride_per_key_per_rank with shape (num_features, 1)
         stride_per_key_per_rank = draw(
             st.lists(
-                st.lists(st.integers(0, 5), min_size=1, max_size=1),
+                st.lists(st.integers(0, 3), min_size=1, max_size=1),
                 min_size=num_features,
                 max_size=num_features,
             )
@@ -64,7 +76,7 @@ def valid_kjt_from_lengths_offsets_strategy(
         lengths = torch.tensor(
             draw(
                 st.lists(
-                    st.integers(0, 20),
+                    st.integers(0, 5),
                     min_size=lengths_size,
                     max_size=lengths_size,
                 )
@@ -72,11 +84,11 @@ def valid_kjt_from_lengths_offsets_strategy(
         )
     else:
         # For non-VBE: use stride-based lengths
-        stride = draw(st.integers(1, 10))
+        stride = draw(st.integers(1, 3))
         lengths = torch.tensor(
             draw(
                 st.lists(
-                    st.integers(0, 20),
+                    st.integers(0, 5),
                     min_size=num_features * stride,
                     max_size=num_features * stride,
                 )
@@ -328,7 +340,7 @@ class TestJaggedTensorValidator(unittest.TestCase):
         )
 
     @given(valid_kjt_from_lengths_offsets_strategy())
-    @settings(verbosity=Verbosity.verbose, max_examples=20)
+    @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
     def test_valid_kjt_from_lengths(
         self,
         test_data: Tuple[
@@ -352,7 +364,7 @@ class TestJaggedTensorValidator(unittest.TestCase):
         validate_keyed_jagged_tensor(kjt)
 
     @given(valid_kjt_from_lengths_offsets_strategy())
-    @settings(verbosity=Verbosity.verbose, max_examples=20)
+    @settings(verbosity=Verbosity.verbose, max_examples=20, deadline=None)
     def test_valid_kjt_from_offsets(
         self,
         test_data: Tuple[

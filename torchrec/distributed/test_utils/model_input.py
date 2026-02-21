@@ -153,6 +153,8 @@ class ModelInput(Pipelineable):
             # pyrefly: ignore[bad-argument-type]
             self.idscore_features.record_stream(stream)
         self.label.record_stream(stream)
+        for d in self.dummy:
+            d.record_stream(stream)
 
     def size_in_bytes(self) -> int:
         """
@@ -165,6 +167,8 @@ class ModelInput(Pipelineable):
             size += self.idlist_features.size_in_bytes()
         if self.idscore_features is not None:
             size += self.idscore_features.size_in_bytes()
+        for d in self.dummy:
+            size += d.element_size() * d.numel()
         return size
 
     @classmethod
@@ -196,6 +200,7 @@ class ModelInput(Pipelineable):
         offsets_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
         all_zeros: bool = False,
+        num_dummy_tensor: int = 0,
     ) -> Tuple["ModelInput", List["ModelInput"]]:
         """
         Returns a global (single-rank training) batch, and a list of local
@@ -258,11 +263,22 @@ class ModelInput(Pipelineable):
             )
             for _ in range(world_size)
         ]
+        dummy_list = [
+            [
+                torch.rand((batch_size, num_float_features), device=device)
+                for _ in range(num_dummy_tensor)
+            ]
+            for _ in range(world_size)
+        ]
         global_input = ModelInput(
             float_features=torch.cat(float_features_list),
             idlist_features=global_idlist_features,
             idscore_features=global_idscore_features,
             label=torch.cat(label_list),
+            dummy=[
+                torch.cat([dummy_list[r][i] for r in range(world_size)])
+                for i in range(num_dummy_tensor)
+            ],
         )
         local_inputs = [
             ModelInput(
@@ -270,12 +286,14 @@ class ModelInput(Pipelineable):
                 idlist_features=idlist_features,
                 idscore_features=idscore_features,
                 label=label,
+                dummy=dummy,
             )
-            for float_features, idlist_features, idscore_features, label in zip(
+            for float_features, idlist_features, idscore_features, label, dummy in zip(
                 float_features_list,
                 idlist_features_list,
                 idscore_features_list,
                 label_list,
+                dummy_list,
             )
         ]
         return global_input, local_inputs
@@ -310,6 +328,7 @@ class ModelInput(Pipelineable):
         lengths_dtype: torch.dtype = torch.int64,
         all_zeros: bool = False,
         pin_memory: bool = False,  # pin_memory is needed for training job qps benchmark
+        num_dummy_tensor: int = 0,
     ) -> List["ModelInput"]:
         """
         Returns multi-rank batches (ModelInput) of world_size
@@ -330,6 +349,7 @@ class ModelInput(Pipelineable):
                 lengths_dtype=lengths_dtype,
                 all_zeros=all_zeros,
                 pin_memory=pin_memory,
+                num_dummy_tensor=num_dummy_tensor,
             )
             for _ in range(world_size)
         ]
@@ -366,6 +386,7 @@ class ModelInput(Pipelineable):
         power_law_alpha: Optional[
             float
         ] = None,  # If set, use power-law distribution for indices
+        num_dummy_tensor: int = 0,
     ) -> "ModelInput":
         """
         Returns a single batch of `ModelInput`
@@ -423,10 +444,14 @@ class ModelInput(Pipelineable):
             if all_zeros
             else torch.rand((batch_size,), device=device)
         )
+        dummy = [
+            torch.rand((batch_size, num_float_features), device=device)
+            for _ in range(num_dummy_tensor)
+        ]
         if pin_memory:
-            float_features, idlist_features, idscore_features, label = (
+            float_features, idlist_features, idscore_features, label, dummy = (
                 ModelInput._pin_memory(
-                    float_features, idlist_features, idscore_features, label
+                    float_features, idlist_features, idscore_features, label, dummy
                 )
             )
 
@@ -435,6 +460,7 @@ class ModelInput(Pipelineable):
             idlist_features=idlist_features,
             idscore_features=idscore_features,
             label=label,
+            dummy=dummy,
         )
 
     @staticmethod
@@ -653,11 +679,13 @@ class ModelInput(Pipelineable):
         idlist_features: Optional[KeyedJaggedTensor],
         idscore_features: Optional[KeyedJaggedTensor],
         label: torch.Tensor,
+        dummy: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[
         torch.Tensor,
         Optional[KeyedJaggedTensor],
         Optional[KeyedJaggedTensor],
         torch.Tensor,
+        List[torch.Tensor],
     ]:
         """
         Pin memory for all tensors in `ModelInput`
@@ -670,6 +698,7 @@ class ModelInput(Pipelineable):
             idlist_features.pin_memory() if idlist_features is not None else None,
             idscore_features.pin_memory() if idscore_features is not None else None,
             label.pin_memory(),
+            [d.pin_memory() for d in dummy] if dummy else [],
         )
 
     @staticmethod
@@ -824,6 +853,7 @@ class VariableBatchModelInput(ModelInput):
         all_zeros: bool = False,
         device: Optional[torch.device] = None,
         pin_memory: bool = False,  # pin_memory is needed for training job qps benchmark
+        num_dummy_tensor: int = 0,
     ) -> "VariableBatchModelInput":
         """
         Returns a single batch of `VariableBatchModelInput`
@@ -868,10 +898,15 @@ class VariableBatchModelInput(ModelInput):
 
         label = torch.rand((dedup_factor * batch_size), device=device)
 
+        dummy = [
+            torch.rand((dedup_factor * batch_size, num_float_features), device=device)
+            for _ in range(num_dummy_tensor)
+        ]
+
         if pin_memory:
-            float_features, idlist_features, idscore_features, label = (
+            float_features, idlist_features, idscore_features, label, dummy = (
                 ModelInput._pin_memory(
-                    float_features, idlist_features, idscore_features, label
+                    float_features, idlist_features, idscore_features, label, dummy
                 )
             )
 
@@ -880,6 +915,7 @@ class VariableBatchModelInput(ModelInput):
             idlist_features=idlist_features,
             idscore_features=idscore_features,
             label=label,
+            dummy=dummy,
         )
 
     @staticmethod

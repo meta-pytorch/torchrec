@@ -585,7 +585,7 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface, ModuleNoCopyMixin)
         embedding_bag_configs = copy.deepcopy(module.embedding_bag_configs())
         _update_embedding_configs(
             cast(List[BaseEmbeddingConfig], embedding_bag_configs),
-            #  but got `Union[Module, Tensor]`.
+            # pyrefly: ignore[bad-argument-type]
             module.qconfig,
             pruning_dict,
         )
@@ -698,7 +698,7 @@ class FeatureProcessedEmbeddingBagCollection(EmbeddingBagCollection):
         embedding_bag_configs = copy.deepcopy(ebc.embedding_bag_configs())
         _update_embedding_configs(
             cast(List[BaseEmbeddingConfig], embedding_bag_configs),
-            #  but got `Union[Module, Tensor]`.
+            # pyrefly: ignore[bad-argument-type]
             qconfig,
             pruning_dict,
         )
@@ -995,7 +995,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
         embedding_configs = copy.deepcopy(module.embedding_configs())
         _update_embedding_configs(
             cast(List[BaseEmbeddingConfig], embedding_configs),
-            #  but got `Union[Module, Tensor]`.
+            # pyrefly: ignore[bad-argument-type]
             module.qconfig,
         )
         table_name_to_quantized_weights: Dict[str, Tuple[Tensor, Tensor]] = {}
@@ -1158,6 +1158,7 @@ class QuantManagedCollisionEmbeddingCollection(EmbeddingCollection):
         mc_ec = module
         ec = module._embedding_module
 
+        # pyrefly: ignore[bad-assignment]
         qconfig: torch.quantization.QConfig = module.qconfig
         assert hasattr(
             module, "qconfig"
@@ -1314,6 +1315,7 @@ class QuantManagedCollisionEmbeddingBagCollection(EmbeddingBagCollection):
         mc_ebc = module
         ebc = module._embedding_module
 
+        # pyrefly: ignore[bad-assignment]
         qconfig: torch.quantization.QConfig = module.qconfig
         assert hasattr(
             module, "qconfig"

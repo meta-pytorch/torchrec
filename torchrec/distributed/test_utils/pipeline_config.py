@@ -24,6 +24,7 @@ from torchrec.distributed.train_pipeline.train_pipelines import (
     TrainEvalHybridPipelineBase,
     TrainPipelineSemiSync,
     TrainPipelineSparseDistLite,
+    TrainPipelineSparseDistT,
 )
 
 
@@ -102,6 +103,7 @@ class PipelineConfig:
             "hybrid_base": TrainEvalHybridPipelineBase,
             "eval-sdd": EvalPipelineSparseDist,
             "eval-fused": EvalPipelineFusedSparseDist,
+            "sparse-threading": TrainPipelineSparseDistT,
         }
 
         if self.pipeline == "semi":
