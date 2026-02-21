@@ -44,6 +44,7 @@ class QuantUtilsTest(unittest.TestCase):
         ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
 
         # test forward
+        # pyrefly: ignore[bad-argument-type]
         ebc.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
