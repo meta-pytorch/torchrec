@@ -97,6 +97,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
 
         # test forward
         if not per_table_weight_dtype:
+            # pyrefly: ignore[bad-argument-type]
             ebc.qconfig = torch.quantization.QConfig(
                 activation=torch.quantization.PlaceholderObserver.with_args(
                     dtype=output_type
@@ -360,6 +361,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         ebc = EmbeddingBagCollection(tables=tables)
 
         # test forward
+        # pyrefly: ignore[bad-argument-type]
         ebc.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -371,6 +373,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         qebc_state_dict = qebc.state_dict()
 
         ebc_2 = EmbeddingBagCollection(tables=tables)
+        # pyrefly: ignore[bad-argument-type]
         ebc_2.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -458,6 +461,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
 
         ebc = EmbeddingBagCollection(tables=tables)
         # test forward
+        # pyrefly: ignore[bad-argument-type]
         ebc.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -498,6 +502,7 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
         )
 
         ebc = EmbeddingBagCollection(tables=[eb1_config, eb2_config])
+        # pyrefly: ignore[bad-argument-type]
         ebc.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -934,6 +939,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
         )
 
         ec = EmbeddingCollection(tables=[ec1_config, ec2_config])
+        # pyrefly: ignore[bad-argument-type]
         ec.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
@@ -1035,6 +1041,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
         )
 
         ec = EmbeddingCollection(tables=[ec1_config, ec2_config])
+        # pyrefly: ignore[bad-argument-type]
         ec.qconfig = torch.quantization.QConfig(
             activation=torch.quantization.PlaceholderObserver.with_args(
                 dtype=output_type
