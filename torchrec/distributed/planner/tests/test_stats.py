@@ -14,7 +14,6 @@ from typing import List
 import hypothesis.strategies as st
 import torch
 from hypothesis import given, settings
-from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.planners import EmbeddingShardingPlanner
@@ -32,12 +31,11 @@ from torchrec.distributed.planner.stats import (
 )
 from torchrec.distributed.planner.types import Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import ModuleSharder, ShardingType
+from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class TWvsRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class TWvsRWSharder(EmbeddingBagCollectionSharder):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.ROW_WISE.value, ShardingType.TABLE_WISE.value]
 
