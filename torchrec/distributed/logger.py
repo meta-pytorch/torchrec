@@ -168,7 +168,7 @@ _P = ParamSpec("_P")
 
 def _torchrec_method_logger(
     **wrapper_kwargs: Any,
-) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+) -> Callable[[Callable[..., _T]], Callable[..., _T]]:
     """
     A method decorator that provides comprehensive logging for TorchRec functions.
 
@@ -180,6 +180,11 @@ def _torchrec_method_logger(
     The decorator is designed for observability in distributed training scenarios
     where debugging across multiple processes can be challenging.
 
+    Uses ``Callable[..., _T]`` instead of ``Callable[_P, _T]`` (ParamSpec) to avoid
+    a Pyre limitation where ParamSpec captures ``self`` and causes type errors in
+    child class ``super().__init__()`` calls when the parent's ``__init__`` is
+    decorated.
+
     Args:
         **wrapper_kwargs: Additional keyword arguments for future extensibility.
             Currently unused but allows for backward-compatible additions.
@@ -189,9 +194,9 @@ def _torchrec_method_logger(
 
     Example:
         @_torchrec_method_logger()
-        def train_step(model, batch, optimizer):
-            # Training logic here
-            return loss
+        def __init__(self, model, optimizer):
+            # init logic here
+            pass
 
         # When called, this will log:
         # - DEBUG: func_name, input args, and output on success
@@ -204,7 +209,7 @@ def _torchrec_method_logger(
           via functools.wraps.
     """
 
-    def decorator(func: Callable[_P, _T]) -> Callable[_P, _T]:
+    def decorator(func: Callable[..., _T]) -> Callable[..., _T]:
         """
         Inner decorator that wraps the actual function.
 
@@ -216,7 +221,7 @@ def _torchrec_method_logger(
         """
 
         @functools.wraps(func)
-        def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _T:
+        def wrapper(*args: Any, **kwargs: Any) -> _T:
             """
             Wrapper function that executes the original function with logging.
 
