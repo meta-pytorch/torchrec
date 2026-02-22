@@ -136,12 +136,12 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         pass
 
-    @_torchrec_method_logger()
     def __init__(self) -> None:
         # pipeline state such as in foward, in backward etc, used in training recover scenarios
         self._state: PipelineState = PipelineState.IDLE
 
         logger.info(f"TrainPipeline class: {type(self)}")
+        one_time_rank0_logger.info(f"TrainPipeline class: {type(self)}")
 
     def sync_embeddings(
         self,
@@ -210,6 +210,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
     memory, and the default stream runs forward, backward, and optimization.
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         model: torch.nn.Module,
@@ -242,7 +243,6 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._cur_batch: Optional[In] = None
         self._connected = False
         self._data_iter_stopped = False
-        # pyrefly: ignore [missing-argument]
         super().__init__()
 
     def _reset_data_iter(self) -> None:
@@ -382,6 +382,7 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
             This is useful when we want to transform KJT parameters for PT2 tracing
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         model: torch.nn.Module,
@@ -505,6 +506,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
     # The PipelinedForward class that is used in _rewrite_model
     _pipelined_forward_type = PipelinedForward
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         model: torch.nn.Module,
@@ -597,7 +599,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         # Backward hook registry for injecting work during backward comms
         self._backward_hook_registry = backward_hook_registry or BackwardHookRegistry()
 
-        # pyrefly: ignore [missing-argument]
         super().__init__()
 
         # DEPRECATED FIELDS
@@ -2459,6 +2460,7 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
             optimizer.step()
     """
 
+    @_torchrec_method_logger()
     def __init__(
         self,
         pipeline_stages: List[PipelineStage],

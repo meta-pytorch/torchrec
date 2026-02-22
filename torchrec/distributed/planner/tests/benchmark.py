@@ -30,7 +30,7 @@ from torchrec.distributed.planner.constants import BATCH_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.types import Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import ModuleSharder, ShardingType
+from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 # Configure logging to ensure visibility
@@ -44,8 +44,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class TWSharder(EmbeddingBagCollectionSharder):
     """
     Table-wise sharder for benchmarking.
     """
@@ -61,8 +60,7 @@ class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class RWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class RWSharder(EmbeddingBagCollectionSharder):
     """
     Row-wise sharder for benchmarking.
     """
@@ -78,8 +76,7 @@ class RWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.DENSE.value]
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class CWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class CWSharder(EmbeddingBagCollectionSharder):
     """
     Column-wise sharder for benchmarking.
     """
@@ -139,7 +136,7 @@ def measure_memory_and_time(
     num_tables: int,
     embedding_dim: int = 128,
     # pyrefly: ignore[bad-function-definition]
-    sharder_class: Type[ModuleSharder[nn.Module]] = TWSharder,
+    sharder_class: Type[EmbeddingBagCollectionSharder] = TWSharder,
 ) -> Dict[str, float]:
     """
     Measure both time and memory usage for the enumerate operation.
@@ -171,6 +168,7 @@ def measure_memory_and_time(
 
     # Measure time
     start_time = time.time()
+    # pyrefly: ignore[bad-argument-type]
     sharding_options = enumerator.enumerate(module=model, sharders=[sharder_class()])
     end_time = time.time()
     elapsed_time = end_time - start_time
@@ -199,7 +197,7 @@ def measure_memory_and_time(
 
 def benchmark_enumerator_comprehensive(
     # pyrefly: ignore[bad-function-definition]
-    sharder_class: Type[ModuleSharder[nn.Module]] = TWSharder,
+    sharder_class: Type[EmbeddingBagCollectionSharder] = TWSharder,
 ) -> None:
     """
     Comprehensive benchmark testing all combinations of world sizes and table counts.

@@ -27,8 +27,6 @@ def compute_cross_entropy(
 ) -> torch.Tensor:
     predictions = predictions.double()
     predictions.clamp_(min=eta, max=1 - eta)
-    labels = labels.double()
-    labels.clamp_(min=0.0, max=1.0)
     cross_entropy = -weights * labels * torch.log2(predictions) - weights * (
         1.0 - labels
     ) * torch.log2(1.0 - predictions)
@@ -81,7 +79,6 @@ def compute_logloss(
 def get_ne_states(
     labels: torch.Tensor, predictions: torch.Tensor, weights: torch.Tensor, eta: float
 ) -> Dict[str, torch.Tensor]:
-    labels = labels.double().clamp(min=0.0, max=1.0)
     cross_entropy = compute_cross_entropy(
         labels,
         predictions,

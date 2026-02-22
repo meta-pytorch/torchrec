@@ -21,7 +21,7 @@ OSS (external):
 see README.md for more details
 """
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -523,6 +523,7 @@ def non_blocking_copy(
     with record_function("## pre-comms compute ##"):
         # make sure the data copy is done before the pre-comms compute
         if use_data_copy_stream:
+            # pyrefly: ignore[bad-argument-type]
             main_stream.wait_stream(data_copy_stream)
         pre_comms = _compute(
             dim=dim, num_mul=num_mul, num_concat=1, ctx=ctx, x=device_data
@@ -598,6 +599,8 @@ def threading_copy(
                 device_tensors[i].copy_(host_tensors[i], non_blocking=True)
 
     # launch the copy via ThreadPoolExecutor
+    executor: ThreadPoolExecutor | None = None
+    future: Future | None = None
     with record_function("## submit copy to executor ##"):
         if multithreading:
             executor = ThreadPoolExecutor(max_workers=1)
@@ -614,7 +617,9 @@ def threading_copy(
 
     with record_function("## wait for executor future ##"):
         if multithreading:
+            assert future is not None
             future.result()
+            assert executor is not None
             executor.shutdown(wait=False)
 
     with record_function("## wait for copy stream ##"):
