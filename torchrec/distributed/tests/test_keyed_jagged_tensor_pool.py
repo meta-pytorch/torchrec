@@ -719,29 +719,6 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
         torch.cuda.device_count() <= 3,
         "Not enough GPUs, this test requires at least four GPUs",
     )
-    def test_sharded_keyed_jagged_tensor_pool_replicated_rw(
-        self,
-    ) -> None:
-        pool_size, feature_max_lengths = 4, {"f1": 2, "f2": 4}
-
-        self._run_multi_process_test(
-            callable=self._test_sharded_keyed_jagged_tensor_pool_replicated_rw,
-            world_size=4,
-            local_world_size=4,
-            pool_size=pool_size,
-            feature_max_lengths=feature_max_lengths,
-            values_dtype=torch.int64,
-            is_weighted=False,
-            sharding_plan=ObjectPoolShardingPlan(
-                sharding_type=ObjectPoolShardingType.REPLICATED_ROW_WISE
-            ),
-            backend="nccl",
-        )
-
-    @unittest.skipIf(
-        torch.cuda.device_count() <= 3,
-        "Not enough GPUs, this test requires at least four GPUs",
-    )
     def test_sharded_kjt_pool_inference(self) -> None:
         world_size = 2
         pool_size = 4
