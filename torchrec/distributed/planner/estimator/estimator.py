@@ -813,16 +813,24 @@ class EmbeddingShardingPerfEvaluator(ABC):
 
             # FB extension: clamp num_unique_lookups if linear regression is enabled
             if use_linear_regression:
+                logger.info("use_linear_regression_prefetch_estimate is enabled")
                 num_unique_lookups = min(
                     num_unique_lookups,
                     batch_inputs,
                     ctx.hash_size_for_clamping,  # hash size
                 )
-
+                logger.info(
+                    "Since use_linear_regression_prefetch_estimate is "
+                    "enabled, adjusting num_unique_lookups to be min(estimated_num_unique_lookups, batch_input_count, hash_size)"
+                )
             # Calculate expected_cache_fetches
             # OSS: expected_miss_rate * expected_lookups (where expected_lookups = cache_stats.expected_lookups)
             # FB extension: optionally use batch_inputs instead
             if use_batch_inputs_for_cache_fetches:
+                logger.info(
+                    "Since use_batch_inputs_for_expected_cache_fetches is enabled, "
+                    "computing expected_cache_fetches = expected_miss_rate * batch_inputs."
+                )
                 expected_cache_fetches = ctx.expected_miss_rate * batch_inputs
             else:
                 # OSS default: use cache_stats.expected_lookups (num_unique_lookups)
@@ -864,7 +872,10 @@ class EmbeddingShardingPerfEvaluator(ABC):
             # IMPORTANT: For linear regression, prefetch_bytes does NOT include table_data_type_size
             # This matches the FB hardware estimator implementation (D89929552)
             prefetch_bytes = expected_cache_fetches * ctx.emb_dim
-
+            logger.info(
+                "Prefetch params are available, using linear regression approach "
+                "for prefetch time estimation"
+            )
             prefetch_time = (
                 prefetch_coeffs.expected_num_lookups_coefficient * expected_lookups
                 + prefetch_coeffs.expected_num_unique_lookups_coefficient
@@ -872,26 +883,6 @@ class EmbeddingShardingPerfEvaluator(ABC):
                 + prefetch_coeffs.expected_size_cache_fetches_coefficient
                 * prefetch_bytes
             )
-
-            # DEBUG: Log linear regression prefetch computation
-            logger.info(
-                f"[PREFETCH_COMP DEBUG] sharding_type={ctx.sharding_type}, "
-                f"table_name={ctx.table_name}, "
-                f"shard_id=(hash={ctx.hash_size}, dim={ctx.emb_dim}), "
-                f"use_linear_regression=True, "
-                f"use_batch_inputs_for_cache_fetches={use_batch_inputs_for_cache_fetches}, "
-                f"is_weighted={ctx.is_weighted}, "
-                f"expected_cache_fetches={expected_cache_fetches}, "
-                f"expected_lookups={expected_lookups}, "
-                f"expected_unique_lookups={expected_unique_lookups}, "
-                f"prefetch_divisor={prefetch_divisor}, "
-                f"prefetch_bytes={prefetch_bytes}, "
-                f"prefetch_time={prefetch_time}, "
-                f"coeffs=(lookups={prefetch_coeffs.expected_num_lookups_coefficient}, "
-                f"unique={prefetch_coeffs.expected_num_unique_lookups_coefficient}, "
-                f"cache_fetches={prefetch_coeffs.expected_size_cache_fetches_coefficient})"
-            )
-
             return prefetch_time
 
         # Raise error if linear regression is enabled but prefetch params are missing
@@ -911,23 +902,6 @@ class EmbeddingShardingPerfEvaluator(ABC):
         prefetch_bytes = expected_cache_fetches * ctx.emb_dim * ctx.table_data_type_size
         hbm_to_ddr_bw = self._get_hbm_to_ddr_mem_bw(ctx, config)
         prefetch_time = prefetch_bytes / hbm_to_ddr_bw if hbm_to_ddr_bw > 0 else 0.0
-
-        # DEBUG: Log bandwidth-based prefetch computation
-        logger.info(
-            f"[PREFETCH_COMP DEBUG] sharding_type={ctx.sharding_type}, "
-            f"table_name={ctx.table_name}, "
-            f"shard_id=(hash={ctx.hash_size}, dim={ctx.emb_dim}), "
-            f"use_linear_regression=False, "
-            f"use_batch_inputs_for_cache_fetches={use_batch_inputs_for_cache_fetches}, "
-            f"is_weighted={ctx.is_weighted}, "
-            f"expected_cache_fetches={expected_cache_fetches}, "
-            f"expected_lookups={expected_lookups}, "
-            f"expected_unique_lookups={expected_unique_lookups}, "
-            f"prefetch_divisor={prefetch_divisor}, "
-            f"prefetch_bytes={prefetch_bytes}, "
-            f"hbm_to_ddr_bw={hbm_to_ddr_bw}, "
-            f"prefetch_time={prefetch_time}"
-        )
 
         return prefetch_time
 
