@@ -42,7 +42,6 @@ from torchrec.distributed.types import (
     DataType,
     EmbeddingModuleShardingPlan,
     KeyValueParams,
-    ModuleSharder,
     ShardingPlan,
     ShardingType,
 )
@@ -50,8 +49,7 @@ from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class TWvsRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class TWvsRWSharder(EmbeddingBagCollectionSharder):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.ROW_WISE.value, ShardingType.TABLE_WISE.value]
 
@@ -61,8 +59,7 @@ class TWvsRWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
         return [EmbeddingComputeKernel.FUSED.value]
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class TWSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class TWSharder(EmbeddingBagCollectionSharder):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.TABLE_WISE.value]
 
@@ -440,8 +437,7 @@ class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):
         )
 
 
-# pyrefly: ignore[inconsistent-inheritance]
-class AutoSharder(EmbeddingBagCollectionSharder, ModuleSharder[nn.Module]):
+class AutoSharder(EmbeddingBagCollectionSharder):
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return [ShardingType.ROW_WISE.value, ShardingType.TABLE_WISE.value]
 
