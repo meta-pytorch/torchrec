@@ -15,7 +15,7 @@ RunOptions:
   num_float_features: 1000
 PipelineConfig:
   pipeline: "prefetch"
-  # inplace_copy_batch_to_gpu: True
+  # enable_inplace_copy_batch: True
 ModelInputConfig:
   num_float_features: 1000
   feature_pooling_avg: 60
