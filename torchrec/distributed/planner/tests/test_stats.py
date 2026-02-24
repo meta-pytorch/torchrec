@@ -104,6 +104,21 @@ class TestEmbeddingStats(unittest.TestCase):
                 top_hbm_mem_usage = float(row.split(" ")[6])
         self.assertIsNotNone(top_hbm_mem_usage)
 
+    def test_embedding_stats_output_with_hardcoded_compute_kernel_stats(self) -> None:
+        planner = EmbeddingShardingPlanner(topology=self.topology)
+        # pyrefly: ignore[bad-argument-type, missing-argument]
+        _ = planner.plan(module=self.model, sharders=[TWvsRWSharder()])
+        self.assertEqual(len(planner._stats), 1)
+        stats_data = planner._stats[0]
+        assert isinstance(stats_data, EmbeddingStats)
+        stats: List[str] = stats_data._stats_table
+        self.assertTrue(isinstance(stats, list))
+        constraint_keyword = "Compute Kernel Constraints:"
+        self.assertTrue(any(constraint_keyword in row for row in stats))
+        # No constraints passed, so all tables should be auto-selected
+        auto_keyword = "Hardcoded: 0, Auto-selected: 4"
+        self.assertTrue(any(auto_keyword in row for row in stats))
+
     def test_normalize_float(self) -> None:
         p = [2.0, 2.0]
         self.assertEqual(_normalize_float(p), [0.5, 0.5])

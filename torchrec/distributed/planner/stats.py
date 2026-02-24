@@ -317,6 +317,8 @@ class EmbeddingStats(Stats):
             description="Compute Kernels Storage",
         )
 
+        self._log_hardcoded_compute_kernel_stats(best_plan, constraints)
+
         if debug:
             if sharding_plan.plan:
                 # Plan imbalance stats for perf and storage
@@ -673,6 +675,38 @@ class EmbeddingStats(Stats):
         self._stats_table.append(f"# {description+':' : <{self._width-3}}#")
         for compute_kernel_count in compute_kernels_count:
             self._stats_table.append(f"#    {compute_kernel_count : <{self._width-6}}#")
+
+    def _log_hardcoded_compute_kernel_stats(
+        self,
+        best_plan: List[ShardingOption],
+        constraints: Optional[Dict[str, ParameterConstraints]],
+    ) -> None:
+        num_hardcoded = 0
+        num_auto = 0
+        hardcoded_breakdown: Dict[str, int] = {}
+
+        for so in best_plan:
+            if (
+                constraints
+                and constraints.get(so.name)
+                and constraints[so.name].compute_kernels
+            ):
+                num_hardcoded += 1
+                kernel = so.compute_kernel
+                hardcoded_breakdown[kernel] = hardcoded_breakdown.get(kernel, 0) + 1
+            else:
+                num_auto += 1
+
+        self._stats_table.append(f"#{'' : ^{self._width-2}}#")
+        header = "Compute Kernel Constraints:"
+        self._stats_table.append(f"# {header : <{self._width-3}}#")
+        summary = f"Hardcoded: {num_hardcoded}, Auto-selected: {num_auto}"
+        self._stats_table.append(f"#    {summary : <{self._width-6}}#")
+
+        if hardcoded_breakdown:
+            for kernel, count in sorted(hardcoded_breakdown.items()):
+                line = f"Hardcoded {kernel}: {count}"
+                self._stats_table.append(f"#    {line : <{self._width-6}}#")
 
     def _log_rank_mem_usage_and_perf(
         self,
