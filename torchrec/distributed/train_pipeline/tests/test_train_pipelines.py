@@ -1887,7 +1887,7 @@ class EvalPipelineSparseDistTest(unittest.TestCase):
             ) -> None:
                 pass
 
-            # pyrefly: ignore[bad-param-name-override]
+            # pyrefly: ignore [bad-override, bad-param-name-override]
             def _start_sparse_data_dist(
                 self, item: Pipelineable, context: TrainPipelineContext
             ) -> None:

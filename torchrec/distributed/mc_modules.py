@@ -1453,7 +1453,7 @@ class ShardedQuantManagedCollisionCollection(
             ret.append(sharding_ret)
         return ret
 
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def compute(
         self,
         ctx: ManagedCollisionCollectionContext,

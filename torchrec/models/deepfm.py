@@ -354,7 +354,7 @@ class SimpleDeepFMNN(nn.Module):
 
 
 class SimpleDeepFMNNWrapper(SimpleDeepFMNN):
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def forward(
         self, model_input: ModelInput
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:

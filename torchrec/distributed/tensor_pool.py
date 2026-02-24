@@ -434,7 +434,7 @@ class ShardedInferenceTensorPool(
     def create_context(self) -> ObjectPoolShardingContext:
         raise NotImplementedError("create_context() is not implemented")
 
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def _lookup_ids_dist(
         self,
         ids: torch.Tensor,
@@ -449,7 +449,7 @@ class ShardedInferenceTensorPool(
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         return self._lookup_ids_dist_impl.update(ids, values)
 
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def _lookup_local(
         self,
         dist_input: List[torch.Tensor],
@@ -459,7 +459,7 @@ class ShardedInferenceTensorPool(
             ret.append(shard(dist_input[i]))
         return ret
 
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def _lookup_values_dist(
         self,
         lookups: List[torch.Tensor],
@@ -526,7 +526,7 @@ class ShardedInferenceTensorPool(
     def _update_values_dist(self, ctx: ObjectPoolShardingContext, values: torch.Tensor):
         raise NotImplementedError("Inference does not support update")
 
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def _update_local(
         self,
         dist_input: List[torch.Tensor],

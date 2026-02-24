@@ -601,14 +601,14 @@ class ShardedInferenceKeyedJaggedTensorPool(
     def create_context(self) -> ObjectPoolShardingContext:
         raise NotImplementedError("create_context() is not implemented")
 
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def _lookup_ids_dist(
         self,
         ids: torch.Tensor,
     ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         return self._lookup_ids_dist_impl(ids)
 
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def _lookup_local(
         self,
         dist_input: List[torch.Tensor],
@@ -618,7 +618,7 @@ class ShardedInferenceKeyedJaggedTensorPool(
             ret.append(shard(dist_input[i]))
         return ret
 
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def _lookup_values_dist(
         self,
         lookups: List[JaggedTensor],
