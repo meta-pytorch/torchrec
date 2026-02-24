@@ -21,6 +21,7 @@ To support a new model in pipeline benchmark:
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -84,6 +85,18 @@ class RunOptions(BenchFuncConfig):
             Default is False.
         debug_mode (bool): Whether to enable debug mode.
             Default is False.
+        topology_domain_multiple (Optional[int]): Number of hosts per NVLink domain/pod.
+            Used for GB200 topology-aware benchmarking. When set, this determines the
+            pod_size for the Topology object, affecting intra_group_size calculations.
+            For GB200 with 10 hosts per domain: topology_domain_multiple=10.
+            Default is None (falls back to single-node topology).
+        topology_domain_max_group_count (Optional[int]): Maximum number of domain groups
+            in the job. This is primarily used for MAST scheduling and documentation.
+            Default is None.
+        local_world_size (Optional[int]): Number of GPUs per host.
+            For GB200: local_world_size=2. If not set, defaults to world_size
+            (single-node assumption).
+            Default is None.
     """
 
     world_size: int = 2
@@ -94,6 +107,9 @@ class RunOptions(BenchFuncConfig):
     num_profiles: int = 2
     export_stacks: bool = False
     debug_mode: bool = False
+    topology_domain_multiple: Optional[int] = None
+    topology_domain_max_group_count: Optional[int] = None
+    local_world_size: Optional[int] = None
 
 
 # single-rank runner
@@ -115,6 +131,17 @@ def runner(
     assert (
         torch.cuda.is_available() and torch.cuda.device_count() >= world_size
     ), "CUDA not available or insufficient GPUs for the requested world_size"
+
+    # Set topology domain environment variable if specified
+    # This enables TorchRec's comm.py to calculate proper topology group sizes
+    if run_option.topology_domain_multiple is not None:
+        os.environ["TOPOLOGY_DOMAIN_MULTIPLE"] = str(
+            run_option.topology_domain_multiple
+        )
+        logger.info(
+            f"Set TOPOLOGY_DOMAIN_MULTIPLE={run_option.topology_domain_multiple} "
+            f"(local_world_size={run_option.local_world_size or 'auto'})"
+        )
 
     # debug mode only works with vscode for now.
     if debug_mode:
@@ -188,7 +215,7 @@ def runner(
             prof_inputs=bench_inputs,
             func_to_benchmark=_func_to_benchmark,
             benchmark_func_kwargs={"model": sharded_model, "pipeline": pipeline},
-            **run_option.benchmark_func_kwargs(rank=rank)
+            **run_option.benchmark_func_kwargs(rank=rank),
         )
 
         if rank == 0:
