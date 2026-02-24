@@ -219,7 +219,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         custom_model_fwd: Optional[
             Callable[[In], Tuple[torch.Tensor, List[torch.Tensor]]]
         ] = None,
-        inplace_copy_batch_to_gpu: bool = False,
+        enable_inplace_copy_batch: bool = False,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -230,9 +230,9 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             else None
         )
         self._batch_count = 0
-        self._inplace_copy_batch_to_gpu = inplace_copy_batch_to_gpu
+        self._enable_inplace_copy_batch = enable_inplace_copy_batch
         logger.info(
-            f"train_pipeline uses inplace_copy_batch_to_gpu: {inplace_copy_batch_to_gpu}"
+            f"train_pipeline uses enable_inplace_copy_batch: {enable_inplace_copy_batch}"
         )
 
         self._stream_context = (
@@ -259,7 +259,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         cur_batch = self._next_batch(dataloader_iter)
         self._cur_batch = cur_batch
         if cur_batch is not None:
-            if self._inplace_copy_batch_to_gpu:
+            if self._enable_inplace_copy_batch:
                 self._cur_batch = _to_device(
                     cur_batch,
                     self._device,
@@ -291,7 +291,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                 cur_batch,
                 self._memcpy_stream,
                 # no need to record stream when using in-place copy
-                record_stream=not self._inplace_copy_batch_to_gpu,
+                record_stream=not self._enable_inplace_copy_batch,
             )
 
     def _backward(self, losses: torch.Tensor) -> None:
@@ -299,7 +299,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
             torch.sum(losses, dim=0).backward()
 
     def _copy_batch_to_gpu(self, cur_batch: In) -> None:
-        if self._inplace_copy_batch_to_gpu:
+        if self._enable_inplace_copy_batch:
             with record_function("## inplace_copy_batch_to_gpu ##"):
                 self._cur_batch = _to_device(
                     cur_batch,
@@ -522,7 +522,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         ] = None,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
-        inplace_copy_batch_to_gpu: bool = False,
+        enable_inplace_copy_batch: bool = False,
         backward_hook_registry: Optional[BackwardHookRegistry] = None,
     ) -> None:
         self._model = model
@@ -531,13 +531,13 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._execute_all_batches = execute_all_batches
         self._apply_jit = apply_jit
         self._enqueue_batch_after_forward = enqueue_batch_after_forward
-        self._inplace_copy_batch_to_gpu = inplace_copy_batch_to_gpu
+        self._enable_inplace_copy_batch = enable_inplace_copy_batch
         self._batch_count = 0
 
         logger.info(
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
             f"execute_all_batches: {self._execute_all_batches} "
-            f"inplace_copy_batch_to_gpu: {inplace_copy_batch_to_gpu}"
+            f"enable_inplace_copy_batch: {enable_inplace_copy_batch}"
         )
 
         if device.type == "cuda":
@@ -677,7 +677,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         load a data batch from dataloader, and copy it from cpu to gpu
         also create the context for this batch.
         """
-        if self._inplace_copy_batch_to_gpu:
+        if self._enable_inplace_copy_batch:
             batch, context = self.inplace_copy_batch_to_gpu(dataloader_iter)
         else:
             batch, context = self.copy_batch_to_gpu(dataloader_iter)
@@ -1147,7 +1147,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
             operations. Default: False.
         custom_model_fwd (Optional[Callable]): Custom forward function to use instead
             of model's default forward. Should return (losses, output) tuple.
-        inplace_copy_batch_to_gpu (bool): If True, performs in-place device transfer
+        enable_inplace_copy_batch (bool): If True, performs in-place device transfer
             to reduce memory allocations. Default: False.
 
     Example:
@@ -1173,7 +1173,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
-        inplace_copy_batch_to_gpu: bool = False,
+        enable_inplace_copy_batch: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1186,7 +1186,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
             custom_model_fwd=custom_model_fwd,
             dmp_collection_sync_interval_batches=None,
             enqueue_batch_after_forward=False,
-            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
         )
 
         # SDD Lite only uses memcpy stream for H2D copy.
@@ -1329,7 +1329,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         strict: bool = False,
         emb_lookup_stream: str = "data_dist",  # new, current, data_dist (default)
         embedding_lookup_after_data_dist: bool = False,
-        inplace_copy_batch_to_gpu: bool = False,
+        enable_inplace_copy_batch: bool = False,
         enqueue_batch_after_forward: bool = False,
     ) -> None:
         super().__init__(
@@ -1341,7 +1341,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             context_type=EmbeddingTrainPipelineContext,
             pipeline_postproc=pipeline_postproc,
             custom_model_fwd=custom_model_fwd,
-            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
             enqueue_batch_after_forward=enqueue_batch_after_forward,
         )
         self._embedding_lookup_after_data_dist = embedding_lookup_after_data_dist
@@ -1519,7 +1519,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
         ] = None,
         strict: bool = False,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
-        inplace_copy_batch_to_gpu: bool = False,
+        enable_inplace_copy_batch: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1531,7 +1531,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             pipeline_postproc=pipeline_postproc,
             custom_model_fwd=custom_model_fwd,
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
-            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
         )
         self._start_batch = start_batch
         self._stash_gradients = stash_gradients
@@ -1860,7 +1860,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             operations. Default: True.
         custom_model_fwd (Optional[Callable]): Custom forward function to use instead
             of model's default forward. Should return (losses, output) tuple.
-        inplace_copy_batch_to_gpu (bool): If True, performs in-place device transfer
+        enable_inplace_copy_batch (bool): If True, performs in-place device transfer
             to reduce memory allocations. Default: False.
 
     Example:
@@ -1896,7 +1896,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
-        inplace_copy_batch_to_gpu: bool = False,
+        enable_inplace_copy_batch: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1907,7 +1907,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             context_type=PrefetchTrainPipelineContext,
             pipeline_postproc=pipeline_postproc,
             custom_model_fwd=custom_model_fwd,
-            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
         )
         self._context = PrefetchTrainPipelineContext(version=0)
         self._prefetch_stream: Optional[torch.Stream] = (
@@ -2270,7 +2270,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         optimizer: torch.optim.Optimizer,
         device: torch.device,
         apply_jit: bool = False,
-        inplace_copy_batch_to_gpu: bool = False,
+        enable_inplace_copy_batch: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -2278,7 +2278,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             device,
             execute_all_batches=True,
             apply_jit=apply_jit,
-            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
         )
         self._batch_loader: Optional[DataLoadingThread[In]] = None
 
@@ -2877,7 +2877,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
         ] = None,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
-        inplace_copy_batch_to_gpu: bool = False,
+        enable_inplace_copy_batch: bool = False,
         backward_hook_registry: Optional[BackwardHookRegistry] = None,
     ) -> None:
         super().__init__(
@@ -2891,7 +2891,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
             custom_model_fwd=custom_model_fwd,
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enqueue_batch_after_forward=False,
-            inplace_copy_batch_to_gpu=inplace_copy_batch_to_gpu,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
             backward_hook_registry=backward_hook_registry,
         )
         self._copy_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)

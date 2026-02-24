@@ -17,10 +17,17 @@ import torch
 from torch import Tensor
 from torchrec import KeyedJaggedTensor
 from torchrec.distributed.embedding_types import ShardedEmbeddingTable
-from torchrec.modules.embedding_configs import EmbeddingBagConfig
-from torchrec.modules.embedding_modules import EmbeddingBagCollection
-from torchrec.modules.itep_embedding_modules import ITEPEmbeddingBagCollection
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
+from torchrec.modules.itep_embedding_modules import (
+    ITEPEmbeddingBagCollection,
+    ITEPEmbeddingCollection,
+)
 from torchrec.modules.itep_modules import GenericITEPModule
+from torchrec.sparse.jagged_tensor import JaggedTensor
 
 MOCK_NS: str = "torchrec.modules.itep_modules"
 
@@ -779,3 +786,443 @@ class TestITEPEmbeddingBagCollection(unittest.TestCase):
             for i, iter_val in enumerate(iter_values_received):
                 self.assertIsInstance(iter_val, int)
                 self.assertEqual(iter_val, i)
+
+
+class TestITEPEmbeddingCollection(unittest.TestCase):
+    def setUp(self) -> None:
+        embedding_config1 = EmbeddingConfig(
+            name="table1",
+            embedding_dim=4,
+            num_embeddings=50,
+            feature_names=["feature1"],
+        )
+        embedding_config2 = EmbeddingConfig(
+            name="table2",
+            embedding_dim=4,
+            num_embeddings=40,
+            feature_names=["feature2"],
+        )
+        unpruned_hash_size_1, unpruned_hash_size_2 = (100, 80)
+        self._table_name_to_unpruned_hash_sizes = {
+            "table1": unpruned_hash_size_1,
+            "table2": unpruned_hash_size_2,
+        }
+        self._feature_name_to_unpruned_hash_sizes = {
+            "feature1": unpruned_hash_size_1,
+            "feature2": unpruned_hash_size_2,
+        }
+        self._batch_size = 8
+        self._embedding_configs = [embedding_config1, embedding_config2]
+
+        def embedding_config_to_sharded_table(
+            config: EmbeddingConfig,
+        ) -> ShardedEmbeddingTable:
+            return ShardedEmbeddingTable(
+                name=config.name,
+                embedding_dim=config.embedding_dim,
+                num_embeddings=config.num_embeddings,
+                feature_names=config.feature_names,
+            )
+
+        sharded_et1 = embedding_config_to_sharded_table(embedding_config1)
+        sharded_et2 = embedding_config_to_sharded_table(embedding_config2)
+
+        self._embedding_collection = EmbeddingCollection(
+            tables=self._embedding_configs,
+            device=torch.device("cuda"),
+        )
+
+        self._mock_lookups = [MagicMock()]
+        self._mock_lookups[0]._emb_modules = [MagicMock()]
+        self._mock_lookups[0]._emb_modules[0]._config = MagicMock()
+        self._mock_lookups[0]._emb_modules[0]._config.embedding_tables = [
+            sharded_et1,
+            sharded_et2,
+        ]
+
+    def generate_input_kjt_cuda(
+        self,
+        feature_name_to_unpruned_hash_sizes: Dict[str, int],
+        use_vbe: bool = False,
+    ) -> KeyedJaggedTensor:
+        keys = []
+        values = []
+        lengths = []
+        cuda_device = torch.device("cuda")
+
+        for key, unpruned_hash_size in feature_name_to_unpruned_hash_sizes.items():
+            value = []
+            length = []
+            for _ in range(self._batch_size):
+                L = random.randint(0, 8)
+                for _ in range(L):
+                    index = random.randint(0, unpruned_hash_size - 1)
+                    value.append(index)
+                length.append(L)
+            keys.append(key)
+            values += value
+            lengths += length
+
+        if use_vbe:
+            inverse_indices_list = []
+            num_keys = len(keys)
+            deduped_batch_size = len(lengths) // num_keys
+            full_batch_size = deduped_batch_size * 2
+            stride_per_key_per_rank = []
+
+            for _ in range(num_keys):
+                stride_per_key_per_rank.append([deduped_batch_size])
+                keyed_inverse_indices = torch.randint(
+                    low=0,
+                    high=deduped_batch_size,
+                    size=(full_batch_size,),
+                    dtype=torch.int32,
+                    device=cuda_device,
+                )
+                inverse_indices_list.append(keyed_inverse_indices)
+            inverse_indices = (
+                keys,
+                torch.stack(inverse_indices_list),
+            )
+
+            input_kjt_cuda = KeyedJaggedTensor.from_lengths_sync(
+                keys=keys,
+                values=torch.tensor(
+                    copy.deepcopy(values),
+                    dtype=torch.int32,
+                    device=cuda_device,
+                ),
+                lengths=torch.tensor(
+                    copy.deepcopy(lengths),
+                    dtype=torch.int32,
+                    device=cuda_device,
+                ),
+                stride_per_key_per_rank=stride_per_key_per_rank,
+                inverse_indices=inverse_indices,
+            )
+        else:
+            input_kjt_cuda = KeyedJaggedTensor.from_lengths_sync(
+                keys=keys,
+                values=torch.tensor(
+                    copy.deepcopy(values),
+                    dtype=torch.int32,
+                    device=cuda_device,
+                ),
+                lengths=torch.tensor(
+                    copy.deepcopy(lengths),
+                    dtype=torch.int32,
+                    device=cuda_device,
+                ),
+            )
+
+        return input_kjt_cuda
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_train_forward(self) -> None:
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        for _ in range(2000):
+            input_kjt = self.generate_input_kjt_cuda(
+                self._feature_name_to_unpruned_hash_sizes
+            )
+            _ = itep_ec(input_kjt)
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_train_forward_vbe(self) -> None:
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        for _ in range(5):
+            input_kjt = self.generate_input_kjt_cuda(
+                self._feature_name_to_unpruned_hash_sizes, use_vbe=True
+            )
+            _ = itep_ec(input_kjt)
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    @patch(f"{MOCK_NS}.GenericITEPModule.reset_weight_momentum")
+    def test_check_pruning_schedule(
+        self,
+        mock_reset_weight_momentum: MagicMock,
+    ) -> None:
+        random.seed(1)
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        for _ in range(2000):
+            input_kjt = self.generate_input_kjt_cuda(
+                self._feature_name_to_unpruned_hash_sizes
+            )
+            _ = itep_ec(input_kjt)
+
+        self.assertEqual(mock_reset_weight_momentum.call_count, 5)
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    @patch(f"{MOCK_NS}.GenericITEPModule.reset_weight_momentum")
+    def test_eval_forward(
+        self,
+        mock_reset_weight_momentum: MagicMock,
+    ) -> None:
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        itep_ec.eval()
+
+        for _ in range(2000):
+            input_kjt = self.generate_input_kjt_cuda(
+                self._feature_name_to_unpruned_hash_sizes
+            )
+            _ = itep_ec(input_kjt)
+
+        self.assertEqual(mock_reset_weight_momentum.call_count, 0)
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_iter_increment_per_forward(self) -> None:
+        """Test that the iteration counter increments correctly with each forward pass."""
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        self.assertEqual(itep_ec._iter.item(), 0)
+
+        for expected_iter in range(1, 6):
+            input_kjt = self.generate_input_kjt_cuda(
+                self._feature_name_to_unpruned_hash_sizes
+            )
+            _ = itep_ec(input_kjt)
+            self.assertEqual(itep_ec._iter.item(), expected_iter)
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_iter_passed_as_int_to_itep_module(self) -> None:
+        """Test that iter is passed as integer to the ITEP module."""
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        original_forward = itep_module.forward
+        captured_iter_args = []
+
+        # pyre-ignore[53]: Captured variable `captured_iter_args` is not annotated.
+        def mock_forward(
+            features: KeyedJaggedTensor, iter_val: int
+        ) -> KeyedJaggedTensor:
+            captured_iter_args.append((type(iter_val), iter_val))
+            return original_forward(features, iter_val)
+
+        with patch.object(itep_module, "forward", mock_forward):
+            itep_ec._iter = torch.tensor(42)
+
+            input_kjt = self.generate_input_kjt_cuda(
+                self._feature_name_to_unpruned_hash_sizes
+            )
+            _ = itep_ec(input_kjt)
+
+            self.assertEqual(len(captured_iter_args), 1)
+            arg_type, arg_value = captured_iter_args[0]
+            self.assertEqual(arg_type, int)
+            self.assertEqual(arg_value, 42)
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_forward_output_type(self) -> None:
+        """Verify forward returns Dict[str, JaggedTensor] with correct keys and shapes."""
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        input_kjt = self.generate_input_kjt_cuda(
+            self._feature_name_to_unpruned_hash_sizes
+        )
+        output = itep_ec(input_kjt)
+
+        self.assertIsInstance(output, dict)
+        self.assertEqual(set(output.keys()), {"feature1", "feature2"})
+        for _feature_name, jt in output.items():
+            self.assertIsInstance(jt, JaggedTensor)
+            # Embedding dim should be 4 for all tables
+            if jt.values().numel() > 0:
+                self.assertEqual(jt.values().shape[1], 4)
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_embedding_configs_accessor(self) -> None:
+        """Verify embedding_bag_configs() returns List[EmbeddingConfig] matching original configs."""
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        configs = itep_ec.embedding_bag_configs()
+        self.assertIsInstance(configs, list)
+        self.assertEqual(len(configs), 2)
+        for config in configs:
+            self.assertIsInstance(config, EmbeddingConfig)
+
+        config_names = {c.name for c in configs}
+        self.assertEqual(config_names, {"table1", "table2"})
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_forward_empty_kjt(self) -> None:
+        """Test forward with an empty KJT (no values or lengths)."""
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        cuda_device = torch.device("cuda")
+        empty_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["feature1", "feature2"],
+            values=torch.tensor([], dtype=torch.int32, device=cuda_device),
+            lengths=torch.zeros(
+                2 * self._batch_size, dtype=torch.int32, device=cuda_device
+            ),
+        )
+
+        output = itep_ec(empty_kjt)
+        self.assertIsInstance(output, dict)
+        self.assertEqual(set(output.keys()), {"feature1", "feature2"})
+        for _feature_name, jt in output.items():
+            self.assertIsInstance(jt, JaggedTensor)
+            self.assertEqual(jt.values().shape[1], 4)
+
+    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_forward_batch_size_one(self) -> None:
+        """Test forward with batch_size=1."""
+        itep_module = GenericITEPModule(
+            table_name_to_unpruned_hash_sizes=self._table_name_to_unpruned_hash_sizes,
+            lookups=self._mock_lookups,
+            enable_pruning=True,
+            pruning_interval=500,
+        )
+
+        itep_ec = ITEPEmbeddingCollection(
+            embedding_collection=self._embedding_collection,
+            itep_module=itep_module,
+        )
+
+        cuda_device = torch.device("cuda")
+        input_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["feature1", "feature2"],
+            values=torch.tensor([1, 2], dtype=torch.int32, device=cuda_device),
+            lengths=torch.tensor([1, 1], dtype=torch.int32, device=cuda_device),
+        )
+
+        output = itep_ec(input_kjt)
+        self.assertIsInstance(output, dict)
+        self.assertEqual(set(output.keys()), {"feature1", "feature2"})
+        for _feature_name, jt in output.items():
+            self.assertIsInstance(jt, JaggedTensor)
+            if jt.values().numel() > 0:
+                self.assertEqual(jt.values().shape[1], 4)

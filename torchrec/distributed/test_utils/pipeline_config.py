@@ -52,7 +52,7 @@ class PipelineConfig:
 
     pipeline: str = "base"
     emb_lookup_stream: str = "data_dist"
-    inplace_copy_batch_to_gpu: bool = False
+    enable_inplace_copy_batch: bool = False
     apply_jit: bool = False
 
     def generate_pipeline(
@@ -121,7 +121,7 @@ class PipelineConfig:
                 device=device,
                 emb_lookup_stream=self.emb_lookup_stream,
                 apply_jit=self.apply_jit,
-                inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
+                enable_inplace_copy_batch=self.enable_inplace_copy_batch,
             )
         elif self.pipeline == "base":
             assert self.apply_jit is False, "JIT is not supported for base pipeline"
@@ -130,7 +130,7 @@ class PipelineConfig:
                 model=model,
                 optimizer=opt,
                 device=device,
-                inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
+                enable_inplace_copy_batch=self.enable_inplace_copy_batch,
             )
         else:
             Pipeline = _pipeline_cls[self.pipeline]
@@ -140,5 +140,5 @@ class PipelineConfig:
                 device=device,
                 # pyrefly: ignore[unexpected-keyword]
                 apply_jit=self.apply_jit,
-                inplace_copy_batch_to_gpu=self.inplace_copy_batch_to_gpu,
+                enable_inplace_copy_batch=self.enable_inplace_copy_batch,
             )
