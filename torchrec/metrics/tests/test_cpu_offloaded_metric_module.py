@@ -22,7 +22,8 @@ from torchrec.metrics.cpu_offloaded_metric_module import (
     CPUOffloadedRecMetricModule,
     MetricUpdateJob,
 )
-from torchrec.metrics.metric_module import RecMetricModule
+from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
+from torchrec.metrics.metrics_config import DefaultMetricsConfig
 from torchrec.metrics.rec_metric import RecMetricException, RecMetricList
 from torchrec.metrics.test_utils import gen_test_tasks
 from torchrec.metrics.test_utils.mock_metrics import (
@@ -630,6 +631,36 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
     def test_no_dtoh_transfer_for_cpu_device(self) -> None:
         self._run_dtoh_transfer_test(use_cuda=False)
+
+    def test_generate_metric_module_creates_cpu_offloaded_module(self) -> None:
+        """Test that generate_metric_module() creates CPUOffloadedRecMetricModule with module_kwargs."""
+        module_kwargs = {
+            "model_out_device": torch.device("cpu"),
+            "update_queue_size": 50,
+            "compute_queue_size": 75,
+        }
+
+        module = generate_metric_module(
+            metric_class=CPUOffloadedRecMetricModule,
+            metrics_config=DefaultMetricsConfig,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cuda"),
+            module_kwargs=module_kwargs,
+        )
+
+        # Verify the returned module is a CPUOffloadedRecMetricModule
+        self.assertIsInstance(module, CPUOffloadedRecMetricModule)
+
+        # Verify the module_kwargs were applied
+        cpu_module = cast(CPUOffloadedRecMetricModule, module)
+        self.assertEqual(cpu_module.model_out_device, torch.device("cpu"))
+        self.assertEqual(cpu_module.update_queue.maxsize, 50)
+        self.assertEqual(cpu_module.compute_queue.maxsize, 75)
+
+        cpu_module.shutdown()
 
 
 @skip_if_asan_class
