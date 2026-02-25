@@ -11,7 +11,6 @@ import abc
 import contextlib
 import logging
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import (
     Any,
@@ -39,12 +38,11 @@ from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionAwaitable,  # noqa: F401
 )
 from torchrec.distributed.logger import one_time_rank0_logger
-from torchrec.distributed.model_parallel import ShardedModule
+from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.backward_injection import (
-    BackwardHookRegistry,
     BackwardHookWork,
     InjectionSite,
-    register_hooks,
+    register_backward_hook,
 )
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
@@ -78,7 +76,6 @@ from torchrec.distributed.train_pipeline.utils import (
     _wait_for_batch,
     _wait_for_events,
     DataLoadingThread,
-    FutureDeque,
     use_context_for_postprocs,
 )
 from torchrec.distributed.types import Awaitable, NoWait, ShardingType  # noqa: F401
@@ -523,7 +520,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
-        backward_hook_registry: Optional[BackwardHookRegistry] = None,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -595,9 +591,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
                 f"{self._dmp_collection_sync_interval_batches} batches"
             )
-
-        # Backward hook registry for injecting work during backward comms
-        self._backward_hook_registry = backward_hook_registry or BackwardHookRegistry()
 
         super().__init__()
 
@@ -801,12 +794,6 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             self._state = PipelineState.CALL_FWD
             losses, output = self._model_fwd(self.batches[0])
 
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:killswitch_enable_sdd_backward_injection"
-        ):
-            # Register all user-configured backward hooks
-            self._register_output_dist_hooks(self.contexts[0])
-
         if self._enqueue_batch_after_forward:
             # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here.
             # Start this step after the forward of batch i, so that the H2D copy doesn't compete
@@ -904,30 +891,37 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         """
         Registers work to execute during backward pass of an EC/EBC.
 
+        Installs a persistent forward hook on the target module via
+        ``register_backward_hook``. Each forward pass, the hook finds the
+        appropriate output tensor and registers a backward hook that
+        executes all work functions for the site.
+
         Args:
-            site: Injection site specification with fqn and sharding_type.
-                  e.g., InjectionSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE)
+            site: Injection site specification.
+                  e.g., OutputDistSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE)
             work: Callable that receives the pipeline instance.
                   Executed sequentially with other work at same site.
 
         Example:
             pipeline.register_backward_hook(
-                site=InjectionSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE),
+                site=OutputDistSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE),
                 work=lambda p: p._optimizer.step(),
             )
         """
-        self._backward_hook_registry.add_hook(site, work)
 
-    def _register_output_dist_hooks(
-        self,
-        context: TrainPipelineContext,
-    ) -> None:
-        """Registers all configured backward hooks on output dist tensors."""
-        register_hooks(
-            registry=self._backward_hook_registry,
-            pipeline=self,
-            output_dist_embeddings_requests=context.output_dist_embeddings_requests,
-        )
+        # DMP doesn't override named_modules(), so FQNs include the
+        # _dmp_wrapped_module (and possibly DDP .module) prefix.
+        # Unwrap to the inner model so find_target_module can match
+        # user-facing FQNs like "sparse.ebc" directly.
+        model = self._model
+        if isinstance(model, DistributedModelParallel):
+            model = model.module
+
+        def hook_fn(grad: torch.Tensor) -> None:
+            with record_function(f"## backward_hook {site} ##"):
+                work(self)
+
+        register_backward_hook(site, model, hook_fn)
 
     def copy_batch_to_gpu(
         self,
@@ -2072,170 +2066,6 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                     )
 
 
-class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
-    """
-    A hybrid pipeline that supports both training and evaluation modes in a single
-    pipelined execution flow.
-
-    This class extends `TrainPipelineSparseDist` to enable seamless switching between
-    training and evaluation within the same pipeline. It is particularly useful for
-    scenarios where you need to interleave training and evaluation batches without
-    the overhead of switching between separate pipelines.
-
-    Key Features:
-        - Supports both training and evaluation modes via the `is_training` flag.
-        - Conditionally executes backward pass and optimizer step only during training.
-        - Maintains the same pipelining benefits (overlapping data transfer, sparse
-          data distribution, and forward pass) for both modes.
-
-    Pipeline Stages (inherited from TrainPipelineSparseDist):
-        - Stage 3: Forward/Backward/Optimizer (current batch)
-        - Stage 2: Sparse data distribution (next batch)
-        - Stage 1: Device transfer (batch i+2)
-
-    Note:
-        The `is_training` flag is set per-batch via the context, allowing fine-grained
-        control over which batches trigger gradient computation and weight updates.
-    """
-
-    def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
-        if self._state == PipelineState.UNKNOWN:
-            return super()._next_batch(dataloader_iter)
-        return self._next_batch_on_cpu
-
-    def progress(self, dataloader_iter: Iterator[In], is_training: bool = True) -> Out:
-        """
-        Execute one step of the pipelined train/eval loop.
-
-        This method processes one batch through the full pipeline while overlapping
-        operations for subsequent batches. It conditionally executes backward pass
-        and optimizer step based on both the model's training mode and the per-batch
-        `is_training` flag.
-
-        For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
-            - batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt
-                          (expecting input_dist completed)
-            - batches[1]: next batch, for input_dist (expecting copied to device)
-            - batches[2]: i+2 batch, for copy_batch_to_gpu
-                          (expecting non-exhausted dataloader iter)
-
-        Args:
-            dataloader_iter: Iterator yielding input batches from the dataloader.
-            is_training: Whether the *newly enqueued* batch (batch i+2) should be
-                processed in training mode. Defaults to True.
-
-        Returns:
-            Out: The output from the forward pass of the current batch (batches[0]).
-
-        Raises:
-            StopIteration: When all batches have been processed (pipeline is empty).
-
-        Note:
-            The backward/optimizer execution depends on BOTH:
-            1. `self._model.training` - the model's overall training mode
-            2. `self.contexts[0].is_training` - the per-batch training flag set during enqueue
-
-            This allows fine-grained control where the model can be in training mode
-            but specific batches can skip gradient computation (e.g., for evaluation batches
-            interleaved with training batches).
-        """
-
-        self._state = PipelineState.UNKNOWN
-        # Attach the model just in case the user forgets to call it, especially when the user
-        # pauses the pipeline.progress and detaches the model for other purposes.
-        if not self._model_attached:
-            self.attach(self._model)
-
-        # Fill the pipeline is only needed for the beginning when the pipeline (batches) is empty
-        self.fill_pipeline(dataloader_iter)
-        self._state = PipelineState.IDLE
-
-        self._next_batch_on_cpu = TrainPipelineSparseDist._next_batch(
-            self, dataloader_iter
-        )
-        if self._next_batch_on_cpu is None and not is_training:
-            # stop current progress if eval iter is exhausted
-            # training iter will continue
-            raise StopIteration
-
-        for context in self.contexts:
-            # this only fills the context loaded from fill_pipeline
-            if not hasattr(context, "is_training"):
-                logger.info(
-                    f"initial fill batch-{context.index} with {'train' if is_training else 'eval'}"
-                )
-                # pyrefly: ignore [missing-attribute]
-                context.is_training = is_training
-
-        # Here is the expected stop after exhausting all batches
-        if not self.batches:
-            raise StopIteration
-
-        # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
-        self._set_module_context(self.contexts[0])
-
-        # Zero gradients only when model is in training mode
-        if self._model.training:
-            with record_function("## zero_grad ##"):
-                self._optimizer.zero_grad()
-
-        # Wait for batches[0] being available on device, this should always be completed since
-        # the input_dist of batches[0] has been invoked in previous iter. TODO: fact check
-        self._wait_for_batch()
-
-        # Start sparse data distribution for the next batch (overlapped with current forward)
-        if len(self.batches) >= 2:
-            # Invoke splits all_to_all comms (first part of input_dist)
-            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
-
-        # pyrefly: ignore [missing-attribute]
-        is_curr_training = self._model.training and self.contexts[0].is_training
-
-        # Batch i+2: load data and copy to GPU, the dataloader iter will first exhaust here
-        if self.enqueue_batch(dataloader_iter):
-            # pyrefly: ignore [missing-attribute]
-            self.contexts[-1].is_training = is_training
-
-        # Forward pass for current batch
-        if is_curr_training:
-            with record_function(f"## forward {self.contexts[0].index} ##"):
-                self._state = PipelineState.CALL_FWD
-                losses, output = self._model_fwd(self.batches[0])
-        else:
-            with record_function(f"## eval {self.contexts[0].index} ##"):
-                with torch.no_grad():
-                    self._state = PipelineState.CALL_FWD
-                    losses, output = self._model_fwd(self.batches[0])
-
-        # Complete sparse data distribution for the next batch
-        if len(self.batches) >= 2:
-            # Invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
-            self.wait_sparse_data_dist(self.contexts[1])
-
-        # Execute backward and optimizer step only if:
-        # 1. Model is in training mode (self._model.training)
-        # 2. Current batch is marked for training (self.contexts[0].is_training)
-        if is_curr_training:
-            # Backward pass
-            self._state = PipelineState.CALL_BWD
-            self._backward(losses)
-
-            # Sync embeddings if configured (for distributed model parallel)
-            self.sync_embeddings(
-                self._model,
-                self._dmp_collection_sync_interval_batches,
-                self.contexts[0],
-            )
-
-            # Optimizer step (weight update)
-            with record_function(f"## optimizer {self.contexts[0].index} ##"):
-                self._optimizer.step()
-
-        # Remove processed batch from the pipeline
-        self.dequeue_batch()
-        return output
-
-
 class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
     """
     This pipeline overlaps device transfer, and `ShardedModule.input_dist()` with
@@ -2848,106 +2678,3 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
 
         self.dequeue_batch()
         return output
-
-
-class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
-    """
-    Extends TrainPipelineSparseDist by running the inplace H2D copy (_to_device) in a
-    background thread so the CPU is not blocked while submitting non-blocking copy
-    operations to the memcpy stream.
-
-    The background result is resolved lazily before the batch is actually consumed
-    (in fill_pipeline before _init_pipelined_modules, and in progress before
-    start_sparse_data_dist).
-
-    All other pipeline behaviour is identical to TrainPipelineSparseDist.
-    """
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        optimizer: torch.optim.Optimizer,
-        device: torch.device,
-        execute_all_batches: bool = True,
-        apply_jit: bool = False,
-        context_type: Type[TrainPipelineContext] = TrainPipelineContext,
-        pipeline_postproc: bool = False,
-        custom_model_fwd: Optional[
-            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
-        ] = None,
-        dmp_collection_sync_interval_batches: Optional[int] = 1,
-        enqueue_batch_after_forward: bool = False,
-        enable_inplace_copy_batch: bool = False,
-        backward_hook_registry: Optional[BackwardHookRegistry] = None,
-    ) -> None:
-        super().__init__(
-            model=model,
-            optimizer=optimizer,
-            device=device,
-            execute_all_batches=execute_all_batches,
-            apply_jit=apply_jit,
-            context_type=context_type,
-            pipeline_postproc=pipeline_postproc,
-            custom_model_fwd=custom_model_fwd,
-            dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
-            enqueue_batch_after_forward=False,
-            enable_inplace_copy_batch=enable_inplace_copy_batch,
-            backward_hook_registry=backward_hook_registry,
-        )
-        self._copy_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
-        self.batches: Deque[Optional[In]] = cast(Deque[Optional[In]], FutureDeque())
-
-    def copy_batch_to_gpu(
-        self, dataloader_iter: Iterator[In]
-    ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
-        context = self._create_context()
-        with record_function(f"## copy_batch_to_gpu {context.index} ##"):
-            batch = self._next_batch(dataloader_iter)
-            if batch is not None:
-
-                def _copy_work() -> In:
-                    # pyrefly: ignore [bad-argument-type]
-                    with self._stream_context(self._memcpy_stream):
-                        return _to_device(cast(In, batch), self._device, True)
-
-                future_batch = self._copy_executor.submit(_copy_work)
-                return cast(In, future_batch), context
-            elif not self._execute_all_batches:
-                logger.info(
-                    "copy_batch_to_gpu: raising StopIteration for None Batch (execute_all_batches=False)"
-                )
-                raise StopIteration
-            else:
-                logger.info(
-                    "copy_batch_to_gpu: returning None batch (execute_all_batches=True)"
-                )
-            return batch, context
-
-    def inplace_copy_batch_to_gpu(
-        self,
-        dataloader_iter: Iterator[In],
-    ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
-        context = self._create_context()
-        with record_function(f"## inplace_copy_batch_to_gpu {context.index} ##"):
-            batch = self._next_batch(dataloader_iter)
-            if batch is not None:
-                future_batch = self._copy_executor.submit(
-                    _to_device,
-                    batch,
-                    self._device,
-                    True,
-                    self._memcpy_stream,
-                )
-                # Return the CPU batch as placeholder; _resolve_copy_future
-                # will replace it in self.batches before consumption.
-                return cast(In, future_batch), context
-            elif not self._execute_all_batches:
-                logger.info(
-                    "inplace_copy_batch_to_gpu: raising StopIteration for None Batch (execute_all_batches=False)"
-                )
-                raise StopIteration
-            else:
-                logger.info(
-                    "inplace_copy_batch_to_gpu: returning None batch (execute_all_batches=True)"
-                )
-            return batch, context

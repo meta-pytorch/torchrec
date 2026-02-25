@@ -283,7 +283,32 @@ def _transform_module(
     batch_size: int,
     ctx: ContextManager,
     benchmark_unsharded_module: bool = False,
+    pod_size: Optional[int] = None,
+    local_world_size: Optional[int] = None,
 ) -> torch.nn.Module:
+    """
+    Transform a module for distributed benchmarking with optional topology awareness.
+
+    Args:
+        module: The module to transform
+        device: Target device
+        inputs: Input data for warmup
+        sharder: Module sharder for distributing the module
+        sharding_type: Sharding strategy to use
+        compile_mode: Compilation mode (EAGER or FX_SCRIPT)
+        world_size: Total number of processes/GPUs
+        batch_size: Batch size for the benchmark
+        ctx: Context manager (MultiProcessContext or nullcontext)
+        benchmark_unsharded_module: Whether to benchmark unsharded version
+        pod_size: Number of hosts per NVLink domain (topology_domain_multiple).
+            When set, enables proper intra_group_size calculation for multi-host
+            NVLink domains like GB200.
+        local_world_size: Number of GPUs per host. If not set, defaults to world_size.
+
+    Returns:
+        Transformed (sharded) module ready for benchmarking
+    """
+
     def fx_script_module(eager_module: torch.nn.Module) -> torch.nn.Module:
         eager_module(inputs[0])
         graph_module = symbolic_trace(
@@ -297,7 +322,26 @@ def _transform_module(
     sharded_module = None
 
     if not benchmark_unsharded_module:
-        topology: Topology = Topology(world_size=world_size, compute_device=device.type)
+        # Build topology kwargs with optional GB200 NVLink domain support
+        topology_kwargs: Dict[str, Any] = {
+            "world_size": world_size,
+            "compute_device": device.type,
+        }
+
+        # Set local_world_size (GPUs per host)
+        if local_world_size is not None:
+            topology_kwargs["local_world_size"] = local_world_size
+
+        # Set pod_size for NVLink domain topology (topology_domain_multiple)
+        # This enables proper intra_group_size calculation
+        if pod_size is not None:
+            topology_kwargs["pod_size"] = pod_size
+            logger.info(
+                f"Using GB200 topology: pod_size={pod_size}, "
+                f"local_world_size={local_world_size or 'auto'}"
+            )
+
+        topology: Topology = Topology(**topology_kwargs)
         planner = EmbeddingShardingPlanner(
             topology=topology,
             batch_size=batch_size,
@@ -316,7 +360,6 @@ def _transform_module(
         # Don't want to modify the module outright
         # Since module is on cpu, won't cause cuda oom.
         copied_module = copy.deepcopy(module)
-        # pyrefly: ignore[bad-argument-type, missing-argument]
         plan = planner.plan(copied_module, [sharder])
 
         if isinstance(ctx, MultiProcessContext):
@@ -334,9 +377,6 @@ def _transform_module(
 
             sharded_module = _shard_modules(
                 module=copied_module,
-                #  `Optional[List[ModuleSharder[Module]]]` but got
-                #  `List[ModuleSharder[Variable[T (bound to Module)]]]`.
-                # pyrefly: ignore[bad-argument-type]
                 sharders=[sharder],
                 device=device,
                 plan=plan,
@@ -394,8 +434,12 @@ def _init_module_and_run_benchmark(
     queue: Optional[mp.Queue] = None,
     pooling_configs: Optional[List[int]] = None,
     benchmark_unsharded_module: bool = False,
+    pod_size: Optional[int] = None,
+    local_world_size: Optional[int] = None,
 ) -> BenchmarkResult:
     """
+    Initialize module and run benchmark with optional topology awareness.
+
     There are a couple of caveats here as to why the module has to be initialized
     here:
     1. Device. To accurately track memory usage, when sharding modules the initial
@@ -406,6 +450,29 @@ def _init_module_and_run_benchmark(
        called by the loop through compile modes and sharding types, returning the
        benchmark result will mean that the reference to module is lost instead of
        existing in the loop
+
+    Args:
+        module: Module to benchmark
+        sharder: Module sharder for distributing the module
+        device: Target device
+        sharding_type: Sharding strategy to use
+        compile_mode: Compilation mode
+        world_size: Total number of processes/GPUs
+        batch_size: Batch size for the benchmark
+        warmup_inputs: Warmup input data
+        bench_inputs: Benchmark input data
+        prof_inputs: Profiling input data
+        tables: Embedding table configurations
+        output_dir: Output directory for profiling results
+        num_benchmarks: Number of benchmark iterations
+        func_to_benchmark: Function to benchmark
+        benchmark_func_kwargs: Keyword arguments for benchmark function
+        rank: Process rank (-1 for single process)
+        queue: Multiprocessing queue for results
+        pooling_configs: Pooling configuration
+        benchmark_unsharded_module: Whether to benchmark unsharded version
+        pod_size: Number of hosts per NVLink domain (topology_domain_multiple)
+        local_world_size: Number of GPUs per host
     """
 
     if rank >= 0:
@@ -452,6 +519,8 @@ def _init_module_and_run_benchmark(
             # pyrefly: ignore[bad-argument-type]
             ctx=ctx,
             benchmark_unsharded_module=benchmark_unsharded_module,
+            pod_size=pod_size,
+            local_world_size=local_world_size,
         )
 
         if benchmark_unsharded_module:
@@ -503,6 +572,8 @@ def benchmark_ebc_module(
     pooling_configs: Optional[List[int]] = None,
     variable_batch_embeddings: bool = False,
     device_type: str = "cuda",
+    pod_size: Optional[int] = None,
+    local_world_size: Optional[int] = None,
 ) -> List[BenchmarkResult]:
     """
     Benchmark EmbeddingBagCollection (EBC) and QuantEmbeddingBagCollection (QEBC) modules.
@@ -526,6 +597,12 @@ def benchmark_ebc_module(
         pooling_configs: The pooling factor for the tables (Optional; if not set, we'll use 10 as default)
         variable_batch_embeddings: Whether to use variable batch size embeddings
         device_type: Device type to use for benchmarking
+        pod_size: Number of hosts per NVLink domain (topology_domain_multiple).
+            When set, enables proper intra_group_size calculation for multi-host
+            NVLink domains like GB200. For example, pod_size=10 means 10 hosts
+            form one high-bandwidth NVLink domain.
+        local_world_size: Number of GPUs per host. For GB200: local_world_size=2.
+            If not set, defaults to world_size (single-node assumption).
 
     Returns:
         A list of BenchmarkResults
@@ -534,6 +611,11 @@ def benchmark_ebc_module(
         This function is specifically designed for EmbeddingBagCollection (EBC) and
         QuantEmbeddingBagCollection (QEBC) modules. It automatically detects the module
         type and applies appropriate wrapping and training mode settings.
+
+        For GB200 topology-aware benchmarking, set pod_size and local_world_size
+        to enable proper intra_group_size calculation. This affects how the sharding
+        planner estimates communication costs between GPUs within and across NVLink
+        domains.
     """
 
     logging.info(
@@ -616,6 +698,8 @@ def benchmark_ebc_module(
                     func_to_benchmark=func_to_benchmark,
                     benchmark_func_kwargs=benchmark_func_kwargs,
                     pooling_configs=pooling_configs,
+                    pod_size=pod_size,
+                    local_world_size=local_world_size,
                 )
             else:
                 res = _init_module_and_run_benchmark(
@@ -637,6 +721,8 @@ def benchmark_ebc_module(
                     benchmark_func_kwargs=benchmark_func_kwargs,
                     pooling_configs=pooling_configs,
                     benchmark_unsharded_module=benchmark_unsharded,
+                    pod_size=pod_size,
+                    local_world_size=local_world_size,
                 )
 
             gc.collect()

@@ -17,33 +17,27 @@ the backward all-to-all communication phase.
 
 Example usage:
     from torchrec.distributed.train_pipeline.backward_injection import (
-        BackwardHookRegistry,
-        InjectionSite,
-        register_hooks,
+        OutputDistSite,
     )
     from torchrec.distributed.types import ShardingType
 
-    # Create registry and add hooks
-    registry = BackwardHookRegistry()
-    registry.add_hook(
-        InjectionSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE),
+    # Register hooks on the pipeline
+    pipeline.register_backward_hook(
+        OutputDistSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE),
         lambda p: p._optimizer.step(),
     )
-
-    # In pipeline progress():
-    register_hooks(registry, pipeline, context.output_dist_embeddings_requests)
 """
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, TYPE_CHECKING
+from dataclasses import dataclass
+from typing import Any, Callable, Optional, TYPE_CHECKING
 
 import torch
-from torch.autograd.profiler import record_function
+from torch import nn
 from torchrec.distributed.comm_ops import Request
 from torchrec.distributed.embedding import EmbeddingCollectionAwaitable
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionAwaitable
-from torchrec.distributed.types import Awaitable, NoWait, ShardingType
+from torchrec.distributed.types import NoWait, ShardingType
 
 
 if TYPE_CHECKING:
@@ -62,213 +56,172 @@ BackwardHookWork = Callable[["TrainPipeline"], None]
 @dataclass(frozen=True)
 class InjectionSite:
     """
-    Injection site specification for backward hooks.
+    Base class for backward hook injection sites.
 
     Attributes:
-        fqn: Fully qualified name of the module (e.g., "sparse_arch.ebc")
-        sharding_type: The sharding type to target (e.g., ShardingType.TABLE_WISE)
+        fqn: Fully qualified name of the target module (e.g., "sparse_arch.ebc")
     """
 
     fqn: str
-    sharding_type: ShardingType
 
+    def find_target_module(self, model: nn.Module) -> Optional[nn.Module]:
+        """
+        Finds the module matching ``self.fqn`` in the model.
 
-@dataclass
-class BackwardHookRegistry:
-    """Registry mapping injection sites to their work functions."""
-
-    hooks: Dict[InjectionSite, List[BackwardHookWork]] = field(default_factory=dict)
-
-    def add_hook(
-        self,
-        site: InjectionSite,
-        work: BackwardHookWork,
-    ) -> None:
-        """Adds a work function at the specified injection site."""
-        if site not in self.hooks:
-            self.hooks[site] = []
-        self.hooks[site].append(work)
-
-    def work(self, site: InjectionSite) -> List[BackwardHookWork]:
-        """Gets all work functions for a site."""
-        return self.hooks.get(site, [])
-
-
-def _filter_awaitables(
-    odist_awaitable: Any,
-) -> Dict[ShardingType, Awaitable[torch.Tensor]] | None:
-    """
-    Extracts valid (non-DP) awaitables from an EC/EBC awaitable.
-
-    Args:
-        odist_awaitable: The EC/EBC awaitable (may be MC tuple-wrapped)
-
-    Returns:
-        Dict mapping ShardingType to awaitable, or None if not a valid
-        EC/EBC awaitable. DP sharding (NoWait) awaitables are filtered out.
-    """
-    # Handle MC EC/EBC tuple wrapping
-    if isinstance(odist_awaitable, tuple):
-        odist_awaitable = odist_awaitable[0]
-
-    # NOTE: We avoid importing VariableBatchEmbeddingBagCollectionAwaitable directly
-    # due to torch.package compatibility issues with repackaging. Instead, we use
-    # hasattr to detect EBC-like awaitables (including VB-EBC).
-    match odist_awaitable:
-        case EmbeddingBagCollectionAwaitable():
-            awaitables = odist_awaitable._awaitables
-            sharding_types = odist_awaitable._sharding_types
-        case EmbeddingCollectionAwaitable():
-            awaitables = odist_awaitable._awaitables_per_sharding
-            sharding_types = odist_awaitable._sharding_types
-        case _ if hasattr(odist_awaitable, "_awaitables") and hasattr(
-            odist_awaitable, "_sharding_types"
-        ):
-            awaitables = odist_awaitable._awaitables
-            sharding_types = odist_awaitable._sharding_types
-        case _:
-            logger.warning(
-                f"Unsupported awaitable type: {type(odist_awaitable).__name__}. "
-            )
+        Returns:
+            The matching module, or ``None`` if not found.
+        """
+        try:
+            return model.get_submodule(self.fqn)
+        except AttributeError:
             return None
 
-    # Filter out DP (NoWait) and build dict mapping sharding type to awaitable
-    valid_awaitables: Dict[str, Awaitable[torch.Tensor]] = {}
-    for w, sharding_type in zip(  # pyrefly: ignore[no-matching-overload]
-        awaitables, sharding_types
-    ):
-        if isinstance(w, NoWait):
-            continue
+    def find_grad_tensor(self, output: Any) -> Optional[torch.Tensor]:
+        """
+        Finds the first tensor with ``requires_grad=True`` from a module output.
 
-        # pyrefly: ignore[unsupported-operation]
-        valid_awaitables[ShardingType(sharding_type)] = w
+        Handles single tensors, tuples/lists, dicts, and nested combinations.
 
-    return valid_awaitables  # pyrefly: ignore[bad-return]
+        Args:
+            output: The module's forward output.
+
+        Returns:
+            The first grad-requiring tensor, or ``None`` if none found.
+        """
+        if isinstance(output, torch.Tensor):
+            if output.requires_grad:
+                return output
+        elif isinstance(output, (tuple, list)):
+            for item in output:
+                t = self.find_grad_tensor(item)
+                if t is not None:
+                    return t
+        elif isinstance(output, dict):
+            for v in output.values():
+                t = self.find_grad_tensor(v)
+                if t is not None:
+                    return t
+        return None
 
 
-def _find_awaitable_for_site(
+def register_backward_hook(
     site: InjectionSite,
-    output_dist_embeddings_requests: Dict[str, Any],
-) -> Awaitable[torch.Tensor] | None:
-    """
-    Finds the specific awaitable matching the injection site.
-
-    Args:
-        site: The injection site specification
-        output_dist_embeddings_requests: Dict mapping FQN to EC/EBC awaitables
-
-    Returns:
-        The matching awaitable, or None if not found
-    """
-    # Find the FQN for this site
-    if site.fqn not in output_dist_embeddings_requests:
-        logger.warning(f"Could not find module FQN for site: {site}")
-        return None
-
-    # Get valid (non-DP) awaitables
-    valid_awaitables = _filter_awaitables(output_dist_embeddings_requests[site.fqn])
-    if valid_awaitables is None or site.sharding_type not in valid_awaitables:
-        logger.warning(
-            f"Could not find awaitable for module {site.fqn} "
-            f"with sharding type: {site.sharding_type}"
-        )
-        return None
-
-    return valid_awaitables[site.sharding_type]
-
-
-def _register_hook_on_tensor(
-    awaitable: Awaitable[torch.Tensor],
+    model: nn.Module,
     hook_fn: Callable[[torch.Tensor], None],
-) -> bool:
+) -> torch.utils.hooks.RemovableHandle:
     """
-    Registers a hook on the awaitable's dummy tensor.
+    Registers a backward hook at this injection site.
 
-    Returns True if successful, False otherwise.
-    """
-    tensor_awaitable = getattr(awaitable, "_tensor_awaitable", None)
-    if tensor_awaitable is None:
-        return False
-
-    if isinstance(tensor_awaitable, Request):
-        dummy_tensor = tensor_awaitable.dummy_tensor
-        dummy_tensor.register_hook(hook_fn)
-        return True
-
-    return False
-
-
-def _create_backward_hook(
-    pipeline: "TrainPipeline",
-    work_list: List[BackwardHookWork],
-    site_name: str,
-) -> Callable[[torch.Tensor], None]:
-    """
-    Creates a backward hook function that executes the given work list.
+    Installs a forward hook on the target module. Each forward pass, the
+    forward hook finds the first grad-requiring output tensor and registers
+    ``hook_fn`` as a backward hook on it. The forward hook persists across
+    iterations; call ``.remove()`` on the returned handle to unregister.
 
     Args:
-        pipeline: The pipeline instance to pass to work functions
-        work_list: List of work functions to execute
-        site_name: Name of the injection site (for profiling)
+        model: The model containing the target module.
+        hook_fn: Backward hook function (receives gradient tensor).
 
     Returns:
-        Hook function to register on a tensor
+        A removable handle for the forward hook.
+
+    Raises:
+        ValueError: If the target module is not found in the model.
+        RuntimeError: If no grad-requiring tensor is found in the
+            module's output during forward.
     """
-
-    def hook_fn(grad: torch.Tensor) -> None:
-        with record_function(f"## backward_hook {site_name} ##"):
-            for work in work_list:
-                work(pipeline)
-
-    return hook_fn
-
-
-def register_hooks(
-    registry: BackwardHookRegistry,
-    pipeline: "TrainPipeline",
-    output_dist_embeddings_requests: Dict[str, Any],
-) -> None:
-    """
-    Registers all configured backward hooks on output dist tensors.
-
-    This function iterates through all registered hooks in the registry and
-    attaches them to the appropriate output dist tensors. The hooks will be
-    executed during the backward pass when gradients flow through the tensors.
-
-    Args:
-        registry: The backward hook registry containing hook configurations
-        pipeline: The pipeline instance to pass to work functions
-        output_dist_embeddings_requests: Dict mapping FQN to EC/EBC awaitables
-            (typically context.output_dist_embeddings_requests)
-
-    Example:
-        register_hooks(
-            registry=self._backward_hook_registry,
-            pipeline=self,
-            output_dist_embeddings_requests=self.contexts[0].output_dist_embeddings_requests,
-        )
-    """
-    if len(registry.hooks) == 0:
-        return
-
-    if len(output_dist_embeddings_requests) == 0:
-        logger.warning(
-            "No output dist requests found. Skipping backward hook registration."
-        )
-        return
-
-    for site, work_list in registry.hooks.items():
-        # Find the specific awaitable matching the site
-        awaitable = _find_awaitable_for_site(site, output_dist_embeddings_requests)
-        if awaitable is None:
-            logger.warning(f"Could not find awaitable for site: {site}")
-            continue
-
-        # Register hook on the dummy tensor
-        registered = _register_hook_on_tensor(
-            awaitable,
-            _create_backward_hook(pipeline, work_list, str(site)),
+    target = site.find_target_module(model)
+    if target is None:
+        raise ValueError(
+            f"register_backward_hook: module '{site.fqn}' not found in model."
         )
 
-        if registered:
-            logger.info(f"Registered backward hook for site: {site} ")
+    def _fwd_hook(
+        module: nn.Module,
+        input: Any,
+        output: Any,
+    ) -> None:
+        tensor = site.find_grad_tensor(output)
+        if tensor is None:
+            raise RuntimeError(
+                f"register_hook: no grad-requiring tensor in "
+                f"output of '{site.fqn}'."
+            )
+        tensor.register_hook(hook_fn)
+
+    return target.register_forward_hook(_fwd_hook)
+
+
+@dataclass(frozen=True)
+class OutputDistSite(InjectionSite):
+    """
+    Injection site for hooking during backward all-to-all on output dist tensors.
+
+    Targets the ``dummy_tensor`` of the EC/EBC output dist awaitable matching
+    the given module FQN and sharding type.
+
+    Attributes:
+        fqn: Fully qualified name of the EC/EBC module (e.g., "sparse_arch.ebc")
+        sharding_type: The sharding type to target (e.g., ShardingType.TABLE_WISE)
+    """
+
+    sharding_type: ShardingType = ShardingType.TABLE_WISE
+
+    def find_grad_tensor(self, output: Any) -> Optional[torch.Tensor]:
+        """
+        Finds the dummy tensor from the output dist awaitable matching
+        this site's sharding type.
+
+        For pipelined modules, the forward output is an EC/EBC awaitable.
+        This method extracts the per-sharding awaitable matching
+        ``self.sharding_type`` and returns its ``dummy_tensor``.
+
+        Args:
+            output: The pipelined module's forward output (an EC/EBC awaitable,
+                possibly MC tuple-wrapped).
+
+        Returns:
+            The dummy tensor for the matching sharding type, or ``None`` if
+            not found.
+        """
+
+        # Handle MC EC/EBC tuple wrapping
+        if isinstance(output, tuple):
+            output = output[0]
+
+        # NOTE: We avoid importing VariableBatchEmbeddingBagCollectionAwaitable
+        # directly due to torch.package compatibility issues with repackaging.
+        # Instead, we use hasattr to detect EBC-like awaitables (including VB-EBC).
+        match output:
+            case EmbeddingBagCollectionAwaitable():
+                awaitables = output._awaitables
+                sharding_types = output._sharding_types
+            case EmbeddingCollectionAwaitable():
+                awaitables = output._awaitables_per_sharding
+                sharding_types = output._sharding_types
+            case _ if hasattr(output, "_awaitables") and hasattr(
+                output, "_sharding_types"
+            ):
+                awaitables = output._awaitables
+                sharding_types = output._sharding_types
+            case _:
+                raise RuntimeError(
+                    f"Unsupported awaitable type: {type(output).__name__}"
+                )
+
+        # Find the awaitable matching our sharding type, skipping DP (NoWait)
+        for w, st in zip(  # pyrefly: ignore[no-matching-overload]
+            awaitables, sharding_types
+        ):
+            if isinstance(w, NoWait):
+                continue
+            # pyrefly: ignore[unsupported-operation]
+            if ShardingType(st) == self.sharding_type:
+                tensor_awaitable = getattr(w, "_tensor_awaitable", None)
+                if isinstance(tensor_awaitable, Request):
+                    return tensor_awaitable.dummy_tensor
+                return None
+
+        raise RuntimeError(
+            f"Could not find awaitable for module {self.fqn} "
+            f"with sharding type: {self.sharding_type}"
+        )

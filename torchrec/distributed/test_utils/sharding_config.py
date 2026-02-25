@@ -59,6 +59,14 @@ class PlannerConfig:
         """
         Generate a topology for distributed training.
 
+        Supports GB200 NVLink domain topology via pod_size parameter:
+        - pod_size: Number of hosts per NVLink domain (topology_domain_multiple)
+        - local_world_size: Number of GPUs per host (overrides auto-detection)
+
+        The intra_group_size is calculated as: pod_size * local_world_size
+        This represents the total number of GPUs connected via high-bandwidth
+        NVLink within a single domain.
+
         Returns:
             A Topology object representing the network topology for distributed training
         """
@@ -88,6 +96,17 @@ class PlannerConfig:
                 topology_kwargs["intra_host_bw"] = self.hardware["intra_host_bw"]
             if "inter_host_bw" in self.hardware:
                 topology_kwargs["inter_host_bw"] = self.hardware["inter_host_bw"]
+
+            # GB200 NVLink domain topology support
+            # pod_size represents topology_domain_multiple (hosts per NVLink domain)
+            # This enables proper intra_group_size calculation for multi-host NVLink domains
+            if "pod_size" in self.hardware:
+                topology_kwargs["pod_size"] = self.hardware["pod_size"]
+
+            # Override local_world_size if explicitly specified in hardware config
+            # Useful for GB200 (2 GPUs/host) vs A100 (8 GPUs/host)
+            if "local_world_size" in self.hardware:
+                topology_kwargs["local_world_size"] = self.hardware["local_world_size"]
 
         return Topology(**topology_kwargs)
 
@@ -237,6 +256,10 @@ class ShardingConfig:
         dense_lr: Learning rate for dense parameters.
         dense_momentum: Momentum for dense parameters (optional).
         dense_weight_decay: Weight decay for dense parameters (optional).
+        dense_optimizer_kwargs: Additional keyword arguments forwarded to the dense
+            optimizer constructor. For Shampoo, this can include
+            precondition_frequency, start_preconditioning_step,
+            max_preconditioner_dim, etc.
     """
 
     fused_params: Dict[str, Any] = field(default_factory=dict)
@@ -244,6 +267,7 @@ class ShardingConfig:
     dense_lr: float = 0.1
     dense_momentum: Optional[float] = None
     dense_weight_decay: Optional[float] = None
+    dense_optimizer_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def _convert_fused_params(self) -> Optional[Dict[str, Any]]:
         """
@@ -335,9 +359,14 @@ class ShardingConfig:
             from torchrec.distributed.test_utils.test_modules import DistributedShampoo
 
             optimizer_class = DistributedShampoo
+            # Default precondition_frequency to 100 to amortize the expensive
+            # preconditioner computation (O(d^3)) across steps.
+            if "precondition_frequency" not in self.dense_optimizer_kwargs:
+                optimizer_kwargs["precondition_frequency"] = 100
         else:
             optimizer_class = getattr(optim, self.dense_optimizer)
 
+        optimizer_kwargs.update(self.dense_optimizer_kwargs)
         optimizer = optimizer_class(dense_params, **optimizer_kwargs)
 
         return sharded_model, optimizer

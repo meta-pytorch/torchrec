@@ -128,7 +128,7 @@ def seed_and_log(wrapped_func: Callable) -> Callable:
         print(f"Using random seed: {seed}")
         torch.manual_seed(seed)
         random.seed(seed)
-        # pyrefly: ignore[implicit-import]
+        # pyrefly: ignore [bad-argument-type, implicit-import]
         np.random.seed(seed)
         return wrapped_func(*args, **kwargs)
 

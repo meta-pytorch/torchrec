@@ -71,7 +71,7 @@ class UIntXTensor(torch.Tensor):
     .detach,.clone - work as an op on underlying uint8 data.
     """
 
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     __torch_function__ = torch._C._disabled_torch_function_impl
 
     @staticmethod
@@ -93,7 +93,7 @@ class UIntXTensor(torch.Tensor):
         return f"UInt{8 // self.N}Tensor(shape={self.shape}, elem={self.elem})"
 
     @classmethod
-    # pyrefly: ignore[bad-param-name-override]
+    # pyrefly: ignore [bad-override, bad-param-name-override]
     def __torch_dispatch__(cls, func, types, args, kwargs=None):  # noqa: C901
         if func is torch.ops.aten.detach.default:
             # Temp workaround to avoid 'Cannot set version_counter for inference tensor'

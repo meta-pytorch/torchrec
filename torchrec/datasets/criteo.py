@@ -615,7 +615,7 @@ class BinaryCriteoUtils:
                 np.save(fout, full_dataset)
 
         print(f"Shuffling dataset with random_seed={random_seed}")
-        # pyrefly: ignore[implicit-import]
+        # pyrefly: ignore [bad-argument-type, implicit-import]
         np.random.seed(random_seed)
         # pyrefly: ignore[implicit-import]
         np.random.shuffle(full_dataset)
@@ -745,7 +745,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         self.drop_last = drop_last
         self.shuffle_batches = shuffle_batches
         self.shuffle_training_set = shuffle_training_set
-        # pyrefly: ignore[implicit-import]
+        # pyrefly: ignore [bad-argument-type, implicit-import]
         np.random.seed(shuffle_training_set_random_seed)
         self.mmap_mode = mmap_mode
         self.hashes: np.ndarray = np.array(hashes).reshape((1, CAT_FEATURE_COUNT))

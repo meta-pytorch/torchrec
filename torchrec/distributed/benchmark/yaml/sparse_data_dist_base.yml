@@ -8,10 +8,14 @@ RunOptions:
   sharding_type: table_wise
   profile_dir: "."
   name: "sparse_data_dist_base"
+  memory_snapshot: True
   # export_stacks: True # enable this to export stack traces
   loglevel: "info"
 PipelineConfig:
-  pipeline: "sparse"
+  pipeline: "sparse" # "sparse-bwd-opt"
+  kwargs:
+    site_fqn: "sparse.weighted_ebc"
+    sharding_type: "table_wise"
 ModelInputConfig:
   num_float_features: 100
   feature_pooling_avg: 30

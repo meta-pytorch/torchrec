@@ -483,7 +483,7 @@ class TestInMemoryBinaryCriteoIterDataPipe(CriteoTest):
                 datapipe_len = len(datapipe)
                 self.assertEqual(datapipe_len, num_batches)
 
-                # pyrefly: ignore[implicit-import]
+                # pyrefly: ignore [bad-argument-type, implicit-import]
                 np.random.seed(random_seed)
                 # pyrefly: ignore[implicit-import]
                 permutation_arr = np.random.permutation(num_rows)

@@ -1,0 +1,85 @@
+# GB200 Topology Benchmark Configuration
+# This config tests TorchRec benchmarks with GB200 NVLink domain topology awareness.
+#
+# Key topology parameters:
+# - topology_domain_multiple: Number of hosts per NVLink domain (pod)
+# - topology_domain_max_group_count: Maximum number of domain groups in the job
+# - local_world_size: Number of GPUs per host (2 for GB200)
+#
+# Example GB200 topology (40x2 job with domain=10, max_groups=4):
+#   - 40 hosts total, 2 GPUs per host = 80 GPUs
+#   - 10 hosts per NVLink domain = 20 GPUs per domain (high bandwidth)
+#   - 4 domains total (cross-domain = lower bandwidth)
+#
+# Usage:
+#   buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:benchmark_train_pipeline -- \
+#       --yaml_config=fbcode/torchrec/distributed/benchmark/yaml/gb200_topology_benchmark.yml \
+#       --name=gb200_topology_test_$(hg whereami | cut -c 1-10)
+
+RunOptions:
+  world_size: 2
+  batch_size: 1000
+  num_batches: 10
+  num_benchmarks: 3
+  num_profiles: 1
+  sharding_type: table_wise
+  profile_dir: "."
+  name: "gb200_topology_benchmark"
+  loglevel: "info"
+
+  # GB200 Topology Domain Configuration
+  topology_domain_multiple: 10
+  topology_domain_max_group_count: 4
+  local_world_size: 2
+
+PipelineConfig:
+  pipeline: "sparse"
+
+ModelInputConfig:
+  num_float_features: 100
+  feature_pooling_avg: 30
+
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 100
+    submodule_kwargs:
+      dense_arch_out_size: 128
+      over_arch_out_size: 1024
+      over_arch_hidden_layers: 5
+      dense_arch_hidden_sizes: [128, 128, 128]
+      skip_regroup: true
+
+EmbeddingTablesConfig:
+  num_unweighted_features: 90
+  num_weighted_features: 80
+  embedding_feature_dim: 256
+  additional_tables:
+    - - name: FP16_table
+        embedding_dim: 512
+        num_embeddings: 100_000
+        feature_names: ["additional_0_0"]
+        data_type: FP16
+      - name: large_table
+        embedding_dim: 2048
+        num_embeddings: 1_000_000
+        feature_names: ["additional_0_1"]
+    - []
+    - - name: skipped_table
+        embedding_dim: 128
+        num_embeddings: 100_000
+        feature_names: ["additional_2_1"]
+
+PlannerConfig:
+  pooling_factors: [30.0]
+
+  # GB200 Hardware Configuration
+  hardware:
+    hbm_cap: 180_000_000_000  # 192GB HBM for GB200
+    # Topology parameters - these will be used to construct the Topology object
+    pod_size: 2  # Same as topology_domain_multiple (hosts per NVLink domain)
+    local_world_size: 2  # GPUs per host
+
+  additional_constraints:
+    large_table:
+      sharding_types: [column_wise]
