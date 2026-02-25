@@ -1,7 +1,7 @@
-# Benchmark configuration using Shampoo optimizer for dense parameters
-# Shampoo is a second-order optimizer that can improve convergence
-# runs on 2 ranks with Shampoo optimizer for dense layers
-# Note: Sparse embeddings use EXACT_ROWWISE_ADAGRAD (Shampoo not supported in fbgemm_gpu)
+# Benchmark config for TrainPipelineSparseDistBWDOpt with Shampoo optimizer
+# Based on sparse_data_dist_bwd_opt, with Shampoo for dense parameters.
+# Shampoo's expensive second-order optimizer step should benefit more from
+# being overlapped with backward all-to-all communication.
 RunOptions:
   world_size: 2
   num_batches: 10
@@ -10,10 +10,12 @@ RunOptions:
   memory_snapshot: True
   profile_dir: "."
   name: "sparse_data_dist_shampoo"
-  # export_stacks: True # enable this to export stack traces
   loglevel: "info"
 PipelineConfig:
-  pipeline: "sparse"
+  pipeline: "sparse" # "sparse-bwd-opt"
+  kwargs:
+    site_fqn: "sparse.weighted_ebc"
+    sharding_type: "table_wise"
 ModelInputConfig:
   num_float_features: 100
   feature_pooling_avg: 30
@@ -22,10 +24,10 @@ ModelSelectionConfig:
   model_config:
     num_float_features: 100
     submodule_kwargs:
-      dense_arch_out_size: 128
-      over_arch_out_size: 1024
+      dense_arch_out_size: 1024
+      over_arch_out_size: 4096
       over_arch_hidden_layers: 5
-      dense_arch_hidden_sizes: [128, 128, 128]
+      dense_arch_hidden_sizes: [1024, 1024, 1024]
 EmbeddingTablesConfig:
   num_unweighted_features: 90
   num_weighted_features: 80
@@ -47,6 +49,9 @@ EmbeddingTablesConfig:
         feature_names: ["additional_2_1"]
 PlannerConfig:
   sharding_type: table_wise
+  pooling_factors: [30.0]  # Must match ModelInputConfig.feature_pooling_avg
+  hardware:  # A100
+    hbm_cap: 85899345920  # 80GB
   additional_constraints:
     large_table:
       sharding_types: [column_wise]
