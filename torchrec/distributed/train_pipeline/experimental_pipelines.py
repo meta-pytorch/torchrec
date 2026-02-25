@@ -8,11 +8,12 @@
 # pyre-strict
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable, cast, Deque, Iterator, Optional, Tuple, Type
 
 import torch
 from torch.autograd.profiler import record_function
+from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.train_pipeline.backward_injection import OutputDistSite
 from torchrec.distributed.train_pipeline.pipeline_context import (
     In,
@@ -416,6 +417,157 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
                 self._dmp_collection_sync_interval_batches,
                 self.contexts[0],
             )
+
+        self.dequeue_batch()
+        return output
+
+
+class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
+    """
+    Extends TrainPipelineSparseDist by stashing optimizer state to CPU after
+    optimizer.step() and restoring it via backward hook injection before the
+    next optimizer.step().
+
+    This frees HBM occupied by optimizer state (e.g. Shampoo's Kronecker
+    factors) between optimizer steps, making it available for forward/backward
+    computation. The restore is triggered during the backward pass at the
+    specified OutputDistSite, overlapping the CPU->GPU transfer with backward
+    all-to-all communication.
+
+    Timeline per iteration:
+        forward -> backward [ restore_optimizer_state at OutputDistSite ] ->
+        optimizer.step() -> stash_optimizer_state
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        site_fqn: str,
+        sharding_type: ShardingType = ShardingType.TABLE_WISE,
+        execute_all_batches: bool = True,
+        apply_jit: bool = False,
+        context_type: Type[TrainPipelineContext] = TrainPipelineContext,
+        pipeline_postproc: bool = False,
+        custom_model_fwd: Optional[
+            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
+        ] = None,
+        dmp_collection_sync_interval_batches: Optional[int] = 1,
+        enqueue_batch_after_forward: bool = False,
+        enable_inplace_copy_batch: bool = False,
+    ) -> None:
+        super().__init__(
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            execute_all_batches=execute_all_batches,
+            apply_jit=apply_jit,
+            context_type=context_type,
+            pipeline_postproc=pipeline_postproc,
+            custom_model_fwd=custom_model_fwd,
+            dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
+            enqueue_batch_after_forward=enqueue_batch_after_forward,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
+        )
+        self._output_dist_site = OutputDistSite(
+            fqn=site_fqn, sharding_type=sharding_type
+        )
+        # Set up shared CUDA streams for memory stashing
+        MemoryStashingManager.set_streams(
+            self._memcpy_stream,  # pyrefly: ignore[bad-argument-type]
+            torch.cuda.Stream(device=device),
+        )
+        self._await_restore: Callable[..., None] = lambda: None
+        self._stash_future: Optional[
+            Future[Tuple[Callable[..., None], Callable[..., None]]]
+        ] = None
+        self._restore_future: Optional[Future[None]] = None
+
+    def _pipeline_model(
+        self,
+        batch: Optional[In],
+        context: TrainPipelineContext,
+        pipelined_forward: Type[PipelinedForward] = PipelinedForward,
+    ) -> None:
+        super()._pipeline_model(batch, context, pipelined_forward)
+
+        def work(_pipeline: Any) -> None:
+            with record_function("## restore_optimizer_state ##"):
+                self._restore_future = (
+                    MemoryStashingManager.restore_optimizer_state_threaded()
+                )
+
+        self.register_backward_hook(self._output_dist_site, work)
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        self._state = PipelineState.IDLE
+        if not self._model_attached:
+            self.attach(self._model)
+
+        self.fill_pipeline(dataloader_iter)
+
+        if not self.batches:
+            raise StopIteration
+
+        self._set_module_context(self.contexts[0])
+
+        if self._model.training:
+            with record_function("## zero_grad ##"):
+                self._optimizer.zero_grad()
+
+        self._wait_for_batch()
+
+        if len(self.batches) >= 2:
+            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+
+        if not self._enqueue_batch_after_forward:
+            self.enqueue_batch(dataloader_iter)
+
+        # forward
+        with record_function(f"## forward {self.contexts[0].index} ##"):
+            self._state = PipelineState.CALL_FWD
+            losses, output = self._model_fwd(self.batches[0])
+
+        if self._enqueue_batch_after_forward:
+            self.enqueue_batch(dataloader_iter)
+
+        if len(self.batches) >= 2:
+            self.wait_sparse_data_dist(self.contexts[1])
+
+        if self._model.training:
+            # Wait for the previous iteration's background stash to complete
+            # before backward, because the backward hook calls
+            # restore_optimizer_state which does resize_(storage_size) on the
+            # same tensors that stash does resize_(0) on.
+            if self._stash_future is not None:
+                self._await_restore, _ = self._stash_future.result()
+                self._stash_future = None
+
+            # backward (restore_optimizer_state fires via hook)
+            self._state = PipelineState.CALL_BWD
+            self._backward(losses)
+
+            self.sync_embeddings(
+                self._model,
+                self._dmp_collection_sync_interval_batches,
+                self.contexts[0],
+            )
+
+            # optimizer step, then stash state back to CPU
+            with record_function(f"## optimizer {self.contexts[0].index} ##"):
+                if self._restore_future is not None:
+                    self._restore_future.result()
+                    self._restore_future = None
+                self._await_restore()
+                self._optimizer.step()
+
+            with record_function("## stash_optimizer_state ##"):
+                self._stash_future = (
+                    MemoryStashingManager.stash_optimizer_state_threaded(
+                        self._optimizer
+                    )
+                )
 
         self.dequeue_batch()
         return output

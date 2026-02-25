@@ -20,6 +20,7 @@ from torchrec.distributed.train_pipeline import (
 from torchrec.distributed.train_pipeline.experimental_pipelines import (
     TrainEvalHybridPipelineBase,
     TrainPipelineSparseDistBwdOpt,
+    TrainPipelineSparseDistOptStash,
     TrainPipelineSparseDistT,
 )
 from torchrec.distributed.train_pipeline.train_pipelines import (
@@ -118,6 +119,7 @@ class PipelineConfig:
             "eval-fused": EvalPipelineFusedSparseDist,
             "sparse-threading": TrainPipelineSparseDistT,
             "sparse-bwd-opt": TrainPipelineSparseDistBwdOpt,
+            "sparse-opt-stash": TrainPipelineSparseDistOptStash,
         }
 
         match self.pipeline:
