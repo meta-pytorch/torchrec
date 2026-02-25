@@ -9,12 +9,15 @@
 
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Callable, cast, Deque, Iterator, Optional, Tuple, Type
+from typing import Any, Callable, cast, Deque, Iterator, Optional, Tuple, Type, Union
 
 import torch
 from torch.autograd.profiler import record_function
 from torchrec.distributed.memory_stashing import MemoryStashingManager
-from torchrec.distributed.train_pipeline.backward_injection import OutputDistSite
+from torchrec.distributed.train_pipeline.backward_injection import (
+    InjectionSite,
+    OutputDistSite,
+)
 from torchrec.distributed.train_pipeline.pipeline_context import (
     In,
     Out,
@@ -571,3 +574,74 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
 
         self.dequeue_batch()
         return output
+
+
+class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
+    """
+    Extends TrainPipelineSparseDist by restoring stashed embedding weights
+    during backward via an InjectionSite backward hook at the specified module
+    (e.g., over-arch).
+
+    The stashing itself is done inside the sharded embedding modules
+    (embeddingbag.py / embedding.py) immediately after the lookup forward.
+    This pipeline registers a restore hook at the injection site so that
+    weights are restored before backward reaches the sparse modules.
+
+    Timeline per iteration:
+        forward [stash happens inside lookup] -> backward
+        [restore_embedding_weights at injection site] -> optimizer.step()
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        site_fqn: Union[str, InjectionSite],
+        execute_all_batches: bool = True,
+        apply_jit: bool = False,
+        context_type: Type[TrainPipelineContext] = TrainPipelineContext,
+        pipeline_postproc: bool = False,
+        custom_model_fwd: Optional[
+            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
+        ] = None,
+        dmp_collection_sync_interval_batches: Optional[int] = 1,
+        enqueue_batch_after_forward: bool = False,
+        enable_inplace_copy_batch: bool = False,
+    ) -> None:
+        super().__init__(
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            execute_all_batches=execute_all_batches,
+            apply_jit=apply_jit,
+            context_type=context_type,
+            pipeline_postproc=pipeline_postproc,
+            custom_model_fwd=custom_model_fwd,
+            dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
+            enqueue_batch_after_forward=enqueue_batch_after_forward,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
+        )
+        if isinstance(site_fqn, str):
+            self._injection_site = InjectionSite(fqn=site_fqn)
+        else:
+            self._injection_site = site_fqn
+
+        MemoryStashingManager.set_streams(
+            self._memcpy_stream,  # pyrefly: ignore[bad-argument-type]
+            torch.cuda.Stream(device=device),
+        )
+
+    def _pipeline_model(
+        self,
+        batch: Optional[In],
+        context: TrainPipelineContext,
+        pipelined_forward: Type[PipelinedForward] = PipelinedForward,
+    ) -> None:
+        super()._pipeline_model(batch, context, pipelined_forward)
+
+        def work(_pipeline: Any) -> None:
+            with record_function("## restore_embedding_weights ##"):
+                MemoryStashingManager.restore_embedding_weights()
+
+        self.register_backward_hook(self._injection_site, work)

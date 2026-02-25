@@ -20,6 +20,7 @@ from torchrec.distributed.train_pipeline import (
 from torchrec.distributed.train_pipeline.experimental_pipelines import (
     TrainEvalHybridPipelineBase,
     TrainPipelineSparseDistBwdOpt,
+    TrainPipelineSparseDistEmbStash,
     TrainPipelineSparseDistOptStash,
     TrainPipelineSparseDistT,
 )
@@ -67,6 +68,8 @@ class PipelineConfig:
             for key in ("site_fqn", "sharding_type"):
                 if key in kwargs:
                     kwargs.pop(key)
+        if self.pipeline in ("sparse-emb-stash",):
+            kwargs.pop("sharding_type", None)
         return kwargs
 
     def generate_pipeline(
@@ -120,6 +123,7 @@ class PipelineConfig:
             "sparse-threading": TrainPipelineSparseDistT,
             "sparse-bwd-opt": TrainPipelineSparseDistBwdOpt,
             "sparse-opt-stash": TrainPipelineSparseDistOptStash,
+            "sparse-emb-stash": TrainPipelineSparseDistEmbStash,
         }
 
         match self.pipeline:
