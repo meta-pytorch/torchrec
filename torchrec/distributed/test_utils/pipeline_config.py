@@ -7,8 +7,8 @@
 
 # pyre-strict
 
-from dataclasses import dataclass
-from typing import Dict, Type, Union
+from dataclasses import dataclass, field
+from typing import Any, Dict, Type, Union
 
 import torch
 from torch import nn
@@ -17,15 +17,19 @@ from torchrec.distributed.train_pipeline import (
     TrainPipelineFusedSparseDist,
     TrainPipelineSparseDist,
 )
+from torchrec.distributed.train_pipeline.experimental_pipelines import (
+    TrainEvalHybridPipelineBase,
+    TrainPipelineSparseDistBwdOpt,
+    TrainPipelineSparseDistT,
+)
 from torchrec.distributed.train_pipeline.train_pipelines import (
     EvalPipelineFusedSparseDist,
     EvalPipelineSparseDist,
     PrefetchTrainPipelineSparseDist,
-    TrainEvalHybridPipelineBase,
     TrainPipelineSemiSync,
     TrainPipelineSparseDistLite,
-    TrainPipelineSparseDistT,
 )
+from torchrec.distributed.types import ShardingType
 
 
 @dataclass
@@ -51,9 +55,18 @@ class PipelineConfig:
     """
 
     pipeline: str = "base"
-    emb_lookup_stream: str = "data_dist"
     enable_inplace_copy_batch: bool = False
-    apply_jit: bool = False
+    kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    def get_kwargs(self, **default_kwargs) -> Dict[str, Any]:
+        kwargs = default_kwargs | self.kwargs
+        if "sharding_type" in kwargs:
+            kwargs["sharding_type"] = ShardingType(kwargs["sharding_type"])
+        if self.pipeline in ("base", "sparse", "sparse_lite"):
+            for key in ("site_fqn", "sharding_type"):
+                if key in kwargs:
+                    kwargs.pop(key)
+        return kwargs
 
     def generate_pipeline(
         self,
@@ -104,41 +117,32 @@ class PipelineConfig:
             "eval-sdd": EvalPipelineSparseDist,
             "eval-fused": EvalPipelineFusedSparseDist,
             "sparse-threading": TrainPipelineSparseDistT,
+            "sparse-bwd-opt": TrainPipelineSparseDistBwdOpt,
         }
 
-        if self.pipeline == "semi":
-            return TrainPipelineSemiSync(
-                model=model,
-                optimizer=opt,
-                device=device,
-                start_batch=0,
-                apply_jit=self.apply_jit,
-            )
-        elif self.pipeline == "fused":
-            return TrainPipelineFusedSparseDist(
-                model=model,
-                optimizer=opt,
-                device=device,
-                emb_lookup_stream=self.emb_lookup_stream,
-                apply_jit=self.apply_jit,
-                enable_inplace_copy_batch=self.enable_inplace_copy_batch,
-            )
-        elif self.pipeline == "base":
-            assert self.apply_jit is False, "JIT is not supported for base pipeline"
-
-            return TrainPipelineBase(
-                model=model,
-                optimizer=opt,
-                device=device,
-                enable_inplace_copy_batch=self.enable_inplace_copy_batch,
-            )
-        else:
-            Pipeline = _pipeline_cls[self.pipeline]
-            return Pipeline(
-                model=model,
-                optimizer=opt,
-                device=device,
+        match self.pipeline:
+            case "semi":
+                return TrainPipelineSemiSync(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    **self.get_kwargs(start_batch=0),
+                )
+            case "fused":
+                return TrainPipelineFusedSparseDist(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    enable_inplace_copy_batch=self.enable_inplace_copy_batch,
+                    **self.get_kwargs(emb_lookup_stream="data_dist"),
+                )
+            case _:
+                Pipeline = _pipeline_cls[self.pipeline]
                 # pyrefly: ignore[unexpected-keyword]
-                apply_jit=self.apply_jit,
-                enable_inplace_copy_batch=self.enable_inplace_copy_batch,
-            )
+                return Pipeline(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    enable_inplace_copy_batch=self.enable_inplace_copy_batch,
+                    **self.get_kwargs(),
+                )

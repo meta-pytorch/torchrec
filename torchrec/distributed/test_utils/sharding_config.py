@@ -256,6 +256,10 @@ class ShardingConfig:
         dense_lr: Learning rate for dense parameters.
         dense_momentum: Momentum for dense parameters (optional).
         dense_weight_decay: Weight decay for dense parameters (optional).
+        dense_optimizer_kwargs: Additional keyword arguments forwarded to the dense
+            optimizer constructor. For Shampoo, this can include
+            precondition_frequency, start_preconditioning_step,
+            max_preconditioner_dim, etc.
     """
 
     fused_params: Dict[str, Any] = field(default_factory=dict)
@@ -263,6 +267,7 @@ class ShardingConfig:
     dense_lr: float = 0.1
     dense_momentum: Optional[float] = None
     dense_weight_decay: Optional[float] = None
+    dense_optimizer_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def _convert_fused_params(self) -> Optional[Dict[str, Any]]:
         """
@@ -354,9 +359,14 @@ class ShardingConfig:
             from torchrec.distributed.test_utils.test_modules import DistributedShampoo
 
             optimizer_class = DistributedShampoo
+            # Default precondition_frequency to 100 to amortize the expensive
+            # preconditioner computation (O(d^3)) across steps.
+            if "precondition_frequency" not in self.dense_optimizer_kwargs:
+                optimizer_kwargs["precondition_frequency"] = 100
         else:
             optimizer_class = getattr(optim, self.dense_optimizer)
 
+        optimizer_kwargs.update(self.dense_optimizer_kwargs)
         optimizer = optimizer_class(dense_params, **optimizer_kwargs)
 
         return sharded_model, optimizer
