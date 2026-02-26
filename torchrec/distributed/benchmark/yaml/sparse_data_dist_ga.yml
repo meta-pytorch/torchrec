@@ -1,0 +1,53 @@
+# Gradient accumulation benchmark config
+# Wraps sparse data dist pipeline with GradientAccumulationWrapper (num_steps=4)
+# to measure QPS impact of reduced allreduce frequency
+RunOptions:
+  world_size: 2
+  num_batches: 10
+  num_benchmarks: 1
+  num_profiles: 1
+  sharding_type: table_wise
+  profile_dir: "."
+  name: "sparse_data_dist_ga"
+  loglevel: "info"
+  ga_num_steps: 4
+PipelineConfig:
+  pipeline: "sparse"
+ModelInputConfig:
+  num_float_features: 100
+  feature_pooling_avg: 30
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 100
+    submodule_kwargs:
+      dense_arch_out_size: 128
+      over_arch_out_size: 1024
+      over_arch_hidden_layers: 5
+      dense_arch_hidden_sizes: [128, 128, 128]
+EmbeddingTablesConfig:
+  num_unweighted_features: 90
+  num_weighted_features: 80
+  embedding_feature_dim: 256
+  additional_tables:
+    - - name: FP16_table
+        embedding_dim: 512
+        num_embeddings: 100_000
+        feature_names: ["additional_0_0"]
+        data_type: FP16
+      - name: large_table
+        embedding_dim: 2048
+        num_embeddings: 1_000_000
+        feature_names: ["additional_0_1"]
+    - []
+    - - name: skipped_table
+        embedding_dim: 128
+        num_embeddings: 100_000
+        feature_names: ["additional_2_1"]
+PlannerConfig:
+  pooling_factors: [30.0]  # Must match ModelInputConfig.feature_pooling_avg
+  hardware:  # A100
+    hbm_cap: 85899345920  # 80GB
+  additional_constraints:
+    large_table:
+      sharding_types: [column_wise]

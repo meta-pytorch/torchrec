@@ -56,7 +56,11 @@ from torchrec.distributed.test_utils.table_config import (
     EmbeddingTablesConfig,
     TableExtendedConfigs,
 )
-from torchrec.distributed.train_pipeline import TrainPipeline
+from torchrec.distributed.train_pipeline import (
+    GradientAccumulationConfig,
+    GradientAccumulationWrapper,
+    TrainPipeline,
+)
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
@@ -97,6 +101,10 @@ class RunOptions(BenchFuncConfig):
             For GB200: local_world_size=2. If not set, defaults to world_size
             (single-node assumption).
             Default is None.
+        ga_num_steps (int): Number of gradient accumulation steps. When set to 1
+            (default), the pipeline runs without gradient accumulation. When > 1,
+            the pipeline is wrapped with GradientAccumulationWrapper to accumulate
+            gradients over multiple micro-batches before synchronizing.
     """
 
     world_size: int = 2
@@ -110,6 +118,7 @@ class RunOptions(BenchFuncConfig):
     topology_domain_multiple: Optional[int] = None
     topology_domain_max_group_count: Optional[int] = None
     local_world_size: Optional[int] = None
+    ga_num_steps: int = 1
 
 
 # single-rank runner
@@ -202,6 +211,17 @@ def runner(
             opt=optimizer,
             device=ctx.device,
         )
+
+        if run_option.ga_num_steps > 1:
+            ga_config = GradientAccumulationConfig(
+                num_steps=run_option.ga_num_steps,
+            )
+            pipeline = GradientAccumulationWrapper(
+                pipeline=pipeline,
+                optimizer=optimizer,
+                model=sharded_model,
+                config=ga_config,
+            )
         # Commented out due to potential conflict with pipeline.reset()
         # pipeline.progress(iter(bench_inputs))  # warmup
 
