@@ -385,7 +385,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             rec_metrics=RecMetricList([offloaded_metric]),
         )
 
-        # Update comms module with new state tensors. Offloaded module is untouched.
         comms_metric = cast(
             MockRecMetric, offloaded_module.comms_module.rec_metrics.rec_metrics[0]
         )
@@ -526,7 +525,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         "Not enough GPUs, this test requires at least one GPU",
     )
     def test_flush_remaining_work(self) -> None:
-        """Test _flush_remaining_work() processes all items in queue during shutdown."""
         test_queue = queue.Queue()
         metric_update_job = MetricUpdateJob(
             model_out={
@@ -534,7 +532,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "task1-label": torch.tensor([0.7]),
                 "task1-weight": torch.tensor([1.0]),
             },
-            transfer_completed_event=torch.cuda.Event(),
             kwargs={},
         )
 
@@ -546,6 +543,93 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         self.assertEqual(items_processed, 2)
         self.assertTrue(test_queue.empty())
+
+    def _run_dtoh_transfer_test(self, use_cuda: bool) -> None:
+        offloaded_metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=self.my_rank,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            initial_states=self.initial_states,
+        )
+
+        device = torch.device("cuda") if use_cuda else torch.device("cpu")
+        offloaded_module = CPUOffloadedRecMetricModule(
+            model_out_device=device,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([offloaded_metric]),
+        )
+
+        transfer_call_info: list = []
+        original_transfer_to_cpu = offloaded_module._transfer_to_cpu
+
+        def tracking_transfer_to_cpu(model_out: dict) -> tuple:
+            transfer_call_info.append(threading.current_thread().name)
+            return original_transfer_to_cpu(model_out)
+
+        model_out = {
+            "task1-prediction": torch.tensor([0.5, 0.7]),
+            "task1-label": torch.tensor([0.0, 1.0]),
+            "task1-weight": torch.tensor([1.0, 1.0]),
+        }
+        if use_cuda:
+            model_out = {k: v.to("cuda:0") for k, v in model_out.items()}
+            for tensor in model_out.values():
+                self.assertEqual(tensor.device.type, "cuda")
+
+        with patch.object(
+            offloaded_module,
+            "_transfer_to_cpu",
+            side_effect=tracking_transfer_to_cpu,
+        ):
+            offloaded_module.update(model_out)
+            wait_until_true(offloaded_metric.update_called)
+
+        if use_cuda:
+            self.assertEqual(
+                len(transfer_call_info),
+                1,
+                "_transfer_to_cpu should be called exactly once for CUDA device",
+            )
+            self.assertEqual(
+                transfer_call_info[0],
+                "metric_update",
+                f"DtoH transfer should happen in 'metric_update' thread, "
+                f"but was called from '{transfer_call_info[0]}'",
+            )
+        else:
+            self.assertEqual(
+                len(transfer_call_info),
+                0,
+                "_transfer_to_cpu should NOT be called when device is CPU",
+            )
+
+        self.assertTrue(offloaded_metric.predictions_update_calls is not None)
+        # pyre-ignore[6]: predictions_update_calls contains Dict[str, Tensor]
+        torch.testing.assert_close(
+            offloaded_metric.predictions_update_calls[0],
+            {"task1": torch.tensor([0.5, 0.7])},
+        )
+        # pyre-ignore[6]: labels_update_calls contains Dict[str, Tensor]
+        torch.testing.assert_close(
+            offloaded_metric.labels_update_calls[0],
+            {"task1": torch.tensor([0.0, 1.0])},
+        )
+
+        offloaded_module.shutdown()
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_dtoh_transfer_in_update_thread_for_cuda_device(self) -> None:
+        self._run_dtoh_transfer_test(use_cuda=True)
+
+    def test_no_dtoh_transfer_for_cpu_device(self) -> None:
+        self._run_dtoh_transfer_test(use_cuda=False)
 
 
 @skip_if_asan_class

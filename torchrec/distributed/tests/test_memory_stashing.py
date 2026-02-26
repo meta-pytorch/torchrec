@@ -14,7 +14,89 @@ from unittest.mock import Mock
 
 import torch
 from torch import nn
-from torchrec.distributed.utils import stash_embedding_weights, stash_optimizer_state
+from torchrec.distributed.memory_stashing import MemoryStashingManager
+
+
+class TestStashTensors(unittest.TestCase):
+    """Tests for MemoryStashingManager._stash_tensors."""
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = torch.device("cuda:0")
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+
+    def test_basic_stash_and_restore(self) -> None:
+        """Test basic stash and restore with a single tensor."""
+        tensor = torch.randn(100, 64, device=self.device)
+        original = tensor.clone()
+
+        await_restore, restore = MemoryStashingManager._stash_tensors([tensor])
+
+        # Verify HBM is freed
+        self.assertEqual(tensor.untyped_storage().size(), 0)
+
+        # Restore
+        restore(None)
+        await_restore(None)
+
+        # Verify values are correct
+        self.assertGreater(tensor.untyped_storage().size(), 0)
+        self.assertTrue(torch.allclose(tensor, original))
+
+    def test_multiple_tensors(self) -> None:
+        """Test stash and restore with multiple tensors."""
+        t1 = torch.randn(50, 32, device=self.device)
+        t2 = torch.ones(80, 64, device=self.device) * 2
+        originals = [t1.clone(), t2.clone()]
+
+        await_restore, restore = MemoryStashingManager._stash_tensors([t1, t2])
+
+        # All freed
+        self.assertEqual(t1.untyped_storage().size(), 0)
+        self.assertEqual(t2.untyped_storage().size(), 0)
+
+        # Restore
+        restore(None)
+        await_restore(None)
+
+        # All restored correctly
+        self.assertTrue(torch.allclose(t1, originals[0]))
+        self.assertTrue(torch.allclose(t2, originals[1]))
+
+    def test_empty_list(self) -> None:
+        """Test that an empty tensor list returns no-op callbacks."""
+        await_restore, restore = MemoryStashingManager._stash_tensors([])
+        # Should not raise
+        restore(None)
+        await_restore(None)
+
+    def test_preserves_autograd_version(self) -> None:
+        """Test that restore does not increment the tensor version counter."""
+        tensor = torch.randn(10, 5, device=self.device, requires_grad=True)
+        version_before = tensor._version
+
+        await_restore, restore = MemoryStashingManager._stash_tensors([tensor])
+        restore(None)
+        await_restore(None)
+
+        self.assertEqual(tensor._version, version_before)
+
+    def test_callbacks_accept_grad_argument(self) -> None:
+        """Test that callbacks work as backward hooks (accept a grad tensor)."""
+        tensor = torch.randn(10, 5, device=self.device)
+        original = tensor.clone()
+
+        await_restore, restore = MemoryStashingManager._stash_tensors([tensor])
+
+        dummy_grad = torch.tensor([1.0])
+        restore(dummy_grad)
+        await_restore(dummy_grad)
+
+        self.assertTrue(torch.allclose(tensor, original))
 
 
 class TestStashEmbeddingWeights(unittest.TestCase):
@@ -24,6 +106,10 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA not available")
         self.device = torch.device("cuda:0")
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
 
     def _create_mock_lookup(self, weights_list: List[torch.Tensor]) -> Mock:
         """Helper to create a mock lookup with multiple embedding modules."""
@@ -40,24 +126,20 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         return lookup
 
     def test_basic_stash_and_restore(self) -> None:
-        """Test basic stash and restore functionality with the three-callback API."""
+        """Test basic stash and restore functionality with the two-callback API."""
         original_weights = torch.ones((100, 64), device=self.device)
         original_values = original_weights.clone()
 
         lookup = self._create_mock_lookup([original_weights])
 
-        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
-
-        # Free HBM after stash copy completes
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
 
         # Verify HBM is freed
         self.assertEqual(original_weights.untyped_storage().size(), 0)
 
         # Restore weights
-        dummy_grad = torch.tensor([])
-        restore(dummy_grad)
-        await_restore(dummy_grad)
+        MemoryStashingManager.restore_embedding_weights()
+        await_restore(None)
 
         # Verify HBM is restored and values are correct
         self.assertGreater(original_weights.untyped_storage().size(), 0)
@@ -75,10 +157,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         lookup = self._create_mock_lookup([weights_1, weights_2, weights_3])
 
-        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
-
-        # Free HBM
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
 
         # Verify all are stashed
         self.assertEqual(weights_1.untyped_storage().size(), 0)
@@ -86,38 +165,35 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertEqual(weights_3.untyped_storage().size(), 0)
 
         # Restore all
-        dummy_grad = torch.tensor([])
-        restore(dummy_grad)
-        await_restore(dummy_grad)
+        MemoryStashingManager.restore_embedding_weights()
+        await_restore(None)
 
         # Verify all are restored correctly
         self.assertTrue(torch.allclose(weights_1, original_values_1))
         self.assertTrue(torch.allclose(weights_2, original_values_2))
         self.assertTrue(torch.allclose(weights_3, original_values_3))
 
-    def test_custom_stash_stream(self) -> None:
-        """Test stash and restore with custom CUDA stream."""
+    def test_custom_d2h_stream(self) -> None:
+        """Test stash and restore with custom D2H CUDA stream."""
         custom_stream = torch.cuda.Stream(device=self.device)
+        MemoryStashingManager.set_streams(
+            host_to_device_stream=MemoryStashingManager.h2d_stream(),
+            device_to_host_stream=custom_stream,
+        )
 
         original_weights = torch.randn(50, 32, device=self.device)
         original_values = original_weights.clone()
 
         lookup = self._create_mock_lookup([original_weights])
 
-        free_hbm, restore, await_restore = stash_embedding_weights(
-            lookup, stash_stream=custom_stream
-        )
-
-        # Free HBM
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
 
         # Verify stash worked
         self.assertEqual(original_weights.untyped_storage().size(), 0)
 
         # Restore
-        dummy_grad = torch.tensor([])
-        restore(dummy_grad)
-        await_restore(dummy_grad)
+        MemoryStashingManager.restore_embedding_weights()
+        await_restore(None)
 
         # Verify restoration
         self.assertTrue(torch.allclose(original_weights, original_values))
@@ -134,12 +210,10 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         output = torch.matmul(x, weights.t())
 
         # Stash and restore
-        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
 
-        dummy_grad = torch.tensor([])
-        restore(dummy_grad)
-        await_restore(dummy_grad)
+        MemoryStashingManager.restore_embedding_weights()
+        await_restore(None)
 
         # Version should not have changed
         self.assertEqual(weights._version, initial_version)
@@ -176,17 +250,15 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         lookup = Mock(spec=["_emb_modules"])
         lookup._emb_modules = emb_modules
 
-        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
 
         # Only CUDA weights should be stashed
         self.assertEqual(cuda_weights.untyped_storage().size(), 0)
         self.assertGreater(cpu_weights.untyped_storage().size(), 0)
 
         # Restore
-        dummy_grad = torch.tensor([])
-        restore(dummy_grad)
-        await_restore(dummy_grad)
+        MemoryStashingManager.restore_embedding_weights()
+        await_restore(None)
 
         self.assertTrue(torch.allclose(cuda_weights, cuda_original))
 
@@ -214,21 +286,19 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         lookup = Mock(spec=["_emb_modules"])
         lookup._emb_modules = emb_modules
 
-        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
 
         # Valid weights should be stashed
         self.assertEqual(valid_weights.untyped_storage().size(), 0)
 
         # Restore
-        dummy_grad = torch.tensor([])
-        restore(dummy_grad)
-        await_restore(dummy_grad)
+        MemoryStashingManager.restore_embedding_weights()
+        await_restore(None)
 
         self.assertTrue(torch.allclose(valid_weights, valid_original))
 
     def test_callback_signature_compatibility_with_register_hook(self) -> None:
-        """Test that restore and await_restore can be used as backward hooks."""
+        """Test that await_restore can be used as backward hook."""
         weights = torch.randn(10, 5, device=self.device, requires_grad=True)
         original_values = weights.clone()
 
@@ -238,11 +308,12 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         x = torch.randn(3, 5, device=self.device, requires_grad=True)
         output = torch.matmul(x, weights.t())
 
-        free_hbm, restore, await_restore = stash_embedding_weights(lookup)
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
 
-        # Register callbacks as backward hooks (this is how they're used in practice)
-        output.register_hook(restore)
+        # Register restore via class method and await_restore as backward hook
+        output.register_hook(
+            lambda _grad: MemoryStashingManager.restore_embedding_weights()
+        )
         output.register_hook(await_restore)
 
         # Backward pass should trigger the hooks
@@ -255,14 +326,18 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
 
 class TestStashOptimizerState(unittest.TestCase):
-    """Tests for stash_optimizer_state function."""
+    """Tests for MemoryStashingManager.stash_optimizer_state method."""
 
     def setUp(self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA not available")
         self.device = torch.device("cuda:0")
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
         # Use a large tensor size to exceed the 1MB threshold
         self.large_size = (512, 512)  # 512*512*4 = 1MB for float32
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
 
     def test_basic_adam_optimizer_stash_and_restore(self) -> None:
         """Test basic stash and restore with Adam optimizer."""
@@ -286,11 +361,10 @@ class TestStashOptimizerState(unittest.TestCase):
                 }
 
         # Stash optimizer state
-        free_hbm, restore, await_restore = stash_optimizer_state(optimizer)
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
 
         # Verify state tensors are freed (storage size should be 0)
-        for param, state in optimizer.state.items():
+        for _param, state in optimizer.state.items():
             if isinstance(state, dict):
                 for key, value in state.items():
                     if isinstance(value, torch.Tensor) and value.is_cuda:
@@ -304,7 +378,7 @@ class TestStashOptimizerState(unittest.TestCase):
                             )
 
         # Restore
-        restore(None)
+        MemoryStashingManager.restore_optimizer_state()
         await_restore(None)
 
         # Verify restored values match original
@@ -335,11 +409,10 @@ class TestStashOptimizerState(unittest.TestCase):
                 original_momentum[param] = state["momentum_buffer"].clone()
 
         # Stash optimizer state
-        free_hbm, restore, await_restore = stash_optimizer_state(optimizer)
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
 
         # Restore
-        restore(None)
+        MemoryStashingManager.restore_optimizer_state()
         await_restore(None)
 
         # Verify momentum buffers are restored correctly
@@ -366,9 +439,8 @@ class TestStashOptimizerState(unittest.TestCase):
         weights_before = model.weight.clone()
 
         # Stash, restore
-        free_hbm, restore, await_restore = stash_optimizer_state(optimizer)
-        free_hbm()
-        restore(None)
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
+        MemoryStashingManager.restore_optimizer_state()
         await_restore(None)
 
         # Another training step after restore
@@ -396,8 +468,7 @@ class TestStashOptimizerState(unittest.TestCase):
         optimizer.step()
 
         # Stash optimizer state
-        free_hbm, restore, await_restore = stash_optimizer_state(optimizer)
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
 
         # Small tensors should NOT be stashed (storage size > 0)
         for param, state in optimizer.state.items():
@@ -450,8 +521,7 @@ class TestStashOptimizerState(unittest.TestCase):
                     original_inv_factors.append(t.clone())
 
         # Stash
-        free_hbm, restore, await_restore = stash_optimizer_state(optimizer)
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
 
         # Verify nested tensors are stashed
         for param, state in optimizer.state.items():
@@ -473,7 +543,7 @@ class TestStashOptimizerState(unittest.TestCase):
                         )
 
         # Restore
-        restore(None)
+        MemoryStashingManager.restore_optimizer_state()
         await_restore(None)
 
         # Verify values are restored correctly
@@ -495,50 +565,8 @@ class TestStashOptimizerState(unittest.TestCase):
                     )
                     inv_idx += 1
 
-    def test_custom_stash_stream(self) -> None:
-        """Test stash and restore with custom CUDA stream."""
-        model = nn.Linear(512, 512).to(self.device)
-        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-
-        # Run a step to populate optimizer state
-        x = torch.randn(32, 512, device=self.device)
-        loss = model(x).sum()
-        loss.backward()
-        optimizer.step()
-
-        # Get original state values
-        original_states: Dict[Any, Dict[str, torch.Tensor]] = {}
-        for param, state in optimizer.state.items():
-            if isinstance(state, dict):
-                original_states[param] = {
-                    k: v.clone()
-                    for k, v in state.items()
-                    if isinstance(v, torch.Tensor)
-                }
-
-        # Stash with custom stream
-        custom_stream = torch.cuda.Stream(device=self.device)
-        free_hbm, restore, await_restore = stash_optimizer_state(
-            optimizer, stash_stream=custom_stream
-        )
-        free_hbm()
-
-        # Restore
-        restore(None)
-        await_restore(None)
-
-        # Verify restored values match original
-        for param, state in optimizer.state.items():
-            if param in original_states and isinstance(state, dict):
-                for key, value in state.items():
-                    if key in original_states[param]:
-                        self.assertTrue(
-                            torch.allclose(value, original_states[param][key]),
-                            f"State {key} not restored correctly with custom stream",
-                        )
-
     def test_callback_signature_compatibility_with_register_hook(self) -> None:
-        """Test that restore and await_restore can be used as backward hooks."""
+        """Test that await_restore can be used as backward hook."""
         model = nn.Linear(512, 512).to(self.device)
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
@@ -561,13 +589,14 @@ class TestStashOptimizerState(unittest.TestCase):
                 }
 
         # Stash and register hooks
-        free_hbm, restore, await_restore = stash_optimizer_state(optimizer)
-        free_hbm()
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
 
         # New forward pass with hooks registered
         x = torch.randn(32, 512, device=self.device)
         output = model(x)
-        output.register_hook(restore)
+        output.register_hook(
+            lambda _grad: MemoryStashingManager.restore_optimizer_state()
+        )
         output.register_hook(await_restore)
 
         # Backward pass should trigger the hooks and restore state
