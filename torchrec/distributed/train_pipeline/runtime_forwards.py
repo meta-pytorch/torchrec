@@ -69,6 +69,7 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
     This pipeline is used in TrainPipelineSparseDist
     """
 
+    @torch._dynamo.disable(recursive=True)
     def __call__(self, *input, **kwargs) -> Awaitable:
         assert (
             self._name in self._context.input_dist_tensors_requests
