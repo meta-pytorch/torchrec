@@ -11,7 +11,7 @@ import logging
 import math
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Any, List, Tuple
+from typing import Any, cast, List, Optional, Tuple
 
 import torch
 from torchrec.optim.keyed import KeyedOptimizer, OptimizerWrapper
@@ -28,6 +28,7 @@ class WarmupPolicy(Enum):
     STEP = "step"
     INVSQRT = "inv_sqrt"  # inverse square root
     COSINE_ANNEALING_WARM_RESTARTS = "cosine_annealing_warm_restarts"
+    INTERPOLATE = "interpolate"
 
 
 @dataclass
@@ -42,6 +43,9 @@ class WarmupStage:
     # default to 1 if not set to value > 0
     decay_iters: int = -1
     sgdr_period: int = 1
+    # the following are used in INTERPOLATE policy only
+    start_interpolating_iters: Optional[int] = None
+    end_value: Optional[float] = None
 
 
 def _lr_stages(stages: List[WarmupStage]) -> List[WarmupStage]:
@@ -55,6 +59,18 @@ def _lr_stages(stages: List[WarmupStage]) -> List[WarmupStage]:
             f"Max iter of the stage {stage} must be greater than the previous "
             f"max iter {start_iter}"
         )
+        if stage.policy == WarmupPolicy.INTERPOLATE:
+            assert (
+                stage.start_interpolating_iters is not None
+            ), "start_interpolating_iters must be set for INTERPOLATE policy"
+            assert (
+                stage.end_value is not None
+            ), "end_value must be set for INTERPOLATE policy"
+            assert stage.max_iters > stage.start_interpolating_iters, (
+                f"max_iters ({stage.max_iters}) must be greater than "
+                f"start_interpolating_iters ({stage.start_interpolating_iters}) "
+                "for INTERPOLATE policy to avoid division by zero"
+            )
         start_iter = stage.max_iters
         if stage.decay_iters <= 0:
             if stage.policy == WarmupPolicy.STEP:
@@ -86,6 +102,12 @@ def _get_multiplier(stage: WarmupStage, iter: int) -> float:
         t_cur = iter % t_0
         cos_iter = 0.5 * (1 + math.cos(math.pi * t_cur / t_0))
         multiplier = eta_min + (1.0 - eta_min) * cos_iter
+    elif stage.policy == WarmupPolicy.INTERPOLATE:
+        end_value = cast(float, stage.end_value)
+        start_interpolating_iters = cast(float, stage.start_interpolating_iters)
+        multiplier = stage.value + (end_value - stage.value) * (
+            iter - start_interpolating_iters
+        ) / (stage.max_iters - start_interpolating_iters)
     return multiplier * stage.lr_scale
 
 
