@@ -116,7 +116,7 @@ REC_METRICS_MAPPING: Dict[RecMetricEnumBase, Type[RecMetric]] = {
 
 T = TypeVar("T")
 
-# Label used for emitting model metrics to the coresponding trainer publishers.
+# Label used for emitting model metrics to the corresponding trainer publishers.
 MODEL_METRIC_LABEL: str = "model"
 
 
@@ -585,6 +585,7 @@ def _generate_rec_metrics(
     my_rank: int,
     batch_size: int,
     process_group: Optional[dist.ProcessGroup] = None,
+    batch_size_stages: Optional[List[BatchSizeStage]] = None,
 ) -> RecMetricList:
     rec_metrics = []
     for metric_enum, metric_def in metrics_config.rec_metrics.items():
@@ -595,6 +596,7 @@ def _generate_rec_metrics(
 
         kwargs["enable_pt2_compile"] = metrics_config.enable_pt2_compile
         kwargs["should_clone_update_inputs"] = metrics_config.should_clone_update_inputs
+        kwargs["batch_size_stages"] = batch_size_stages
 
         rec_tasks: List[RecTaskInfo] = []
         if metric_def.rec_tasks and metric_def.rec_task_indices:
@@ -668,13 +670,13 @@ def generate_metric_module(
     batch_size_stages: Optional[List[BatchSizeStage]] = None,
 ) -> RecMetricModule:
     rec_metrics = _generate_rec_metrics(
-        metrics_config, world_size, my_rank, batch_size, process_group
+        metrics_config,
+        world_size,
+        my_rank,
+        batch_size,
+        process_group,
+        batch_size_stages,
     )
-    """
-    Batch_size_stages currently only used by ThroughputMetric to ensure total_example correct so
-    different training jobs have aligned mertics.
-    TODO: update metrics other than ThroughputMetric if it has dependency on batch_size
-    """
     validate_batch_size_stages(batch_size_stages)
 
     if metrics_config.throughput_metric:
