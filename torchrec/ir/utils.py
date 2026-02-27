@@ -209,6 +209,10 @@ def _get_dim(name: str, min: Optional[int] = None, max: Optional[int] = None) ->
     return Dim(dim, min=min, max=max)
 
 
+def _has_dim(t: Optional[torch.Tensor]) -> bool:
+    return t is not None and t.dim() > 0
+
+
 def mark_dynamic_kjt(
     kjt: KeyedJaggedTensor,
     shapes_collection: Optional[ShapesCollection] = None,
@@ -246,13 +250,12 @@ def mark_dynamic_kjt(
         llen (Optional[DIM]): The dynamic length for the lengths, it's only used when variable_length is true. If it's None, it will use the default name "llen".
         batch_size (Optional[DIM]): The dynamic length for the batch_size, it's only used when variable_length and mark_batch_size are both true.
     """
-
-    def _has_dim(t: Optional[torch.Tensor]) -> bool:
-        return t is not None and t.dim() > 0
-
     if shapes_collection is None:
         shapes_collection = ShapesCollection()
-    vlen = _get_dim("vlen") if vlen is None else vlen
+    # min=2 to ensure compatibility with dynamic shapes (empty KJT is padded to size 2)
+    # This also helps avoid constraint violations during torch.export when guards
+    # are added based on observed batch sizes
+    vlen = _get_dim("vlen", min=2) if vlen is None else vlen
 
     if _has_dim(kjt._values):
         if kjt._values.numel() == 0:
@@ -282,11 +285,13 @@ def mark_dynamic_kjt(
         # it's the user's responsibility to make sure that in a variable batch scenario,
         # the argument variable_batch is only used when setting variable_length to False,
         # otherwise it will lead to unexpected behavior with the dynamic shapes in torch.export
-        batch_size = _get_dim("batch_size")
-        if _has_dim(kjt._lengths):
-            shapes_collection[kjt._lengths] = (batch_size * len(kjt.keys()),)
-        if _has_dim(kjt._offsets):
-            shapes_collection[kjt._offsets] = (batch_size * len(kjt.keys()) + 1,)
+        num_keys = len(kjt.keys())
+        if num_keys > 0:
+            batch_size = _get_dim("batch_size")
+            if _has_dim(kjt._lengths):
+                shapes_collection[kjt._lengths] = (batch_size * num_keys,)
+            if _has_dim(kjt._offsets):
+                shapes_collection[kjt._offsets] = (batch_size * num_keys + 1,)
     return shapes_collection
 
 
