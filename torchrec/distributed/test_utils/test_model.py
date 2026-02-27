@@ -10,13 +10,14 @@
 import copy
 import random
 from dataclasses import dataclass
-from typing import Any, cast, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torchrec import EmbeddingCollection
 from torchrec.distributed.embedding_types import EmbeddingTableConfig
+from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.utils import CopyableMixin
 from torchrec.modules.activation import SwishLayerNorm
 from torchrec.modules.embedding_configs import (
@@ -2581,6 +2582,82 @@ class TestMixedSequenceOverArch(nn.Module):
         return self.linear(torch.cat([dense, sparse], dim=1))
 
 
+class TestMixedSequenceOverArchLargeActivation(nn.Module):
+    """
+    Over-arch for mixed embedding models with large hidden dimensions to
+    create high activation memory pressure during backward.
+
+    Every hidden layer uses ``large_activation_dim`` as its output dimension,
+    producing ``[batch_size, large_activation_dim]`` tensors that must be
+    retained for gradient computation.
+
+    Architecture::
+
+        Linear(in_features → large_activation_dim) + SwishLayerNorm
+        [Linear(large_activation_dim → large_activation_dim) + SwishLayerNorm] × N
+        Linear(large_activation_dim → over_arch_out_size)
+
+    Args:
+        ebc_tables: the EBC embedding tables (pooled)
+        ec_tables: the EC embedding tables (sequence)
+        weighted_tables: the weighted embedding tables
+        device: the device on which this module will be placed
+        max_sequence_length: max sequence length for EC tables (default 20)
+        dense_arch_out_size: the size of output dense embedding
+        over_arch_out_size: the final output size
+        over_arch_hidden_layers: the number of hidden layers in the MLP
+        large_activation_dim: the hidden dimension for all inner layers.
+            Defaults to 4096.
+    """
+
+    def __init__(
+        self,
+        ebc_tables: List[EmbeddingBagConfig],
+        ec_tables: List[EmbeddingConfig],
+        weighted_tables: List[EmbeddingBagConfig],
+        device: Optional[torch.device] = None,
+        max_sequence_length: Optional[int] = None,
+        dense_arch_out_size: Optional[int] = None,
+        over_arch_out_size: Optional[int] = None,
+        over_arch_hidden_layers: Optional[int] = None,
+        large_activation_dim: int = 4096,
+    ) -> None:
+        super().__init__()
+        if device is None:
+            device = torch.device("cpu")
+        if max_sequence_length is None:
+            max_sequence_length = 20
+        if dense_arch_out_size is None:
+            dense_arch_out_size = DENSE_LAYER_OUT_SIZE
+        if over_arch_out_size is None:
+            over_arch_out_size = OVER_ARCH_OUT_SIZE
+        if over_arch_hidden_layers is None:
+            over_arch_hidden_layers = 5
+
+        in_features = (
+            dense_arch_out_size
+            + _tables_dim_sum(ebc_tables)
+            + _tables_dim_sum(ec_tables, max_sequence_length)
+            + _tables_dim_sum(weighted_tables)
+        )
+        hidden = large_activation_dim
+
+        layers: List[nn.Module] = [
+            nn.Linear(in_features, hidden, device=device),
+            SwishLayerNorm(hidden, device=device),
+        ]
+        for _ in range(over_arch_hidden_layers):
+            layers += [
+                nn.Linear(hidden, hidden, device=device),
+                SwishLayerNorm(hidden, device=device),
+            ]
+        layers.append(nn.Linear(hidden, over_arch_out_size, device=device))
+        self.overarch = nn.Sequential(*layers)
+
+    def forward(self, dense: torch.Tensor, sparse: torch.Tensor) -> torch.Tensor:
+        return self.overarch(torch.cat([dense, sparse], dim=1))
+
+
 class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
     """
     Test model that handles both EmbeddingBagCollection and EmbeddingCollection tables
@@ -2604,6 +2681,9 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
         feature_processor_modules: Optional[Dict[str, torch.nn.Module]] = None,
         over_arch_clazz: Type[nn.Module] = TestMixedSequenceOverArch,
         device: Optional[torch.device] = None,
+        enable_activation_stashing: bool = False,
+        dense_arch_hidden_sizes: Optional[List[int]] = None,
+        over_arch_kwargs: Optional[Dict[str, Any]] = None,
     ) -> None:
         if weighted_tables is None:
             weighted_tables = []
@@ -2614,6 +2694,14 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
             dense_device=dense_device,
             sparse_device=sparse_device,
         )
+        self._enable_activation_stashing = enable_activation_stashing
+        self._restore_callback: Callable[[Optional[torch.Tensor]], None] = (
+            lambda _: None
+        )
+        if self._enable_activation_stashing:
+            MemoryStashingManager.set_streams(
+                torch.cuda.Stream(device=device),
+            )
         if device is None:
             device = torch.device("cpu")
 
@@ -2664,8 +2752,14 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
             else [feature for table in tables for feature in table.feature_names]
         )
 
-        self.dense = TestDenseArch(num_float_features, device=dense_device)
-        self.over: nn.Module = over_arch_clazz(ebc_tables, ec_tables, [], device)
+        self.dense = TestDenseArch(
+            num_float_features,
+            device=dense_device,
+            dense_arch_hidden_sizes=dense_arch_hidden_sizes,
+        )
+        self.over: nn.Module = over_arch_clazz(
+            ebc_tables, ec_tables, [], device, **(over_arch_kwargs or {})
+        )
         self.register_buffer(
             "dummy_ones",
             torch.ones(1, device=dense_device),
@@ -2675,6 +2769,11 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
         self, input: ModelInput, sparse_output: torch.Tensor
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         dense_r = self.dense(input.float_features)
+        if (
+            self._enable_activation_stashing
+            and not torch.fx._symbolic_trace.is_fx_tracing()
+        ):
+            dense_r.register_hook(self._restore_callback)
         over_r = self.over(dense_r, sparse_output)
         # pyrefly: ignore[unsupported-operation]
         pred = torch.sigmoid(torch.mean(over_r, dim=1)) + self.dummy_ones
@@ -2733,6 +2832,17 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
             # Concatenate all EC embeddings along feature dimension
             # Note: We avoid using batch_size in control flow for FX tracing compatibility
             ec_embeddings = torch.cat(padded_embeddings, dim=1)
+            if (
+                self._enable_activation_stashing
+                and not torch.fx._symbolic_trace.is_fx_tracing()
+            ):
+                await_restore, restore = MemoryStashingManager._stash_tensors(
+                    [ec_result[e]._values for e in self._ec_features]
+                )
+                ec_embeddings.register_hook(await_restore)
+                cat_emb = torch.cat([ebc_embeddings, ec_embeddings], dim=1)
+                self._restore_callback = restore
+                return cat_emb
 
         return torch.cat([ebc_embeddings, ec_embeddings], dim=1)
 
