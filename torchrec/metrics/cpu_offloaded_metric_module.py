@@ -11,7 +11,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Any, Dict, Mapping, Optional, Tuple, Union
+from typing import Any, Dict, Mapping, Optional, Union
 
 import torch
 from torch import distributed as dist
@@ -25,6 +25,10 @@ from torchrec.metrics.metric_job_types import (
 )
 from torchrec.metrics.metric_module import MetricsFuture, MetricsResult, RecMetricModule
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
+from torchrec.metrics.metrics_output_util import (
+    device_supports_async,
+    transfer_tensors_to_cpu,
+)
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.rec_metric import RecMetricException
 from torchrec.utils.percentile_logger import PercentileLogger
@@ -126,7 +130,9 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         self.update_thread.start()
         self.compute_thread.start()
 
-        logger.info("CPUOffloadedRecMetricModule initialization complete.")
+        logger.info(
+            f"CPUOffloadedRecMetricModule initialization complete with {model_out_device.type=}, {update_queue_size=}, {compute_queue_size=}."
+        )
 
     @override
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
@@ -164,41 +170,6 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         except queue.Full:
             raise RecMetricException("update metric queue is full.")
 
-    def _transfer_to_cpu(
-        self,
-        model_out: Dict[str, torch.Tensor],
-    ) -> Tuple[Dict[str, torch.Tensor], torch.cuda.Event]:
-        """
-        Create a copy of model_out on CPU and return the copy. A cuda event
-        is created to track when the copy is completed.
-
-
-        Args:
-            model_out: intermediate model outputs to be used for metric updates
-        """
-
-        transfer_completed_event = torch.cuda.Event()
-        cpu_model_out = self._move_output_to_cpu(model_out)
-        transfer_completed_event.record()
-
-        return (
-            cpu_model_out,
-            transfer_completed_event,
-        )
-
-    def _move_output_to_cpu(
-        self, output: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Move all tensors in output to CPU and preserve dictionary structure.
-        Args:
-            output: tensors to be moved to CPU
-        """
-        return {
-            k: tensor.to(device="cpu", non_blocking=True)
-            for k, tensor in output.items()
-        }
-
     def _process_metric_update_job(self, metric_update_job: MetricUpdateJob) -> None:
         """
         Process a single metric update job by a worker thread. It first
@@ -212,8 +183,8 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         with record_function("## CPUOffloadedRecMetricModule:update ##"):
             start_time = time.time()
             cpu_model_out, transfer_completed_event = (
-                self._transfer_to_cpu(metric_update_job.model_out)
-                if self._model_out_device.type == "cuda"
+                transfer_tensors_to_cpu(metric_update_job.model_out)
+                if device_supports_async(self._model_out_device)
                 else (metric_update_job.model_out, None)
             )
             if transfer_completed_event is not None:
