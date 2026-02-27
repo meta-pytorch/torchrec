@@ -41,8 +41,6 @@ if [[ ${MATRIX_GPU_ARCH_TYPE} = 'cuda' ]]; then
     elif [[ ${MATRIX_GPU_ARCH_VERSION} = '12.9' ]]; then
         export CUDA_VERSION="cu129"
     elif [[ ${MATRIX_GPU_ARCH_VERSION} = '13.0' ]]; then
-        echo "fbgemm does not support cuda 13.0 so far, exit"
-        exit 0
         export CUDA_VERSION="cu130"
     else
         export CUDA_VERSION="cu126"
