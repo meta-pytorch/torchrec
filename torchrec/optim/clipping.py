@@ -250,6 +250,13 @@ def _batch_cal_norm(
     """Helper function that calculates the p-th power of the norm of a list of gradients in batches.
     If process_groups are passed in, the norm will be aggregated across all ranks in the process group.
     """
+    # Filter out any empty tensors for infinity norm.
+    # This is necessary because torch._foreach_norm cannot compute infinity norm on empty tensors.
+    if norm_type == torch.inf:
+        grad_list = [g for g in grad_list if g.numel() > 0]
+        if len(grad_list) == 0:
+            return torch.tensor(float("-inf"))
+
     global use_64bit_grad_norm
     if use_64bit_grad_norm:
         grad_norms = torch.linalg.vector_norm(

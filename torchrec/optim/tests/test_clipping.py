@@ -317,6 +317,36 @@ class TestBatchCalNorm(unittest.TestCase):
 
         self.assertTrue(torch.allclose(result, torch.tensor(expected_result)))
 
+    def test_batch_cal_norm_inf_with_empty_tensor(self) -> None:
+        """Test that infinity norm handles empty tensors without erroring."""
+        grad_1 = torch.tensor([1.0, 5.0])
+        grad_2 = torch.tensor([])  # empty tensor
+
+        result = _batch_cal_norm(
+            grad_list=[grad_1, grad_2],
+            max_norm=1.0,
+            norm_type=torch.inf,
+        )
+
+        # The empty tensor should be filtered out, so the result should be max of grad_1
+        expected_result = 5.0
+
+        self.assertTrue(torch.allclose(result, torch.tensor(expected_result)))
+
+    def test_batch_cal_norm_inf_all_empty_tensors(self) -> None:
+        """Test that infinity norm returns -inf when all tensors are empty."""
+        grad_1 = torch.tensor([])
+        grad_2 = torch.tensor([])
+
+        result = _batch_cal_norm(
+            grad_list=[grad_1, grad_2],
+            max_norm=1.0,
+            norm_type=torch.inf,
+        )
+
+        # When all tensors are empty, return -inf (identity for max operation)
+        self.assertEqual(result.item(), float("-inf"))
+
 
 class TestComputeTotalNorm(unittest.TestCase):
     def test_compute_total_norm_replicate_only_l2(self) -> None:

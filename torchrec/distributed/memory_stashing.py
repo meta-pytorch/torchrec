@@ -14,6 +14,7 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from torch.autograd.profiler import record_function
+from torchrec.distributed.logger import capped_logger, one_time_rank0_logger
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -78,6 +79,7 @@ class MemoryStashingManager:
             cls._device_to_host_stream = host_to_device_stream
         else:
             cls._device_to_host_stream = device_to_host_stream
+        one_time_rank0_logger.info("MemoryStashingManager: streams initialized")
 
     @classmethod
     def reset(cls) -> None:
@@ -97,6 +99,9 @@ class MemoryStashingManager:
         sync_event: Optional[torch.cuda.Event] = None,
     ) -> None:
         """Pop and call all embedding weight restore callbacks in reverse order."""
+        one_time_rank0_logger.info(
+            f"restore_embedding_weights: invoking {len(cls._embedding_weight_restore_callbacks)} callbacks"
+        )
         while cls._embedding_weight_restore_callbacks:
             cls._embedding_weight_restore_callbacks.pop()(None, sync_event)
 
@@ -107,6 +112,9 @@ class MemoryStashingManager:
         sync_event: Optional[torch.cuda.Event] = None,
     ) -> None:
         """Pop and call all optimizer state restore callbacks in reverse order."""
+        one_time_rank0_logger.info(
+            f"restore_optimizer_state: invoking {len(cls._optimizer_state_restore_callbacks)} callbacks"
+        )
         while cls._optimizer_state_restore_callbacks:
             cls._optimizer_state_restore_callbacks.pop()(None, sync_event)
 
@@ -145,8 +153,8 @@ class MemoryStashingManager:
             - await_restore: Pauses current stream awaiting restore completion
             - restore: Retrieves stashed data from CPU back to HBM asynchronously
         """
-        # (hbm_tensor ref, cpu_buffer)
-        stash_data: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        # (hbm_tensor ref, cpu_buffer, original_storage_size)
+        stash_data: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
 
         # Restore events populated by ``restore`` and consumed by ``await_restore``
         restore_events: List[torch.cuda.Event] = []
@@ -163,6 +171,7 @@ class MemoryStashingManager:
             d2h_stream.wait_stream(torch.cuda.current_stream())
 
         size_text = _tensor_size_text(tensors)
+        capped_logger.info(f"stash {label}: {len(tensors)} tensors, total {size_text}")
 
         # Start async copy from HBM to CPU
         with record_function(f"stash {label} to host ({size_text})"):
@@ -176,22 +185,20 @@ class MemoryStashingManager:
                         pin_memory=True,
                     )
                     cpu_buffer.copy_(tensor, non_blocking=True)
-                    stash_data.append((tensor, cpu_buffer))
+                    orig_storage_size = tensor.untyped_storage().size()
+                    stash_data.append((tensor, cpu_buffer, orig_storage_size))
 
-                    # resize_(0) frees HBM storage.  Since it runs inside
-                    # the d2h_stream context, the allocator associates the
-                    # free with d2h_stream via current_stream() and won't
-                    # reuse the block until d2h_stream advances past this
-                    # point — which is after the copy_ above completes.
-                    #
-                    # record_stream(d2h_stream) would explicitly tell the
-                    # allocator about d2h_stream usage, but is redundant
-                    # here because resize_(0) already runs with
-                    # current_stream() == d2h_stream.  Commented out for
-                    # now; re-enable if we move resize_(0) outside the
-                    # stream context.
-                    # tensor.record_stream(d2h_stream)
-                    tensor.untyped_storage().resize_(0)
+                # Two-pass: free HBM storage only after all copies are
+                # enqueued.  Tensors may share the same underlying storage
+                # (e.g. views into an all-to-all output buffer), so freeing
+                # one tensor's storage before copying another would
+                # invalidate the shared data.
+                seen_storage_ptrs: set = set()
+                for tensor, _, _ in stash_data:
+                    storage_ptr = tensor.untyped_storage().data_ptr()
+                    if storage_ptr not in seen_storage_ptrs:
+                        seen_storage_ptrs.add(storage_ptr)
+                        tensor.untyped_storage().resize_(0)
 
         def restore(
             _grad: Optional[torch.Tensor] = None,
@@ -201,16 +208,20 @@ class MemoryStashingManager:
             restore_events.clear()
             h2d_stream = cls.h2d_stream()
 
-            size_text = _tensor_size_text([cpu_buf for _, cpu_buf in stash_data])
+            size_text = _tensor_size_text([cpu_buf for _, cpu_buf, _ in stash_data])
+            capped_logger.info(
+                f"restore {label}: {len(stash_data)} tensors, total {size_text}"
+            )
             with record_function(f"restore {label} on device ({size_text})"):
-                for hbm_ref, cpu_buf in stash_data:
-                    storage_size = cpu_buf.numel() * cpu_buf.element_size()
-                    # Re-allocate HBM storage inside the h2d_stream
-                    # context so the caching allocator records the
-                    # allocation on h2d_stream.  This prevents premature
-                    # reuse when a background thread's default stream
-                    # differs from the main thread's.
-                    hbm_ref.untyped_storage().resize_(storage_size)
+                for hbm_ref, _cpu_buf, orig_storage_size in stash_data:
+                    # Re-allocate HBM storage to the original size (which
+                    # may be larger than this tensor if storage is shared).
+                    # For shared storage, the first resize allocates the
+                    # full buffer; subsequent resizes for sibling views are
+                    # no-ops since the storage is already large enough.
+                    cur_size = hbm_ref.untyped_storage().size()
+                    if cur_size < orig_storage_size:
+                        hbm_ref.untyped_storage().resize_(orig_storage_size)
 
             # Ensure h2d_stream waits for the caller's stream before any
             # allocations.  When called from a background thread the default
@@ -222,7 +233,7 @@ class MemoryStashingManager:
                 h2d_stream.wait_stream(torch.cuda.current_stream())
 
             with record_function(f"restore {label} from host ({size_text})"):
-                for hbm_ref, cpu_buf in stash_data:
+                for hbm_ref, cpu_buf, _orig_storage_size in stash_data:
 
                     # Copy data back using a temporary tensor to bypass
                     # autograd.  copy_() on the original tensor would
@@ -230,10 +241,13 @@ class MemoryStashingManager:
                     # inplace operation" errors during backward.  A fresh
                     # tensor viewing the same storage has its own version
                     # counter, avoiding the issue.
+                    #
+                    # Use hbm_ref.storage_offset() to place data at the
+                    # correct position within potentially shared storage.
                     tmp = torch.tensor([], dtype=hbm_ref.dtype, device=hbm_ref.device)
                     tmp.set_(
                         hbm_ref.untyped_storage(),
-                        storage_offset=0,
+                        storage_offset=hbm_ref.storage_offset(),
                         size=hbm_ref.shape,
                         stride=hbm_ref.stride(),
                     )
@@ -297,6 +311,9 @@ class MemoryStashingManager:
 
         # Early return if module doesn't have embedding modules
         if not hasattr(module, "_emb_modules"):
+            capped_logger.info(
+                "stash_embedding_weights: no _emb_modules found, skipping"
+            )
             return lambda _grad: None, lambda _grad: None
 
         # Collect CUDA embedding weight tensors
@@ -311,6 +328,12 @@ class MemoryStashingManager:
             if weights_dev is None or not weights_dev.is_cuda:
                 continue
             tensors.append(weights_dev)
+
+        capped_logger.info(
+            f"stash_embedding_weights: lookup={type(lookup).__name__}, "
+            f"module={type(module).__name__}, "
+            f"collected {len(tensors)} weight tensors"
+        )
 
         await_restore, restore = cls._stash_tensors(tensors, label="embedding")
         cls._embedding_weight_restore_callbacks.append(restore)
@@ -371,6 +394,11 @@ class MemoryStashingManager:
             for _state_key, state_value in state_dict.items():
                 tensors.extend(_collect_cuda_tensors_from_value(state_value))
 
+        one_time_rank0_logger.info(
+            f"stash_optimizer_state: optimizer={type(optimizer).__name__}, "
+            f"collected {len(tensors)} state tensors"
+        )
+
         await_restore, restore = cls._stash_tensors(
             tensors, label="optimizer state", sync_event=sync_event
         )
@@ -421,6 +449,9 @@ class MemoryStashingManager:
         ``await_restore`` on the main thread afterwards to make the default
         stream wait for the H2D copies to finish.
         """
+        one_time_rank0_logger.info(
+            "restore_optimizer_state_threaded: submitting to background thread"
+        )
         sync_event = torch.cuda.Event()
         sync_event.record(torch.cuda.current_stream())
         device = torch.cuda.current_device()
@@ -445,6 +476,9 @@ class MemoryStashingManager:
         ``await_restore`` on the main thread afterwards to make the default
         stream wait for the H2D copies to finish.
         """
+        one_time_rank0_logger.info(
+            "restore_embedding_weights_threaded: submitting to background thread"
+        )
         sync_event = torch.cuda.Event()
         sync_event.record(torch.cuda.current_stream())
         device = torch.cuda.current_device()

@@ -21,6 +21,7 @@ OSS (external):
 see README.md for more details
 """
 
+import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -35,11 +36,14 @@ from torchrec.distributed.benchmark.base import (
     benchmark_func,
     cmd_conf,
 )
+from torchrec.distributed.collective_utils import create_on_rank_and_share_result
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     run_multi_process_func,
 )
 from torchrec.distributed.types import DeviceToHostTensorAwaitable
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 # pyrefly: ignore[missing-argument]
 _cc = cmd_conf()
@@ -55,6 +59,8 @@ class AllToAllSingleRunConfig(BenchFuncConfig):
     num_profiles: int = 2
     num_mul: int = 5
     num_concat: int = 100
+    debug_mode: bool = False
+    backend: str = "nccl"
 
 
 def _compute(
@@ -651,18 +657,77 @@ def single_thread_copy(
     )
 
 
+def shared_memory_across_process(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    CPU shared memory benchmark: rank 0 creates a large CPU tensor in POSIX
+    shared memory (/dev/shm) and shares the storage metadata with other ranks
+    via a broadcast collective. Other ranks open the same shared memory region
+    and access the tensor without any data copy.
+
+    Both processes hold the mapping open simultaneously so you can verify
+    from the host that only one copy of the data exists:
+        ls -lh /dev/shm/torch_*
+    """
+
+    # Use (num_concat * dim, dim) to make the shared region large enough
+    # to be clearly visible in /dev/shm.
+    # Default: num_concat=100, dim=2048 => 100*2048*2048*4 bytes ≈ 1.6 GB
+    shm_shape = (num_concat * dim, dim)
+
+    assert ctx.pg is not None
+    with record_function("## create and share tensor ##"):
+        shared_tensor = create_on_rank_and_share_result(
+            ctx.pg,
+            0,
+            creator=lambda: torch.full(shm_shape, fill_value=42.0, dtype=torch.float32),
+            extractor=lambda t: [t],
+            constructor=lambda ts: ts[0],  # pyrefly: ignore[bad-argument-type]
+        )
+        # Keep the tensor alive across benchmark iterations so the shared
+        # memory file in /dev/shm is not cleaned up prematurely.
+        # pyrefly: ignore[missing-attribute]
+        shared_memory_across_process._shm_tensor = shared_tensor
+
+    if ctx.rank != 0:
+        with record_function(f"## rank-{ctx.rank}: validate shared data ##"):
+            assert torch.all(
+                shared_tensor == 42.0
+            ).item(), "Shared memory validation failed"
+            logger.info(
+                f"[rank-{ctx.rank}] validated shared tensor {list(shared_tensor.shape)}, "
+                f"data_ptr matches rank 0's /dev/shm region"
+            )
+
+
 # single-rank runner
 def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) -> None:
-    # Ensure GPUs are available and we have enough of them
-    assert (
-        torch.cuda.is_available() and torch.cuda.device_count() >= world_size
-    ), "CUDA not available or insufficient GPUs for the requested world_size"
+    if arg.backend == "nccl":
+        # Ensure GPUs are available and we have enough of them
+        assert (
+            torch.cuda.is_available() and torch.cuda.device_count() >= world_size
+        ), "CUDA not available or insufficient GPUs for the requested world_size"
+
+    arg.set_log_level()
+
+    # debug mode only works with vscode for now.
+    if arg.debug_mode:
+        # pyrefly: ignore[missing-module-attribute]
+        from fbvscode import attach_debugger
+
+        attach_debugger()
 
     torch.autograd.set_detect_anomaly(True)
     with MultiProcessContext(
         rank=rank,
         world_size=world_size,
-        backend="nccl",
+        backend=arg.backend,
         use_deterministic_algorithms=False,
     ) as ctx:
         match arg.name.lower():
@@ -690,6 +755,8 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = threading_copy
             case "single_thread_copy":
                 func = single_thread_copy
+            case "shared_memory_across_process":
+                func = shared_memory_across_process
             case _:
                 raise ValueError(f"Unknown benchmark name: {arg.name}")
 
@@ -704,7 +771,7 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
             },
             func_to_benchmark=func,
             rank=rank,
-            **arg.benchmark_func_kwargs(),
+            **arg.benchmark_func_kwargs(name=f"{arg.name}_{arg.backend}"),
         )
 
         if rank == 0:

@@ -1,0 +1,57 @@
+# Mixed EBC + EC (EmbeddingCollection) benchmark config
+# Demonstrates benchmarking with both EmbeddingBagConfig and EmbeddingConfig tables
+RunOptions:
+  world_size: 2
+  num_batches: 10
+  num_benchmarks: 1
+  num_profiles: 1
+  sharding_type: table_wise
+  profile_dir: "."
+  name: "sdd_activation_stashing"
+  memory_snapshot: True
+  loglevel: "info"
+PipelineConfig:
+  pipeline: "sparse"
+ModelInputConfig:
+  num_float_features: 100
+  feature_pooling_avg: 30
+ModelSelectionConfig:
+  model_name: "mixed_embedding"
+  model_config:
+    num_float_features: 100
+    over_arch_clazz: "large_activation"
+    enable_activation_stashing: true
+    dense_arch_hidden_sizes: [8192, 8192, 8192]
+    over_arch_kwargs:
+      large_activation_dim: 8192
+EmbeddingTablesConfig:
+  num_unweighted_features: 70
+  num_weighted_features: 0
+  embedding_feature_dim: 256
+  additional_tables:
+    # First list: unweighted tables (EBC + EC mixed)
+    - - name: ebc_table_0
+        embedding_dim: 256
+        num_embeddings: 100_000
+        feature_names: ["ebc_feature_0"]
+      - name: ebc_table_1
+        embedding_dim: 256
+        num_embeddings: 200_000
+        feature_names: ["ebc_feature_1"]
+      # EC tables - use config_class to specify EmbeddingConfig
+      - name: ec_table_0
+        embedding_dim: 1024
+        num_embeddings: 1_000_000
+        feature_names: ["ec_feature_0"]
+        config_class: EmbeddingConfig
+      - name: ec_table_1
+        embedding_dim: 1024
+        num_embeddings: 2_000_000
+        feature_names: ["ec_feature_1"]
+        config_class: EmbeddingConfig
+    # Second list: weighted tables (empty for this config)
+    - []
+PlannerConfig:
+  pooling_factors: [10.0]
+  hardware:  # A100
+    hbm_cap: 85899345920  # 80GB

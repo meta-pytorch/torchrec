@@ -402,6 +402,11 @@ class RecMetric(nn.Module, abc.ABC):
         if "should_clone_update_inputs" in kwargs:
             del kwargs["should_clone_update_inputs"]
 
+        # Pop batch_size_stages from kwargs so it doesn't cause type conflicts
+        # when subclasses pass **kwargs: Dict[str, Any] to super().__init__().
+        # TowerQPSMetric declares its own explicit batch_size_stages parameter.
+        kwargs.pop("batch_size_stages", None)
+
         if self._window_size < self._batch_size:
             raise ValueError(
                 f"Local window size must be larger than batch size. Got local window size {self._window_size} and batch size {self._batch_size}."

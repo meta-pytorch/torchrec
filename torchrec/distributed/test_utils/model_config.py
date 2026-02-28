@@ -25,6 +25,8 @@ from torch import nn
 from torchrec.distributed.test_utils.table_config import ManagedCollisionConfig
 from torchrec.distributed.test_utils.test_model import (
     TestMixedEmbeddingSparseArch,
+    TestMixedSequenceOverArch,
+    TestMixedSequenceOverArchLargeActivation,
     TestOverArch,
     TestOverArchLarge,
     TestOverArchRegroupModule,
@@ -77,6 +79,11 @@ OVER_ARCH_CLASSES: Dict[str, Type[nn.Module]] = {
     "default": TestOverArch,
     "large": TestOverArchLarge,
     "regroup_module": TestOverArchRegroupModule,
+}
+
+MIXED_OVER_ARCH_CLASSES: Dict[str, Type[nn.Module]] = {
+    "default": TestMixedSequenceOverArch,
+    "large_activation": TestMixedSequenceOverArchLargeActivation,
 }
 
 
@@ -231,6 +238,19 @@ class MixedEmbeddingConfig(BaseModelConfig):
     """Configuration for mixed EBC+EC model using TestMixedEmbeddingSparseArch."""
 
     embedding_groups: Optional[Dict[str, List[str]]] = None
+    over_arch_clazz: Type[nn.Module] = TestMixedSequenceOverArch
+    enable_activation_stashing: bool = False
+    dense_arch_hidden_sizes: Optional[List[int]] = None
+    over_arch_kwargs: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.over_arch_clazz, str):
+            if self.over_arch_clazz not in MIXED_OVER_ARCH_CLASSES:
+                raise ValueError(
+                    f"Unknown mixed over_arch_clazz: {self.over_arch_clazz}. "
+                    f"Available: {list(MIXED_OVER_ARCH_CLASSES.keys())}"
+                )
+            self.over_arch_clazz = MIXED_OVER_ARCH_CLASSES[self.over_arch_clazz]
 
     def generate_model(
         self,
@@ -246,6 +266,10 @@ class MixedEmbeddingConfig(BaseModelConfig):
             embedding_groups=self.embedding_groups,
             dense_device=dense_device,
             sparse_device=torch.device("meta"),
+            over_arch_clazz=self.over_arch_clazz,
+            enable_activation_stashing=self.enable_activation_stashing,
+            dense_arch_hidden_sizes=self.dense_arch_hidden_sizes,
+            over_arch_kwargs=self.over_arch_kwargs,
         )
 
 

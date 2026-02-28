@@ -40,12 +40,14 @@ from torchrec.metrics.metrics_config import (
     RecMetricDef,
     RecMetricEnum,
     ThroughputDef,
+    validate_batch_size_stages,
 )
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.rec_metric import RecMetricException, RecMetricList, RecTaskInfo
 from torchrec.metrics.test_utils import gen_test_batch, gen_test_tasks
 from torchrec.metrics.test_utils.mock_metrics import MockRecMetric
 from torchrec.metrics.throughput import ThroughputMetric
+from torchrec.metrics.tower_qps import TowerQPSMetric
 from torchrec.test_utils import get_free_port, seed_and_log, skip_if_asan_class
 
 METRIC_MODULE_PATH = "torchrec.metrics.metric_module"
@@ -839,6 +841,54 @@ class MetricModuleTest(unittest.TestCase):
         # Make sure num_batch wasn't created on the throughput module (and no exception was thrown above)
         self.assertFalse(hasattr(no_bss_metric_module.throughput_metric, "_num_batch"))
 
+    def test_batch_size_stages_passed_to_rec_metrics(self) -> None:
+        """Verify batch_size_stages flows from generate_metric_module
+        through _generate_rec_metrics to individual RecMetric instances."""
+        batch_size_stages = [
+            BatchSizeStage(256, 100),
+            BatchSizeStage(512, None),
+        ]
+        # Create a config that includes TowerQPSMetric
+        config = MetricsConfig(
+            rec_tasks=[DefaultTaskInfo],
+            rec_metrics={
+                RecMetricEnum.NE: RecMetricDef(
+                    rec_tasks=[DefaultTaskInfo],
+                    window_size=_DEFAULT_WINDOW_SIZE,
+                ),
+                RecMetricEnum.TOWER_QPS: RecMetricDef(
+                    rec_tasks=[DefaultTaskInfo],
+                    window_size=_DEFAULT_WINDOW_SIZE,
+                ),
+            },
+            throughput_metric=ThroughputDef(),
+            state_metrics=[],
+        )
+
+        metric_module = generate_metric_module(
+            TestMetricModule,
+            metrics_config=config,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+            batch_size_stages=batch_size_stages,
+        )
+
+        # Verify TowerQPSMetric received batch_size_stages
+        found_tower_qps = False
+        for metric in metric_module.rec_metrics.rec_metrics:
+            if isinstance(metric, TowerQPSMetric):
+                found_tower_qps = True
+                self.assertIsNotNone(metric._batch_size_stages)
+                self.assertEqual(len(metric._batch_size_stages), 2)
+                self.assertEqual(metric._batch_size_stages[0].batch_size, 256)
+                self.assertEqual(metric._batch_size_stages[0].max_iters, 100)
+                self.assertEqual(metric._batch_size_stages[1].batch_size, 512)
+                self.assertIsNone(metric._batch_size_stages[1].max_iters)
+        self.assertTrue(found_tower_qps, "TowerQPSMetric not found in rec_metrics")
+
     def test_async_compute_raises_exception(self) -> None:
         metric_module = generate_metric_module(
             TestMetricModule,
@@ -1573,3 +1623,23 @@ def _test_get_metric_states_with_asymmetric_batches(
             expected[0],
             msg="Mismatch in gathered predictions with multiple batches per rank",
         )
+
+
+class ValidateBatchSizeStagesTest(unittest.TestCase):
+    def test_none_is_valid(self) -> None:
+        # Should not raise
+        validate_batch_size_stages(None)
+
+    def test_last_stage_max_iters_not_none_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_batch_size_stages([BatchSizeStage(256, 100)])
+
+    def test_valid_stages(self) -> None:
+        # Should not raise
+        validate_batch_size_stages(
+            [BatchSizeStage(256, 100), BatchSizeStage(512, None)]
+        )
+
+    def test_single_stage_valid(self) -> None:
+        # Should not raise - single stage with max_iters=None
+        validate_batch_size_stages([BatchSizeStage(256, None)])

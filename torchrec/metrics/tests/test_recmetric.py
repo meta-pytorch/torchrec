@@ -8,9 +8,10 @@
 # pyre-strict
 
 import unittest
+from typing import Any
 
 import torch
-from torchrec.metrics.metrics_config import DefaultTaskInfo, RecTaskInfo
+from torchrec.metrics.metrics_config import BatchSizeStage, DefaultTaskInfo, RecTaskInfo
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.mse import MSEMetric
 from torchrec.metrics.ne import NEMetric
@@ -296,3 +297,32 @@ class RecMetricTest(unittest.TestCase):
             required_inputs_list=["session_id"],
         )
         self.assertEqual(required_inputs["session_id"].device, torch.device("cuda:0"))
+
+    def test_batch_size_stages_kwargs_stripped(self) -> None:
+        """Verify RecMetric.__init__ strips batch_size_stages from kwargs
+        so non-TowerQPS metrics can be constructed with it in kwargs."""
+        batch_size_stages = [
+            BatchSizeStage(256, 100),
+            BatchSizeStage(512, None),
+        ]
+        # NEMetric does NOT declare batch_size_stages as an explicit param.
+        # This should succeed because RecMetric.__init__ strips it from kwargs.
+        extra_kwargs: dict[str, Any] = {"batch_size_stages": batch_size_stages}
+        ne = NEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=0,
+            **extra_kwargs,
+        )
+        # Verify the metric initialized and can compute
+        ne.update(
+            predictions=self.predictions,
+            labels=self.labels,
+            weights=self.weights,
+        )
+        res = ne.compute()
+        self.assertIn("ne-DefaultTask|lifetime_ne", res)
