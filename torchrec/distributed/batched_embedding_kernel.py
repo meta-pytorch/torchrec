@@ -174,8 +174,9 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
     fused_params = config.fused_params or {}
     # read and clean up the fused_params that are not in the constructor
     if RES_STORE_SHARDS_STR in fused_params:
-        # pyrefly: ignore [bad-assignment]
-        res_params.res_store_shards = fused_params.get(RES_STORE_SHARDS_STR)
+        res_store_shards_value = fused_params.get(RES_STORE_SHARDS_STR)
+        if res_store_shards_value is not None:
+            res_params.res_store_shards = res_store_shards_value
         del fused_params[RES_STORE_SHARDS_STR]
     res_enabled_tables: Optional[List[str]] = None
     if RES_ENABLED_TABLES_STR in fused_params:
