@@ -72,6 +72,10 @@ class MetricName(MetricNameBase):
     SCALAR = "scalar"
     OUTPUT = "output"
 
+    UAUC = "uauc"
+    WUAUC = "wuauc"
+    UAUC_NUM_USERS = "uauc_num_users"
+
     GAUC_NUM_SAMPLES = "gauc_num_samples"
     TOTAL_POSITIVE_EXAMPLES = "total_positive_examples"
     TOTAL_NEGATIVE_EXAMPLES = "total_negative_examples"
@@ -118,6 +122,7 @@ class MetricNamespace(MetricNamespaceBase):
     MSE = "mse"
     AUC = "auc"
     GAUC = "gauc"
+    UAUC = "uauc"
     AUPRC = "auprc"
     RAUC = "rauc"
     MAE = "mae"
