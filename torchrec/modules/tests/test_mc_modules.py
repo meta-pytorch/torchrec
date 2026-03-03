@@ -11,8 +11,8 @@ import unittest
 from typing import cast, Dict
 
 import torch
+from torchrec.fb.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.embedding_configs import EmbeddingConfig
-from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.mc_modules import (
     average_threshold_filter,
     DistanceLFU_EvictionPolicy,
@@ -486,3 +486,92 @@ class TestManagedCollisionCollection(unittest.TestCase):
         # and produces valid output in both cases
         self.assertTrue(torch.equal(output_true.values(), output_false.values()))
         self.assertTrue(torch.equal(output_true.lengths(), output_false.lengths()))
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_return_zch_runtime_meta(self) -> None:
+        device = torch.device("cuda")
+        zch_size = 8
+        total_num_buckets = 2
+
+        embedding_configs = [
+            EmbeddingConfig(
+                name="t1",
+                embedding_dim=8,
+                num_embeddings=zch_size,
+                feature_names=["f1", "f2"],
+            ),
+            EmbeddingConfig(
+                name="t2",
+                embedding_dim=8,
+                num_embeddings=zch_size,
+                feature_names=["f3"],
+            ),
+        ]
+        hash_zch_mc1 = HashZchManagedCollisionModule(
+            zch_size=zch_size,
+            device=device,
+            name="t1",
+            total_num_buckets=total_num_buckets,
+            track_id_freq=True,
+        )
+        self.assertIsNotNone(hash_zch_mc1._hash_zch_runtime_meta)
+        self.assertIsNotNone(hash_zch_mc1._hash_zch_identities)
+        hash_zch_mc1._hash_zch_runtime_meta = torch.nn.Parameter(
+            torch.arange(10, 10 + zch_size, device=device).reshape(zch_size, -1),
+            requires_grad=False,
+        )
+        self.assertTrue(hash_zch_mc1._hash_zch_runtime_meta.size(0), zch_size)
+        hash_zch_mc1._hash_zch_identities = torch.nn.Parameter(
+            torch.tensor([50, 100, 999, 300, 400, 500, 600, -1], device=device),
+            requires_grad=False,
+        )
+        hash_zch_mc2 = HashZchManagedCollisionModule(
+            zch_size=zch_size,
+            device=device,
+            name="t2",
+            total_num_buckets=total_num_buckets,
+        )
+        self.assertIsNone(hash_zch_mc2._hash_zch_runtime_meta)
+        mc_modules_dict = {
+            "t1": cast(
+                ManagedCollisionModule,
+                hash_zch_mc1,
+            ),
+            "t2": cast(
+                ManagedCollisionModule,
+                hash_zch_mc2,
+            ),
+        }
+        mcc = ManagedCollisionCollection(
+            managed_collision_modules=mc_modules_dict,
+            embedding_configs=embedding_configs,
+        )
+        kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f1", "f2", "f3"],
+            values=torch.tensor(
+                [100, 200, 300, 400, 500], dtype=torch.int64, device=device
+            ),
+            lengths=torch.tensor([2, 2, 1], dtype=torch.int64, device=device),
+            weights=torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5], dtype=torch.float32),
+        )
+        remapped_ids = KeyedJaggedTensor.from_lengths_sync(
+            keys=kjt.keys(),
+            values=torch.tensor([1, 2, 3, 4, 0], dtype=torch.int64, device=device),
+            lengths=kjt.lengths(),
+            weights=kjt.weights(),
+        )
+
+        runtime_meta = mcc.lookup_runtime_meta(kjt, remapped_ids)
+        self.assertIsNotNone(runtime_meta)
+        self.assertEqual(runtime_meta.keys(), kjt.keys())
+        self.assertTrue(
+            torch.equal(
+                runtime_meta.values(),
+                torch.tensor([11, 0, 13, 14, -1], dtype=torch.int64, device=device),
+            )
+        )
+        self.assertTrue(torch.equal(runtime_meta.lengths(), kjt.lengths()))
+        self.assertTrue(torch.equal(runtime_meta.weights(), kjt.weights()))

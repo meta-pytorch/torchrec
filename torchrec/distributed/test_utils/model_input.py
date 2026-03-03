@@ -41,6 +41,7 @@ class ModelInput(Pipelineable):
         device: torch.device,
         non_blocking: bool = False,
         data_copy_stream: Optional[torch.cuda.streams.Stream] = None,
+        dense_only: bool = False,
     ) -> "ModelInput":
         """
         Move ModelInput to the specified device.
@@ -51,6 +52,9 @@ class ModelInput(Pipelineable):
             data_copy_stream: Optional CUDA stream for async data copies. When provided,
                 tensors are pre-allocated on the target device and copied within this stream.
                 This enables pipelined data transfers with computation on other streams.
+            dense_only: Whether to only move dense features (float_features, label, dummy)
+                to the target device, keeping sparse features (idlist_features, idscore_features)
+                on their current device.
 
         Returns:
             ModelInput on the target device.
@@ -62,6 +66,9 @@ class ModelInput(Pipelineable):
             # Async transfer with dedicated stream
             copy_stream = torch.cuda.Stream()
             batch_gpu = batch_cpu.to(device="cuda", non_blocking=True, data_copy_stream=copy_stream)
+
+            # Move only dense features to GPU, keep sparse on CPU
+            batch_mixed = batch_cpu.to(device="cuda", dense_only=True)
         """
         if data_copy_stream is None:
             # Standard .to() method
@@ -69,69 +76,90 @@ class ModelInput(Pipelineable):
                 device=device,
                 non_blocking=non_blocking,
             )
-            idlist_features = (
-                self.idlist_features.to(
-                    device=device,
-                    non_blocking=non_blocking,
-                )
-                if self.idlist_features is not None
-                else None
-            )
-            idscore_features = (
-                self.idscore_features.to(
-                    device=device,
-                    non_blocking=non_blocking,
-                )
-                if self.idscore_features is not None
-                else None
-            )
             label = self.label.to(
                 device=device,
                 non_blocking=non_blocking,
             )
             dummy = [d.to(device=device, non_blocking=non_blocking) for d in self.dummy]
+
+            if dense_only:
+                # Keep sparse features on their current device
+                idlist_features = self.idlist_features
+                idscore_features = self.idscore_features
+            else:
+                idlist_features = (
+                    self.idlist_features.to(
+                        device=device,
+                        non_blocking=non_blocking,
+                    )
+                    if self.idlist_features is not None
+                    else None
+                )
+                idscore_features = (
+                    self.idscore_features.to(
+                        device=device,
+                        non_blocking=non_blocking,
+                    )
+                    if self.idscore_features is not None
+                    else None
+                )
         else:
             # Async copy using dedicated stream
             current_stream = torch.cuda.current_stream(device)
 
-            # Pre-allocate tensors on target device
+            # Pre-allocate dense tensors on target device
             float_features = torch.empty_like(self.float_features, device=device)
             label = torch.empty_like(self.label, device=device)
-            idlist_features = (
-                None
-                if self.idlist_features is None
-                else KeyedJaggedTensor.empty_like(self.idlist_features, device=device)
-            )
-            idscore_features = (
-                None
-                if self.idscore_features is None
-                else KeyedJaggedTensor.empty_like(self.idscore_features, device=device)
-            )
             dummy = [torch.empty_like(d, device=device) for d in self.dummy]
+
+            if dense_only:
+                # Keep sparse features on their current device
+                idlist_features = self.idlist_features
+                idscore_features = self.idscore_features
+            else:
+                # Pre-allocate sparse tensors on target device
+                idlist_features = (
+                    None
+                    if self.idlist_features is None
+                    else KeyedJaggedTensor.empty_like(
+                        self.idlist_features, device=device
+                    )
+                )
+                idscore_features = (
+                    None
+                    if self.idscore_features is None
+                    else KeyedJaggedTensor.empty_like(
+                        self.idscore_features, device=device
+                    )
+                )
 
             # Perform async copy in dedicated stream
             with data_copy_stream:
                 # Wait for current stream to finish memory allocation
                 data_copy_stream.wait_stream(current_stream)
 
+                # Copy dense features
                 float_features.copy_(self.float_features, non_blocking=non_blocking)
                 label.copy_(self.label, non_blocking=non_blocking)
-                if idlist_features is not None:
-                    idlist_features.copy_(
-                        # pyrefly: ignore[bad-argument-type]
-                        self.idlist_features,
-                        non_blocking=non_blocking,
-                    )
-                if idscore_features is not None:
-                    idscore_features.copy_(
-                        # pyrefly: ignore[bad-argument-type]
-                        self.idscore_features,
-                        non_blocking=non_blocking,
-                    )
                 dummy = [
                     d.copy_(self.dummy[i], non_blocking=non_blocking)
                     for (i, d) in enumerate(dummy)
                 ]
+
+                # Copy sparse features only if not dense_only
+                if not dense_only:
+                    if idlist_features is not None:
+                        idlist_features.copy_(
+                            # pyrefly: ignore[bad-argument-type]
+                            self.idlist_features,
+                            non_blocking=non_blocking,
+                        )
+                    if idscore_features is not None:
+                        idscore_features.copy_(
+                            # pyrefly: ignore[bad-argument-type]
+                            self.idscore_features,
+                            non_blocking=non_blocking,
+                        )
 
         return ModelInput(
             float_features=float_features,

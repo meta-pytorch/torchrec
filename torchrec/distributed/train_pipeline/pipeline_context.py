@@ -99,3 +99,8 @@ class EmbeddingTrainPipelineContext(TrainPipelineContext):
     embedding_tensors: List[List[torch.Tensor]] = field(default_factory=list)
     embedding_features: List[List[Union[str, List[str]]]] = field(default_factory=list)
     detached_embedding_tensors: List[List[torch.Tensor]] = field(default_factory=list)
+
+
+@dataclass
+class CPUEmbeddingTrainPipelineContext(EmbeddingTrainPipelineContext):
+    dense_gpu_device: str = field(default_factory=str)

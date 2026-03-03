@@ -163,7 +163,7 @@ def runner(
     with MultiProcessContext(
         rank=rank,
         world_size=world_size,
-        backend="nccl",
+        backend="cpu:gloo,cuda:nccl",
         use_deterministic_algorithms=False,
     ) as ctx:
         unsharded_model = model_config.generate_model(

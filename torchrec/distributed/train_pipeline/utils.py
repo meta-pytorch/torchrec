@@ -48,6 +48,7 @@ from torchrec.distributed.train_pipeline.pipeline_context import (
 from torchrec.distributed.train_pipeline.postproc import PipelinedPostproc
 from torchrec.distributed.train_pipeline.runtime_forwards import (
     BaseForward,
+    CPUEmbeddingPipelinedForward,
     EmbeddingPipelinedForward,
     InSyncEmbeddingPipelinedForward,
     KJTAllToAllForward,
@@ -170,6 +171,7 @@ def _start_data_dist(
                 PrefetchPipelinedForward,
                 EmbeddingPipelinedForward,
                 InSyncEmbeddingPipelinedForward,
+                CPUEmbeddingPipelinedForward,
             ),
         )
 
