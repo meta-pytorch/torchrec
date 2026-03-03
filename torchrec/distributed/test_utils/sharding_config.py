@@ -21,6 +21,7 @@ from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.model_parallel import HybridEvalDMP
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
@@ -33,6 +34,7 @@ from torchrec.distributed.types import (
     KeyValueParams,
     ModuleSharder,
     ShardingEnv,
+    ShardingPlan,
     ShardingType,
 )
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
@@ -260,6 +262,15 @@ class ShardingConfig:
             optimizer constructor. For Shampoo, this can include
             precondition_frequency, start_preconditioning_step,
             max_preconditioner_dim, etc.
+        init_data_parallel: Whether to wrap in DDP. Set to False for eval
+            workflows that don't need gradient synchronization.
+        embedding_device: If set, DMP uses this device for embeddings (e.g. "cpu").
+            When set, the .to(device) call is skipped to preserve split-device
+            placement (CPU embeddings + GPU dense).
+        skip_dense_optimizer: If True, return a dummy optimizer instead of creating
+            a real one for dense parameters. Useful for eval-only workflows.
+        deepcopy_model: If True (default), deepcopy the model before passing to DMP.
+            Set to False to save memory when the original model is not needed.
     """
 
     fused_params: Dict[str, Any] = field(default_factory=dict)
@@ -268,6 +279,10 @@ class ShardingConfig:
     dense_momentum: Optional[float] = None
     dense_weight_decay: Optional[float] = None
     dense_optimizer_kwargs: Dict[str, Any] = field(default_factory=dict)
+    init_data_parallel: bool = True
+    embedding_device: Optional[str] = None
+    skip_dense_optimizer: bool = False
+    deepcopy_model: bool = True
 
     def _convert_fused_params(self) -> Optional[Dict[str, Any]]:
         """
@@ -294,6 +309,134 @@ class ShardingConfig:
 
         return fused_params
 
+    def _plan_and_sharders(
+        self,
+        model: nn.Module,
+        pg: dist.ProcessGroup,
+        planner: Optional[
+            Union[
+                EmbeddingShardingPlanner,
+                HeteroEmbeddingShardingPlanner,
+            ]
+        ] = None,
+    ) -> Tuple[List[ModuleSharder[nn.Module]], Optional[ShardingPlan]]:
+        """
+        Convert fused params, create sharders, and run the planner.
+
+        Returns:
+            Tuple of (sharders, plan)
+        """
+        converted_fused_params = self._convert_fused_params()
+        sharders = _get_sharders_with_fused_params(converted_fused_params)
+
+        plan = None
+        if planner is not None:
+            if pg is not None:
+                plan = planner.collective_plan(model, sharders, pg)
+            else:
+                # pyrefly: ignore[bad-argument-type, missing-argument]
+                plan = planner.plan(model, sharders)
+
+        return sharders, plan
+
+    def generate_dmp_model(
+        self,
+        model: nn.Module,
+        pg: dist.ProcessGroup,
+        device: torch.device,
+        planner: Optional[
+            Union[
+                EmbeddingShardingPlanner,
+                HeteroEmbeddingShardingPlanner,
+            ]
+        ] = None,
+    ) -> DistributedModelParallel:
+        """
+        Generate a standard DistributedModelParallel model.
+
+        All modules are placed on the same device.
+        """
+        sharders, plan = self._plan_and_sharders(model, pg, planner)
+
+        return DistributedModelParallel(
+            module=copy.deepcopy(model) if self.deepcopy_model else model,
+            env=ShardingEnv.from_process_group(pg),
+            init_data_parallel=self.init_data_parallel,
+            device=device,
+            sharders=sharders,
+            plan=plan,
+        ).to(device)
+
+    def generate_hybrid_dmp_model(
+        self,
+        model: nn.Module,
+        pg: dist.ProcessGroup,
+        device: torch.device,
+        planner: Optional[
+            Union[
+                EmbeddingShardingPlanner,
+                HeteroEmbeddingShardingPlanner,
+            ]
+        ] = None,
+    ) -> HybridEvalDMP:
+        """
+        Generate a HybridEvalDMP model for split-device placement.
+
+        Embeddings are placed on ``embedding_device`` (e.g. CPU),
+        while dense modules are moved to ``device`` (e.g. CUDA).
+        CPU embedding storage is shared across ranks via /dev/shm.
+        """
+        assert (
+            self.embedding_device is not None
+        ), "embedding_device must be set for generate_hybrid_dmp_model"
+        sharders, plan = self._plan_and_sharders(model, pg, planner)
+
+        model = HybridEvalDMP(
+            module=copy.deepcopy(model) if self.deepcopy_model else model,
+            env=ShardingEnv.from_process_group(pg),
+            device=torch.device(self.embedding_device),
+            sharders=sharders,
+            plan=plan,
+        ).to(device)
+        model.share_embedding_memory(pg)
+        return model
+
+    def generate_dense_optimizer(
+        self,
+        sharded_model: nn.Module,
+    ) -> Optimizer:
+        """
+        Generate an optimizer for dense (non-sparse) parameters.
+
+        If skip_dense_optimizer is True, returns a dummy optimizer.
+        """
+        if self.skip_dense_optimizer:
+            return torch.optim.SGD([torch.zeros(1)], lr=0.0)
+
+        dense_params = [
+            param
+            for name, param in sharded_model.named_parameters()
+            if "sparse" not in name
+        ]
+
+        optimizer_kwargs: Dict[str, Any] = {"lr": self.dense_lr}
+        if self.dense_momentum is not None:
+            optimizer_kwargs["momentum"] = self.dense_momentum
+        if self.dense_weight_decay is not None:
+            optimizer_kwargs["weight_decay"] = self.dense_weight_decay
+
+        if self.dense_optimizer.lower() == "shampoo":
+            from torchrec.distributed.test_utils.test_modules import DistributedShampoo
+
+            optimizer_class = DistributedShampoo
+            if "precondition_frequency" not in self.dense_optimizer_kwargs:
+                optimizer_kwargs["precondition_frequency"] = 100
+        else:
+            optimizer_class = getattr(optim, self.dense_optimizer)
+
+        optimizer_kwargs.update(self.dense_optimizer_kwargs)
+        return optimizer_class(dense_params, **optimizer_kwargs)
+
     def generate_sharded_model_and_optimizer(
         self,
         model: nn.Module,
@@ -309,64 +452,13 @@ class ShardingConfig:
         """
         Generate a sharded model and optimizer for distributed training.
 
-        Args:
-            model: The model to be sharded
-            pg: Process group for distributed training
-            device: Device to place the model on
-            planner: Optional planner for sharding strategy
-
-        Returns:
-            Tuple of sharded model and optimizer
+        Dispatches to generate_dmp_model or generate_hybrid_dmp_model based
+        on whether embedding_device is set, then creates the dense optimizer.
         """
-        # Convert fused_params and create sharders
-        converted_fused_params = self._convert_fused_params()
-        sharders = _get_sharders_with_fused_params(converted_fused_params)
-
-        # Use planner if provided
-        plan = None
-        if planner is not None:
-            if pg is not None:
-                plan = planner.collective_plan(model, sharders, pg)
-            else:
-                # pyrefly: ignore[bad-argument-type, missing-argument]
-                plan = planner.plan(model, sharders)
-
-        sharded_model = DistributedModelParallel(
-            module=copy.deepcopy(model),
-            env=ShardingEnv.from_process_group(pg),
-            init_data_parallel=True,
-            device=device,
-            sharders=sharders,
-            plan=plan,
-        ).to(device)
-
-        # Get dense parameters
-        dense_params = [
-            param
-            for name, param in sharded_model.named_parameters()
-            if "sparse" not in name
-        ]
-
-        # Build common optimizer kwargs
-        optimizer_kwargs: Dict[str, Any] = {"lr": self.dense_lr}
-        if self.dense_momentum is not None:
-            optimizer_kwargs["momentum"] = self.dense_momentum
-        if self.dense_weight_decay is not None:
-            optimizer_kwargs["weight_decay"] = self.dense_weight_decay
-
-        # Get the appropriate optimizer class
-        if self.dense_optimizer.lower() == "shampoo":
-            from torchrec.distributed.test_utils.test_modules import DistributedShampoo
-
-            optimizer_class = DistributedShampoo
-            # Default precondition_frequency to 100 to amortize the expensive
-            # preconditioner computation (O(d^3)) across steps.
-            if "precondition_frequency" not in self.dense_optimizer_kwargs:
-                optimizer_kwargs["precondition_frequency"] = 100
+        if self.embedding_device:
+            sharded_model = self.generate_hybrid_dmp_model(model, pg, device, planner)
         else:
-            optimizer_class = getattr(optim, self.dense_optimizer)
+            sharded_model = self.generate_dmp_model(model, pg, device, planner)
 
-        optimizer_kwargs.update(self.dense_optimizer_kwargs)
-        optimizer = optimizer_class(dense_params, **optimizer_kwargs)
-
+        optimizer = self.generate_dense_optimizer(sharded_model)
         return sharded_model, optimizer

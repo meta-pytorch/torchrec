@@ -1,0 +1,44 @@
+# CPU eval benchmark with DATA_PARALLEL sharding
+#   All embedding tables are replicated on each rank (DATA_PARALLEL),
+#   eliminating cross-rank communication for input/output distribution.
+#   Embeddings run on CPU; dense model runs on GPU.
+RunOptions:
+  world_size: 2
+  num_batches: 10
+  num_benchmarks: 5
+  num_profiles: 1
+  sharding_type: data_parallel
+  profile_dir: "."
+  name: "eval_dp_cpu"
+  memory_snapshot: True
+  all_rank_traces: True
+PipelineConfig:
+  pipeline: "eval-cpu-sparse"
+ModelInputConfig:
+  num_float_features: 1000
+  feature_pooling_avg: 30
+  use_variable_batch: False
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 1000
+    submodule_kwargs:
+      dense_arch_out_size: 1024
+      over_arch_out_size: 4096
+      skip_regroup: True
+EmbeddingTablesConfig:
+  num_unweighted_features: 10
+  num_weighted_features: 10
+  embedding_feature_dim: 256
+PlannerConfig:
+  pooling_factors: [30.0]
+  sharding_type: data_parallel
+  device_group: "cpu"
+  compute_kernel: dense
+  hardware:
+    hbm_cap: 85899345920  # 80GB
+ShardingConfig:
+  init_data_parallel: false
+  embedding_device: "cpu"
+  skip_dense_optimizer: true
+  deepcopy_model: false

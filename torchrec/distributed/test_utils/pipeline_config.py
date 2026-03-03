@@ -18,6 +18,7 @@ from torchrec.distributed.train_pipeline import (
     TrainPipelineSparseDist,
 )
 from torchrec.distributed.train_pipeline.experimental_pipelines import (
+    EvalPipelineCPUSparse,
     TrainEvalHybridPipelineBase,
     TrainPipelineSparseDistBwdOpt,
     TrainPipelineSparseDistEmbStash,
@@ -124,6 +125,7 @@ class PipelineConfig:
             "sparse-bwd-opt": TrainPipelineSparseDistBwdOpt,
             "sparse-opt-stash": TrainPipelineSparseDistOptStash,
             "sparse-emb-stash": TrainPipelineSparseDistEmbStash,
+            "eval-cpu-sparse": EvalPipelineCPUSparse,
         }
 
         match self.pipeline:
