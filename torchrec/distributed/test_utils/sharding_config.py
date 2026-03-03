@@ -7,6 +7,7 @@
 
 # pyre-strict
 import copy
+import logging
 from dataclasses import dataclass, field
 from typing import Any, cast, Dict, List, Optional, Tuple, Union
 
@@ -39,6 +40,22 @@ from torchrec.distributed.types import (
 )
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _detect_hbm_cap(compute_device: str) -> Optional[int]:
+    """Auto-detect HBM capacity from the current CUDA device.
+
+    Returns the total GPU memory in bytes, or None if detection is not
+    possible (e.g., no CUDA device available or compute_device is not cuda).
+    """
+    if compute_device != "cuda" or not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.get_device_properties(torch.device("cuda")).total_memory
+    except Exception:
+        return None
+
 
 @dataclass
 class PlannerConfig:
@@ -56,6 +73,49 @@ class PlannerConfig:
     storage_reservation_percentage: float = 0.15
     # Hardware configuration for topology (dict with keys: hbm_cap, ddr_cap, etc.)
     hardware: Optional[Dict[str, Any]] = None
+
+    def _apply_hardware_config(
+        self,
+        topology_kwargs: Dict[str, Any],
+        device_type: str,
+    ) -> None:
+        """Apply hardware config to topology kwargs, with hbm_cap fact-checking."""
+        if self.hardware is None:
+            return
+
+        # Passthrough keys from hardware config to topology kwargs
+        _HARDWARE_KEYS = [
+            "hbm_cap",
+            "ddr_cap",
+            "hbm_mem_bw",
+            "ddr_mem_bw",
+            "hbm_to_ddr_mem_bw",
+            "intra_host_bw",
+            "inter_host_bw",
+            "pod_size",
+            "local_world_size",
+        ]
+        for key in _HARDWARE_KEYS:
+            if key in self.hardware:
+                topology_kwargs[key] = self.hardware[key]
+
+        # Fact-check user-provided hbm_cap against detected value
+        if "hbm_cap" in self.hardware:
+            detected_hbm = _detect_hbm_cap(device_type)
+            if detected_hbm is not None:
+                user_hbm = self.hardware["hbm_cap"]
+                ratio = user_hbm / detected_hbm if detected_hbm else 0.0
+                if ratio < 0.5 or ratio > 2.0:
+                    logger.warning(
+                        "Hardware config hbm_cap=%d (%.1f GB) differs significantly "
+                        "from detected GPU memory %d (%.1f GB), ratio=%.2fx. "
+                        "Using configured value.",
+                        user_hbm,
+                        user_hbm / (1024**3),
+                        detected_hbm,
+                        detected_hbm / (1024**3),
+                        ratio,
+                    )
 
     def generate_topology(self, device_type: str) -> Topology:
         """
@@ -81,34 +141,18 @@ class PlannerConfig:
             "compute_device": device_type,
         }
 
-        if self.hardware is not None:
-            if "hbm_cap" in self.hardware:
-                topology_kwargs["hbm_cap"] = self.hardware["hbm_cap"]
-            if "ddr_cap" in self.hardware:
-                topology_kwargs["ddr_cap"] = self.hardware["ddr_cap"]
-            if "hbm_mem_bw" in self.hardware:
-                topology_kwargs["hbm_mem_bw"] = self.hardware["hbm_mem_bw"]
-            if "ddr_mem_bw" in self.hardware:
-                topology_kwargs["ddr_mem_bw"] = self.hardware["ddr_mem_bw"]
-            if "hbm_to_ddr_mem_bw" in self.hardware:
-                topology_kwargs["hbm_to_ddr_mem_bw"] = self.hardware[
-                    "hbm_to_ddr_mem_bw"
-                ]
-            if "intra_host_bw" in self.hardware:
-                topology_kwargs["intra_host_bw"] = self.hardware["intra_host_bw"]
-            if "inter_host_bw" in self.hardware:
-                topology_kwargs["inter_host_bw"] = self.hardware["inter_host_bw"]
+        self._apply_hardware_config(topology_kwargs, device_type)
 
-            # GB200 NVLink domain topology support
-            # pod_size represents topology_domain_multiple (hosts per NVLink domain)
-            # This enables proper intra_group_size calculation for multi-host NVLink domains
-            if "pod_size" in self.hardware:
-                topology_kwargs["pod_size"] = self.hardware["pod_size"]
-
-            # Override local_world_size if explicitly specified in hardware config
-            # Useful for GB200 (2 GPUs/host) vs A100 (8 GPUs/host)
-            if "local_world_size" in self.hardware:
-                topology_kwargs["local_world_size"] = self.hardware["local_world_size"]
+        # Auto-detect hbm_cap when not provided in hardware config
+        if "hbm_cap" not in topology_kwargs:
+            detected_hbm = _detect_hbm_cap(device_type)
+            if detected_hbm is not None:
+                topology_kwargs["hbm_cap"] = detected_hbm
+                logger.info(
+                    "Auto-detected hbm_cap=%d (%.1f GB) from GPU.",
+                    detected_hbm,
+                    detected_hbm / (1024**3),
+                )
 
         return Topology(**topology_kwargs)
 
