@@ -14,19 +14,30 @@ from typing import Any, Callable, cast, Deque, Iterator, Optional, Tuple, Type, 
 import torch
 from torch.autograd.profiler import record_function
 from torchrec.distributed.memory_stashing import MemoryStashingManager
+from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.backward_injection import (
     InjectionSite,
     OutputDistSite,
 )
 from torchrec.distributed.train_pipeline.pipeline_context import (
+    CPUEmbeddingTrainPipelineContext,
+    EmbeddingTrainPipelineContext,
     In,
     Out,
     TrainPipelineContext,
 )
-from torchrec.distributed.train_pipeline.runtime_forwards import PipelinedForward
+from torchrec.distributed.train_pipeline.runtime_forwards import (
+    CPUEmbeddingPipelinedForward,
+    PipelinedForward,
+)
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
 from torchrec.distributed.train_pipeline.types import PipelineState
-from torchrec.distributed.train_pipeline.utils import _to_device, FutureDeque
+from torchrec.distributed.train_pipeline.utils import (
+    _start_data_dist,
+    _to_device,
+    FutureDeque,
+    use_context_for_postprocs,
+)
 from torchrec.distributed.types import ShardingType
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -193,6 +204,160 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
 
         # Remove processed batch from the pipeline
         self.dequeue_batch()
+        return output
+
+
+class EvalPipelineCPUSparseDist(TrainPipelineSparseDist[In, Out]):
+    """
+    Note: this is work in progress
+    This pipeline runs input_dist, forward and output_dist on CPU.
+    This pipeline will process sparse tensors on CPU and other tensors on GPU
+
+    Args:
+        See @TrainPipelineSparseDist args
+        is_sparse_embedding (bool): if True, run input_dist on CPU, else run on GPU
+    """
+
+    # pyrefly: ignore [bad-override]
+    _pipelined_forward_type = CPUEmbeddingPipelinedForward
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        gpu_device: torch.device,
+        apply_jit: bool = False,
+    ) -> None:
+        super().__init__(
+            model,
+            optimizer,
+            gpu_device,
+            apply_jit,
+            context_type=CPUEmbeddingTrainPipelineContext,
+        )
+
+    def get_next_batch(self, dataloader_iter: Iterator[In]) -> None:
+        """
+        load a data batch from dataloader, sparse features remain on CPU, all other features
+        will be copied to GPU
+        """
+        if self._dataloader_iter is not dataloader_iter:
+            self._dataloader_iter = dataloader_iter
+        context = self._create_context()
+        assert isinstance(context, CPUEmbeddingTrainPipelineContext)
+        context.dense_gpu_device = self._device.type
+        with record_function(
+            f"## enqueue_batch_sparse_cpu_other_gpu {context.index} ##"
+        ):
+            batch = self._next_batch(dataloader_iter)
+            if batch is None:
+                return
+
+            batch = batch.to(
+                self._device,
+                non_blocking=True,
+                # pyrefly: ignore[unexpected-keyword]
+                data_copy_stream=self._memcpy_stream,
+                # pyrefly: ignore[unexpected-keyword]
+                dense_only=True,
+            )
+        self.batches.append(cast(In, batch))
+
+        self.contexts.append(context)
+
+    def wait_sparse_data_dist(self, context: TrainPipelineContext) -> None:
+        """
+        Waits on the input dist splits requests to get the input dist tensors requests,
+        and populates the context with them.
+        """
+        with record_function(f"## wait_sparse_data_dist {context.index} on CPU ##"):
+            for names, awaitable in context.fused_splits_awaitables:
+                for name, request in zip(names, awaitable.wait()):
+                    context.input_dist_tensors_requests[name] = request
+        context.input_dist_splits_requests.clear()
+        context.fused_splits_awaitables.clear()
+
+    def start_sparse_data_dist(
+        self, batch: Optional[In], context: TrainPipelineContext
+    ) -> None:
+        """
+        Input distribution
+        """
+        if batch is None:
+            return
+        with record_function(f"## start_sparse_data_dist {context.index} on CPU ##"):
+            # Temporarily set context for next iter to populate cache
+            with use_context_for_postprocs(self._pipelined_postprocs, context):
+                _start_data_dist(self._pipelined_modules, batch, context)
+
+        self.wait_sparse_data_dist(self.contexts[0])
+
+    def _start_embedding_lookup(
+        self, module: ShardedModule, context: EmbeddingTrainPipelineContext
+    ) -> None:
+        """
+        Embedding lookup
+        """
+        # pyrefly: ignore[missing-attribute]
+        module_context = context.module_contexts[module.forward.name]
+        # pyrefly: ignore[missing-attribute]
+        kjt = context.input_dist_tensors_requests[module.forward.name].wait()
+
+        output_dist_out = module.compute_and_output_dist(module_context, kjt)
+        # pyrefly: ignore[missing-attribute]
+        context.embedding_a2a_requests[module.forward.name] = output_dist_out
+
+    def start_embedding_lookup(
+        self,
+        batch: Optional[In],
+        context: CPUEmbeddingTrainPipelineContext,
+    ) -> None:
+        """
+        Do embedding lookup on CPU and then copy the result to GPU
+        """
+        if batch is None:
+            return
+
+        with record_function(f"## start_embedding_lookup {context.index} in CPU ##"):
+            for module in self._pipelined_modules:
+                self._start_embedding_lookup(
+                    module,
+                    context,
+                )
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        """
+        For EvalPipelineCPUSparseDist, it will only deal with one batch at a time
+         * batches[0]: i+0 batch, fwd (expecting output_dist)
+        """
+
+        self.get_next_batch(dataloader_iter)
+
+        if len(self.batches) == 0 or self.batches[0] is None:
+            raise StopIteration
+
+        self._init_pipelined_modules(
+            self.batches[0],
+            self.contexts[0],
+            # pyrefly: ignore [bad-argument-type]
+            self._pipelined_forward_type,
+        )
+
+        self.start_embedding_lookup(
+            self.batches[0], cast(CPUEmbeddingTrainPipelineContext, self.contexts[0])
+        )
+
+        # make sure dense copy is done
+        if self._memcpy_stream:
+            self._memcpy_stream.synchronize()
+        # forward
+        with record_function(f"## forward {self.contexts[0].index} ##"):
+            self._state = PipelineState.CALL_FWD
+            with torch.no_grad():
+                _, output = self._model_fwd(self.batches[0])
+
+        self.dequeue_batch()
+
         return output
 
 

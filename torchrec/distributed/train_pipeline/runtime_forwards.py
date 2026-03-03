@@ -17,6 +17,7 @@ from torch.profiler import record_function
 from torchrec.distributed.embedding_sharding import KJTSplitsAllToAllMeta
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
+    CPUEmbeddingTrainPipelineContext,
     EmbeddingTrainPipelineContext,
     PrefetchTrainPipelineContext,
     TrainPipelineContext,
@@ -206,6 +207,44 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
             """
             self._context.embedding_features.append([list(embeddings.keys())])
             self._context.detached_embedding_tensors.append(detached_tensors)
+
+
+class CPUEmbeddingPipelinedForward(EmbeddingPipelinedForward):
+    """
+    Pipeline used in CPU eval
+    """
+
+    # pyre-ignore [2, 24]
+    def __call__(self, *input, **kwargs) -> Union[
+        Awaitable[EmbeddingModuleRetType],
+        Tuple[
+            Awaitable[EmbeddingModuleRetType], Awaitable[Optional[KeyedJaggedTensor]]
+        ],
+    ]:
+        ctx = self._context
+        assert isinstance(ctx, CPUEmbeddingTrainPipelineContext)
+        assert (
+            self._name in ctx.embedding_a2a_requests
+        ), f"Invalid PipelinedForward usage, input_dist of {self._name} is not available, probably consumed by others"
+        # we made a basic assumption that an embedding module (EBC, EC, etc.) should only be evoked only
+        # once in the model's forward pass. For more details: https://github.com/meta-pytorch/torchrec/pull/32944
+
+        awaitable = self._context.embedding_a2a_requests.pop(self._name)
+
+        assert isinstance(awaitable, Awaitable)
+        embeddings = awaitable.wait()  # trigger awaitable manually for type checking
+        if isinstance(embeddings, KeyedTensor):
+            embeddings = embeddings.to(
+                device=torch.device(ctx.dense_gpu_device), non_blocking=False
+            )
+        else:
+            assert isinstance(embeddings, dict)
+            for key, jt in embeddings.items():
+                embeddings[key] = jt.to(
+                    device=torch.device(ctx.dense_gpu_device), non_blocking=False
+                )
+
+        return LazyNoWait(embeddings)
 
 
 class InSyncEmbeddingPipelinedForward(EmbeddingPipelinedForward):
