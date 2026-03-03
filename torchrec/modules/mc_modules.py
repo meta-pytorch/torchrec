@@ -454,6 +454,41 @@ class ManagedCollisionCollection(nn.Module):
             open_slots[table] = managed_collision_module.open_slots()
         return open_slots
 
+    def lookup_runtime_meta(
+        self,
+        features: KeyedJaggedTensor,
+        remapped_ids: KeyedJaggedTensor,
+    ) -> KeyedJaggedTensor:
+        feature_splits: List[KeyedJaggedTensor] = features.split(
+            self._table_feature_splits
+        )
+        remapped_ids_splits: List[KeyedJaggedTensor] = remapped_ids.split(
+            self._table_feature_splits
+        )
+        runtime_meta_dict: Dict[str, torch.Tensor] = {}
+        for i, (table, mc_module) in enumerate(self._managed_collision_modules.items()):
+            kjt: KeyedJaggedTensor = feature_splits[i]
+            remapped_ids_kjt: KeyedJaggedTensor = remapped_ids_splits[i]
+            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            per_table_runtime_meta = mc_module.lookup_runtime_meta(
+                kjt.values(), remapped_ids_kjt.values()
+            )
+            runtime_meta_dict[table] = per_table_runtime_meta
+
+        values: torch.Tensor = torch.cat(
+            [t.reshape(-1) for t in runtime_meta_dict.values()], dim=0
+        )
+        return KeyedJaggedTensor(
+            keys=features.keys(),
+            values=values,
+            lengths=features.lengths(),
+            weights=features.weights_or_none(),
+            stride=features.stride(),
+            stride_per_key=features.stride_per_key(),
+            stride_per_key_per_rank=features._stride_per_key_per_rank,
+            inverse_indices=features.inverse_indices_or_none(),
+        )
+
 
 class MCHEvictionPolicyMetadataInfo(NamedTuple):
     metadata_name: str
