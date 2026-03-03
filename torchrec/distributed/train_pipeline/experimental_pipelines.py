@@ -8,20 +8,31 @@
 # pyre-strict
 
 import logging
+from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Callable, cast, Deque, Iterator, Optional, Tuple, Type, Union
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Deque,
+    Dict,
+    Iterator,
+    Optional,
+    Tuple,
+    Type,
+    Union,
+)
 
 import torch
 from torch.autograd.profiler import record_function
+from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.memory_stashing import MemoryStashingManager
-from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.backward_injection import (
     InjectionSite,
     OutputDistSite,
 )
 from torchrec.distributed.train_pipeline.pipeline_context import (
     CPUEmbeddingTrainPipelineContext,
-    EmbeddingTrainPipelineContext,
     In,
     Out,
     TrainPipelineContext,
@@ -33,12 +44,15 @@ from torchrec.distributed.train_pipeline.runtime_forwards import (
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
 from torchrec.distributed.train_pipeline.types import PipelineState
 from torchrec.distributed.train_pipeline.utils import (
+    _override_input_dist_forwards,
+    _rewrite_model,
     _start_data_dist,
     _to_device,
     FutureDeque,
     use_context_for_postprocs,
 )
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import LazyNoWait, ShardingType
+from torchrec.sparse.jagged_tensor import KeyedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -207,15 +221,36 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
         return output
 
 
-class EvalPipelineCPUSparseDist(TrainPipelineSparseDist[In, Out]):
+class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
     """
-    Note: this is work in progress
-    This pipeline runs input_dist, forward and output_dist on CPU.
-    This pipeline will process sparse tensors on CPU and other tensors on GPU
+    3-stage pipelined eval pipeline for CPU embeddings + GPU dense forward.
+
+    Designed for DATA_PARALLEL sharding where all embedding tables are on CPU
+    and dense model runs on GPU. The 3 stages overlap CPU and GPU work:
+
+    - **Stage 1** (CPU): ``_sparse_forward`` — merged input_dist + compute +
+      output_dist. For DP sharding there are no cross-rank comms, so this runs
+      entirely on CPU.
+    - **Stage 2** (memcpy stream): ``copy_data_to_gpu`` — async DMA of pinned
+      embedding outputs + dense features to GPU.
+    - **Stage 3** (GPU default stream): ``_dense_forward`` — model forward
+      where ``CPUEmbeddingPipelinedForward`` returns pre-copied GPU embeddings.
+
+    Pipeline overlap (steady state)::
+
+        progress() returning output for batch N:
+          Stage 3: dense_forward(batch N)       ← GPU (async kernel launch)
+          Stage 1: sparse_forward(batch N+1)    ← CPU (overlaps with GPU above)
+          Stage 2: copy_to_gpu(batch N+1)       ← memcpy stream (async DMA)
+
+    Pre-allocated pinned memory buffers are used for embedding outputs to enable
+    truly async CPU→GPU DMA transfers via ``non_blocking=True``.
 
     Args:
-        See @TrainPipelineSparseDist args
-        is_sparse_embedding (bool): if True, run input_dist on CPU, else run on GPU
+        model: The model to pipeline.
+        optimizer: The optimizer (unused for eval, but required by base class).
+        device: The GPU device for dense forward.
+        apply_jit: Whether to apply ``torch.jit.script`` to non-pipelined modules.
     """
 
     # pyrefly: ignore [bad-override]
@@ -225,34 +260,175 @@ class EvalPipelineCPUSparseDist(TrainPipelineSparseDist[In, Out]):
         self,
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
-        gpu_device: torch.device,
+        device: torch.device,
+        execute_all_batches: bool = True,
         apply_jit: bool = False,
+        pipeline_postproc: bool = False,
+        enable_inplace_copy_batch: bool = False,
+        multi_thread: bool = False,
+        pipeline_depth: int = 2,
     ) -> None:
         super().__init__(
             model,
             optimizer,
-            gpu_device,
+            device,
+            execute_all_batches,
             apply_jit,
             context_type=CPUEmbeddingTrainPipelineContext,
+            pipeline_postproc=pipeline_postproc,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
+        )
+        assert pipeline_depth in (1, 2), "pipeline_depth must be 1 or 2"
+        self._pipeline_depth = pipeline_depth
+        # Pre-allocated pinned memory buffers keyed by module FQN
+        self._pinned_buffers: Dict[str, torch.Tensor] = {}
+
+        # Override parent types: batches are never None in this pipeline
+        # pyrefly: ignore [bad-override]
+        self.batches: Deque[In] = deque()
+        # pyrefly: ignore [bad-override]
+        self.contexts: Deque[CPUEmbeddingTrainPipelineContext] = deque()
+
+        # Optional thread pool for running Stage 1 (sparse forward) in background
+        self._multi_thread = multi_thread
+        self._sparse_executor: Optional[ThreadPoolExecutor] = (
+            ThreadPoolExecutor(max_workers=1) if multi_thread else None
+        )
+        self._sparse_future: Optional[Future[In]] = None
+
+    # pyre-ignore[14]
+    def _pipeline_model(
+        self,
+        batch: In,
+        context: TrainPipelineContext,
+        pipelined_forward: Type[
+            CPUEmbeddingPipelinedForward
+        ] = CPUEmbeddingPipelinedForward,
+    ) -> None:
+        """
+        Model surgery + bootstrap input_dist.
+
+        Overrides the base ``_pipeline_model`` to avoid calling
+        ``self.start_sparse_data_dist`` (which depends on ``self.contexts[0]``
+        existing). Instead, runs input_dist inline and waits for splits.
+        """
+        (
+            self._pipelined_modules,
+            self._model,
+            self._original_forwards,
+            self._pipelined_postprocs,
+            _,
+        ) = _rewrite_model(
+            model=self._model,
+            context=context,
+            dist_stream=None,  # No cross-rank comms for DP CPU eval
+            default_stream=None,
+            batch=batch,
+            apply_jit=self._apply_jit,
+            # pyrefly: ignore[bad-argument-type]
+            pipelined_forward=pipelined_forward,
+            pipeline_postproc=self._pipeline_postproc,
+        )
+        # Bootstrap: run input_dist once to initialize KJT dist state
+        _start_data_dist(self._pipelined_modules, batch, context)
+        # Wait for splits → tensor awaitables
+        for names, awaitable in context.fused_splits_awaitables:
+            for name, request in zip(names, awaitable.wait()):
+                context.input_dist_tensors_requests[name] = request
+        context.fused_splits_awaitables.clear()
+        # Override KJT dist forwards with fused versions (requires initialized dists)
+        self._original_kjt_dist_forwards = _override_input_dist_forwards(
+            self._pipelined_modules
         )
 
-    def get_next_batch(self, dataloader_iter: Iterator[In]) -> None:
-        """
-        load a data batch from dataloader, sparse features remain on CPU, all other features
-        will be copied to GPU
-        """
-        if self._dataloader_iter is not dataloader_iter:
-            self._dataloader_iter = dataloader_iter
-        context = self._create_context()
-        assert isinstance(context, CPUEmbeddingTrainPipelineContext)
-        context.dense_gpu_device = self._device.type
-        with record_function(
-            f"## enqueue_batch_sparse_cpu_other_gpu {context.index} ##"
-        ):
-            batch = self._next_batch(dataloader_iter)
-            if batch is None:
-                return
+    def _get_or_alloc_pinned(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
+        """Get or allocate a pre-allocated pinned memory buffer matching tensor."""
+        buf = self._pinned_buffers.get(name)
+        if buf is None or buf.shape != tensor.shape or buf.dtype != tensor.dtype:
+            self._pinned_buffers[name] = torch.empty_like(tensor, pin_memory=True)
+        return self._pinned_buffers[name]
 
+    def _embedding_lookup_and_pin(
+        self, context: CPUEmbeddingTrainPipelineContext
+    ) -> None:
+        """
+        Run ``compute_and_output_dist`` for each pipelined module on CPU,
+        then copy embedding values into pre-allocated pinned memory buffers.
+
+        After this, ``context.embedding_a2a_requests`` holds ``LazyNoWait``
+        wrappers around pinned-memory ``KeyedTensor`` / ``Dict[str, JaggedTensor]``.
+        """
+        with record_function(f"## embedding_lookup_and_pin {context.index} on CPU ##"):
+            for module in self._pipelined_modules:
+                # pyrefly: ignore[missing-attribute]
+                name = module.forward.name
+                module_ctx = context.module_contexts[name]
+                kjt = context.input_dist_tensors_requests.pop(name).wait()
+                output = module.compute_and_output_dist(module_ctx, kjt)
+                embeddings = output.wait()  # CPU result
+
+                # Copy values into pre-allocated pinned buffer for async DMA
+                if isinstance(embeddings, KeyedTensor):
+                    values = embeddings.values()
+                    pinned = self._get_or_alloc_pinned(name, values)
+                    pinned.copy_(values)
+                    embeddings._values = pinned
+
+                context.embedding_a2a_requests[name] = LazyNoWait(embeddings)
+
+    def _sparse_forward(
+        self, batch: In, context: CPUEmbeddingTrainPipelineContext
+    ) -> In:
+        """
+        Stage 1: merged input_dist + compute + output_dist on CPU.
+
+        For DP sharding there are no cross-rank comms — splits awaitables
+        resolve immediately. Results are stored in pinned memory for Stage 2.
+        """
+        with record_function(f"## sparse_forward {context.index} on CPU ##"):
+            # input_dist
+            with use_context_for_postprocs(self._pipelined_postprocs, context):
+                _start_data_dist(self._pipelined_modules, batch, context)
+            # wait splits → tensor awaitables
+            for names, awaitable in context.fused_splits_awaitables:
+                for name, request in zip(names, awaitable.wait()):
+                    context.input_dist_tensors_requests[name] = request
+            context.fused_splits_awaitables.clear()
+            # compute + output_dist + pin
+            self._embedding_lookup_and_pin(context)
+
+            if self._pipeline_depth == 1:
+                return self.copy_data_to_gpu(batch, context)
+            else:
+                return batch
+
+    def _inplace_copy_to_gpu(
+        self, batch: In, context: CPUEmbeddingTrainPipelineContext
+    ) -> In:
+        """
+        Async inplace copy of pinned embeddings + dense features to GPU.
+
+        GPU buffers are pre-allocated on the default stream, then filled via
+        ``non_blocking`` inplace copies on the memcpy stream. This avoids
+        allocating GPU memory on the memcpy stream and enables truly async DMA.
+        """
+        with record_function(f"## inplace_copy_to_gpu {context.index} ##"):
+            # Pre-allocate GPU embedding buffers on the default stream
+            gpu_embedding_buffers: Dict[str, Tuple[Any, Optional[torch.Tensor]]] = {}
+            for name in context.embedding_a2a_requests:
+                awaitable = context.embedding_a2a_requests[name]
+                assert isinstance(awaitable, LazyNoWait)
+                embeddings = awaitable._obj
+                if isinstance(embeddings, KeyedTensor):
+                    gpu_values = torch.empty_like(
+                        embeddings.values(), device=self._device
+                    )
+                    gpu_embedding_buffers[name] = (embeddings, gpu_values)
+                else:
+                    gpu_embedding_buffers[name] = (embeddings, None)
+
+            # Copy batch dense features to GPU (pre-alloc + inplace copy on memcpy stream)
+            # pyrefly: ignore[bad-assignment]
             batch = batch.to(
                 self._device,
                 non_blocking=True,
@@ -261,102 +437,196 @@ class EvalPipelineCPUSparseDist(TrainPipelineSparseDist[In, Out]):
                 # pyrefly: ignore[unexpected-keyword]
                 dense_only=True,
             )
-        self.batches.append(cast(In, batch))
 
-        self.contexts.append(context)
+            # Inplace copy pinned embeddings to pre-allocated GPU buffers on memcpy stream
+            # pyrefly: ignore[bad-argument-type]
+            with self._stream_context(self._memcpy_stream):
+                if self._memcpy_stream:
+                    self._memcpy_stream.wait_stream(
+                        torch.get_device_module(self._device).current_stream()
+                    )
+                for name, (embeddings, gpu_values) in gpu_embedding_buffers.items():
+                    if gpu_values is not None:
+                        gpu_values.copy_(embeddings.values(), non_blocking=True)
+                        context.gpu_embedding_outputs[name] = KeyedTensor(
+                            keys=embeddings.keys(),
+                            length_per_key=embeddings.length_per_key(),
+                            values=gpu_values,
+                        )
+                    else:
+                        context.gpu_embedding_outputs[name] = embeddings.to(
+                            device=self._device, non_blocking=True
+                        )
+        return batch
 
-    def wait_sparse_data_dist(self, context: TrainPipelineContext) -> None:
+    def _copy_to_gpu(self, batch: In, context: CPUEmbeddingTrainPipelineContext) -> In:
         """
-        Waits on the input dist splits requests to get the input dist tensors requests,
-        and populates the context with them.
-        """
-        with record_function(f"## wait_sparse_data_dist {context.index} on CPU ##"):
-            for names, awaitable in context.fused_splits_awaitables:
-                for name, request in zip(names, awaitable.wait()):
-                    context.input_dist_tensors_requests[name] = request
-        context.input_dist_splits_requests.clear()
-        context.fused_splits_awaitables.clear()
+        Stage 2: async copy pinned embeddings + dense features to GPU.
 
-    def start_sparse_data_dist(
-        self, batch: Optional[In], context: TrainPipelineContext
-    ) -> None:
+        Uses the memcpy stream with ``non_blocking=True`` for async DMA.
+        Dense features are copied via ``batch.to(..., dense_only=True)``.
+        Embedding outputs (pinned) are copied via ``KeyedTensor.to(device)``.
         """
-        Input distribution
-        """
-        if batch is None:
-            return
-        with record_function(f"## start_sparse_data_dist {context.index} on CPU ##"):
-            # Temporarily set context for next iter to populate cache
-            with use_context_for_postprocs(self._pipelined_postprocs, context):
-                _start_data_dist(self._pipelined_modules, batch, context)
-
-        self.wait_sparse_data_dist(self.contexts[0])
-
-    def _start_embedding_lookup(
-        self, module: ShardedModule, context: EmbeddingTrainPipelineContext
-    ) -> None:
-        """
-        Embedding lookup
-        """
-        # pyrefly: ignore[missing-attribute]
-        module_context = context.module_contexts[module.forward.name]
-        # pyrefly: ignore[missing-attribute]
-        kjt = context.input_dist_tensors_requests[module.forward.name].wait()
-
-        output_dist_out = module.compute_and_output_dist(module_context, kjt)
-        # pyrefly: ignore[missing-attribute]
-        context.embedding_a2a_requests[module.forward.name] = output_dist_out
-
-    def start_embedding_lookup(
-        self,
-        batch: Optional[In],
-        context: CPUEmbeddingTrainPipelineContext,
-    ) -> None:
-        """
-        Do embedding lookup on CPU and then copy the result to GPU
-        """
-        if batch is None:
-            return
-
-        with record_function(f"## start_embedding_lookup {context.index} in CPU ##"):
-            for module in self._pipelined_modules:
-                self._start_embedding_lookup(
-                    module,
-                    context,
+        with record_function(f"## copy_to_gpu {context.index} ##"):
+            # pyrefly: ignore[bad-argument-type]
+            with self._stream_context(self._memcpy_stream):
+                # Copy dense features to GPU (non_blocking)
+                # pyrefly: ignore[bad-assignment]
+                batch = batch.to(
+                    self._device,
+                    non_blocking=True,
+                    # pyrefly: ignore[unexpected-keyword]
+                    data_copy_stream=self._memcpy_stream,
+                    # pyrefly: ignore[unexpected-keyword]
+                    dense_only=True,
                 )
+                # Copy pinned embedding outputs to GPU (async DMA)
+                for name in list(context.embedding_a2a_requests.keys()):
+                    awaitable = context.embedding_a2a_requests[name]
+                    # pyrefly: ignore[missing-attribute]
+                    embeddings = awaitable.wait()
+                    gpu_embeddings = embeddings.to(
+                        device=self._device, non_blocking=True
+                    )
+                    context.gpu_embedding_outputs[name] = gpu_embeddings
+        return batch
+
+    def copy_data_to_gpu(
+        self, batch: In, context: CPUEmbeddingTrainPipelineContext
+    ) -> In:
+        """Stage 2: copy pinned embeddings + dense features to GPU."""
+        if self._enable_inplace_copy_batch:
+            return self._inplace_copy_to_gpu(batch, context)
+        else:
+            return self._copy_to_gpu(batch, context)
+
+    # pyre-ignore[14]
+    def enqueue_batch(self, dataloader_iter: Iterator[In]) -> bool:
+        """
+        Load a batch from the dataloader, create context, and append to
+        pipeline deques. The batch stays on CPU at this point.
+        """
+        batch = self._next_batch(dataloader_iter)
+        if batch is None:
+            return False
+        context = self._create_context()
+        assert isinstance(context, CPUEmbeddingTrainPipelineContext)
+        context.dense_gpu_device = self._device.type
+
+        self.batches.append(batch)
+        self.contexts.append(context)
+        self._batch_count += 1
+        return True
+
+    def _dense_forward(
+        self, batch: In, context: CPUEmbeddingTrainPipelineContext
+    ) -> Out:
+        """
+        Stage 3: GPU dense forward.
+
+        Waits for the memcpy stream (Stage 2) to complete, then runs model
+        forward. ``CPUEmbeddingPipelinedForward`` intercepts embedding module
+        calls and returns the pre-copied GPU embeddings from ``context``.
+        """
+        with record_function(f"## dense_forward {context.index} ##"):
+            if self._memcpy_stream:
+                torch.get_device_module(self._device).current_stream().wait_stream(
+                    self._memcpy_stream
+                )
+            self._set_module_context(context)
+            with torch.no_grad():
+                _, output = self._model_fwd(batch)
+        return output
+
+    def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
+        """
+        Cold start: load first batch, run model surgery, then Stage 1 + Stage 2.
+
+        After this, ``batches[0]`` is ready for Stage 3 (dense forward).
+        """
+        # pipeline is already filled with max capacity (2)
+        if len(self.batches) >= 2:
+            return
+
+        # executes last batch in pipeline, when there is only one batch in the pipeline
+        # TODO: this _execute_all_batches doesn't really work here D43546239. it will
+        # just throw an exception at copy_to_gpu when the dataloader is exhausted
+        if self.batches and self._execute_all_batches:
+            return
+
+        # batch i, data (batch) and context
+        if not self.enqueue_batch(dataloader_iter):
+            logger.info("fill_pipeline: failed to load batch i")
+            return
+
+        batch = self.batches[0]
+        context = self.contexts[0]
+
+        # First-time model surgery + bootstrap input_dist
+        self._pipeline_model(batch, context, self._pipelined_forward_type)
+        # context now has input_dist_tensors_requests populated
+
+        # Stage 1 (remaining): compute + output_dist + pin
+        self._embedding_lookup_and_pin(context)
+        self.batches[0] = self.copy_data_to_gpu(batch, context)
+
+        if self._pipeline_depth == 2:
+            # batch i+1
+            if not self.enqueue_batch(dataloader_iter):
+                logger.info("fill_pipeline: failed to load batch i+1")
+                return
+
+            self.batches[1] = self._sparse_forward(self.batches[1], self.contexts[1])
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
-        For EvalPipelineCPUSparseDist, it will only deal with one batch at a time
-         * batches[0]: i+0 batch, fwd (expecting output_dist)
+        3-stage pipelined progress with CPU/GPU overlap.
+
+        Each call processes one batch through Stage 3 (GPU dense forward)
+        while preparing the next batch through Stages 1+2 (CPU sparse forward
+        + async copy). This overlaps CPU sparse work with GPU dense compute.
         """
-
-        self.get_next_batch(dataloader_iter)
-
-        if len(self.batches) == 0 or self.batches[0] is None:
+        self.fill_pipeline(dataloader_iter)
+        if not self.batches:
+            one_time_rank0_logger.info(
+                f"training stopped at {self._batch_count} batches"
+            )
             raise StopIteration
 
-        self._init_pipelined_modules(
+        # Wait for any pending sparse forward from previous iteration
+        if self._sparse_future is not None:
+            self.batches[-1] = self._sparse_future.result()
+            self._sparse_future = None
+
+        # Stage 3: dense forward for current batch (GPU, async kernel launch)
+        output = self._dense_forward(
             self.batches[0],
             self.contexts[0],
-            # pyrefly: ignore [bad-argument-type]
-            self._pipelined_forward_type,
         )
 
-        self.start_embedding_lookup(
-            self.batches[0], cast(CPUEmbeddingTrainPipelineContext, self.contexts[0])
-        )
+        # Stage 2: copy to GPU (must be on main thread for stream ops)
+        if len(self.batches) > 1 and self._pipeline_depth == 2:
+            if self._memcpy_stream:
+                self._memcpy_stream.wait_stream(
+                    torch.get_device_module(self._device).current_stream()
+                )
+            self.batches[1] = self.copy_data_to_gpu(self.batches[1], self.contexts[1])
 
-        # make sure dense copy is done
-        if self._memcpy_stream:
-            self._memcpy_stream.synchronize()
-        # forward
-        with record_function(f"## forward {self.contexts[0].index} ##"):
-            self._state = PipelineState.CALL_FWD
-            with torch.no_grad():
-                _, output = self._model_fwd(self.batches[0])
-
+        # Dequeue current batch
         self.dequeue_batch()
+
+        # While GPU computes, load and prepare next batch:
+        if self.enqueue_batch(dataloader_iter):
+            batch = self.batches[-1]
+            context = self.contexts[-1]
+            if self._sparse_executor is not None:
+                # Stage 1: submit sparse forward to background thread
+                self._sparse_future = self._sparse_executor.submit(
+                    self._sparse_forward, batch, context
+                )
+            else:
+                # Stage 1: sparse forward on CPU (overlaps with GPU dense forward above)
+                self.batches[-1] = self._sparse_forward(batch, context)
 
         return output
 

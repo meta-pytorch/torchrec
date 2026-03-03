@@ -28,6 +28,7 @@ from torch.distributed.remote_device import _remote_device
 from torch.distributed.tensor import DeviceMesh
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.collective_utils import create_on_rank_and_share_result
 from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.model_tracker.model_delta_tracker import (
     ModelDeltaTracker,
@@ -870,6 +871,106 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         )
         self._plan.plan[sharded_module_fqn] = sharded_module.module_sharding_plan
         return data_volume
+
+
+class HybridEvalDMP(DistributedModelParallel):
+    """
+    DMP for eval-only workflows with split-device placement
+    (e.g., CPU embeddings + GPU dense).
+
+    - Defaults to ``init_data_parallel=False`` (no DDP gradient sync for eval)
+    - Calls ``self.eval()`` on construction
+    - Recursive ``.to()`` skips entire ``ShardedModule`` subtrees, preserving
+      the device placement of sharded embedding modules
+    - ``share_embedding_memory()`` deduplicates CPU embedding storage across
+      ranks on the same host via POSIX shared memory (``/dev/shm``)
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        *,
+        init_data_parallel: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(module, init_data_parallel=init_data_parallel, **kwargs)
+
+    # pyre-ignore[14]: inconsistent override
+    def to(self, *args: Any, **kwargs: Any) -> "HybridEvalDMP":
+        def _selective_to(mod: nn.Module) -> None:
+            for key, param in mod._parameters.items():
+                if param is not None:
+                    mod._parameters[key] = nn.Parameter(
+                        param.data.to(*args, **kwargs),
+                        requires_grad=param.requires_grad,
+                    )
+            for key, buf in mod._buffers.items():
+                if buf is not None:
+                    mod._buffers[key] = buf.to(*args, **kwargs)
+            for child in mod.children():
+                if not isinstance(child, ShardedModule):
+                    _selective_to(child)
+
+        _selective_to(self.module)
+        return self
+
+    def share_embedding_memory(self, pg: dist.ProcessGroup) -> None:
+        """
+        Share CPU embedding parameters across ranks via POSIX shared memory.
+
+        Walks all ``ShardedModule`` children, finds CPU parameters, deduplicates
+        by underlying storage, and uses ``create_on_rank_and_share_result`` to
+        place the storage in ``/dev/shm``. Rank 0 is the creator; other ranks
+        map the same physical memory — no data is copied.
+
+        Args:
+            pg: Process group whose members share memory. Should be an
+                intra-node (host-local) group for multi-host jobs.
+        """
+        # Step 1: Collect CPU params from ShardedModules, dedup by storage ptr
+        seen_ptrs: Dict[int, torch.Tensor] = {}
+        param_info: List[Tuple[nn.Parameter, int]] = []
+
+        for _fqn, module in self.module.named_modules():
+            if isinstance(module, ShardedModule):
+                for _pname, param in module.named_parameters():
+                    if param.device.type == "cpu":
+                        ptr = param.data.untyped_storage().data_ptr()
+                        if ptr not in seen_ptrs:
+                            seen_ptrs[ptr] = param.data
+                        param_info.append((param, ptr))
+
+        if not seen_ptrs:
+            return
+
+        unique_ptrs = list(seen_ptrs.keys())
+        unique_tensors = [seen_ptrs[ptr] for ptr in unique_ptrs]
+
+        # Step 2: Share unique storages via create_on_rank_and_share_result.
+        # On rank 0, _share_filename_cpu_() moves storages to shm in-place;
+        # all existing views (params) automatically point to shared memory.
+        shared = create_on_rank_and_share_result(
+            pg,
+            0,
+            creator=lambda: unique_tensors,
+            extractor=lambda ts: list(ts),  # List[Tensor] -> List[Optional[Tensor]]
+            constructor=lambda ts: [t for t in ts if t is not None],
+        )
+
+        # Step 3: On non-creator ranks, remap params to shared storages
+        if pg.rank() != 0:
+            ptr_to_shared_storage = {
+                old_ptr: shared[i].untyped_storage()
+                for i, old_ptr in enumerate(unique_ptrs)
+            }
+            for param, old_ptr in param_info:
+                new_storage = ptr_to_shared_storage[old_ptr]
+                param.data.set_(
+                    new_storage,
+                    param.data.storage_offset(),
+                    param.data.shape,
+                    param.data.stride(),
+                )
 
 
 class DMPCollection(DistributedModelParallel):
