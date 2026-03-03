@@ -1601,7 +1601,7 @@ class DataParallelEvaluator(EmbeddingShardingPerfEvaluator):
     # Prefetch and Input Dist - not applicable for DATA_PARALLEL
     # =========================================================================
 
-    def compute_prefetch_comms(
+    def compute_prefetch_comp(
         self, ctx: ShardPerfContext, config: HardwarePerfConfig
     ) -> float:
         return 0.0
@@ -1627,286 +1627,11 @@ class GridShardEvaluator(TableRowWiseEvaluator):
 
 
 # =============================================================================
-# EmbeddingPerfEstimator Factory
+#  EmbeddingPerfEstimator
 # =============================================================================
 
 
-class EmbeddingPerfEstimatorFactory:
-    """
-    Factory for creating hardware-specific EmbeddingPerfEstimator instances.
-
-    This factory maintains a registry of hardware configurations and provides
-    a simple interface to create estimators for different hardware types.
-
-    Usage:
-        # Register a hardware config
-        @EmbeddingPerfEstimatorFactory.register("my_hardware")
-        class MyHardwarePerfConfig(HardwarePerfConfig):
-            ...
-
-        # Create an estimator
-        estimator = EmbeddingPerfEstimatorFactory.create(
-            "my_hardware",
-            is_inference=False,
-        )
-    """
-
-    _registry: Dict[str, Type[HardwarePerfConfig]] = {}
-
-    @classmethod
-    def register(
-        cls, name: str
-    ) -> Callable[[Type[HardwarePerfConfig]], Type[HardwarePerfConfig]]:
-        """
-        Decorator to register a hardware config class.
-
-        Args:
-            name: Name to register the config under (e.g., "grand_teton", "athena")
-
-        Returns:
-            Decorator function that registers the class
-
-        Example:
-            @EmbeddingPerfEstimatorFactory.register("grand_teton")
-            class GrandTetonHardwarePerfConfig(HardwarePerfConfig):
-                ...
-        """
-
-        def decorator(
-            config_cls: Type[HardwarePerfConfig],
-        ) -> Type[HardwarePerfConfig]:
-            cls._registry[name.lower()] = config_cls
-            return config_cls
-
-        return decorator
-
-    @classmethod
-    def create(
-        cls,
-        hardware_name: str,
-        is_inference: bool = False,
-        topology: Optional[Topology] = None,
-        constraints: Optional[Dict[str, ParameterConstraints]] = None,
-        use_batch_inputs_for_expected_cache_fetches: bool = False,
-        use_linear_regression_prefetch_estimate: bool = False,
-    ) -> "EmbeddingPerfEstimatorV2":
-        """
-        Create an EmbeddingPerfEstimatorV2 for the specified hardware.
-
-        Args:
-            hardware_name: Name of the registered hardware config
-            is_inference: Whether this is for inference
-            topology: Device topology with bandwidth and world size info
-            constraints: Optional parameter constraints
-            use_batch_inputs_for_expected_cache_fetches: If True, expected_cache_fetches
-                is computed as expected_miss_rate * batch_inputs (total lookups per batch).
-                If False (default), uses expected_miss_rate * expected_unique_lookups.
-            use_linear_regression_prefetch_estimate: If True, enables linear regression
-                based prefetch time estimation using hardware-specific coefficients.
-
-        Returns:
-            EmbeddingPerfEstimatorV2 instance configured for the hardware
-
-        Raises:
-            ValueError: If hardware_name is not registered
-        """
-        name_lower = hardware_name.lower()
-        if name_lower not in cls._registry:
-            available = list(cls._registry.keys())
-            raise ValueError(
-                f"Unknown hardware: '{hardware_name}'. "
-                f"Available: {available}. "
-                f"Use 'default' for OSS defaults."
-            )
-
-        config_cls = cls._registry[name_lower]
-        config = config_cls()
-        logger.info(
-            f" EmbeddingPerfEstimatorFactory is creating the Perf Estimator for {hardware_name} "
-        )
-        if topology is None:
-            raise ValueError("topology is required to create EmbeddingPerfEstimatorV2")
-        return EmbeddingPerfEstimatorV2(
-            topology=topology,
-            constraints=constraints,
-            is_inference=is_inference,
-            config=config,
-            use_batch_inputs_for_expected_cache_fetches=use_batch_inputs_for_expected_cache_fetches,
-            use_linear_regression_prefetch_estimate=use_linear_regression_prefetch_estimate,
-        )
-
-    @classmethod
-    def create_with_config(
-        cls,
-        config: HardwarePerfConfig,
-        is_inference: bool = False,
-        topology: Optional[Topology] = None,
-        constraints: Optional[Dict[str, ParameterConstraints]] = None,
-        use_batch_inputs_for_expected_cache_fetches: bool = False,
-        use_linear_regression_prefetch_estimate: bool = False,
-    ) -> "EmbeddingPerfEstimatorV2":
-        """
-        Create an EmbeddingPerfEstimatorV2 with a specific config instance.
-
-        This is useful when you need to customize a config at runtime.
-
-        Args:
-            config: HardwarePerfConfig instance
-            is_inference: Whether this is for inference
-            topology: Device topology with bandwidth and world size info
-            constraints: Optional parameter constraints
-            use_batch_inputs_for_expected_cache_fetches: If True, expected_cache_fetches
-                is computed as expected_miss_rate * batch_inputs (total lookups per batch).
-                If False (default), uses expected_miss_rate * expected_unique_lookups.
-            use_linear_regression_prefetch_estimate: If True, enables linear regression
-                based prefetch time estimation using hardware-specific coefficients.
-
-        Returns:
-            EmbeddingPerfEstimatorV2 instance
-        """
-        if topology is None:
-            raise ValueError("topology is required to create EmbeddingPerfEstimatorV2")
-        return EmbeddingPerfEstimatorV2(
-            topology=topology,
-            constraints=constraints,
-            is_inference=is_inference,
-            config=config,
-            use_batch_inputs_for_expected_cache_fetches=use_batch_inputs_for_expected_cache_fetches,
-            use_linear_regression_prefetch_estimate=use_linear_regression_prefetch_estimate,
-        )
-
-    @classmethod
-    def list_registered(cls) -> List[str]:
-        """List all registered hardware names."""
-        return list(cls._registry.keys())
-
-    @classmethod
-    def is_registered(cls, name: str) -> bool:
-        """Check if a hardware name is registered."""
-        return name.lower() in cls._registry
-
-
-# =============================================================================
-#  InferencePerfEvaluator
-# =============================================================================
-
-
-class InferenceShardingPerfEvaluator(EmbeddingShardingPerfEvaluator):
-    """
-    Inference sharding performance evaluator.
-
-    Implement common inference behaviour
-        - No backward compute
-        - No backward comms
-        - Inherits forward compute/comms from traning evaluator
-    """
-
-    def compute_bwd_comp(
-        self, ctx: ShardPerfContext, config: HardwarePerfConfig
-    ) -> float:
-        return 0.0
-
-    def compute_bwd_comms(
-        self, ctx: ShardPerfContext, config: HardwarePerfConfig
-    ) -> float:
-        return 0.0
-
-
-class TableWiseInferenceEvaluator(InferenceShardingPerfEvaluator, TableWiseEvaluator):
-    # TODO inference perf logic for TW should go here in future, if need more customization
-    pass
-
-
-class RowWiseInferenceEvaluator(InferenceShardingPerfEvaluator, RowWiseEvaluator):
-    pass
-
-
-class TableRowWiseInferenceEvaluator(
-    InferenceShardingPerfEvaluator, TableRowWiseEvaluator
-):
-    pass
-
-
-class ColumnWiseInferenceEvaluator(InferenceShardingPerfEvaluator, ColumnWiseEvaluator):
-    pass
-
-
-class DataParallelInferenceEvaluator(
-    InferenceShardingPerfEvaluator, DataParallelEvaluator
-):
-    pass
-
-
-class TableColumnWiseInferenceEvaluator(
-    InferenceShardingPerfEvaluator, TableColumnWiseEvaluator
-):
-    pass
-
-
-class GridShardInferenceEvaluator(InferenceShardingPerfEvaluator, GridShardEvaluator):
-    pass
-
-
-def compute_block_usage_penalty(embedding_dim: int) -> float:
-    """
-    Compute block usage penalty based on embedding dimension.
-    Args:
-        embedding_dim: Embedding dimension
-
-    Returns:
-        Penalty multiplier (1.0 = no penalty)
-    """
-    if embedding_dim < FULL_BLOCK_EMB_DIM:
-        if embedding_dim >= 64:
-            return HALF_BLOCK_PENALTY
-        else:
-            return QUARTER_BLOCK_PENALTY
-    return 1.0
-
-
-TRAINING_EVALUATORS: Dict[str, EmbeddingShardingPerfEvaluator] = {
-    ShardingType.TABLE_WISE.value: TableWiseEvaluator(),
-    ShardingType.ROW_WISE.value: RowWiseEvaluator(),
-    ShardingType.TABLE_ROW_WISE.value: TableRowWiseEvaluator(),
-    ShardingType.COLUMN_WISE.value: ColumnWiseEvaluator(),
-    ShardingType.DATA_PARALLEL.value: DataParallelEvaluator(),
-    ShardingType.TABLE_COLUMN_WISE.value: TableColumnWiseEvaluator(),
-    ShardingType.GRID_SHARD.value: GridShardEvaluator(),
-}
-
-INFERENCE_EVALUATORS: Dict[str, EmbeddingShardingPerfEvaluator] = {
-    ShardingType.TABLE_WISE.value: TableWiseInferenceEvaluator(),
-    ShardingType.ROW_WISE.value: RowWiseInferenceEvaluator(),
-    ShardingType.TABLE_ROW_WISE.value: TableRowWiseInferenceEvaluator(),
-    ShardingType.COLUMN_WISE.value: ColumnWiseInferenceEvaluator(),
-    ShardingType.DATA_PARALLEL.value: DataParallelInferenceEvaluator(),
-    ShardingType.TABLE_COLUMN_WISE.value: TableColumnWiseInferenceEvaluator(),
-    ShardingType.GRID_SHARD.value: GridShardInferenceEvaluator(),
-}
-
-
-def get_embedding_perf_sharding_evaluator(
-    sharding_type: str, is_inference: bool = False
-) -> EmbeddingShardingPerfEvaluator:
-    """Get the appropriate evaluator for a sharding type.
-
-    Args:
-        sharding_type: The sharding type (e.g., "table_wise", "row_wise")
-        is_inference: Whether this is for inference mode
-
-    Returns:
-        The appropriate evaluator instance
-    """
-    evaluators = INFERENCE_EVALUATORS if is_inference else TRAINING_EVALUATORS
-    return evaluators.get(sharding_type, TableWiseEvaluator())
-
-
-# =============================================================================
-#  EmbeddingPerfEstimatorV2
-# =============================================================================
-
-
-class EmbeddingPerfEstimatorV2(ShardEstimator):  # TODO rename this later
+class EmbeddingPerfEstimator(ShardEstimator):
     """
     Embedding Performance Estimator using HardwarePerfConfig.
     This estimator uses :
@@ -2057,3 +1782,282 @@ class EmbeddingPerfEstimatorV2(ShardEstimator):  # TODO rename this later
                 shard.perf = perf
 
         logger.info(f"Total {num_feature_processors} feature processor.")
+
+
+# Backward compatibility alias
+EmbeddingPerfEstimatorV2 = EmbeddingPerfEstimator
+
+
+# =============================================================================
+# EmbeddingPerfEstimator Factory
+# =============================================================================
+
+
+class EmbeddingPerfEstimatorFactory:
+    """
+    Factory for creating hardware-specific EmbeddingPerfEstimator instances.
+
+    This factory maintains a registry of hardware configurations and provides
+    a simple interface to create estimators for different hardware types.
+
+    Usage:
+        # Register a hardware config
+        @EmbeddingPerfEstimatorFactory.register("my_hardware")
+        class MyHardwarePerfConfig(HardwarePerfConfig):
+            ...
+
+        # Create an estimator
+        estimator = EmbeddingPerfEstimatorFactory.create(
+            "my_hardware",
+            is_inference=False,
+        )
+    """
+
+    _registry: Dict[str, Type[HardwarePerfConfig]] = {}
+
+    @classmethod
+    def register(
+        cls, name: str
+    ) -> Callable[[Type[HardwarePerfConfig]], Type[HardwarePerfConfig]]:
+        """
+        Decorator to register a hardware config class.
+
+        Args:
+            name: Name to register the config under (e.g., "grand_teton", "athena")
+
+        Returns:
+            Decorator function that registers the class
+
+        Example:
+            @EmbeddingPerfEstimatorFactory.register("grand_teton")
+            class GrandTetonHardwarePerfConfig(HardwarePerfConfig):
+                ...
+        """
+
+        def decorator(
+            config_cls: Type[HardwarePerfConfig],
+        ) -> Type[HardwarePerfConfig]:
+            cls._registry[name.lower()] = config_cls
+            return config_cls
+
+        return decorator
+
+    @classmethod
+    def create(
+        cls,
+        hardware_name: str,
+        is_inference: bool = False,
+        topology: Optional[Topology] = None,
+        constraints: Optional[Dict[str, ParameterConstraints]] = None,
+        use_batch_inputs_for_expected_cache_fetches: bool = False,
+        use_linear_regression_prefetch_estimate: bool = False,
+    ) -> EmbeddingPerfEstimator:
+        """
+        Create an EmbeddingPerfEstimatorV2 for the specified hardware.
+
+        Args:
+            hardware_name: Name of the registered hardware config
+            is_inference: Whether this is for inference
+            topology: Device topology with bandwidth and world size info
+            constraints: Optional parameter constraints
+            use_batch_inputs_for_expected_cache_fetches: If True, expected_cache_fetches
+                is computed as expected_miss_rate * batch_inputs (total lookups per batch).
+                If False (default), uses expected_miss_rate * expected_unique_lookups.
+            use_linear_regression_prefetch_estimate: If True, enables linear regression
+                based prefetch time estimation using hardware-specific coefficients.
+
+        Returns:
+            EmbeddingPerfEstimator instance configured for the hardware
+
+        Raises:
+            ValueError: If hardware_name is not registered
+        """
+        name_lower = hardware_name.lower()
+        if name_lower not in cls._registry:
+            available = list(cls._registry.keys())
+            raise ValueError(
+                f"Unknown hardware: '{hardware_name}'. "
+                f"Available: {available}. "
+                f"Use 'default' for OSS defaults."
+            )
+
+        config_cls = cls._registry[name_lower]
+        config = config_cls()
+        logger.info(
+            f" EmbeddingPerfEstimatorFactory is creating the Perf Estimator for {hardware_name} "
+        )
+        if topology is None:
+            raise ValueError("topology is required to create EmbeddingPerfEstimatorV2")
+        return EmbeddingPerfEstimator(
+            topology=topology,
+            constraints=constraints,
+            is_inference=is_inference,
+            config=config,
+            use_batch_inputs_for_expected_cache_fetches=use_batch_inputs_for_expected_cache_fetches,
+            use_linear_regression_prefetch_estimate=use_linear_regression_prefetch_estimate,
+        )
+
+    @classmethod
+    def create_with_config(
+        cls,
+        config: HardwarePerfConfig,
+        is_inference: bool = False,
+        topology: Optional[Topology] = None,
+        constraints: Optional[Dict[str, ParameterConstraints]] = None,
+        use_batch_inputs_for_expected_cache_fetches: bool = False,
+        use_linear_regression_prefetch_estimate: bool = False,
+    ) -> EmbeddingPerfEstimator:
+        """
+        Create an EmbeddingPerfEstimator with a specific config instance.
+
+        This is useful when you need to customize a config at runtime.
+
+        Args:
+            config: HardwarePerfConfig instance
+            is_inference: Whether this is for inference
+            topology: Device topology with bandwidth and world size info
+            constraints: Optional parameter constraints
+            use_batch_inputs_for_expected_cache_fetches: If True, expected_cache_fetches
+                is computed as expected_miss_rate * batch_inputs (total lookups per batch).
+                If False (default), uses expected_miss_rate * expected_unique_lookups.
+            use_linear_regression_prefetch_estimate: If True, enables linear regression
+                based prefetch time estimation using hardware-specific coefficients.
+
+        Returns:
+            EmbeddingPerfEstimator instance
+        """
+        if topology is None:
+            raise ValueError("topology is required to create EmbeddingPerfEstimator")
+        return EmbeddingPerfEstimator(
+            topology=topology,
+            constraints=constraints,
+            is_inference=is_inference,
+            config=config,
+            use_batch_inputs_for_expected_cache_fetches=use_batch_inputs_for_expected_cache_fetches,
+            use_linear_regression_prefetch_estimate=use_linear_regression_prefetch_estimate,
+        )
+
+    @classmethod
+    def list_registered(cls) -> List[str]:
+        """List all registered hardware names."""
+        return list(cls._registry.keys())
+
+    @classmethod
+    def is_registered(cls, name: str) -> bool:
+        """Check if a hardware name is registered."""
+        return name.lower() in cls._registry
+
+
+# =============================================================================
+#  InferencePerfEvaluator
+# =============================================================================
+
+
+class InferenceShardingPerfEvaluator(EmbeddingShardingPerfEvaluator):
+    """
+    Inference sharding performance evaluator.
+
+    Implement common inference behaviour
+        - No backward compute
+        - No backward comms
+        - Inherits forward compute/comms from traning evaluator
+    """
+
+    def compute_bwd_comp(
+        self, ctx: ShardPerfContext, config: HardwarePerfConfig
+    ) -> float:
+        return 0.0
+
+    def compute_bwd_comms(
+        self, ctx: ShardPerfContext, config: HardwarePerfConfig
+    ) -> float:
+        return 0.0
+
+
+class TableWiseInferenceEvaluator(InferenceShardingPerfEvaluator, TableWiseEvaluator):
+    # TODO inference perf logic for TW should go here in future, if need more customization
+    pass
+
+
+class RowWiseInferenceEvaluator(InferenceShardingPerfEvaluator, RowWiseEvaluator):
+    pass
+
+
+class TableRowWiseInferenceEvaluator(
+    InferenceShardingPerfEvaluator, TableRowWiseEvaluator
+):
+    pass
+
+
+class ColumnWiseInferenceEvaluator(InferenceShardingPerfEvaluator, ColumnWiseEvaluator):
+    pass
+
+
+class DataParallelInferenceEvaluator(
+    InferenceShardingPerfEvaluator, DataParallelEvaluator
+):
+    pass
+
+
+class TableColumnWiseInferenceEvaluator(
+    InferenceShardingPerfEvaluator, TableColumnWiseEvaluator
+):
+    pass
+
+
+class GridShardInferenceEvaluator(InferenceShardingPerfEvaluator, GridShardEvaluator):
+    pass
+
+
+def compute_block_usage_penalty(embedding_dim: int) -> float:
+    """
+    Compute block usage penalty based on embedding dimension.
+    Args:
+        embedding_dim: Embedding dimension
+
+    Returns:
+        Penalty multiplier (1.0 = no penalty)
+    """
+    if embedding_dim < FULL_BLOCK_EMB_DIM:
+        if embedding_dim >= 64:
+            return HALF_BLOCK_PENALTY
+        else:
+            return QUARTER_BLOCK_PENALTY
+    return 1.0
+
+
+TRAINING_EVALUATORS: Dict[str, EmbeddingShardingPerfEvaluator] = {
+    ShardingType.TABLE_WISE.value: TableWiseEvaluator(),
+    ShardingType.ROW_WISE.value: RowWiseEvaluator(),
+    ShardingType.TABLE_ROW_WISE.value: TableRowWiseEvaluator(),
+    ShardingType.COLUMN_WISE.value: ColumnWiseEvaluator(),
+    ShardingType.DATA_PARALLEL.value: DataParallelEvaluator(),
+    ShardingType.TABLE_COLUMN_WISE.value: TableColumnWiseEvaluator(),
+    ShardingType.GRID_SHARD.value: GridShardEvaluator(),
+}
+
+INFERENCE_EVALUATORS: Dict[str, EmbeddingShardingPerfEvaluator] = {
+    ShardingType.TABLE_WISE.value: TableWiseInferenceEvaluator(),
+    ShardingType.ROW_WISE.value: RowWiseInferenceEvaluator(),
+    ShardingType.TABLE_ROW_WISE.value: TableRowWiseInferenceEvaluator(),
+    ShardingType.COLUMN_WISE.value: ColumnWiseInferenceEvaluator(),
+    ShardingType.DATA_PARALLEL.value: DataParallelInferenceEvaluator(),
+    ShardingType.TABLE_COLUMN_WISE.value: TableColumnWiseInferenceEvaluator(),
+    ShardingType.GRID_SHARD.value: GridShardInferenceEvaluator(),
+}
+
+
+def get_embedding_perf_sharding_evaluator(
+    sharding_type: str, is_inference: bool = False
+) -> EmbeddingShardingPerfEvaluator:
+    """Get the appropriate evaluator for a sharding type.
+
+    Args:
+        sharding_type: The sharding type (e.g., "table_wise", "row_wise")
+        is_inference: Whether this is for inference mode
+
+    Returns:
+        The appropriate evaluator instance
+    """
+    evaluators = INFERENCE_EVALUATORS if is_inference else TRAINING_EVALUATORS
+    return evaluators.get(sharding_type, TableWiseEvaluator())
