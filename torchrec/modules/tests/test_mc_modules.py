@@ -11,8 +11,8 @@ import unittest
 from typing import cast, Dict
 
 import torch
-from torchrec.fb.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.mc_modules import (
     average_threshold_filter,
     DistanceLFU_EvictionPolicy,
