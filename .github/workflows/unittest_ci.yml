@@ -44,7 +44,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        cuda-tag: ["cu126", "cu128", "cu129"]
+        cuda-tag: ["cu126", "cu128", "cu129", "cu130"]
         os:
           - linux.g5.12xlarge.nvidia.gpu
         python:
@@ -63,6 +63,8 @@ jobs:
             free_threaded: true
         is_pr:
           - ${{ github.event_name == 'pull_request' }}
+        is_main_push:  # for main branch
+          - ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         exclude:
           - is_pr: true
             cuda-tag: "cu126"
@@ -70,20 +72,59 @@ jobs:
             cuda-tag: "cu128"
           - is_pr: true
             cuda-tag: "cu129"
+          - is_pr: true
+            cuda-tag: "cu130"
             python:
               version: "3.10"
           - is_pr: true
-            cuda-tag: "cu129"
+            cuda-tag: "cu130"
             python:
               version: "3.11"
           - is_pr: true
-            cuda-tag: "cu129"
+            cuda-tag: "cu130"
             python:
               version: "3.12"
           - is_pr: true
+            cuda-tag: "cu130"
+            python:
+              version: "3.13"
+          - is_main_push: true
+            cuda-tag: "cu126"
+            python:
+              version: "3.11"
+          - is_main_push: true
+            cuda-tag: "cu126"
+            python:
+              version: "3.12"
+          - is_main_push: true
+            cuda-tag: "cu126"
+            python:
+              version: "3.13"
+          - is_main_push: true
+            cuda-tag: "cu128"
+            python:
+              version: "3.10"
+          - is_main_push: true
+            cuda-tag: "cu128"
+            python:
+              version: "3.12"
+          - is_main_push: true
+            cuda-tag: "cu128"
+            python:
+              version: "3.14"
+          - is_main_push: true
+            cuda-tag: "cu129"
+            python:
+              version: "3.11"
+          - is_main_push: true
             cuda-tag: "cu129"
             python:
               version: "3.13"
+          - is_main_push: true
+            cuda-tag: "cu129"
+            python:
+              version: "3.14"
+              free_threaded: true
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     permissions:
       id-token: write
