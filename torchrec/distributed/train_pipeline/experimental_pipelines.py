@@ -68,34 +68,99 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
     the overhead of switching between separate pipelines.
 
     Key Features:
-        - Supports both training and evaluation modes via the `is_training` flag.
+        - Supports both training and evaluation modes via the model's training flag.
         - Conditionally executes backward pass and optimizer step only during training.
         - Maintains the same pipelining benefits (overlapping data transfer, sparse
           data distribution, and forward pass) for both modes.
+        - Uses model.training state (set by set_eval_mode()) to determine whether
+          to run backward/optimizer for each batch.
 
     Pipeline Stages (inherited from TrainPipelineSparseDist):
         - Stage 3: Forward/Backward/Optimizer (current batch)
         - Stage 2: Sparse data distribution (next batch)
         - Stage 1: Device transfer (batch i+2)
 
-    Note:
-        The `is_training` flag is set per-batch via the context, allowing fine-grained
-        control over which batches trigger gradient computation and weight updates.
+    Eval Draining:
+        When the eval data iterator is exhausted, the pipeline enters a draining
+        state where it continues processing remaining eval batches already in the
+        pipeline queue without fetching new data. Once the queue is empty, the
+        pipeline resets its state and raises StopIteration to signal eval completion.
     """
+
+    _draining_eval: bool = False
+
+    def copy_batch_to_gpu(
+        self,
+        dataloader_iter: Iterator[In],
+    ) -> Tuple[Optional[In], Optional[TrainPipelineContext]]:
+        """
+        Retrieve batch from dataloader and move to device.
+
+        Returns:
+            Tuple of (batch, context).
+        """
+        context = self._create_context()
+        with record_function(f"## copy_batch_to_gpu {context.index} ##"):
+            # pyrefly: ignore [bad-argument-type]
+            with self._stream_context(self._memcpy_stream):
+                batch = self._next_batch(dataloader_iter)
+
+                if batch is not None:
+                    batch = _to_device(batch, self._device, non_blocking=True)
+                elif not self._execute_all_batches:
+                    raise StopIteration
+                return batch, context
 
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
         if self._state == PipelineState.UNKNOWN:
             return super()._next_batch(dataloader_iter)
         return self._next_batch_on_cpu
 
-    def progress(self, dataloader_iter: Iterator[In], is_training: bool = True) -> Out:
+    def _prepare_pipeline_step(self, dataloader_iter: Iterator[In]) -> None:
+        """
+        Reset flags, pre-fetch next batch, and check for empty pipeline.
+
+        Handles draining mode transitions for eval: when the eval data iterator
+        is exhausted, enters draining mode to process remaining queued batches.
+        When the pipeline is fully drained, resets state and raises StopIteration.
+
+        Raises:
+            StopIteration: When pipeline is empty (all batches processed or
+                eval draining complete).
+        """
+        # Only reset exhaustion/draining flags when in training mode.
+        # During eval, we want to preserve these flags so the pipeline
+        # can drain remaining eval batches after the eval iter exhausts.
+        if self._model.training:
+            self._dataloader_exhausted = False
+            self._draining_eval = False
+
+        # Pre-fetch next batch unless we're draining (no more data to fetch)
+        if not self._draining_eval:
+            self._next_batch_on_cpu = TrainPipelineSparseDist._next_batch(
+                self, dataloader_iter
+            )
+            if self._next_batch_on_cpu is None and not self._model.training:
+                # Eval data exhausted. Enter draining mode to process
+                # remaining eval batches already in the pipeline queue.
+                self._draining_eval = True
+
+        # Pipeline is empty — either all batches processed or draining complete
+        if not self.batches:
+            if self._draining_eval:
+                # Pipeline fully drained after eval. Reset state so
+                # fill_pipeline re-initializes on the next progress() call.
+                self._state = PipelineState.UNKNOWN
+                self._draining_eval = False
+            raise StopIteration
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
         Execute one step of the pipelined train/eval loop.
 
         This method processes one batch through the full pipeline while overlapping
         operations for subsequent batches. It conditionally executes backward pass
-        and optimizer step based on both the model's training mode and the per-batch
-        `is_training` flag.
+        and optimizer step based on the model's training mode.
 
         For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
             - batches[0]: current batch, for emb_lookup, output_dist, and fwd/bwd/opt
@@ -106,23 +171,13 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
 
         Args:
             dataloader_iter: Iterator yielding input batches from the dataloader.
-            is_training: Whether the *newly enqueued* batch (batch i+2) should be
-                processed in training mode. Defaults to True.
 
         Returns:
             Out: The output from the forward pass of the current batch (batches[0]).
 
         Raises:
-            StopIteration: When all batches have been processed (pipeline is empty).
-
-        Note:
-            The backward/optimizer execution depends on BOTH:
-            1. `self._model.training` - the model's overall training mode
-            2. `self.contexts[0].is_training` - the per-batch training flag set during enqueue
-
-            This allows fine-grained control where the model can be in training mode
-            but specific batches can skip gradient computation (e.g., for evaluation batches
-            interleaved with training batches).
+            StopIteration: When all batches have been processed (pipeline is empty),
+                or when eval draining completes (all remaining eval batches processed).
         """
 
         self._state = PipelineState.UNKNOWN
@@ -135,32 +190,15 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
         self.fill_pipeline(dataloader_iter)
         self._state = PipelineState.IDLE
 
-        self._next_batch_on_cpu = TrainPipelineSparseDist._next_batch(
-            self, dataloader_iter
-        )
-        if self._next_batch_on_cpu is None and not is_training:
-            # stop current progress if eval iter is exhausted
-            # training iter will continue
-            raise StopIteration
-
-        for context in self.contexts:
-            # this only fills the context loaded from fill_pipeline
-            if not hasattr(context, "is_training"):
-                logger.info(
-                    f"initial fill batch-{context.index} with {'train' if is_training else 'eval'}"
-                )
-                # pyrefly: ignore [missing-attribute]
-                context.is_training = is_training
-
-        # Here is the expected stop after exhausting all batches
-        if not self.batches:
-            raise StopIteration
+        self._prepare_pipeline_step(dataloader_iter)
 
         # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
         self._set_module_context(self.contexts[0])
 
+        is_curr_training = self._model.training
+
         # Zero gradients only when model is in training mode
-        if self._model.training:
+        if is_curr_training:
             with record_function("## zero_grad ##"):
                 self._optimizer.zero_grad()
 
@@ -173,15 +211,17 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
             # Invoke splits all_to_all comms (first part of input_dist)
             self.start_sparse_data_dist(self.batches[1], self.contexts[1])
 
-        # pyrefly: ignore [missing-attribute]
-        is_curr_training = self._model.training and self.contexts[0].is_training
-
-        # Batch i+2: load data and copy to GPU, the dataloader iter will first exhaust here
-        if self.enqueue_batch(dataloader_iter):
-            # pyrefly: ignore [missing-attribute]
-            self.contexts[-1].is_training = is_training
+        # Batch i+2: load data and copy to GPU (skip when draining — no more data)
+        if not self._draining_eval:
+            self.enqueue_batch(dataloader_iter)
 
         # Forward pass for current batch
+        if self.batches[0] is None:
+            # Pipeline drained: batch was None from exhausted dataloader.
+            # No input_dist was staged, so forward would fail. Stop here.
+            self.dequeue_batch()
+            raise StopIteration
+
         if is_curr_training:
             with record_function(f"## forward {self.contexts[0].index} ##"):
                 self._state = PipelineState.CALL_FWD
@@ -197,9 +237,7 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
             # Invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
             self.wait_sparse_data_dist(self.contexts[1])
 
-        # Execute backward and optimizer step only if:
-        # 1. Model is in training mode (self._model.training)
-        # 2. Current batch is marked for training (self.contexts[0].is_training)
+        # Execute backward and optimizer step only when model is in training mode
         if is_curr_training:
             # Backward pass
             self._state = PipelineState.CALL_BWD
