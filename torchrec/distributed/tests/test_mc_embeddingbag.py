@@ -31,7 +31,7 @@ from torchrec.distributed.test_utils.multi_process import (
 )
 from torchrec.distributed.test_utils.test_model import ModelInput
 from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingPlan
-from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.modules.hash_mc_evictions import (
     HashZchEvictionConfig,
@@ -597,6 +597,7 @@ def _run_single_rank_training_step(
 
 @skip_if_asan_class
 class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
+
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -649,9 +650,29 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    @given(backend=st.sampled_from(["nccl"]))
+    @given(
+        backend=st.sampled_from(["nccl"]),
+        pooling_type=st.sampled_from([PoolingType.SUM, PoolingType.MEAN]),
+    )
     @settings(deadline=None)
-    def test_sharding_zch_mc_ebc(self, backend: str) -> None:
+    def test_sharding_zch_mc_ebc(self, backend: str, pooling_type: PoolingType) -> None:
+        embedding_bag_config: Final[List[EmbeddingBagConfig]] = [
+            EmbeddingBagConfig(
+                name="table_0",
+                feature_names=["feature_0"],
+                embedding_dim=8,
+                num_embeddings=16,
+                pooling=pooling_type,
+            ),
+            EmbeddingBagConfig(
+                name="table_1",
+                feature_names=["feature_1"],
+                embedding_dim=8,
+                num_embeddings=32,
+                pooling=pooling_type,
+            ),
+        ]
+
         self._run_multi_process_test(
             callable=_test_sharding_and_remapping,
             output_keys=["feature_0", "feature_1"],
@@ -699,10 +720,11 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
                 EmbeddingComputeKernel.FUSED.value,
             ]
         ),
+        pooling_type=st.sampled_from([PoolingType.SUM, PoolingType.MEAN]),
     )
     @settings(deadline=None)
     def test_mc_zch_with_sharded_versus_unsharded_vbe(
-        self, backend: str, kernel_type: str
+        self, backend: str, kernel_type: str, pooling_type: PoolingType
     ) -> None:
         WORLD_SIZE = 2
         embedding_bag_config: Final[List[EmbeddingBagConfig]] = [
@@ -712,12 +734,14 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
                 embedding_dim=64,
                 num_embeddings=1000,
                 data_type=DataType.FP16,
+                pooling=pooling_type,
             ),
             EmbeddingBagConfig(
                 name="table_1",
                 feature_names=["feature_1"],
                 embedding_dim=8,
                 num_embeddings=32,
+                pooling=pooling_type,
             ),
         ]
 

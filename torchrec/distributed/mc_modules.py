@@ -625,13 +625,16 @@ class ShardedManagedCollisionCollection(
         self,
         ctx: ManagedCollisionCollectionContext,
         features: KeyedJaggedTensor,
+        skip_permute: bool = False,
     ) -> Awaitable[Awaitable[KJTList]]:
         if self._has_uninitialized_input_dists:
             self._create_input_dists(input_feature_names=features.keys())
             self._has_uninitialized_input_dists = False
 
+        # TODO: Refactor mc_modules to make it generic with mc_embeddingbag/mc_embedding
         with torch.no_grad():
-            if self._features_order:
+            # skip_permute added since these were used earlier in `mc_embeddingbag`
+            if not skip_permute and self._features_order:
                 features = features.permute(
                     #  `Union[Module, Tensor]`.
                     self._features_order,
