@@ -755,6 +755,12 @@ class TestMCH(unittest.TestCase):
                 torch.tensor([6], dtype=torch.int64, device="cuda:0"),
             )
         )
+        self.assertTrue(
+            torch.equal(
+                output1["test"].offsets(),
+                torch.tensor([0, 6], dtype=torch.int64, device="cuda:0"),
+            )
+        )
         jt = JaggedTensor(
             values=torch.tensor([9, 0, 1, 4, 6, 8], dtype=torch.int64, device="cuda"),
             lengths=torch.tensor([1, 1, 1, 1, 1, 1], dtype=torch.int64, device="cuda"),
@@ -773,6 +779,12 @@ class TestMCH(unittest.TestCase):
             torch.equal(
                 output2["test"].lengths(),
                 torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output2["test"].offsets(),
+                torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
             )
         )
 
@@ -833,6 +845,12 @@ class TestMCH(unittest.TestCase):
                 torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
             )
         )
+        self.assertTrue(
+            torch.equal(
+                output1["test"].offsets(),
+                torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
+            )
+        )
 
         m = HashZchManagedCollisionModule(
             zch_size=10,
@@ -883,6 +901,12 @@ class TestMCH(unittest.TestCase):
             torch.equal(
                 output1["test"].lengths(),
                 torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output1["test"].offsets(),
+                torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
             )
         )
 
@@ -1000,6 +1024,13 @@ class TestMCH(unittest.TestCase):
                 # pyrefly: ignore[unsupported-operation]
                 res[1]["table_0"].lengths(),
                 torch.tensor([0, 1, 1, 0, 0, 1], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                # pyrefly: ignore[unsupported-operation]
+                res[1]["table_0"].offsets(),
+                torch.tensor([0, 0, 1, 2, 2, 2, 3], dtype=torch.int64, device="cuda:0"),
             )
         )
         # pyrefly: ignore[bad-argument-type]
