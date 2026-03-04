@@ -680,6 +680,21 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             track_id_freq=self._track_id_freq,
         )
 
+    def lookup_runtime_meta(
+        self,
+        features: torch.Tensor,
+        remapped_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        assert features.numel() == remapped_ids.numel()
+        if self._hash_zch_runtime_meta is None:
+            return torch.full_like(remapped_ids, -1)
+        else:
+            not_hit_indices_mask = self._hash_zch_identities[remapped_ids] != features
+            metadata = torch.index_select(self._hash_zch_runtime_meta, 0, remapped_ids)
+            # force the counter to be 0 for the ids not found in emb table.
+            metadata[not_hit_indices_mask] = 0
+            return metadata.reshape(-1)
+
 
 @torch.fx.wrap
 def _append_eviction_indice(
