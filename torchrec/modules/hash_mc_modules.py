@@ -253,6 +253,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self._eviction_policy_name: Optional[HashZchEvictionPolicyName] = (
             eviction_policy_name
         )
+        self._eviction_flag: int = get_kernel_from_policy(self._eviction_policy_name)
         self._eviction_config: Optional[HashZchEvictionConfig] = eviction_config
         self._eviction_module: Optional[HashZchEvictionModule] = (
             HashZchEvictionModule(
@@ -560,7 +561,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     _modulo_identity_DPRECATED=False,  # deprecated, always False
                     input_metadata=input_metadata,
                     eviction_threshold=eviction_threshold,
-                    eviction_policy=get_kernel_from_policy(self._eviction_policy_name),
+                    eviction_policy=self._eviction_flag,
                     opt_in_prob=self._opt_in_prob,
                     num_reserved_slots=num_reserved_slots,
                     opt_in_rands=opt_in_rands,
