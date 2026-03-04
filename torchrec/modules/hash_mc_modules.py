@@ -272,10 +272,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             assert (
                 self._percent_reserved_slots > 0
             ), "percent_reserved_slots must be positive when opt_in_prob is positive"
-            assert (
-                self._eviction_policy_name is None
-                or self._eviction_policy_name != HashZchEvictionPolicyName.LRU_EVICTION
-            ), "LRU eviction is not compatible with opt-in at this time"
         self._disable_fallback: bool = disable_fallback
         self._track_id_freq: bool = track_id_freq
 
