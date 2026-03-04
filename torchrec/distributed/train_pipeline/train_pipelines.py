@@ -256,19 +256,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         cur_batch = self._next_batch(dataloader_iter)
         self._cur_batch = cur_batch
         if cur_batch is not None:
-            if self._enable_inplace_copy_batch:
-                self._cur_batch = _to_device(
-                    cur_batch,
-                    self._device,
-                    non_blocking=True,
-                    data_copy_stream=self._memcpy_stream,
-                )
-            else:
-                # pyrefly: ignore [bad-argument-type]
-                with self._stream_context(self._memcpy_stream):
-                    self._cur_batch = _to_device(
-                        cur_batch, self._device, non_blocking=True
-                    )
+            self._copy_batch_to_gpu(cur_batch)
         self._connected = True
 
     def _next_batch(self, dataloader_iter: Iterator[In]) -> Optional[In]:
