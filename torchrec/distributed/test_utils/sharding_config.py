@@ -7,6 +7,7 @@
 
 # pyre-strict
 import copy
+import logging
 from dataclasses import dataclass, field
 from typing import Any, cast, Dict, List, Optional, Tuple, Union
 
@@ -21,6 +22,7 @@ from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.model_parallel import HybridEvalDMP
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
@@ -33,9 +35,26 @@ from torchrec.distributed.types import (
     KeyValueParams,
     ModuleSharder,
     ShardingEnv,
+    ShardingPlan,
     ShardingType,
 )
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _detect_hbm_cap(compute_device: str) -> Optional[int]:
+    """Auto-detect HBM capacity from the current CUDA device.
+
+    Returns the total GPU memory in bytes, or None if detection is not
+    possible (e.g., no CUDA device available or compute_device is not cuda).
+    """
+    if compute_device != "cuda" or not torch.cuda.is_available():
+        return None
+    try:
+        return torch.cuda.get_device_properties(torch.device("cuda")).total_memory
+    except Exception:
+        return None
 
 
 @dataclass
@@ -54,6 +73,49 @@ class PlannerConfig:
     storage_reservation_percentage: float = 0.15
     # Hardware configuration for topology (dict with keys: hbm_cap, ddr_cap, etc.)
     hardware: Optional[Dict[str, Any]] = None
+
+    def _apply_hardware_config(
+        self,
+        topology_kwargs: Dict[str, Any],
+        device_type: str,
+    ) -> None:
+        """Apply hardware config to topology kwargs, with hbm_cap fact-checking."""
+        if self.hardware is None:
+            return
+
+        # Passthrough keys from hardware config to topology kwargs
+        _HARDWARE_KEYS = [
+            "hbm_cap",
+            "ddr_cap",
+            "hbm_mem_bw",
+            "ddr_mem_bw",
+            "hbm_to_ddr_mem_bw",
+            "intra_host_bw",
+            "inter_host_bw",
+            "pod_size",
+            "local_world_size",
+        ]
+        for key in _HARDWARE_KEYS:
+            if key in self.hardware:
+                topology_kwargs[key] = self.hardware[key]
+
+        # Fact-check user-provided hbm_cap against detected value
+        if "hbm_cap" in self.hardware:
+            detected_hbm = _detect_hbm_cap(device_type)
+            if detected_hbm is not None:
+                user_hbm = self.hardware["hbm_cap"]
+                ratio = user_hbm / detected_hbm if detected_hbm else 0.0
+                if ratio < 0.5 or ratio > 2.0:
+                    logger.warning(
+                        "Hardware config hbm_cap=%d (%.1f GB) differs significantly "
+                        "from detected GPU memory %d (%.1f GB), ratio=%.2fx. "
+                        "Using configured value.",
+                        user_hbm,
+                        user_hbm / (1024**3),
+                        detected_hbm,
+                        detected_hbm / (1024**3),
+                        ratio,
+                    )
 
     def generate_topology(self, device_type: str) -> Topology:
         """
@@ -79,34 +141,18 @@ class PlannerConfig:
             "compute_device": device_type,
         }
 
-        if self.hardware is not None:
-            if "hbm_cap" in self.hardware:
-                topology_kwargs["hbm_cap"] = self.hardware["hbm_cap"]
-            if "ddr_cap" in self.hardware:
-                topology_kwargs["ddr_cap"] = self.hardware["ddr_cap"]
-            if "hbm_mem_bw" in self.hardware:
-                topology_kwargs["hbm_mem_bw"] = self.hardware["hbm_mem_bw"]
-            if "ddr_mem_bw" in self.hardware:
-                topology_kwargs["ddr_mem_bw"] = self.hardware["ddr_mem_bw"]
-            if "hbm_to_ddr_mem_bw" in self.hardware:
-                topology_kwargs["hbm_to_ddr_mem_bw"] = self.hardware[
-                    "hbm_to_ddr_mem_bw"
-                ]
-            if "intra_host_bw" in self.hardware:
-                topology_kwargs["intra_host_bw"] = self.hardware["intra_host_bw"]
-            if "inter_host_bw" in self.hardware:
-                topology_kwargs["inter_host_bw"] = self.hardware["inter_host_bw"]
+        self._apply_hardware_config(topology_kwargs, device_type)
 
-            # GB200 NVLink domain topology support
-            # pod_size represents topology_domain_multiple (hosts per NVLink domain)
-            # This enables proper intra_group_size calculation for multi-host NVLink domains
-            if "pod_size" in self.hardware:
-                topology_kwargs["pod_size"] = self.hardware["pod_size"]
-
-            # Override local_world_size if explicitly specified in hardware config
-            # Useful for GB200 (2 GPUs/host) vs A100 (8 GPUs/host)
-            if "local_world_size" in self.hardware:
-                topology_kwargs["local_world_size"] = self.hardware["local_world_size"]
+        # Auto-detect hbm_cap when not provided in hardware config
+        if "hbm_cap" not in topology_kwargs:
+            detected_hbm = _detect_hbm_cap(device_type)
+            if detected_hbm is not None:
+                topology_kwargs["hbm_cap"] = detected_hbm
+                logger.info(
+                    "Auto-detected hbm_cap=%d (%.1f GB) from GPU.",
+                    detected_hbm,
+                    detected_hbm / (1024**3),
+                )
 
         return Topology(**topology_kwargs)
 
@@ -260,6 +306,15 @@ class ShardingConfig:
             optimizer constructor. For Shampoo, this can include
             precondition_frequency, start_preconditioning_step,
             max_preconditioner_dim, etc.
+        init_data_parallel: Whether to wrap in DDP. Set to False for eval
+            workflows that don't need gradient synchronization.
+        embedding_device: If set, DMP uses this device for embeddings (e.g. "cpu").
+            When set, the .to(device) call is skipped to preserve split-device
+            placement (CPU embeddings + GPU dense).
+        skip_dense_optimizer: If True, return a dummy optimizer instead of creating
+            a real one for dense parameters. Useful for eval-only workflows.
+        deepcopy_model: If True (default), deepcopy the model before passing to DMP.
+            Set to False to save memory when the original model is not needed.
     """
 
     fused_params: Dict[str, Any] = field(default_factory=dict)
@@ -268,6 +323,10 @@ class ShardingConfig:
     dense_momentum: Optional[float] = None
     dense_weight_decay: Optional[float] = None
     dense_optimizer_kwargs: Dict[str, Any] = field(default_factory=dict)
+    init_data_parallel: bool = True
+    embedding_device: Optional[str] = None
+    skip_dense_optimizer: bool = False
+    deepcopy_model: bool = True
 
     def _convert_fused_params(self) -> Optional[Dict[str, Any]]:
         """
@@ -294,6 +353,134 @@ class ShardingConfig:
 
         return fused_params
 
+    def _plan_and_sharders(
+        self,
+        model: nn.Module,
+        pg: dist.ProcessGroup,
+        planner: Optional[
+            Union[
+                EmbeddingShardingPlanner,
+                HeteroEmbeddingShardingPlanner,
+            ]
+        ] = None,
+    ) -> Tuple[List[ModuleSharder[nn.Module]], Optional[ShardingPlan]]:
+        """
+        Convert fused params, create sharders, and run the planner.
+
+        Returns:
+            Tuple of (sharders, plan)
+        """
+        converted_fused_params = self._convert_fused_params()
+        sharders = _get_sharders_with_fused_params(converted_fused_params)
+
+        plan = None
+        if planner is not None:
+            if pg is not None:
+                plan = planner.collective_plan(model, sharders, pg)
+            else:
+                # pyrefly: ignore[bad-argument-type, missing-argument]
+                plan = planner.plan(model, sharders)
+
+        return sharders, plan
+
+    def generate_dmp_model(
+        self,
+        model: nn.Module,
+        pg: dist.ProcessGroup,
+        device: torch.device,
+        planner: Optional[
+            Union[
+                EmbeddingShardingPlanner,
+                HeteroEmbeddingShardingPlanner,
+            ]
+        ] = None,
+    ) -> DistributedModelParallel:
+        """
+        Generate a standard DistributedModelParallel model.
+
+        All modules are placed on the same device.
+        """
+        sharders, plan = self._plan_and_sharders(model, pg, planner)
+
+        return DistributedModelParallel(
+            module=copy.deepcopy(model) if self.deepcopy_model else model,
+            env=ShardingEnv.from_process_group(pg),
+            init_data_parallel=self.init_data_parallel,
+            device=device,
+            sharders=sharders,
+            plan=plan,
+        ).to(device)
+
+    def generate_hybrid_dmp_model(
+        self,
+        model: nn.Module,
+        pg: dist.ProcessGroup,
+        device: torch.device,
+        planner: Optional[
+            Union[
+                EmbeddingShardingPlanner,
+                HeteroEmbeddingShardingPlanner,
+            ]
+        ] = None,
+    ) -> HybridEvalDMP:
+        """
+        Generate a HybridEvalDMP model for split-device placement.
+
+        Embeddings are placed on ``embedding_device`` (e.g. CPU),
+        while dense modules are moved to ``device`` (e.g. CUDA).
+        CPU embedding storage is shared across ranks via /dev/shm.
+        """
+        assert (
+            self.embedding_device is not None
+        ), "embedding_device must be set for generate_hybrid_dmp_model"
+        sharders, plan = self._plan_and_sharders(model, pg, planner)
+
+        model = HybridEvalDMP(
+            module=copy.deepcopy(model) if self.deepcopy_model else model,
+            env=ShardingEnv.from_process_group(pg),
+            device=torch.device(self.embedding_device),
+            sharders=sharders,
+            plan=plan,
+        ).to(device)
+        model.share_embedding_memory(pg)
+        return model
+
+    def generate_dense_optimizer(
+        self,
+        sharded_model: nn.Module,
+    ) -> Optimizer:
+        """
+        Generate an optimizer for dense (non-sparse) parameters.
+
+        If skip_dense_optimizer is True, returns a dummy optimizer.
+        """
+        if self.skip_dense_optimizer:
+            return torch.optim.SGD([torch.zeros(1)], lr=0.0)
+
+        dense_params = [
+            param
+            for name, param in sharded_model.named_parameters()
+            if "sparse" not in name
+        ]
+
+        optimizer_kwargs: Dict[str, Any] = {"lr": self.dense_lr}
+        if self.dense_momentum is not None:
+            optimizer_kwargs["momentum"] = self.dense_momentum
+        if self.dense_weight_decay is not None:
+            optimizer_kwargs["weight_decay"] = self.dense_weight_decay
+
+        if self.dense_optimizer.lower() == "shampoo":
+            from torchrec.distributed.test_utils.test_modules import DistributedShampoo
+
+            optimizer_class = DistributedShampoo
+            if "precondition_frequency" not in self.dense_optimizer_kwargs:
+                optimizer_kwargs["precondition_frequency"] = 100
+        else:
+            optimizer_class = getattr(optim, self.dense_optimizer)
+
+        optimizer_kwargs.update(self.dense_optimizer_kwargs)
+        return optimizer_class(dense_params, **optimizer_kwargs)
+
     def generate_sharded_model_and_optimizer(
         self,
         model: nn.Module,
@@ -309,64 +496,13 @@ class ShardingConfig:
         """
         Generate a sharded model and optimizer for distributed training.
 
-        Args:
-            model: The model to be sharded
-            pg: Process group for distributed training
-            device: Device to place the model on
-            planner: Optional planner for sharding strategy
-
-        Returns:
-            Tuple of sharded model and optimizer
+        Dispatches to generate_dmp_model or generate_hybrid_dmp_model based
+        on whether embedding_device is set, then creates the dense optimizer.
         """
-        # Convert fused_params and create sharders
-        converted_fused_params = self._convert_fused_params()
-        sharders = _get_sharders_with_fused_params(converted_fused_params)
-
-        # Use planner if provided
-        plan = None
-        if planner is not None:
-            if pg is not None:
-                plan = planner.collective_plan(model, sharders, pg)
-            else:
-                # pyrefly: ignore[bad-argument-type, missing-argument]
-                plan = planner.plan(model, sharders)
-
-        sharded_model = DistributedModelParallel(
-            module=copy.deepcopy(model),
-            env=ShardingEnv.from_process_group(pg),
-            init_data_parallel=True,
-            device=device,
-            sharders=sharders,
-            plan=plan,
-        ).to(device)
-
-        # Get dense parameters
-        dense_params = [
-            param
-            for name, param in sharded_model.named_parameters()
-            if "sparse" not in name
-        ]
-
-        # Build common optimizer kwargs
-        optimizer_kwargs: Dict[str, Any] = {"lr": self.dense_lr}
-        if self.dense_momentum is not None:
-            optimizer_kwargs["momentum"] = self.dense_momentum
-        if self.dense_weight_decay is not None:
-            optimizer_kwargs["weight_decay"] = self.dense_weight_decay
-
-        # Get the appropriate optimizer class
-        if self.dense_optimizer.lower() == "shampoo":
-            from torchrec.distributed.test_utils.test_modules import DistributedShampoo
-
-            optimizer_class = DistributedShampoo
-            # Default precondition_frequency to 100 to amortize the expensive
-            # preconditioner computation (O(d^3)) across steps.
-            if "precondition_frequency" not in self.dense_optimizer_kwargs:
-                optimizer_kwargs["precondition_frequency"] = 100
+        if self.embedding_device:
+            sharded_model = self.generate_hybrid_dmp_model(model, pg, device, planner)
         else:
-            optimizer_class = getattr(optim, self.dense_optimizer)
+            sharded_model = self.generate_dmp_model(model, pg, device, planner)
 
-        optimizer_kwargs.update(self.dense_optimizer_kwargs)
-        optimizer = optimizer_class(dense_params, **optimizer_kwargs)
-
+        optimizer = self.generate_dense_optimizer(sharded_model)
         return sharded_model, optimizer

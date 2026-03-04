@@ -104,3 +104,5 @@ class EmbeddingTrainPipelineContext(TrainPipelineContext):
 @dataclass
 class CPUEmbeddingTrainPipelineContext(EmbeddingTrainPipelineContext):
     dense_gpu_device: str = field(default_factory=str)
+    # Populated by Stage 2 (copy_to_gpu): embedding results already on GPU, keyed by module FQN
+    gpu_embedding_outputs: Dict[str, Any] = field(default_factory=dict)

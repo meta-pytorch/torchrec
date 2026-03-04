@@ -47,5 +47,3 @@ EmbeddingTablesConfig:
     - []
 PlannerConfig:
   pooling_factors: [10.0]
-  hardware:  # A100
-    hbm_cap: 85899345920  # 80GB
