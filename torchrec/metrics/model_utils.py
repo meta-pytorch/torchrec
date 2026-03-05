@@ -61,8 +61,12 @@ def parse_model_outputs(
         assert not weight_name, "weight name must be empty if prediction name is empty"
         return (labels, None, None)
     assert isinstance(labels, torch.Tensor)
+    if prediction_name not in model_out:
+        raise ValueError(f"Prediction name {prediction_name} not found in model output")
     predictions = model_out[prediction_name].squeeze()
     assert isinstance(predictions, torch.Tensor)
+    if weight_name not in model_out:
+        raise ValueError(f"Weight {weight_name} not found in model output")
     weights = model_out[weight_name].squeeze()
     assert isinstance(weights, torch.Tensor)
 
@@ -81,25 +85,25 @@ def parse_model_outputs(
             if is_vector_valued_label_and_prediction:
                 logger.warning(
                     f"""
-                    Vector valued labels and predictions are provided. 
+                    Vector valued labels and predictions are provided.
 
-                    For vector valued label and prediction we should have shapes 
+                    For vector valued label and prediction we should have shapes
                     labels.shape: (batch_size, dim_vector_valued_label)
                     predictions.shape: (batch_size, dim_vector_valued_prediction)
                     weights.shape: (batch_size,)
 
-                    The provided labels, predictions and weights comply with the conditions for vector valued labels and predictions. 
-                    These conditions are: 
+                    The provided labels, predictions and weights comply with the conditions for vector valued labels and predictions.
+                    These conditions are:
                     1. labels.dim() == 2
                     2. predictions.dim() == 2
                     3. weights.dim() == 1
                     4. labels.size()[0] == predictions.size()[0]
                     5. labels.size()[0] == weights.size()[0]
 
-                    The shapes of labels, predictions and weights are: 
-                    labels.shape == {labels.shape}, 
-                    predictions.shape == {predictions.shape}, 
-                    weights.shape == {weights.shape} 
+                    The shapes of labels, predictions and weights are:
+                    labels.shape == {labels.shape},
+                    predictions.shape == {predictions.shape},
+                    weights.shape == {weights.shape}
                     """
                 )
             else:
