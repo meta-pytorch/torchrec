@@ -14,6 +14,7 @@ from typing import Any, cast, Dict, List, Optional, Type, TypeVar
 import torch
 from torchrec.distributed.embedding_types import KJTList
 from torchrec.distributed.embeddingbag import (
+    _create_mean_pooling_divisor,
     EmbeddingBagCollectionContext,
     EmbeddingBagCollectionSharder,
     ShardedEmbeddingBagCollection,
@@ -118,11 +119,52 @@ class ShardedManagedCollisionEmbeddingBagCollection(
                     # pyrefly: ignore[missing-attribute]
                     ctx.inverse_indices
                 )
+            # For mean pooling
+            if self._embedding_module._has_mean_pooling_callback:
+                self._embedding_module._init_mean_pooling_callback(
+                    features.keys(),
+                    # pyrefly: ignore[missing-attribute]
+                    ctx.inverse_indices,
+                )
+
+        with torch.no_grad():
+            skip_permute = False
+            if self._managed_collision_collection._features_order:
+                skip_permute = True
+                features = features.permute(
+                    self._managed_collision_collection._features_order,
+                    # pyrefly: ignore[bad-argument-type]
+                    self._managed_collision_collection._features_order_tensor,
+                )
+
+            # TODO: Consider turning this into a hook inside mc_modules and remove skip_permute
+            #   from mc_modules, and fix all the private methods to be public.
+            if self._embedding_module._has_mean_pooling_callback:
+                emb_mod = self._embedding_module
+                # pyrefly: ignore[missing-attribute]
+                ctx.divisor = _create_mean_pooling_divisor(
+                    lengths=features.lengths(),
+                    stride=features.stride(),
+                    keys=features.keys(),
+                    offsets=features.offsets(),
+                    pooling_type_to_rs_features=emb_mod._pooling_type_to_rs_features,
+                    stride_per_key=features.stride_per_key(),
+                    dim_per_key=emb_mod._dim_per_key,
+                    embedding_names=emb_mod._embedding_names,
+                    embedding_dims=emb_mod._embedding_dims,
+                    variable_batch_per_feature=ctx.variable_batch_per_feature,
+                    kjt_inverse_order=emb_mod._kjt_inverse_order,
+                    kjt_key_indices=emb_mod._kjt_key_indices,
+                    kt_key_ordering=emb_mod._kt_key_ordering,
+                    inverse_indices=ctx.inverse_indices,
+                    weights=features.weights_or_none(),
+                )
 
         return self._managed_collision_collection.input_dist(
             # pyrefly: ignore[bad-argument-type]
             ctx,
             features,
+            skip_permute,
         )
 
 
