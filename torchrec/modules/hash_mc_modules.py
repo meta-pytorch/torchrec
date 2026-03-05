@@ -272,10 +272,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             assert (
                 self._percent_reserved_slots > 0
             ), "percent_reserved_slots must be positive when opt_in_prob is positive"
-            assert (
-                self._eviction_policy_name is None
-                or self._eviction_policy_name != HashZchEvictionPolicyName.LRU_EVICTION
-            ), "LRU eviction is not compatible with opt-in at this time"
         self._disable_fallback: bool = disable_fallback
         self._track_id_freq: bool = track_id_freq
 
@@ -574,6 +570,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 # record the on-device remapped ids
                 self.table_name_on_device_remapped_ids_dict[name] = remapped_ids.clone()
                 lengths: torch.Tensor = feature.lengths()
+                offsets: Optional[torch.Tensor] = feature.offsets()
                 hit_indices: torch.Tensor = remapped_ids != -1
                 if self._disable_fallback:
                     # Only works on GPU when read only is true.
@@ -587,6 +584,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                         remapped_ids = remapped_ids[hit_indices]
                     if mutate_miss_lengths:
                         lengths = torch.masked_fill(lengths, ~hit_indices, 0)
+                        # Set offsets to None such that it can be re-calculated in KJT when needed.
+                        offsets = None
                 if self._scalar_logger is not None:
                     assert identities_0 is not None
                     self._scalar_logger.update(
@@ -610,7 +609,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 remapped_features[name] = JaggedTensor(
                     values=remapped_ids,
                     lengths=lengths,
-                    offsets=feature.offsets(),
+                    offsets=offsets,
                     weights=feature.weights_or_none(),
                 )
 
