@@ -33,6 +33,12 @@ FUSED_PARAM_SSD_TABLE_LIST: str = "__register_ssd_table_list"
 # Bool fused param per table to check if the table is offloaded to SSD
 FUSED_PARAM_IS_SSD_TABLE: str = "__register_is_ssd_table"
 
+# Embedding table index type for int32 support. Defaults to torch.int64 if not specified.
+FUSED_PARAM_EMBEDDING_TABLE_INDEX_TYPE: str = "embedding_table_index_type"
+
+# Embedding table offset type for int32 support. Defaults to torch.int64 if not specified.
+FUSED_PARAM_EMBEDDING_TABLE_OFFSET_TYPE: str = "embedding_table_offset_type"
+
 
 class TBEToRegisterMixIn:
     def get_tbes_to_register(
@@ -122,3 +128,33 @@ def tbe_fused_params(
         fused_params_for_tbe.pop(FUSED_PARAM_SSD_TABLE_LIST)
 
     return fused_params_for_tbe
+
+
+def get_embedding_table_index_type(
+    fused_params: Optional[Dict[str, Any]],
+) -> torch.dtype:
+    """Get embedding table index type from fused_params.
+
+    Defaults to torch.int64 if not specified.
+    """
+    if (
+        fused_params is None
+        or FUSED_PARAM_EMBEDDING_TABLE_INDEX_TYPE not in fused_params
+    ):
+        return torch.int64
+    return fused_params[FUSED_PARAM_EMBEDDING_TABLE_INDEX_TYPE]
+
+
+def get_embedding_table_offset_type(
+    fused_params: Optional[Dict[str, Any]],
+) -> torch.dtype:
+    """Get embedding table offset type from fused_params.
+
+    Defaults to torch.int64 if not specified.
+    """
+    if (
+        fused_params is None
+        or FUSED_PARAM_EMBEDDING_TABLE_OFFSET_TYPE not in fused_params
+    ):
+        return torch.int64
+    return fused_params[FUSED_PARAM_EMBEDDING_TABLE_OFFSET_TYPE]
