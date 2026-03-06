@@ -11,6 +11,7 @@ import abc
 import copy
 import logging as logger
 from collections import defaultdict, OrderedDict
+from functools import wraps
 from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Set, Tuple, Type
 
 import torch
@@ -30,6 +31,7 @@ from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.collective_utils import create_on_rank_and_share_result
 from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.model_tracker.model_delta_tracker import (
     ModelDeltaTracker,
     ModelDeltaTrackerTrec,
@@ -40,7 +42,6 @@ from torchrec.distributed.model_tracker.types import (
     ModelTrackerConfigs,
     RawIdTrackerConfig,
     Trackers,
-    UniqueRows,
 )
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.sharding_plan import get_default_sharders
@@ -61,7 +62,6 @@ from torchrec.distributed.utils import (
     append_prefix,
     copy_to_device,
     filter_state_dict,
-    none_throws,
     sharded_model_copy,
 )
 from torchrec.optim.fused import FusedOptimizerModule
@@ -75,6 +75,40 @@ except OSError:
 
 
 _DDP_STATE_DICT_PREFIX = "module."
+
+
+def _populate_updatable_modules(
+    func: Callable[..., nn.Module],
+) -> Callable[..., nn.Module]:
+    """
+    Decorator that populates the list of modules that can be updated with kjt.
+    Specifically, modules with enable_embedding_update flag set to True.
+
+    Applied to _shard_modules_impl to automatically process returned modules.
+    """
+
+    @wraps(func)
+    def wrapper(
+        self: "DistributedModelParallel",
+        module: nn.Module,
+        path: str = "",
+        module_id_cache: Optional[Dict[str, "ShardedModule"]] = None,
+    ) -> nn.Module:
+        result = func(self, module, path, module_id_cache)
+
+        module_id = id(result)
+        if module_id_cache and module_id in module_id_cache:
+            # skip adding duplicate one
+            return result
+
+        if isinstance(result, ShardedEmbeddingCollection) and getattr(
+            result, "enable_embedding_update", False
+        ):
+            self._writable_sharded_modules.append(result)
+
+        return result
+
+    return wrapper
 
 
 class DataParallelWrapper(abc.ABC):
@@ -297,6 +331,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
                 # pyrefly: ignore[bad-argument-type, missing-argument]
                 plan = planner.plan(module, self.sharders)
         self._plan: ShardingPlan = plan
+        self._writable_sharded_modules: list[ShardedEmbeddingCollection] = []
         self._dmp_wrapped_module: nn.Module = self._init_dmp(module)
         self._optim: CombinedOptimizer = self._init_optim(self._dmp_wrapped_module)
 
@@ -462,6 +497,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             )
         return fused_optims
 
+    @_populate_updatable_modules
     def _shard_modules_impl(
         self,
         module: nn.Module,
@@ -612,6 +648,18 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         strict: bool = True,
     ) -> _IncompatibleKeys:
         return self._load_state_dict(self, state_dict, prefix, strict)
+
+    def write(self, *input, **kwargs) -> None:
+        """
+        Write features to the sharded module if it has enable_embedding_update flag.
+        """
+        if len(self._writable_sharded_modules) == 0:
+            raise RuntimeError(
+                "No writable sharded modules found. Please check `enable_embedding_update` flag in your embedding config"
+            )
+
+        for module in self._writable_sharded_modules:
+            module.write(*input, **kwargs)
 
     def _load_state_dict(
         self,
