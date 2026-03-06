@@ -50,7 +50,7 @@ class DeferrableMetrics:
 
     def subscribe(
         self,
-        callback: Callable[[dict[str, Any]], None],
+        callback: Callable[[dict[str, Any]], Any],
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         """Register a callback for when metrics are available.
