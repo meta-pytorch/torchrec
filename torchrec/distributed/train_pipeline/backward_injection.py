@@ -63,6 +63,7 @@ class InjectionSite:
     """
 
     fqn: str
+    use_output_tensor: bool = True
 
     def find_target_module(self, model: nn.Module) -> Optional[nn.Module]:
         """
@@ -140,7 +141,10 @@ def register_backward_hook(
         input: Any,
         output: Any,
     ) -> None:
-        tensor = site.find_grad_tensor(output)
+        if site.use_output_tensor:
+            tensor = site.find_grad_tensor(output)
+        else:
+            tensor = site.find_grad_tensor(input)
         if tensor is None:
             raise RuntimeError(
                 f"register_hook: no grad-requiring tensor in "

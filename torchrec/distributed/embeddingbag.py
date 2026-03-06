@@ -55,6 +55,7 @@ from torchrec.distributed.fused_params import (
     FUSED_PARAM_IS_SSD_TABLE,
     FUSED_PARAM_SSD_TABLE_LIST,
 )
+from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.sharding.cw_sharding import CwPooledEmbeddingSharding
 from torchrec.distributed.sharding.dp_sharding import DpPooledEmbeddingSharding
 from torchrec.distributed.sharding.dynamic_sharding import (
@@ -1857,6 +1858,11 @@ class ShardedEmbeddingBagCollection(
             ):
                 # with fully sharded 2D enabled, it returns an awaitable for the reduce scatter and resize operation
                 embs = lookup(features)
+                if MemoryStashingManager.is_enabled():
+                    stash_result = MemoryStashingManager.stash_embedding_weights(lookup)
+                    if stash_result is not None:
+                        await_restore, _ = stash_result
+                        embs.register_hook(await_restore)
                 if hasattr(lookup, "get_resize_awaitables"):
                     # pyrefly: ignore [not-callable]
                     resize_awaitables.extend(lookup.get_resize_awaitables())
