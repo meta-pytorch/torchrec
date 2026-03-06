@@ -9,12 +9,18 @@
 
 import unittest
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import Mock
 
 import torch
 from torch import nn
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+    ShardedEmbeddingTable,
+)
 from torchrec.distributed.memory_stashing import MemoryStashingManager
+from torchrec.modules.embedding_configs import DataType, PoolingType
 
 
 class TestStashTensors(unittest.TestCase):
@@ -111,14 +117,49 @@ class TestStashEmbeddingWeights(unittest.TestCase):
     def tearDown(self) -> None:
         MemoryStashingManager.reset()
 
-    def _create_mock_lookup(self, weights_list: List[torch.Tensor]) -> Mock:
-        """Helper to create a mock lookup with multiple embedding modules."""
+    def _create_mock_lookup(
+        self,
+        weights_list: List[torch.Tensor],
+        stash_weights_list: Optional[List[bool]] = None,
+    ) -> Mock:
+        """Helper to create a mock lookup with multiple embedding modules.
+
+        Args:
+            weights_list: List of weight tensors, one per TBE group.
+            stash_weights_list: If provided, sets _config to a
+                GroupedEmbeddingConfig with a single ShardedEmbeddingTable
+                per group whose stash_weights matches this list. If None,
+                no _config is set (backward-compatible: stash everything).
+        """
         emb_modules = []
-        for weights in weights_list:
+        for i, weights in enumerate(weights_list):
             inner = Mock()
             inner.weights_dev = weights
             emb_module = Mock()
             emb_module._emb_module = inner
+            if stash_weights_list is not None:
+                emb_module._config = GroupedEmbeddingConfig(
+                    data_type=DataType.FP32,
+                    pooling=PoolingType.SUM,
+                    is_weighted=False,
+                    has_feature_processor=False,
+                    compute_kernel=EmbeddingComputeKernel.FUSED,
+                    embedding_tables=[
+                        ShardedEmbeddingTable(
+                            num_embeddings=weights.shape[0],
+                            embedding_dim=weights.shape[1],
+                            name=f"table_{i}",
+                            feature_names=[f"feature_{i}"],
+                            pooling=PoolingType.SUM,
+                            is_weighted=False,
+                            has_feature_processor=False,
+                            compute_kernel=EmbeddingComputeKernel.FUSED,
+                            local_rows=weights.shape[0],
+                            local_cols=weights.shape[1],
+                            stash_weights=stash_weights_list[i],
+                        ),
+                    ],
+                )
             emb_modules.append(emb_module)
 
         lookup = Mock(spec=["_emb_modules"])
@@ -132,7 +173,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         lookup = self._create_mock_lookup([original_weights])
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Verify HBM is freed
         self.assertEqual(original_weights.untyped_storage().size(), 0)
@@ -157,7 +200,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         lookup = self._create_mock_lookup([weights_1, weights_2, weights_3])
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Verify all are stashed
         self.assertEqual(weights_1.untyped_storage().size(), 0)
@@ -186,7 +231,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         lookup = self._create_mock_lookup([original_weights])
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Verify stash worked
         self.assertEqual(original_weights.untyped_storage().size(), 0)
@@ -210,7 +257,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         output = torch.matmul(x, weights.t())
 
         # Stash and restore
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         MemoryStashingManager.restore_embedding_weights()
         await_restore(None)
@@ -250,7 +299,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         lookup = Mock(spec=["_emb_modules"])
         lookup._emb_modules = emb_modules
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Only CUDA weights should be stashed
         self.assertEqual(cuda_weights.untyped_storage().size(), 0)
@@ -286,7 +337,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         lookup = Mock(spec=["_emb_modules"])
         lookup._emb_modules = emb_modules
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Valid weights should be stashed
         self.assertEqual(valid_weights.untyped_storage().size(), 0)
@@ -308,7 +361,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         x = torch.randn(3, 5, device=self.device, requires_grad=True)
         output = torch.matmul(x, weights.t())
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Register restore via class method and await_restore as backward hook
         output.register_hook(
@@ -323,6 +378,106 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         # Weights should be restored after backward
         self.assertGreater(weights.untyped_storage().size(), 0)
         self.assertTrue(torch.allclose(weights, original_values))
+
+    def test_stash_weights_config_filters_tbe_groups(self) -> None:
+        """Test that only TBE groups with stash_weights=True are stashed."""
+        stash_weights = torch.ones((50, 32), device=self.device)
+        no_stash_weights = torch.ones((80, 64), device=self.device) * 2
+
+        stash_original = stash_weights.clone()
+        no_stash_original = no_stash_weights.clone()
+
+        lookup = self._create_mock_lookup(
+            [stash_weights, no_stash_weights],
+            stash_weights_list=[True, False],
+        )
+
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
+
+        # Only the stash_weights=True group should be stashed
+        self.assertEqual(stash_weights.untyped_storage().size(), 0)
+        # The stash_weights=False group should NOT be stashed
+        self.assertGreater(no_stash_weights.untyped_storage().size(), 0)
+        self.assertTrue(torch.allclose(no_stash_weights, no_stash_original))
+
+        # Restore
+        MemoryStashingManager.restore_embedding_weights()
+        await_restore(None)
+
+        # Stashed weights should be restored correctly
+        self.assertTrue(torch.allclose(stash_weights, stash_original))
+        # Non-stashed weights should remain unchanged
+        self.assertTrue(torch.allclose(no_stash_weights, no_stash_original))
+
+    def test_stash_weights_all_false_returns_none(self) -> None:
+        """Test that stash_embedding_weights returns None when all tables have stash_weights=False."""
+        weights_1 = torch.ones((50, 32), device=self.device)
+        weights_2 = torch.ones((80, 64), device=self.device)
+
+        lookup = self._create_mock_lookup(
+            [weights_1, weights_2],
+            stash_weights_list=[False, False],
+        )
+
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNone(result)
+
+        # No weights should be stashed
+        self.assertGreater(weights_1.untyped_storage().size(), 0)
+        self.assertGreater(weights_2.untyped_storage().size(), 0)
+
+    def test_stash_weights_all_true_stashes_all(self) -> None:
+        """Test that all TBE groups are stashed when all have stash_weights=True."""
+        weights_1 = torch.ones((50, 32), device=self.device)
+        weights_2 = torch.ones((80, 64), device=self.device) * 2
+
+        original_1 = weights_1.clone()
+        original_2 = weights_2.clone()
+
+        lookup = self._create_mock_lookup(
+            [weights_1, weights_2],
+            stash_weights_list=[True, True],
+        )
+
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
+
+        # Both should be stashed
+        self.assertEqual(weights_1.untyped_storage().size(), 0)
+        self.assertEqual(weights_2.untyped_storage().size(), 0)
+
+        # Restore
+        MemoryStashingManager.restore_embedding_weights()
+        await_restore(None)
+
+        self.assertTrue(torch.allclose(weights_1, original_1))
+        self.assertTrue(torch.allclose(weights_2, original_2))
+
+    def test_stash_weights_no_config_stashes_all(self) -> None:
+        """Test backward compat: without _config, all TBE groups are stashed."""
+        weights_1 = torch.ones((50, 32), device=self.device)
+        weights_2 = torch.ones((80, 64), device=self.device)
+
+        lookup = self._create_mock_lookup(
+            [weights_1, weights_2],
+            stash_weights_list=None,  # No config set
+        )
+
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+
+        # Both should be stashed (no config = stash everything)
+        self.assertEqual(weights_1.untyped_storage().size(), 0)
+        self.assertEqual(weights_2.untyped_storage().size(), 0)
+
+    def test_is_enabled(self) -> None:
+        """Test is_enabled reflects stream initialization state."""
+        self.assertTrue(MemoryStashingManager.is_enabled())
+        MemoryStashingManager.reset()
+        self.assertFalse(MemoryStashingManager.is_enabled())
 
 
 class TestStashOptimizerState(unittest.TestCase):
