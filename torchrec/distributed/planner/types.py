@@ -279,6 +279,318 @@ class BasicCommsBandwidths(GeneralizedCommsBandwidth):
         )
 
 
+# ============================================================================
+# Topology Configuration Classes
+# ============================================================================
+#
+# These configuration classes provide a structured way to pass parameters
+# to the Topology class. They support a precedence-based resolution:
+#   1. TrainerConfig (explicit user overrides) - HIGHEST PRIORITY
+#   2. HardwareConfig (detected/mapped values)
+#   3. KernelConfig (compute kernel specific)
+#   4. Default constants - LOWEST PRIORITY
+#
+# Usage:
+#   hardware_config = HardwareConfig(...)
+#   trainer_config = TrainerConfig(...)
+#   kernel_config = KernelConfig(...)
+#   topology = TopologyConfig.create_topology(
+#       world_size=8,
+#       hardware_config=hardware_config,
+#       trainer_config=trainer_config,
+#       kernel_config=kernel_config,
+#   )
+# ============================================================================
+
+
+class TopologyConfigBase(abc.ABC):
+    """
+    Abstract base class for all topology configuration classes.
+
+    Provides a common interface for configuration validation, serialization,
+    and extensible key-value storage via additional_params.
+
+    All topology-related configs should inherit from this class and include
+    an `additional_params: Dict[str, Any]` field for extensibility.
+
+    The `additional_params` field provides a generalized mechanism for passing
+    custom data without modifying the schema. This can be used for:
+    - Custom per-device topology data (e.g., CustomTopologyData for heterogeneous setups)
+    - Framework-specific parameters
+    - Hardware-specific metadata (e.g., training_hardware type, LLST info)
+    - Experimental or deprecated parameters during migration
+
+    Attributes:
+        additional_params: Key-value store for framework-specific or extensible data.
+            Allows passing custom configuration without modifying the schema.
+
+    Example Usage:
+        # Pass CustomTopologyData via additional_params
+        trainer_config = TrainerConfig(
+            hbm_cap_bytes=80 * 1024**3,
+            additional_params={
+                "custom_topology_data": CustomTopologyData(
+                    data={"hbm_cap": [40*1024**3, 80*1024**3]},
+                    world_size=2,
+                ),
+            }
+        )
+
+        # Access custom data using helper methods
+        custom_data = trainer_config.get_param("custom_topology_data")
+        if trainer_config.has_param("custom_topology_data"):
+            # Use custom per-device capacities
+            pass
+    """
+
+    # Subclasses must define: additional_params: Dict[str, Any] = field(default_factory=dict)
+    # Note: We declare this as a class attribute rather than an abstract property
+    # because frozen dataclasses define fields as class attributes, not properties.
+    # Using @property @abstractmethod would make the dataclass remain abstract.
+    additional_params: Dict[str, Any]
+
+    def get_param(self, key: str, default: Any = None) -> Any:
+        """
+        Get a value from additional_params with optional default.
+
+        Args:
+            key: The parameter key to look up.
+            default: Value to return if key is not found.
+
+        Returns:
+            The value associated with the key, or default if not found.
+        """
+        return self.additional_params.get(key, default)
+
+    def has_param(self, key: str) -> bool:
+        """
+        Check if a key exists in additional_params.
+
+        Args:
+            key: The parameter key to check.
+
+        Returns:
+            True if the key exists, False otherwise.
+        """
+        return key in self.additional_params
+
+    @abc.abstractmethod
+    def validate(self) -> None:
+        """
+        Validate the configuration parameters.
+
+        Raises:
+            ValueError: If configuration parameters are invalid.
+        """
+        pass
+
+
+@dataclass(frozen=True)
+class HardwareConfig(TopologyConfigBase):
+    """
+    Hardware-related configuration for Topology creation.
+
+    Contains parameters that are typically detected from the hardware environment
+    or mapped from hardware type specifications. These values represent the
+    physical capabilities of the training infrastructure.
+
+    This is a base class that can be extended for specific hardware types
+    (e.g., GrandTeton, ZionEX, MTIA) in framework-specific code to provide
+    hardware-specific defaults and capabilities.
+
+    Attributes:
+        hbm_cap_bytes: HBM (High Bandwidth Memory) capacity per device in bytes.
+            Typically detected via torch.cuda.get_device_properties() or
+            torch.mtia.get_device_properties().
+        ddr_cap_bytes: DDR (host memory) capacity per rank in bytes.
+            Typically detected via psutil.virtual_memory() divided by local_world_size.
+        ssd_cap_bytes: SSD storage capacity per rank in bytes.
+        intra_host_bw: Intra-node communication bandwidth in bytes/ms.
+            High bandwidth interconnect (e.g., NVLink, NVSwitch).
+        inter_host_bw: Inter-node communication bandwidth in bytes/ms.
+            Network bandwidth between nodes (e.g., InfiniBand, RoCE).
+        hbm_mem_bw: HBM memory bandwidth in bytes/ms.
+        ddr_mem_bw: DDR memory bandwidth in bytes/ms.
+        hbm_to_ddr_mem_bw: HBM to DDR transfer bandwidth in bytes/ms (for UVM).
+        ssd_mem_bw: SSD memory bandwidth in bytes/ms.
+        additional_params: Inherited from TopologyConfigBase. Key-value store for
+            framework-specific or extensible data.
+
+    Example Extension (in FB code):
+        @dataclass(frozen=True)
+        class GrandTetonHardwareConfig(HardwareConfig):
+            '''Hardware config with GrandTeton-specific defaults.'''
+            hbm_cap_bytes: int = 80 * 1024**3  # 80GB HBM
+            pod_size: int = 8  # Hardware-specific pod size
+            intra_host_bw: float = 900 * 1024**3 / 1000  # NVSwitch bandwidth
+    """
+
+    # Memory Capacities (detected from hardware APIs)
+    hbm_cap_bytes: Optional[int] = None
+    ddr_cap_bytes: Optional[int] = None
+    ssd_cap_bytes: Optional[int] = None
+
+    # Communication Bandwidths (from hardware type mapping)
+    intra_host_bw: Optional[float] = None
+    inter_host_bw: Optional[float] = None
+
+    # Memory Bandwidths (from hardware type mapping)
+    hbm_mem_bw: Optional[float] = None
+    ddr_mem_bw: Optional[float] = None
+    hbm_to_ddr_mem_bw: Optional[float] = None
+    ssd_mem_bw: Optional[float] = None
+
+    # Extensible Key-Value Store (implements TopologyConfigBase.additional_params)
+    # pyrefly: ignore[bad-override]
+    additional_params: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        """Validate hardware configuration parameters."""
+        # No strict validation required - values are optional and
+        # will use defaults from Topology class if not provided
+        pass
+
+
+@dataclass(frozen=True)
+class TrainerConfig(TopologyConfigBase):
+    """
+    Trainer-specified configuration overrides for Topology creation.
+
+    Contains parameters that users explicitly configure through their training
+    framework (e.g., planner_config, dry_run_config). These values have the
+    highest precedence and override hardware-detected values.
+
+    Attributes:
+        world_size: Total number of devices (ranks) in distributed training.
+            Required parameter for Topology creation.
+        local_world_size: Number of devices (GPUs) per node.
+            Typically from LOCAL_WORLD_SIZE environment variable or explicit config.
+        hbm_cap_bytes: User-specified HBM capacity override in bytes.
+        ddr_cap_bytes: User-specified DDR capacity override in bytes.
+        ssd_cap_bytes: User-specified SSD capacity override in bytes.
+        is_dry_run: Whether this is a dry-run/planning mode execution.
+            When True, dry_run_* values take precedence over detected values.
+        dry_run_hbm_bytes: HBM capacity to use during dry-run in bytes.
+        dry_run_ddr_bytes: DDR capacity to use during dry-run in bytes.
+        pod_size: User-specified pod size override. Number of nodes per
+            NVLink domain, used to calculate intra_group_size.
+        additional_params: Inherited from TopologyConfigBase. Key-value store for
+            trainer-specific or extensible data. Can be used to pass
+            CustomTopologyData for heterogeneous topologies via:
+            `additional_params={"custom_topology_data": CustomTopologyData(...)}`
+    """
+
+    # Distributed Training Topology (required for Topology creation)
+    world_size: Optional[int] = None
+    local_world_size: Optional[int] = None
+
+    # User-specified Memory Overrides (highest priority)
+    hbm_cap_bytes: Optional[int] = None
+    ddr_cap_bytes: Optional[int] = None
+    ssd_cap_bytes: Optional[int] = None
+
+    # Dry-run Mode Configuration
+    is_dry_run: bool = False
+    dry_run_hbm_bytes: Optional[int] = None
+    dry_run_ddr_bytes: Optional[int] = None
+
+    # Topology Overrides
+    pod_size: Optional[int] = None
+
+    # Extensible Key-Value Store (implements TopologyConfigBase.additional_params)
+    # pyrefly: ignore[bad-override]
+    additional_params: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        """Validate trainer configuration parameters."""
+        # Match Topology class validation: pod_size cannot exceed world_size
+        if (
+            self.pod_size is not None
+            and self.world_size is not None
+            and self.pod_size > self.world_size
+        ):
+            raise ValueError(
+                f"pod_size ({self.pod_size}) cannot be greater than "
+                f"world_size ({self.world_size})"
+            )
+
+
+@dataclass(frozen=True)
+class KernelConfig(TopologyConfigBase):
+    """
+    Compute kernel-specific configuration for Topology creation.
+
+    Contains parameters related to the compute device and kernel performance
+    characteristics. These affect how the planner estimates performance for
+    different sharding strategies.
+
+    This is a base class that can be extended for specific kernel/device types
+    (e.g., CUDAKernelConfig, MTIAKernelConfig) in framework-specific code to
+    provide device-specific performance multipliers and communication patterns.
+
+    Attributes:
+        compute_device: The compute device type ("cuda", "mtia", or "cpu").
+        bwd_compute_multiplier: Multiplier for backward compute estimation.
+            Accounts for the additional compute in backward pass vs forward.
+        weighted_feature_bwd_compute_multiplier: Multiplier for weighted feature
+            backward compute estimation.
+        uneven_sharding_perf_multiplier: Performance penalty multiplier for
+            uneven sharding distributions.
+        use_hardware_based_bandwidth: If True, TopologyFactory will compute
+            generalized_comms_bandwidths from detected hardware capability.
+            If False, uses TorchRec defaults (BasicCommsBandwidths).
+        generalized_comms_bandwidths: Custom communication bandwidth model.
+            If provided, overrides both use_hardware_based_bandwidth and
+            intra_host_bw/inter_host_bw from HardwareConfig.
+        additional_params: Inherited from TopologyConfigBase. Key-value store for
+            kernel-specific or extensible data.
+
+    Example Extension (in FB code):
+        @dataclass(frozen=True)
+        class MTIAKernelConfig(KernelConfig):
+            '''Kernel config with MTIA-specific defaults.'''
+            compute_device: str = "mtia"
+            bwd_compute_multiplier: float = 2.5  # MTIA-specific
+            custom_mtia_param: float = 1.0  # Device-specific parameter
+
+        @dataclass(frozen=True)
+        class CUDAFusedKernelConfig(KernelConfig):
+            '''Kernel config optimized for CUDA fused kernels.'''
+            compute_device: str = "cuda"
+            fused_kernel_efficiency: float = 0.95
+    """
+
+    # Compute Device
+    compute_device: str = "cuda"
+
+    # Performance Multipliers
+    bwd_compute_multiplier: float = BWD_COMPUTE_MULTIPLIER
+    weighted_feature_bwd_compute_multiplier: float = (
+        WEIGHTED_FEATURE_BWD_COMPUTE_MULTIPLIER
+    )
+    uneven_sharding_perf_multiplier: float = 1.0
+
+    # Hardware-based Bandwidth Configuration
+    # If True, TopologyFactory computes bandwidths from detected hardware
+    use_hardware_based_bandwidth: bool = False
+
+    # Custom Communication Bandwidth Model (overrides use_hardware_based_bandwidth)
+    generalized_comms_bandwidths: Optional[GeneralizedCommsBandwidth] = None
+
+    # Extensible Key-Value Store (implements TopologyConfigBase.additional_params)
+    # pyrefly: ignore[bad-override]
+    additional_params: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        """Validate kernel configuration parameters."""
+        # Match Topology class validation: compute_device must be valid
+        valid_devices = {"cuda", "mtia", "cpu"}
+        if self.compute_device not in valid_devices:
+            raise ValueError(
+                f"compute_device must be one of {valid_devices}, got '{self.compute_device}'"
+            )
+
+
 class Topology:
     """
     Representation of a network of devices in a cluster.

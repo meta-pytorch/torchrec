@@ -23,11 +23,14 @@ from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.planner.types import (
+    HardwareConfig,
     hash_planner_context_inputs,
+    KernelConfig,
     ParameterConstraints,
     Shard,
     ShardingOption,
     Topology,
+    TrainerConfig,
 )
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
@@ -1081,3 +1084,83 @@ class TestConsistentHashingBetweenProcesses(MultiProcessTestBase):
         )
         hashes = return_hash_dict.values()
         assert hashes[0] == hashes[1], "hash values are different."
+
+
+class TestHardwareConfig(unittest.TestCase):
+    """Tests for HardwareConfig dataclass."""
+
+    def test_hardware_config_functionality(self) -> None:
+        """Test HardwareConfig instantiation and default values."""
+        with self.subTest("instantiation_with_values"):
+            config = HardwareConfig(
+                hbm_cap_bytes=80 * 1024**3,
+                ddr_cap_bytes=512 * 1024**3,
+                intra_host_bw=900 * 1024**3 / 1000,
+            )
+            self.assertEqual(config.hbm_cap_bytes, 80 * 1024**3)
+            self.assertEqual(config.ddr_cap_bytes, 512 * 1024**3)
+            self.assertEqual(config.intra_host_bw, 900 * 1024**3 / 1000)
+
+        with self.subTest("default_values"):
+            config = HardwareConfig()
+            self.assertIsNone(config.hbm_cap_bytes)
+            self.assertIsNone(config.ddr_cap_bytes)
+
+
+class TestTrainerConfig(unittest.TestCase):
+    """Tests for TrainerConfig dataclass."""
+
+    def test_trainer_config_functionality(self) -> None:
+        """Test TrainerConfig instantiation and validation."""
+        with self.subTest("instantiation_with_values"):
+            config = TrainerConfig(
+                world_size=8,
+                local_world_size=8,
+                pod_size=8,
+            )
+            self.assertEqual(config.world_size, 8)
+            self.assertEqual(config.local_world_size, 8)
+            self.assertEqual(config.pod_size, 8)
+
+        with self.subTest("validate_raises_when_pod_size_greater_than_world_size"):
+            config = TrainerConfig(world_size=8, pod_size=16)
+            with self.assertRaises(ValueError) as context:
+                config.validate()
+            self.assertIn(
+                "pod_size (16) cannot be greater than world_size (8)",
+                str(context.exception),
+            )
+
+
+class TestKernelConfig(unittest.TestCase):
+    """Tests for KernelConfig dataclass."""
+
+    def test_kernel_config_functionality(self) -> None:
+        """Test KernelConfig instantiation and validation."""
+        with self.subTest("instantiation_with_values"):
+            config = KernelConfig(
+                compute_device="mtia",
+                bwd_compute_multiplier=2.5,
+            )
+            self.assertEqual(config.compute_device, "mtia")
+            self.assertEqual(config.bwd_compute_multiplier, 2.5)
+
+        with self.subTest("instantiation_with_hardware_based_bandwidth"):
+            config = KernelConfig(
+                compute_device="cuda",
+                use_hardware_based_bandwidth=True,
+            )
+            self.assertEqual(config.compute_device, "cuda")
+            self.assertTrue(config.use_hardware_based_bandwidth)
+            self.assertIsNone(config.generalized_comms_bandwidths)
+
+        with self.subTest("default_use_hardware_based_bandwidth_is_false"):
+            config = KernelConfig()
+            self.assertFalse(config.use_hardware_based_bandwidth)
+
+        with self.subTest("validate_raises_for_invalid_device"):
+            config = KernelConfig(compute_device="invalid_device")
+            with self.assertRaises(ValueError) as context:
+                config.validate()
+            self.assertIn("compute_device must be one of", str(context.exception))
+            self.assertIn("invalid_device", str(context.exception))
