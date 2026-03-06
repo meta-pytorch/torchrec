@@ -74,6 +74,10 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
+from torchrec.distributed.fused_params import (
+    get_embedding_table_index_type,
+    get_embedding_table_offset_type,
+)
 from torchrec.distributed.shards_wrapper import LocalShardsWrapper
 from torchrec.distributed.types import (
     LazyAwaitable,
@@ -1735,6 +1739,12 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
         self._feature_table_map: List[int] = []
         self.table_name_to_count: Dict[str, int] = {}
         self._param_per_table: Dict[str, TableBatchedEmbeddingSlice] = {}
+        self._embedding_table_index_type: torch.dtype = get_embedding_table_index_type(
+            config.fused_params
+        )
+        self._embedding_table_offset_type: torch.dtype = (
+            get_embedding_table_offset_type(config.fused_params)
+        )
 
         for idx, table_config in enumerate(self._config.embedding_tables):
             self._local_rows.append(table_config.local_rows)
@@ -1806,13 +1816,13 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
 
         if len(forward_args) == 0:
             return self.emb_module(
-                indices=features.values().long(),
-                offsets=features.offsets().long(),
+                indices=features.values().to(self._embedding_table_index_type),
+                offsets=features.offsets().to(self._embedding_table_offset_type),
             )
         else:
             return self.emb_module(
-                indices=features.values().long(),
-                offsets=features.offsets().long(),
+                indices=features.values().to(self._embedding_table_index_type),
+                offsets=features.offsets().to(self._embedding_table_offset_type),
                 **forward_args,
             )
 
@@ -2876,6 +2886,12 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         self._lengths_per_emb: List[int] = []
         self.table_name_to_count: Dict[str, int] = {}
         self._param_per_table: Dict[str, TableBatchedEmbeddingSlice] = {}
+        self._embedding_table_index_type: torch.dtype = get_embedding_table_index_type(
+            config.fused_params
+        )
+        self._embedding_table_offset_type: torch.dtype = (
+            get_embedding_table_offset_type(config.fused_params)
+        )
 
         for idx, table_config in enumerate(self._config.embedding_tables):
             self._local_rows.append(table_config.local_rows)
@@ -2971,14 +2987,14 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
 
         if len(forward_args) == 0:
             return self.emb_module(
-                indices=features.values().long(),
-                offsets=features.offsets().long(),
+                indices=features.values().to(self._embedding_table_index_type),
+                offsets=features.offsets().to(self._embedding_table_offset_type),
                 per_sample_weights=weights,
             )
         else:
             return self.emb_module(
-                indices=features.values().long(),
-                offsets=features.offsets().long(),
+                indices=features.values().to(self._embedding_table_index_type),
+                offsets=features.offsets().to(self._embedding_table_offset_type),
                 per_sample_weights=weights,
                 **forward_args,
             )
