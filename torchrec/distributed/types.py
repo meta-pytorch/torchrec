@@ -183,6 +183,19 @@ class ParameterStorage(Enum):
     DDR = "ddr"
 
 
+class ComputeDevice(Enum):
+    """
+    Well-known compute devices, which can be used as constraints by ShardingPlanner.
+    """
+
+    # GPU compute device
+    CUDA = "cuda"
+    # CPU compute device
+    CPU = "cpu"
+    # MTIA compute device
+    MTIA = "mtia"
+
+
 @unique
 class ComputeKernel(Enum):
     DEFAULT = "default"
