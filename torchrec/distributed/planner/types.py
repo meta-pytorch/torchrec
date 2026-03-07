@@ -934,11 +934,52 @@ class ShardingOption:
         self.bounds_check_mode = bounds_check_mode
         self.dependency = dependency
         self._is_pooled = is_pooled
+        if self._is_pooled is None and module[1] is not None:
+            self._is_pooled = ShardingOption.module_pooled(module[1], name)
+        if self._is_pooled is None:
+            self._is_pooled = True
         self.is_weighted: Optional[bool] = None
         self.feature_names: Optional[List[str]] = feature_names
         self.output_dtype: Optional[DataType] = output_dtype
         self.key_value_params: Optional[KeyValueParams] = key_value_params
         self.num_poolings: Optional[List[float]] = num_poolings
+
+        child_module = module[1]
+        if child_module is not None:
+            self._module_type_key: str = (
+                type(child_module).__module__ + "." + type(child_module).__name__
+            )
+            _module_has_fp = (
+                hasattr(child_module, "_feature_processor")
+                and hasattr(
+                    child_module._feature_processor,
+                    "feature_processor_modules",
+                )
+                and isinstance(
+                    # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+                    child_module._feature_processor.feature_processor_modules,
+                    nn.ModuleDict,
+                )
+            )
+            self._has_feature_processor: bool = (
+                _module_has_fp
+                and name
+                # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+                in child_module._feature_processor.feature_processor_modules.keys()
+            )
+            if hasattr(child_module, "is_weighted") and callable(
+                child_module.is_weighted
+            ):
+                from torchrec.modules.embedding_modules import (
+                    EmbeddingBagCollectionInterface,
+                )
+
+                if isinstance(child_module, EmbeddingBagCollectionInterface):
+                    # pyre-ignore[29]: `Module` has no attribute `is_weighted`
+                    self.is_weighted = child_module.is_weighted()
+        else:
+            self._module_type_key: str = ""
+            self._has_feature_processor: bool = False
 
     @property
     def tensor(self) -> torch.Tensor:
@@ -987,8 +1028,7 @@ class ShardingOption:
 
     @property
     def is_pooled(self) -> bool:
-        if self._is_pooled is None:
-            self._is_pooled = ShardingOption.module_pooled(self.module[1], self.name)
+        # pyre-ignore[7]: _is_pooled is always resolved in __init__
         return self._is_pooled
 
     @staticmethod
@@ -1008,6 +1048,14 @@ class ShardingOption:
                         return False
 
         return True
+
+    @property
+    def module_type_key(self) -> str:
+        return self._module_type_key
+
+    @property
+    def has_feature_processor(self) -> bool:
+        return self._has_feature_processor
 
     def get_shards_assignment(self) -> List[Optional[int]]:
         return [shard.rank for shard in self.shards]
