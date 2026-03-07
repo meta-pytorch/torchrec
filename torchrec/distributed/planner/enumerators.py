@@ -318,6 +318,10 @@ class EmbeddingEnumerator(Enumerator):
         return None
 
     @property
+    def sharder_map(self) -> Dict[str, ModuleSharder[nn.Module]]:
+        return self._sharder_map
+
+    @property
     def last_stored_search_space(self) -> Optional[List[ShardingOption]]:
         # NOTE: This is the last search space stored by enumerate(...), do not use
         # this field in place of actually calling enumerate(...) as it will varie for each
