@@ -1857,6 +1857,13 @@ class ShardedEmbeddingBagCollection(
             ):
                 # with fully sharded 2D enabled, it returns an awaitable for the reduce scatter and resize operation
                 embs = lookup(features)
+                # Ensure Triton kernels complete before NCCL collectives.
+                # This is needed because Triton kernels run asynchronously and NCCL may
+                # use a separate stream. The wait_for_forward() method synchronizes via
+                # CUDA events recorded after the Triton kernel completes.
+                if hasattr(lookup, "wait_for_forward"):
+                    # pyre-ignore[29]: `wait_for_forward` is dynamically checked
+                    lookup.wait_for_forward()
                 if hasattr(lookup, "get_resize_awaitables"):
                     # pyrefly: ignore [not-callable]
                     resize_awaitables.extend(lookup.get_resize_awaitables())

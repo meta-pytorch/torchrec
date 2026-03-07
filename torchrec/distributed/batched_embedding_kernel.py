@@ -2576,6 +2576,22 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
 
+    def wait_for_forward(self) -> None:
+        """
+        Wait for any pending Triton forward kernel to complete.
+
+        This should be called before collective operations (e.g., ALLTOALL for
+        output distribution) to ensure the forward kernel has completed on all
+        ranks. Without this synchronization, NCCL collectives may time out
+        because different ranks reach the collective at different times (since
+        Triton kernels run asynchronously).
+
+        The underlying TritonTableBatchedEmbeddingBags records a CUDA event after
+        the forward kernel completes, and this method waits on that event.
+        """
+        if hasattr(self._emb_module, "wait_for_forward"):
+            self._emb_module.wait_for_forward()
+
 
 class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
     """
@@ -3816,6 +3832,18 @@ class TritonBatchedFusedEmbeddingBag(
     @property
     def fused_optimizer(self) -> FusedOptimizer:
         return self._optim
+
+    def wait_for_forward(self) -> None:
+        """
+        Wait for any pending Triton forward kernel to complete on the current stream.
+
+        This is called before NCCL collectives (e.g., AllToAll in output_dist) to ensure
+        the embedding lookup has fully completed. While Triton kernels run on the same
+        stream as PyTorch operations, NCCL collectives may run on a separate NCCL stream.
+        This method ensures proper synchronization via CUDA events.
+        """
+        if hasattr(self._emb_module, "wait_for_forward"):
+            self._emb_module.wait_for_forward()
 
     def forward(
         self,
