@@ -498,6 +498,7 @@ class ShardedEmbeddingCollection(
         self._write_splits: List[int] = []
         self._feature_splits: List[int] = []
         self._features_order: List[int] = []
+        self._writable_embedding_names: set[str] = set()
 
         self._has_uninitialized_input_dist: bool = True
         logger.info(f"EC index dedup enabled: {self._use_index_dedup}.")
@@ -1685,6 +1686,7 @@ class ShardedEmbeddingCollection(
             if sharding.enable_embedding_update:
                 self._write_dists.append(sharding.create_write_dist())
                 self._write_splits.append(sharding._get_num_writable_features())
+                self._writable_embedding_names.update(sharding.embedding_names())
 
     # pyrefly: ignore[bad-override]
     def write_dist(
@@ -1694,6 +1696,10 @@ class ShardedEmbeddingCollection(
             raise ValueError("enable_embedding_update is False for this collection")
         if not self._write_dists:
             self._create_write_dist()
+        if set(embeddings.keys()) != self._writable_embedding_names:
+            raise ValueError(
+                f"write_dist feature names {embeddings.keys()} do not match expected {self._writable_embedding_names}"
+            )
         with torch.no_grad():
             embeddings_by_shards = embeddings.split(self._write_splits)
             awaitables = []
