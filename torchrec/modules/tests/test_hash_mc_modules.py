@@ -26,7 +26,10 @@ from torchrec.modules.hash_mc_evictions import (
     HashZchEvictionConfig,
     HashZchEvictionPolicyName,
 )
-from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
+from torchrec.modules.hash_mc_modules import (
+    _compute_lengths_from_hits,
+    HashZchManagedCollisionModule,
+)
 from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingBagCollection
 from torchrec.modules.mc_modules import (
     ManagedCollisionCollection,
@@ -1042,6 +1045,189 @@ class TestMCH(unittest.TestCase):
             torch.equal(
                 torch.tensor([0, 3, 4], device="cuda:0"),
                 torch.nonzero(row_mask, as_tuple=False).squeeze(),
+            )
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_zch_hash_disable_fallback_sharded_module(self) -> None:
+        # Lengths should not be modified when disabling fallback in traning eval.
+        m = HashZchManagedCollisionModule(
+            zch_size=30,
+            device=torch.device("cuda"),
+            total_num_buckets=2,
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=10,
+            ),
+            max_probe=4,
+            disable_fallback=True,
+            start_bucket=1,
+            end_bucket=2,
+            output_segments=[0, 10, 20],
+            is_inference=False,
+        )
+        jt = JaggedTensor(
+            values=torch.arange(0, 4, dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor(
+                [1, 1, 1, 0, 0, 0, 1, 0], dtype=torch.int64, device="cuda"
+            ),
+        )
+        # Run once to insert ids
+        output0 = m.remap({"test": jt})
+        self.assertTrue(
+            torch.equal(
+                output0["test"].values(),
+                torch.tensor([8, 15, 11], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output0["test"].lengths(),
+                torch.tensor(
+                    [1, 1, 0, 0, 0, 0, 1, 0], dtype=torch.int64, device="cuda:0"
+                ),
+            )
+        )
+        m.eval()
+        self.assertFalse(m.training)
+        jt = JaggedTensor(
+            values=torch.tensor([9, 0, 1, 4, 6, 8], dtype=torch.int64, device="cuda"),
+            # Assume there are two ranks.
+            lengths=torch.tensor(
+                [1, 0, 1, 0, 1, 1, 1, 0, 1, 0, 0, 0],
+                dtype=torch.int64,
+                device="cuda",
+            ),
+        )
+        # Run again in training eval mode and only values 0 and 1 exist.
+        output = m.remap({"test": jt})
+        self.assertTrue(
+            torch.equal(
+                output["test"].values(),
+                torch.tensor([8, 15], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output["test"].lengths(),
+                torch.tensor(
+                    [0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                    dtype=torch.int64,
+                    device="cuda:0",
+                ),
+            )
+        )
+
+    def test_is_sharded_property(self) -> None:
+        # Non-sharded: full module with all buckets
+        m = HashZchManagedCollisionModule(
+            zch_size=20,
+            device=torch.device("cpu"),
+            total_num_buckets=4,
+        )
+        self.assertFalse(m.is_sharded)
+
+        # Sharded via rebuild_with_output_id_range
+        shard = m.rebuild_with_output_id_range((0, 5))
+        self.assertTrue(shard.is_sharded)
+
+        shard2 = m.rebuild_with_output_id_range((5, 10))
+        self.assertTrue(shard2.is_sharded)
+
+        # Full range rebuild is not sharded
+        full = m.rebuild_with_output_id_range((0, 20))
+        self.assertFalse(full.is_sharded)
+
+    def test_is_sharded_with_start_bucket(self) -> None:
+        # Module created directly with start_bucket (simulating a shard)
+        m = HashZchManagedCollisionModule(
+            zch_size=30,
+            device=torch.device("cpu"),
+            total_num_buckets=2,
+            start_bucket=1,
+            output_segments=[0, 10, 20],
+        )
+        self.assertTrue(m.is_sharded)
+
+        # Module with start_bucket=0 and all buckets is not sharded
+        m2 = HashZchManagedCollisionModule(
+            zch_size=20,
+            device=torch.device("cpu"),
+            total_num_buckets=2,
+            start_bucket=0,
+        )
+        self.assertFalse(m2.is_sharded)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_compute_lengths_from_hits(self) -> None:
+        # Simple case: 4 samples, each with 1 ID, some are hits
+        lengths = torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda")
+        hit_indices = torch.tensor([True, False, True, False], device="cuda")
+        result = _compute_lengths_from_hits(lengths, hit_indices)
+        self.assertTrue(
+            torch.equal(
+                result,
+                torch.tensor([1, 0, 1, 0], dtype=torch.int64, device="cuda"),
+            )
+        )
+
+        # Variable lengths: samples with different numbers of IDs
+        lengths = torch.tensor([3, 2, 1], dtype=torch.int64, device="cuda")
+        # 6 IDs total: first 3 belong to sample 0, next 2 to sample 1, last 1 to sample 2
+        hit_indices = torch.tensor(
+            [True, False, True, True, False, True], device="cuda"
+        )
+        result = _compute_lengths_from_hits(lengths, hit_indices)
+        self.assertTrue(
+            torch.equal(
+                result,
+                torch.tensor([2, 1, 1], dtype=torch.int64, device="cuda"),
+            )
+        )
+
+        # All hits
+        lengths = torch.tensor([2, 3], dtype=torch.int64, device="cuda")
+        hit_indices = torch.tensor([True, True, True, True, True], device="cuda")
+        result = _compute_lengths_from_hits(lengths, hit_indices)
+        self.assertTrue(
+            torch.equal(
+                result,
+                torch.tensor([2, 3], dtype=torch.int64, device="cuda"),
+            )
+        )
+
+        # No hits
+        lengths = torch.tensor([2, 3], dtype=torch.int64, device="cuda")
+        hit_indices = torch.tensor([False, False, False, False, False], device="cuda")
+        result = _compute_lengths_from_hits(lengths, hit_indices)
+        self.assertTrue(
+            torch.equal(
+                result,
+                torch.tensor([0, 0], dtype=torch.int64, device="cuda"),
+            )
+        )
+
+        # Sparse lengths (simulating distributed execution with zero-length samples)
+        lengths = torch.tensor(
+            [0, 0, 1, 0, 1, 0, 0, 0, 1, 0, 1, 1], dtype=torch.int64, device="cuda"
+        )
+        hit_indices = torch.tensor([True, False, True, True, False], device="cuda")
+        result = _compute_lengths_from_hits(lengths, hit_indices)
+        self.assertTrue(
+            torch.equal(
+                result,
+                torch.tensor(
+                    [0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0],
+                    dtype=torch.int64,
+                    device="cuda",
+                ),
             )
         )
 
