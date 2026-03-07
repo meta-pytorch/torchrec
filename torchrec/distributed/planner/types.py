@@ -503,12 +503,12 @@ class TrainerConfig(TopologyConfigBase):
 
     def validate(self) -> None:
         """Validate trainer configuration parameters."""
+        # world_size is required for Topology creation
+        if self.world_size is None:
+            raise ValueError("world_size must be provided in TrainerConfig")
+
         # Match Topology class validation: pod_size cannot exceed world_size
-        if (
-            self.pod_size is not None
-            and self.world_size is not None
-            and self.pod_size > self.world_size
-        ):
+        if self.pod_size is not None and self.pod_size > self.world_size:
             raise ValueError(
                 f"pod_size ({self.pod_size}) cannot be greater than "
                 f"world_size ({self.world_size})"
@@ -589,6 +589,135 @@ class KernelConfig(TopologyConfigBase):
             raise ValueError(
                 f"compute_device must be one of {valid_devices}, got '{self.compute_device}'"
             )
+
+
+class TopologyFactory:
+    """
+    Factory for creating Topology instances with precedence-based resolution.
+
+    Resolves parameters in the following order (highest to lowest priority):
+        1. TrainerConfig (explicit user overrides)
+        2. HardwareConfig (detected/mapped values)
+        3. Default constants
+
+    Usage:
+        hardware_config = HardwareConfig(hbm_cap_bytes=80 * 1024**3, ...)
+        trainer_config = TrainerConfig(world_size=8, local_world_size=8, ...)
+        kernel_config = KernelConfig(compute_device="cuda", ...)
+
+        topology = TopologyFactory.create_topology(
+            trainer_config=trainer_config,
+            hardware_config=hardware_config,
+            kernel_config=kernel_config,
+        )
+    """
+
+    @staticmethod
+    def create_topology(
+        trainer_config: TrainerConfig,
+        hardware_config: Optional[HardwareConfig] = None,
+        kernel_config: Optional[KernelConfig] = None,
+    ) -> "Topology":
+        """
+        Create a Topology instance using precedence-based parameter resolution.
+
+        Args:
+            trainer_config: User-specified overrides (required, must have world_size).
+            hardware_config: Hardware-detected values.
+            kernel_config: Compute kernel specific parameters.
+
+        Returns:
+            A configured Topology instance.
+
+        Raises:
+            ValueError: If validation fails on any config.
+        """
+        hardware = hardware_config or HardwareConfig()
+        kernel = kernel_config or KernelConfig()
+
+        # Validate configs
+        trainer_config.validate()
+        kernel.validate()
+
+        # Build topology kwargs with precedence resolution
+        topology_kwargs: Dict[str, Any] = {
+            "world_size": trainer_config.world_size,
+            "compute_device": kernel.compute_device,
+            "bwd_compute_multiplier": kernel.bwd_compute_multiplier,
+            "weighted_feature_bwd_compute_multiplier": kernel.weighted_feature_bwd_compute_multiplier,
+            "uneven_sharding_perf_multiplier": kernel.uneven_sharding_perf_multiplier,
+        }
+
+        # Add optional parameters from configs
+        TopologyFactory._add_trainer_params(topology_kwargs, trainer_config, hardware)
+        TopologyFactory._add_hardware_params(topology_kwargs, hardware)
+        TopologyFactory._add_comms_params(topology_kwargs, hardware, kernel)
+
+        return Topology(**topology_kwargs)
+
+    @staticmethod
+    def _add_trainer_params(
+        kwargs: Dict[str, Any],
+        trainer: TrainerConfig,
+        hardware: HardwareConfig,
+    ) -> None:
+        """Add trainer config parameters with precedence over hardware."""
+        if trainer.local_world_size is not None:
+            kwargs["local_world_size"] = trainer.local_world_size
+        if trainer.pod_size is not None:
+            kwargs["pod_size"] = trainer.pod_size
+
+        # Memory capacities: trainer > hardware > defaults
+        hbm_cap = trainer.hbm_cap_bytes or hardware.hbm_cap_bytes
+        ddr_cap = trainer.ddr_cap_bytes or hardware.ddr_cap_bytes
+        ssd_cap = trainer.ssd_cap_bytes or hardware.ssd_cap_bytes
+
+        # Handle dry-run mode overrides
+        if trainer.is_dry_run:
+            if trainer.dry_run_hbm_bytes is not None:
+                hbm_cap = trainer.dry_run_hbm_bytes
+            if trainer.dry_run_ddr_bytes is not None:
+                ddr_cap = trainer.dry_run_ddr_bytes
+
+        if hbm_cap is not None:
+            kwargs["hbm_cap"] = hbm_cap
+        if ddr_cap is not None:
+            kwargs["ddr_cap"] = ddr_cap
+        if ssd_cap is not None:
+            kwargs["ssd_cap"] = ssd_cap
+
+        # Custom topology data from additional_params
+        custom_topology_data = trainer.get_param("custom_topology_data")
+        if custom_topology_data is not None:
+            kwargs["custom_topology_data"] = custom_topology_data
+
+    @staticmethod
+    def _add_hardware_params(kwargs: Dict[str, Any], hardware: HardwareConfig) -> None:
+        """Add hardware config parameters (memory bandwidths)."""
+        if hardware.hbm_mem_bw is not None:
+            kwargs["hbm_mem_bw"] = hardware.hbm_mem_bw
+        if hardware.ddr_mem_bw is not None:
+            kwargs["ddr_mem_bw"] = hardware.ddr_mem_bw
+        if hardware.hbm_to_ddr_mem_bw is not None:
+            kwargs["hbm_to_ddr_mem_bw"] = hardware.hbm_to_ddr_mem_bw
+        if hardware.ssd_mem_bw is not None:
+            kwargs["ssd_mem_bw"] = hardware.ssd_mem_bw
+
+    @staticmethod
+    def _add_comms_params(
+        kwargs: Dict[str, Any],
+        hardware: HardwareConfig,
+        kernel: KernelConfig,
+    ) -> None:
+        """Add communication bandwidth parameters."""
+        # generalized_comms_bandwidths takes precedence over individual bandwidths
+        if kernel.generalized_comms_bandwidths is not None:
+            kwargs["generalized_comms_bandwidths"] = kernel.generalized_comms_bandwidths
+        else:
+            if hardware.intra_host_bw is not None:
+                kwargs["intra_host_bw"] = hardware.intra_host_bw
+            if hardware.inter_host_bw is not None:
+                kwargs["inter_host_bw"] = hardware.inter_host_bw
 
 
 class Topology:
