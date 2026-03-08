@@ -185,6 +185,23 @@ def runner(
             weighted_tables=weighted_tables,
         )
 
+        total_bytes = 0
+        for i, batch in enumerate(bench_inputs):
+            batch_bytes = batch.size_in_bytes()
+            total_bytes += batch_bytes
+            if batch_bytes >= 1024 * 1024 * 1024:
+                batch_size_str = f"{batch_bytes / 1024 / 1024 / 1024:.2f} GB"
+            else:
+                batch_size_str = f"{batch_bytes / 1024 / 1024:.2f} MB"
+            logger.info(f"Rank {rank} batch {i} input size: {batch_size_str}")
+        if total_bytes >= 1024 * 1024 * 1024:
+            total_size_str = f"{total_bytes / 1024 / 1024 / 1024:.2f} GB"
+        else:
+            total_size_str = f"{total_bytes / 1024 / 1024:.2f} MB"
+        logger.info(
+            f"Rank {rank} total input size: {total_size_str} ({len(bench_inputs)} batches)"
+        )
+
         sharded_model, optimizer = sharding_config.generate_sharded_model_and_optimizer(
             model=unsharded_model,
             # pyrefly: ignore[bad-argument-type]
