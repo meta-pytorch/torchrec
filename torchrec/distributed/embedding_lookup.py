@@ -981,6 +981,23 @@ class GroupedPooledEmbeddingsLookup(
             dim=1,
         )
 
+    def wait_for_forward(self) -> None:
+        """
+        Wait for any pending Triton forward kernels to complete.
+
+        This should be called before NCCL collectives (e.g., AllToAll in output_dist)
+        to ensure all embedding lookups have fully completed. While Triton kernels run
+        on the same CUDA stream as PyTorch operations, NCCL collectives may run on a
+        separate NCCL stream. This method ensures proper synchronization via CUDA events.
+
+        For non-Triton embedding modules (e.g., SplitTBE), this is a no-op since they
+        don't require explicit event-based synchronization.
+        """
+        for emb_module in self._emb_modules:
+            if hasattr(emb_module, "wait_for_forward"):
+                # pyre-ignore[16]: `wait_for_forward` is dynamically checked above
+                emb_module.wait_for_forward()
+
     def get_resize_awaitables(self) -> List[LazyAwaitable[torch.Tensor]]:
         # TODO - we can probably do some smart grouping to make this more efficient
         return [
