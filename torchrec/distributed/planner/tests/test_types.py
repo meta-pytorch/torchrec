@@ -23,6 +23,8 @@ from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.planner.types import (
+    BasicCommsBandwidths,
+    CustomTopologyData,
     HardwareConfig,
     hash_planner_context_inputs,
     KernelConfig,
@@ -30,6 +32,7 @@ from torchrec.distributed.planner.types import (
     Shard,
     ShardingOption,
     Topology,
+    TopologyFactory,
     TrainerConfig,
 )
 from torchrec.distributed.test_utils.multi_process import (
@@ -1122,6 +1125,12 @@ class TestTrainerConfig(unittest.TestCase):
             self.assertEqual(config.local_world_size, 8)
             self.assertEqual(config.pod_size, 8)
 
+        with self.subTest("validate_raises_when_world_size_is_none"):
+            config = TrainerConfig()
+            with self.assertRaises(ValueError) as context:
+                config.validate()
+            self.assertIn("world_size must be provided", str(context.exception))
+
         with self.subTest("validate_raises_when_pod_size_greater_than_world_size"):
             config = TrainerConfig(world_size=8, pod_size=16)
             with self.assertRaises(ValueError) as context:
@@ -1164,3 +1173,221 @@ class TestKernelConfig(unittest.TestCase):
                 config.validate()
             self.assertIn("compute_device must be one of", str(context.exception))
             self.assertIn("invalid_device", str(context.exception))
+
+
+class TestTopologyFactory(unittest.TestCase):
+    """Tests for TopologyFactory.create_topology method."""
+
+    def test_topology_creation_basics(self) -> None:
+        """Test basic topology creation scenarios."""
+        with self.subTest("create_topology_basic"):
+            trainer_config = TrainerConfig(world_size=8, local_world_size=8)
+            kernel_config = KernelConfig(compute_device="cuda")
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                kernel_config=kernel_config,
+            )
+
+            self.assertEqual(topology.world_size, 8)
+            self.assertEqual(topology.local_world_size, 8)
+            self.assertEqual(topology.compute_device, "cuda")
+
+        with self.subTest("create_topology_with_hardware_config"):
+            trainer_config = TrainerConfig(world_size=8, local_world_size=8)
+            hardware_config = HardwareConfig(hbm_cap_bytes=80 * 1024**3)
+            kernel_config = KernelConfig(compute_device="cuda")
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                hardware_config=hardware_config,
+                kernel_config=kernel_config,
+            )
+
+            self.assertEqual(topology.world_size, 8)
+            self.assertEqual(topology.devices[0].storage.hbm, 80 * 1024**3)
+
+        with self.subTest("pod_size_from_trainer_config"):
+            trainer_config = TrainerConfig(
+                world_size=16,
+                local_world_size=8,
+                pod_size=2,
+            )
+
+            topology = TopologyFactory.create_topology(trainer_config=trainer_config)
+
+            # intra_group_size should be pod_size * local_world_size
+            self.assertEqual(topology.intra_group_size, 16)
+
+        with self.subTest("validation_called_on_configs"):
+            trainer_config = TrainerConfig(world_size=8, local_world_size=8)
+            kernel_config = KernelConfig(compute_device="invalid_device")
+
+            with self.assertRaises(ValueError) as context:
+                TopologyFactory.create_topology(
+                    trainer_config=trainer_config,
+                    kernel_config=kernel_config,
+                )
+            self.assertIn("compute_device must be one of", str(context.exception))
+
+    def test_topology_precedence_rules(self) -> None:
+        """Test precedence rules: trainer > hardware > defaults, dry-run overrides."""
+        with self.subTest("trainer_overrides_hardware_hbm"):
+            trainer_config = TrainerConfig(
+                world_size=8,
+                local_world_size=8,
+                hbm_cap_bytes=40 * 1024**3,
+            )
+            hardware_config = HardwareConfig(hbm_cap_bytes=80 * 1024**3)
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                hardware_config=hardware_config,
+            )
+
+            self.assertEqual(topology.devices[0].storage.hbm, 40 * 1024**3)
+
+        with self.subTest("dry_run_overrides_hbm_cap"):
+            trainer_config = TrainerConfig(
+                world_size=8,
+                local_world_size=8,
+                hbm_cap_bytes=80 * 1024**3,
+                is_dry_run=True,
+                dry_run_hbm_bytes=40 * 1024**3,
+            )
+            hardware_config = HardwareConfig(hbm_cap_bytes=100 * 1024**3)
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                hardware_config=hardware_config,
+            )
+
+            self.assertEqual(topology.devices[0].storage.hbm, 40 * 1024**3)
+
+        with self.subTest("dry_run_overrides_ddr_cap"):
+            trainer_config = TrainerConfig(
+                world_size=8,
+                local_world_size=8,
+                ddr_cap_bytes=512 * 1024**3,
+                is_dry_run=True,
+                dry_run_ddr_bytes=256 * 1024**3,
+            )
+            hardware_config = HardwareConfig(ddr_cap_bytes=1024 * 1024**3)
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                hardware_config=hardware_config,
+            )
+
+            self.assertEqual(topology.devices[0].storage.ddr, 256 * 1024**3)
+
+        with self.subTest("ssd_capacity_precedence"):
+            trainer_config = TrainerConfig(
+                world_size=8,
+                local_world_size=8,
+                ssd_cap_bytes=500 * 1024**3,
+            )
+            hardware_config = HardwareConfig(ssd_cap_bytes=1000 * 1024**3)
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                hardware_config=hardware_config,
+            )
+
+            self.assertEqual(topology.devices[0].storage.ssd, 500 * 1024**3)
+
+        with self.subTest("custom_topology_data_from_additional_params"):
+            custom_data = CustomTopologyData(
+                data={"hbm_cap": [40 * 1024**3, 80 * 1024**3]},
+                world_size=2,
+            )
+            trainer_config = TrainerConfig(
+                world_size=2,
+                local_world_size=2,
+                additional_params={"custom_topology_data": custom_data},
+            )
+
+            topology = TopologyFactory.create_topology(trainer_config=trainer_config)
+
+            self.assertEqual(topology.devices[0].storage.hbm, 40 * 1024**3)
+            self.assertEqual(topology.devices[1].storage.hbm, 80 * 1024**3)
+
+    def test_topology_bandwidth_and_multipliers(self) -> None:
+        """Test bandwidth and multiplier configurations."""
+        with self.subTest("kernel_config_multipliers_applied"):
+            trainer_config = TrainerConfig(world_size=8, local_world_size=8)
+            kernel_config = KernelConfig(
+                compute_device="cuda",
+                bwd_compute_multiplier=3.0,
+                weighted_feature_bwd_compute_multiplier=2.5,
+                uneven_sharding_perf_multiplier=1.5,
+            )
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                kernel_config=kernel_config,
+            )
+
+            self.assertEqual(topology.bwd_compute_multiplier, 3.0)
+            self.assertEqual(topology.weighted_feature_bwd_compute_multiplier, 2.5)
+            self.assertEqual(topology.uneven_sharding_perf_multiplier, 1.5)
+
+        with self.subTest("generalized_comms_bandwidths_overrides_hardware_bw"):
+            trainer_config = TrainerConfig(world_size=8, local_world_size=8)
+            hardware_config = HardwareConfig(
+                intra_host_bw=100.0,
+                inter_host_bw=50.0,
+            )
+            custom_comms = BasicCommsBandwidths(
+                intra_host_bw=200.0,
+                inter_host_bw=100.0,
+            )
+            kernel_config = KernelConfig(
+                compute_device="cuda",
+                generalized_comms_bandwidths=custom_comms,
+            )
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                hardware_config=hardware_config,
+                kernel_config=kernel_config,
+            )
+
+            self.assertEqual(topology.intra_host_bw, 200.0)
+            self.assertEqual(topology.inter_host_bw, 100.0)
+
+        with self.subTest("hardware_bandwidths_used_when_no_generalized_comms"):
+            trainer_config = TrainerConfig(world_size=8, local_world_size=8)
+            hardware_config = HardwareConfig(
+                intra_host_bw=150.0,
+                inter_host_bw=75.0,
+            )
+            kernel_config = KernelConfig(compute_device="cuda")
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                hardware_config=hardware_config,
+                kernel_config=kernel_config,
+            )
+
+            self.assertEqual(topology.intra_host_bw, 150.0)
+            self.assertEqual(topology.inter_host_bw, 75.0)
+
+        with self.subTest("memory_bandwidths_from_hardware_config"):
+            trainer_config = TrainerConfig(world_size=8, local_world_size=8)
+            hardware_config = HardwareConfig(
+                hbm_mem_bw=1000.0,
+                ddr_mem_bw=200.0,
+                hbm_to_ddr_mem_bw=50.0,
+                ssd_mem_bw=10.0,
+            )
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                hardware_config=hardware_config,
+            )
+
+            self.assertEqual(topology.hbm_mem_bw, 1000.0)
+            self.assertEqual(topology.ddr_mem_bw, 200.0)
+            self.assertEqual(topology.hbm_to_ddr_mem_bw, 50.0)
+            self.assertEqual(topology.ssd_mem_bw, 10.0)
