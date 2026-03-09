@@ -834,6 +834,7 @@ class ShardedManagedCollisionCollection(
                 )
 
             values: torch.Tensor
+            lengths: torch.Tensor
             if len(splits) > 1:
                 # features per shard split by tables
                 feature_splits = features.split(splits)
@@ -843,15 +844,17 @@ class ShardedManagedCollisionCollection(
                     output.update(mc_input)
 
                 values = torch.cat([jt.values() for jt in output.values()])
+                lengths = torch.cat([jt.lengths() for jt in output.values()])
             else:
                 table: str = tables[0]
                 mc_input = self.get_lookup_value(table, features)
                 values = mc_input[table].values()
+                lengths = mc_input[table].lengths()
             remapped_kjts.append(
                 KeyedJaggedTensor(
                     keys=fns,
                     values=values,
-                    lengths=features.lengths(),
+                    lengths=lengths,
                     # original weights instead of features splits
                     weights=features.weights_or_none(),
                     stride_per_key_per_rank=features._stride_per_key_per_rank,

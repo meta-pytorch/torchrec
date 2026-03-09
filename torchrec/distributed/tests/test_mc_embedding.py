@@ -16,11 +16,16 @@ import torch.nn as nn
 from hypothesis import given, settings, strategies as st
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.mc_embedding import (
+    KJTList,
     ManagedCollisionEmbeddingCollectionSharder,
     ShardedManagedCollisionEmbeddingCollection,
 )
-from torchrec.distributed.mc_modules import ShardedManagedCollisionCollection
+from torchrec.distributed.mc_modules import (
+    ManagedCollisionCollectionContext,
+    ShardedManagedCollisionCollection,
+)
 from torchrec.distributed.shard import _shard_modules
+from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.sharding_plan import (
     construct_module_sharding_plan,
     EmbeddingCollectionSharder,
@@ -1273,4 +1278,139 @@ class ShardedMCEmbeddingCollectionParallelTest(MultiProcessTestBase):
             sharder=ManagedCollisionEmbeddingCollectionSharder(),
             backend=backend,
             allow_in_place_embed_weight_update=allow_in_place_embed_weight_update,
+        )
+
+
+class ComputeOutputLengthTest(unittest.TestCase):
+    """Test that ShardedManagedCollisionCollection.compute uses
+    mc_module output lengths rather than input feature lengths."""
+
+    def test_compute_single_table_uses_mc_output_lengths(self) -> None:
+        """Single-table path (len(splits) == 1): compute should use
+        mc_input[table].lengths(), not features.lengths()."""
+        smcc = object.__new__(ShardedManagedCollisionCollection)
+        smcc._sharding_tables = [["table_0"]]
+        smcc._sharding_per_table_feature_splits = [[2]]
+        smcc._sharding_features = [["feature_0", "feature_1"]]
+
+        input_lengths = torch.tensor([2, 1, 1, 3])
+        input_kjt = KeyedJaggedTensor(
+            keys=["feature_0", "feature_1"],
+            values=torch.arange(7, dtype=torch.long),
+            lengths=input_lengths,
+        )
+
+        # MC module returns different lengths than input
+        mc_output_lengths = torch.tensor([1, 2, 2, 2])
+
+        def mock_get_lookup_value(
+            table: str, features: KeyedJaggedTensor
+        ) -> Dict[str, JaggedTensor]:
+            return {
+                table: JaggedTensor(
+                    values=torch.arange(7, dtype=torch.long),
+                    lengths=mc_output_lengths,
+                )
+            }
+
+        smcc.get_lookup_value = mock_get_lookup_value
+
+        ctx = ManagedCollisionCollectionContext(
+            sharding_contexts=[SequenceShardingContext()]
+        )
+
+        result = smcc.compute(ctx, KJTList([input_kjt]))
+
+        self.assertTrue(
+            torch.equal(result[0].lengths(), mc_output_lengths),
+            f"Expected lengths {mc_output_lengths}, got {result[0].lengths()}. "
+            "compute should use lengths from mc_module output.",
+        )
+
+    def test_compute_multi_table_uses_mc_output_lengths(self) -> None:
+        """Multi-table path (len(splits) > 1): compute should use
+        concatenated lengths from mc_module outputs, not features.lengths()."""
+        smcc = object.__new__(ShardedManagedCollisionCollection)
+        smcc._sharding_tables = [["table_0", "table_1"]]
+        smcc._sharding_per_table_feature_splits = [[1, 1]]
+        smcc._sharding_features = [["feature_0", "feature_1"]]
+
+        input_lengths = torch.tensor([2, 1, 1, 3])
+        input_kjt = KeyedJaggedTensor(
+            keys=["feature_0", "feature_1"],
+            values=torch.arange(7, dtype=torch.long),
+            lengths=input_lengths,
+        )
+
+        mc_lengths_table_0 = torch.tensor([1, 2])
+        mc_lengths_table_1 = torch.tensor([2, 2])
+
+        def mock_get_lookup_value(
+            table: str, features: KeyedJaggedTensor
+        ) -> Dict[str, JaggedTensor]:
+            if table == "table_0":
+                return {
+                    table: JaggedTensor(
+                        values=torch.tensor([10, 20, 30], dtype=torch.long),
+                        lengths=mc_lengths_table_0,
+                    )
+                }
+            return {
+                table: JaggedTensor(
+                    values=torch.tensor([40, 50, 60, 70], dtype=torch.long),
+                    lengths=mc_lengths_table_1,
+                )
+            }
+
+        smcc.get_lookup_value = mock_get_lookup_value
+
+        ctx = ManagedCollisionCollectionContext(
+            sharding_contexts=[SequenceShardingContext()]
+        )
+
+        result = smcc.compute(ctx, KJTList([input_kjt]))
+
+        expected_lengths = torch.cat([mc_lengths_table_0, mc_lengths_table_1])
+        self.assertTrue(
+            torch.equal(result[0].lengths(), expected_lengths),
+            f"Expected lengths {expected_lengths}, got {result[0].lengths()}. "
+            "compute should use concatenated mc_module output lengths.",
+        )
+
+    def test_compute_preserves_lengths_when_mc_unchanged(self) -> None:
+        """When mc_module preserves lengths (standard MCH behavior),
+        output lengths should match input lengths."""
+        smcc = object.__new__(ShardedManagedCollisionCollection)
+        smcc._sharding_tables = [["table_0"]]
+        smcc._sharding_per_table_feature_splits = [[1]]
+        smcc._sharding_features = [["feature_0"]]
+
+        input_lengths = torch.tensor([2, 1])
+        input_kjt = KeyedJaggedTensor(
+            keys=["feature_0"],
+            values=torch.arange(3, dtype=torch.long),
+            lengths=input_lengths,
+        )
+
+        def mock_get_lookup_value(
+            table: str, features: KeyedJaggedTensor
+        ) -> Dict[str, JaggedTensor]:
+            return {
+                table: JaggedTensor(
+                    values=torch.tensor([10, 20, 30], dtype=torch.long),
+                    lengths=input_lengths.clone(),
+                )
+            }
+
+        smcc.get_lookup_value = mock_get_lookup_value
+
+        ctx = ManagedCollisionCollectionContext(
+            sharding_contexts=[SequenceShardingContext()]
+        )
+
+        result = smcc.compute(ctx, KJTList([input_kjt]))
+
+        self.assertTrue(
+            torch.equal(result[0].lengths(), input_lengths),
+            f"Expected lengths {input_lengths}, got {result[0].lengths()}.",
         )
