@@ -39,6 +39,40 @@ def _tensor_may_to_device(
     return (src, src_device)
 
 
+def _compute_lengths_from_hits(
+    lengths: torch.Tensor,
+    hit_indices: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute new lengths by counting hits within each sample's ID range.
+
+    In distributed (Row-Wise sharded) execution, `lengths` has one entry per sample
+    in the global batch (most are 0 for samples on other ranks), while `hit_indices`
+    has one entry per ID value (local to this rank). This function correctly computes
+    the new lengths by counting how many IDs per sample are hits.
+
+    Args:
+        lengths: Original lengths tensor with shape [num_samples]. Each entry is the
+            number of IDs for that sample. Most entries are 0 in distributed execution.
+        hit_indices: Boolean tensor with shape [num_ids] indicating which IDs are hits.
+
+    Returns:
+        New lengths tensor with shape [num_samples] where each entry is the count of
+        hits for that sample.
+    """
+    # Compute offsets from lengths
+    offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
+
+    # Use segment_sum_csr to count hits per sample
+    # segment_sum_csr expects: (scale, offsets, values) and sums values within each segment
+    new_lengths = torch.ops.fbgemm.segment_sum_csr(
+        1,  # scale factor
+        offsets,
+        hit_indices.to(lengths.dtype),
+    )
+    return new_lengths
+
+
 class TrainInputMapper(torch.nn.Module):
     """
     Module used to generate sizes and offsets information corresponding to
@@ -377,6 +411,11 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
     def buckets(self) -> int:
         return self._buckets
 
+    @property
+    def is_sharded(self) -> bool:
+        # For sharded hash mc module, the buckets are split across multiple ranks.
+        return (self._end_bucket - self._start_bucket) < self._buckets
+
     # TODO: This is hacky as we are using parameters to go through publishing.
     # Can remove once working out buffer solution.
     def named_buffers(
@@ -583,7 +622,13 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     else:
                         remapped_ids = remapped_ids[hit_indices]
                     if mutate_miss_lengths:
-                        lengths = torch.masked_fill(lengths, ~hit_indices, 0)
+                        if self.is_sharded:
+                            # Re-compute lengths by counting hits per sample using vectorized segment_sum, as we need to skip lengths that are mapped in other ranks in this sharded module.
+                            # This is necessary because in distributed (Row-Wise sharded) execution,
+                            # lengths has shape [global_batch_size] while hit_indices has shape [local_num_ids]
+                            lengths = _compute_lengths_from_hits(lengths, hit_indices)
+                        else:
+                            lengths = torch.masked_fill(lengths, ~hit_indices, 0)
                         # Set offsets to None such that it can be re-calculated in KJT when needed.
                         offsets = None
                 if self._scalar_logger is not None:
