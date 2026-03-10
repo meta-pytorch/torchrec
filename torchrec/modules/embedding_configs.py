@@ -367,6 +367,8 @@ class BaseEmbeddingConfig:
             for number embedding memory for virtual table is dynamic and only materialized when
             id is trained this needs to be paired with SSD/DRAM Virtual talbe in EmbeddingComputeKernel
         virtual_table_eviction_policy (Optional[VirtualTableEvictionPolicy]): eviction policy for virtual table.
+        enable_embedding_update (bool): whether to enable embedding update.
+        stash_weights (bool): whether to stash weights.
     """
 
     num_embeddings: int
@@ -389,6 +391,7 @@ class BaseEmbeddingConfig:
     use_virtual_table: bool = False
     virtual_table_eviction_policy: Optional[VirtualTableEvictionPolicy] = None
     enable_embedding_update: bool = False
+    stash_weights: bool = False
 
     def get_weight_init_max(self) -> float:
         if self.weight_init_max is None:
