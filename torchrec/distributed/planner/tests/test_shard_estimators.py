@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 import torch
 import torchrec.optim as trec_optim
+from torch._utils_internal import justknobs_check
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
@@ -364,6 +365,96 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
             ],
         }
 
+        if justknobs_check("pytorch/torchrec:enable_ssd_offloading"):
+            expected_perfs.update(
+                {
+                    ("key_value", "column_wise"): [
+                        Perf(
+                            fwd_compute=3.0078125,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=6.015625,
+                            bwd_comms=6.357828776041667e-05,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        )
+                    ],
+                    ("key_value", "grid_shard"): [
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                    ],
+                    ("key_value", "row_wise"): [
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                    ],
+                    ("key_value", "table_column_wise"): [
+                        Perf(
+                            fwd_compute=3.0078125,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=6.015625,
+                            bwd_comms=6.357828776041667e-05,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        )
+                    ],
+                    ("key_value", "table_row_wise"): [
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                    ],
+                    ("key_value", "table_wise"): [
+                        Perf(
+                            fwd_compute=3.0078125,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=6.015625,
+                            bwd_comms=6.357828776041667e-05,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        )
+                    ],
+                }
+            )
+
         perfs = {
             (
                 sharding_option.compute_kernel,
@@ -650,6 +741,96 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
             ],
         }
 
+        if justknobs_check("pytorch/torchrec:enable_ssd_offloading"):
+            expected_perfs.update(
+                {
+                    ("key_value", "column_wise"): [
+                        Perf(
+                            fwd_compute=3.14453125,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=9.748046875,
+                            bwd_comms=6.357828776041667e-05,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        )
+                    ],
+                    ("key_value", "grid_shard"): [
+                        Perf(
+                            fwd_compute=0.6640625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=2.05859375,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                        Perf(
+                            fwd_compute=0.6640625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=2.05859375,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                    ],
+                    ("key_value", "row_wise"): [
+                        Perf(
+                            fwd_compute=0.6640625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=2.05859375,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                        Perf(
+                            fwd_compute=0.6640625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=2.05859375,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                    ],
+                    ("key_value", "table_column_wise"): [
+                        Perf(
+                            fwd_compute=3.14453125,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=9.748046875,
+                            bwd_comms=6.357828776041667e-05,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        )
+                    ],
+                    ("key_value", "table_row_wise"): [
+                        Perf(
+                            fwd_compute=0.6640625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=2.05859375,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                        Perf(
+                            fwd_compute=0.6640625,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=2.05859375,
+                            bwd_comms=0.9590479532877604,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        ),
+                    ],
+                    ("key_value", "table_wise"): [
+                        Perf(
+                            fwd_compute=3.14453125,
+                            fwd_comms=6.357828776041667e-05,
+                            bwd_compute=9.748046875,
+                            bwd_comms=6.357828776041667e-05,
+                            input_dist_comms=1.2715657552083334e-05,
+                            prefetch_compute=0.0,
+                        )
+                    ],
+                }
+            )
+
         perfs = {
             (
                 sharding_option.compute_kernel,
@@ -732,6 +913,24 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
             ],
         }
 
+        if justknobs_check("pytorch/torchrec:enable_ssd_offloading"):
+            expected_total_perfs.update(
+                {
+                    ("key_value", "column_wise"): [7.485383351643881],
+                    ("key_value", "grid_shard"): [
+                        1.7686182657877603,
+                        1.7686182657877603,
+                    ],
+                    ("key_value", "row_wise"): [1.7686182657877603, 1.7686182657877603],
+                    ("key_value", "table_column_wise"): [7.485383351643881],
+                    ("key_value", "table_row_wise"): [
+                        1.7686182657877603,
+                        1.7686182657877603,
+                    ],
+                    ("key_value", "table_wise"): [7.485383351643881],
+                }
+            )
+
         total_perfs = {
             (
                 sharding_option.compute_kernel,
@@ -780,6 +979,15 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
                 0.025934979198424798,
             ],
         }
+
+        if justknobs_check("pytorch/torchrec:enable_ssd_offloading"):
+            expected_total_perfs.update(
+                {
+                    ("key_value", "column_wise"): [13.535563151041668],
+                    ("key_value", "row_wise"): [5.401765950520833, 5.401765950520833],
+                    ("key_value", "table_wise"): [13.535563151041668],
+                }
+            )
 
         total_perfs = {
             (
@@ -1400,6 +1608,96 @@ class TestEmbeddingPerfEstimatorWithGeneralizedComms(unittest.TestCase):
                 ),
             ],
         }
+
+        if justknobs_check("pytorch/torchrec:enable_ssd_offloading"):
+            expected_perfs.update(
+                {
+                    ("key_value", "column_wise"): [
+                        Perf(
+                            fwd_compute=3.0078125,
+                            fwd_comms=0.00012715657552083334,
+                            bwd_compute=6.015625,
+                            bwd_comms=0.00012715657552083334,
+                            input_dist_comms=2.5431315104166668e-05,
+                            prefetch_compute=0.0,
+                        )
+                    ],
+                    ("key_value", "grid_shard"): [
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=0.00012715657552083334,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9591115315755209,
+                            input_dist_comms=2.5431315104166668e-05,
+                            prefetch_compute=0.0,
+                        ),
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=0.00012715657552083334,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9591115315755209,
+                            input_dist_comms=2.5431315104166668e-05,
+                            prefetch_compute=0.0,
+                        ),
+                    ],
+                    ("key_value", "row_wise"): [
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=0.00012715657552083334,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9591115315755209,
+                            input_dist_comms=2.5431315104166668e-05,
+                            prefetch_compute=0.0,
+                        ),
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=0.00012715657552083334,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9591115315755209,
+                            input_dist_comms=2.5431315104166668e-05,
+                            prefetch_compute=0.0,
+                        ),
+                    ],
+                    ("key_value", "table_column_wise"): [
+                        Perf(
+                            fwd_compute=3.0078125,
+                            fwd_comms=0.00012715657552083334,
+                            bwd_compute=6.015625,
+                            bwd_comms=0.00012715657552083334,
+                            input_dist_comms=2.5431315104166668e-05,
+                            prefetch_compute=0.0,
+                        )
+                    ],
+                    ("key_value", "table_row_wise"): [
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=0.00012715657552083334,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9591115315755209,
+                            input_dist_comms=2.5431315104166668e-05,
+                            prefetch_compute=0.0,
+                        ),
+                        Perf(
+                            fwd_compute=0.625,
+                            fwd_comms=0.00012715657552083334,
+                            bwd_compute=1.25,
+                            bwd_comms=0.9591115315755209,
+                            input_dist_comms=2.5431315104166668e-05,
+                            prefetch_compute=0.0,
+                        ),
+                    ],
+                    ("key_value", "table_wise"): [
+                        Perf(
+                            fwd_compute=3.0078125,
+                            fwd_comms=0.00012715657552083334,
+                            bwd_compute=6.015625,
+                            bwd_comms=0.00012715657552083334,
+                            input_dist_comms=2.5431315104166668e-05,
+                            prefetch_compute=0.0,
+                        )
+                    ],
+                }
+            )
 
         perfs = {
             (

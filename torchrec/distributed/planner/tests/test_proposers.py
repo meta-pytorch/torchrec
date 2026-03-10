@@ -12,6 +12,7 @@ from typing import cast, List, Optional, Type
 from unittest.mock import MagicMock
 
 import torch
+from torch._utils_internal import justknobs_check
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.constants import BATCH_SIZE, DEFAULT_PERF_ESTIMATOR
@@ -420,7 +421,11 @@ class TestProposers(unittest.TestCase):
         So the total number of pruned options will be:
             (num_sharding_types - 1) * 3 + 1 = 19
         """
-        num_pruned_options = (len(ShardingType) - 1) * 3 + 1
+        if justknobs_check("pytorch/torchrec:enable_ssd_offloading"):
+            num_pruned_options = (len(ShardingType) - 1) * 4 + 1
+            self.grid_search_proposer = GridSearchProposer(max_proposals=int(1e5))
+        else:
+            num_pruned_options = (len(ShardingType) - 1) * 3 + 1
         self.grid_search_proposer.load(search_space)
         for (
             sharding_options
