@@ -383,6 +383,7 @@ class TowerQPSMetric(RecMetric):
         error_msgs: List[str],
     ) -> None:
         key = f"{prefix}num_batch"
-        if key in state_dict and self._batch_size_stages is not None:
+        if key in state_dict:
             num_batch_tensor = state_dict.pop(key)
-            self._num_batch = int(num_batch_tensor.item())
+            if self._batch_size_stages is not None:
+                self._num_batch = int(num_batch_tensor.item())
