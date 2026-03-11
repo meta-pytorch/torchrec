@@ -729,12 +729,12 @@ class FullTrainingLoopTest(unittest.TestCase):
         optimizer.zero_grad()
         out1 = model(torch.ones(1, 10))
         out1.sum().backward()
-        assert model.weight.grad is not None
+        self.assertIsNotNone(model.weight.grad)
         grad_after_first = model.weight.grad.clone()
 
         out2 = model(torch.ones(1, 10) * 2)
         out2.sum().backward()
-        assert model.weight.grad is not None
+        self.assertIsNotNone(model.weight.grad)
         grad_after_second = model.weight.grad.clone()
 
         self.assertFalse(torch.equal(grad_after_first, grad_after_second))

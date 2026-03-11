@@ -39,10 +39,10 @@ class QuantUtilsTest(unittest.TestCase):
         assert torch.equal(t_u2.view(torch.uint8), t_u8)
 
         for t in [t_u4[:, :8], t_u4[:, 8:]]:
-            assert t.size(1) == 8
+            self.assertEqual(t.size(1), 8)
         t_u4[:, :8].copy_(t_u4[:, 8:])
 
         for t in [t_u2[:, 4:8], t_u2[:, 8:12]]:
-            assert t.size(1) == 4
+            self.assertEqual(t.size(1), 4)
 
         t_u2[:, 4:8].copy_(t_u2[:, 8:12])

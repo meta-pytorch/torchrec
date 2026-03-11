@@ -802,6 +802,12 @@ class TestShardedKeyedJaggedTensorPool(MultiProcessTestBase):
                 ref.length_per_key(), val_gm_script.length_per_key()
             )
 
-        assert hasattr(sharded_inference_kjt_pool_gm_script, "_local_kjt_pool_shards")
-        assert hasattr(sharded_inference_kjt_pool_gm_script._local_kjt_pool_shards, "0")
-        assert hasattr(sharded_inference_kjt_pool_gm_script._local_kjt_pool_shards, "1")
+        self.assertTrue(
+            hasattr(sharded_inference_kjt_pool_gm_script, "_local_kjt_pool_shards")
+        )
+        self.assertTrue(
+            hasattr(sharded_inference_kjt_pool_gm_script._local_kjt_pool_shards, "0")
+        )
+        self.assertTrue(
+            hasattr(sharded_inference_kjt_pool_gm_script._local_kjt_pool_shards, "1")
+        )

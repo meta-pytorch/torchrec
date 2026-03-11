@@ -378,11 +378,15 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
         )
 
         # for this to work, we expect the order of lookups to be the same
-        # pyrefly: ignore[missing-attribute]
-        assert len(fused_model.module.sparse.ebc._lookups) == len(
+        self.assertEqual(
             # pyrefly: ignore[missing-attribute]
-            ssd_model.module.sparse.ebc._lookups
-        ), "Expect same number of lookups"
+            len(fused_model.module.sparse.ebc._lookups),
+            len(
+                # pyrefly: ignore[missing-attribute]
+                ssd_model.module.sparse.ebc._lookups
+            ),
+            "Expect same number of lookups",
+        )
 
         for fused_lookup, ssd_lookup in zip(
             # pyrefly: ignore[missing-attribute]
@@ -390,9 +394,11 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups,
         ):
-            assert len(fused_lookup._emb_modules) == len(
-                ssd_lookup._emb_modules
-            ), "Expect same number of emb modules"
+            self.assertEqual(
+                len(fused_lookup._emb_modules),
+                len(ssd_lookup._emb_modules),
+                "Expect same number of emb modules",
+            )
             for fused_emb_module, ssd_emb_module in zip(
                 fused_lookup._emb_modules, ssd_lookup._emb_modules
             ):
@@ -732,7 +738,7 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
             cm = self.assertLogs(lookup_logger, level="INFO")
 
         with cm as logs:
-            assert pg is not None, "Process group is not initialized"
+            self.assertIsNotNone(pg, "Process group is not initialized")
             sharding_single_rank_test_single_process(
                 pg=pg,
                 device=self.device,
@@ -1307,11 +1313,15 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
         )
 
         # for this to work, we expect the order of lookups to be the same
-        # pyrefly: ignore[missing-attribute]
-        assert len(fused_model.module.sparse.ebc._lookups) == len(
+        self.assertEqual(
             # pyrefly: ignore[missing-attribute]
-            ssd_model.module.sparse.ebc._lookups
-        ), "Expect same number of lookups"
+            len(fused_model.module.sparse.ebc._lookups),
+            len(
+                # pyrefly: ignore[missing-attribute]
+                ssd_model.module.sparse.ebc._lookups
+            ),
+            "Expect same number of lookups",
+        )
 
         for fused_lookup, ssd_lookup in zip(
             # pyrefly: ignore[missing-attribute]
@@ -1319,9 +1329,11 @@ class ZeroCollisionModelParallelTest(ModelParallelSingleRankBase):
             # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ebc._lookups,
         ):
-            assert len(fused_lookup._emb_modules) == len(
-                ssd_lookup._emb_modules
-            ), "Expect same number of emb modules"
+            self.assertEqual(
+                len(fused_lookup._emb_modules),
+                len(ssd_lookup._emb_modules),
+                "Expect same number of emb modules",
+            )
 
         self._copy_fused_modules_into_ssd_emb_modules(fused_model, ssd_model)
 
@@ -1772,11 +1784,15 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
         )
 
         # for this to work, we expect the order of lookups to be the same
-        # pyrefly: ignore[missing-attribute]
-        assert len(fused_model.module.sparse.ec._lookups) == len(
+        self.assertEqual(
             # pyrefly: ignore[missing-attribute]
-            ssd_model.module.sparse.ec._lookups
-        ), "Expect same number of lookups"
+            len(fused_model.module.sparse.ec._lookups),
+            len(
+                # pyrefly: ignore[missing-attribute]
+                ssd_model.module.sparse.ec._lookups
+            ),
+            "Expect same number of lookups",
+        )
 
         for fused_lookup, ssd_lookup in zip(
             # pyrefly: ignore[missing-attribute]
@@ -1784,9 +1800,11 @@ class ZeroCollisionSequenceModelParallelStateDictTest(ModelParallelSingleRankBas
             # pyrefly: ignore[missing-attribute]
             ssd_model.module.sparse.ec._lookups,
         ):
-            assert len(fused_lookup._emb_modules) == len(
-                ssd_lookup._emb_modules
-            ), "Expect same number of emb modules"
+            self.assertEqual(
+                len(fused_lookup._emb_modules),
+                len(ssd_lookup._emb_modules),
+                "Expect same number of emb modules",
+            )
 
         self._copy_fused_modules_into_ssd_emb_modules(fused_model, ssd_model)
 

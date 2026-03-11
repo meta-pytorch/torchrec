@@ -50,7 +50,7 @@ class TestModelInput(unittest.TestCase):
             power_law_alpha=None,
         )
 
-        assert model_input.idlist_features is not None
+        self.assertIsNotNone(model_input.idlist_features)
         indices = model_input.idlist_features.values().tolist()
 
         counter = Counter(indices)
@@ -72,7 +72,7 @@ class TestModelInput(unittest.TestCase):
             power_law_alpha=1.2,
         )
 
-        assert model_input.idlist_features is not None
+        self.assertIsNotNone(model_input.idlist_features)
         indices = model_input.idlist_features.values().tolist()
 
         counter = Counter(indices)
@@ -104,7 +104,7 @@ class TestModelInput(unittest.TestCase):
             power_law_alpha=1.1,
         )
 
-        assert model_input.idlist_features is not None
+        self.assertIsNotNone(model_input.idlist_features)
         indices = model_input.idlist_features.values()
 
         self.assertTrue(torch.all(indices >= 0))
@@ -130,7 +130,7 @@ class TestModelInput(unittest.TestCase):
             power_law_alpha=1.2,
         )
 
-        assert model_input.idscore_features is not None
+        self.assertIsNotNone(model_input.idscore_features)
         indices = model_input.idscore_features.values().tolist()
 
         counter = Counter(indices)

@@ -459,7 +459,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
         for key, value in sd2.items():
             v2 = sd1[key]
             if isinstance(value, ShardedTensor):
-                assert isinstance(v2, ShardedTensor)
+                self.assertIsInstance(v2, ShardedTensor)
                 self.assertEqual(len(value.local_shards()), len(v2.local_shards()))
                 for local_shard_id, (dst, src) in enumerate(
                     zip(value.local_shards(), v2.local_shards())
@@ -467,7 +467,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
                     src_tensor = None
                     dst_tensor = None
                     if isinstance(dst.tensor, PartiallyMaterializedTensor):
-                        assert isinstance(src.tensor, PartiallyMaterializedTensor)
+                        self.assertIsInstance(src.tensor, PartiallyMaterializedTensor)
                         if use_virtual_table:
                             # kvz zch emb table comparison, id is non-continuous
                             wid_key = key[: key.rfind(".")] + ".weight_id"
@@ -500,7 +500,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
                             src_tensor, dst_tensor, rtol=rtol, atol=atol
                         )
             elif isinstance(value, DTensor):
-                assert isinstance(v2, DTensor)
+                self.assertIsInstance(v2, DTensor)
                 self.assertEqual(
                     # pyrefly: ignore[missing-attribute]
                     len(value._local_tensor.local_shards()),
@@ -660,22 +660,22 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                 continue
             if isinstance(v2, ShardedTensor):
                 self.assertTrue(isinstance(v1, ShardedTensor))
-                assert len(v2.local_shards()) == 1
+                self.assertEqual(len(v2.local_shards()), 1)
                 dst = v2.local_shards()[0].tensor
             elif isinstance(v2, DTensor):
                 self.assertTrue(isinstance(v1, DTensor))
                 # pyrefly: ignore[missing-attribute]
-                assert len(v2._local_tensor.local_shards()) == 1
+                self.assertEqual(len(v2._local_tensor.local_shards()), 1)
                 # pyrefly: ignore[missing-attribute]
                 dst = v2._local_tensor.local_shards()[0]
             else:
                 dst = v2
             if isinstance(v1, ShardedTensor):
-                assert len(v1.local_shards()) == 1
+                self.assertEqual(len(v1.local_shards()), 1)
                 src = v1.local_shards()[0].tensor
             elif isinstance(v1, DTensor):
                 # pyrefly: ignore[missing-attribute]
-                assert len(v1._local_tensor.local_shards()) == 1
+                self.assertEqual(len(v1._local_tensor.local_shards()), 1)
                 # pyrefly: ignore[missing-attribute]
                 src = v1._local_tensor.local_shards()[0]
             else:
