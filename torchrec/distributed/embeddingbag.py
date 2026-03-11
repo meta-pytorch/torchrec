@@ -267,7 +267,9 @@ def create_sharding_infos_by_sharding_device_group(
 
         optimizer_class = optimizer_classes[0]
         optimizer_params = optimizer_params[0]
-        if optimizer_class:
+        # Only derive optimizer type from class if not already explicitly set
+        # (e.g., EmainplaceRowwiseAdagradConfig sets it explicitly in fused_params)
+        if optimizer_class and "optimizer" not in optimizer_params:
             optimizer_params["optimizer"] = optimizer_type_to_emb_opt_type(
                 optimizer_class
             )
@@ -854,7 +856,9 @@ class ShardedEmbeddingBagCollection(
 
             optimizer_class = optimizer_classes[0]
             optimizer_params = optimizer_params[0]
-            if optimizer_class:
+            # Only derive optimizer type from class if not already explicitly set
+            # (e.g., EmainplaceRowwiseAdagradConfig sets it explicitly in fused_params)
+            if optimizer_class and "optimizer" not in optimizer_params:
                 optimizer_params["optimizer"] = optimizer_type_to_emb_opt_type(
                     optimizer_class
                 )
