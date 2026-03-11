@@ -14,14 +14,65 @@ from typing import Any, cast, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 import torch
 from torch import nn
+from torchrec.distributed.embedding_types import (
+    BaseEmbeddingSharder,
+    BaseQuantEmbeddingSharder,
+)
 from torchrec.distributed.planner.constants import NUM_POOLINGS
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     Perf,
+    SharderData,
+    SharderDataMap,
     ShardingOption,
     Storage,
+    StorageUsageType,
 )
 from torchrec.distributed.types import CommOp, ModuleSharder, ShardingType
+
+
+def build_sharder_data(sharder: ModuleSharder[nn.Module]) -> SharderData:
+    fused_params = (
+        dict(sharder.fused_params)
+        if hasattr(sharder, "fused_params") and sharder.fused_params
+        else {}
+    )
+
+    qcomm_dtype_sizes: Dict[str, Tuple[float, float]] = {}
+    if sharder.qcomm_codecs_registry is not None:
+        for comm_op_name in [
+            CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name,
+            CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name,
+            CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name,
+        ]:
+            if comm_op_name in sharder.qcomm_codecs_registry:
+                codecs = sharder.qcomm_codecs_registry[comm_op_name]
+                fwd_size = torch.tensor(
+                    [], dtype=codecs.forward.quantized_dtype
+                ).element_size()
+                bwd_size = torch.tensor(
+                    [], dtype=codecs.backward.quantized_dtype
+                ).element_size()
+                qcomm_dtype_sizes[comm_op_name] = (fwd_size, bwd_size)
+
+    if isinstance(sharder, BaseQuantEmbeddingSharder):
+        storage_usage_type = StorageUsageType.BASE_QUANT
+    elif isinstance(sharder, BaseEmbeddingSharder):
+        storage_usage_type = StorageUsageType.BASE
+    else:
+        storage_usage_type = StorageUsageType.DEFAULT
+
+    return SharderData(
+        fused_params=fused_params,
+        qcomm_dtype_sizes=qcomm_dtype_sizes,
+        storage_usage_type=storage_usage_type,
+    )
+
+
+def build_sharder_data_map(
+    sharder_map: Dict[str, ModuleSharder[nn.Module]],
+) -> SharderDataMap:
+    return {key: build_sharder_data(sharder) for key, sharder in sharder_map.items()}
 
 
 def sharder_name(t: Type[Any]) -> str:

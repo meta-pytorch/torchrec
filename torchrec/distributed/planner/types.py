@@ -38,6 +38,7 @@ from torchrec.distributed.types import (
     KeyValueParams,
     ModuleSharder,
     ShardingPlan,
+    StorageUsageType,
 )
 from torchrec.modules.embedding_configs import DataType
 from torchrec.modules.embedding_modules import (
@@ -1245,6 +1246,22 @@ class PartitionByType(Enum):
     UNIFORM = "uniform"
     # Partitioning based on multiple hosts
     MULTI_HOST = "multi_host"
+
+
+@dataclass
+class SharderData:
+    """Picklable snapshot of sharder data needed by estimators.
+
+    Captures fused_params, quantized comm codec dtype sizes, and storage
+    usage dispatch info so estimators can work without live sharder objects.
+    """
+
+    fused_params: Dict[str, Any]
+    qcomm_dtype_sizes: Dict[str, Tuple[float, float]]
+    storage_usage_type: StorageUsageType
+
+
+SharderDataMap = Dict[str, SharderData]
 
 
 @dataclass
