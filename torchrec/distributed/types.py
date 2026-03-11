@@ -183,6 +183,12 @@ class ParameterStorage(Enum):
     DDR = "ddr"
 
 
+class StorageUsageType(Enum):
+    BASE_QUANT = "BaseQuantEmbeddingSharder"
+    BASE = "BaseEmbeddingSharder"
+    DEFAULT = "ModuleSharder"
+
+
 @unique
 class ComputeKernel(Enum):
     DEFAULT = "default"
@@ -1329,6 +1335,41 @@ def get_tensor_size_bytes(t: torch.Tensor) -> int:
         b = b // 4
 
     return b
+
+
+def compute_storage_usage(
+    tensor: torch.Tensor,
+    compute_device_type: str,
+    compute_kernel: str,
+    storage_usage_type: StorageUsageType,
+) -> Dict[str, int]:
+    tensor_bytes = get_tensor_size_bytes(tensor)
+    if storage_usage_type == StorageUsageType.BASE_QUANT:
+        tensor_bytes += tensor.shape[0] * 4
+        if compute_kernel in {"quant_uvm", "quant_uvm_caching"}:
+            return {ParameterStorage.DDR.value: tensor_bytes}
+        storage_map = {
+            "cuda": ParameterStorage.HBM,
+            "cpu": ParameterStorage.DDR,
+            "mtia": ParameterStorage.DDR,
+        }
+    elif storage_usage_type == StorageUsageType.BASE:
+        if compute_kernel in {"fused_uvm", "fused_uvm_caching"}:
+            return {ParameterStorage.DDR.value: tensor_bytes}
+        storage_map = {
+            "cuda": ParameterStorage.HBM,
+            "cpu": ParameterStorage.DDR,
+            "mtia": ParameterStorage.HBM,
+        }
+    else:
+        storage_map = {
+            "cuda": ParameterStorage.HBM,
+            "cpu": ParameterStorage.DDR,
+            "mtia": ParameterStorage.HBM,
+        }
+    return {
+        storage_map.get(compute_device_type, ParameterStorage.HBM).value: tensor_bytes
+    }
 
 
 class ModuleSharder(abc.ABC, Generic[M]):

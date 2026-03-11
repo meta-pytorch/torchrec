@@ -13,14 +13,24 @@ from typing import Callable, List, Optional
 from unittest.mock import MagicMock
 
 import torch
+from torchrec.distributed.embedding_types import (
+    BaseEmbeddingSharder,
+    BaseQuantEmbeddingSharder,
+)
 from torchrec.distributed.planner.types import Perf, Shard, ShardingOption, Storage
 from torchrec.distributed.planner.utils import (
     _find_imbalance_tables,
     BinarySearchPredicate,
+    build_sharder_data,
     LuusJaakolaSearch,
     reset_shard_rank,
 )
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import (
+    CommOp,
+    ModuleSharder,
+    ShardingType,
+    StorageUsageType,
+)
 
 
 class TestFindImbalanceTables(unittest.TestCase):
@@ -381,3 +391,77 @@ class TestLuusJaakolaSearch(unittest.TestCase):
             ],
         )
         torch.testing.assert_close(results, want)
+
+
+class TestBuildSharderData(unittest.TestCase):
+    def test_base_embedding_sharder(self) -> None:
+        sharder = MagicMock(spec=BaseEmbeddingSharder)
+        sharder.fused_params = {"cache_load_factor": 0.5}
+        sharder.qcomm_codecs_registry = None
+
+        result = build_sharder_data(sharder)
+
+        self.assertEqual(result.storage_usage_type, StorageUsageType.BASE)
+        self.assertEqual(result.fused_params, {"cache_load_factor": 0.5})
+        self.assertEqual(result.qcomm_dtype_sizes, {})
+
+    def test_base_quant_embedding_sharder(self) -> None:
+        sharder = MagicMock(spec=BaseQuantEmbeddingSharder)
+        sharder.fused_params = {}
+        sharder.qcomm_codecs_registry = None
+
+        result = build_sharder_data(sharder)
+
+        self.assertEqual(result.storage_usage_type, StorageUsageType.BASE_QUANT)
+
+    def test_generic_module_sharder(self) -> None:
+        sharder = MagicMock(spec=ModuleSharder)
+        sharder.fused_params = {}
+        sharder.qcomm_codecs_registry = None
+
+        result = build_sharder_data(sharder)
+
+        self.assertEqual(result.storage_usage_type, StorageUsageType.DEFAULT)
+
+    def test_no_fused_params(self) -> None:
+        sharder = MagicMock(spec=BaseEmbeddingSharder)
+        sharder.fused_params = None
+        sharder.qcomm_codecs_registry = None
+
+        result = build_sharder_data(sharder)
+
+        self.assertEqual(result.fused_params, {})
+
+    def test_qcomm_codecs_extraction(self) -> None:
+        sharder = MagicMock(spec=BaseEmbeddingSharder)
+        sharder.fused_params = {}
+
+        forward_codec = MagicMock()
+        forward_codec.quantized_dtype = torch.float16
+        backward_codec = MagicMock()
+        backward_codec.quantized_dtype = torch.bfloat16
+
+        codec = MagicMock()
+        codec.forward = forward_codec
+        codec.backward = backward_codec
+
+        sharder.qcomm_codecs_registry = {
+            CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name: codec,
+        }
+
+        result = build_sharder_data(sharder)
+
+        fwd_size = torch.tensor([], dtype=torch.float16).element_size()
+        bwd_size = torch.tensor([], dtype=torch.bfloat16).element_size()
+        self.assertEqual(
+            result.qcomm_dtype_sizes[CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name],
+            (fwd_size, bwd_size),
+        )
+        self.assertNotIn(
+            CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name,
+            result.qcomm_dtype_sizes,
+        )
+        self.assertNotIn(
+            CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name,
+            result.qcomm_dtype_sizes,
+        )
