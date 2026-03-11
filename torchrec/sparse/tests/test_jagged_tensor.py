@@ -170,9 +170,14 @@ class TestJaggedTensor(unittest.TestCase):
             values=values,
             lengths=torch.IntTensor([1, 0, 2, 3]),
         )
-        self.assertTrue(torch.equal(j0.lengths(), torch.IntTensor([1, 0, 2, 3])))
-        self.assertTrue(
-            torch.equal(j0.values(), torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]))
+        torch.testing.assert_close(
+            j0.lengths(), torch.IntTensor([1, 0, 2, 3]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j0.values(),
+            torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]),
+            rtol=0,
+            atol=0,
         )
         self.assertTrue(j0.weights_or_none() is None)
 
@@ -183,11 +188,17 @@ class TestJaggedTensor(unittest.TestCase):
             values=values,
             lengths=torch.IntTensor([1, 0, 2, 3]),
         )
-        self.assertTrue(torch.equal(traced_j0.lengths(), torch.IntTensor([1, 0, 2, 3])))
-        self.assertTrue(
-            torch.equal(
-                traced_j0.values(), torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0])
-            )
+        torch.testing.assert_close(
+            traced_j0.lengths(),
+            torch.IntTensor([1, 0, 2, 3]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            traced_j0.values(),
+            torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]),
+            rtol=0,
+            atol=0,
         )
 
     def test_from_dense_lengths_weighted(self) -> None:
@@ -201,9 +212,18 @@ class TestJaggedTensor(unittest.TestCase):
             lengths=torch.IntTensor([2, 0, 1, 1]),
             weights=weights,
         )
-        self.assertTrue(torch.equal(j1.lengths(), torch.IntTensor([2, 0, 1, 1])))
-        self.assertTrue(torch.equal(j1.values(), torch.Tensor([1.0, 2.0, 7.0, 10.0])))
-        self.assertTrue(torch.equal(j1.weights(), torch.Tensor([11.0, 10.0, 5.0, 2.0])))
+        torch.testing.assert_close(
+            j1.lengths(), torch.IntTensor([2, 0, 1, 1]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.values(), torch.Tensor([1.0, 2.0, 7.0, 10.0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.weights(),
+            torch.Tensor([11.0, 10.0, 5.0, 2.0]),
+            rtol=0,
+            atol=0,
+        )
 
         traced_from_dense_lengths = torch.fx.symbolic_trace(
             JaggedTensor.from_dense_lengths
@@ -213,12 +233,23 @@ class TestJaggedTensor(unittest.TestCase):
             lengths=torch.IntTensor([2, 0, 1, 1]),
             weights=weights,
         )
-        self.assertTrue(torch.equal(traced_j1.lengths(), torch.IntTensor([2, 0, 1, 1])))
-        self.assertTrue(
-            torch.equal(traced_j1.values(), torch.Tensor([1.0, 2.0, 7.0, 10.0]))
+        torch.testing.assert_close(
+            traced_j1.lengths(),
+            torch.IntTensor([2, 0, 1, 1]),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(traced_j1.weights(), torch.Tensor([11.0, 10.0, 5.0, 2.0]))
+        torch.testing.assert_close(
+            traced_j1.values(),
+            torch.Tensor([1.0, 2.0, 7.0, 10.0]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            traced_j1.weights(),
+            torch.Tensor([11.0, 10.0, 5.0, 2.0]),
+            rtol=0,
+            atol=0,
         )
 
     def test_from_dense(self) -> None:
@@ -238,21 +269,34 @@ class TestJaggedTensor(unittest.TestCase):
         j0 = JaggedTensor.from_dense(
             values=values,
         )
-        self.assertTrue(torch.equal(j0.lengths(), torch.IntTensor([1, 0, 2, 3])))
-        self.assertTrue(
-            torch.equal(j0.values(), torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]))
+        torch.testing.assert_close(
+            j0.lengths(), torch.IntTensor([1, 0, 2, 3]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j0.values(),
+            torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]),
+            rtol=0,
+            atol=0,
         )
         self.assertTrue(j0.weights_or_none() is None)
         j1 = JaggedTensor.from_dense(
             values=values,
             weights=weights,
         )
-        self.assertTrue(torch.equal(j1.offsets(), torch.IntTensor([0, 1, 1, 3, 6])))
-        self.assertTrue(
-            torch.equal(j1.values(), torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]))
+        torch.testing.assert_close(
+            j1.offsets(), torch.IntTensor([0, 1, 1, 3, 6]), rtol=0, atol=0
         )
-        self.assertTrue(
-            torch.equal(j1.weights(), torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]))
+        torch.testing.assert_close(
+            j1.values(),
+            torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            j1.weights(),
+            torch.Tensor([1.0, 7.0, 8.0, 10.0, 11.0, 12.0]),
+            rtol=0,
+            atol=0,
         )
 
     @unittest.skipIf(
@@ -291,7 +335,7 @@ class TestJaggedTensor(unittest.TestCase):
             torch.tensor([6.0, 7.0, 8.0]),
         ]
         for t0, expected_t0 in zip(torch_list, expected_list):
-            self.assertTrue(torch.equal(t0, expected_t0))
+            torch.testing.assert_close(t0, expected_t0, rtol=0, atol=0)
 
     def test_to_dense_weights(self) -> None:
         values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
@@ -313,7 +357,7 @@ class TestJaggedTensor(unittest.TestCase):
         ]
         # pyrefly: ignore[no-matching-overload]
         for t0, expected_t0 in zip(weights_list, expected_weights_list):
-            self.assertTrue(torch.equal(t0, expected_t0))
+            torch.testing.assert_close(t0, expected_t0, rtol=0, atol=0)
 
         jt = JaggedTensor(
             values=values,
@@ -342,7 +386,7 @@ class TestJaggedTensor(unittest.TestCase):
             [6.0, 7.0, 8.0],
         ]
         expected_t0 = torch.tensor(t0_value).type(torch.float32)
-        self.assertTrue(torch.equal(t0, expected_t0))
+        torch.testing.assert_close(t0, expected_t0, rtol=0, atol=0)
 
         t1 = jt.to_padded_dense(desired_length=2, padding_value=10.0)
         self.assertEqual(t1.dtype, torch.float32)
@@ -355,7 +399,7 @@ class TestJaggedTensor(unittest.TestCase):
             [6.0, 7.0],
         ]
         expected_t1 = torch.tensor(t1_value).type(torch.float32)
-        self.assertTrue(torch.equal(t1, expected_t1))
+        torch.testing.assert_close(t1, expected_t1, rtol=0, atol=0)
 
         values = torch.Tensor(
             [
@@ -394,7 +438,7 @@ class TestJaggedTensor(unittest.TestCase):
             ],
         ]
         expected_t2 = torch.tensor(t2_value).type(torch.int64)
-        self.assertTrue(torch.equal(t2, expected_t2))
+        torch.testing.assert_close(t2, expected_t2, rtol=0, atol=0)
 
     def test_to_padded_dense_weights(self) -> None:
         values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).type(
@@ -419,7 +463,7 @@ class TestJaggedTensor(unittest.TestCase):
 
         expected_t0_weights = torch.tensor(expected_t0_weights)
         # pyrefly: ignore[bad-argument-type]
-        self.assertTrue(torch.equal(t0_weights, expected_t0_weights))
+        torch.testing.assert_close(t0_weights, expected_t0_weights, rtol=0, atol=0)
 
         t1_weights = jt.to_padded_dense_weights(desired_length=2, padding_value=1.0)
         expected_t1_weights = [
@@ -432,7 +476,7 @@ class TestJaggedTensor(unittest.TestCase):
         ]
         expected_t1_weights = torch.tensor(expected_t1_weights)
         # pyrefly: ignore[bad-argument-type]
-        self.assertTrue(torch.equal(t1_weights, expected_t1_weights))
+        torch.testing.assert_close(t1_weights, expected_t1_weights, rtol=0, atol=0)
 
         values = torch.Tensor(
             [
@@ -480,7 +524,7 @@ class TestJaggedTensor(unittest.TestCase):
         ]
         expected_t2_weights = torch.tensor(expected_t2_weights)
         # pyrefly: ignore[bad-argument-type]
-        self.assertTrue(torch.equal(t2_weights, expected_t2_weights))
+        torch.testing.assert_close(t2_weights, expected_t2_weights, rtol=0, atol=0)
 
         jt = JaggedTensor(
             values=values,
@@ -503,11 +547,20 @@ class TestJaggedTensor(unittest.TestCase):
         j1 = jag_tensor["index_1"]
 
         self.assertTrue(isinstance(j0, JaggedTensor))
-        self.assertTrue(torch.equal(j0.lengths(), torch.IntTensor([2, 0, 1])))
-        self.assertTrue(torch.equal(j0.values(), torch.Tensor([1.0, 2.0, 3.0])))
-        self.assertTrue(torch.equal(j1.lengths(), torch.IntTensor([1, 1, 3])))
-        self.assertTrue(
-            torch.equal(j1.values(), torch.Tensor([4.0, 5.0, 6.0, 7.0, 8.0]))
+        torch.testing.assert_close(
+            j0.lengths(), torch.IntTensor([2, 0, 1]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j0.values(), torch.Tensor([1.0, 2.0, 3.0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.lengths(), torch.IntTensor([1, 1, 3]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.values(),
+            torch.Tensor([4.0, 5.0, 6.0, 7.0, 8.0]),
+            rtol=0,
+            atol=0,
         )
 
     def test_split(self) -> None:
@@ -525,11 +578,20 @@ class TestJaggedTensor(unittest.TestCase):
         self.assertTrue(isinstance(j0, KeyedJaggedTensor))
         self.assertEqual(j0.keys(), ["index_0"])
         self.assertEqual(j1.keys(), ["index_1"])
-        self.assertTrue(torch.equal(j0.lengths(), torch.IntTensor([2, 0, 1])))
-        self.assertTrue(torch.equal(j0.values(), torch.Tensor([1.0, 2.0, 3.0])))
-        self.assertTrue(torch.equal(j1.lengths(), torch.IntTensor([1, 1, 3])))
-        self.assertTrue(
-            torch.equal(j1.values(), torch.Tensor([4.0, 5.0, 6.0, 7.0, 8.0]))
+        torch.testing.assert_close(
+            j0.lengths(), torch.IntTensor([2, 0, 1]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j0.values(), torch.Tensor([1.0, 2.0, 3.0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.lengths(), torch.IntTensor([1, 1, 3]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.values(),
+            torch.Tensor([4.0, 5.0, 6.0, 7.0, 8.0]),
+            rtol=0,
+            atol=0,
         )
 
     def test_length_vs_offset(self) -> None:
@@ -550,8 +612,10 @@ class TestJaggedTensor(unittest.TestCase):
             lengths=lengths,
         )
 
-        self.assertTrue(torch.equal(j_offset.lengths(), j_lens.lengths()))
-        self.assertTrue(torch.equal(j_offset.offsets(), j_lens.offsets().int()))
+        torch.testing.assert_close(j_offset.lengths(), j_lens.lengths(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            j_offset.offsets(), j_lens.offsets().int(), rtol=0, atol=0
+        )
 
         stride_per_key_per_rank = [[3], [5]]
         j_offset = KeyedJaggedTensor.from_offsets_sync(
@@ -567,14 +631,23 @@ class TestJaggedTensor(unittest.TestCase):
             lengths=lengths,
             stride_per_key_per_rank=stride_per_key_per_rank,
         )
-        self.assertTrue(torch.equal(j_offset.lengths(), j_lens.lengths()))
-        self.assertTrue(torch.equal(j_offset.offsets(), j_lens.offsets().int()))
+        torch.testing.assert_close(j_offset.lengths(), j_lens.lengths(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            j_offset.offsets(), j_lens.offsets().int(), rtol=0, atol=0
+        )
 
     def test_empty(self) -> None:
         jt = JaggedTensor.empty(values_dtype=torch.int64)
 
-        self.assertTrue(torch.equal(jt.values(), torch.tensor([], dtype=torch.int64)))
-        self.assertTrue(torch.equal(jt.offsets(), torch.tensor([], dtype=torch.int32)))
+        torch.testing.assert_close(
+            jt.values(), torch.tensor([], dtype=torch.int64), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            jt.offsets(),
+            torch.tensor([], dtype=torch.int32),
+            rtol=0,
+            atol=0,
+        )
 
         jt_from_script = torch.jit.script(JaggedTensor.empty)()
         self.assertEqual(jt_from_script.to_dense(), [])
@@ -588,18 +661,20 @@ class TestJaggedTensor(unittest.TestCase):
             offsets=offsets,
         )
 
-        self.assertTrue(torch.equal(jt.lengths(), torch.IntTensor([2, 0, 1])))
-        self.assertTrue(
-            torch.equal(
-                jt.values(),
-                torch.Tensor(
-                    [
-                        [0.5, 1.0, 1.5],
-                        [1.0, 2.0, 3.0],
-                        [1.5, 3.0, 4.5],
-                    ],
-                ),
-            )
+        torch.testing.assert_close(
+            jt.lengths(), torch.IntTensor([2, 0, 1]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            jt.values(),
+            torch.Tensor(
+                [
+                    [0.5, 1.0, 1.5],
+                    [1.0, 2.0, 3.0],
+                    [1.5, 3.0, 4.5],
+                ],
+            ),
+            rtol=0,
+            atol=0,
         )
 
     def test_float_lengths_offsets_throws(self) -> None:
@@ -619,10 +694,10 @@ class TestJaggedTensor(unittest.TestCase):
             weights=torch.tensor([5.0, 10.0, 15.0]),
         )
         j2 = j.to(device=torch.device("cpu"))
-        self.assertTrue(torch.equal(j.offsets(), j2.offsets()))
-        self.assertTrue(torch.equal(j.lengths(), j2.lengths()))
-        self.assertTrue(torch.equal(j.values(), j2.values()))
-        self.assertTrue(torch.equal(j.weights(), j2.weights()))
+        torch.testing.assert_close(j.offsets(), j2.offsets(), rtol=0, atol=0)
+        torch.testing.assert_close(j.lengths(), j2.lengths(), rtol=0, atol=0)
+        torch.testing.assert_close(j.values(), j2.values(), rtol=0, atol=0)
+        torch.testing.assert_close(j.weights(), j2.weights(), rtol=0, atol=0)
 
     @unittest.skipIf(
         torch.cuda.device_count() <= 0,
@@ -692,10 +767,10 @@ class TestJaggedTensor(unittest.TestCase):
         elems, spec = pytree.tree_flatten(j0)
         j1 = pytree.tree_unflatten(elems, spec)
 
-        self.assertTrue(torch.equal(j0.lengths(), j1.lengths()))
+        torch.testing.assert_close(j0.lengths(), j1.lengths(), rtol=0, atol=0)
         self.assertIsNone(j0.weights_or_none())
         self.assertIsNone(j1.weights_or_none())
-        self.assertTrue(torch.equal(j0.values(), j1.values()))
+        torch.testing.assert_close(j0.values(), j1.values(), rtol=0, atol=0)
 
         values = [
             torch.Tensor([1.0]),
@@ -716,9 +791,9 @@ class TestJaggedTensor(unittest.TestCase):
         elems, spec = pytree.tree_flatten(j0)
         j1 = pytree.tree_unflatten(elems, spec)
 
-        self.assertTrue(torch.equal(j0.lengths(), j1.lengths()))
-        self.assertTrue(torch.equal(j0.weights(), j1.weights()))
-        self.assertTrue(torch.equal(j0.values(), j1.values()))
+        torch.testing.assert_close(j0.lengths(), j1.lengths(), rtol=0, atol=0)
+        torch.testing.assert_close(j0.weights(), j1.weights(), rtol=0, atol=0)
+        torch.testing.assert_close(j0.values(), j1.values(), rtol=0, atol=0)
 
     def test_compute_jt_dict_to_kjt_module(self) -> None:
         compute_jt_dict_to_kjt = ComputeJTDictToKJT()
@@ -740,15 +815,29 @@ class TestJaggedTensor(unittest.TestCase):
 
         self.assertTrue(isinstance(j0, JaggedTensor))
         self.assertTrue(isinstance(j0, JaggedTensor))
-        self.assertTrue(torch.equal(j0.lengths(), torch.IntTensor([2, 0, 1])))
-        self.assertTrue(torch.equal(j0.weights(), torch.Tensor([1.0, 0.5, 1.5])))
-        self.assertTrue(torch.equal(j0.values(), torch.Tensor([1.0, 2.0, 3.0])))
-        self.assertTrue(torch.equal(j1.lengths(), torch.IntTensor([1, 1, 3])))
-        self.assertTrue(
-            torch.equal(j1.weights(), torch.Tensor([1.0, 0.5, 1.0, 1.0, 1.5]))
+        torch.testing.assert_close(
+            j0.lengths(), torch.IntTensor([2, 0, 1]), rtol=0, atol=0
         )
-        self.assertTrue(
-            torch.equal(j1.values(), torch.Tensor([4.0, 5.0, 6.0, 7.0, 8.0]))
+        torch.testing.assert_close(
+            j0.weights(), torch.Tensor([1.0, 0.5, 1.5]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j0.values(), torch.Tensor([1.0, 2.0, 3.0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.lengths(), torch.IntTensor([1, 1, 3]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.weights(),
+            torch.Tensor([1.0, 0.5, 1.0, 1.0, 1.5]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            j1.values(),
+            torch.Tensor([4.0, 5.0, 6.0, 7.0, 8.0]),
+            rtol=0,
+            atol=0,
         )
 
     def test_from_jt_dict(self) -> None:
@@ -770,15 +859,29 @@ class TestJaggedTensor(unittest.TestCase):
 
         self.assertTrue(isinstance(j0, JaggedTensor))
         self.assertTrue(isinstance(j0, JaggedTensor))
-        self.assertTrue(torch.equal(j0.lengths(), torch.IntTensor([2, 0, 1])))
-        self.assertTrue(torch.equal(j0.weights(), torch.Tensor([1.0, 0.5, 1.5])))
-        self.assertTrue(torch.equal(j0.values(), torch.Tensor([1.0, 2.0, 3.0])))
-        self.assertTrue(torch.equal(j1.lengths(), torch.IntTensor([1, 1, 3])))
-        self.assertTrue(
-            torch.equal(j1.weights(), torch.Tensor([1.0, 0.5, 1.0, 1.0, 1.5]))
+        torch.testing.assert_close(
+            j0.lengths(), torch.IntTensor([2, 0, 1]), rtol=0, atol=0
         )
-        self.assertTrue(
-            torch.equal(j1.values(), torch.Tensor([4.0, 5.0, 6.0, 7.0, 8.0]))
+        torch.testing.assert_close(
+            j0.weights(), torch.Tensor([1.0, 0.5, 1.5]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j0.values(), torch.Tensor([1.0, 2.0, 3.0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.lengths(), torch.IntTensor([1, 1, 3]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.weights(),
+            torch.Tensor([1.0, 0.5, 1.0, 1.0, 1.5]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            j1.values(),
+            torch.Tensor([4.0, 5.0, 6.0, 7.0, 8.0]),
+            rtol=0,
+            atol=0,
         )
 
     def test_from_jt_dict_vb(self) -> None:
@@ -802,15 +905,29 @@ class TestJaggedTensor(unittest.TestCase):
 
         self.assertTrue(isinstance(j0, JaggedTensor))
         self.assertTrue(isinstance(j0, JaggedTensor))
-        self.assertTrue(torch.equal(j0.lengths(), torch.IntTensor([2, 0])))
-        self.assertTrue(torch.equal(j0.weights(), torch.Tensor([1.0, 0.5])))
-        self.assertTrue(torch.equal(j0.values(), torch.Tensor([1.0, 2.0])))
-        self.assertTrue(torch.equal(j1.lengths(), torch.IntTensor([1, 1, 1, 3])))
-        self.assertTrue(
-            torch.equal(j1.weights(), torch.Tensor([1.5, 1.0, 0.5, 1.0, 1.0, 1.5]))
+        torch.testing.assert_close(
+            j0.lengths(), torch.IntTensor([2, 0]), rtol=0, atol=0
         )
-        self.assertTrue(
-            torch.equal(j1.values(), torch.Tensor([3.0, 4.0, 5.0, 6.0, 7.0, 8.0]))
+        torch.testing.assert_close(
+            j0.weights(), torch.Tensor([1.0, 0.5]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j0.values(), torch.Tensor([1.0, 2.0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.lengths(), torch.IntTensor([1, 1, 1, 3]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            j1.weights(),
+            torch.Tensor([1.5, 1.0, 0.5, 1.0, 1.0, 1.5]),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            j1.values(),
+            torch.Tensor([3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+            rtol=0,
+            atol=0,
         )
 
     def test_to_dict_compute_offsets_false(self) -> None:
@@ -828,11 +945,17 @@ class TestJaggedTensor(unittest.TestCase):
         self.assertIsNone(jt_dict["f1"].offsets_or_none())
         self.assertIsNone(jt_dict["f2"].offsets_or_none())
         # Lengths should still be available
-        self.assertTrue(
-            torch.equal(jt_dict["f1"].lengths(), torch.IntTensor([2, 0, 1]))
+        torch.testing.assert_close(
+            jt_dict["f1"].lengths(),
+            torch.IntTensor([2, 0, 1]),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(jt_dict["f2"].lengths(), torch.IntTensor([1, 1, 3]))
+        torch.testing.assert_close(
+            jt_dict["f2"].lengths(),
+            torch.IntTensor([1, 1, 3]),
+            rtol=0,
+            atol=0,
         )
 
     def test_to_dict_compute_offsets_false_variable_stride(self) -> None:
@@ -856,9 +979,14 @@ class TestJaggedTensor(unittest.TestCase):
         self.assertIsNone(jt_dict["f1"].offsets_or_none())
         self.assertIsNone(jt_dict["f2"].offsets_or_none())
         # Lengths should still be available
-        self.assertTrue(torch.equal(jt_dict["f1"].lengths(), torch.IntTensor([2, 0])))
-        self.assertTrue(
-            torch.equal(jt_dict["f2"].lengths(), torch.IntTensor([1, 1, 1, 3]))
+        torch.testing.assert_close(
+            jt_dict["f1"].lengths(), torch.IntTensor([2, 0]), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            jt_dict["f2"].lengths(),
+            torch.IntTensor([1, 1, 1, 3]),
+            rtol=0,
+            atol=0,
         )
 
 
@@ -929,9 +1057,13 @@ class TestJaggedTensorTracing(unittest.TestCase):
         ref_jt = m(values, weights, lengths)
         traced_jt = gm(values, weights, lengths)
 
-        self.assertTrue(torch.equal(traced_jt.values(), ref_jt.values()))
-        self.assertTrue(torch.equal(traced_jt.weights(), ref_jt.weights()))
-        self.assertTrue(torch.equal(traced_jt.lengths(), ref_jt.lengths()))
+        torch.testing.assert_close(traced_jt.values(), ref_jt.values(), rtol=0, atol=0)
+        torch.testing.assert_close(
+            traced_jt.weights(), ref_jt.weights(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            traced_jt.lengths(), ref_jt.lengths(), rtol=0, atol=0
+        )
 
         # Case 2: JaggedTensor is only used as an input of the root module.
         m = ModuleUseJaggedTensorAsInput()
@@ -958,9 +1090,15 @@ class TestJaggedTensorTracing(unittest.TestCase):
 
         ref_out = m(input)
         traced_out = gm(input)
-        self.assertTrue(torch.equal(traced_out.values(), ref_out.values()))
-        self.assertTrue(torch.equal(traced_out.weights(), ref_out.weights()))
-        self.assertTrue(torch.equal(traced_out.lengths(), ref_out.lengths()))
+        torch.testing.assert_close(
+            traced_out.values(), ref_out.values(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            traced_out.weights(), ref_out.weights(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            traced_out.lengths(), ref_out.lengths(), rtol=0, atol=0
+        )
 
         # Case 4: JaggedTensor is only used within the root module and not as part of
         # the root module's input/output interface.
@@ -1118,9 +1256,15 @@ class TestJaggedTensorTracing(unittest.TestCase):
         result_jt = dest_jt.copy_(source_jt)
 
         # Assert: Verify the destination JT has the source values
-        self.assertTrue(torch.equal(result_jt.values().cpu(), source_values))
-        self.assertTrue(torch.equal(result_jt.weights().cpu(), source_weights))
-        self.assertTrue(torch.equal(result_jt.lengths().cpu(), source_lengths))
+        torch.testing.assert_close(
+            result_jt.values().cpu(), source_values, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            result_jt.weights().cpu(), source_weights, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            result_jt.lengths().cpu(), source_lengths, rtol=0, atol=0
+        )
         # Verify it returns the same object (in-place operation)
         self.assertIs(result_jt, dest_jt)
         # Assert: Verify tensors are on CUDA
@@ -1154,8 +1298,12 @@ class TestJaggedTensorTracing(unittest.TestCase):
         result_jt = dest_jt.copy_(source_jt)
 
         # Assert: Verify the destination JT has the source values
-        self.assertTrue(torch.equal(result_jt.values().cpu(), source_values))
-        self.assertTrue(torch.equal(result_jt.lengths().cpu(), source_lengths))
+        torch.testing.assert_close(
+            result_jt.values().cpu(), source_values, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            result_jt.lengths().cpu(), source_lengths, rtol=0, atol=0
+        )
         self.assertIsNone(result_jt.weights_or_none())
         # Assert: Verify tensors are on CUDA
         self.assertTrue(result_jt.values().is_cuda)
@@ -1187,8 +1335,12 @@ class TestJaggedTensorTracing(unittest.TestCase):
         result_jt = dest_jt.copy_(source_jt)
 
         # Assert: Verify the destination JT has the source values and offsets
-        self.assertTrue(torch.equal(result_jt.values().cpu(), source_values))
-        self.assertTrue(torch.equal(result_jt.offsets().cpu(), source_offsets))
+        torch.testing.assert_close(
+            result_jt.values().cpu(), source_values, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            result_jt.offsets().cpu(), source_offsets, rtol=0, atol=0
+        )
         # Assert: Verify tensors are on CUDA
         self.assertTrue(result_jt.values().is_cuda)
         self.assertTrue(result_jt.offsets().is_cuda)
@@ -1222,8 +1374,12 @@ class TestJaggedTensorTracing(unittest.TestCase):
         torch.cuda.synchronize()
 
         # Assert: Verify the copy succeeded
-        self.assertTrue(torch.equal(result_jt.values().cpu(), source_values))
-        self.assertTrue(torch.equal(result_jt.lengths().cpu(), source_lengths))
+        torch.testing.assert_close(
+            result_jt.values().cpu(), source_values, rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            result_jt.lengths().cpu(), source_lengths, rtol=0, atol=0
+        )
         # Assert: Verify tensors are on CUDA
         self.assertTrue(result_jt.values().is_cuda)
         self.assertTrue(result_jt.lengths().is_cuda)

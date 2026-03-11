@@ -39,7 +39,9 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         param_1.grad = torch.tensor([1.0, 2.0])
         gradient_clipping_optimizer.step()
 
-        self.assertTrue(torch.equal(param_1.grad, torch.tensor([0.0, 0.0])))
+        torch.testing.assert_close(
+            param_1.grad, torch.tensor([0.0, 0.0]), rtol=0, atol=0
+        )
 
     def test_clip_no_gradients_norm(self) -> None:
         # gradients are too small to be clipped
@@ -57,7 +59,9 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         param_1.grad = torch.tensor([0.5, 0.5])
         gradient_clipping_optimizer.step()
 
-        self.assertTrue(torch.equal(param_1.grad, torch.tensor([0.5, 0.5])))
+        torch.testing.assert_close(
+            param_1.grad, torch.tensor([0.5, 0.5]), rtol=0, atol=0
+        )
 
     def test_clip_partial_gradients_norm(self) -> None:
         # test partial clipping
@@ -132,7 +136,9 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         param_1.grad = torch.tensor([1.0, 2.0])
         gradient_clipping_optimizer.step()
 
-        self.assertTrue(torch.equal(param_1.grad, torch.tensor([0.0, 0.0])))
+        torch.testing.assert_close(
+            param_1.grad, torch.tensor([0.0, 0.0]), rtol=0, atol=0
+        )
 
     def test_clip_no_gradients_value(self) -> None:
         # gradients are too small to be clipped
@@ -150,7 +156,9 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         param_1.grad = torch.tensor([0.5, 0.5])
         gradient_clipping_optimizer.step()
 
-        self.assertTrue(torch.equal(param_1.grad, torch.tensor([0.5, 0.5])))
+        torch.testing.assert_close(
+            param_1.grad, torch.tensor([0.5, 0.5]), rtol=0, atol=0
+        )
 
     def test_clip_gradients_value(self) -> None:
         # test partial clipping
@@ -237,8 +245,8 @@ class TestGetGrads(unittest.TestCase):
         grads = _get_grads([param_1, param_2])
 
         self.assertEqual(len(grads), 2)
-        self.assertTrue(torch.equal(grads[0], torch.tensor([0.1, 0.2])))
-        self.assertTrue(torch.equal(grads[1], torch.tensor([0.3, 0.4])))
+        torch.testing.assert_close(grads[0], torch.tensor([0.1, 0.2]), rtol=0, atol=0)
+        torch.testing.assert_close(grads[1], torch.tensor([0.3, 0.4]), rtol=0, atol=0)
 
     def test_get_grads_skips_none_gradients(self) -> None:
         param_1 = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -249,7 +257,7 @@ class TestGetGrads(unittest.TestCase):
         grads = _get_grads([param_1, param_2])
 
         self.assertEqual(len(grads), 1)
-        self.assertTrue(torch.equal(grads[0], torch.tensor([0.1, 0.2])))
+        torch.testing.assert_close(grads[0], torch.tensor([0.1, 0.2]), rtol=0, atol=0)
 
     def test_get_grads_skips_empty_gradients(self) -> None:
         param_1 = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -260,7 +268,7 @@ class TestGetGrads(unittest.TestCase):
         grads = _get_grads([param_1, param_2])
 
         self.assertEqual(len(grads), 1)
-        self.assertTrue(torch.equal(grads[0], torch.tensor([0.1, 0.2])))
+        torch.testing.assert_close(grads[0], torch.tensor([0.1, 0.2]), rtol=0, atol=0)
 
     def test_get_grads_empty_list(self) -> None:
         grads = _get_grads([])

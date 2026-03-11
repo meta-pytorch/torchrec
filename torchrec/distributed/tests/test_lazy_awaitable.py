@@ -85,12 +85,12 @@ class TestLazyAwaitable(unittest.TestCase):
         # ensure computation of y happens earlier than wait()
         m = Model()
         ref_res = m(torch.ones(3, 4))
-        self.assertTrue(torch.equal(ref_res, 17 * torch.ones(3, 4)))
+        torch.testing.assert_close(ref_res, 17 * torch.ones(3, 4), rtol=0, atol=0)
 
         # ensure fx tracing works
         gm = torch.fx.symbolic_trace(m)
         traced_res = gm(torch.ones(3, 4))
-        self.assertTrue(torch.equal(traced_res, ref_res))
+        torch.testing.assert_close(traced_res, ref_res, rtol=0, atol=0)
 
     def test_lazy_getattr(self) -> None:
         class Model(torch.nn.Module):
@@ -125,12 +125,12 @@ class TestLazyAwaitable(unittest.TestCase):
 
         m = Model()
         ref_res = m(torch.ones(3, 4))
-        self.assertTrue(torch.equal(ref_res, 17 * torch.ones(3, 4)))
+        torch.testing.assert_close(ref_res, 17 * torch.ones(3, 4), rtol=0, atol=0)
 
         # ensure fx tracing works
         gm = torch.fx.symbolic_trace(m)
         traced_res = gm(torch.ones(3, 4))
-        self.assertTrue(torch.equal(traced_res, ref_res))
+        torch.testing.assert_close(traced_res, ref_res, rtol=0, atol=0)
 
     def test_lazy_awaitable_init_error(self) -> None:
         class Model(torch.nn.Module):
@@ -161,12 +161,12 @@ class TestLazyAwaitable(unittest.TestCase):
 
         m = Model()
         ref_res = m(torch.ones(3, 4))
-        self.assertTrue(torch.equal(ref_res, 29 * torch.ones(3, 4)))
+        torch.testing.assert_close(ref_res, 29 * torch.ones(3, 4), rtol=0, atol=0)
 
         # ensure fx tracing works
         gm = torch.fx.symbolic_trace(m)
         traced_res = gm(torch.ones(3, 4))
-        self.assertTrue(torch.equal(traced_res, ref_res))
+        torch.testing.assert_close(traced_res, ref_res, rtol=0, atol=0)
 
     def test_lazy_get_item(self) -> None:
         class Model(torch.nn.Module):
@@ -180,12 +180,12 @@ class TestLazyAwaitable(unittest.TestCase):
 
         m = Model()
         ref_res = m(torch.ones(3, 4))
-        self.assertTrue(torch.equal(ref_res, 9 * torch.ones(2, 4)))
+        torch.testing.assert_close(ref_res, 9 * torch.ones(2, 4), rtol=0, atol=0)
 
         # ensure fx tracing works
         gm = torch.fx.symbolic_trace(m)
         traced_res = gm(torch.ones(3, 4))
-        self.assertTrue(torch.equal(traced_res, ref_res))
+        torch.testing.assert_close(traced_res, ref_res, rtol=0, atol=0)
 
     def test_lazy_magic_methods(self) -> None:
         class Model(torch.nn.Module):
@@ -202,11 +202,11 @@ class TestLazyAwaitable(unittest.TestCase):
 
         m = Model()
         ref_res = m(torch.ones(3, 4))
-        self.assertTrue(torch.equal(ref_res, 9 * torch.ones(3, 4)))
+        torch.testing.assert_close(ref_res, 9 * torch.ones(3, 4), rtol=0, atol=0)
 
         gm = torch.fx.symbolic_trace(m)
         traced_res = gm(torch.ones(3, 4))
-        self.assertTrue(torch.equal(traced_res, ref_res))
+        torch.testing.assert_close(traced_res, ref_res, rtol=0, atol=0)
 
     def test_awatiable_pickle(self) -> None:
         awaitable = LazyNoWait(torch.randn(2, 3))
@@ -226,12 +226,12 @@ class TestLazyAwaitable(unittest.TestCase):
 
         m = Model()
         ref_res = m()
-        self.assertTrue(torch.equal(ref_res, 5 * torch.ones(2, 3)))
+        torch.testing.assert_close(ref_res, 5 * torch.ones(2, 3), rtol=0, atol=0)
 
         # ensure fx tracing works
         gm = torch.fx.symbolic_trace(m)
         traced_res = gm()
-        self.assertTrue(torch.equal(traced_res, ref_res))
+        torch.testing.assert_close(traced_res, ref_res, rtol=0, atol=0)
 
     def test_lazy_awaitable_serde(self) -> None:
         class Model(torch.nn.Module):
@@ -259,7 +259,7 @@ class TestLazyAwaitable(unittest.TestCase):
             loaded = pickle.load(f)
 
             ref_res = loaded(torch.ones(3, 4))
-            self.assertTrue(torch.equal(ref_res, 17 * torch.ones(3, 4)))
+            torch.testing.assert_close(ref_res, 17 * torch.ones(3, 4), rtol=0, atol=0)
 
         tempFile.close()
 

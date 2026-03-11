@@ -49,4 +49,4 @@ class TestTracer(unittest.TestCase):
         input = torch.randn(3, 4)
         ref_out = auto_model(input)
         traced_out = auto_gm(input)
-        self.assertTrue(torch.equal(ref_out, traced_out))
+        torch.testing.assert_close(ref_out, traced_out, rtol=0, atol=0)
