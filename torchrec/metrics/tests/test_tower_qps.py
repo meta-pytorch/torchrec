@@ -591,3 +591,78 @@ class TowerQPSMetricTest(unittest.TestCase):
         state_dict[f"{prefix}num_batch"] = torch.tensor(10, dtype=torch.long)
         metric.load_state_dict_hook(state_dict, prefix, {}, True, [], [], [])
         self.assertEqual(metric._num_batch, 10)
+
+    def test_load_state_dict_cross_bss_to_no_bss(self) -> None:
+        """Test loading a state_dict saved WITH batch_size_stages into a
+        TowerQPSMetric WITHOUT batch_size_stages. This reproduces the bug where
+        the load_state_dict_hook fails to pop the num_batch key when
+        batch_size_stages is None, causing an 'Unexpected key' RuntimeError.
+        """
+        task_names = ["t1", "t2", "t3"]
+        tasks = gen_test_tasks(task_names)
+
+        # Step 1: Create a metric WITH batch_size_stages and update it
+        bss_metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_size=1000,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            batch_size_stages=[BatchSizeStage(256, 1), BatchSizeStage(512, None)],
+        )
+        bss_metric.update(
+            labels={
+                "t1": torch.rand(self.batch_size),
+                "t2": torch.rand(self.batch_size),
+                "t3": torch.rand(self.batch_size),
+            },
+            predictions=torch.ones(self.batch_size),
+            weights=torch.rand(self.batch_size),
+        )
+
+        # Step 2: Save state_dict - should include num_batch
+        state_dict = bss_metric.state_dict()
+        self.assertIn("num_batch", state_dict)
+        self.assertEqual(state_dict["num_batch"].item(), 1)
+
+        # Step 3: Create a metric WITHOUT batch_size_stages
+        no_bss_metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_size=1000,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            batch_size_stages=None,
+        )
+
+        # Step 4: Load the BSS state_dict into the non-BSS metric
+        # This should NOT raise RuntimeError about unexpected keys
+        no_bss_metric.load_state_dict(state_dict)
+
+        # num_batch should NOT be created on the non-BSS metric
+        self.assertFalse(hasattr(no_bss_metric, "_num_batch"))
+
+    def test_load_state_dict_hook_pops_key_without_bss(self) -> None:
+        """Test that the load_state_dict_hook pops the num_batch key from
+        state_dict even when batch_size_stages is None. This ensures
+        cross-loading compatibility between BSS and non-BSS checkpoints."""
+        task_names = ["t1", "t2", "t3"]
+        tasks = gen_test_tasks(task_names)
+        metric = TowerQPSMetric(
+            my_rank=0,
+            tasks=tasks,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_size=1000,
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            batch_size_stages=None,
+        )
+        state_dict: OrderedDict[str, torch.Tensor] = OrderedDict()
+        prefix: str = "test_prefix_"
+        state_dict[f"{prefix}num_batch"] = torch.tensor(10, dtype=torch.long)
+
+        # The hook should pop the key even when batch_size_stages is None
+        metric.load_state_dict_hook(state_dict, prefix, {}, True, [], [], [])
+        self.assertNotIn(f"{prefix}num_batch", state_dict)
