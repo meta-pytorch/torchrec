@@ -190,7 +190,7 @@ class InteractionArchTransformerTest(unittest.TestCase):
                 [-1, 0, 0, 0, 0, 0, -1, 1, 0, 1, -1, 0],
             ]
         )
-        self.assertTrue(torch.equal(concat_dense.long(), expected))
+        torch.testing.assert_close(concat_dense.long(), expected, rtol=0, atol=0)
 
 
 class DLRMTransformerTest(unittest.TestCase):

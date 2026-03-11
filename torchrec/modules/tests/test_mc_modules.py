@@ -484,8 +484,12 @@ class TestManagedCollisionCollection(unittest.TestCase):
 
         # Verify the forward method accepts the parameter without errors
         # and produces valid output in both cases
-        self.assertTrue(torch.equal(output_true.values(), output_false.values()))
-        self.assertTrue(torch.equal(output_true.lengths(), output_false.lengths()))
+        torch.testing.assert_close(
+            output_true.values(), output_false.values(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            output_true.lengths(), output_false.lengths(), rtol=0, atol=0
+        )
 
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
@@ -567,11 +571,15 @@ class TestManagedCollisionCollection(unittest.TestCase):
         runtime_meta = mcc.lookup_runtime_meta(kjt, remapped_ids)
         self.assertIsNotNone(runtime_meta)
         self.assertEqual(runtime_meta.keys(), kjt.keys())
-        self.assertTrue(
-            torch.equal(
-                runtime_meta.values(),
-                torch.tensor([11, 0, 13, 14, -1], dtype=torch.int64, device=device),
-            )
+        torch.testing.assert_close(
+            runtime_meta.values(),
+            torch.tensor([11, 0, 13, 14, -1], dtype=torch.int64, device=device),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(torch.equal(runtime_meta.lengths(), kjt.lengths()))
-        self.assertTrue(torch.equal(runtime_meta.weights(), kjt.weights()))
+        torch.testing.assert_close(
+            runtime_meta.lengths(), kjt.lengths(), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            runtime_meta.weights(), kjt.weights(), rtol=0, atol=0
+        )

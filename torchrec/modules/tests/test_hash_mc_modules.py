@@ -91,21 +91,21 @@ class TestMCH(unittest.TestCase):
             m_infer.reset_inference_mode()
             m_infer.to(device_str)
 
-            self.assertTrue(
-                torch.equal(
-                    #  `Union[Tensor, Module]`.
-                    # pyrefly: ignore[bad-argument-type]
-                    none_throws(m_infer.input_mapper._zch_size_per_training_rank),
-                    torch.tensor([10, 10], dtype=torch.int64, device=device_str),
-                )
+            torch.testing.assert_close(
+                #  `Union[Tensor, Module]`.
+                # pyrefly: ignore[bad-argument-type]
+                none_throws(m_infer.input_mapper._zch_size_per_training_rank),
+                torch.tensor([10, 10], dtype=torch.int64, device=device_str),
+                rtol=0,
+                atol=0,
             )
-            self.assertTrue(
-                torch.equal(
-                    #  `Union[Tensor, Module]`.
-                    # pyrefly: ignore[bad-argument-type]
-                    none_throws(m_infer.input_mapper._train_rank_offsets),
-                    torch.tensor([0, 10], dtype=torch.int64, device=device_str),
-                )
+            torch.testing.assert_close(
+                #  `Union[Tensor, Module]`.
+                # pyrefly: ignore[bad-argument-type]
+                none_throws(m_infer.input_mapper._train_rank_offsets),
+                torch.tensor([0, 10], dtype=torch.int64, device=device_str),
+                rtol=0,
+                atol=0,
             )
 
             m_infer._hash_zch_identities = torch.nn.Parameter(
@@ -123,7 +123,7 @@ class TestMCH(unittest.TestCase):
             m_infer = torch.jit.script(m_infer)
             o_infer = m_infer(in12)["f"].values()
             o12 = torch.stack([o1, o2], dim=1).view(-1).to(device_str)
-            self.assertTrue(torch.equal(o_infer, o12), f"{o_infer=} vs {o12=}")
+            torch.testing.assert_close(o_infer, o12, rtol=0, atol=0)
 
         m3 = HashZchManagedCollisionModule(
             zch_size=10,
@@ -559,16 +559,22 @@ class TestMCH(unittest.TestCase):
 
         bucket2 = m.rebuild_with_output_id_range((5, 10))
         self.assertIsNotNone(bucket2._output_global_offset_tensor)
-        self.assertTrue(
-            torch.equal(bucket2._output_global_offset_tensor, torch.tensor([5]))
+        torch.testing.assert_close(
+            bucket2._output_global_offset_tensor,
+            torch.tensor([5]),
+            rtol=0,
+            atol=0,
         )
         self.assertEqual(bucket2._start_bucket, 1)
 
         m.reset_inference_mode()
         bucket3 = m.rebuild_with_output_id_range((10, 15))
         self.assertIsNotNone(bucket3._output_global_offset_tensor)
-        self.assertTrue(
-            torch.equal(bucket3._output_global_offset_tensor, torch.tensor([10]))
+        torch.testing.assert_close(
+            bucket3._output_global_offset_tensor,
+            torch.tensor([10]),
+            rtol=0,
+            atol=0,
         )
         self.assertEqual(bucket3._start_bucket, 2)
         self.assertEqual(
@@ -720,17 +726,17 @@ class TestMCH(unittest.TestCase):
         # Run once to insert ids
         output0 = m.remap({"test": jt}, mutate_miss_lengths=True)
         # All values should be inserted, and lengths should remain unchanged
-        self.assertTrue(
-            torch.equal(
-                output0["test"].values(),
-                torch.tensor([3, 5, 4, 6], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output0["test"].values(),
+            torch.tensor([3, 5, 4, 6], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output0["test"].lengths(),
-                torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output0["test"].lengths(),
+            torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
 
         m.reset_inference_mode()
@@ -745,24 +751,24 @@ class TestMCH(unittest.TestCase):
         output1 = m.remap({"test": jt}, mutate_miss_lengths=False)
         # For missed IDs (9, 4, 6, 8), remapped_ids should be 0 instead of being removed
         # remapped_ids: [0, 3, 5, 0, 0, 0] (where 0 is the fallback for misses)
-        self.assertTrue(
-            torch.equal(
-                output1["test"].values(),
-                torch.tensor([0, 3, 5, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output1["test"].values(),
+            torch.tensor([0, 3, 5, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
         # Lengths should remain unchanged (all 1s, not mutated to 0 for misses)
-        self.assertTrue(
-            torch.equal(
-                output1["test"].lengths(),
-                torch.tensor([6], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output1["test"].lengths(),
+            torch.tensor([6], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output1["test"].offsets(),
-                torch.tensor([0, 6], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output1["test"].offsets(),
+            torch.tensor([0, 6], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
         jt = JaggedTensor(
             values=torch.tensor([9, 0, 1, 4, 6, 8], dtype=torch.int64, device="cuda"),
@@ -771,24 +777,24 @@ class TestMCH(unittest.TestCase):
         output2 = m.remap({"test": jt}, mutate_miss_lengths=True)
         # For missed IDs (9, 4, 6, 8), remapped_ids should be 0 instead of being removed
         # remapped_ids: [0, 3, 5, 0, 0, 0] (where 0 is the fallback for misses)
-        self.assertTrue(
-            torch.equal(
-                output2["test"].values(),
-                torch.tensor([0, 3, 5, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output2["test"].values(),
+            torch.tensor([0, 3, 5, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
         # Lengths should be mutated to 0 for misses
-        self.assertTrue(
-            torch.equal(
-                output2["test"].lengths(),
-                torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output2["test"].lengths(),
+            torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output2["test"].offsets(),
-                torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output2["test"].offsets(),
+            torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
 
     # Skipping this test because it is flaky on CI. TODO: T240185573 T240185565 investigate the flakiness and re-enable the test.
@@ -817,17 +823,17 @@ class TestMCH(unittest.TestCase):
         )
         # Run once to insert ids
         output0 = m.remap({"test": jt})
-        self.assertTrue(
-            torch.equal(
-                output0["test"].values(),
-                torch.tensor([8, 15, 11], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output0["test"].values(),
+            torch.tensor([8, 15, 11], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output0["test"].lengths(),
-                torch.tensor([1, 1, 0, 1], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output0["test"].lengths(),
+            torch.tensor([1, 1, 0, 1], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
         m.reset_inference_mode()
         jt = JaggedTensor(
@@ -836,23 +842,23 @@ class TestMCH(unittest.TestCase):
         )
         # Run again in inference mode and only values 0 and 1 exist.
         output1 = m.remap({"test": jt})
-        self.assertTrue(
-            torch.equal(
-                output1["test"].values(),
-                torch.tensor([8, 15], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output1["test"].values(),
+            torch.tensor([8, 15], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output1["test"].lengths(),
-                torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output1["test"].lengths(),
+            torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output1["test"].offsets(),
-                torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output1["test"].offsets(),
+            torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
 
         m = HashZchManagedCollisionModule(
@@ -875,17 +881,17 @@ class TestMCH(unittest.TestCase):
         )
         # Run once to insert ids
         output0 = m.remap({"test": jt})
-        self.assertTrue(
-            torch.equal(
-                output0["test"].values(),
-                torch.tensor([3, 5, 4, 6], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output0["test"].values(),
+            torch.tensor([3, 5, 4, 6], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output0["test"].lengths(),
-                torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output0["test"].lengths(),
+            torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
         m.reset_inference_mode()
         jt = JaggedTensor(
@@ -894,23 +900,23 @@ class TestMCH(unittest.TestCase):
         )
         # Run again in inference mode and only values 0 and 1 exist.
         output1 = m.remap({"test": jt})
-        self.assertTrue(
-            torch.equal(
-                output1["test"].values(),
-                torch.tensor([3, 5], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output1["test"].values(),
+            torch.tensor([3, 5], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output1["test"].lengths(),
-                torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output1["test"].lengths(),
+            torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output1["test"].offsets(),
-                torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output1["test"].offsets(),
+            torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
 
     @unittest.skipIf(
@@ -984,17 +990,17 @@ class TestMCH(unittest.TestCase):
         # Get indices of zero rows
         self.assertEqual(torch.nonzero(row_mask, as_tuple=False).squeeze().numel(), 0)
         self.assertIsNotNone(res[1])
-        self.assertTrue(
-            torch.equal(
-                res[1]["table_0"].values(),
-                torch.tensor([1, 2, 8, 9, 3], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            res[1]["table_0"].values(),
+            torch.tensor([1, 2, 8, 9, 3], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                res[1]["table_0"].lengths(),
-                torch.tensor([1, 1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            res[1]["table_0"].lengths(),
+            torch.tensor([1, 1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
         # pyrefly: ignore[not-callable]
         mcebc._managed_collision_collection._managed_collision_modules[
@@ -1015,37 +1021,37 @@ class TestMCH(unittest.TestCase):
         )
         # Run once to insert ids.
         res = mcebc.forward(features)
-        self.assertTrue(
-            torch.equal(
-                # pyrefly: ignore[unsupported-operation]
-                res[1]["table_0"].values(),
-                torch.tensor([2, 8, 3], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            # pyrefly: ignore[unsupported-operation]
+            res[1]["table_0"].values(),
+            torch.tensor([2, 8, 3], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                # pyrefly: ignore[unsupported-operation]
-                res[1]["table_0"].lengths(),
-                torch.tensor([0, 1, 1, 0, 0, 1], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            # pyrefly: ignore[unsupported-operation]
+            res[1]["table_0"].lengths(),
+            torch.tensor([0, 1, 1, 0, 0, 1], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                # pyrefly: ignore[unsupported-operation]
-                res[1]["table_0"].offsets(),
-                torch.tensor([0, 0, 1, 2, 2, 2, 3], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            # pyrefly: ignore[unsupported-operation]
+            res[1]["table_0"].offsets(),
+            torch.tensor([0, 0, 1, 2, 2, 2, 3], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
         # pyrefly: ignore[bad-argument-type]
         mask = torch.abs(res[0]["table_0"]) == 0
         # For each row, check if all elements are True (i.e., close to zero)
         row_mask = mask.all(dim=1)
         # Get indices of zero rows
-        self.assertTrue(
-            torch.equal(
-                torch.tensor([0, 3, 4], device="cuda:0"),
-                torch.nonzero(row_mask, as_tuple=False).squeeze(),
-            )
+        torch.testing.assert_close(
+            torch.tensor([0, 3, 4], device="cuda:0"),
+            torch.nonzero(row_mask, as_tuple=False).squeeze(),
+            rtol=0,
+            atol=0,
         )
 
     @unittest.skipIf(
@@ -1080,19 +1086,17 @@ class TestMCH(unittest.TestCase):
         )
         # Run once to insert ids
         output0 = m.remap({"test": jt})
-        self.assertTrue(
-            torch.equal(
-                output0["test"].values(),
-                torch.tensor([8, 15, 11], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output0["test"].values(),
+            torch.tensor([8, 15, 11], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output0["test"].lengths(),
-                torch.tensor(
-                    [1, 1, 0, 0, 0, 0, 1, 0], dtype=torch.int64, device="cuda:0"
-                ),
-            )
+        torch.testing.assert_close(
+            output0["test"].lengths(),
+            torch.tensor([1, 1, 0, 0, 0, 0, 1, 0], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
         m.eval()
         self.assertFalse(m.training)
@@ -1108,21 +1112,21 @@ class TestMCH(unittest.TestCase):
         )
         # Run again in training eval mode and only values 0 and 1 exist.
         output = m.remap({"test": jt})
-        self.assertTrue(
-            torch.equal(
-                output["test"].values(),
-                torch.tensor([8, 15], dtype=torch.int64, device="cuda:0"),
-            )
+        torch.testing.assert_close(
+            output["test"].values(),
+            torch.tensor([8, 15], dtype=torch.int64, device="cuda:0"),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                output["test"].lengths(),
-                torch.tensor(
-                    [0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
-                    dtype=torch.int64,
-                    device="cuda:0",
-                ),
-            )
+        torch.testing.assert_close(
+            output["test"].lengths(),
+            torch.tensor(
+                [0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                dtype=torch.int64,
+                device="cuda:0",
+            ),
+            rtol=0,
+            atol=0,
         )
 
     def test_is_sharded_property(self) -> None:
@@ -1174,11 +1178,11 @@ class TestMCH(unittest.TestCase):
         lengths = torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda")
         hit_indices = torch.tensor([True, False, True, False], device="cuda")
         result = _compute_lengths_from_hits(lengths, hit_indices)
-        self.assertTrue(
-            torch.equal(
-                result,
-                torch.tensor([1, 0, 1, 0], dtype=torch.int64, device="cuda"),
-            )
+        torch.testing.assert_close(
+            result,
+            torch.tensor([1, 0, 1, 0], dtype=torch.int64, device="cuda"),
+            rtol=0,
+            atol=0,
         )
 
         # Variable lengths: samples with different numbers of IDs
@@ -1188,33 +1192,33 @@ class TestMCH(unittest.TestCase):
             [True, False, True, True, False, True], device="cuda"
         )
         result = _compute_lengths_from_hits(lengths, hit_indices)
-        self.assertTrue(
-            torch.equal(
-                result,
-                torch.tensor([2, 1, 1], dtype=torch.int64, device="cuda"),
-            )
+        torch.testing.assert_close(
+            result,
+            torch.tensor([2, 1, 1], dtype=torch.int64, device="cuda"),
+            rtol=0,
+            atol=0,
         )
 
         # All hits
         lengths = torch.tensor([2, 3], dtype=torch.int64, device="cuda")
         hit_indices = torch.tensor([True, True, True, True, True], device="cuda")
         result = _compute_lengths_from_hits(lengths, hit_indices)
-        self.assertTrue(
-            torch.equal(
-                result,
-                torch.tensor([2, 3], dtype=torch.int64, device="cuda"),
-            )
+        torch.testing.assert_close(
+            result,
+            torch.tensor([2, 3], dtype=torch.int64, device="cuda"),
+            rtol=0,
+            atol=0,
         )
 
         # No hits
         lengths = torch.tensor([2, 3], dtype=torch.int64, device="cuda")
         hit_indices = torch.tensor([False, False, False, False, False], device="cuda")
         result = _compute_lengths_from_hits(lengths, hit_indices)
-        self.assertTrue(
-            torch.equal(
-                result,
-                torch.tensor([0, 0], dtype=torch.int64, device="cuda"),
-            )
+        torch.testing.assert_close(
+            result,
+            torch.tensor([0, 0], dtype=torch.int64, device="cuda"),
+            rtol=0,
+            atol=0,
         )
 
         # Sparse lengths (simulating distributed execution with zero-length samples)
@@ -1223,15 +1227,15 @@ class TestMCH(unittest.TestCase):
         )
         hit_indices = torch.tensor([True, False, True, True, False], device="cuda")
         result = _compute_lengths_from_hits(lengths, hit_indices)
-        self.assertTrue(
-            torch.equal(
-                result,
-                torch.tensor(
-                    [0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0],
-                    dtype=torch.int64,
-                    device="cuda",
-                ),
-            )
+        torch.testing.assert_close(
+            result,
+            torch.tensor(
+                [0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0],
+                dtype=torch.int64,
+                device="cuda",
+            ),
+            rtol=0,
+            atol=0,
         )
 
 
@@ -1453,5 +1457,12 @@ class TestVBEWithManagedCollision(unittest.TestCase):
         expected_prod = pooled_embeddings["product_table"][prod_inverse]
 
         # Verify actual output matches expected output
-        self.assertTrue(torch.equal(expected_user, actual_output["user"].to("cpu")))
-        self.assertTrue(torch.equal(expected_prod, actual_output["product"].to("cpu")))
+        torch.testing.assert_close(
+            expected_user, actual_output["user"].to("cpu"), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            expected_prod,
+            actual_output["product"].to("cpu"),
+            rtol=0,
+            atol=0,
+        )

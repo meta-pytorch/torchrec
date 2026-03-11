@@ -146,4 +146,4 @@ class MainTest(unittest.TestCase):
         for k, v in retrieval_sd.items():
             k = k.replace("query_ebc", "two_tower.ebc")
             k = k.replace("candidate_ebc", "two_tower.ebc")
-            self.assertTrue(torch.equal(v, two_tower_sd[k]))
+            torch.testing.assert_close(v, two_tower_sd[k], rtol=0, atol=0)

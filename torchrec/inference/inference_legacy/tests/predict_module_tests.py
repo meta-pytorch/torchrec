@@ -40,7 +40,7 @@ class PredictModulesTest(unittest.TestCase):
         for tensor0, tensor1 in zip(
             module_state_dict.values(), predict_module_state_dict.values()
         ):
-            self.assertTrue(torch.equal(tensor0, tensor1))
+            torch.testing.assert_close(tensor0, tensor1, rtol=0, atol=0)
 
     def test_dense_lowering(self) -> None:
         module = TestModule()

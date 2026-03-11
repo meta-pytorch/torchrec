@@ -367,8 +367,13 @@ class TestModelInput(unittest.TestCase):
         cpu_device = torch.device("cpu")
         result = model_input.to(device=cpu_device)
 
-        self.assertTrue(torch.equal(result.float_features, model_input.float_features))
-        self.assertTrue(torch.equal(result.label, model_input.label))
+        torch.testing.assert_close(
+            result.float_features,
+            model_input.float_features,
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(result.label, model_input.label, rtol=0, atol=0)
 
     def test_to_with_none_features(self) -> None:
         """ModelInput.to should handle None idlist/idscore features."""
@@ -459,13 +464,16 @@ class TestModelInput(unittest.TestCase):
 
         # Float features should be concatenated
         expected_float_features = torch.cat([b.float_features for b in local_inputs])
-        self.assertTrue(
-            torch.equal(global_input.float_features, expected_float_features)
+        torch.testing.assert_close(
+            global_input.float_features,
+            expected_float_features,
+            rtol=0,
+            atol=0,
         )
 
         # Labels should be concatenated
         expected_labels = torch.cat([b.label for b in local_inputs])
-        self.assertTrue(torch.equal(global_input.label, expected_labels))
+        torch.testing.assert_close(global_input.label, expected_labels, rtol=0, atol=0)
 
     # =======================================================
     # Tests for ModelInput.create_standard_kjt()
