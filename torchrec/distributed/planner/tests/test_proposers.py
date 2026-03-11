@@ -12,6 +12,7 @@ from typing import cast, List, Optional, Type
 from unittest.mock import MagicMock
 
 import torch
+from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.constants import BATCH_SIZE, DEFAULT_PERF_ESTIMATOR
@@ -116,8 +117,7 @@ def make_sharding_option(
     return ShardingOption(
         name=name,
         tensor=torch.zeros(1),
-        # pyrefly: ignore[bad-argument-type]
-        module=("model", None),
+        module=("model", nn.Module()),
         input_lengths=[],
         batch_size=8,
         sharding_type="row_wise",
@@ -927,8 +927,7 @@ class TestProposers(unittest.TestCase):
                 ShardingOption(
                     name=name,
                     tensor=torch.zeros(1),
-                    # pyrefly: ignore[bad-argument-type]
-                    module=("model", None),
+                    module=("model", nn.Module()),
                     input_lengths=[],
                     batch_size=8,
                     sharding_type="row_wise",
