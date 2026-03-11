@@ -1052,7 +1052,9 @@ class TestMCH(unittest.TestCase):
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
     )
-    def test_zch_hash_disable_fallback_sharded_module(self) -> None:
+    def test_zch_hash_disable_fallback_sharded_module_disabled_in_oss_compatibility(
+        self,
+    ) -> None:
         # Lengths should not be modified when disabling fallback in traning eval.
         m = HashZchManagedCollisionModule(
             zch_size=30,
