@@ -82,7 +82,7 @@ class TestGradientClippingOptimizer(unittest.TestCase):
 
         norm = 2.0**2 + 4.0**2
         expected_grad = torch.tensor([2.0, 4.0]) * norm ** (-0.5)
-        self.assertTrue(torch.allclose(param_1.grad, expected_grad))
+        torch.testing.assert_close(param_1.grad, expected_grad, rtol=1e-05, atol=1e-08)
 
     def test_clip_partial_gradients_norm_multi_params(self) -> None:
         # test partial clipping
@@ -117,8 +117,12 @@ class TestGradientClippingOptimizer(unittest.TestCase):
 
         print(param_1.grad, param_2.grad, expected_grad_1, expected_grad_2)
 
-        self.assertTrue(torch.allclose(param_1.grad, expected_grad_1))
-        self.assertTrue(torch.allclose(param_2.grad, expected_grad_2))
+        torch.testing.assert_close(
+            param_1.grad, expected_grad_1, rtol=1e-05, atol=1e-08
+        )
+        torch.testing.assert_close(
+            param_2.grad, expected_grad_2, rtol=1e-05, atol=1e-08
+        )
 
     def test_clip_all_gradients_value(self) -> None:
         # Clip all gradients to zero
@@ -179,7 +183,7 @@ class TestGradientClippingOptimizer(unittest.TestCase):
 
         expected_grad = torch.tensor([1.0, 1.0])
 
-        self.assertTrue(torch.allclose(param_1.grad, expected_grad))
+        torch.testing.assert_close(param_1.grad, expected_grad, rtol=1e-05, atol=1e-08)
 
     def test_clip_partial_gradients_value_multi_params(self) -> None:
         # test partial clipping
@@ -209,8 +213,12 @@ class TestGradientClippingOptimizer(unittest.TestCase):
         expected_grad_1 = torch.tensor([2.0, 2.0])
         expected_grad_2 = torch.tensor([2.0, 2.0])
 
-        self.assertTrue(torch.allclose(param_1.grad, expected_grad_1))
-        self.assertTrue(torch.allclose(param_2.grad, expected_grad_2))
+        torch.testing.assert_close(
+            param_1.grad, expected_grad_1, rtol=1e-05, atol=1e-08
+        )
+        torch.testing.assert_close(
+            param_2.grad, expected_grad_2, rtol=1e-05, atol=1e-08
+        )
 
     @patch("torch.nn.utils.clip_grad_norm_")
     def test_clip_no_gradients_norm_meta_device(
@@ -292,7 +300,9 @@ class TestBatchCalNorm(unittest.TestCase):
         expected_total = (expected_norm_1**2 + expected_norm_2**2) ** 0.5
         expected_result = expected_total**2.0
 
-        self.assertTrue(torch.allclose(result, torch.tensor(expected_result)))
+        torch.testing.assert_close(
+            result, torch.tensor(expected_result), rtol=1e-05, atol=1e-08
+        )
 
     def test_batch_cal_norm_l1(self) -> None:
         grad_1 = torch.tensor([1.0, 2.0])
@@ -309,7 +319,9 @@ class TestBatchCalNorm(unittest.TestCase):
         expected_total = expected_norm_1 + expected_norm_2
         expected_result = expected_total**1.0
 
-        self.assertTrue(torch.allclose(result, torch.tensor(expected_result)))
+        torch.testing.assert_close(
+            result, torch.tensor(expected_result), rtol=1e-05, atol=1e-08
+        )
 
     def test_batch_cal_norm_inf(self) -> None:
         grad_1 = torch.tensor([1.0, 5.0])
@@ -323,7 +335,9 @@ class TestBatchCalNorm(unittest.TestCase):
 
         expected_result = 5.0
 
-        self.assertTrue(torch.allclose(result, torch.tensor(expected_result)))
+        torch.testing.assert_close(
+            result, torch.tensor(expected_result), rtol=1e-05, atol=1e-08
+        )
 
     def test_batch_cal_norm_inf_with_empty_tensor(self) -> None:
         """Test that infinity norm handles empty tensors without erroring."""
@@ -339,7 +353,9 @@ class TestBatchCalNorm(unittest.TestCase):
         # The empty tensor should be filtered out, so the result should be max of grad_1
         expected_result = 5.0
 
-        self.assertTrue(torch.allclose(result, torch.tensor(expected_result)))
+        torch.testing.assert_close(
+            result, torch.tensor(expected_result), rtol=1e-05, atol=1e-08
+        )
 
     def test_batch_cal_norm_inf_all_empty_tensors(self) -> None:
         """Test that infinity norm returns -inf when all tensors are empty."""
@@ -372,7 +388,9 @@ class TestComputeTotalNorm(unittest.TestCase):
         expected_norm_2 = (6.0**2 + 8.0**2) ** 0.5
         expected_total = (expected_norm_1**2 + expected_norm_2**2) ** 0.5
 
-        self.assertTrue(torch.allclose(result, torch.tensor(expected_total)))
+        torch.testing.assert_close(
+            result, torch.tensor(expected_total), rtol=1e-05, atol=1e-08
+        )
 
     def test_compute_total_norm_replicate_only_inf(self) -> None:
         grad_1 = torch.tensor([1.0, 5.0])
@@ -387,7 +405,9 @@ class TestComputeTotalNorm(unittest.TestCase):
 
         expected_result = 5.0
 
-        self.assertTrue(torch.allclose(result, torch.tensor(expected_result)))
+        torch.testing.assert_close(
+            result, torch.tensor(expected_result), rtol=1e-05, atol=1e-08
+        )
 
     def test_compute_total_norm_empty_grads(self) -> None:
         result = _compute_total_norm(
@@ -397,7 +417,7 @@ class TestComputeTotalNorm(unittest.TestCase):
             max_grad_norm=1.0,
         )
 
-        self.assertTrue(torch.allclose(result, torch.tensor(0.0)))
+        torch.testing.assert_close(result, torch.tensor(0.0), rtol=1e-05, atol=1e-08)
 
     def test_compute_total_norm_single_grad(self) -> None:
         grad_1 = torch.tensor([3.0, 4.0])
@@ -411,7 +431,9 @@ class TestComputeTotalNorm(unittest.TestCase):
 
         expected_norm = (3.0**2 + 4.0**2) ** 0.5
 
-        self.assertTrue(torch.allclose(result, torch.tensor(expected_norm)))
+        torch.testing.assert_close(
+            result, torch.tensor(expected_norm), rtol=1e-05, atol=1e-08
+        )
 
 
 class TestClipGradNorm(unittest.TestCase):
@@ -473,12 +495,12 @@ class TestClipGradNorm(unittest.TestCase):
             total_norm = gradient_clipping_optimizer.clip_grad_norm_()
 
         expected_norm = (3.0**2 + 4.0**2) ** 0.5
-        self.assertTrue(
-            torch.allclose(
-                # pyrefly: ignore[bad-argument-type]
-                total_norm,
-                torch.tensor(expected_norm),
-            )
+        torch.testing.assert_close(
+            # pyrefly: ignore[bad-argument-type]
+            total_norm,
+            torch.tensor(expected_norm),
+            rtol=1e-05,
+            atol=1e-08,
         )
 
     def test_clip_grad_norm_no_clipping_when_below_threshold(self) -> None:
@@ -508,7 +530,7 @@ class TestClipGradNorm(unittest.TestCase):
         with patch("torch.distributed.all_reduce"):
             gradient_clipping_optimizer.clip_grad_norm_()
 
-        self.assertTrue(torch.allclose(param_1.grad, original_grad))
+        torch.testing.assert_close(param_1.grad, original_grad, rtol=1e-05, atol=1e-08)
 
     def test_clip_grad_norm_applies_clipping_when_above_threshold(self) -> None:
         max_gradient = 1.0
@@ -542,7 +564,7 @@ class TestClipGradNorm(unittest.TestCase):
         clip_coef_clamped = min(clip_coef.item(), 1.0)
         expected_grad = original_grad * clip_coef_clamped
 
-        self.assertTrue(torch.allclose(param_1.grad, expected_grad))
+        torch.testing.assert_close(param_1.grad, expected_grad, rtol=1e-05, atol=1e-08)
 
     def test_clip_grad_norm_with_replicate_and_sharded_params(self) -> None:
         max_gradient = 1.0

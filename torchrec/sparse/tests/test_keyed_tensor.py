@@ -757,7 +757,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             values, permutes, in_shapes, out_shapes, out_lengths
         )
         for out, ref in zip(outputs, refs):
-            self.assertTrue(torch.allclose(out, ref))
+            torch.testing.assert_close(out, ref, rtol=1e-05, atol=1e-08)
 
         ref_loss, loss = refs[0].sum(), outputs[0].sum()
         for i in range(1, len(refs)):
@@ -769,7 +769,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             val_grad, ref_grad = val.grad, ref.grad
             self.assertIsInstance(val_grad, torch.Tensor)
             # pyrefly: ignore[bad-argument-type]
-            self.assertTrue(torch.allclose(val_grad, ref_grad))
+            torch.testing.assert_close(val_grad, ref_grad, rtol=1e-05, atol=1e-08)
 
     @given(
         device_str=st.sampled_from(["cpu", "cuda"]),
@@ -809,7 +809,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             non_contiguous, permutes, in_shapes, out_shapes, out_lengths
         )
         for out, ref in zip(outputs, refs):
-            self.assertTrue(torch.allclose(out, ref))
+            torch.testing.assert_close(out, ref, rtol=1e-05, atol=1e-08)
 
         ref_loss, loss = refs[0].sum(), outputs[0].sum()
         for i in range(1, len(refs)):
@@ -821,7 +821,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             val_grad, ref_grad = val.grad, ref.grad
             self.assertIsInstance(val_grad, torch.Tensor)
             # pyrefly: ignore[bad-argument-type]
-            self.assertTrue(torch.allclose(val_grad, ref_grad))
+            torch.testing.assert_close(val_grad, ref_grad, rtol=1e-05, atol=1e-08)
 
     @given(
         device_str=st.sampled_from(["cpu", "meta", "cuda"]),
@@ -955,7 +955,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             groups,
         )
         for out, ref in zip(outputs, refs):
-            self.assertTrue(torch.allclose(out, ref))
+            torch.testing.assert_close(out, ref, rtol=1e-05, atol=1e-08)
 
         ref_loss, loss = refs[0].sum(), outputs[0].sum()
         for i in range(1, len(refs)):
@@ -967,7 +967,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             val_grad, ref_grad = val.grad, ref.grad
             self.assertIsInstance(val_grad, torch.Tensor)
             # pyrefly: ignore[bad-argument-type]
-            self.assertTrue(torch.allclose(val_grad, ref_grad))
+            torch.testing.assert_close(val_grad, ref_grad, rtol=1e-05, atol=1e-08)
 
 
 @skip_if_asan_class

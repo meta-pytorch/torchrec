@@ -488,7 +488,9 @@ class ModelParallelSingleRankBase(unittest.TestCase):
                         src_tensor = torch.sort(src.tensor.flatten()).values
                         dst_tensor = torch.sort(dst.tensor.flatten()).values
                     if is_deterministic:
-                        self.assertTrue(torch.allclose(src_tensor, dst_tensor))
+                        torch.testing.assert_close(
+                            src_tensor, dst_tensor, rtol=1e-05, atol=1e-08
+                        )
                     else:
                         if tolerance:
                             rtol, atol = tolerance, tolerance

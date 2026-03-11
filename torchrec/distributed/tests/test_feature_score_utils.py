@@ -385,8 +385,15 @@ class MayCollectFeatureScoresTest(unittest.TestCase):
         weights = result[0].weights_or_none()
         self.assertIsNotNone(weights)
         self.assertEqual(weights.shape[0], 5)
-        self.assertTrue(torch.allclose(weights[:2], torch.tensor([1.5, 1.5])))
-        self.assertTrue(torch.allclose(weights[2:], torch.tensor([2.0, 2.0, 2.0])))
+        torch.testing.assert_close(
+            weights[:2], torch.tensor([1.5, 1.5]), rtol=1e-05, atol=1e-08
+        )
+        torch.testing.assert_close(
+            weights[2:],
+            torch.tensor([2.0, 2.0, 2.0]),
+            rtol=1e-05,
+            atol=1e-08,
+        )
 
     def test_auto_collection_with_missing_feature_in_mapping(self) -> None:
         # Setup: create input features with one feature not in mapping
@@ -447,8 +454,12 @@ class MayCollectFeatureScoresTest(unittest.TestCase):
         weights_2 = result[1].weights_or_none()
         self.assertIsNotNone(weights_1)
         self.assertIsNotNone(weights_2)
-        self.assertTrue(torch.allclose(weights_1, torch.tensor([1.0, 1.0])))
-        self.assertTrue(torch.allclose(weights_2, torch.tensor([2.0, 2.0, 2.0])))
+        torch.testing.assert_close(
+            weights_1, torch.tensor([1.0, 1.0]), rtol=1e-05, atol=1e-08
+        )
+        torch.testing.assert_close(
+            weights_2, torch.tensor([2.0, 2.0, 2.0]), rtol=1e-05, atol=1e-08
+        )
 
     def test_auto_collection_preserves_device(self) -> None:
         # Setup: create input features on GPU if available

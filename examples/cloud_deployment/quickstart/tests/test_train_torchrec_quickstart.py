@@ -515,7 +515,7 @@ class MLPEdgeCaseTest(unittest.TestCase):
         x = torch.randn(4, 10)
         out1 = mlp(x)
         out2 = mlp(x)
-        self.assertTrue(torch.allclose(out1, out2))
+        torch.testing.assert_close(out1, out2, rtol=1e-05, atol=1e-08)
 
     def test_mlp_relu_output_non_negative(self) -> None:
         """Test that MLP with ReLU produces non-negative outputs after each ReLU."""
@@ -643,7 +643,7 @@ class DLRMEdgeCaseTest(unittest.TestCase):
         with torch.no_grad():
             out1 = model(dense, sparse)
             out2 = model(dense, sparse)
-        self.assertTrue(torch.allclose(out1, out2))
+        torch.testing.assert_close(out1, out2, rtol=1e-05, atol=1e-08)
 
     def test_dlrm_has_expected_submodules(self) -> None:
         """Test that DLRM contains dense_arch, over_arch, final_linear, and ebc."""

@@ -241,7 +241,7 @@ class NMSEMetricValueTest(unittest.TestCase):
         expected_nmse = torch.tensor([0.0], dtype=torch.double)
         self.nmse.update(**self.batches)
         actual_nmse = self.nmse.compute()["nmse-DefaultTask|window_nmse"]
-        self.assertTrue(torch.allclose(expected_nmse, actual_nmse, atol=1e-6))
+        torch.testing.assert_close(expected_nmse, actual_nmse, rtol=1e-05, atol=1e-6)
 
     def test_calc_nmse_constant_predictor(self) -> None:
         """Test NMSE when predictions are all constant (NMSE should be 1.0)"""
@@ -252,7 +252,7 @@ class NMSEMetricValueTest(unittest.TestCase):
         expected_nmse = torch.tensor([1.0], dtype=torch.double)
         self.nmse.update(**self.batches)
         actual_nmse = self.nmse.compute()["nmse-DefaultTask|window_nmse"]
-        self.assertTrue(torch.allclose(expected_nmse, actual_nmse, atol=1e-6))
+        torch.testing.assert_close(expected_nmse, actual_nmse, rtol=1e-05, atol=1e-6)
 
     def test_calc_nmse_better_than_baseline(self) -> None:
         """Test NMSE when predictions are better than baseline (NMSE should be < 1.0)"""
@@ -266,7 +266,7 @@ class NMSEMetricValueTest(unittest.TestCase):
         expected_nmse = torch.tensor([0.1], dtype=torch.double)
         self.nmse.update(**self.batches)
         actual_nmse = self.nmse.compute()["nmse-DefaultTask|window_nmse"]
-        self.assertTrue(torch.allclose(expected_nmse, actual_nmse, atol=1e-6))
+        torch.testing.assert_close(expected_nmse, actual_nmse, rtol=1e-05, atol=1e-6)
 
 
 class NMSEThresholdValueTest(unittest.TestCase):
