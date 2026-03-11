@@ -92,7 +92,7 @@ class ApplyOptmizerDenseTBETest(ModelParallelSingleRankBase):
         }
         sharders = get_default_sharders()
         pg = dist.GroupMember.WORLD
-        assert pg is not None, "Process group is not initialized"
+        self.assertIsNotNone(pg, "Process group is not initialized")
         env = ShardingEnv.from_process_group(pg)
         planner = EmbeddingShardingPlanner(
             topology=Topology(

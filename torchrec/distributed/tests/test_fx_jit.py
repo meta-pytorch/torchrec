@@ -457,7 +457,7 @@ class ModelTraceScriptTest(unittest.TestCase):
             world_size=2,
         ):
             # We need more than one input to verify correctness of tracing and scripting using input different from what was used for tracing
-            assert len(inputs) > 1
+            self.assertGreater(len(inputs), 1)
 
             # Run model first time to go through lazy initialized blocks before tracing
             # Targeting only inference for this time

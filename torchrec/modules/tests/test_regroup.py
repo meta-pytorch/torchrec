@@ -50,7 +50,7 @@ class KTRegroupAsDictTest(unittest.TestCase):
         groups = build_groups(
             kts=self.kts, num_groups=self.num_groups, skips=True, duplicates=True
         )
-        assert _all_keys_used_once(self.kts, groups) is False
+        self.assertIs(_all_keys_used_once(self.kts, groups), False)
 
         regroup_module = KTRegroupAsDict(groups=groups, keys=self.keys)
 
@@ -109,7 +109,7 @@ class KTRegroupAsDictTest(unittest.TestCase):
         groups = build_groups(
             kts=self.kts, num_groups=self.num_groups, skips=False, duplicates=False
         )
-        assert _all_keys_used_once(self.kts, groups) is True
+        self.assertIs(_all_keys_used_once(self.kts, groups), True)
 
         regroup_module = KTRegroupAsDict(groups=groups, keys=self.keys)
         tensor_groups = regroup_module(self.kts)
@@ -140,7 +140,7 @@ class KTRegroupAsDictTest(unittest.TestCase):
         groups = build_groups(
             kts=self.kts, num_groups=self.num_groups, skips=False, duplicates=False
         )
-        assert _all_keys_used_once(self.kts, groups) is True
+        self.assertIs(_all_keys_used_once(self.kts, groups), True)
 
         regroup_module = KTRegroupAsDict(groups=groups, keys=self.keys)
         # first pass
@@ -159,7 +159,7 @@ class KTRegroupAsDictTest(unittest.TestCase):
         groups = build_groups(
             kts=self.kts, num_groups=self.num_groups, skips=False, duplicates=False
         )
-        assert _all_keys_used_once(self.kts, groups) is True
+        self.assertIs(_all_keys_used_once(self.kts, groups), True)
 
         regroup_module = KTRegroupAsDict(groups=groups, keys=self.keys)
         # first pass
@@ -178,7 +178,7 @@ class KTRegroupAsDictTest(unittest.TestCase):
         groups = build_groups(
             kts=self.kts, num_groups=self.num_groups, skips=True, duplicates=True
         )
-        assert _all_keys_used_once(self.kts, groups) is False
+        self.assertIs(_all_keys_used_once(self.kts, groups), False)
 
         regroup_module = KTRegroupAsDict(
             groups=groups, keys=self.keys, multi_device=True
@@ -202,7 +202,7 @@ class KTRegroupAsDictTest(unittest.TestCase):
         groups = build_groups(
             kts=self.kts, num_groups=self.num_groups, skips=True, duplicates=True
         )
-        assert _all_keys_used_once(self.kts, groups) is False
+        self.assertIs(_all_keys_used_once(self.kts, groups), False)
 
         regroup_module = KTRegroupAsDict(groups=groups, keys=self.keys)
         cast_regroup = KTRegroupAsDict(

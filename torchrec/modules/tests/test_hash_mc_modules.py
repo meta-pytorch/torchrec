@@ -528,7 +528,7 @@ class TestMCH(unittest.TestCase):
         m0.load_state_dict(state_dict)
 
         m1_2.eval()
-        assert m0.training is False
+        self.assertIs(m0.training, False)
 
         inf_input = kjt.to_dict()
 

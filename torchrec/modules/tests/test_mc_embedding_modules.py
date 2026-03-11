@@ -144,8 +144,8 @@ class MCHManagedCollisionEmbeddingBagCollectionTest(unittest.TestCase):
                 mc_module._managed_collision_collection.open_slots()["t1"].item(), 0
             )  # post update, 0 slots
 
-            assert remapped_kjt1 is not None
-            assert remapped_kjt1.keys() == ["f1", "f2"]
+            self.assertIsNotNone(remapped_kjt1)
+            self.assertEqual(remapped_kjt1.keys(), ["f1", "f2"])
             assert torch.all(
                 remapped_kjt1["f1"].values() == zch_size - 1
             ), "all remapped ids should be mapped to end of range"
@@ -153,8 +153,8 @@ class MCHManagedCollisionEmbeddingBagCollectionTest(unittest.TestCase):
                 remapped_kjt1["f2"].values() == zch_size - 1
             ), "all remapped ids should be mapped to end of range"
 
-            assert remapped_kjt2 is not None
-            assert remapped_kjt2.keys() == ["f1", "f2"]
+            self.assertIsNotNone(remapped_kjt2)
+            self.assertEqual(remapped_kjt2.keys(), ["f1", "f2"])
             assert torch.all(
                 remapped_kjt2["f1"].values() == torch.arange(0, 10, dtype=torch.int64)
             )
@@ -197,7 +197,7 @@ class MCHManagedCollisionEmbeddingBagCollectionTest(unittest.TestCase):
             out3, remapped_kjt3 = mc_module.forward(update_two)
             out4, remapped_kjt4 = mc_module.forward(update_two)
 
-            assert remapped_kjt3 is not None
+            self.assertIsNotNone(remapped_kjt3)
             assert torch.all(
                 remapped_kjt3["f1"].values() == zch_size - 1
             ), "all remapped ids should be mapped to end of range"
@@ -206,7 +206,7 @@ class MCHManagedCollisionEmbeddingBagCollectionTest(unittest.TestCase):
                 remapped_kjt3["f2"].values() == remapped_kjt2["f2"].values()
             )
 
-            assert remapped_kjt4 is not None
+            self.assertIsNotNone(remapped_kjt4)
             assert torch.all(
                 remapped_kjt4["f1"].values()
                 == torch.cat(

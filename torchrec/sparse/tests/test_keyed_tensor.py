@@ -769,7 +769,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         loss.backward()
         for val, ref in zip(values, ref_values):
             val_grad, ref_grad = val.grad, ref.grad
-            assert isinstance(val_grad, torch.Tensor)
+            self.assertIsInstance(val_grad, torch.Tensor)
             # pyrefly: ignore[bad-argument-type]
             self.assertTrue(torch.allclose(val_grad, ref_grad))
 
@@ -821,7 +821,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         loss.backward()
         for val, ref in zip(values, ref_values):
             val_grad, ref_grad = val.grad, ref.grad
-            assert isinstance(val_grad, torch.Tensor)
+            self.assertIsInstance(val_grad, torch.Tensor)
             # pyrefly: ignore[bad-argument-type]
             self.assertTrue(torch.allclose(val_grad, ref_grad))
 
@@ -967,7 +967,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         loss.backward()
         for val, ref in zip(values, ref_values):
             val_grad, ref_grad = val.grad, ref.grad
-            assert isinstance(val_grad, torch.Tensor)
+            self.assertIsInstance(val_grad, torch.Tensor)
             # pyrefly: ignore[bad-argument-type]
             self.assertTrue(torch.allclose(val_grad, ref_grad))
 

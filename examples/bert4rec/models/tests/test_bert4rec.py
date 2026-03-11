@@ -35,6 +35,7 @@ class BERT4RecTest(unittest.TestCase):
             vocab_size=6, max_len=3, emb_dim=4, nhead=4, num_layers=4, device=device
         )
         logits = bert4rec(input_kjt)
-        assert logits.size() == torch.Size(
-            [input_kjt.stride(), bert4rec.max_len, bert4rec.vocab_size]
+        self.assertEqual(
+            logits.size(),
+            torch.Size([input_kjt.stride(), bert4rec.max_len, bert4rec.vocab_size]),
         )

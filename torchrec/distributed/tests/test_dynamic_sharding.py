@@ -696,22 +696,24 @@ class SingleRankDynamicShardingUtilsTest(unittest.TestCase):
             module_sharding_plan, new_module_sharding_plan
         )
 
-        assert len(new_module_sharding_plan_delta) <= len(new_module_sharding_plan)
+        self.assertLessEqual(
+            len(new_module_sharding_plan_delta), len(new_module_sharding_plan)
+        )
 
         # using t_name instead of table_name to avoid clashing with helper method
         for t_name, new_sharding in new_module_sharding_plan.items():
             if new_sharding.ranks != module_sharding_plan[t_name].ranks:
-                assert t_name in new_module_sharding_plan_delta
-                assert (
-                    new_module_sharding_plan_delta[t_name].ranks == new_sharding.ranks
+                self.assertIn(t_name, new_module_sharding_plan_delta)
+                self.assertEqual(
+                    new_module_sharding_plan_delta[t_name].ranks, new_sharding.ranks
                 )
-                assert (
-                    new_module_sharding_plan_delta[t_name].sharding_type
-                    == new_sharding.sharding_type
+                self.assertEqual(
+                    new_module_sharding_plan_delta[t_name].sharding_type,
+                    new_sharding.sharding_type,
                 )
-                assert (
-                    new_module_sharding_plan_delta[t_name].compute_kernel
-                    == new_sharding.compute_kernel
+                self.assertEqual(
+                    new_module_sharding_plan_delta[t_name].compute_kernel,
+                    new_sharding.compute_kernel,
                 )
                 # NOTE there are other attributes to test for equivalence in ParameterSharding type
                 # but the ones included here are the most important.
@@ -781,20 +783,22 @@ class SingleRankDynamicShardingUtilsTest(unittest.TestCase):
                 or new_sharding.sharding_type != old_sharding.sharding_type
                 or new_sharding.compute_kernel != old_sharding.compute_kernel
             ):
-                assert t_name in new_module_sharding_plan_delta
-                assert (
-                    new_module_sharding_plan_delta[t_name].ranks == new_sharding.ranks
+                self.assertIn(t_name, new_module_sharding_plan_delta)
+                self.assertEqual(
+                    new_module_sharding_plan_delta[t_name].ranks, new_sharding.ranks
                 )
-                assert (
-                    new_module_sharding_plan_delta[t_name].sharding_type
-                    == new_sharding.sharding_type
+                self.assertEqual(
+                    new_module_sharding_plan_delta[t_name].sharding_type,
+                    new_sharding.sharding_type,
                 )
-                assert (
-                    new_module_sharding_plan_delta[t_name].compute_kernel
-                    == new_sharding.compute_kernel
+                self.assertEqual(
+                    new_module_sharding_plan_delta[t_name].compute_kernel,
+                    new_sharding.compute_kernel,
                 )
             else:
-                assert t_name not in new_module_sharding_plan_delta
+                self.assertNotIn(t_name, new_module_sharding_plan_delta)
 
         # The delta should not contain more keys than the new plan
-        assert len(new_module_sharding_plan_delta) <= len(new_module_sharding_plan)
+        self.assertLessEqual(
+            len(new_module_sharding_plan_delta), len(new_module_sharding_plan)
+        )
