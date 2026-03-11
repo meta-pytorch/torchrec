@@ -1386,6 +1386,21 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertTrue(result_kjt.values().is_cuda)
         self.assertTrue(result_kjt.lengths().is_cuda)
 
+    def test_clear_storage(self) -> None:
+        kjt = KeyedJaggedTensor(
+            values=torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            keys=["index_0", "index_1"],
+            lengths=torch.IntTensor([1, 0, 2, 3]),
+            weights=torch.Tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
+        )
+        self.assertGreater(kjt._values.untyped_storage().nbytes(), 0)
+        self.assertGreater(kjt._lengths.untyped_storage().nbytes(), 0)
+        self.assertGreater(kjt._weights.untyped_storage().nbytes(), 0)
+        kjt.clear_storage()
+        self.assertEqual(kjt._values.untyped_storage().nbytes(), 0)
+        self.assertEqual(kjt._lengths.untyped_storage().nbytes(), 0)
+        self.assertEqual(kjt._weights.untyped_storage().nbytes(), 0)
+
 
 class TestKeyedJaggedTensorScripting(unittest.TestCase):
     def test_scriptable_forward(self) -> None:

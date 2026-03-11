@@ -239,6 +239,7 @@ class ShardedManagedCollisionCollection(
             module._table_name_to_config
         )
         self._has_uninitialized_input_dists: bool = True
+        self._free_features_storage_early: bool = False
         self._input_dists: List[nn.Module] = []
         self._managed_collision_modules = nn.ModuleDict()
         self._create_managed_collision_modules(module)
@@ -635,6 +636,7 @@ class ShardedManagedCollisionCollection(
         with torch.no_grad():
             # skip_permute added since these were used earlier in `mc_embeddingbag`
             if not skip_permute and self._features_order:
+                original_features = features
                 features = features.permute(
                     #  `Union[Module, Tensor]`.
                     self._features_order,
@@ -642,6 +644,8 @@ class ShardedManagedCollisionCollection(
                     # pyrefly: ignore[bad-argument-type]
                     self._features_order_tensor,
                 )
+                if self._free_features_storage_early:
+                    original_features.clear_storage()
 
             feature_splits: List[KeyedJaggedTensor] = []
             if self.need_preprocess:

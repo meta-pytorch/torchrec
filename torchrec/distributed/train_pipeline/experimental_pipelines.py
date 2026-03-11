@@ -305,6 +305,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         enable_inplace_copy_batch: bool = False,
         multi_thread: bool = False,
         pipeline_depth: int = 2,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -315,6 +316,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
             context_type=CPUEmbeddingTrainPipelineContext,
             pipeline_postproc=pipeline_postproc,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         assert pipeline_depth in (1, 2), "pipeline_depth must be 1 or 2"
         self._pipeline_depth = pipeline_depth
@@ -696,6 +698,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
         ] = None,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -709,6 +712,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enqueue_batch_after_forward=False,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         self._copy_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
         self.batches: Deque[Optional[In]] = cast(Deque[Optional[In]], FutureDeque())
@@ -796,6 +800,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -809,6 +814,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         self._output_dist_site = OutputDistSite(
             fqn=site_fqn, sharding_type=sharding_type
@@ -932,6 +938,7 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -945,6 +952,7 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         self._output_dist_site = OutputDistSite(
             fqn=site_fqn, sharding_type=sharding_type
@@ -1081,6 +1089,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1094,6 +1103,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         if isinstance(site_fqn, str):
             self._injection_site = InjectionSite(fqn=site_fqn)

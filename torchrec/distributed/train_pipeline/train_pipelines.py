@@ -486,6 +486,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             (applicable to 2D sharding only)
             if set and DMP collection is enabled for 2D sharding,
             sync DMPs every N batches (default to 1, i.e. every batch, None to disable)
+        free_features_storage_early (bool): if True, free the original batch KJT
+            tensor storage right after permute in input_dist.  Safe because
+            PipelinedForward ignores the KJT args during model forward.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -508,6 +511,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -516,6 +520,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._apply_jit = apply_jit
         self._enqueue_batch_after_forward = enqueue_batch_after_forward
         self._enable_inplace_copy_batch = enable_inplace_copy_batch
+        self._free_features_storage_early = free_features_storage_early
         self._batch_count = 0
 
         logger.info(
@@ -837,6 +842,11 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             pipelined_forward=pipelined_forward,
             pipeline_postproc=self._pipeline_postproc,
         )
+        if self._free_features_storage_early:
+            for module in self._pipelined_modules:
+                if hasattr(module, "_free_features_storage_early"):
+                    # pyrefly: ignore [bad-argument-type]
+                    module._free_features_storage_early = True
         # initializes input dist, so we can override input dist forwards
         self.start_sparse_data_dist(batch, context)
         self._original_kjt_dist_forwards = _override_input_dist_forwards(
@@ -1156,6 +1166,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1169,6 +1180,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=None,
             enqueue_batch_after_forward=False,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
 
         # SDD Lite only uses memcpy stream for H2D copy.
@@ -1313,6 +1325,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         embedding_lookup_after_data_dist: bool = False,
         enable_inplace_copy_batch: bool = False,
         enqueue_batch_after_forward: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1325,6 +1338,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             custom_model_fwd=custom_model_fwd,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             enqueue_batch_after_forward=enqueue_batch_after_forward,
+            free_features_storage_early=free_features_storage_early,
         )
         self._embedding_lookup_after_data_dist = embedding_lookup_after_data_dist
 
@@ -1502,6 +1516,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
         strict: bool = False,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1514,6 +1529,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             custom_model_fwd=custom_model_fwd,
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         self._start_batch = start_batch
         self._stash_gradients = stash_gradients
@@ -1879,6 +1895,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1890,6 +1907,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             pipeline_postproc=pipeline_postproc,
             custom_model_fwd=custom_model_fwd,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         self._context = PrefetchTrainPipelineContext(version=0)
         self._prefetch_stream: Optional[torch.Stream] = (
@@ -2089,6 +2107,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         device: torch.device,
         apply_jit: bool = False,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -2097,6 +2116,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             execute_all_batches=True,
             apply_jit=apply_jit,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         self._batch_loader: Optional[DataLoadingThread[In]] = None
 
@@ -2556,6 +2576,7 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
         custom_model_fwd: Optional[
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -2566,6 +2587,7 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
             context_type,
             pipeline_postproc,
             custom_model_fwd,
+            free_features_storage_early=free_features_storage_early,
         )
 
         torch._logging.set_logs(compiled_autograd_verbose=True)
