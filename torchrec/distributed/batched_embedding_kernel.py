@@ -3755,6 +3755,11 @@ class TritonBatchedFusedEmbeddingBag(
         optimizer = fused_params.get("optimizer", OptimType.EXACT_SGD)
         learning_rate = fused_params.get("learning_rate", 0.01)
         eps = fused_params.get("eps", 0.1)
+        output_dtype_sparse: SparseType = fused_params.get(
+            "output_dtype", SparseType.FP32
+        )
+        output_dtype = output_dtype_sparse.as_dtype()
+        stochastic_rounding = fused_params.get("stochastic_rounding", True)
 
         # Create Triton TBE module with feature_table_map for correct batch size handling
         self._emb_module: TritonTableBatchedEmbeddingBags = (
@@ -3762,6 +3767,8 @@ class TritonBatchedFusedEmbeddingBag(
                 embedding_specs=list(zip(self._local_rows, self._local_cols)),
                 feature_table_map=self._feature_table_map,
                 weights_precision=weights_precision.as_dtype(),
+                output_dtype=output_dtype,
+                stochastic_rounding=stochastic_rounding,
                 learning_rate=learning_rate,
                 eps=eps,
                 optimizer=optimizer,
