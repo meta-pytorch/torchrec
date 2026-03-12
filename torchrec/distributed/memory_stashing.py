@@ -14,7 +14,6 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from torch.autograd.profiler import record_function
-from torchrec.distributed.embedding_types import GroupedEmbeddingConfig
 from torchrec.distributed.logger import capped_logger, one_time_rank0_logger
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -69,11 +68,6 @@ class MemoryStashingManager:
         return cls._device_to_host_stream
 
     @classmethod
-    def is_enabled(cls) -> bool:
-        """Return whether memory stashing streams have been initialized."""
-        return cls._device_to_host_stream is not None
-
-    @classmethod
     def set_streams(
         cls,
         host_to_device_stream: Optional[torch.cuda.Stream] = None,
@@ -85,13 +79,11 @@ class MemoryStashingManager:
             cls._device_to_host_stream = host_to_device_stream
         else:
             cls._device_to_host_stream = device_to_host_stream
-        logger.info("MemoryStashingManager: streams initialized")
         one_time_rank0_logger.info("MemoryStashingManager: streams initialized")
 
     @classmethod
     def reset(cls) -> None:
         """Release all resources."""
-        logger.info("MemoryStashingManager: resetting all resources")
         cls._host_to_device_stream = None
         cls._device_to_host_stream = None
         cls._embedding_weight_restore_callbacks.clear()
@@ -278,11 +270,9 @@ class MemoryStashingManager:
     def stash_embedding_weights(
         cls,
         lookup: nn.Module,
-    ) -> Optional[
-        Tuple[
-            Callable[[Optional[torch.Tensor]], None],
-            Callable[[Optional[torch.Tensor]], None],
-        ]
+    ) -> Tuple[
+        Callable[[Optional[torch.Tensor]], None],
+        Callable[[Optional[torch.Tensor]], None],
     ]:
         """
         Stash embedding weights from HBM to CPU asynchronously.
@@ -298,7 +288,7 @@ class MemoryStashingManager:
                 embedding modules with weights to stash.
 
         Returns:
-            A tuple of two callback functions, or None if no tensors were stashed:
+            A tuple of two callback functions:
             - await_restore: Pauses current stream awaiting restore completion
             - restore: Retrieves stashed data from CPU back to HBM asynchronously
 
@@ -324,24 +314,13 @@ class MemoryStashingManager:
             capped_logger.info(
                 "stash_embedding_weights: no _emb_modules found, skipping"
             )
-            return None
+            return lambda _grad: None, lambda _grad: None
 
-        # Collect CUDA embedding weight tensors from TBE groups marked for stashing
+        # Collect CUDA embedding weight tensors
         tensors: List[torch.Tensor] = []
         for emb_module in module._emb_modules:
             if not hasattr(emb_module, "_emb_module"):
                 continue
-            # Check if this TBE group is marked for stashing via per-table config.
-            # If _config is a GroupedEmbeddingConfig, only stash TBEs where at
-            # least one table has stash_weights=True. Otherwise (e.g., in tests
-            # with mock objects), stash all TBEs.
-            config = getattr(emb_module, "_config", None)
-            if isinstance(config, GroupedEmbeddingConfig):
-                should_stash = any(
-                    getattr(t, "stash_weights", False) for t in config.embedding_tables
-                )
-                if not should_stash:
-                    continue
             inner = emb_module._emb_module
             if not hasattr(inner, "weights_dev"):
                 continue
@@ -355,9 +334,6 @@ class MemoryStashingManager:
             f"module={type(module).__name__}, "
             f"collected {len(tensors)} weight tensors"
         )
-
-        if not tensors:
-            return None
 
         await_restore, restore = cls._stash_tensors(tensors, label="embedding")
         cls._embedding_weight_restore_callbacks.append(restore)

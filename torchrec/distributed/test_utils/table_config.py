@@ -143,10 +143,6 @@ class EmbeddingTablesConfig:
     table_data_type: DataType = DataType.FP32
     total_num_buckets: Optional[int] = None
     additional_tables: List[List[Dict[str, Any]]] = field(default_factory=list)
-
-    # Default for all tables; per-table overrides in additional_tables
-    stash_weights: bool = False
-
     # ManagedCollision configs for all tables
     mc_config: Optional[ManagedCollisionConfig] = None  # Default for all tables
     mc_configs_per_table: Dict[str, ManagedCollisionConfig] = field(
@@ -184,10 +180,6 @@ class EmbeddingTablesConfig:
 
         # Remove all keys that are not part of EmbeddingBagConfig
         kwargs.pop("location", None)
-
-        # Apply global stash_weights default if not set per-table
-        if "stash_weights" not in kwargs:
-            kwargs["stash_weights"] = self.stash_weights
 
         # Support EmbeddingConfig via config_class field
         if "config_class" in kwargs:
@@ -229,7 +221,6 @@ class EmbeddingTablesConfig:
                 name="table_" + str(i),
                 feature_names=["feature_" + str(i)],
                 data_type=self.table_data_type,
-                stash_weights=self.stash_weights,
             )
             for i in range(self.num_unweighted_features)
         ]
@@ -240,7 +231,6 @@ class EmbeddingTablesConfig:
                 name="weighted_table_" + str(i),
                 feature_names=["weighted_feature_" + str(i)],
                 data_type=self.table_data_type,
-                stash_weights=self.stash_weights,
             )
             for i in range(self.num_weighted_features)
         ]
