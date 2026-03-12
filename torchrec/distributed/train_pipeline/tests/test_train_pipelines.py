@@ -429,7 +429,7 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
             optimizer_no_pipeline.step()
 
             pred_pipeline = pipeline.progress(dataloader)
-            self.assertTrue(torch.equal(pred_pipeline.cpu(), pred.cpu()))
+            torch.testing.assert_close(pred_pipeline.cpu(), pred.cpu(), rtol=0, atol=0)
 
         self.assertEqual(len(pipeline._pipelined_modules), 1)
         self.assertIsInstance(
@@ -1202,7 +1202,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
             optim.step()
 
             pred_pipelined = pipeline.progress(dataloader)
-            self.assertTrue(torch.equal(pred, pred_pipelined))
+            torch.testing.assert_close(pred, pred_pipelined, rtol=0, atol=0)
 
         # Check internal states
         ebcs = [
@@ -1242,7 +1242,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
             batch = data[3].to(self.device)
             _, detached_out = detached_model(batch)
             _, out = sharded_model(batch)
-            self.assertTrue(torch.equal(detached_out, out))
+            torch.testing.assert_close(detached_out, out, rtol=0, atol=0)
 
         # Check that pipeline re-attaches the model again without issues
         for i in range(3, 7):
@@ -1255,7 +1255,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
             optim.step()
 
             pred_pipelined = pipeline.progress(dataloader)
-            self.assertTrue(torch.equal(pred, pred_pipelined))
+            torch.testing.assert_close(pred, pred_pipelined, rtol=0, atol=0)
 
         for ebc in ebcs:
             self.assertIsInstance(ebc.forward, pipelined_forward_type)
@@ -1366,7 +1366,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
             optim.step()
 
             pred_pipelined = pipeline.progress(dataloader)
-            self.assertTrue(torch.equal(pred, pred_pipelined))
+            torch.testing.assert_close(pred, pred_pipelined, rtol=0, atol=0)
 
         # Check pipeline exhausted
         self.assertRaises(StopIteration, pipeline.progress, dataloader)
@@ -1406,7 +1406,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
                 batch = data[i].to(self.device)
                 _, detached_out = detached_model(batch)
                 _, out = sharded_model(batch)
-                self.assertTrue(torch.equal(detached_out, out))
+                torch.testing.assert_close(detached_out, out, rtol=0, atol=0)
 
         # Provide new loaded dataloader and check model is re-attached
         data = self._generate_data(
@@ -1424,7 +1424,7 @@ class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
             optim.step()
 
             pred_pipelined = pipeline.progress(dataloader)
-            self.assertTrue(torch.equal(pred, pred_pipelined))
+            torch.testing.assert_close(pred, pred_pipelined, rtol=0, atol=0)
 
         if with_postproc:
             self.assertIsInstance(
@@ -1688,7 +1688,7 @@ class PrefetchTrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
 
             if not mixed_precision:
                 # Rounding error is expected when using different precisions for weights and cache
-                self.assertTrue(torch.equal(pred, pred_pipeline))
+                torch.testing.assert_close(pred, pred_pipeline, rtol=0, atol=0)
             else:
                 torch.testing.assert_close(pred, pred_pipeline)
 
@@ -2272,7 +2272,7 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
             loss_pred.backward()
             optim_pipelined.step()
 
-            self.assertTrue(torch.equal(pred, pred_pipelined))
+            torch.testing.assert_close(pred, pred_pipelined, rtol=0, atol=0)
 
         # Check internal states
         ebcs = [
@@ -2298,7 +2298,7 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
         batch = data[5].to(self.device)
         loss_detached, detached_out = detached_model(batch)
         loss_sharded, out = sharded_model(batch)
-        self.assertTrue(torch.equal(detached_out, out))
+        torch.testing.assert_close(detached_out, out, rtol=0, atol=0)
         loss_detached.backward()
         loss_sharded.backward()
         optim.step()
@@ -2309,7 +2309,7 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
             batch = data[6].to(self.device)
             _, detached_out = detached_model(batch)
             _, out = sharded_model(batch)
-            self.assertTrue(torch.equal(detached_out, out))
+            torch.testing.assert_close(detached_out, out, rtol=0, atol=0)
 
         # Check that pipeline re-attaches the model again without issues
         for i in range(5, 12):
@@ -2327,7 +2327,7 @@ class StagedTrainPipelineTest(TrainPipelineSparseDistTestBase):
             loss_pred.backward()
             optim_pipelined.step()
 
-            self.assertTrue(torch.equal(pred, pred_pipelined))
+            torch.testing.assert_close(pred, pred_pipelined, rtol=0, atol=0)
 
         for ebc in ebcs:
             self.assertIsInstance(ebc.forward, PipelinedForward)

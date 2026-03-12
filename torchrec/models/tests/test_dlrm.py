@@ -364,7 +364,7 @@ class InteractionArchTest(unittest.TestCase):
             ]
         )
 
-        self.assertTrue(torch.equal(concat_dense, expected))
+        torch.testing.assert_close(concat_dense, expected, rtol=0, atol=0)
 
 
 class DLRMTest(unittest.TestCase):
