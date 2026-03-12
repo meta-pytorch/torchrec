@@ -255,7 +255,6 @@ def create_sharding_infos_by_sharding_device_group(
                         total_num_buckets=config.total_num_buckets,
                         use_virtual_table=config.use_virtual_table,
                         virtual_table_eviction_policy=config.virtual_table_eviction_policy,
-                        stash_weights=getattr(config, "stash_weights", False),
                     ),
                     param_sharding=parameter_sharding,
                     param=param,

@@ -185,7 +185,6 @@ class BaseTwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                     fused_params=info.fused_params,
                     num_embeddings_post_pruning=info.embedding_config.num_embeddings_post_pruning,
                     use_virtual_table=info.embedding_config.use_virtual_table,
-                    stash_weights=info.embedding_config.stash_weights,
                 )
             )
         return tables_per_rank

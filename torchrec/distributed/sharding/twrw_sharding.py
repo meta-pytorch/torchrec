@@ -202,7 +202,6 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                         weight_init_min=info.embedding_config.weight_init_min,
                         fused_params=info.fused_params,
                         use_virtual_table=info.embedding_config.use_virtual_table,
-                        stash_weights=info.embedding_config.stash_weights,
                     )
                 )
 
