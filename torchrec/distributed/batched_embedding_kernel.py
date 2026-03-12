@@ -2590,6 +2590,7 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
         the forward kernel completes, and this method waits on that event.
         """
         if hasattr(self._emb_module, "wait_for_forward"):
+            # pyrefly: ignore [not-callable]
             self._emb_module.wait_for_forward()
 
 
