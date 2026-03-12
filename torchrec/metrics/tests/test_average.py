@@ -199,7 +199,7 @@ class AverageMetricValueTest(unittest.TestCase):
         expected_avg = torch.tensor([6.0], dtype=torch.double)
         self.average.update(**self.batches)
         actual_avg = self.average.compute()["average-DefaultTask|window_label_average"]
-        self.assertTrue(torch.allclose(expected_avg, actual_avg, atol=1e-6))
+        torch.testing.assert_close(expected_avg, actual_avg, rtol=1e-05, atol=1e-6)
 
     def test_calc_prediction_average(self) -> None:
         """Test prediction average computation"""
@@ -213,7 +213,7 @@ class AverageMetricValueTest(unittest.TestCase):
         actual_avg = self.average.compute()[
             "average-DefaultTask|window_prediction_average"
         ]
-        self.assertTrue(torch.allclose(expected_avg, actual_avg, atol=1e-6))
+        torch.testing.assert_close(expected_avg, actual_avg, rtol=1e-05, atol=1e-6)
 
     def test_calc_averages_with_weights(self) -> None:
         """Test label and prediction averages with non-uniform weights"""
@@ -232,8 +232,12 @@ class AverageMetricValueTest(unittest.TestCase):
         actual_pred_avg = self.average.compute()[
             "average-DefaultTask|window_prediction_average"
         ]
-        self.assertTrue(torch.allclose(expected_label_avg, actual_label_avg, atol=1e-6))
-        self.assertTrue(torch.allclose(expected_pred_avg, actual_pred_avg, atol=1e-6))
+        torch.testing.assert_close(
+            expected_label_avg, actual_label_avg, rtol=1e-05, atol=1e-6
+        )
+        torch.testing.assert_close(
+            expected_pred_avg, actual_pred_avg, rtol=1e-05, atol=1e-6
+        )
 
     def test_calc_averages_zero_weights(self) -> None:
         """Test that zero weights return 0 average"""
@@ -249,5 +253,7 @@ class AverageMetricValueTest(unittest.TestCase):
         actual_pred_avg = self.average.compute()[
             "average-DefaultTask|window_prediction_average"
         ]
-        self.assertTrue(torch.allclose(expected_avg, actual_label_avg, atol=1e-6))
-        self.assertTrue(torch.allclose(expected_avg, actual_pred_avg, atol=1e-6))
+        torch.testing.assert_close(
+            expected_avg, actual_label_avg, rtol=1e-05, atol=1e-6
+        )
+        torch.testing.assert_close(expected_avg, actual_pred_avg, rtol=1e-05, atol=1e-6)

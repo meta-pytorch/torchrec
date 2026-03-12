@@ -157,7 +157,7 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
         m = TestModule()
         m.register_forward_pre_hook(input_only_hook)
         output = m(torch.zeros(2, 2))
-        self.assertTrue(torch.allclose(output, torch.ones(2, 2)))
+        torch.testing.assert_close(output, torch.ones(2, 2), rtol=1e-05, atol=1e-08)
 
     def test_lazy_apply(self) -> None:
         count_original: int = 0
@@ -183,18 +183,25 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
         def check_result(m: torch.nn.Module, count_after_first_forward: int) -> None:
             # This check ensures that `lazy_apply()` is a delayed operation (i.e. the function is not applied immediately).
             for count in m.parameters():
-                self.assertTrue(torch.allclose(count, torch.tensor(0)))
+                torch.testing.assert_close(
+                    count, torch.tensor(0), rtol=1e-05, atol=1e-08
+                )
 
             input = torch.tensor(321)
             out = m(input)
 
             # This check ensures that the lazy-applied function is not called before forward function is called.
-            self.assertTrue(torch.allclose(out, torch.tensor(count_original)))
+            torch.testing.assert_close(
+                out, torch.tensor(count_original), rtol=1e-05, atol=1e-08
+            )
 
             # This check ensures that the lazy-applied function is called after forward function is called.
             for count in m.parameters():
-                self.assertTrue(
-                    torch.allclose(count, torch.tensor(count_after_first_forward))
+                torch.testing.assert_close(
+                    count,
+                    torch.tensor(count_after_first_forward),
+                    rtol=1e-05,
+                    atol=1e-08,
                 )
 
             # This check ensures that the lazy-applied function is removed after first forward pass is run.
@@ -204,8 +211,11 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
             )
             # Since `increment_count` is not run the second time, value of `count` parameter is not changed.
             for count in m.parameters():
-                self.assertTrue(
-                    torch.allclose(count, torch.tensor(count_after_first_forward))
+                torch.testing.assert_close(
+                    count,
+                    torch.tensor(count_after_first_forward),
+                    rtol=1e-05,
+                    atol=1e-08,
                 )
 
         # fmt: off
@@ -294,14 +304,18 @@ class TestLazyModuleExtensionMixin(unittest.TestCase):
         net.apply(init_weights)
         #  Module]`.
         # pyrefly: ignore[bad-argument-type]
-        self.assertTrue(torch.allclose(net[0].param, torch.tensor(7.0)))
+        torch.testing.assert_close(
+            net[0].param, torch.tensor(7.0), rtol=1e-05, atol=1e-08
+        )
 
         # Case 3: Running `.lazy_apply()` without running first forward pass will succeed,
         # and the function will be applied right after first forward pass.
         net = torch.nn.Sequential(TestModule(), TestModule())
         net = lazy_apply(net, init_weights)
-        # pyrefly: ignore[bad-index]
-        self.assertTrue(torch.allclose(net[0].param, torch.tensor(1.0)))
+        torch.testing.assert_close(
+            net[0].param, torch.tensor(1.0), rtol=1e-05, atol=1e-08  # pyrefly: ignore
+        )
         net(torch.tensor(2.0))
-        # pyrefly: ignore[bad-index]
-        self.assertTrue(torch.allclose(net[0].param, torch.tensor(7.0)))
+        torch.testing.assert_close(
+            net[0].param, torch.tensor(7.0), rtol=1e-05, atol=1e-08  # pyrefly: ignore
+        )

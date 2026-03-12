@@ -44,13 +44,13 @@ class PositionWeightedModuleTest(unittest.TestCase):
             pw.state_dict()["position_weights.f1"], 0, torch.tensor([0, 1, 0])
         )
         pw_f1 = weighted_features["f1"].weights().detach()
-        self.assertTrue(torch.allclose(pw_f1_ref, pw_f1))
+        torch.testing.assert_close(pw_f1_ref, pw_f1, rtol=1e-05, atol=1e-08)
 
         pw_f2_ref = torch.gather(
             pw.state_dict()["position_weights.f2"], 0, torch.tensor([0, 0, 0, 1, 2])
         )
         pw_f2 = weighted_features["f2"].weights().detach()
-        self.assertTrue(torch.allclose(pw_f2_ref, pw_f2))
+        torch.testing.assert_close(pw_f2_ref, pw_f2, rtol=1e-05, atol=1e-08)
 
     def test_fx_script_PositionWeightedModule(self) -> None:
         features_max_length = {"f1": 10, "f2": 3}
@@ -83,13 +83,13 @@ class PositionWeightedModuleTest(unittest.TestCase):
             pw.state_dict()["position_weights.f1"], 0, torch.tensor([0, 1, 0])
         )
         pw_f1 = weighted_features["f1"].weights().detach()
-        self.assertTrue(torch.allclose(pw_f1_ref, pw_f1))
+        torch.testing.assert_close(pw_f1_ref, pw_f1, rtol=1e-05, atol=1e-08)
 
         pw_f2_ref = torch.gather(
             pw.state_dict()["position_weights.f2"], 0, torch.tensor([0, 0, 0, 1, 2])
         )
         pw_f2 = weighted_features["f2"].weights().detach()
-        self.assertTrue(torch.allclose(pw_f2_ref, pw_f2))
+        torch.testing.assert_close(pw_f2_ref, pw_f2, rtol=1e-05, atol=1e-08)
 
     def test_fx_script_PositionWeightedProcessor(self) -> None:
         features_max_length = {"f1": 10, "f2": 3}

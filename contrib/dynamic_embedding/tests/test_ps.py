@@ -1,3 +1,13 @@
+#!/usr/bin/env python3
+
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+#!/usr/bin/env python3
+
 import unittest
 
 import torch
@@ -18,7 +28,12 @@ class TestPS(unittest.TestCase):
         ps.evict(ids)
         tensor[:, :] = 0
         ps.fetch(ids, 0).wait()
-        self.assertTrue(torch.allclose(tensor[cache_ids], origin_tensor[cache_ids]))
+        torch.testing.assert_close(
+            tensor[cache_ids],
+            origin_tensor[cache_ids],
+            rtol=1e-05,
+            atol=1e-08,
+        )
 
     def testOS(self):
         cache_ids = [1, 3, 6]
@@ -35,9 +50,24 @@ class TestPS(unittest.TestCase):
         optim1[:, :] = 0
         optim2[:, :] = 0
         ps.fetch(ids, 0).wait()
-        self.assertTrue(torch.allclose(tensor[cache_ids], origin_tensor[cache_ids]))
-        self.assertTrue(torch.allclose(optim1[cache_ids], origin_optim1[cache_ids]))
-        self.assertTrue(torch.allclose(optim2[cache_ids], origin_optim2[cache_ids]))
+        torch.testing.assert_close(
+            tensor[cache_ids],
+            origin_tensor[cache_ids],
+            rtol=1e-05,
+            atol=1e-08,
+        )
+        torch.testing.assert_close(
+            optim1[cache_ids],
+            origin_optim1[cache_ids],
+            rtol=1e-05,
+            atol=1e-08,
+        )
+        torch.testing.assert_close(
+            optim2[cache_ids],
+            origin_optim2[cache_ids],
+            rtol=1e-05,
+            atol=1e-08,
+        )
 
     def testFetchToDifferentCacheID(self):
         cache_ids = [0, 2, 4, 8]
@@ -54,7 +84,12 @@ class TestPS(unittest.TestCase):
             [[100, 1], [101, 3], [102, 5], [103, 7]], dtype=torch.long
         )
         ps.fetch(fetch_ids, 0).wait()
-        self.assertTrue(torch.allclose(tensor[new_cache_ids], origin_tensor[cache_ids]))
+        torch.testing.assert_close(
+            tensor[new_cache_ids],
+            origin_tensor[cache_ids],
+            rtol=1e-05,
+            atol=1e-08,
+        )
 
     def testFetchNonExist(self):
         cache_ids = [0, 2, 4]
@@ -67,12 +102,17 @@ class TestPS(unittest.TestCase):
         addition_cache_ids = [3, 9]
         additional_fetch_ids = torch.tensor([[103, 3], [104, 9]], dtype=torch.long)
         ps.fetch(torch.cat([evict_ids, additional_fetch_ids]), 0).wait()
-        self.assertTrue(torch.allclose(tensor[cache_ids], origin_tensor[cache_ids]))
-        self.assertTrue(
-            torch.allclose(
-                tensor[addition_cache_ids],
-                torch.zeros_like(tensor[addition_cache_ids]),
-            )
+        torch.testing.assert_close(
+            tensor[cache_ids],
+            origin_tensor[cache_ids],
+            rtol=1e-05,
+            atol=1e-08,
+        )
+        torch.testing.assert_close(
+            tensor[addition_cache_ids],
+            torch.zeros_like(tensor[addition_cache_ids]),
+            rtol=1e-05,
+            atol=1e-08,
         )
 
 
