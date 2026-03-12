@@ -210,9 +210,12 @@ def _test_sharding_and_remapping(  # noqa C901
             postfix = ".".join(key.split(".")[-2:])
             if postfix in initial_state_per_rank[ctx.rank]:
                 tensor = sharded_tensor.local_shards()[0].tensor.cpu()
-                assert torch.equal(
-                    tensor, initial_state_per_rank[ctx.rank][postfix]
-                ), f"initial state {key} on {ctx.rank} does not match, got {tensor}, expect {initial_state_per_rank[rank][postfix]}"
+                torch.testing.assert_close(
+                    tensor,
+                    initial_state_per_rank[ctx.rank][postfix],
+                    rtol=0,
+                    atol=0,
+                )
 
         sharded_sparse_arch.load_state_dict(initial_state_dict)
 
@@ -228,17 +231,22 @@ def _test_sharding_and_remapping(  # noqa C901
             postfix = ".".join(key.split(".")[-2:])
             if postfix in final_state_per_rank[ctx.rank]:
                 tensor = sharded_tensor.local_shards()[0].tensor.cpu()
-                assert torch.equal(
-                    tensor, final_state_per_rank[ctx.rank][postfix]
-                ), f"initial state {key} on {ctx.rank} does not match, got {tensor}, expect {final_state_per_rank[rank][postfix]}"
+                torch.testing.assert_close(
+                    tensor,
+                    final_state_per_rank[ctx.rank][postfix],
+                    rtol=0,
+                    atol=0,
+                )
 
         remapped_ids = [remapped_ids1, remapped_ids2]
         for key in output_keys:
             for i, kjt_out in enumerate(kjt_out_per_iter):
-                assert torch.equal(
+                torch.testing.assert_close(
                     remapped_ids[i][key].values(),
                     kjt_out[key].values(),
-                ), f"feature {key} on {ctx.rank} iteration {i} does not match, got {remapped_ids[i][key].values()}, expect {kjt_out[key].values()}"
+                    rtol=0,
+                    atol=0,
+                )
 
         # TODO: validate embedding rows, and eviction
 
@@ -306,9 +314,12 @@ def _test_in_place_embd_weight_update(  # noqa C901
             postfix = ".".join(key.split(".")[-2:])
             if postfix in initial_state_per_rank[ctx.rank]:
                 tensor = sharded_tensor.local_shards()[0].tensor.cpu()
-                assert torch.equal(
-                    tensor, initial_state_per_rank[ctx.rank][postfix]
-                ), f"initial state {key} on {ctx.rank} does not match, got {tensor}, expect {initial_state_per_rank[rank][postfix]}"
+                torch.testing.assert_close(
+                    tensor,
+                    initial_state_per_rank[ctx.rank][postfix],
+                    rtol=0,
+                    atol=0,
+                )
 
         sharded_sparse_arch.load_state_dict(initial_state_dict)
 
@@ -332,17 +343,22 @@ def _test_in_place_embd_weight_update(  # noqa C901
                 postfix = ".".join(key.split(".")[-2:])
                 if postfix in final_state_per_rank[ctx.rank]:
                     tensor = sharded_tensor.local_shards()[0].tensor.cpu()
-                    assert torch.equal(
-                        tensor, final_state_per_rank[ctx.rank][postfix]
-                    ), f"initial state {key} on {ctx.rank} does not match, got {tensor}, expect {final_state_per_rank[rank][postfix]}"
+                    torch.testing.assert_close(
+                        tensor,
+                        final_state_per_rank[ctx.rank][postfix],
+                        rtol=0,
+                        atol=0,
+                    )
 
             remapped_ids = [remapped_ids1, remapped_ids2]
             for key in output_keys:
                 for i, kjt_out in enumerate(kjt_out_per_iter):
-                    assert torch.equal(
+                    torch.testing.assert_close(
                         remapped_ids[i][key].values(),
                         kjt_out[key].values(),
-                    ), f"feature {key} on {ctx.rank} iteration {i} does not match, got {remapped_ids[i][key].values()}, expect {kjt_out[key].values()}"
+                        rtol=0,
+                        atol=0,
+                    )
 
 
 def _test_sharding_and_resharding(  # noqa C901
@@ -437,10 +453,12 @@ def _test_sharding_and_resharding(  # noqa C901
         remapped_ids = [remapped_ids1, remapped_ids2]
         for key in kjt_input.keys():
             for i, kjt_out in enumerate(kjt_out_per_iter[:2]):  # first two iterations
-                assert torch.equal(
+                torch.testing.assert_close(
                     remapped_ids[i][key].values(),
                     kjt_out[key].values(),
-                ), f"feature {key} on {ctx.rank} iteration {i} does not match, got {remapped_ids[i][key].values()}, expect {kjt_out[key].values()}"
+                    rtol=0,
+                    atol=0,
+                )
 
         state_dict = sharded_sparse_arch.state_dict()
         cpu_state_dict = {}
@@ -513,17 +531,22 @@ def _test_sharding_and_resharding(  # noqa C901
                 postfix = ".".join(key.split(".")[-2:])
                 if postfix in final_state_per_rank[ctx.rank]:
                     tensor = sharded_tensor.local_shards()[0].tensor.cpu()
-                    assert torch.equal(
-                        tensor, final_state_per_rank[ctx.rank][postfix]
-                    ), f"initial state {key} on {ctx.rank} does not match, got {tensor}, expect {final_state_per_rank[rank][postfix]}"
+                    torch.testing.assert_close(
+                        tensor,
+                        final_state_per_rank[ctx.rank][postfix],
+                        rtol=0,
+                        atol=0,
+                    )
 
             remapped_ids = [remapped_ids3]
             for key in kjt_input.keys():
                 for i, kjt_out in enumerate(kjt_out_per_iter[-1:]):  # last iteration
-                    assert torch.equal(
+                    torch.testing.assert_close(
                         remapped_ids[i][key].values(),
                         kjt_out[key].values(),
-                    ), f"feature {key} on {ctx.rank} iteration {i} does not match, got {remapped_ids[i][key].values()}, expect {kjt_out[key].values()}"
+                        rtol=0,
+                        atol=0,
+                    )
 
 
 def _test_sharding_dedup(  # noqa C901
@@ -633,7 +656,7 @@ def _test_sharding_dedup(  # noqa C901
         dedup_loss1, dedup_remapped_1 = dedup_sharded_sparse_arch(kjt_input)
         dedup_loss1.backward()
 
-        assert torch.allclose(loss1, dedup_loss1)
+        torch.testing.assert_close(loss1, dedup_loss1, rtol=1e-05, atol=1e-08)
         # deduping is not being used right now
         # assert torch.allclose(remapped_1.values(), dedup_remapped_1.values())
         # assert torch.allclose(remapped_1.lengths(), dedup_remapped_1.lengths())
