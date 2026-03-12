@@ -45,7 +45,7 @@ class TestStashTensors(unittest.TestCase):
 
         # Verify values are correct
         self.assertGreater(tensor.untyped_storage().size(), 0)
-        self.assertTrue(torch.allclose(tensor, original))
+        torch.testing.assert_close(tensor, original, rtol=1e-05, atol=1e-08)
 
     def test_multiple_tensors(self) -> None:
         """Test stash and restore with multiple tensors."""
@@ -64,8 +64,8 @@ class TestStashTensors(unittest.TestCase):
         await_restore(None)
 
         # All restored correctly
-        self.assertTrue(torch.allclose(t1, originals[0]))
-        self.assertTrue(torch.allclose(t2, originals[1]))
+        torch.testing.assert_close(t1, originals[0], rtol=1e-05, atol=1e-08)
+        torch.testing.assert_close(t2, originals[1], rtol=1e-05, atol=1e-08)
 
     def test_empty_list(self) -> None:
         """Test that an empty tensor list returns no-op callbacks."""
@@ -96,7 +96,7 @@ class TestStashTensors(unittest.TestCase):
         restore(dummy_grad)
         await_restore(dummy_grad)
 
-        self.assertTrue(torch.allclose(tensor, original))
+        torch.testing.assert_close(tensor, original, rtol=1e-05, atol=1e-08)
 
 
 class TestStashEmbeddingWeights(unittest.TestCase):
@@ -143,7 +143,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         # Verify HBM is restored and values are correct
         self.assertGreater(original_weights.untyped_storage().size(), 0)
-        self.assertTrue(torch.allclose(original_weights, original_values))
+        torch.testing.assert_close(
+            original_weights, original_values, rtol=1e-05, atol=1e-08
+        )
 
     def test_multiple_emb_modules_stashed(self) -> None:
         """Test that multiple embedding modules are all stashed and restored."""
@@ -169,9 +171,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         await_restore(None)
 
         # Verify all are restored correctly
-        self.assertTrue(torch.allclose(weights_1, original_values_1))
-        self.assertTrue(torch.allclose(weights_2, original_values_2))
-        self.assertTrue(torch.allclose(weights_3, original_values_3))
+        torch.testing.assert_close(weights_1, original_values_1, rtol=1e-05, atol=1e-08)
+        torch.testing.assert_close(weights_2, original_values_2, rtol=1e-05, atol=1e-08)
+        torch.testing.assert_close(weights_3, original_values_3, rtol=1e-05, atol=1e-08)
 
     def test_custom_d2h_stream(self) -> None:
         """Test stash and restore with custom D2H CUDA stream."""
@@ -196,7 +198,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         await_restore(None)
 
         # Verify restoration
-        self.assertTrue(torch.allclose(original_weights, original_values))
+        torch.testing.assert_close(
+            original_weights, original_values, rtol=1e-05, atol=1e-08
+        )
 
     def test_restore_does_not_break_autograd(self) -> None:
         """Test that restore doesn't break autograd for backward pass."""
@@ -260,7 +264,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         MemoryStashingManager.restore_embedding_weights()
         await_restore(None)
 
-        self.assertTrue(torch.allclose(cuda_weights, cuda_original))
+        torch.testing.assert_close(cuda_weights, cuda_original, rtol=1e-05, atol=1e-08)
 
     def test_skip_none_weights(self) -> None:
         """Test that None weights are handled gracefully."""
@@ -295,7 +299,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         MemoryStashingManager.restore_embedding_weights()
         await_restore(None)
 
-        self.assertTrue(torch.allclose(valid_weights, valid_original))
+        torch.testing.assert_close(
+            valid_weights, valid_original, rtol=1e-05, atol=1e-08
+        )
 
     def test_callback_signature_compatibility_with_register_hook(self) -> None:
         """Test that await_restore can be used as backward hook."""
@@ -322,7 +328,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         # Weights should be restored after backward
         self.assertGreater(weights.untyped_storage().size(), 0)
-        self.assertTrue(torch.allclose(weights, original_values))
+        torch.testing.assert_close(weights, original_values, rtol=1e-05, atol=1e-08)
 
 
 class TestStashOptimizerState(unittest.TestCase):

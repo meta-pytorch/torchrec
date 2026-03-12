@@ -550,6 +550,7 @@ class ModelInput(Pipelineable):
             # Resample any out-of-bounds values
             mask = indices >= num_embeddings
             while mask.any():
+                # pyrefly: ignore [no-matching-overload]
                 u_new = torch.rand(mask.sum(), device=device).clamp(1e-10, 1 - 1e-10)
                 indices[mask] = ((1 - u_new) ** exponent - 1).long()
                 mask = indices >= num_embeddings

@@ -144,8 +144,10 @@ class InferenceTest(unittest.TestCase):
 
             sharded_quant_output = sharded_quant_model(local_batch[0])
 
-            self.assertTrue(torch.allclose(output, quantized_output, atol=1e-4))
-            self.assertTrue(torch.allclose(output, sharded_quant_output, atol=1e-4))
+            torch.testing.assert_close(output, quantized_output, rtol=1e-05, atol=1e-4)
+            torch.testing.assert_close(
+                output, sharded_quant_output, rtol=1e-05, atol=1e-4
+            )
 
     def test_set_pruning_data(self) -> None:
         model = TestSparseNN(
@@ -284,8 +286,8 @@ class InferenceTest(unittest.TestCase):
         self.assertTrue(len(sharded_quant_model.sparse.weighted_ebc.tbes) == 1)
 
         # Check the weights are close
-        self.assertTrue(torch.allclose(output, quantized_output, atol=1e-3))
-        self.assertTrue(torch.allclose(output, sharded_quant_output, atol=1e-3))
+        torch.testing.assert_close(output, quantized_output, rtol=1e-05, atol=1e-3)
+        torch.testing.assert_close(output, sharded_quant_output, rtol=1e-05, atol=1e-3)
 
         # Check the sizes are correct
         expected_num_embeddings = {}
@@ -370,8 +372,8 @@ class InferenceTest(unittest.TestCase):
         self.assertTrue(len(sharded_quant_model.sparse.weighted_ebc.tbes) == 1)
 
         # Check the weights are close
-        self.assertTrue(torch.allclose(output, quantized_output, atol=1e-3))
-        self.assertTrue(torch.allclose(output, sharded_quant_output, atol=1e-3))
+        torch.testing.assert_close(output, quantized_output, rtol=1e-05, atol=1e-3)
+        torch.testing.assert_close(output, sharded_quant_output, rtol=1e-05, atol=1e-3)
 
     def test_quantized_tbe_count_different_pooling(self) -> None:
         set_propogate_device(True)

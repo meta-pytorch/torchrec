@@ -41,5 +41,7 @@ class TestInBackwardOptimizerFilter(unittest.TestCase):
         non_in_backward_params = dict(
             in_backward_optimizer_filter(ebc.named_parameters(), include=False)
         )
-        assert set(in_backward_params.keys()) == {"embedding_bags.t1.weight"}
-        assert set(non_in_backward_params.keys()) == {"embedding_bags.t2.weight"}
+        self.assertEqual(set(in_backward_params.keys()), {"embedding_bags.t1.weight"})
+        self.assertEqual(
+            set(non_in_backward_params.keys()), {"embedding_bags.t2.weight"}
+        )

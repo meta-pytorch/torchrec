@@ -68,7 +68,7 @@ class TestEmbeddingStats(unittest.TestCase):
         _ = planner.plan(module=self.model, sharders=[TWvsRWSharder()])
         self.assertEqual(len(planner._stats), 1)
         stats_data = planner._stats[0]
-        assert isinstance(stats_data, EmbeddingStats)
+        self.assertIsInstance(stats_data, EmbeddingStats)
         stats: List[str] = stats_data._stats_table
         self.assertTrue(isinstance(stats, list))
         self.assertTrue(stats[0].startswith("####"))
@@ -93,7 +93,7 @@ class TestEmbeddingStats(unittest.TestCase):
         _ = planner.plan(module=self.model, sharders=[TWvsRWSharder()])
         self.assertEqual(len(planner._stats), 1)
         stats_data = planner._stats[0]
-        assert isinstance(stats_data, EmbeddingStats)
+        self.assertIsInstance(stats_data, EmbeddingStats)
         stats: List[str] = stats_data._stats_table
         self.assertTrue(isinstance(stats, list))
         top_hbm_usage_keyword = "Top HBM Memory Usage Estimation:"
@@ -110,7 +110,7 @@ class TestEmbeddingStats(unittest.TestCase):
         _ = planner.plan(module=self.model, sharders=[TWvsRWSharder()])
         self.assertEqual(len(planner._stats), 1)
         stats_data = planner._stats[0]
-        assert isinstance(stats_data, EmbeddingStats)
+        self.assertIsInstance(stats_data, EmbeddingStats)
         stats: List[str] = stats_data._stats_table
         self.assertTrue(isinstance(stats, list))
         constraint_keyword = "Compute Kernel Constraints:"

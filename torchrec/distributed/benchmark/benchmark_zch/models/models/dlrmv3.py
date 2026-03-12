@@ -100,6 +100,7 @@ class DLRMv3(nn.Module):
         # convert the predictions to [batch_size, ]
         mt_target_preds = mt_target_preds.squeeze()
         # return the loss and the predictions
+        # pyrefly: ignore [bad-return]
         return sum(aux_losses.values()), (
             aux_losses,
             mt_target_preds.detach(),

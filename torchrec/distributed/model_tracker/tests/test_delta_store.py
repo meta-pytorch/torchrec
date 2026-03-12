@@ -427,16 +427,18 @@ class DeltaStoreTrecTest(unittest.TestCase):
                 test_params.ids, test_params.embeddings, test_params.updateMode
             )
 
-            self.assertTrue(torch.equal(result.ids, test_params.expected_output.ids))
-            self.assertTrue(
-                torch.equal(
-                    (result.states if result.states is not None else torch.empty(0)),
-                    (
-                        test_params.expected_output.states
-                        if test_params.expected_output.states is not None
-                        else torch.empty(0)
-                    ),
-                )
+            torch.testing.assert_close(
+                result.ids, test_params.expected_output.ids, rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                (result.states if result.states is not None else torch.empty(0)),
+                (
+                    test_params.expected_output.states
+                    if test_params.expected_output.states is not None
+                    else torch.empty(0)
+                ),
+                rtol=0,
+                atol=0,
             )
 
     @dataclass

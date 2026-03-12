@@ -65,7 +65,7 @@ class TestMLP(unittest.TestCase):
 
         # Dry-run with input of a different batch size
         dry_run_batch_size = 1
-        assert dry_run_batch_size != batch_size
+        self.assertNotEqual(dry_run_batch_size, batch_size)
         for i in range(num_tasks):
             perceptron_for_tasks[i](
                 torch.randn(dry_run_batch_size, input_tensors[i].shape[-1])

@@ -38,9 +38,13 @@ from torchrec.distributed.types import (
     KeyValueParams,
     ModuleSharder,
     ShardingPlan,
+    StorageUsageType,
 )
 from torchrec.modules.embedding_configs import DataType
-from torchrec.modules.embedding_modules import EmbeddingCollectionInterface
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollectionInterface,
+    EmbeddingCollectionInterface,
+)
 from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingCollection
 
 
@@ -1062,12 +1066,43 @@ class ShardingOption:
         self.stochastic_rounding = stochastic_rounding
         self.bounds_check_mode = bounds_check_mode
         self.dependency = dependency
-        self._is_pooled = is_pooled
+        self._is_pooled: bool = (
+            is_pooled
+            if is_pooled is not None
+            else ShardingOption.module_pooled(module[1], name)
+        )
         self.is_weighted: Optional[bool] = None
         self.feature_names: Optional[List[str]] = feature_names
         self.output_dtype: Optional[DataType] = output_dtype
         self.key_value_params: Optional[KeyValueParams] = key_value_params
         self.num_poolings: Optional[List[float]] = num_poolings
+
+        child_module = module[1]
+        self._module_type_key: str = (
+            type(child_module).__module__ + "." + type(child_module).__name__
+        )
+        _module_has_fp = (
+            hasattr(child_module, "_feature_processor")
+            and hasattr(
+                child_module._feature_processor,
+                "feature_processor_modules",
+            )
+            and isinstance(
+                # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+                child_module._feature_processor.feature_processor_modules,
+                nn.ModuleDict,
+            )
+        )
+        self._has_feature_processor: bool = (
+            _module_has_fp
+            and name
+            # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+            in child_module._feature_processor.feature_processor_modules.keys()
+        )
+        if hasattr(child_module, "is_weighted") and callable(child_module.is_weighted):
+            if isinstance(child_module, EmbeddingBagCollectionInterface):
+                # pyre-ignore[29]: `Module` has no attribute `is_weighted`
+                self.is_weighted = child_module.is_weighted()
 
     @property
     def tensor(self) -> torch.Tensor:
@@ -1116,8 +1151,6 @@ class ShardingOption:
 
     @property
     def is_pooled(self) -> bool:
-        if self._is_pooled is None:
-            self._is_pooled = ShardingOption.module_pooled(self.module[1], self.name)
         return self._is_pooled
 
     @staticmethod
@@ -1137,6 +1170,14 @@ class ShardingOption:
                         return False
 
         return True
+
+    @property
+    def module_type_key(self) -> str:
+        return self._module_type_key
+
+    @property
+    def has_feature_processor(self) -> bool:
+        return self._has_feature_processor
 
     def get_shards_assignment(self) -> List[Optional[int]]:
         return [shard.rank for shard in self.shards]
@@ -1205,6 +1246,22 @@ class PartitionByType(Enum):
     UNIFORM = "uniform"
     # Partitioning based on multiple hosts
     MULTI_HOST = "multi_host"
+
+
+@dataclass
+class SharderData:
+    """Picklable snapshot of sharder data needed by estimators.
+
+    Captures fused_params, quantized comm codec dtype sizes, and storage
+    usage dispatch info so estimators can work without live sharder objects.
+    """
+
+    fused_params: Dict[str, Any]
+    qcomm_dtype_sizes: Dict[str, Tuple[float, float]]
+    storage_usage_type: StorageUsageType
+
+
+SharderDataMap = Dict[str, SharderData]
 
 
 @dataclass

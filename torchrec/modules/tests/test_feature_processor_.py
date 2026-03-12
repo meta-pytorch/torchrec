@@ -45,7 +45,7 @@ class PositionWeightedModuleTest(unittest.TestCase):
         )
 
         pw_f1 = weighted_features.weights().detach()
-        self.assertTrue(torch.allclose(pw_f1_ref, pw_f1))
+        torch.testing.assert_close(pw_f1_ref, pw_f1, rtol=1e-05, atol=1e-08)
 
         position_weighted_module_gm = symbolic_trace(pw)
         position_weighted_module_gm_script = torch.jit.script(

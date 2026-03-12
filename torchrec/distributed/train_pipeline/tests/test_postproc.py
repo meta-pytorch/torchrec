@@ -114,7 +114,7 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
             optim.step()
 
             pred_pipelined = pipeline.progress(dataloader)
-            self.assertTrue(torch.equal(pred, pred_pipelined))
+            torch.testing.assert_close(pred, pred_pipelined, rtol=0, atol=0)
 
         return sharded_model_pipelined, pipeline
 

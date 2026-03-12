@@ -62,24 +62,6 @@ except Exception:
 logger: logging.Logger = logging.getLogger(__name__)
 
 
-def _is_prefetch_pipelined(
-    sharding_option: ShardingOption, sharder: ModuleSharder[nn.Module]
-) -> bool:
-    prefetch_pipeline = (
-        sharding_option.cache_params.prefetch_pipeline
-        if sharding_option.cache_params
-        else None
-    )
-    # TODO: remove after deprecating fused_params in sharder
-    if not prefetch_pipeline:
-        prefetch_pipeline = (
-            sharder.fused_params.get("prefetch_pipeline", False)
-            if hasattr(sharder, "fused_params") and sharder.fused_params
-            else False
-        )
-    return prefetch_pipeline
-
-
 class EmbeddingPerfEstimator(ShardEstimator):
     """
     Embedding Wall Time Perf Estimator. This estimator estimates the wall time

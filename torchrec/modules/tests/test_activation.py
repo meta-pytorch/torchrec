@@ -21,7 +21,7 @@ class TestActivation(unittest.TestCase):
         output = m(input)
         norm = torch.nn.LayerNorm([3, 4])
         ref_output = input * torch.sigmoid(norm(input))
-        self.assertTrue(torch.allclose(output, ref_output))
+        torch.testing.assert_close(output, ref_output, rtol=1e-05, atol=1e-08)
 
     def test_fx_script_swish(self) -> None:
         m = SwishLayerNorm(10)

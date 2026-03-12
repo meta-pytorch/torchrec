@@ -664,21 +664,23 @@ class InferShardingsTest(unittest.TestCase):
                     f"_module.sparse.ebc.tbes.{tbe_idx}.0.{table_name}.weight"
                 )
 
-                assert sharded_weight_fqn in weights_spec
+                self.assertIn(sharded_weight_fqn, weights_spec)
                 wspec = weights_spec[sharded_weight_fqn]
-                assert wspec.fqn == unsharded_weight_fqn
-                assert wspec.shard_sizes == [size_r, size_c]
-                assert wspec.shard_offsets == [offset_r, offset_c]
-                assert wspec.sharding_type == ShardingType.COLUMN_WISE.value
+                self.assertEqual(wspec.fqn, unsharded_weight_fqn)
+                self.assertEqual(wspec.shard_sizes, [size_r, size_c])
+                self.assertEqual(wspec.shard_offsets, [offset_r, offset_c])
+                self.assertEqual(wspec.sharding_type, ShardingType.COLUMN_WISE.value)
 
                 for qcomp in ["qscale", "qbias"]:
                     sharded_weight_qcomp_fqn: str = f"{sharded_weight_fqn}_{qcomp}"
-                    assert sharded_weight_qcomp_fqn in weights_spec
+                    self.assertIn(sharded_weight_qcomp_fqn, weights_spec)
                     wqcomp_spec = weights_spec[sharded_weight_qcomp_fqn]
-                    assert wqcomp_spec.fqn == f"{unsharded_weight_fqn}_{qcomp}"
-                    assert wqcomp_spec.shard_sizes == [size_r, 2]
-                    assert wqcomp_spec.shard_offsets == [0, 0]
-                    assert wqcomp_spec.sharding_type == ShardingType.COLUMN_WISE.value
+                    self.assertEqual(wqcomp_spec.fqn, f"{unsharded_weight_fqn}_{qcomp}")
+                    self.assertEqual(wqcomp_spec.shard_sizes, [size_r, 2])
+                    self.assertEqual(wqcomp_spec.shard_offsets, [0, 0])
+                    self.assertEqual(
+                        wqcomp_spec.sharding_type, ShardingType.COLUMN_WISE.value
+                    )
 
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
@@ -1559,7 +1561,7 @@ class InferShardingsTest(unittest.TestCase):
         path_device_lists = get_path_device_tuples(sharded_model)
 
         for path_device in path_device_lists:
-            assert device in path_device[1]
+            self.assertIn(device, path_device[1])
 
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
@@ -2198,7 +2200,7 @@ class InferShardingsTest(unittest.TestCase):
         inputs = []
         for model_input in model_inputs:
             kjt = model_input.idlist_features
-            assert isinstance(kjt, KeyedJaggedTensor)
+            self.assertIsInstance(kjt, KeyedJaggedTensor)
             kjt = kjt.to(local_device)
             weights = torch.rand(
                 kjt._values.size(0), dtype=torch.float, device=local_device
@@ -2272,7 +2274,7 @@ class InferShardingsTest(unittest.TestCase):
             if isinstance(m, TimeGapPoolingCollectionModule):
                 count_registered_fp += 1
 
-        assert count_registered_fp == world_size
+        self.assertEqual(count_registered_fp, world_size)
 
         sharded_output = sharded_model(*inputs[0])
         assert_close(non_sharded_output, sharded_output)
@@ -2295,7 +2297,7 @@ class InferShardingsTest(unittest.TestCase):
                 if isinstance(m, TimeGapPoolingCollectionModule):
                     fp_call_module += 1
 
-        assert fp_call_module == world_size
+        self.assertEqual(fp_call_module, world_size)
         print(f"fx.graph:\n{gm.graph}")
 
         gm_script = torch.jit.script(gm)
@@ -2383,7 +2385,7 @@ class InferShardingsTest(unittest.TestCase):
         inputs = []
         for model_input in model_inputs:
             kjt = model_input.idlist_features
-            assert isinstance(kjt, KeyedJaggedTensor)
+            self.assertIsInstance(kjt, KeyedJaggedTensor)
             kjt = kjt.to(local_device)
             weights = None
             inputs.append(
@@ -2398,7 +2400,7 @@ class InferShardingsTest(unittest.TestCase):
 
         mi.model(*inputs[0])
         print(f"model:\n{mi.model}")
-        assert mi.model.training is True
+        self.assertIs(mi.model.training, True)
         mi.quant_model = quantize(
             module=mi.model,
             inplace=False,
@@ -2407,7 +2409,7 @@ class InferShardingsTest(unittest.TestCase):
             weight_dtype=weight_dtype,
         )
         quant_model = mi.quant_model
-        assert quant_model.training is False
+        self.assertIs(quant_model.training, False)
         non_sharded_output = mi.quant_model(*inputs[0])
 
         topology: Topology = Topology(world_size=world_size, compute_device=device_type)
@@ -2522,7 +2524,7 @@ class InferShardingsTest(unittest.TestCase):
         )
         inputs = []
         kjt = model_inputs[0].idlist_features
-        assert isinstance(kjt, KeyedJaggedTensor)
+        self.assertIsInstance(kjt, KeyedJaggedTensor)
         kjt = kjt.to(local_device)
         weights = torch.rand(
             kjt._values.size(0), dtype=torch.float, device=local_device
@@ -2596,7 +2598,7 @@ class InferShardingsTest(unittest.TestCase):
             if isinstance(m, PositionWeightedModuleCollection):
                 count_registered_fp += 1
 
-        assert count_registered_fp == world_size
+        self.assertEqual(count_registered_fp, world_size)
 
         # Move inputs to meta now that we shard on meta
         for i, input in enumerate(inputs):
@@ -2626,7 +2628,7 @@ class InferShardingsTest(unittest.TestCase):
                 if isinstance(m, PositionWeightedModuleCollection):
                     fp_call_module += 1
 
-        assert fp_call_module == world_size
+        self.assertEqual(fp_call_module, world_size)
         print(f"fx.graph:\n{gm.graph}")
 
         gm_script = torch.jit.script(gm)

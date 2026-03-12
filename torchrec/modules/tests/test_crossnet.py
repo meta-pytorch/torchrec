@@ -39,7 +39,7 @@ class TestCrossNet(unittest.TestCase):
                 [1.4030, 1.0054],
             ]
         )
-        self.assertTrue(torch.allclose(output, expected_output, rtol=1e-4, atol=1e-4))
+        torch.testing.assert_close(output, expected_output, rtol=1e-4, atol=1e-4)
 
     def test_fx_script_cross_net(self) -> None:
         input = torch.randn(2, 3)
@@ -73,7 +73,7 @@ class TestLowRankCrossNet(unittest.TestCase):
                 [249.6694, 117.3466],
             ]
         )
-        self.assertTrue(torch.allclose(output, expected_output, rtol=1e-4, atol=1e-4))
+        torch.testing.assert_close(output, expected_output, rtol=1e-4, atol=1e-4)
 
     def test_fx_script_cross_net(self) -> None:
         input = torch.randn(2, 3)
@@ -105,7 +105,7 @@ class TestVectorCrossNet(unittest.TestCase):
                 [-1.3328e02, -1.7187e02],
             ]
         )
-        self.assertTrue(torch.allclose(output, expected_output, rtol=1e-4, atol=1e-4))
+        torch.testing.assert_close(output, expected_output, rtol=1e-4, atol=1e-4)
 
     def test_fx_script_cross_net(self) -> None:
         input = torch.randn(2, 3)
@@ -139,7 +139,7 @@ class TestLowRankMixtureCrossNet(unittest.TestCase):
                 [-0.9467, -1.3091],
             ]
         )
-        self.assertTrue(torch.allclose(output, expected_output, rtol=1e-4, atol=1e-4))
+        torch.testing.assert_close(output, expected_output, rtol=1e-4, atol=1e-4)
 
     def test_cross_net_numercial_forward_1_expert(self) -> None:
         torch.manual_seed(0)
@@ -161,7 +161,7 @@ class TestLowRankMixtureCrossNet(unittest.TestCase):
                 [-2.5836, -1.8124],
             ]
         )
-        self.assertTrue(torch.allclose(output, expected_output, rtol=1e-4, atol=1e-4))
+        torch.testing.assert_close(output, expected_output, rtol=1e-4, atol=1e-4)
 
     def test_fx_script_cross_net(self) -> None:
         input = torch.randn(2, 3)

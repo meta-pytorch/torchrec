@@ -39,8 +39,8 @@ class TestKeyedTensor(unittest.TestCase):
         kt = KeyedTensor.from_tensor_list(keys, tensor_list, cat_dim=0, key_dim=0)
         self.assertEqual(kt.key_dim(), 0)
 
-        self.assertTrue(torch.equal(kt["dense_0"], tensor_list[0]))
-        self.assertTrue(torch.equal(kt["dense_1"], tensor_list[1]))
+        torch.testing.assert_close(kt["dense_0"], tensor_list[0], rtol=0, atol=0)
+        torch.testing.assert_close(kt["dense_1"], tensor_list[1], rtol=0, atol=0)
 
     def test_key_lookup_dim_1(self) -> None:
         tensor_list = [
@@ -50,8 +50,8 @@ class TestKeyedTensor(unittest.TestCase):
         keys = ["dense_0", "dense_1"]
         kt = KeyedTensor.from_tensor_list(keys, tensor_list, key_dim=1)
         self.assertEqual(kt.key_dim(), 1)
-        self.assertTrue(torch.equal(kt["dense_0"], tensor_list[0]))
-        self.assertTrue(torch.equal(kt["dense_1"], tensor_list[1]))
+        torch.testing.assert_close(kt["dense_0"], tensor_list[0], rtol=0, atol=0)
+        torch.testing.assert_close(kt["dense_1"], tensor_list[1], rtol=0, atol=0)
 
     def test_to_dict(self) -> None:
         tensor_list = [
@@ -64,7 +64,7 @@ class TestKeyedTensor(unittest.TestCase):
 
         d = kt.to_dict()
         for key in keys:
-            self.assertTrue(torch.equal(kt[key], d[key]))
+            torch.testing.assert_close(kt[key], d[key], rtol=0, atol=0)
 
     def test_to_dict_dim_1(self) -> None:
         tensor_list = [
@@ -77,7 +77,7 @@ class TestKeyedTensor(unittest.TestCase):
 
         d = kt.to_dict()
         for key in keys:
-            self.assertTrue(torch.equal(kt[key], d[key]))
+            torch.testing.assert_close(kt[key], d[key], rtol=0, atol=0)
 
     def test_regroup_single_kt(self) -> None:
         tensor_list = [torch.randn(2, 3) for i in range(5)]
@@ -87,17 +87,19 @@ class TestKeyedTensor(unittest.TestCase):
         grouped_tensors = KeyedTensor.regroup(
             [kt], [["dense_0", "dense_4"], ["dense_1", "dense_3"], ["dense_2"]]
         )
-        self.assertTrue(
-            torch.equal(
-                grouped_tensors[0], torch.cat([tensor_list[0], tensor_list[4]], key_dim)
-            )
+        torch.testing.assert_close(
+            grouped_tensors[0],
+            torch.cat([tensor_list[0], tensor_list[4]], key_dim),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                grouped_tensors[1], torch.cat([tensor_list[1], tensor_list[3]], key_dim)
-            )
+        torch.testing.assert_close(
+            grouped_tensors[1],
+            torch.cat([tensor_list[1], tensor_list[3]], key_dim),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(torch.equal(grouped_tensors[2], tensor_list[2]))
+        torch.testing.assert_close(grouped_tensors[2], tensor_list[2], rtol=0, atol=0)
 
     def test_regroup_multiple_kt(self) -> None:
         key_dim = 1
@@ -110,19 +112,17 @@ class TestKeyedTensor(unittest.TestCase):
         grouped_tensors = KeyedTensor.regroup(
             [kt_1, kt_2], [["dense_0", "sparse_1", "dense_2"], ["dense_1", "sparse_0"]]
         )
-        self.assertTrue(
-            torch.equal(
-                grouped_tensors[0],
-                torch.cat(
-                    [tensor_list_1[0], tensor_list_2[1], tensor_list_1[2]], key_dim
-                ),
-            )
+        torch.testing.assert_close(
+            grouped_tensors[0],
+            torch.cat([tensor_list_1[0], tensor_list_2[1], tensor_list_1[2]], key_dim),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                grouped_tensors[1],
-                torch.cat([tensor_list_1[1], tensor_list_2[0]], key_dim),
-            )
+        torch.testing.assert_close(
+            grouped_tensors[1],
+            torch.cat([tensor_list_1[1], tensor_list_2[0]], key_dim),
+            rtol=0,
+            atol=0,
         )
 
     @given(
@@ -338,19 +338,17 @@ class TestKeyedTensor(unittest.TestCase):
         grouped_tensors = KeyedTensor.regroup(
             [kt_1, kt_2], [["dense_0", "sparse_1"], ["dense_1", "sparse_0", "dense_0"]]
         )
-        self.assertTrue(
-            torch.equal(
-                grouped_tensors[0],
-                torch.cat([tensor_list_1[0], tensor_list_2[1]], key_dim),
-            )
+        torch.testing.assert_close(
+            grouped_tensors[0],
+            torch.cat([tensor_list_1[0], tensor_list_2[1]], key_dim),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(
-                grouped_tensors[1],
-                torch.cat(
-                    [tensor_list_1[1], tensor_list_2[0], tensor_list_1[0]], key_dim
-                ),
-            )
+        torch.testing.assert_close(
+            grouped_tensors[1],
+            torch.cat([tensor_list_1[1], tensor_list_2[0], tensor_list_1[0]], key_dim),
+            rtol=0,
+            atol=0,
         )
 
     @given(
@@ -474,7 +472,7 @@ class TestKeyedTensor(unittest.TestCase):
         traced_results = gm(inputs, groups)
         self.assertEqual(len(results), len(traced_results))
         for result, traced_result in zip(results, traced_results):
-            self.assertTrue(torch.equal(result, traced_result))
+            torch.testing.assert_close(result, traced_result, rtol=0, atol=0)
 
     def test_regroup_as_dict_scriptable(self) -> None:
         class MyModule(torch.nn.Module):
@@ -511,7 +509,7 @@ class TestKeyedTensor(unittest.TestCase):
         traced_results = gm(inputs)
         self.assertEqual(len(results), len(traced_results))
         for result, traced_result in zip(results.values(), traced_results.values()):
-            self.assertTrue(torch.equal(result, traced_result))
+            torch.testing.assert_close(result, traced_result, rtol=0, atol=0)
 
     def test_scriptable(self) -> None:
         class MyModule(torch.nn.Module):
@@ -570,7 +568,7 @@ class TestKeyedTensor(unittest.TestCase):
         flattened, out_spec = pytree.tree_flatten(kt)
 
         # first element of flattened list should be the kt._values
-        self.assertTrue(torch.equal(flattened[0], kt.values()))
+        torch.testing.assert_close(flattened[0], kt.values(), rtol=0, atol=0)
         # re-construct the unflattened kt from the flattened list plus the out_spec
         unflattened = pytree.tree_unflatten(flattened, out_spec)
 
@@ -630,11 +628,11 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             self.assertEqual(in_shapes.shape, (3,))
             self.assertEqual(out_shapes.shape, (4,))
         else:
-            self.assertTrue(
-                torch.equal(
-                    permutes,
-                    torch.tensor(ref_permutes, dtype=torch.int32, device=device),
-                )
+            torch.testing.assert_close(
+                permutes,
+                torch.tensor(ref_permutes, dtype=torch.int32, device=device),
+                rtol=0,
+                atol=0,
             )
             self.assertEqual(in_shapes.tolist(), [7, 18, 8])
             self.assertEqual(out_shapes.tolist(), [8, 4, 17, 10])
@@ -759,7 +757,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             values, permutes, in_shapes, out_shapes, out_lengths
         )
         for out, ref in zip(outputs, refs):
-            self.assertTrue(torch.allclose(out, ref))
+            torch.testing.assert_close(out, ref, rtol=1e-05, atol=1e-08)
 
         ref_loss, loss = refs[0].sum(), outputs[0].sum()
         for i in range(1, len(refs)):
@@ -769,9 +767,9 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         loss.backward()
         for val, ref in zip(values, ref_values):
             val_grad, ref_grad = val.grad, ref.grad
-            assert isinstance(val_grad, torch.Tensor)
+            self.assertIsInstance(val_grad, torch.Tensor)
             # pyrefly: ignore[bad-argument-type]
-            self.assertTrue(torch.allclose(val_grad, ref_grad))
+            torch.testing.assert_close(val_grad, ref_grad, rtol=1e-05, atol=1e-08)
 
     @given(
         device_str=st.sampled_from(["cpu", "cuda"]),
@@ -811,7 +809,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             non_contiguous, permutes, in_shapes, out_shapes, out_lengths
         )
         for out, ref in zip(outputs, refs):
-            self.assertTrue(torch.allclose(out, ref))
+            torch.testing.assert_close(out, ref, rtol=1e-05, atol=1e-08)
 
         ref_loss, loss = refs[0].sum(), outputs[0].sum()
         for i in range(1, len(refs)):
@@ -821,9 +819,9 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         loss.backward()
         for val, ref in zip(values, ref_values):
             val_grad, ref_grad = val.grad, ref.grad
-            assert isinstance(val_grad, torch.Tensor)
+            self.assertIsInstance(val_grad, torch.Tensor)
             # pyrefly: ignore[bad-argument-type]
-            self.assertTrue(torch.allclose(val_grad, ref_grad))
+            torch.testing.assert_close(val_grad, ref_grad, rtol=1e-05, atol=1e-08)
 
     @given(
         device_str=st.sampled_from(["cpu", "meta", "cuda"]),
@@ -863,11 +861,11 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             self.assertEqual(in_shapes.shape, (3,))
             self.assertEqual(out_shapes.shape, (4,))
         else:
-            self.assertTrue(
-                torch.equal(
-                    permutes,
-                    torch.tensor(ref_permutes, dtype=torch.int32, device=device),
-                )
+            torch.testing.assert_close(
+                permutes,
+                torch.tensor(ref_permutes, dtype=torch.int32, device=device),
+                rtol=0,
+                atol=0,
             )
             self.assertEqual(in_shapes.tolist(), [7, 18, 8])
             self.assertEqual(out_shapes.tolist(), [8, 4, 17, 10])
@@ -957,7 +955,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             groups,
         )
         for out, ref in zip(outputs, refs):
-            self.assertTrue(torch.allclose(out, ref))
+            torch.testing.assert_close(out, ref, rtol=1e-05, atol=1e-08)
 
         ref_loss, loss = refs[0].sum(), outputs[0].sum()
         for i in range(1, len(refs)):
@@ -967,9 +965,9 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         loss.backward()
         for val, ref in zip(values, ref_values):
             val_grad, ref_grad = val.grad, ref.grad
-            assert isinstance(val_grad, torch.Tensor)
+            self.assertIsInstance(val_grad, torch.Tensor)
             # pyrefly: ignore[bad-argument-type]
-            self.assertTrue(torch.allclose(val_grad, ref_grad))
+            torch.testing.assert_close(val_grad, ref_grad, rtol=1e-05, atol=1e-08)
 
 
 @skip_if_asan_class

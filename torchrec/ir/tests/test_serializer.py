@@ -272,7 +272,7 @@ class TestJsonSerializer(unittest.TestCase):
         # check FPEBC config
         for i in range(2):
             fpebc_name = f"fpebc{i + 1}"
-            assert isinstance(
+            self.assertIsInstance(
                 getattr(deserialized_model, fpebc_name),
                 FeatureProcessedEmbeddingBagCollection,
             )
@@ -535,12 +535,16 @@ class TestJsonSerializer(unittest.TestCase):
             )
             for name, m in deserialized_model.named_modules():
                 if hasattr(m, "device"):
-                    assert m.device.type == device.type, f"{name} should be on {device}"
+                    self.assertEqual(
+                        m.device.type, device.type, f"{name} should be on {device}"
+                    )
             for name, param in deserialized_model.named_parameters():
                 # TODO: we don't support FPEBC yet, so we skip the FPEBC params
                 if "_feature_processors" in name:
                     continue
-                assert param.device.type == device.type, f"{name} should be on {device}"
+                self.assertEqual(
+                    param.device.type, device.type, f"{name} should be on {device}"
+                )
 
     def test_compound_module(self) -> None:
         tb1_config = EmbeddingBagConfig(

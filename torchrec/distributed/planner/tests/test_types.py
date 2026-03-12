@@ -1086,7 +1086,7 @@ class TestConsistentHashingBetweenProcesses(MultiProcessTestBase):
             return_hash_dict=return_hash_dict,
         )
         hashes = return_hash_dict.values()
-        assert hashes[0] == hashes[1], "hash values are different."
+        self.assertEqual(hashes[0], hashes[1], "hash values are different.")
 
 
 class TestHardwareConfig(unittest.TestCase):

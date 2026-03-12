@@ -434,8 +434,8 @@ class ModelParallelSingleRankBase(unittest.TestCase):
             loss1, pred1 = m1(batch)
             loss2, pred2 = m2(batch)
         if is_deterministic:
-            self.assertTrue(torch.equal(loss1, loss2))
-            self.assertTrue(torch.equal(pred1, pred2))
+            torch.testing.assert_close(loss1, loss2, rtol=0, atol=0)
+            torch.testing.assert_close(pred1, pred2, rtol=0, atol=0)
         else:
             if tolerance:
                 torch.testing.assert_close(loss1, loss2, rtol=tolerance, atol=tolerance)
@@ -459,7 +459,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
         for key, value in sd2.items():
             v2 = sd1[key]
             if isinstance(value, ShardedTensor):
-                assert isinstance(v2, ShardedTensor)
+                self.assertIsInstance(v2, ShardedTensor)
                 self.assertEqual(len(value.local_shards()), len(v2.local_shards()))
                 for local_shard_id, (dst, src) in enumerate(
                     zip(value.local_shards(), v2.local_shards())
@@ -467,7 +467,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
                     src_tensor = None
                     dst_tensor = None
                     if isinstance(dst.tensor, PartiallyMaterializedTensor):
-                        assert isinstance(src.tensor, PartiallyMaterializedTensor)
+                        self.assertIsInstance(src.tensor, PartiallyMaterializedTensor)
                         if use_virtual_table:
                             # kvz zch emb table comparison, id is non-continuous
                             wid_key = key[: key.rfind(".")] + ".weight_id"
@@ -488,7 +488,9 @@ class ModelParallelSingleRankBase(unittest.TestCase):
                         src_tensor = torch.sort(src.tensor.flatten()).values
                         dst_tensor = torch.sort(dst.tensor.flatten()).values
                     if is_deterministic:
-                        self.assertTrue(torch.allclose(src_tensor, dst_tensor))
+                        torch.testing.assert_close(
+                            src_tensor, dst_tensor, rtol=1e-05, atol=1e-08
+                        )
                     else:
                         if tolerance:
                             rtol, atol = tolerance, tolerance
@@ -500,7 +502,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
                             src_tensor, dst_tensor, rtol=rtol, atol=atol
                         )
             elif isinstance(value, DTensor):
-                assert isinstance(v2, DTensor)
+                self.assertIsInstance(v2, DTensor)
                 self.assertEqual(
                     # pyrefly: ignore[missing-attribute]
                     len(value._local_tensor.local_shards()),
@@ -514,7 +516,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
                     v2._local_tensor.local_shards(),
                 ):
                     if is_deterministic:
-                        self.assertTrue(torch.equal(src, dst))
+                        torch.testing.assert_close(src, dst, rtol=0, atol=0)
                     else:
                         if tolerance:
                             rtol, atol = tolerance, tolerance
@@ -527,7 +529,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
                 dst = value
                 src = v2
                 if is_deterministic:
-                    self.assertTrue(torch.equal(src, dst))
+                    torch.testing.assert_close(src, dst, rtol=0, atol=0)
                 else:
                     if tolerance:
                         rtol, atol = tolerance, tolerance
@@ -660,22 +662,22 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                 continue
             if isinstance(v2, ShardedTensor):
                 self.assertTrue(isinstance(v1, ShardedTensor))
-                assert len(v2.local_shards()) == 1
+                self.assertEqual(len(v2.local_shards()), 1)
                 dst = v2.local_shards()[0].tensor
             elif isinstance(v2, DTensor):
                 self.assertTrue(isinstance(v1, DTensor))
                 # pyrefly: ignore[missing-attribute]
-                assert len(v2._local_tensor.local_shards()) == 1
+                self.assertEqual(len(v2._local_tensor.local_shards()), 1)
                 # pyrefly: ignore[missing-attribute]
                 dst = v2._local_tensor.local_shards()[0]
             else:
                 dst = v2
             if isinstance(v1, ShardedTensor):
-                assert len(v1.local_shards()) == 1
+                self.assertEqual(len(v1.local_shards()), 1)
                 src = v1.local_shards()[0].tensor
             elif isinstance(v1, DTensor):
                 # pyrefly: ignore[missing-attribute]
-                assert len(v1._local_tensor.local_shards()) == 1
+                self.assertEqual(len(v1._local_tensor.local_shards()), 1)
                 # pyrefly: ignore[missing-attribute]
                 src = v1._local_tensor.local_shards()[0]
             else:
@@ -1056,8 +1058,11 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                     for src_local_shard, dst_local_shard in zip(
                         value.local_shards(), v2.local_shards()
                     ):
-                        self.assertTrue(
-                            torch.equal(src_local_shard.tensor, dst_local_shard.tensor)
+                        torch.testing.assert_close(
+                            src_local_shard.tensor,
+                            dst_local_shard.tensor,
+                            rtol=0,
+                            atol=0,
                         )
                 elif isinstance(v2, DTensor):
                     self.assertEqual(
@@ -1070,10 +1075,12 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                         # pyrefly: ignore[missing-attribute]
                         v2._local_tensor.local_shards(),
                     ):
-                        self.assertTrue(torch.equal(src_local_shard, dst_local_shard))
+                        torch.testing.assert_close(
+                            src_local_shard, dst_local_shard, rtol=0, atol=0
+                        )
                 else:
                     src = v2
-                    self.assertTrue(torch.equal(src, dst))
+                    torch.testing.assert_close(src, dst, rtol=0, atol=0)
 
         for param_name, dst_param_group in dst_optimizer_state_dict.items():
             src_param_group = src_optimizer_state_dict[param_name]
@@ -1097,8 +1104,11 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                     for src_local_shard, dst_local_shard in zip(
                         src_opt_state.local_shards(), dst_opt_state.local_shards()
                     ):
-                        self.assertTrue(
-                            torch.equal(src_local_shard.tensor, dst_local_shard.tensor)
+                        torch.testing.assert_close(
+                            src_local_shard.tensor,
+                            dst_local_shard.tensor,
+                            rtol=0,
+                            atol=0,
                         )
                 elif isinstance(dst_opt_state, DTensor):
                     self.assertIsInstance(src_opt_state, DTensor)
@@ -1119,7 +1129,9 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                         # pyrefly: ignore[missing-attribute]
                         dst_opt_state._local_tensor.local_shards(),
                     ):
-                        self.assertTrue(torch.equal(src_local_shard, dst_local_shard))
+                        torch.testing.assert_close(
+                            src_local_shard, dst_local_shard, rtol=0, atol=0
+                        )
                 elif isinstance(dst_opt_state, torch.Tensor):
                     self.assertIsInstance(src_opt_state, torch.Tensor)
 
