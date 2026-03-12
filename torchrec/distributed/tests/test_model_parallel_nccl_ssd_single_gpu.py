@@ -153,10 +153,12 @@ class KeyValueModelParallelTest(ModelParallelSingleRankBase):
                                 0
                             ].local_shards()
                         ][0]
-                        assert torch.equal(
+                        torch.testing.assert_close(
                             optim_weight_from_emb_tensor,
                             optim_weight_from_optim_tensor,
-                        ), "Expect optimizer weights from emb and optim to be equal."
+                            rtol=0,
+                            atol=0,
+                        )
 
     @staticmethod
     def _copy_ssd_emb_modules(

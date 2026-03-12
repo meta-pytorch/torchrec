@@ -393,10 +393,12 @@ def _test_sharding_and_remapping(  # noqa C901
         remapped_ids = [remapped_ids1, remapped_ids2]
         for key in output_keys:
             for i, kjt_out in enumerate(kjt_out_per_iter):
-                assert torch.equal(
+                torch.testing.assert_close(
                     remapped_ids[i][key].values(),
                     kjt_out[key].values(),
-                ), f"feature {key} on {ctx.rank} iteration {i} does not match, got {remapped_ids[i][key].values()}, expect {kjt_out[key].values()}"
+                    rtol=0,
+                    atol=0,
+                )
 
         # TODO: validate embedding rows, and eviction
 
@@ -478,10 +480,12 @@ def _test_in_place_embd_weight_update(  # noqa C901
             remapped_ids = [remapped_ids1, remapped_ids2]
             for key in output_keys:
                 for i, kjt_out in enumerate(kjt_out_per_iter):
-                    assert torch.equal(
+                    torch.testing.assert_close(
                         remapped_ids[i][key].values(),
                         kjt_out[key].values(),
-                    ), f"feature {key} on {ctx.rank} iteration {i} does not match, got {remapped_ids[i][key].values()}, expect {kjt_out[key].values()}"
+                        rtol=0,
+                        atol=0,
+                    )
 
 
 def _merge_sharded_return_state_dict(

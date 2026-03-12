@@ -33,10 +33,10 @@ class QuantUtilsTest(unittest.TestCase):
         t_u4.detach()
 
         t_u4.to(torch.device("cuda"))
-        assert torch.equal(t_u4.view(torch.uint8), t_u8)
+        torch.testing.assert_close(t_u4.view(torch.uint8), t_u8, rtol=0, atol=0)
         t_u2 = UInt2Tensor(t_u8)
         t_u2.to(torch.device("cuda"))
-        assert torch.equal(t_u2.view(torch.uint8), t_u8)
+        torch.testing.assert_close(t_u2.view(torch.uint8), t_u8, rtol=0, atol=0)
 
         for t in [t_u4[:, :8], t_u4[:, 8:]]:
             self.assertEqual(t.size(1), 8)
