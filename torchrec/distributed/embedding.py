@@ -54,6 +54,7 @@ from torchrec.distributed.fused_params import (
     FUSED_PARAM_IS_SSD_TABLE,
     FUSED_PARAM_SSD_TABLE_LIST,
 )
+from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.sharding.cw_sequence_sharding import (
     CwSequenceEmbeddingSharding,
 )
@@ -1623,6 +1624,11 @@ class ShardedEmbeddingCollection(
                 EmbeddingEvent.LOOKUP, self._module_fqn, sharding_type
             ):
                 embs = lookup(features)
+                if MemoryStashingManager.is_enabled():
+                    stash_result = MemoryStashingManager.stash_embedding_weights(lookup)
+                    if stash_result is not None:
+                        await_restore, _ = stash_result
+                        embs.register_hook(await_restore)
                 if hasattr(lookup, "get_resize_awaitables"):
                     # pyrefly: ignore[not-callable]
                     resize_awaitables.extend(lookup.get_resize_awaitables())
