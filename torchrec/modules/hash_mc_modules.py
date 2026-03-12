@@ -220,13 +220,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
     BUCKET_BUFFER: str = "_hash_zch_bucket"
     RUNTIME_META_BUFFER: str = "_hash_zch_runtime_meta"
 
-    table_name_on_device_remapped_ids_dict: Dict[
-        str, torch.Tensor
-    ]  # used to store the on-device remapped ids
-    table_name_on_device_input_ids_dict: Dict[
-        str, torch.Tensor
-    ]  # used to store the on-device input ids
-
     def __init__(
         self,
         zch_size: int,
@@ -247,6 +240,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         percent_reserved_slots: float = 0,
         disable_fallback: bool = False,
         track_id_freq: bool = False,
+        read_only_suffix: str = "_readonly",
+        enable_per_feature_lookups: bool = False,
         no_bag: bool = False,
     ) -> None:
         if output_segments is None:
@@ -380,17 +375,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self._eviction_policy_name_copy: Optional[HashZchEvictionPolicyName] = (
             self._eviction_policy_name
         )
-
-        # create two dictionaries to store the input values and remapped ids on the current rank
-        # these values are used for calculating zch metrics like hit rate and collision rate
-        ## on-device remapped ids
-        self.table_name_on_device_remapped_ids_dict: Dict[str, torch.Tensor] = (
-            {}
-        )  # {table_name: on_device_remapped_ids}
-        ## on-device input ids
-        self.table_name_on_device_input_ids_dict: Dict[str, torch.Tensor] = (
-            {}
-        )  # {table_name: input JT values that maps to the current rank}
+        self._read_only_suffix: str = read_only_suffix
+        self._enable_per_feature_lookups: bool = enable_per_feature_lookups
         self._no_bag = no_bag
 
         logger.info(
@@ -401,7 +387,9 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._buckets=}, {self._start_bucket=}, {self._end_bucket=}, "
             f"{self._output_global_offset_tensor=}, {self._output_segments=}, "
             f"{inference_dispatch_div_train_world_size=}, "
-            f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, {self._track_id_freq=}, {self._no_bag=}"
+            f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, "
+            f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
+            f"{self._no_bag=}"
         )
 
     @property
@@ -444,28 +432,28 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self._eviction_policy_name = None
         self._eviction_module = None
 
+    @staticmethod
+    def _reset_inference_mode_load_state_dict_pre_hook(
+        module: "HashZchManagedCollisionModule",
+        state_dict: Dict[str, Any],
+        prefix: str,
+        *args: Any,
+    ) -> None:
+        logger.info("HashZchManagedCollisionModule loading state dict")
+        # We store the full identity in checkpoint and predictor, cut it at inference loading
+        if not module._is_inference:
+            return
+        if "_hash_zch_metadata" in state_dict:
+            del state_dict["_hash_zch_metadata"]
+
     def reset_inference_mode(
         self,
     ) -> None:
         logger.info("HashZchManagedCollisionModule resetting inference mode")
         self._set_eval_mode_impl()
         self._hash_zch_metadata = None
-
-        def _load_state_dict_pre_hook(
-            module: "HashZchManagedCollisionModule",
-            state_dict: Dict[str, Any],
-            prefix: str,
-            *args: Any,
-        ) -> None:
-            logger.info("HashZchManagedCollisionModule loading state dict")
-            # We store the full identity in checkpoint and predictor, cut it at inference loading
-            if not self._is_inference:
-                return
-            if "_hash_zch_metadata" in state_dict:
-                del state_dict["_hash_zch_metadata"]
-
         self._register_load_state_dict_pre_hook(
-            _load_state_dict_pre_hook, with_module=True
+            self._reset_inference_mode_load_state_dict_pre_hook, with_module=True
         )
 
     def reset_intrainer_bulk_eval_mode(self) -> None:
@@ -550,11 +538,22 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             remapped_features: Dict[str, JaggedTensor] = {}
             identities_0 = (
                 self._hash_zch_identities.data.clone()
-                # if self._tb_logging_frequency > 0
-                # else None
+                if self._tb_logging_frequency > 0
+                else None
             )
-
+            metadata_0 = (
+                self._hash_zch_metadata.data.clone()
+                if self._tb_logging_frequency > 0
+                and self._hash_zch_metadata is not None
+                else None
+            )
             for name, feature in features.items():
+                if name.lower().endswith(self._read_only_suffix):
+                    overwrite_readonly = True
+                    overwrite_metadata = None
+                else:
+                    overwrite_readonly = readonly
+                    overwrite_metadata = metadata
                 values = feature.values()
                 input_metadata, eviction_threshold = (
                     self._eviction_module(feature)
@@ -578,9 +577,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     output_offset=self._output_global_offset_tensor,
                 )
 
-                # record the input values
-                self.table_name_on_device_input_ids_dict[name] = values.clone()
-
                 num_reserved_slots = self.get_reserved_slots_per_bucket()
                 remapped_ids, evictions = torch.ops.fbgemm.zero_collision_hash(
                     input=values,
@@ -588,10 +584,10 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     max_probe=self._max_probe,
                     circular_probe=True,
                     exp_hours=-1,  # deprecated, always -1
-                    readonly=readonly,
+                    readonly=overwrite_readonly,
                     local_sizes=local_sizes,
                     offsets=offsets,
-                    metadata=metadata,
+                    metadata=overwrite_metadata,
                     # Use self._is_inference to turn on writing to pinned
                     # CPU memory directly. But may not have perf benefit.
                     output_on_uvm=False,  # self._is_inference,
@@ -605,9 +601,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     opt_in_rands=opt_in_rands,
                     runtime_meta=self._hash_zch_runtime_meta,
                 )
-
-                # record the on-device remapped ids
-                self.table_name_on_device_remapped_ids_dict[name] = remapped_ids.clone()
                 lengths: torch.Tensor = feature.lengths()
                 offsets: Optional[torch.Tensor] = feature.offsets()
                 hit_indices: torch.Tensor = remapped_ids != -1
@@ -640,7 +633,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                         remapped_ids=remapped_ids,
                         hit_indices=hit_indices,
                         evicted_emb_indices=evictions,
-                        metadata=metadata,
+                        metadata=metadata_0,
                         eviction_config=self._eviction_config,
                     )
 
@@ -722,6 +715,9 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             percent_reserved_slots=self._percent_reserved_slots,
             disable_fallback=self._disable_fallback,
             track_id_freq=self._track_id_freq,
+            read_only_suffix=self._read_only_suffix,
+            enable_per_feature_lookups=self._enable_per_feature_lookups,
+            no_bag=self._no_bag,
         )
 
     def lookup_runtime_meta(
