@@ -175,7 +175,7 @@ class RAUCMetricValueTest(unittest.TestCase):
         expected_rauc = torch.tensor([1], dtype=torch.float)
         self.rauc.update(**self.batches)
         actual_rauc = self.rauc.compute()["rauc-DefaultTask|window_rauc"]
-        assert torch.allclose(expected_rauc, actual_rauc)
+        torch.testing.assert_close(expected_rauc, actual_rauc, rtol=1e-05, atol=1e-08)
 
     def test_calc_rauc_zero(self) -> None:
         self.predictions["DefaultTask"] = torch.Tensor(
@@ -189,7 +189,7 @@ class RAUCMetricValueTest(unittest.TestCase):
         expected_rauc = torch.tensor([0], dtype=torch.float)
         self.rauc.update(**self.batches)
         actual_rauc = self.rauc.compute()["rauc-DefaultTask|window_rauc"]
-        assert torch.allclose(expected_rauc, actual_rauc)
+        torch.testing.assert_close(expected_rauc, actual_rauc, rtol=1e-05, atol=1e-08)
 
     def test_calc_rauc_random(self) -> None:
         self.predictions["DefaultTask"] = torch.Tensor([[1, 2, 3, 4]])
@@ -199,7 +199,7 @@ class RAUCMetricValueTest(unittest.TestCase):
         expected_rauc = torch.tensor([2.0 / 3], dtype=torch.float)
         self.rauc.update(**self.batches)
         actual_rauc = self.rauc.compute()["rauc-DefaultTask|window_rauc"]
-        assert torch.allclose(expected_rauc, actual_rauc)
+        torch.testing.assert_close(expected_rauc, actual_rauc, rtol=1e-05, atol=1e-08)
 
     def test_window_size_rauc(self) -> None:
         # for determinisitc batches
@@ -230,9 +230,10 @@ class RAUCMetricValueTest(unittest.TestCase):
         # with bs 5, we expect 20 tensors per state, so 60 tensors
         self.assertEqual(len(rauc.get_memory_usage().values()), 60)
 
-        assert torch.allclose(
+        torch.testing.assert_close(
             rauc.compute()["rauc-DefaultTask|window_rauc"],
             torch.tensor([0.5152], dtype=torch.float),
+            rtol=1e-05,
             atol=1e-4,
         )
 
@@ -256,9 +257,10 @@ class RAUCMetricValueTest(unittest.TestCase):
         self.assertEqual(sum(rauc.get_memory_usage().values()), 1200)
         self.assertEqual(len(rauc.get_memory_usage().values()), 3)
 
-        assert torch.allclose(
+        torch.testing.assert_close(
             rauc.compute()["rauc-DefaultTask|window_rauc"],
             torch.tensor([0.5508], dtype=torch.float),
+            rtol=1e-05,
             atol=1e-4,
         )
 

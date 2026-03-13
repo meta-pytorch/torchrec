@@ -476,7 +476,12 @@ class ModelParallelSingleRankBase(unittest.TestCase):
 
                             sorted_src_wid = torch.sort(src_wid.view(-1))[0]
                             sorted_dst_wid = torch.sort(dst_wid.view(-1))[0]
-                            assert torch.equal(sorted_src_wid, sorted_dst_wid)
+                            torch.testing.assert_close(
+                                sorted_src_wid,
+                                sorted_dst_wid,
+                                rtol=0,
+                                atol=0,
+                            )
                             # kvz zch emb table comparison, id is non-continuous
                             src_tensor = src.tensor.get_weights_by_ids(sorted_src_wid)
                             dst_tensor = dst.tensor.get_weights_by_ids(sorted_dst_wid)

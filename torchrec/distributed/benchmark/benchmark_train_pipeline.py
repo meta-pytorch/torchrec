@@ -20,6 +20,7 @@ To support a new model in pipeline benchmark:
     See benchmark_pipeline_utils.py for step-by-step instructions.
 """
 
+import itertools
 import logging
 import os
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 import torch
 from torch import nn
+from torch.autograd.profiler import record_function
 from torchrec.distributed.benchmark.base import (
     BenchFuncConfig,
     benchmark_func,
@@ -38,6 +40,7 @@ from torchrec.distributed.benchmark.base import (
     GPUMemoryStats,
 )
 from torchrec.distributed.test_utils.input_config import ModelInputConfig
+from torchrec.distributed.test_utils.metric_config import RecMetricConfig
 from torchrec.distributed.test_utils.model_config import (
     BaseModelConfig,
     ModelSelectionConfig,
@@ -61,6 +64,7 @@ from torchrec.distributed.train_pipeline import (
     GradientAccumulationWrapper,
     TrainPipeline,
 )
+from torchrec.metrics.metric_module import RecMetricModule
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
@@ -105,6 +109,12 @@ class RunOptions(BenchFuncConfig):
             (default), the pipeline runs without gradient accumulation. When > 1,
             the pipeline is wrapped with GradientAccumulationWrapper to accumulate
             gradients over multiple micro-batches before synchronizing.
+        num_iters (Optional[int]): Total number of training iterations per
+            benchmark run. When set, the dataloader cycles over the pre-generated
+            batches (num_batches) repeatedly until num_iters iterations are
+            reached. This allows simulating long training runs without the CPU
+            memory cost of generating unique batches. When None (default),
+            num_batches iterations are run (no cycling).
     """
 
     world_size: int = 2
@@ -119,6 +129,7 @@ class RunOptions(BenchFuncConfig):
     topology_domain_max_group_count: Optional[int] = None
     local_world_size: Optional[int] = None
     ga_num_steps: int = 1
+    num_iters: Optional[int] = None
 
 
 # single-rank runner
@@ -133,6 +144,7 @@ def runner(
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
     sharding_config: ShardingConfig,
+    metric_config: RecMetricConfig,
     table_related_configs: Optional[TableExtendedConfigs] = None,
     debug_mode: bool = False,
 ) -> BenchmarkResult:
@@ -210,16 +222,48 @@ def runner(
             planner=planner,
         )
 
+        metric_module: Optional[RecMetricModule] = metric_config.generate_metric_module(
+            batch_size=run_option.batch_size,
+            world_size=world_size,
+            rank=rank,
+            device=ctx.device,
+            process_group=ctx.pg,
+        )
+
         def _func_to_benchmark(
             bench_inputs: List[ModelInput],
             model: nn.Module,
             pipeline: TrainPipeline,
         ) -> None:
             pipeline.reset()
-            dataloader = iter(bench_inputs)
+            if metric_module is not None:
+                metric_module.reset()
+                metric_module.trained_batches = 0
+            if run_option.num_iters is not None:
+                dataloader = itertools.islice(
+                    itertools.cycle(bench_inputs), run_option.num_iters
+                )
+            else:
+                dataloader = iter(bench_inputs)
             while True:
                 try:
-                    pipeline.progress(dataloader)
+                    output = pipeline.progress(dataloader)
+                    if metric_module is not None and output is not None:
+                        # Reduce to 1D [batch_size] for binary classification
+                        # metrics (NE, AUC). The model produces [batch_size,
+                        # over_arch_out_size] which would cause OOM in metric
+                        # sync (dist.all_gather accumulates all predictions).
+                        pred = output.detach().mean(dim=-1)
+                        model_out = {
+                            "prediction": pred,
+                            "label": torch.rand_like(pred),
+                            "weight": torch.ones_like(pred),
+                        }
+                        with record_function("## metric_update ##"):
+                            metric_module.update(model_out)
+                        if metric_module.should_compute():
+                            with record_function("## metric_compute ##"):
+                                metric_module.compute()
                 except StopIteration:
                     break
 
@@ -272,6 +316,7 @@ def run_pipeline(
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
     sharding_config: ShardingConfig,
+    metric_config: RecMetricConfig,
 ) -> BenchmarkResult:
     tables, weighted_tables, *_ = table_config.generate_tables()
 
@@ -286,6 +331,7 @@ def run_pipeline(
         input_config=input_config,
         planner_config=planner_config,
         sharding_config=sharding_config,
+        metric_config=metric_config,
     )
 
     # Combine results from all ranks into a single BenchmarkResult
@@ -323,6 +369,7 @@ def main(
     input_config: ModelInputConfig,
     planner_config: PlannerConfig,
     sharding_config: ShardingConfig,
+    metric_config: RecMetricConfig,
 ) -> None:
     if run_option.debug_mode:
         # pyrefly: ignore[missing-module-attribute]
@@ -348,6 +395,7 @@ def main(
         input_config=input_config,
         planner_config=planner_config,
         sharding_config=sharding_config,
+        metric_config=metric_config,
         table_related_configs=table_extended_config,
         debug_mode=run_option.debug_mode,
     )

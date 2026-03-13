@@ -423,25 +423,33 @@ def _assert_metric_results(
     """Helper function to assert metric results based on metric name."""
     # Serving Calibration uses Calibration naming inconsistently
     if metric_name == "serving_calibration":
-        assert torch.allclose(
-            test_metrics[1][task_names[0]],
-            res[f"{metric_name}-{task_names[0]}|window_calibration"],
+        torch.testing.assert_close(
+            test_metrics[1][task_names[0]].squeeze(),
+            res[f"{metric_name}-{task_names[0]}|window_calibration"].squeeze(),
+            rtol=1e-05,
+            atol=1e-08,
         )
     elif metric_name == "effective_sample_rate":
-        assert torch.allclose(
-            test_metrics[1][task_names[0]],
-            res[f"effective_rate-{task_names[0]}|window_{metric_name}"],
+        torch.testing.assert_close(
+            test_metrics[1][task_names[0]].squeeze(),
+            res[f"effective_rate-{task_names[0]}|window_{metric_name}"].squeeze(),
+            rtol=1e-05,
+            atol=1e-08,
         )
     elif metric_name in ("label_average", "prediction_average"):
         # Average metrics use "average" as namespace but different metric names
-        assert torch.allclose(
-            test_metrics[1][task_names[0]],
-            res[f"average-{task_names[0]}|window_{metric_name}"],
+        torch.testing.assert_close(
+            test_metrics[1][task_names[0]].squeeze(),
+            res[f"average-{task_names[0]}|window_{metric_name}"].squeeze(),
+            rtol=1e-05,
+            atol=1e-08,
         )
     else:
-        assert torch.allclose(
-            test_metrics[1][task_names[0]],
-            res[f"{metric_name}-{task_names[0]}|window_{metric_name}"],
+        torch.testing.assert_close(
+            test_metrics[1][task_names[0]].squeeze(),
+            res[f"{metric_name}-{task_names[0]}|window_{metric_name}"].squeeze(),
+            rtol=1e-05,
+            atol=1e-08,
         )
 
 
@@ -708,29 +716,37 @@ def metric_test_helper(
                 and target_clazz != AUPRCMetric
                 and target_clazz != RAUCMetric
             ):
-                assert torch.allclose(
+                torch.testing.assert_close(
                     target_metrics[
                         f"{str(target_clazz._namespace)}-{name}|lifetime_{metric_name}"
-                    ],
-                    test_metrics[0][name],
+                    ].squeeze(),
+                    test_metrics[0][name].squeeze(),
+                    rtol=1e-05,
+                    atol=1e-08,
                 )
-                assert torch.allclose(
+                torch.testing.assert_close(
                     target_metrics[
                         f"{str(target_clazz._namespace)}-{name}|local_lifetime_{metric_name}"
-                    ],
-                    test_metrics[2][name],
+                    ].squeeze(),
+                    test_metrics[2][name].squeeze(),
+                    rtol=1e-05,
+                    atol=1e-08,
                 )
-            assert torch.allclose(
+            torch.testing.assert_close(
                 target_metrics[
                     f"{str(target_clazz._namespace)}-{name}|window_{metric_name}"
-                ],
-                test_metrics[1][name],
+                ].squeeze(),
+                test_metrics[1][name].squeeze(),
+                rtol=1e-05,
+                atol=1e-08,
             )
 
-            assert torch.allclose(
+            torch.testing.assert_close(
                 target_metrics[
                     f"{str(target_clazz._namespace)}-{name}|local_window_{metric_name}"
-                ],
-                test_metrics[3][name],
+                ].squeeze(),
+                test_metrics[3][name].squeeze(),
+                rtol=1e-05,
+                atol=1e-08,
             )
     dist.destroy_process_group()

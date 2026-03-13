@@ -144,7 +144,7 @@ def are_sharded_ebc_modules_identical(
         # Check parameter names
         assert param1[0] == param2[0]
         # Check parameter values
-        assert torch.allclose(param1[1], param2[1])
+        torch.testing.assert_close(param1[1], param2[1], rtol=1e-05, atol=1e-08)
 
     # Check if both modules have the same buffers
     buffers1 = list(module1.named_buffers())
@@ -154,7 +154,9 @@ def are_sharded_ebc_modules_identical(
 
     for buffer1, buffer2 in zip(buffers1, buffers2):
         assert buffer1[0] == buffer2[0]  # Check buffer names
-        assert torch.allclose(buffer1[1], buffer2[1])  # Check buffer values
+        torch.testing.assert_close(
+            buffer1[1], buffer2[1], rtol=1e-05, atol=1e-08
+        )  # Check buffer values
 
     # Hard-coded attributes for EmbeddingBagCollection
     attribute_list = [
