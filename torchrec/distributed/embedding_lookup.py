@@ -360,10 +360,11 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
     def get_resize_awaitables(self) -> List[LazyAwaitable[torch.Tensor]]:
         # TODO - we can probably do some smart grouping to make this more efficient
         return [
-            # pyrefly: ignore[not-callable]
-            emb_module.get_rs_awaitable()
+            awaitable
             for emb_module in self._emb_modules
             if hasattr(emb_module, "get_rs_awaitable")
+            # pyrefly: ignore[not-callable]
+            and (awaitable := emb_module.get_rs_awaitable()) is not None
         ]
 
     # pyrefly: ignore[bad-override]
@@ -1017,10 +1018,11 @@ class GroupedPooledEmbeddingsLookup(
     def get_resize_awaitables(self) -> List[LazyAwaitable[torch.Tensor]]:
         # TODO - we can probably do some smart grouping to make this more efficient
         return [
-            # pyrefly: ignore[not-callable]
-            emb_module.get_rs_awaitable()
+            awaitable
             for emb_module in self._emb_modules
             if hasattr(emb_module, "get_rs_awaitable")
+            # pyrefly: ignore[not-callable]
+            and (awaitable := emb_module.get_rs_awaitable()) is not None
         ]
 
     # pyrefly: ignore[bad-override]

@@ -2735,9 +2735,10 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
 
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         embs = super().forward(features)
-        self._async_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._async_stream):
-            self._rs_awaitable = self._reduce_scatter_weights_async()
+        if self.training:
+            self._async_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._async_stream):
+                self._rs_awaitable = self._reduce_scatter_weights_async()
         return embs
 
     def _reduce_scatter_weights_async(self) -> ReduceScatterResizeAwaitable:
@@ -4618,9 +4619,10 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
     # pyrefly: ignore [bad-override]
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         embs = super().forward(features)
-        self._async_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._async_stream):
-            self._rs_awaitable = self._reduce_scatter_weights_async()
+        if self.training:
+            self._async_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._async_stream):
+                self._rs_awaitable = self._reduce_scatter_weights_async()
         return embs
 
     def _reduce_scatter_weights_async(self) -> ReduceScatterResizeAwaitable:
