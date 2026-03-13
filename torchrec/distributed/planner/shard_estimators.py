@@ -415,7 +415,7 @@ def calculate_shard_storages(
     if (
         compute_kernel
         in {
-            EmbeddingComputeKernel.KEY_VALUE.value,
+            # EmbeddingComputeKernel.KEY_VALUE.value,
             EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
             EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
         }
@@ -442,6 +442,30 @@ def calculate_shard_storages(
         ddr_specific_sizes = [
             # TODO: revisit the logic for SSD virtual table
             0
+            for _ in ddr_specific_sizes
+        ]
+    elif compute_kernel == EmbeddingComputeKernel.KEY_VALUE.value:
+        key_value_params = key_value_params or KeyValueParams()
+
+        hbm_specific_sizes = [
+            int(
+                min(
+                    (key_value_params.max_l1_cache_size or float("inf")) * 1024**2,
+                    math.ceil(
+                        tensor.shape[0]  # num_embeddings
+                        * kv_cache_load_factor
+                        * tensor.element_size()  # size of one column
+                        * tensor.shape[1],  # number of columns in embedding
+                    ),
+                )
+            )
+            for _ in hbm_specific_sizes
+        ]
+        ddr_specific_sizes = [
+            (
+                (key_value_params.l2_cache_size or 0) * 1024**3
+                + (key_value_params.ssd_rocksdb_write_buffer_size or 2 * 1024**3)
+            )
             for _ in ddr_specific_sizes
         ]
 
