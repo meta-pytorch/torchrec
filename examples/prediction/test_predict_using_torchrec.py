@@ -313,7 +313,7 @@ class TestCreateKJTFromBatch(unittest.TestCase):
 
         # Check lengths
         self.assertEqual(kjt.lengths().shape[0], self.batch_size * 4)
-        self.assertTrue((kjt.lengths() == 1).all())
+        self.assertTrue((kjt.lengths() == 1).all().item())
 
 
 if __name__ == "__main__":

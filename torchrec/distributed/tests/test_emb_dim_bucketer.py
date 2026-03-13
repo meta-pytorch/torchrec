@@ -72,14 +72,14 @@ class TestEmbDimBucketer(unittest.TestCase):
         emb_dim_bucketer = EmbDimBucketer(
             embedding_tables, EmbDimBucketerPolicy.CACHELINE_BUCKETS
         )
-        self.assertTrue(emb_dim_bucketer.bucket_count() == 1)
+        self.assertEqual(emb_dim_bucketer.bucket_count(), 1)
 
     def test_single_bucket_policy(self) -> None:
         embedding_tables, _ = self.gen_tables()
         emb_dim_bucketer = EmbDimBucketer(
             embedding_tables, EmbDimBucketerPolicy.SINGLE_BUCKET
         )
-        self.assertTrue(emb_dim_bucketer.bucket_count() == 1)
+        self.assertEqual(emb_dim_bucketer.bucket_count(), 1)
 
     def test_cacheline_bucket_policy(self) -> None:
         embedding_tables, _ = self.gen_tables()
@@ -95,7 +95,7 @@ class TestEmbDimBucketer(unittest.TestCase):
             embedding_tables, EmbDimBucketerPolicy.ALL_BUCKETS
         )
 
-        self.assertTrue(emb_dim_bucketer.bucket_count() == num_buckets)
+        self.assertEqual(emb_dim_bucketer.bucket_count(), num_buckets)
 
         for i in range(emb_dim_bucketer.bucket_count()):
             self.assertTrue(i in emb_dim_bucketer.emb_dim_buckets.values())

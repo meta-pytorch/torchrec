@@ -73,7 +73,7 @@ class TestFindImbalanceTables(unittest.TestCase):
             sharding_option.name
             for sharding_option in _find_imbalance_tables(self.best_plan)
         ]
-        self.assertTrue(expected_max_perf_table_names, max_perf_table_names)
+        self.assertEqual(expected_max_perf_table_names, max_perf_table_names)
 
     def test_find_hbm_imbalance_tables(self) -> None:
         reset_shard_rank(self.best_plan)
@@ -92,7 +92,7 @@ class TestFindImbalanceTables(unittest.TestCase):
                 self.best_plan, target_imbalance="hbm"
             )
         ]
-        self.assertTrue(expected_max_hbm_table_names, max_hbm_table_names)
+        self.assertEqual(expected_max_hbm_table_names, max_hbm_table_names)
 
 
 class TestBinarySearchPredicate(unittest.TestCase):

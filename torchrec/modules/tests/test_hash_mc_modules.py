@@ -605,7 +605,7 @@ class TestMCH(unittest.TestCase):
         )
         bucket4 = gpu_zch.rebuild_with_output_id_range((15, 20))
         self.assertIsNotNone(bucket4._output_global_offset_tensor)
-        self.assertTrue(bucket4._output_global_offset_tensor.device.type == "cuda")
+        self.assertEqual(bucket4._output_global_offset_tensor.device.type, "cuda")
         self.assertEqual(
             bucket4._output_global_offset_tensor, torch.tensor([15], device="cuda")
         )
@@ -619,7 +619,7 @@ class TestMCH(unittest.TestCase):
         self.assertIsNone(meta_zch._output_global_offset_tensor)
         bucket5 = meta_zch.rebuild_with_output_id_range((15, 20))
         self.assertIsNotNone(bucket5._output_global_offset_tensor)
-        self.assertTrue(bucket5._output_global_offset_tensor.device.type == "cpu")
+        self.assertEqual(bucket5._output_global_offset_tensor.device.type, "cpu")
         self.assertEqual(bucket5._output_global_offset_tensor, torch.tensor([15]))
 
     @unittest.skipIf(
@@ -670,7 +670,7 @@ class TestMCH(unittest.TestCase):
 
         # check self._hash_zch_metadata is frozen
         # pyrefly: ignore[no-matching-overload]
-        self.assertTrue(torch.all(m._hash_zch_metadata == 110))
+        self.assertTrue(torch.all(m._hash_zch_metadata == 110).item())
 
         m.reset_training_mode()
         self.assertTrue(m.training)
@@ -685,7 +685,7 @@ class TestMCH(unittest.TestCase):
             m.remap({"test": jt})
             # check self._hash_zch_metadata is updated
             # pyrefly: ignore[no-matching-overload]
-            self.assertTrue(torch.all(m._hash_zch_metadata == 160))
+            self.assertTrue(torch.all(m._hash_zch_metadata == 160).item())
 
         m.reset_inference_mode()
         self.assertFalse(m.training)

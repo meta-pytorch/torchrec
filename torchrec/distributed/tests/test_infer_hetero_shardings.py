@@ -121,7 +121,7 @@ class InferHeteroShardingsTest(unittest.TestCase):
         # pyrefly: ignore[bad-index]
         self.assertTrue(hasattr(sharded_model._module_kjt_input[0], "_lookups"))
         # pyrefly: ignore[bad-index]
-        self.assertTrue(len(sharded_model._module_kjt_input[0]._lookups) == 2)
+        self.assertEqual(len(sharded_model._module_kjt_input[0]._lookups), 2)
         # pyrefly: ignore[bad-index]
         self.assertTrue(hasattr(sharded_model._module_kjt_input[0], "_input_dists"))
 
@@ -133,14 +133,14 @@ class InferHeteroShardingsTest(unittest.TestCase):
                     "_embedding_lookups_per_rank",
                 )
             )
-            self.assertTrue(
+            self.assertEqual(
                 len(
                     # pyrefly: ignore[bad-index]
                     sharded_model._module_kjt_input[0]
                     ._lookups[i]
                     ._embedding_lookups_per_rank
-                )
-                == env.world_size
+                ),
+                env.world_size,
             )
 
     @unittest.skipIf(
@@ -218,7 +218,7 @@ class InferHeteroShardingsTest(unittest.TestCase):
         # pyrefly: ignore[bad-index]
         self.assertTrue(hasattr(sharded_model._module_kjt_input[0], "_lookups"))
         # pyrefly: ignore[bad-index]
-        self.assertTrue(len(sharded_model._module_kjt_input[0]._lookups) == 2)
+        self.assertEqual(len(sharded_model._module_kjt_input[0]._lookups), 2)
         for i, env in enumerate(env_dict.values()):
             self.assertTrue(
                 hasattr(
@@ -227,14 +227,14 @@ class InferHeteroShardingsTest(unittest.TestCase):
                     "_embedding_lookups_per_rank",
                 )
             )
-            self.assertTrue(
+            self.assertEqual(
                 len(
                     # pyrefly: ignore[bad-index]
                     sharded_model._module_kjt_input[0]
                     ._lookups[i]
                     ._embedding_lookups_per_rank
-                )
-                == env.world_size
+                ),
+                env.world_size,
             )
 
     def test_cpu_gpu_sharding_autoplanner(self) -> None:
@@ -285,7 +285,7 @@ class InferHeteroShardingsTest(unittest.TestCase):
         )
         print(module_plan)
 
-        self.assertTrue(
+        self.assertEqual(
             # pyrefly: ignore[bad-index]
             module_plan.plan["_module_kjt_input.0"]["table_0"]
             .sharding_spec.shards[0]
@@ -293,7 +293,7 @@ class InferHeteroShardingsTest(unittest.TestCase):
             .type,
             "cpu",
         )
-        self.assertTrue(
+        self.assertEqual(
             # pyrefly: ignore[bad-index]
             module_plan.plan["_module_kjt_input.0"]["table_1"]
             .sharding_spec.shards[0]
@@ -301,7 +301,7 @@ class InferHeteroShardingsTest(unittest.TestCase):
             .type,
             "cuda",
         )
-        self.assertTrue(
+        self.assertEqual(
             # pyrefly: ignore[bad-index]
             module_plan.plan["_module_kjt_input.0"]["table_2"]
             .sharding_spec.shards[0]

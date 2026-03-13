@@ -215,8 +215,8 @@ class DLRMTest(unittest.TestCase):
         output = model(dense_features, sparse_features)
 
         # All outputs should be between 0 and 1
-        self.assertTrue(torch.all(output >= 0).item())
-        self.assertTrue(torch.all(output <= 1).item())
+        self.assertGreaterEqual(output.min().item(), 0)
+        self.assertLessEqual(output.max().item(), 1)
 
     def test_dlrm_backward_pass(self) -> None:
         """Test that DLRM can perform backward pass."""
@@ -360,8 +360,8 @@ class SyntheticDatasetTest(unittest.TestCase):
 
         for _, sparse, _ in dataset:
             values = sparse.values()
-            self.assertTrue(torch.all(values >= 0))
-            self.assertTrue(torch.all(values < self.num_embeddings))
+            self.assertGreaterEqual(values.min().item(), 0)
+            self.assertLess(values.max().item(), self.num_embeddings)
 
     def test_dataset_dense_features_range(self) -> None:
         """Test that dense features are in [0, 1] range (from torch.rand)."""
@@ -375,8 +375,8 @@ class SyntheticDatasetTest(unittest.TestCase):
         )
 
         for dense, _, _ in dataset:
-            self.assertTrue(torch.all(dense >= 0))
-            self.assertTrue(torch.all(dense <= 1))
+            self.assertGreaterEqual(dense.min().item(), 0)
+            self.assertLessEqual(dense.max().item(), 1)
 
 
 class SetupDistributedTest(unittest.TestCase):
@@ -523,15 +523,15 @@ class MLPEdgeCaseTest(unittest.TestCase):
         x = torch.randn(100, 10)
         output = mlp(x)
         # After ReLU, output should be non-negative
-        self.assertTrue(torch.all(output >= 0))
+        self.assertGreaterEqual(output.min().item(), 0)
 
     def test_mlp_sigmoid_output_range(self) -> None:
         """Test that MLP with sigmoid produces outputs in (0, 1)."""
         mlp = MLP(in_size=10, layer_sizes=[32], activation="sigmoid")
         x = torch.randn(100, 10)
         output = mlp(x)
-        self.assertTrue(torch.all(output >= 0).item())
-        self.assertTrue(torch.all(output <= 1).item())
+        self.assertGreaterEqual(output.min().item(), 0)
+        self.assertLessEqual(output.max().item(), 1)
 
 
 class DLRMEdgeCaseTest(unittest.TestCase):
@@ -618,8 +618,8 @@ class DLRMEdgeCaseTest(unittest.TestCase):
         with torch.no_grad():
             output = model(dense, sparse)
         self.assertEqual(output.shape, (4,))
-        self.assertTrue(torch.all(output >= 0).item())
-        self.assertTrue(torch.all(output <= 1).item())
+        self.assertGreaterEqual(output.min().item(), 0)
+        self.assertLessEqual(output.max().item(), 1)
 
     def test_dlrm_deterministic_in_eval(self) -> None:
         """Test that DLRM produces same output for same input in eval mode."""
@@ -728,8 +728,8 @@ class DLRMEdgeCaseTest(unittest.TestCase):
         sparse = self._make_sparse_features(3, 4, 50)
         output = model(dense, sparse)
         self.assertEqual(output.shape, (4,))
-        self.assertTrue(torch.all(output >= 0).item())
-        self.assertTrue(torch.all(output <= 1).item())
+        self.assertGreaterEqual(output.min().item(), 0)
+        self.assertLessEqual(output.max().item(), 1)
 
     def test_dlrm_rejects_mismatched_dense_arch_and_embedding_dim(self) -> None:
         """dense_arch_layer_sizes[-1] must equal embedding_dim."""
@@ -840,8 +840,8 @@ class SyntheticDatasetEdgeCaseTest(unittest.TestCase):
         )
         for _, sparse, _ in dataset:
             lengths = sparse.lengths()
-            self.assertTrue(torch.all(lengths >= 1))
-            self.assertTrue(torch.all(lengths <= 3))
+            self.assertGreaterEqual(lengths.min().item(), 1)
+            self.assertLessEqual(lengths.max().item(), 3)
 
     def test_dataset_reiterable(self) -> None:
         """Test that dataset can be iterated over multiple times."""
