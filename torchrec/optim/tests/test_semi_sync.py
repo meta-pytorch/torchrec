@@ -172,11 +172,11 @@ class TestSemisyncOptimizer(unittest.TestCase):
         self.assertEqual(set(param_state.keys()), expected_keys)
 
         # Verify exact tensor values
-        self.assertTrue(
-            torch.equal(param_state["semi_sync_local_momentum"], local_momentum)
+        torch.testing.assert_close(
+            param_state["semi_sync_local_momentum"], local_momentum, rtol=0, atol=0
         )
-        self.assertTrue(
-            torch.equal(param_state["semi_sync_global_momentum"], global_momentum)
+        torch.testing.assert_close(
+            param_state["semi_sync_global_momentum"], global_momentum, rtol=0, atol=0
         )
 
         # Verify step counters
@@ -319,8 +319,11 @@ class TestSemisyncOptimizer(unittest.TestCase):
                     for key in case["expected_keys"]:
                         # pyrefly: ignore [unsupported-operation]
                         original_key = case["prefix"] + key
-                        self.assertTrue(
-                            torch.equal(result[key], param_state[original_key])
+                        torch.testing.assert_close(
+                            result[key],
+                            param_state[original_key],
+                            rtol=0,
+                            atol=0,
                         )
 
 
