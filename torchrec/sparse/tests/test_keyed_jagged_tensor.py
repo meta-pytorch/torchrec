@@ -212,8 +212,8 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         torch.testing.assert_close(kjt_0.weights(), kjt_1.weights(), rtol=0, atol=0)
         torch.testing.assert_close(kjt_0.offsets(), kjt_1.offsets(), rtol=0, atol=0)
         self.assertEqual(kjt_0.keys(), kjt_1.keys())
-        self.assertTrue(len(kjt_0.stride_per_key_per_rank()) == 0)
-        self.assertTrue(len(kjt_1.stride_per_key_per_rank()) == 0)
+        self.assertEqual(len(kjt_0.stride_per_key_per_rank()), 0)
+        self.assertEqual(len(kjt_1.stride_per_key_per_rank()), 0)
         self.assertIsNone(kjt_0.inverse_indices_or_none())
         self.assertIsNone(kjt_1.inverse_indices_or_none())
 

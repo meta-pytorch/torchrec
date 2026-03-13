@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import unittest
 
 import torch
@@ -21,9 +28,9 @@ class TestIDTransformerCollection(unittest.TestCase):
         for handle in fetch_handles:
             handle.wait()
         self.assertEqual(cache_kjt.keys(), global_kjt.keys())
-        self.assertTrue(torch.all(cache_kjt.lengths() == global_kjt.lengths()))
+        self.assertTrue(torch.all(cache_kjt.lengths() == global_kjt.lengths()).item())
         self.assertTrue(
-            torch.all(cache_kjt.values() == torch.tensor([0, 1, 2, 1, 0, 1, 2]))
+            torch.all(cache_kjt.values() == torch.tensor([0, 1, 2, 1, 0, 1, 2])).item()
         )
 
     def testFeatureNames(self):
@@ -43,9 +50,9 @@ class TestIDTransformerCollection(unittest.TestCase):
         for handle in fetch_handles:
             handle.wait()
         self.assertEqual(cache_kjt.keys(), global_kjt.keys())
-        self.assertTrue(torch.all(cache_kjt.lengths() == global_kjt.lengths()))
+        self.assertTrue(torch.all(cache_kjt.lengths() == global_kjt.lengths()).item())
         self.assertTrue(
             torch.all(
                 cache_kjt.values() == torch.tensor([0, 1, 2, 1, 0, 1, 2, 1, 2, 0])
-            )
+            ).item()
         )

@@ -128,7 +128,7 @@ class TestInferenceSchema(unittest.TestCase):
             module_type,
         ) in STABLE_DEFAULT_QUANT_MAPPING.items():
             self.assertTrue(name in DEFAULT_QUANT_MAPPING)
-            self.assertTrue(DEFAULT_QUANT_MAPPING[name] == module_type)
+            self.assertEqual(DEFAULT_QUANT_MAPPING[name], module_type)
 
         # check that the fused params are a superset of the stable ones
         for (
@@ -136,10 +136,10 @@ class TestInferenceSchema(unittest.TestCase):
             val,
         ) in STABLE_DEFAULT_FUSED_PARAMS.items():
             self.assertTrue(name in DEFAULT_FUSED_PARAMS)
-            self.assertTrue(DEFAULT_FUSED_PARAMS[name] == val)
+            self.assertEqual(DEFAULT_FUSED_PARAMS[name], val)
 
         # Check default quant type
-        self.assertTrue(DEFAULT_QUANTIZATION_DTYPE == STABLE_DEFAULT_QUANTIZATION_DTYPE)
+        self.assertEqual(DEFAULT_QUANTIZATION_DTYPE, STABLE_DEFAULT_QUANTIZATION_DTYPE)
 
         # Check default sharders are a superset of the stable ones
         # and check fused_params are also a superset
@@ -151,11 +151,11 @@ class TestInferenceSchema(unittest.TestCase):
                     for key in sharder.fused_params.keys():
                         # pyrefly: ignore[missing-attribute]
                         self.assertTrue(key in default_sharder.fused_params)
-                        self.assertTrue(
+                        self.assertEqual(
                             # pyrefly: ignore[missing-attribute]
-                            default_sharder.fused_params[key]
+                            default_sharder.fused_params[key],
                             # pyrefly: ignore[missing-attribute]
-                            == sharder.fused_params[key]
+                            sharder.fused_params[key],
                         )
                     found = True
 

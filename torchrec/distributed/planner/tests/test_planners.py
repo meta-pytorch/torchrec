@@ -1094,7 +1094,7 @@ class TestPlanLoaderIntegration(unittest.TestCase):
 
         # Verify a plan was generated
         self.assertIsNotNone(loaded_plan)
-        self.assertTrue(len(loaded_plan.plan) > 0)
+        self.assertGreater(len(loaded_plan.plan), 0)
 
 
 class TestExtractPlan(unittest.TestCase):

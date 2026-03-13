@@ -99,7 +99,8 @@ class TestPSCollection(unittest.TestCase):
         weight = (
             model.module.state_dict()["embeddings.AB.weight"].local_shards()[0].tensor
         )
-        self.assertTrue(weight.shape[0] == 4 and weight.shape[1] == embedding_dim)
+        self.assertEqual(weight.shape[0], 4)
+        self.assertEqual(weight.shape[1], embedding_dim)
 
         # init to zero
         weight[:] = torch.zeros_like(weight)
@@ -114,7 +115,7 @@ class TestPSCollection(unittest.TestCase):
             handle.wait()
         embedding = model(cache_kjt.to(device))
         self.assertTrue(
-            torch.all(cache_kjt.values() == torch.tensor([0, 1, 2, 3, 0, 1]))
+            torch.all(cache_kjt.values() == torch.tensor([0, 1, 2, 3, 0, 1])).item()
         )
         self.assertTrue(
             torch.allclose(
@@ -139,7 +140,7 @@ class TestPSCollection(unittest.TestCase):
             handle.wait()
         embedding = model(cache_kjt.to(device))
         self.assertTrue(
-            torch.all(cache_kjt.values() == torch.tensor([0, 1, 0, 2, 2, 3]))
+            torch.all(cache_kjt.values() == torch.tensor([0, 1, 0, 2, 2, 3])).item()
         )
         self.assertTrue(
             torch.allclose(
@@ -164,7 +165,7 @@ class TestPSCollection(unittest.TestCase):
             handle.wait()
         embedding = model(cache_kjt.to(device))
         self.assertTrue(
-            torch.all(cache_kjt.values() == torch.tensor([0, 1, 0, 2, 3, 2]))
+            torch.all(cache_kjt.values() == torch.tensor([0, 1, 0, 2, 3, 2])).item()
         )
         self.assertTrue(
             torch.allclose(

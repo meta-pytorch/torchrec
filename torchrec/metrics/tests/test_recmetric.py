@@ -65,10 +65,10 @@ class RecMetricTest(unittest.TestCase):
         )
         ne1 = ne1._metrics_computations[0]
         ne2 = ne2._metrics_computations[0]
-        self.assertTrue(ne1.cross_entropy_sum == ne2.cross_entropy_sum)
-        self.assertTrue(ne1.weighted_num_samples == ne2.weighted_num_samples)
-        self.assertTrue(ne1.pos_labels == ne2.pos_labels)
-        self.assertTrue(ne1.neg_labels == ne2.neg_labels)
+        self.assertEqual(ne1.cross_entropy_sum, ne2.cross_entropy_sum)
+        self.assertEqual(ne1.weighted_num_samples, ne2.weighted_num_samples)
+        self.assertEqual(ne1.pos_labels, ne2.pos_labels)
+        self.assertEqual(ne1.neg_labels, ne2.neg_labels)
 
     def test_zero_weights(self) -> None:
         # Test if weights = 0 for an update
