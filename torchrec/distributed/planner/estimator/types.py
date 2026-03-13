@@ -630,32 +630,47 @@ class ShardPerfContext:
             len(sharding_option.input_lengths) == len(num_poolings) == len(batch_sizes)
         ), "Provided `pooling_factors`, `num_poolings`, and `batch_sizes` constraints must match."
 
-        # Check for feature processor
-        module = sharding_option.module[1]
-        has_feature_processor = False
-        if (
-            hasattr(module, "_feature_processor")
-            and hasattr(module._feature_processor, "feature_processor_modules")
-            and isinstance(
-                module._feature_processor.feature_processor_modules,  # pyre-ignore[16]
-                nn.ModuleDict,
-            )
-            and sharding_option.name
-            in module._feature_processor.feature_processor_modules.keys()  # pyre-ignore[16]
-        ):
-            has_feature_processor = True
+        # Check for feature processor and determine is_weighted
+        from torch._utils_internal import justknobs_check
 
-        # Determine is_weighted
-        if isinstance(module, EmbeddingBagCollectionInterface):
-            is_weighted = module.is_weighted()
-        elif (
-            constraints
-            and constraints.get(sharding_option.name)
-            and constraints[sharding_option.name].is_weighted
+        if justknobs_check(
+            "pytorch/torchrec:enable_precomputed_sharding_option_fields"
         ):
-            is_weighted = constraints[sharding_option.name].is_weighted
+            has_feature_processor = sharding_option.has_feature_processor
+            if sharding_option.is_weighted is not None:
+                is_weighted = sharding_option.is_weighted
+            elif (
+                constraints
+                and constraints.get(sharding_option.name)
+                and constraints[sharding_option.name].is_weighted
+            ):
+                is_weighted = constraints[sharding_option.name].is_weighted
+            else:
+                is_weighted = False
         else:
-            is_weighted = False
+            module = sharding_option.module[1]
+            has_feature_processor = False
+            if (
+                hasattr(module, "_feature_processor")
+                and hasattr(module._feature_processor, "feature_processor_modules")
+                and isinstance(
+                    module._feature_processor.feature_processor_modules,  # pyre-ignore[16]
+                    nn.ModuleDict,
+                )
+                and sharding_option.name
+                in module._feature_processor.feature_processor_modules.keys()  # pyre-ignore[16]
+            ):
+                has_feature_processor = True
+            if isinstance(module, EmbeddingBagCollectionInterface):
+                is_weighted = module.is_weighted()  # pyre-ignore[29]
+            elif (
+                constraints
+                and constraints.get(sharding_option.name)
+                and constraints[sharding_option.name].is_weighted
+            ):
+                is_weighted = constraints[sharding_option.name].is_weighted
+            else:
+                is_weighted = False
 
         is_weighted = is_weighted or has_feature_processor
 
