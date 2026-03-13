@@ -291,14 +291,23 @@ class EmbeddingCollectionTest(unittest.TestCase):
         sequence_embeddings = ec(
             features=id_list_features,
         )
-        self.assertTrue(
-            torch.equal(sequence_embeddings["f1"].weights(), torch.tensor([0, 1, 2]))
+        torch.testing.assert_close(
+            sequence_embeddings["f1"].weights(),
+            torch.tensor([0, 1, 2]),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(sequence_embeddings["f2@t1"].weights(), torch.tensor([3]))
+        torch.testing.assert_close(
+            sequence_embeddings["f2@t1"].weights(),
+            torch.tensor([3]),
+            rtol=0,
+            atol=0,
         )
-        self.assertTrue(
-            torch.equal(sequence_embeddings["f2@t2"].weights(), torch.tensor([3]))
+        torch.testing.assert_close(
+            sequence_embeddings["f2@t2"].weights(),
+            torch.tensor([3]),
+            rtol=0,
+            atol=0,
         )
 
     def test_fx(self) -> None:

@@ -1334,19 +1334,28 @@ class TestVBEWithManagedCollision(unittest.TestCase):
                     i
                 ] : kjt_with_weights.offset_per_key()[i + 1]
             ]
-            self.assertTrue(
-                torch.equal(original_inds, mapping[remapped_inds]),
-                f"ID remapping incorrect for {table}",
+            torch.testing.assert_close(
+                original_inds,
+                mapping[remapped_inds],
+                rtol=0,
+                atol=0,
+                msg=f"ID remapping incorrect for {table}",
             )
 
         # Verify all other attributes (relevant to VBE) are preserved
-        self.assertTrue(
-            torch.equal(kjt_with_weights.lengths(), output.lengths()),
-            "Lengths should be preserved",
+        torch.testing.assert_close(
+            kjt_with_weights.lengths(),
+            output.lengths(),
+            rtol=0,
+            atol=0,
+            msg="Lengths should be preserved",
         )
-        self.assertTrue(
-            torch.equal(kjt_with_weights.weights(), output.weights()),
-            "Weights should be preserved",
+        torch.testing.assert_close(
+            kjt_with_weights.weights(),
+            output.weights(),
+            rtol=0,
+            atol=0,
+            msg="Weights should be preserved",
         )
         self.assertEqual(
             kjt_with_weights.stride(), output.stride(), "Stride should be preserved"
@@ -1371,9 +1380,12 @@ class TestVBEWithManagedCollision(unittest.TestCase):
             output_inverse_indices[0],
             "inverse_indices keys should be preserved",
         )
-        self.assertTrue(
-            torch.equal(input_inverse_indices[1], output_inverse_indices[1]),
-            "inverse_indices tensor should be preserved",
+        torch.testing.assert_close(
+            input_inverse_indices[1],
+            output_inverse_indices[1],
+            rtol=0,
+            atol=0,
+            msg="inverse_indices tensor should be preserved",
         )
 
     def test_mcebc_with_vbe(self) -> None:
