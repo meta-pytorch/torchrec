@@ -1903,6 +1903,34 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             else None
         )
         self._batch_ip3: Optional[In] = None
+        self._staged_postproc_fwd_results: Dict[str, Any] = {}
+
+    def _start_sparse_data_dist(self, batch: Optional[In]) -> None:
+        """
+        Override to use a staging context for postprocs, preventing
+        postproc_fwd_results cache contamination in the shared v0 context.
+        """
+        if batch is None:
+            return
+        self._set_module_context(self._context)
+        staging_context = PrefetchTrainPipelineContext(version=0)
+        with record_function("## start_sparse_data_dist ##"):
+            # pyrefly: ignore [bad-argument-type]
+            with self._stream_context(self._data_dist_stream):
+                _wait_for_batch(batch, self._memcpy_stream)
+                with use_context_for_postprocs(
+                    self._pipelined_postprocs, staging_context
+                ):
+                    _start_data_dist(self._pipelined_modules, batch, self._context)
+        self._staged_postproc_fwd_results = staging_context.postproc_fwd_results
+
+    def _commit_postproc_results(self) -> None:
+        """
+        Swap staged postproc results into the live context so forward reads
+        the correct batch's postproc results.
+        """
+        self._context.postproc_fwd_results = self._staged_postproc_fwd_results
+        self._staged_postproc_fwd_results = {}
 
     def _fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
         """
@@ -1938,6 +1966,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         )
         self._start_sparse_data_dist(self._batch_i)
         self._wait_sparse_data_dist()
+        self._commit_postproc_results()
         self._prefetch(self._batch_i)
 
         # batch 2
@@ -1981,6 +2010,8 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         # forward
         with record_function("## forward ##"):
             losses, output = self._model_fwd(self._batch_i)
+
+        self._commit_postproc_results()
 
         self._prefetch(self._batch_ip1)
 
