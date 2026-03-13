@@ -668,6 +668,7 @@ def generate_metric_module(
     device: torch.device,
     process_group: Optional[dist.ProcessGroup] = None,
     batch_size_stages: Optional[List[BatchSizeStage]] = None,
+    module_kwargs: Optional[Dict[str, Any]] = None,
 ) -> RecMetricModule:
     rec_metrics = _generate_rec_metrics(
         metrics_config,
@@ -690,6 +691,7 @@ def generate_metric_module(
     else:
         throughput_metric = None
     state_metrics = _generate_state_metrics(metrics_config, state_metrics_mapping)
+
     metrics = metric_class(
         batch_size=batch_size,
         world_size=world_size,
@@ -700,6 +702,7 @@ def generate_metric_module(
         compute_interval_steps=metrics_config.compute_interval_steps,
         min_compute_interval=metrics_config.min_compute_interval,
         max_compute_interval=metrics_config.max_compute_interval,
+        **(module_kwargs if module_kwargs else {}),
     )
     metrics.to(device)
     return metrics
