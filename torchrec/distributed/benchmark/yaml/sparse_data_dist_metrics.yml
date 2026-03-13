@@ -1,0 +1,41 @@
+# Sparse data dist benchmark with RecMetrics enabled
+# Measures pipeline overhead including metric update/compute
+#
+# Usage:
+#   buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:benchmark_train_pipeline -- \
+#     --yaml_config=fbcode/torchrec/distributed/benchmark/yaml/sparse_data_dist_metrics.yml
+RunOptions:
+  world_size: 2
+  num_batches: 10
+  num_benchmarks: 1
+  num_profiles: 1
+  profile_dir: "."
+  memory_snapshot: True
+  name: "sparse_data_dist_metrics"
+  loglevel: "info"
+PipelineConfig:
+  pipeline: "sparse"
+ModelInputConfig:
+  num_float_features: 100
+  feature_pooling_avg: 30
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 100
+    submodule_kwargs:
+      dense_arch_out_size: 128
+      over_arch_out_size: 1024
+      over_arch_hidden_layers: 5
+      dense_arch_hidden_sizes: [128, 128, 128]
+      skip_regroup: true
+EmbeddingTablesConfig:
+  num_unweighted_features: 90
+  num_weighted_features: 80
+  embedding_feature_dim: 256
+PlannerConfig:
+  pooling_factors: [30.0]
+RecMetricConfig:
+  enable_metrics: true
+  metrics: [ne, auc]
+  compute_interval: 5
+  window_size: 10_000_000
