@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from typing import cast, Dict
+from typing import cast, Dict, Optional
 from unittest.mock import patch
 
 import torch
@@ -547,6 +547,171 @@ class TestMCH(unittest.TestCase):
 
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    @given(hash_size=st.sampled_from([0, 80]))
+    @settings(max_examples=5, deadline=None)
+    def test_zch_hash_train_rescales_four(self, hash_size: int) -> None:
+        keep_original_indices = True
+        kjt = KeyedJaggedTensor(
+            keys=["f"],
+            values=torch.cat(
+                [
+                    torch.randint(
+                        0,
+                        hash_size if hash_size > 0 else 1000,
+                        (20,),
+                        dtype=torch.int64,
+                        device="cuda",
+                    ),
+                ]
+            ),
+            lengths=torch.cat(
+                [
+                    torch.tensor([4, 6], dtype=torch.int64, device="cuda"),
+                    torch.tensor([4, 6], dtype=torch.int64, device="cuda"),
+                ]
+            ),
+        )
+
+        # initialize mch with 8 buckets
+        m0 = HashZchManagedCollisionModule(
+            zch_size=40,
+            device=torch.device("cuda"),
+            input_hash_size=hash_size,
+            total_num_buckets=4,
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=10,
+            ),
+        )
+
+        # start with world_size = 4
+        world_size = 4
+        block_sizes = torch.tensor(
+            [(size + world_size - 1) // world_size for size in [hash_size]],
+            dtype=torch.int64,
+            device="cuda",
+        )
+
+        m1_1 = m0.rebuild_with_output_id_range((0, 10))
+        m2_1 = m0.rebuild_with_output_id_range((10, 20))
+        m3_1 = m0.rebuild_with_output_id_range((20, 30))
+        m4_1 = m0.rebuild_with_output_id_range((30, 40))
+
+        # shard, now world size 2!
+        # start with world_size = 4
+        if hash_size > 0:
+            world_size = 2
+            block_sizes = torch.tensor(
+                [(size + world_size - 1) // world_size for size in [hash_size]],
+                dtype=torch.int64,
+                device="cuda",
+            )
+            # simulate kjt call
+            bucketized_kjt, permute = bucketize_kjt_before_all2all(
+                kjt,
+                num_buckets=world_size,
+                block_sizes=block_sizes,
+                keep_original_indices=keep_original_indices,
+                output_permute=True,
+            )
+            in1_2, in2_2 = bucketized_kjt.split([len(kjt.keys())] * world_size)
+        else:
+            bucketized_kjt, permute = bucketize_kjt_before_all2all(
+                kjt,
+                num_buckets=world_size,
+                block_sizes=block_sizes,
+                keep_original_indices=keep_original_indices,
+                output_permute=True,
+            )
+            kjts = bucketized_kjt.split([len(kjt.keys())] * world_size)
+            # rebuild kjt
+            in1_2 = KeyedJaggedTensor(
+                keys=kjts[0].keys(),
+                values=torch.cat([kjts[0].values(), kjts[1].values()], dim=0),
+                lengths=torch.cat([kjts[0].lengths(), kjts[1].lengths()], dim=0),
+            )
+            in2_2 = KeyedJaggedTensor(
+                keys=kjts[2].keys(),
+                values=torch.cat([kjts[2].values(), kjts[3].values()], dim=0),
+                lengths=torch.cat([kjts[2].lengths(), kjts[3].lengths()], dim=0),
+            )
+
+        m1_2 = m0.rebuild_with_output_id_range((0, 20))
+        m2_2 = m0.rebuild_with_output_id_range((20, 40))
+        m1_zch_identities = torch.cat(
+            [
+                m1_1.state_dict()["_hash_zch_identities"],
+                m2_1.state_dict()["_hash_zch_identities"],
+            ]
+        )
+        m1_zch_metadata = torch.cat(
+            [
+                m1_1.state_dict()["_hash_zch_metadata"],
+                m2_1.state_dict()["_hash_zch_metadata"],
+            ]
+        )
+        state_dict = m1_2.state_dict()
+        state_dict["_hash_zch_identities"] = m1_zch_identities
+        state_dict["_hash_zch_metadata"] = m1_zch_metadata
+        m1_2.load_state_dict(state_dict)
+
+        m2_zch_identities = torch.cat(
+            [
+                m3_1.state_dict()["_hash_zch_identities"],
+                m4_1.state_dict()["_hash_zch_identities"],
+            ]
+        )
+        m2_zch_metadata = torch.cat(
+            [
+                m3_1.state_dict()["_hash_zch_metadata"],
+                m4_1.state_dict()["_hash_zch_metadata"],
+            ]
+        )
+        state_dict = m2_2.state_dict()
+        state_dict["_hash_zch_identities"] = m2_zch_identities
+        state_dict["_hash_zch_metadata"] = m2_zch_metadata
+        m2_2.load_state_dict(state_dict)
+
+        _ = m1_2(in1_2.to_dict())
+        _ = m2_2(in2_2.to_dict())
+
+        m0.reset_inference_mode()  # just clears out training state
+        full_zch_identities = torch.cat(
+            [
+                m1_2.state_dict()["_hash_zch_identities"],
+                m2_2.state_dict()["_hash_zch_identities"],
+            ]
+        )
+        state_dict = m0.state_dict()
+        state_dict["_hash_zch_identities"] = full_zch_identities
+        m0.load_state_dict(state_dict)
+
+        # now set all models to eval, and run kjt
+        m1_2.eval()
+        m2_2.eval()
+        assert m0.training is False
+
+        inf_input = kjt.to_dict()
+        inf_output = m0(inf_input)
+
+        o1_2 = m1_2(in1_2.to_dict())
+        o2_2 = m2_2(in2_2.to_dict())
+        self.assertTrue(
+            torch.allclose(
+                inf_output["f"].values(),
+                torch.index_select(
+                    torch.cat([x["f"].values() for x in [o1_2, o2_2]]),
+                    dim=0,
+                    index=cast(torch.Tensor, permute),
+                ),
+            )
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
         "This test requires at least one GPU",
     )
     def test_output_global_offset_tensor(self) -> None:
@@ -704,6 +869,57 @@ class TestMCH(unittest.TestCase):
         the lengths are not mutated even though missed IDs are replaced with 0.
         This is useful for EC (EmbeddingCollection) where we want to keep original lengths.
         """
+        m = HashZchManagedCollisionModule(
+            zch_size=30,
+            device=torch.device("cuda"),
+            total_num_buckets=2,
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=10,
+            ),
+            max_probe=4,
+            disable_fallback=True,
+            start_bucket=1,
+            output_segments=[0, 10, 20],
+        )
+        jt = JaggedTensor(
+            values=torch.arange(0, 4, dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda"),
+        )
+        # Run once to insert ids
+        output0 = m.remap({"test": jt})
+        self.assertTrue(
+            torch.equal(
+                output0["test"].values(),
+                torch.tensor([8, 15, 11], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output0["test"].lengths(),
+                torch.tensor([1, 1, 0, 1], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        m.reset_inference_mode()
+        jt = JaggedTensor(
+            values=torch.tensor([9, 0, 1, 4, 6, 8], dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([1, 1, 1, 1, 1, 1], dtype=torch.int64, device="cuda"),
+        )
+        # Run again in inference mode and only values 0 and 1 exist.
+        output1 = m.remap({"test": jt})
+        self.assertTrue(
+            torch.equal(
+                output1["test"].values(),
+                torch.tensor([8, 15], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output1["test"].lengths(),
+                torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            )
+        )
         m = HashZchManagedCollisionModule(
             zch_size=10,
             device=torch.device("cuda"),
@@ -1129,6 +1345,190 @@ class TestMCH(unittest.TestCase):
             atol=0,
         )
 
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_zch_hash_disable_fallback_no_bag(self) -> None:
+        """
+        Test that when no_bag=True and disable_fallback=True,
+        missed IDs are replaced with 0 instead of being filtered out.
+        This is useful for EC (EmbeddingCollection) where we don't pool embeddings.
+        """
+        m = HashZchManagedCollisionModule(
+            zch_size=10,
+            device=torch.device("cuda"),
+            total_num_buckets=2,
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=10,
+            ),
+            max_probe=4,
+            start_bucket=0,
+            output_segments=None,
+            disable_fallback=True,
+            no_bag=True,
+        )
+        jt = JaggedTensor(
+            values=torch.arange(0, 4, dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda"),
+        )
+        # Run once to insert ids
+        output0 = m.remap({"test": jt})
+        # All values should be inserted
+        self.assertTrue(
+            torch.equal(
+                output0["test"].values(),
+                torch.tensor([3, 5, 4, 6], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output0["test"].lengths(),
+                torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+
+        m.reset_inference_mode()
+        jt = JaggedTensor(
+            values=torch.tensor([9, 0, 1, 4, 6, 8], dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([1, 1, 1, 1, 1, 1], dtype=torch.int64, device="cuda"),
+        )
+        # Run again in inference mode: only values 0 and 1 exist in the table.
+        # With no_bag=True:
+        # - Missed IDs should be replaced with 0 instead of being removed
+        # - Lengths should still be mutated to 0 for missed IDs (since mutate_miss_lengths defaults to True)
+        output1 = m.remap({"test": jt})
+        # For missed IDs (9, 4, 6, 8), remapped_ids should be 0 instead of being removed
+        self.assertTrue(
+            torch.equal(
+                output1["test"].values(),
+                torch.tensor([0, 3, 5, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        # Lengths should be mutated to 0 for misses (default mutate_miss_lengths=True behavior)
+        self.assertTrue(
+            torch.equal(
+                output1["test"].lengths(),
+                torch.tensor([0, 1, 1, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output1["test"].offsets(),
+                torch.tensor([0, 0, 1, 2, 2, 2, 2], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+
+        # Run again in inference mode: only values 0 and 1 exist in the table.
+        # With mutate_miss_lengths=False and no_bag=True:
+        # - Missed IDs should be replaced with 0 instead of being removed
+        # - Lengths should NOT be mutated to 0 for missed IDs
+        jt1 = JaggedTensor(
+            values=torch.tensor([9, 0, 1, 4, 6, 8], dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([6], dtype=torch.int64, device="cuda"),
+        )
+        output1 = m.remap({"test": jt1}, mutate_miss_lengths=False)
+        # For missed IDs (9, 4, 6, 8), remapped_ids should be 0 instead of being removed
+        self.assertTrue(
+            torch.equal(
+                output1["test"].values(),
+                torch.tensor([0, 3, 5, 0, 0, 0], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        # Lengths should remain unchanged (all 1s, not mutated to 0 for misses)
+        self.assertTrue(
+            torch.equal(
+                output1["test"].lengths(),
+                torch.tensor([6], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output1["test"].offsets(),
+                torch.tensor([0, 6], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_zch_hash_disable_fallback_mutate_miss_lengths_false(self) -> None:
+        """
+        Test that when mutate_miss_lengths=False and disable_fallback=True,
+        lengths are NOT mutated even though missed IDs are handled.
+        This is useful for non-NRO features in EC where we want to keep original lengths.
+        """
+        m = HashZchManagedCollisionModule(
+            zch_size=10,
+            device=torch.device("cuda"),
+            total_num_buckets=2,
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=10,
+            ),
+            max_probe=4,
+            start_bucket=0,
+            output_segments=None,
+            disable_fallback=True,
+            no_bag=False,  # for ebc
+        )
+        jt0 = JaggedTensor(
+            values=torch.arange(0, 4, dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda"),
+        )
+        # Run once to insert ids
+        output0 = m.remap({"test": jt0}, mutate_miss_lengths=False)
+        # All values should be inserted, and lengths should remain unchanged
+        self.assertTrue(
+            torch.equal(
+                output0["test"].values(),
+                torch.tensor([3, 5, 4, 6], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output0["test"].lengths(),
+                torch.tensor([1, 1, 1, 1], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+
+        m.reset_inference_mode()
+        jt1 = JaggedTensor(
+            values=torch.tensor([9, 0, 1, 4, 6, 8], dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([6], dtype=torch.int64, device="cuda"),
+        )
+        # Run again in inference mode: only values 0 and 1 exist in the table.
+        # With mutate_miss_lengths=False and no_bag=True:
+        # - Missed IDs should be replaced with 0 instead of being removed
+        # - Lengths should NOT be mutated to 0 for missed IDs
+        output1 = m.remap({"test": jt1}, mutate_miss_lengths=False)
+        # For missed IDs (9, 4, 6, 8), remapped_ids should be 0 instead of being removed
+        self.assertTrue(
+            torch.equal(
+                output1["test"].values(),
+                torch.tensor([3, 5], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        # Lengths should remain unchanged (all 1s, not mutated to 0 for misses)
+        self.assertTrue(
+            torch.equal(
+                output1["test"].lengths(),
+                torch.tensor([6], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output1["test"].offsets(),
+                torch.tensor([0, 6], dtype=torch.int64, device="cuda:0"),
+            )
+        )
+
     def test_is_sharded_property(self) -> None:
         # Non-sharded: full module with all buckets
         m = HashZchManagedCollisionModule(
@@ -1237,6 +1637,239 @@ class TestMCH(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_mc_module_forward(self) -> None:
+        embedding_configs = [
+            EmbeddingConfig(
+                name="t1",
+                num_embeddings=100,
+                embedding_dim=8,
+                feature_names=["f1", "f2"],
+            ),
+            EmbeddingConfig(
+                name="t2",
+                num_embeddings=100,
+                embedding_dim=8,
+                feature_names=["f3", "f4"],
+            ),
+        ]
+
+        mc_modules = {
+            "t1": HashZchManagedCollisionModule(
+                zch_size=100,
+                device=torch.device("cpu"),
+                total_num_buckets=1,
+                eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+                eviction_config=HashZchEvictionConfig(
+                    features=[],
+                    single_ttl=10,
+                ),
+            ),
+            "t2": HashZchManagedCollisionModule(
+                zch_size=100,
+                device=torch.device("cpu"),
+                total_num_buckets=1,
+                eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+                eviction_config=HashZchEvictionConfig(
+                    features=[],
+                    single_ttl=10,
+                ),
+            ),
+        }
+        for mc_module in mc_modules.values():
+            mc_module.reset_inference_mode()
+        mc_ebc = ManagedCollisionCollection(
+            # pyrefly: ignore[bad-argument-type]
+            managed_collision_modules=mc_modules,
+            embedding_configs=embedding_configs,
+        )
+        kjt = KeyedJaggedTensor(
+            keys=["f1", "f2", "f3", "f4"],
+            values=torch.cat(
+                [
+                    torch.arange(0, 20, 2, dtype=torch.int64, device="cpu"),
+                    torch.arange(30, 60, 3, dtype=torch.int64, device="cpu"),
+                    torch.arange(20, 30, 2, dtype=torch.int64, device="cpu"),
+                    torch.arange(0, 20, 2, dtype=torch.int64, device="cpu"),
+                ]
+            ),
+            lengths=torch.cat(
+                [
+                    torch.tensor([4, 6], dtype=torch.int64, device="cpu"),
+                    torch.tensor([5, 5], dtype=torch.int64, device="cpu"),
+                    torch.tensor([1, 4], dtype=torch.int64, device="cpu"),
+                    torch.tensor([7, 3], dtype=torch.int64, device="cpu"),
+                ]
+            ),
+        )
+        res = mc_ebc.forward(kjt)
+        self.assertTrue(torch.equal(res.lengths(), kjt.lengths()))
+        self.assertTrue(
+            torch.equal(
+                res.lengths(), torch.tensor([4, 6, 5, 5, 1, 4, 7, 3], dtype=torch.int64)
+            )
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_mc_module_lookup_remapped_lengths_mask(self) -> None:
+        embedding_configs = [
+            EmbeddingBagConfig(
+                name="t1",
+                num_embeddings=100,
+                embedding_dim=8,
+                feature_names=["f1"],
+            ),
+            EmbeddingBagConfig(
+                name="t2",
+                num_embeddings=100,
+                embedding_dim=8,
+                feature_names=["f2"],
+            ),
+        ]
+
+        mc_modules = {
+            "t1": HashZchManagedCollisionModule(
+                zch_size=100,
+                device=torch.device("cpu"),
+                total_num_buckets=1,
+                eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+                eviction_config=HashZchEvictionConfig(
+                    features=[],
+                    single_ttl=10,
+                ),
+                disable_fallback=False,
+            ),
+            "t2": HashZchManagedCollisionModule(
+                zch_size=100,
+                device=torch.device("cpu"),
+                total_num_buckets=1,
+                eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+                eviction_config=HashZchEvictionConfig(
+                    features=[],
+                    single_ttl=10,
+                ),
+                disable_fallback=False,
+            ),
+        }
+        for mc_module in mc_modules.values():
+            mc_module.reset_inference_mode()
+        kjt = KeyedJaggedTensor(
+            keys=["f1", "f2"],
+            values=torch.cat(
+                [
+                    torch.arange(0, 20, 2, dtype=torch.int64, device="cpu"),
+                    torch.arange(30, 60, 3, dtype=torch.int64, device="cpu"),
+                ]
+            ),
+            lengths=torch.cat(
+                [
+                    torch.ones([10], dtype=torch.int64, device="cpu"),
+                    torch.ones([10], dtype=torch.int64, device="cpu"),
+                ]
+            ),
+        )
+        mc_ebc = None
+        mc_ebc = ManagedCollisionEmbeddingBagCollection(
+            EmbeddingBagCollection(
+                device=torch.device("cuda"),
+                tables=embedding_configs,
+                is_weighted=False,
+            ),
+            ManagedCollisionCollection(
+                # pyrefly: ignore[bad-argument-type]
+                managed_collision_modules=mc_modules,
+                embedding_configs=embedding_configs,
+            ),
+            return_remapped_features=True,
+        )
+        mask = mc_ebc.lookup_remapped_lengths_mask(kjt)
+        self.assertTrue(torch.equal(mask, torch.ones(20, dtype=torch.bool)))
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_mc_module_lookup_remapped_lengths_mask_no_fallback(self) -> None:
+        embedding_configs = [
+            EmbeddingBagConfig(
+                name="t1",
+                num_embeddings=100,
+                embedding_dim=8,
+                feature_names=["f1"],
+            ),
+            EmbeddingBagConfig(
+                name="t2",
+                num_embeddings=100,
+                embedding_dim=8,
+                feature_names=["f2"],
+            ),
+        ]
+
+        mc_modules = {
+            "t1": HashZchManagedCollisionModule(
+                zch_size=100,
+                device=torch.device("cpu"),
+                total_num_buckets=1,
+                eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+                eviction_config=HashZchEvictionConfig(
+                    features=[],
+                    single_ttl=10,
+                ),
+                disable_fallback=True,
+            ),
+            "t2": HashZchManagedCollisionModule(
+                zch_size=100,
+                device=torch.device("cpu"),
+                total_num_buckets=1,
+                eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+                eviction_config=HashZchEvictionConfig(
+                    features=[],
+                    single_ttl=10,
+                ),
+                disable_fallback=True,
+            ),
+        }
+        for mc_module in mc_modules.values():
+            mc_module.reset_inference_mode()
+        kjt = KeyedJaggedTensor(
+            keys=["f1", "f2"],
+            values=torch.cat(
+                [
+                    torch.arange(0, 20, 2, dtype=torch.int64, device="cpu"),
+                    torch.arange(30, 60, 3, dtype=torch.int64, device="cpu"),
+                ]
+            ),
+            lengths=torch.cat(
+                [
+                    torch.ones([10], dtype=torch.int64, device="cpu"),
+                    torch.ones([10], dtype=torch.int64, device="cpu"),
+                ]
+            ),
+        )
+        mc_ebc: Optional[ManagedCollisionEmbeddingBagCollection] = None
+        mc_ebc = ManagedCollisionEmbeddingBagCollection(
+            EmbeddingBagCollection(
+                device=torch.device("cuda"),
+                tables=embedding_configs,
+                is_weighted=False,
+            ),
+            ManagedCollisionCollection(
+                # pyrefly: ignore[bad-argument-type]
+                managed_collision_modules=mc_modules,
+                embedding_configs=embedding_configs,
+            ),
+            return_remapped_features=True,
+        )
+        mask = mc_ebc.lookup_remapped_lengths_mask(kjt)
+        # It should be all cache miss as we initialize identity tensor as -1.
+        self.assertTrue(torch.equal(mask, torch.zeros(20, dtype=torch.bool)))
 
 
 @unittest.skipIf(
