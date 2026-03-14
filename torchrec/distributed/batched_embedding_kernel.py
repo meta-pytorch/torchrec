@@ -536,6 +536,8 @@ def _populate_zero_collision_tbe_params(
         optimizer_state_dtypes_for_st = kvzch_tbe_config.optimizer_state_dtypes_for_st
         load_ckpt_without_opt = True
 
+    enrichment_policy = kvzch_tbe_config.enrichment_policy if kvzch_tbe_config else None
+
     tbe_params["kv_zch_params"] = KVZCHParams(
         bucket_offsets=bucket_offsets,
         bucket_sizes=bucket_sizes,
@@ -546,6 +548,7 @@ def _populate_zero_collision_tbe_params(
         load_ckpt_without_opt=load_ckpt_without_opt,
         optimizer_type_for_st=optimizer_type_for_st,
         optimizer_state_dtypes_for_st=optimizer_state_dtypes_for_st,
+        enrichment_policy=enrichment_policy,
     )
 
 
