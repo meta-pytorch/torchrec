@@ -31,11 +31,12 @@ from torchrec.distributed.planner.types import (
     ParameterConstraints,
     PartitionByType,
     Shard,
+    SharderDataMap,
     ShardEstimator,
     ShardingOption,
     Topology,
 )
-from torchrec.distributed.planner.utils import sharder_name
+from torchrec.distributed.planner.utils import build_sharder_data_map, sharder_name
 from torchrec.distributed.sharding_plan import calculate_shard_sizes_and_offsets
 from torchrec.distributed.types import (
     BoundsCheckMode,
@@ -99,6 +100,7 @@ class EmbeddingEnumerator(Enumerator):
         self._batch_size: int = batch_size
         self._constraints = constraints
         self._sharder_map: Dict[str, ModuleSharder[nn.Module]] = {}
+        self._sharder_data_map: SharderDataMap = {}
         self._use_exact_enumerate_order: bool = (
             use_exact_enumerate_order if use_exact_enumerate_order else False
         )
@@ -159,6 +161,10 @@ class EmbeddingEnumerator(Enumerator):
         self._sharder_map = {
             sharder_name(sharder.module_type): sharder for sharder in sharders
         }
+        from torch._utils_internal import justknobs_check
+
+        if justknobs_check("pytorch/torchrec:enable_sharder_data"):
+            self._sharder_data_map = build_sharder_data_map(self._sharder_map)
         sharding_options: List[ShardingOption] = []
 
         named_modules_queue = [("", module)]
@@ -329,8 +335,19 @@ class EmbeddingEnumerator(Enumerator):
         return self._last_stored_search_space
 
     def populate_estimates(self, sharding_options: List[ShardingOption]) -> None:
+        from torch._utils_internal import justknobs_check
+
         for estimator in self._estimators:
-            estimator.estimate(sharding_options, self._sharder_map)
+            if justknobs_check("pytorch/torchrec:enable_sharder_data"):
+                estimator.estimate(
+                    sharding_options,
+                    sharder_data_map=self._sharder_data_map,
+                )
+            else:
+                estimator.estimate(
+                    sharding_options,
+                    sharder_map=self._sharder_map,
+                )
 
     def _filter_sharding_types(
         self, name: str, allowed_sharding_types: List[str], sharder_key: str = ""

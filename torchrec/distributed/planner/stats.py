@@ -898,7 +898,14 @@ class EmbeddingStats(Stats):
             num_poolings = str(round(sum(num_poolings), 3))
             output = "pooled" if so.is_pooled else "sequence"
             weighted = "weighted" if so.is_weighted else "unweighted"
-            sharder = sharder_map.get(get_sharder_name(type(so.module[1])), None)
+            from torch._utils_internal import justknobs_check
+
+            if justknobs_check(
+                "pytorch/torchrec:enable_precomputed_sharding_option_fields"
+            ):
+                sharder = sharder_map.get(so.module_type_key, None)
+            else:
+                sharder = sharder_map.get(get_sharder_name(type(so.module[1])), None)
             sharder_name = type(sharder).__name__
             num_features = len(so.input_lengths)
             embedding_dim = _get_embedding_dim(so)
