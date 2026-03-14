@@ -9,7 +9,7 @@
 
 import unittest
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import Mock
 
 import torch
@@ -132,7 +132,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         lookup = self._create_mock_lookup([original_weights])
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Verify HBM is freed
         self.assertEqual(original_weights.untyped_storage().size(), 0)
@@ -159,7 +161,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         lookup = self._create_mock_lookup([weights_1, weights_2, weights_3])
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Verify all are stashed
         self.assertEqual(weights_1.untyped_storage().size(), 0)
@@ -188,7 +192,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         lookup = self._create_mock_lookup([original_weights])
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Verify stash worked
         self.assertEqual(original_weights.untyped_storage().size(), 0)
@@ -214,7 +220,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         output = torch.matmul(x, weights.t())
 
         # Stash and restore
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         MemoryStashingManager.restore_embedding_weights()
         await_restore(None)
@@ -254,7 +262,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         lookup = Mock(spec=["_emb_modules"])
         lookup._emb_modules = emb_modules
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Only CUDA weights should be stashed
         self.assertEqual(cuda_weights.untyped_storage().size(), 0)
@@ -290,7 +300,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         lookup = Mock(spec=["_emb_modules"])
         lookup._emb_modules = emb_modules
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Valid weights should be stashed
         self.assertEqual(valid_weights.untyped_storage().size(), 0)
@@ -314,7 +326,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         x = torch.randn(3, 5, device=self.device, requires_grad=True)
         output = torch.matmul(x, weights.t())
 
-        await_restore, _restore = MemoryStashingManager.stash_embedding_weights(lookup)
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+        await_restore, _restore = result
 
         # Register restore via class method and await_restore as backward hook
         output.register_hook(
@@ -329,6 +343,12 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         # Weights should be restored after backward
         self.assertGreater(weights.untyped_storage().size(), 0)
         torch.testing.assert_close(weights, original_values, rtol=1e-05, atol=1e-08)
+
+    def test_is_enabled(self) -> None:
+        """Test is_enabled reflects stream initialization state."""
+        self.assertTrue(MemoryStashingManager.is_enabled())
+        MemoryStashingManager.reset()
+        self.assertFalse(MemoryStashingManager.is_enabled())
 
 
 class TestStashOptimizerState(unittest.TestCase):
