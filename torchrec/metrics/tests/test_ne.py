@@ -210,8 +210,8 @@ class NEMetricTest(unittest.TestCase):
             eta=eta,
             allow_missing_label_with_zero_weight=True,
         )
-        self.assertTrue(torch.all(~ne.isinf()))
-        self.assertTrue(torch.all(~ne.isnan()))
+        self.assertFalse(ne.isinf().any().item())
+        self.assertFalse(ne.isnan().any().item())
         torch.testing.assert_close(
             ne.eq(eta), torch.tensor([False, True, False]), rtol=0, atol=0
         )

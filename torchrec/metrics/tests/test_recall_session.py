@@ -313,23 +313,23 @@ class RecallSessionValueTest(unittest.TestCase):
         self.assertSetEqual(
             recall_metric.get_required_inputs(), {"session1", "session2"}
         )
-        self.assertTrue(len(recall_metric._tasks) == 2)
-        self.assertTrue(recall_metric._tasks[0] == task_info1)
-        self.assertTrue(recall_metric._tasks[1] == task_info2)
+        self.assertEqual(len(recall_metric._tasks), 2)
+        self.assertEqual(recall_metric._tasks[0], task_info1)
+        self.assertEqual(recall_metric._tasks[1], task_info2)
 
         # metrics_computations checks
-        self.assertTrue(recall_metric._metrics_computations[0]._my_rank == 5)
-        self.assertTrue(recall_metric._metrics_computations[1]._my_rank == 5)
-        self.assertTrue(recall_metric._metrics_computations[0]._batch_size == 100)
-        self.assertTrue(recall_metric._metrics_computations[1]._batch_size == 100)
+        self.assertEqual(recall_metric._metrics_computations[0]._my_rank, 5)
+        self.assertEqual(recall_metric._metrics_computations[1]._my_rank, 5)
+        self.assertEqual(recall_metric._metrics_computations[0]._batch_size, 100)
+        self.assertEqual(recall_metric._metrics_computations[1]._batch_size, 100)
 
-        self.assertTrue(recall_metric._metrics_computations[0].top_threshold == 1)
-        self.assertTrue(recall_metric._metrics_computations[1].top_threshold == 2)
-        self.assertTrue(
-            recall_metric._metrics_computations[0].session_var_name == "session1"
+        self.assertEqual(recall_metric._metrics_computations[0].top_threshold, 1)
+        self.assertEqual(recall_metric._metrics_computations[1].top_threshold, 2)
+        self.assertEqual(
+            recall_metric._metrics_computations[0].session_var_name, "session1"
         )
-        self.assertTrue(
-            recall_metric._metrics_computations[1].session_var_name == "session2"
+        self.assertEqual(
+            recall_metric._metrics_computations[1].session_var_name, "session2"
         )
         self.assertTrue(recall_metric._metrics_computations[0].run_ranking_of_labels)
         self.assertTrue(

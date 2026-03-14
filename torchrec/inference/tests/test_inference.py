@@ -281,9 +281,9 @@ class InferenceTest(unittest.TestCase):
 
         # When world_size = 1, we should have 1 TBE per sharded, quantized ebc
         # pyrefly: ignore[missing-attribute]
-        self.assertTrue(len(sharded_quant_model.sparse.ebc.tbes) == 1)
+        self.assertEqual(len(sharded_quant_model.sparse.ebc.tbes), 1)
         # pyrefly: ignore[missing-attribute]
-        self.assertTrue(len(sharded_quant_model.sparse.weighted_ebc.tbes) == 1)
+        self.assertEqual(len(sharded_quant_model.sparse.weighted_ebc.tbes), 1)
 
         # Check the weights are close
         torch.testing.assert_close(output, quantized_output, rtol=1e-05, atol=1e-3)
@@ -367,9 +367,9 @@ class InferenceTest(unittest.TestCase):
 
         # When world_size = 1, we should have 1 TBE per sharded, quantized ebc
         # pyrefly: ignore[missing-attribute]
-        self.assertTrue(len(sharded_quant_model.sparse.ebc.tbes) == 1)
+        self.assertEqual(len(sharded_quant_model.sparse.ebc.tbes), 1)
         # pyrefly: ignore[missing-attribute]
-        self.assertTrue(len(sharded_quant_model.sparse.weighted_ebc.tbes) == 1)
+        self.assertEqual(len(sharded_quant_model.sparse.weighted_ebc.tbes), 1)
 
         # Check the weights are close
         torch.testing.assert_close(output, quantized_output, rtol=1e-05, atol=1e-3)
@@ -403,9 +403,9 @@ class InferenceTest(unittest.TestCase):
         quantized_model = quantize_inference_model(model)
         # We should have 2 TBEs for unweighted ebc as the 2 tables here have different pooling types
         # pyrefly: ignore[missing-attribute]
-        self.assertTrue(len(quantized_model.sparse.ebc.tbes) == 2)
+        self.assertEqual(len(quantized_model.sparse.ebc.tbes), 2)
         # pyrefly: ignore[missing-attribute]
-        self.assertTrue(len(quantized_model.sparse.weighted_ebc.tbes) == 1)
+        self.assertEqual(len(quantized_model.sparse.weighted_ebc.tbes), 1)
         # Changing this back
         self.tables[0].pooling = PoolingType.SUM
 

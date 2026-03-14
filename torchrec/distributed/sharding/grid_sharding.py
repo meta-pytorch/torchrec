@@ -277,6 +277,7 @@ class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                         weight_init_max=info.embedding_config.weight_init_max,
                         weight_init_min=info.embedding_config.weight_init_min,
                         fused_params=info.fused_params,
+                        stash_weights=info.embedding_config.stash_weights,
                     )
                 )
 

@@ -824,7 +824,7 @@ class TestMemoryBalancedPartitioner(unittest.TestCase):
                     #  got `Optional[int]`.
                     memory_balanced_hbm_uses[shard.rank] += shard.storage.hbm
 
-        self.assertTrue(max(memory_balanced_hbm_uses) < max(greedy_perf_hbm_uses))
+        self.assertLess(max(memory_balanced_hbm_uses), max(greedy_perf_hbm_uses))
 
 
 class TestBalanceModules(unittest.TestCase):

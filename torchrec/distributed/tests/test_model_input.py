@@ -107,8 +107,8 @@ class TestModelInput(unittest.TestCase):
         self.assertIsNotNone(model_input.idlist_features)
         indices = model_input.idlist_features.values()
 
-        self.assertTrue(torch.all(indices >= 0))
-        self.assertTrue(torch.all(indices < num_embeddings))
+        self.assertGreaterEqual(indices.min().item(), 0)
+        self.assertLess(indices.max().item(), num_embeddings)
 
     def test_generate_power_law_with_weighted_tables(self) -> None:
         """Power-law distribution should work with weighted tables."""
@@ -170,10 +170,10 @@ class TestModelInput(unittest.TestCase):
             all_zeros=True,
         )
 
-        self.assertTrue(torch.all(model_input.float_features == 0))
-        self.assertTrue(torch.all(model_input.label == 0))
+        self.assertTrue(torch.all(model_input.float_features == 0).item())
+        self.assertTrue(torch.all(model_input.label == 0).item())
         self.assertIsNotNone(model_input.idlist_features)
-        self.assertTrue(torch.all(model_input.idlist_features.values() == 0))
+        self.assertTrue(torch.all(model_input.idlist_features.values() == 0).item())
 
     def test_generate_with_use_offsets(self) -> None:
         """When use_offsets=True, KJT should use offsets instead of lengths."""
@@ -264,7 +264,7 @@ class TestModelInput(unittest.TestCase):
         self.assertIsNotNone(model_input.idlist_features)
         kjt = model_input.idlist_features
         lengths = kjt.lengths()
-        self.assertTrue(torch.all(lengths <= max_length))
+        self.assertLessEqual(lengths.max().item(), max_length)
 
     def test_generate_without_tables(self) -> None:
         """ModelInput.generate should work when tables are empty or None."""
@@ -534,8 +534,8 @@ class TestModelInput(unittest.TestCase):
         )
 
         self.assertEqual(indices.numel(), 10000)
-        self.assertTrue(torch.all(indices >= 0))
-        self.assertTrue(torch.all(indices < num_embeddings))
+        self.assertGreaterEqual(indices.min().item(), 0)
+        self.assertLess(indices.max().item(), num_embeddings)
 
         # Check distribution is roughly uniform
         counter = Counter(indices.tolist())
@@ -556,8 +556,8 @@ class TestModelInput(unittest.TestCase):
         )
 
         self.assertEqual(indices.numel(), 10000)
-        self.assertTrue(torch.all(indices >= 0))
-        self.assertTrue(torch.all(indices < num_embeddings))
+        self.assertGreaterEqual(indices.min().item(), 0)
+        self.assertLess(indices.max().item(), num_embeddings)
         # Verify index 0 is actually generated (validates off-by-one fix)
         self.assertIn(0, indices.tolist())
 
@@ -575,8 +575,8 @@ class TestModelInput(unittest.TestCase):
         )
 
         self.assertEqual(indices.numel(), 10000)
-        self.assertTrue(torch.all(indices >= 0))
-        self.assertTrue(torch.all(indices < num_embeddings))
+        self.assertGreaterEqual(indices.min().item(), 0)
+        self.assertLess(indices.max().item(), num_embeddings)
         # Verify index 0 is actually generated (validates off-by-one fix)
         self.assertIn(0, indices.tolist())
 
@@ -600,8 +600,8 @@ class TestModelInput(unittest.TestCase):
         )
 
         self.assertEqual(indices.numel(), 10000)
-        self.assertTrue(torch.all(indices >= 0))
-        self.assertTrue(torch.all(indices < num_embeddings))
+        self.assertGreaterEqual(indices.min().item(), 0)
+        self.assertLess(indices.max().item(), num_embeddings)
         # Verify index 0 is actually generated (validates off-by-one fix)
         self.assertIn(0, indices.tolist())
 
@@ -622,7 +622,7 @@ class TestModelInput(unittest.TestCase):
         )
 
         self.assertEqual(indices.numel(), 100)
-        self.assertTrue(torch.all(indices == 0))
+        self.assertTrue(torch.all(indices == 0).item())
 
     def test_generate_power_law_indices_alpha_near_one_from_below(self) -> None:
         """Test alpha very close to 1 from below uses log-uniform branch."""
@@ -638,8 +638,8 @@ class TestModelInput(unittest.TestCase):
         )
 
         self.assertEqual(indices.numel(), 10000)
-        self.assertTrue(torch.all(indices >= 0))
-        self.assertTrue(torch.all(indices < num_embeddings))
+        self.assertGreaterEqual(indices.min().item(), 0)
+        self.assertLess(indices.max().item(), num_embeddings)
         # Should not have numerical overflow issues
         self.assertFalse(torch.any(torch.isnan(indices.float())))
         self.assertFalse(torch.any(torch.isinf(indices.float())))
@@ -658,8 +658,8 @@ class TestModelInput(unittest.TestCase):
         )
 
         self.assertEqual(indices.numel(), 10000)
-        self.assertTrue(torch.all(indices >= 0))
-        self.assertTrue(torch.all(indices < num_embeddings))
+        self.assertGreaterEqual(indices.min().item(), 0)
+        self.assertLess(indices.max().item(), num_embeddings)
         # Should not have numerical overflow issues
         self.assertFalse(torch.any(torch.isnan(indices.float())))
         self.assertFalse(torch.any(torch.isinf(indices.float())))

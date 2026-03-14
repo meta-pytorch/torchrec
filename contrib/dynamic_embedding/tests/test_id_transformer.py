@@ -1,3 +1,10 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 import unittest
 
 import torch
@@ -55,7 +62,7 @@ class TestIDTransformer(unittest.TestCase):
             self.assertTrue(success)
 
             python_cache_ids = python_transformer.transform(global_ids)
-            self.assertTrue(torch.all(cache_ids == python_cache_ids))
+            self.assertTrue(torch.all(cache_ids == python_cache_ids).item())
 
             if ids_to_fetch is not None:
                 ids_map = {

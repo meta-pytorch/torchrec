@@ -527,7 +527,7 @@ class TestManagedCollisionCollection(unittest.TestCase):
             torch.arange(10, 10 + zch_size, device=device).reshape(zch_size, -1),
             requires_grad=False,
         )
-        self.assertTrue(hash_zch_mc1._hash_zch_runtime_meta.size(0), zch_size)
+        self.assertEqual(hash_zch_mc1._hash_zch_runtime_meta.size(0), zch_size)
         hash_zch_mc1._hash_zch_identities = torch.nn.Parameter(
             torch.tensor([50, 100, 999, 300, 400, 500, 600, -1], device=device),
             requires_grad=False,
