@@ -5,6 +5,62 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# Auto version mapping: torchrec 1.X -> torch 2.(X+5)
+# e.g. torchrec 1.4 -> torch 2.9, 1.5 -> 2.10, 1.6 -> 2.11
+get_expected_torch_version() {
+    local torchrec_ver="$1"
+    local minor
+    minor=$(echo "$torchrec_ver" | cut -d'.' -f2)
+    if [[ -z "$minor" || ! "$minor" =~ ^[0-9]+$ ]]; then
+        echo "Cannot parse torchrec version: $torchrec_ver" >&2
+        return 1
+    fi
+    echo "2.$((minor + 5))"
+}
+
+# Validate installed package versions against expected versions
+validate_versions() {
+    local expected_torchrec_ver="$1"
+    local expected_torch_ver="$2"
+
+    local torchrec_ver
+    torchrec_ver=$(conda run -n "${CONDA_ENV}" pip show torchrec | grep Version | cut -d' ' -f2)
+    local fbgemm_ver
+    fbgemm_ver=$(conda run -n "${CONDA_ENV}" pip show fbgemm_gpu | grep Version | cut -d' ' -f2)
+    local torch_ver
+    torch_ver=$(conda run -n "${CONDA_ENV}" pip show torch | grep Version | cut -d' ' -f2)
+
+    echo "Installed versions: torchrec=$torchrec_ver, fbgemm_gpu=$fbgemm_ver, torch=$torch_ver"
+    echo "Expected versions: torchrec=${expected_torchrec_ver}, fbgemm_gpu=${expected_torchrec_ver}, torch=${expected_torch_ver}.*"
+
+    local failed=0
+    if [[ "$torchrec_ver" != "$expected_torchrec_ver"* ]]; then
+        echo "Error: torchrec version mismatch: got $torchrec_ver, expected ${expected_torchrec_ver}*"
+        failed=1
+    fi
+    if [[ "$fbgemm_ver" != "$expected_torchrec_ver"* ]]; then
+        echo "Error: fbgemm_gpu version mismatch: got $fbgemm_ver, expected ${expected_torchrec_ver}*"
+        failed=1
+    fi
+    if [[ "$torch_ver" != "$expected_torch_ver"* ]]; then
+        echo "Error: torch version mismatch: got $torch_ver, expected ${expected_torch_ver}*"
+        failed=1
+    fi
+    if [[ "$failed" -eq 1 ]]; then
+        exit 1
+    fi
+    echo "All package versions validated successfully."
+}
+
+# Read expected version from version.txt
+EXPECTED_TORCHREC_VERSION=$(tr -d '[:space:]' < version.txt)
+EXPECTED_TORCH_VERSION=$(get_expected_torch_version "$EXPECTED_TORCHREC_VERSION")
+if [[ $? -ne 0 ]]; then
+    echo "Failed to determine expected torch version for torchrec=$EXPECTED_TORCHREC_VERSION"
+    exit 1
+fi
+echo "Expected torchrec/fbgemm version: $EXPECTED_TORCHREC_VERSION"
+echo "Expected torch version: $EXPECTED_TORCH_VERSION.*"
 
 export PYTORCH_CUDA_PKG=""
 export CONDA_ENV="build_binary"
@@ -113,19 +169,13 @@ else
 fi
 
 
-# redo for pypi release
+# Validate all package versions for release binaries
+validate_versions "$EXPECTED_TORCHREC_VERSION" "$EXPECTED_TORCH_VERSION"
 
+
+# redo for pypi release
 if [[ ${MATRIX_CHANNEL} != 'release' ]]; then
     exit 0
-else
-    # Check version matches only for release binaries
-    torchrec_version=$(conda run -n "${CONDA_ENV}" pip show torchrec | grep Version | cut -d' ' -f2)
-    fbgemm_version=$(conda run -n "${CONDA_ENV}" pip show fbgemm_gpu | grep Version | cut -d' ' -f2)
-
-    if [ "$torchrec_version" != "$fbgemm_version" ]; then
-        echo "Error: TorchRec package version does not match FBGEMM package version"
-        exit 1
-    fi
 fi
 
 if [[ ${MATRIX_PYTHON_VERSION} = '3.14' ]]; then
@@ -152,14 +202,8 @@ conda run -n "${CONDA_ENV}" pip install torch
 conda run -n "${CONDA_ENV}" pip install fbgemm-gpu
 conda run -n "${CONDA_ENV}" pip install torchrec
 
-# Check version matching again for PyPI
-torchrec_version=$(conda run -n "${CONDA_ENV}" pip show torchrec | grep Version | cut -d' ' -f2)
-fbgemm_version=$(conda run -n "${CONDA_ENV}" pip show fbgemm_gpu | grep Version | cut -d' ' -f2)
-
-if [ "$torchrec_version" != "$fbgemm_version" ]; then
-    echo "Error: TorchRec package version does not match FBGEMM package version"
-    exit 1
-fi
+# Validate all package versions for PyPI release
+validate_versions "$EXPECTED_TORCHREC_VERSION" "$EXPECTED_TORCH_VERSION"
 
 # check directory
 ls -R
