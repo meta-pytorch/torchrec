@@ -74,10 +74,7 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
-from torchrec.distributed.fused_params import (
-    get_embedding_table_index_type,
-    get_embedding_table_offset_type,
-)
+from torchrec.distributed.model_tracker.types import IndexedLookup
 from torchrec.distributed.shards_wrapper import LocalShardsWrapper
 from torchrec.distributed.types import (
     LazyAwaitable,
@@ -1739,12 +1736,6 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
         self._feature_table_map: List[int] = []
         self.table_name_to_count: Dict[str, int] = {}
         self._param_per_table: Dict[str, TableBatchedEmbeddingSlice] = {}
-        self._embedding_table_index_type: torch.dtype = get_embedding_table_index_type(
-            config.fused_params
-        )
-        self._embedding_table_offset_type: torch.dtype = (
-            get_embedding_table_offset_type(config.fused_params)
-        )
 
         for idx, table_config in enumerate(self._config.embedding_tables):
             self._local_rows.append(table_config.local_rows)
@@ -1816,13 +1807,13 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
 
         if len(forward_args) == 0:
             return self.emb_module(
-                indices=features.values().to(self._embedding_table_index_type),
-                offsets=features.offsets().to(self._embedding_table_offset_type),
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
             )
         else:
             return self.emb_module(
-                indices=features.values().to(self._embedding_table_index_type),
-                offsets=features.offsets().to(self._embedding_table_offset_type),
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
                 **forward_args,
             )
 
@@ -2586,23 +2577,6 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
 
-    def wait_for_forward(self) -> None:
-        """
-        Wait for any pending Triton forward kernel to complete.
-
-        This should be called before collective operations (e.g., ALLTOALL for
-        output distribution) to ensure the forward kernel has completed on all
-        ranks. Without this synchronization, NCCL collectives may time out
-        because different ranks reach the collective at different times (since
-        Triton kernels run asynchronously).
-
-        The underlying TritonTableBatchedEmbeddingBags records a CUDA event after
-        the forward kernel completes, and this method waits on that event.
-        """
-        if hasattr(self._emb_module, "wait_for_forward"):
-            # pyrefly: ignore [not-callable]
-            self._emb_module.wait_for_forward()
-
 
 class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
     """
@@ -2904,12 +2878,6 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         self._lengths_per_emb: List[int] = []
         self.table_name_to_count: Dict[str, int] = {}
         self._param_per_table: Dict[str, TableBatchedEmbeddingSlice] = {}
-        self._embedding_table_index_type: torch.dtype = get_embedding_table_index_type(
-            config.fused_params
-        )
-        self._embedding_table_offset_type: torch.dtype = (
-            get_embedding_table_offset_type(config.fused_params)
-        )
 
         for idx, table_config in enumerate(self._config.embedding_tables):
             self._local_rows.append(table_config.local_rows)
@@ -3005,14 +2973,14 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
 
         if len(forward_args) == 0:
             return self.emb_module(
-                indices=features.values().to(self._embedding_table_index_type),
-                offsets=features.offsets().to(self._embedding_table_offset_type),
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
                 per_sample_weights=weights,
             )
         else:
             return self.emb_module(
-                indices=features.values().to(self._embedding_table_index_type),
-                offsets=features.offsets().to(self._embedding_table_offset_type),
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
                 per_sample_weights=weights,
                 **forward_args,
             )
@@ -3773,11 +3741,6 @@ class TritonBatchedFusedEmbeddingBag(
         optimizer = fused_params.get("optimizer", OptimType.EXACT_SGD)
         learning_rate = fused_params.get("learning_rate", 0.01)
         eps = fused_params.get("eps", 0.1)
-        output_dtype_sparse: SparseType = fused_params.get(
-            "output_dtype", SparseType.FP32
-        )
-        output_dtype = output_dtype_sparse.as_dtype()
-        stochastic_rounding = fused_params.get("stochastic_rounding", True)
 
         # Create Triton TBE module with feature_table_map for correct batch size handling
         self._emb_module: TritonTableBatchedEmbeddingBags = (
@@ -3785,8 +3748,6 @@ class TritonBatchedFusedEmbeddingBag(
                 embedding_specs=list(zip(self._local_rows, self._local_cols)),
                 feature_table_map=self._feature_table_map,
                 weights_precision=weights_precision.as_dtype(),
-                output_dtype=output_dtype,
-                stochastic_rounding=stochastic_rounding,
                 learning_rate=learning_rate,
                 eps=eps,
                 optimizer=optimizer,
@@ -3858,18 +3819,6 @@ class TritonBatchedFusedEmbeddingBag(
     def fused_optimizer(self) -> FusedOptimizer:
         return self._optim
 
-    def wait_for_forward(self) -> None:
-        """
-        Wait for any pending Triton forward kernel to complete on the current stream.
-
-        This is called before NCCL collectives (e.g., AllToAll in output_dist) to ensure
-        the embedding lookup has fully completed. While Triton kernels run on the same
-        stream as PyTorch operations, NCCL collectives may run on a separate NCCL stream.
-        This method ensures proper synchronization via CUDA events.
-        """
-        if hasattr(self._emb_module, "wait_for_forward"):
-            self._emb_module.wait_for_forward()
-
     def forward(
         self,
         features: KeyedJaggedTensor,
@@ -3909,172 +3858,6 @@ class TritonBatchedFusedEmbeddingBag(
 
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
-
-
-class ShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBag):
-    """
-    Collective Communications:
-        - Forward: async reduce_scatter (ReduceOp.AVG) on weights via replica_pg
-        - Backward (pre-hook): all_gather on weights via replica_pg
-    """
-
-    def __init__(
-        self,
-        config: GroupedEmbeddingConfig,
-        pg: Optional[dist.ProcessGroup] = None,
-        device: Optional[torch.device] = None,
-        sharding_type: Optional[ShardingType] = None,
-        env: Optional[ShardingEnv] = None,
-    ) -> None:
-        super().__init__(config, pg, device, sharding_type, env)
-        assert isinstance(
-            env, ShardingEnv2D
-        ), "env is required for ShardedTritonBatchedFusedEmbeddingBag"
-
-        self._env: ShardingEnv2D = env
-
-        self.weights_sharded = False
-        self._input_tensor = None
-        self._element_size = self._emb_module.weight.element_size()
-        # pyre-ignore[8]
-        self._original_shape: torch.Size = self._emb_module.weight.shape
-        # Triton TBE's weight is a plain tensor attribute (not nn.Parameter),
-        # same pattern as CUDA TBE's weights_dev.
-        # pyre-ignore[8]
-        self._unsharded_param: torch.Tensor = self._emb_module.weight
-        self._shard_buf_nbytes: int = 0
-        self._shard_buf: Optional[torch.Tensor] = None
-
-        self._async_stream: torch.cuda.Stream = torch.cuda.Stream(
-            device=self._emb_module.weight.device
-        )
-        self._async_work: Optional[dist.Work] = None
-        self._async_event: Optional[torch.cuda.Event] = None
-        self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
-
-        self.register_full_backward_pre_hook(
-            self._hybrid_sharded_backward_hook,  # pyre-ignore[6]
-        )
-
-    def _all_gather_table_weights(self) -> None:
-        if not self.weights_sharded:
-            return
-        self.ensure_reduce_scatter_complete()
-
-        shard_size = self._shard_buf.numel()
-        padded_total_size = shard_size * self._env.num_sharding_groups()
-
-        self._unsharded_param.untyped_storage().resize_(
-            padded_total_size * self._element_size
-        )
-        output_tensor = self._unsharded_param
-
-        if padded_total_size != self._unsharded_param.numel():
-            output_tensor = torch.empty(
-                0,
-                dtype=self._unsharded_param.dtype,
-                device=self._unsharded_param.device,
-            )
-            output_tensor.set_(
-                self._unsharded_param.untyped_storage(),
-                0,  # storage_offset
-                (padded_total_size,),  # size
-            )
-
-        with record_function("## 2d_allgather_fully_sharded ##"):
-            dist.all_gather_into_tensor(
-                output_tensor=output_tensor,
-                input_tensor=self._shard_buf,
-                group=self._env.replica_pg,
-                async_op=False,
-            )
-        # pyre-ignore[16]
-        self._emb_module.weight = self._unsharded_param[: self._original_shape.numel()]
-        # pyre-ignore[16]
-        self._shard_buf.untyped_storage().resize_(0)
-        self.weights_sharded = False
-
-    def _hybrid_sharded_backward_hook(
-        self, module: nn.Module, grad_input: List[torch.Tensor]
-    ) -> None:
-        self._all_gather_table_weights()
-
-    def get_rs_awaitable(self) -> Optional[ReduceScatterResizeAwaitable]:
-        return self._rs_awaitable
-
-    def ensure_reduce_scatter_complete(self) -> None:
-        if self._rs_awaitable is not None:
-            self._rs_awaitable.wait()
-            self._rs_awaitable = None
-
-    def forward(
-        self,
-        features: KeyedJaggedTensor,
-        vbe_output: Optional[torch.Tensor] = None,
-        vbe_output_offsets: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        embs = super().forward(features, vbe_output, vbe_output_offsets)
-        self._async_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._async_stream):
-            self._rs_awaitable = self._reduce_scatter_weights_async()
-        return embs
-
-    def _reduce_scatter_weights_async(self) -> ReduceScatterResizeAwaitable:
-        with torch.no_grad():
-            self.weights_sharded = True
-
-            total_size = self._emb_module.weight.numel()
-
-            num_groups = self._env.num_sharding_groups()
-            shard_size = (total_size + num_groups - 1) // num_groups  # ceil division
-            padded_total_size = shard_size * num_groups
-            padding_size = padded_total_size - total_size
-
-            self._input_tensor = self._emb_module.weight.contiguous()
-            if padding_size > 0:
-                self._input_tensor = torch.nn.functional.pad(
-                    self._emb_module.weight.contiguous(),
-                    (0, padding_size),
-                    value=0.0,
-                )
-
-            if self._shard_buf is None:
-                self._shard_buf = torch.empty(
-                    shard_size,
-                    dtype=self._emb_module.weight.dtype,
-                    device=self._emb_module.weight.device,
-                )
-                # pyre-ignore[16]
-                self._shard_buf_nbytes = self._shard_buf.untyped_storage().nbytes()
-            else:
-                self._shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
-
-            with record_function("## 2d_reduce_scatter_fully_sharded ##"):
-                self._async_work = dist.reduce_scatter_tensor(
-                    output=self._shard_buf,
-                    input=self._input_tensor,
-                    op=dist.ReduceOp.AVG,
-                    group=self._env.replica_pg,
-                    async_op=True,
-                )
-
-            self._async_event = torch.cuda.Event(enable_timing=False, blocking=False)
-            # pyre-ignore[16]
-            self._async_event.record(self._async_stream)
-
-            def resize_callback() -> None:
-                # pyre-ignore[29]
-                self._emb_module.weight.untyped_storage().resize_(0)
-                self._emb_module.weight = self._shard_buf  # pyre-ignore[16]
-                self._input_tensor.untyped_storage().resize_(0)  # pyre-ignore[29]
-                self._input_tensor = None
-
-            return ReduceScatterResizeAwaitable(
-                async_work=self._async_work,
-                async_event=self._async_event,
-                shard_buf=self._shard_buf,
-                resize_callback=resize_callback,
-            )
 
 
 class TritonEmbeddingFusedOptimizer(FusedOptimizer):
