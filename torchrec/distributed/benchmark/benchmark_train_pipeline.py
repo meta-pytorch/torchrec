@@ -21,6 +21,7 @@ To support a new model in pipeline benchmark:
 """
 
 import itertools
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -130,6 +131,7 @@ class RunOptions(BenchFuncConfig):
     local_world_size: Optional[int] = None
     ga_num_steps: int = 1
     num_iters: Optional[int] = None
+    output_json: bool = False
 
 
 # single-rank runner
@@ -301,8 +303,11 @@ def runner(
 
         if rank == 0:
             logger.setLevel(logging.INFO)
-            logger.info(result.prettify())
-            logger.info("\nMarkdown format:\n%s", result)
+            if run_option.output_json:
+                print(json.dumps(result.to_dict(), indent=2))
+            else:
+                logger.info(result.prettify())
+                logger.info("\nMarkdown format:\n%s", result)
 
         return result
 

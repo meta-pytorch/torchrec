@@ -234,6 +234,21 @@ class BenchmarkResult:
 
         return "\n".join(lines)
 
+    def to_dict(self) -> dict[str, float | str]:
+        """Return a dict of key P90 metrics for structured (JSON) output."""
+        d: dict[str, float | str] = {
+            "short_name": self.short_name,
+            "gpu_runtime_p90_ms": float(self.runtime_percentile(90, device="gpu")),
+            "cpu_runtime_p90_ms": float(self.runtime_percentile(90, device="cpu")),
+            "cpu_peak_rss_p90_mb": float(self.cpu_mem_percentile(90)),
+        }
+        if len(self.gpu_mem_stats) > 0:
+            d["gpu_peak_alloc_p90_mb"] = float(self.max_mem_alloc_percentile(90))
+            d["gpu_peak_reserved_p90_mb"] = float(self.max_mem_reserved_percentile(90))
+            d["gpu_mem_used_p90_mb"] = float(self.device_mem_used(90))
+            d["gpu_malloc_retries_p90"] = float(self.mem_retries(90))
+        return d
+
     @classmethod
     def print_table(cls, res: List["BenchmarkResult"]) -> str:
         """Print a human-readable formatted table for console output."""
