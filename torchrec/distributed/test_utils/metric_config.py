@@ -15,6 +15,7 @@ import torch.distributed as dist
 from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
 from torchrec.metrics.metrics_config import (
     MetricsConfig,
+    RecComputeMode,
     RecMetricDef,
     RecMetricEnum,
     RecTaskInfo,
@@ -23,6 +24,12 @@ from torchrec.metrics.metrics_config import (
 
 # Mapping from string names to RecMetricEnum values for CLI usage
 _METRIC_NAME_MAP = {e.value: e for e in RecMetricEnum}
+
+_REC_COMPUTE_MODE_MAP: Dict[str, RecComputeMode] = {
+    "unfused": RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+    "fused": RecComputeMode.FUSED_TASKS_COMPUTATION,
+    "fused_states": RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION,
+}
 
 
 @dataclass
@@ -45,14 +52,51 @@ class RecMetricConfig:
             num_batches=10).
         window_size (int): Window size for windowed metric computation.
             Default is 10_000_000.
-        task_name (str): Name of the metric task. Default is "DefaultTask".
+        num_tasks (int): Number of metric tasks. Each task gets unique
+            prediction/label/weight keys in model_out. Default is 1.
+        rec_compute_mode (str): Computation mode for RecMetrics.
+            "unfused" (default), "fused", or "fused_states".
     """
 
     enable_metrics: bool = False
     metrics: List[str] = field(default_factory=lambda: ["ne"])
     compute_interval: int = 10
     window_size: int = 10_000_000
-    task_name: str = "DefaultTask"
+    num_tasks: int = 1
+    rec_compute_mode: str = "unfused"
+
+    def _generate_tasks(self) -> List[RecTaskInfo]:
+        if self.num_tasks == 1:
+            return [
+                RecTaskInfo(
+                    name="DefaultTask",
+                    label_name="label",
+                    prediction_name="prediction",
+                    weight_name="weight",
+                )
+            ]
+        return [
+            RecTaskInfo(
+                name=f"task_{i}",
+                label_name=f"label_{i}",
+                prediction_name=f"prediction_{i}",
+                weight_name=f"weight_{i}",
+            )
+            for i in range(self.num_tasks)
+        ]
+
+    def generate_model_output(
+        self,
+        batch_size: int,
+        device: torch.device,
+    ) -> Dict[str, torch.Tensor]:
+        """Generate synthetic per-task model output tensors for metric update."""
+        model_out: Dict[str, torch.Tensor] = {}
+        for task in self._generate_tasks():
+            model_out[task.prediction_name] = torch.rand(batch_size, device=device)
+            model_out[task.label_name] = torch.rand(batch_size, device=device)
+            model_out[task.weight_name] = torch.ones(batch_size, device=device)
+        return model_out
 
     def generate_metric_module(
         self,
@@ -66,26 +110,18 @@ class RecMetricConfig:
         Generate a RecMetricModule based on this configuration.
 
         Returns None if enable_metrics is False.
-
-        Args:
-            batch_size: Batch size for the benchmark.
-            world_size: Number of distributed ranks.
-            rank: Current rank.
-            device: Device to place metric tensors on.
-            process_group: Distributed process group for metric sync.
-
-        Returns:
-            A RecMetricModule if metrics are enabled, None otherwise.
         """
         if not self.enable_metrics:
             return None
 
-        task = RecTaskInfo(
-            name=self.task_name,
-            label_name="label",
-            prediction_name="prediction",
-            weight_name="weight",
-        )
+        if self.rec_compute_mode not in _REC_COMPUTE_MODE_MAP:
+            raise ValueError(
+                f"Unknown rec_compute_mode '{self.rec_compute_mode}'. "
+                f"Valid options: {sorted(_REC_COMPUTE_MODE_MAP.keys())}"
+            )
+        compute_mode = _REC_COMPUTE_MODE_MAP[self.rec_compute_mode]
+
+        tasks = self._generate_tasks()
 
         rec_metrics: Dict[RecMetricEnum, RecMetricDef] = {}
         for metric_name in self.metrics:
@@ -95,13 +131,14 @@ class RecMetricConfig:
                     f"Valid options: {sorted(_METRIC_NAME_MAP.keys())}"
                 )
             rec_metrics[_METRIC_NAME_MAP[metric_name]] = RecMetricDef(
-                rec_tasks=[task],
+                rec_tasks=tasks,
                 window_size=self.window_size,
             )
 
         metrics_config = MetricsConfig(
-            rec_tasks=[task],
+            rec_tasks=tasks,
             rec_metrics=rec_metrics,
+            rec_compute_mode=compute_mode,
             compute_interval_steps=self.compute_interval,
         )
 
