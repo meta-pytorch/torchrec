@@ -1362,7 +1362,10 @@ class TestTopologyFactory(unittest.TestCase):
                 intra_host_bw=150.0,
                 inter_host_bw=75.0,
             )
-            kernel_config = KernelConfig(compute_device="cuda")
+            kernel_config = KernelConfig(
+                compute_device="cuda",
+                use_hardware_based_bandwidth=True,
+            )
 
             topology = TopologyFactory.create_topology(
                 trainer_config=trainer_config,
@@ -1381,10 +1384,15 @@ class TestTopologyFactory(unittest.TestCase):
                 hbm_to_ddr_mem_bw=50.0,
                 ssd_mem_bw=10.0,
             )
+            kernel_config = KernelConfig(
+                compute_device="cuda",
+                use_hardware_based_bandwidth=True,
+            )
 
             topology = TopologyFactory.create_topology(
                 trainer_config=trainer_config,
                 hardware_config=hardware_config,
+                kernel_config=kernel_config,
             )
 
             self.assertEqual(topology.hbm_mem_bw, 1000.0)
