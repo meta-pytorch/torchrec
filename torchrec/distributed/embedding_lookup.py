@@ -332,6 +332,7 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                     )
                 if hasattr(emb_op.emb_module, "prefetch"):
                     #  attribute `prefetch`.
+                    # pyrefly: ignore[not-callable]
                     emb_op.emb_module.prefetch(
                         indices=features.values(),
                         offsets=features.offsets(),
@@ -719,6 +720,7 @@ class GroupedPooledEmbeddingsLookup(
                     )
                 if hasattr(emb_op.emb_module, "prefetch"):
                     #  attribute `prefetch`.
+                    # pyrefly: ignore[not-callable]
                     emb_op.emb_module.prefetch(
                         indices=features.values(),
                         offsets=features.offsets(),
