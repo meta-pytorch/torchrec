@@ -71,9 +71,22 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
     """
 
     def __call__(self, *input, **kwargs) -> Awaitable:
-        assert (
-            self._name in self._context.input_dist_tensors_requests
-        ), f"Invalid PipelinedForward usage, input_dist of {self._name} is not available, probably consumed by others"
+        if self._name not in self._context.input_dist_tensors_requests:
+            available_names = list(self._context.input_dist_tensors_requests.keys())
+            output_dist_names = list(
+                self._context.output_dist_embeddings_requests.keys()
+            )
+            raise AssertionError(
+                f"Invalid PipelinedForward usage, input_dist of {self._name} "
+                f"is not available, probably consumed by others. "
+                f"This typically means the embedding module '{self._name}' is "
+                f"being invoked more than once in the model's forward pass, "
+                f"or the pipeline context was not properly populated for this "
+                f"iteration. Each embedding module (EBC, EC, etc.) can only be "
+                f"invoked once per forward pass when using pipelined training. "
+                f"Available input_dist names: {available_names}. "
+                f"Already completed output_dist names: {output_dist_names}."
+            )
         # we made a basic assumption that an embedding module (EBC, EC, etc.) should only be evoked only
         # once in the model's forward pass. For more details: https://github.com/meta-pytorch/torchrec/pull/3294
         request = self._context.input_dist_tensors_requests.pop(self._name)
@@ -120,9 +133,15 @@ class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
             Awaitable[EmbeddingModuleRetType], Awaitable[Optional[KeyedJaggedTensor]]
         ],
     ]:
-        assert (
-            self._name in self._context.embedding_a2a_requests
-        ), f"Invalid PipelinedForward usage, input_dist of {self._name} is not available, probably consumed by others"
+        if self._name not in self._context.embedding_a2a_requests:
+            available_names = list(self._context.embedding_a2a_requests.keys())
+            raise AssertionError(
+                f"Invalid PipelinedForward usage, input_dist of {self._name} "
+                f"is not available, probably consumed by others. "
+                f"Each embedding module (EBC, EC, etc.) can only be invoked "
+                f"once per forward pass when using pipelined training. "
+                f"Available embedding_a2a names: {available_names}."
+            )
         # we made a basic assumption that an embedding module (EBC, EC, etc.) should only be evoked only
         # once in the model's forward pass. For more details: https://github.com/meta-pytorch/torchrec/pull/3294
 
