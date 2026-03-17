@@ -44,13 +44,16 @@ from torchrec.distributed.planner.types import (
     ParameterConstraints,
     Perf,
     PlannerError,
+    SharderData,
     ShardingOption,
     Topology,
 )
 from torchrec.distributed.planner.utils import (
     extract_comm_data_type_size,
+    extract_comm_data_type_size_v2,
     get_num_poolings,
     is_prefetch_pipelined,
+    is_prefetch_pipelined_v2,
 )
 from torchrec.distributed.types import ModuleSharder, ShardingType
 from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
@@ -585,9 +588,8 @@ class ShardPerfContext:
         use_linear_regression_prefetch_estimate: bool = False,
     ) -> List["ShardPerfContext"]:
         """
-        Build list of ShardPerfContexts from ShardingOption and Topology.
-
-        This follows the exact logic from OSS EmbeddingPerfEstimator.estimate.
+        Build list of ShardPerfContexts from ShardingOption and Topology using a live
+        ModuleSharder.
 
         Args:
             config: Hardware performance configuration
@@ -616,6 +618,121 @@ class ShardPerfContext:
                 else None
             )
 
+        # Get data type sizes
+        (
+            fwd_a2a_comm_data_type_size,
+            bwd_a2a_comm_data_type_size,
+            fwd_sr_comm_data_type_size,
+            bwd_sr_comm_data_type_size,
+        ) = extract_comm_data_type_size(sharder, sharding_option)
+
+        # Check prefetch pipeline
+        prefetch_pipeline = is_prefetch_pipelined(sharding_option, sharder)
+
+        return cls._build_contexts(
+            config=config,
+            shard_sizes=shard_sizes,
+            sharding_option=sharding_option,
+            topology=topology,
+            constraints=constraints,
+            caching_ratio=caching_ratio,
+            fwd_a2a_comm_data_type_size=fwd_a2a_comm_data_type_size,
+            bwd_a2a_comm_data_type_size=bwd_a2a_comm_data_type_size,
+            fwd_sr_comm_data_type_size=fwd_sr_comm_data_type_size,
+            bwd_sr_comm_data_type_size=bwd_sr_comm_data_type_size,
+            prefetch_pipeline=prefetch_pipeline,
+            is_inference=is_inference,
+            use_batch_inputs_for_expected_cache_fetches=use_batch_inputs_for_expected_cache_fetches,
+            use_linear_regression_prefetch_estimate=use_linear_regression_prefetch_estimate,
+        )
+
+    @classmethod
+    def build_shard_perf_contexts_v2(
+        cls,
+        config: HardwarePerfConfig,
+        shard_sizes: List[List[int]],
+        sharding_option: ShardingOption,
+        topology: Topology,
+        constraints: Optional[Dict[str, ParameterConstraints]],
+        sharder_data: SharderData,
+        is_inference: bool = False,
+        use_batch_inputs_for_expected_cache_fetches: bool = False,
+        use_linear_regression_prefetch_estimate: bool = False,
+    ) -> List["ShardPerfContext"]:
+        """
+        Build list of ShardPerfContexts from ShardingOption and Topology using a
+        SharderData snapshot.
+
+        Args:
+            config: Hardware performance configuration
+            shard_sizes: List of [hash_size, emb_dim] for each shard
+            sharding_option: The sharding option being evaluated
+            topology: Device topology with bandwidth and world size info
+            constraints: Optional parameter constraints
+            sharder_data: SharderData snapshot for this option
+            is_inference: Whether this is for inference
+            use_batch_inputs_for_expected_cache_fetches: If True, expected_cache_fetches
+                is computed as expected_miss_rate * batch_inputs (total lookups per batch).
+                If False (default), uses expected_miss_rate * expected_unique_lookups.
+            use_linear_regression_prefetch_estimate: If True, clamps num_unique_lookups
+                to min(num_unique_lookups, batch_inputs, hash_size) before computing
+                prefetch time.
+
+        Returns:
+            List of ShardPerfContext instances, one per shard.
+        """
+        # Get caching ratio
+        caching_ratio = sharding_option.cache_load_factor
+        if caching_ratio is None:
+            caching_ratio = sharder_data.fused_params.get("cache_load_factor")
+
+        # Get data type sizes
+        (
+            fwd_a2a_comm_data_type_size,
+            bwd_a2a_comm_data_type_size,
+            fwd_sr_comm_data_type_size,
+            bwd_sr_comm_data_type_size,
+        ) = extract_comm_data_type_size_v2(sharding_option, sharder_data)
+
+        # Check prefetch pipeline
+        prefetch_pipeline = is_prefetch_pipelined_v2(sharding_option, sharder_data)
+
+        return cls._build_contexts(
+            config=config,
+            shard_sizes=shard_sizes,
+            sharding_option=sharding_option,
+            topology=topology,
+            constraints=constraints,
+            caching_ratio=caching_ratio,
+            fwd_a2a_comm_data_type_size=fwd_a2a_comm_data_type_size,
+            bwd_a2a_comm_data_type_size=bwd_a2a_comm_data_type_size,
+            fwd_sr_comm_data_type_size=fwd_sr_comm_data_type_size,
+            bwd_sr_comm_data_type_size=bwd_sr_comm_data_type_size,
+            prefetch_pipeline=prefetch_pipeline,
+            is_inference=is_inference,
+            use_batch_inputs_for_expected_cache_fetches=use_batch_inputs_for_expected_cache_fetches,
+            use_linear_regression_prefetch_estimate=use_linear_regression_prefetch_estimate,
+        )
+
+    @classmethod
+    def _build_contexts(
+        cls,
+        config: HardwarePerfConfig,
+        shard_sizes: List[List[int]],
+        sharding_option: ShardingOption,
+        topology: Topology,
+        constraints: Optional[Dict[str, ParameterConstraints]],
+        caching_ratio: Optional[float],
+        fwd_a2a_comm_data_type_size: float,
+        bwd_a2a_comm_data_type_size: float,
+        fwd_sr_comm_data_type_size: float,
+        bwd_sr_comm_data_type_size: float,
+        prefetch_pipeline: bool,
+        is_inference: bool = False,
+        use_batch_inputs_for_expected_cache_fetches: bool = False,
+        use_linear_regression_prefetch_estimate: bool = False,
+    ) -> List["ShardPerfContext"]:
+        """Shared context-building logic for both build_shard_perf_contexts variants."""
         # Get num_poolings and batch_sizes
         num_poolings = get_num_poolings(constraints, sharding_option)
         batch_sizes = (
@@ -676,15 +793,6 @@ class ShardPerfContext:
 
         # Get data type sizes
         table_data_type_size = sharding_option.tensor.element_size()
-        (
-            fwd_a2a_comm_data_type_size,
-            bwd_a2a_comm_data_type_size,
-            fwd_sr_comm_data_type_size,
-            bwd_sr_comm_data_type_size,
-        ) = extract_comm_data_type_size(sharder, sharding_option)
-
-        # Check prefetch pipeline
-        prefetch_pipeline = is_prefetch_pipelined(sharding_option, sharder)
 
         # Get input_data_type_size from config annotation (if set) or use default BIGINT_DTYPE
         input_data_type_size = getattr(config, "_input_data_type_size", BIGINT_DTYPE)

@@ -1426,6 +1426,7 @@ class ShardEstimator(abc.ABC):
         self,
         sharding_options: List[ShardingOption],
         sharder_map: Optional[Dict[str, ModuleSharder[nn.Module]]] = None,
+        sharder_data_map: Optional[SharderDataMap] = None,
     ) -> None:
         # update sharding_options with per shard estimate in-place
         ...

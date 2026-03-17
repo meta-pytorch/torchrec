@@ -97,6 +97,19 @@ def is_prefetch_pipelined(
     return prefetch_pipeline
 
 
+def is_prefetch_pipelined_v2(
+    sharding_option: ShardingOption, sharder_data: SharderData
+) -> bool:
+    prefetch_pipeline = (
+        sharding_option.cache_params.prefetch_pipeline
+        if sharding_option.cache_params
+        else None
+    )
+    if not prefetch_pipeline:
+        prefetch_pipeline = sharder_data.fused_params.get("prefetch_pipeline", False)
+    return prefetch_pipeline
+
+
 def extract_comm_data_type_size(
     sharder: ModuleSharder[nn.Module], sharding_option: ShardingOption
 ) -> Tuple[float, float, float, float]:
@@ -146,6 +159,47 @@ def extract_comm_data_type_size(
             bwd_sr_comm_data_type_size = torch.tensor(
                 [], dtype=codecs.backward.quantized_dtype
             ).element_size()
+
+    return (
+        fwd_a2a_comm_data_type_size,
+        bwd_a2a_comm_data_type_size,
+        fwd_sr_comm_data_type_size,
+        bwd_sr_comm_data_type_size,
+    )
+
+
+def extract_comm_data_type_size_v2(
+    sharding_option: ShardingOption, sharder_data: SharderData
+) -> Tuple[float, float, float, float]:
+    table_data_type_size = sharding_option.tensor.element_size()
+
+    fwd_a2a_comm_data_type_size = table_data_type_size
+    bwd_a2a_comm_data_type_size = table_data_type_size
+    fwd_sr_comm_data_type_size = table_data_type_size
+    bwd_sr_comm_data_type_size = table_data_type_size
+
+    qcomm = sharder_data.qcomm_dtype_sizes
+
+    if sharding_option.is_pooled and CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name in qcomm:
+        fwd_a2a_comm_data_type_size, bwd_a2a_comm_data_type_size = qcomm[
+            CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name
+        ]
+
+    if (
+        not sharding_option.is_pooled
+        and CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name in qcomm
+    ):
+        fwd_a2a_comm_data_type_size, bwd_a2a_comm_data_type_size = qcomm[
+            CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name
+        ]
+
+    if (
+        sharding_option.is_pooled
+        and CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name in qcomm
+    ):
+        fwd_sr_comm_data_type_size, bwd_sr_comm_data_type_size = qcomm[
+            CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name
+        ]
 
     return (
         fwd_a2a_comm_data_type_size,
