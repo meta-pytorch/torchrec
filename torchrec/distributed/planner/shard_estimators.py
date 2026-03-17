@@ -160,8 +160,15 @@ class EmbeddingStorageEstimator(ShardEstimator):
             assert not sharding_options, "sharder_map not provided for sharding_options"
             return
 
+        from torch._utils_internal import justknobs_check
+
         for sharding_option in sharding_options:
-            sharder_key = sharder_name(type(sharding_option.module[1]))
+            if justknobs_check(
+                "pytorch/torchrec:enable_precomputed_sharding_option_fields"
+            ):
+                sharder_key = sharding_option.module_type_key
+            else:
+                sharder_key = sharder_name(type(sharding_option.module[1]))
             sharder = sharder_map[sharder_key]
 
             caching_ratio = sharding_option.cache_load_factor
