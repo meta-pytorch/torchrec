@@ -188,6 +188,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
             # pyre-ignore[16]: model may not have _dmp_wrapped_module
             dmp = model._dmp_wrapped_module
             if hasattr(dmp, "no_sync"):
+                # pyrefly: ignore[not-callable]
                 return dmp.no_sync()
 
         # Check for direct DDP

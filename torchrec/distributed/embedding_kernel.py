@@ -191,8 +191,9 @@ def create_virtual_table_local_metadata(
             if weight_count_per_rank is None
             else sum(weight_count_per_rank[:my_rank])
         )
-    # pyrefly: ignore[no-matching-overload]
+    # pyrefly: ignore[no-matching-overload, missing-attribute]
     local_metadata.shard_sizes = list(param.size())
+    # pyrefly: ignore[missing-attribute]
     local_metadata.shard_offsets = [
         offset if dim == 0 else 0
         # pyrefly: ignore[bad-argument-type]
@@ -233,12 +234,13 @@ def create_virtual_table_global_metadata(
                 weight_count_per_rank[rank] if weight_count_per_rank is not None else 1
             )
         if rank < my_rank:
-            # pyrefly: ignore[bad-assignment]
+            # pyrefly: ignore[bad-assignment, missing-attribute]
             shard_metadata.shard_sizes = [
                 curr_rank_rows if dim == 0 else param.size(dim)
                 # pyrefly: ignore[bad-argument-type]
                 for dim in range(len(param.size()))
             ]
+            # pyrefly: ignore[missing-attribute]
             shard_metadata.shard_offsets = [
                 offset if dim == 0 else 0
                 # pyrefly: ignore[bad-argument-type]
@@ -249,12 +251,13 @@ def create_virtual_table_global_metadata(
             curr_rank_rows = param.size()[0]
             create_virtual_table_local_metadata(shard_metadata, param, my_rank, offset)
         else:
-            # pyrefly: ignore[bad-assignment]
+            # pyrefly: ignore[bad-assignment, missing-attribute]
             shard_metadata.shard_sizes = [
                 curr_rank_rows if dim == 0 else param.size(dim)
                 # pyrefly: ignore[bad-argument-type]
                 for dim in range(len(param.size()))
             ]
+            # pyrefly: ignore[missing-attribute]
             shard_metadata.shard_offsets = [
                 offset if dim == 0 else 0
                 # pyrefly: ignore[bad-argument-type]
@@ -318,6 +321,7 @@ def create_virtual_sharded_tensors(
         key_to_global_metadata[key] = global_metadata
 
         local_metadata = copy.deepcopy(global_metadata.shards_metadata[my_rank])
+        # pyrefly: ignore[missing-attribute]
         local_metadata.placement = none_throws(
             none_throws(
                 embedding_table.local_metadata,
@@ -444,7 +448,9 @@ def get_state_dict(
                 my_rank = dist.get_rank()
                 for rank, shards_metadata in enumerate(glb_metadata.shards_metadata):
                     if rank < my_rank:
+                        # pyrefly: ignore[missing-attribute]
                         shards_metadata.shard_offsets = [0, 0]
+                        # pyrefly: ignore[missing-attribute]
                         shards_metadata.shard_sizes = [0, 0]
                     elif rank == my_rank:
                         # pyrefly: ignore[missing-attribute]
@@ -452,11 +458,13 @@ def get_state_dict(
                         # pyrefly: ignore[missing-attribute]
                         shards_metadata.shard_sizes = local_metadata.shard_sizes
                     else:
+                        # pyrefly: ignore[missing-attribute]
                         shards_metadata.shard_offsets = [
                             # pyrefly: ignore[missing-attribute]
                             local_metadata.shard_sizes[0],
                             0,
                         ]
+                        # pyrefly: ignore[missing-attribute]
                         shards_metadata.shard_sizes = [0, 0]
 
             key_to_global_metadata[weights_key] = glb_metadata

@@ -92,6 +92,7 @@ class RecMetricConfig:
             if metric_name not in _METRIC_NAME_MAP:
                 raise ValueError(
                     f"Unknown metric '{metric_name}'. "
+                    # pyrefly: ignore[no-matching-overload]
                     f"Valid options: {sorted(_METRIC_NAME_MAP.keys())}"
                 )
             rec_metrics[_METRIC_NAME_MAP[metric_name]] = RecMetricDef(
