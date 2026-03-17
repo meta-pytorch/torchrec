@@ -1877,7 +1877,7 @@ class ShardedEmbeddingBagCollection(
                 # use a separate stream. The wait_for_forward() method synchronizes via
                 # CUDA events recorded after the Triton kernel completes.
                 if hasattr(lookup, "wait_for_forward"):
-                    # pyre-ignore[29]: `wait_for_forward` is dynamically checked
+                    # pyrefly: ignore[not-callable]: `wait_for_forward` is dynamically checked
                     lookup.wait_for_forward()
                 if MemoryStashingManager.is_enabled():
                     stash_result = MemoryStashingManager.stash_embedding_weights(lookup)

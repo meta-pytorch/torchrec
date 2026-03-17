@@ -157,7 +157,9 @@ class OutputDistSiteTest(unittest.TestCase):
         w._tensor_awaitable = _make_request_with_dummy_tensor()
 
         fake = FakeAwaitable()
-        fake._awaitables = [w]  # pyre-ignore[16]
-        fake._sharding_types = [ShardingType.TABLE_WISE.value]  # pyre-ignore[16]
+        # pyrefly: ignore[missing-attribute]
+        fake._awaitables = [w]
+        # pyrefly: ignore[missing-attribute]
+        fake._sharding_types = [ShardingType.TABLE_WISE.value]
 
         self.assertIsNotNone(site.find_grad_tensor(fake))

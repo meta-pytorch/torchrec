@@ -796,7 +796,7 @@ def get_num_poolings(
 
     # Second priority: use constraint-based num_poolings
     if constraints and constraints.get(so.name) and constraints[so.name].num_poolings:
-        # pyre-ignore[6]
+        # pyrefly: ignore[bad-argument-type]
         return cast(List[float], constraints[so.name].num_poolings)
 
     # Fallback: use default NUM_POOLINGS constant

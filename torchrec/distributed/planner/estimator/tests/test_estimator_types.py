@@ -65,7 +65,7 @@ class PerfCoefficientTest(unittest.TestCase):
         """Test that PerfCoefficient is frozen (immutable)."""
         coeff = PerfCoefficient()
         with self.assertRaises(AttributeError):
-            coeff.input_read_size_multiplier = 2.0  # pyre-ignore[41]
+            coeff.input_read_size_multiplier = 2.0  # pyrefly: ignore[read-only]
 
 
 class EstimatorPerfCoefficientsTest(unittest.TestCase):
@@ -297,7 +297,7 @@ class HardwarePerfConfigTest(unittest.TestCase):
         perf_config = config.coefficients
         self.assertIsNotNone(perf_config.row_wise)
         self.assertEqual(
-            perf_config.row_wise.fwd.lookup_size_multiplier,  # pyre-ignore[16]
+            perf_config.row_wise.fwd.lookup_size_multiplier,  # pyrefly: ignore[missing-attribute]
             3.0,
         )
         self.assertIsNotNone(perf_config.prefetch)

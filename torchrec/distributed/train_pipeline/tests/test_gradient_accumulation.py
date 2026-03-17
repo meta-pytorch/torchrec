@@ -26,7 +26,7 @@ class _MockPipeline(TrainPipeline[Any, float]):
     """Mock pipeline that tracks progress() calls and can raise StopIteration."""
 
     def __init__(self, num_batches: int) -> None:
-        super().__init__()  # pyre-ignore[20]
+        super().__init__()  # pyrefly: ignore[missing-argument]
         self._optimizer = MagicMock()
         self._num_batches = num_batches
         self._calls: int = 0
@@ -52,7 +52,7 @@ class _RealForwardPipeline(TrainPipeline[Any, torch.Tensor]):
         model: nn.Module,
         optimizer: optim.Optimizer,
     ) -> None:
-        super().__init__()  # pyre-ignore[20]
+        super().__init__()  # pyrefly: ignore[missing-argument]
         self._model = model
         self._optimizer = optimizer
         self._progress_count = 0
@@ -518,7 +518,9 @@ class StopIterationHandlingTest(unittest.TestCase):
             flush_call_count[0] += 1
             return original_flush(steps)
 
-        ga._flush_accumulated_gradients = counting_flush  # pyre-ignore[8]
+        ga._flush_accumulated_gradients = (
+            counting_flush  # pyrefly: ignore[bad-assignment]
+        )
 
         with self.assertRaises(StopIteration):
             ga.progress(dummy_iter, is_last_batch=True)
@@ -626,7 +628,9 @@ class IsLastBatchTest(unittest.TestCase):
             step_call_count[0] += 1
             return original_step(*args, **kwargs)
 
-        wrapper.optimizer_wrapper._optimizer.step = counting_step  # pyre-ignore[8]
+        wrapper.optimizer_wrapper._optimizer.step = (
+            counting_step  # pyrefly: ignore[bad-assignment]
+        )
 
         # 4th batch is at accumulation boundary AND is_last_batch=True
         wrapper.progress(iter([torch.randn(2, 10)]), is_last_batch=True)

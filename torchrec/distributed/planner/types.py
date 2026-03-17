@@ -1134,7 +1134,7 @@ class ShardingOption:
                 "feature_processor_modules",
             )
             and isinstance(
-                # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+                # pyrefly: ignore[missing-attribute]: `Module` has no attribute `_feature_processor`
                 child_module._feature_processor.feature_processor_modules,
                 nn.ModuleDict,
             )
@@ -1142,12 +1142,12 @@ class ShardingOption:
         self._has_feature_processor: bool = (
             _module_has_fp
             and name
-            # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+            # pyrefly: ignore[missing-attribute]: `Module` has no attribute `_feature_processor`
             in child_module._feature_processor.feature_processor_modules.keys()
         )
         if hasattr(child_module, "is_weighted") and callable(child_module.is_weighted):
             if isinstance(child_module, EmbeddingBagCollectionInterface):
-                # pyre-ignore[29]: `Module` has no attribute `is_weighted`
+                # pyrefly: ignore[not-callable]: `Module` has no attribute `is_weighted`
                 self.is_weighted = child_module.is_weighted()
 
     @property

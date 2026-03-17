@@ -79,9 +79,9 @@ def create_test_context(
     compute_kernel: str = EmbeddingComputeKernel.FUSED.value,
     hash_size: int = 10000,
     emb_dim: int = 128,
-    batch_sizes: Optional[list] = None,  # pyre-ignore[24]
-    num_poolings: Optional[list] = None,  # pyre-ignore[24]
-    input_lengths: Optional[list] = None,  # pyre-ignore[24]
+    batch_sizes: Optional[list] = None,  # pyrefly: ignore
+    num_poolings: Optional[list] = None,  # pyrefly: ignore
+    input_lengths: Optional[list] = None,  # pyrefly: ignore
     world_size: int = 8,
     local_world_size: int = 4,
     device_bw: float = HBM_MEM_BW,

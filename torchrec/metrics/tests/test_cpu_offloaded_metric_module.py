@@ -607,12 +607,12 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             )
 
         self.assertTrue(offloaded_metric.predictions_update_calls is not None)
-        # pyre-ignore[6]: predictions_update_calls contains Dict[str, Tensor]
+        # pyrefly: ignore[bad-argument-type]
         torch.testing.assert_close(
             offloaded_metric.predictions_update_calls[0],
             {"task1": torch.tensor([0.5, 0.7])},
         )
-        # pyre-ignore[6]: labels_update_calls contains Dict[str, Tensor]
+        # pyrefly: ignore[bad-argument-type]
         torch.testing.assert_close(
             offloaded_metric.labels_update_calls[0],
             {"task1": torch.tensor([0.0, 1.0])},
@@ -620,7 +620,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         offloaded_module.shutdown()
 
-    # pyre-ignore[56]
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",

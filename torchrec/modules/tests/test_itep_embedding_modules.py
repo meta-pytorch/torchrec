@@ -917,7 +917,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
 
         return input_kjt_cuda
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -941,7 +941,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
             )
             _ = itep_ec(input_kjt)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -965,7 +965,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
             )
             _ = itep_ec(input_kjt)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -996,7 +996,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
 
         self.assertEqual(mock_reset_weight_momentum.call_count, 5)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -1028,7 +1028,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
 
         self.assertEqual(mock_reset_weight_momentum.call_count, 0)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -1056,7 +1056,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
             _ = itep_ec(input_kjt)
             self.assertEqual(itep_ec._iter.item(), expected_iter)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -1078,7 +1078,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
         original_forward = itep_module.forward
         captured_iter_args = []
 
-        # pyre-ignore[53]: Captured variable `captured_iter_args` is not annotated.
+        # pyrefly: ignore
         def mock_forward(
             features: KeyedJaggedTensor, iter_val: int
         ) -> KeyedJaggedTensor:
@@ -1098,7 +1098,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
             self.assertEqual(arg_type, int)
             self.assertEqual(arg_value, 42)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -1130,7 +1130,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
             if jt.values().numel() > 0:
                 self.assertEqual(jt.values().shape[1], 4)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -1158,7 +1158,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
         config_names = {c.name for c in configs}
         self.assertEqual(config_names, {"table1", "table2"})
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -1193,7 +1193,7 @@ class TestITEPEmbeddingCollection(unittest.TestCase):
             self.assertIsInstance(jt, JaggedTensor)
             self.assertEqual(jt.values().shape[1], 4)
 
-    # pyre-ignore[56]: Pyre was not able to infer the type of argument
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",

@@ -3939,11 +3939,11 @@ class ShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBag):
         self.weights_sharded = False
         self._input_tensor = None
         self._element_size = self._emb_module.weight.element_size()
-        # pyre-ignore[8]
+        # pyrefly: ignore[bad-assignment]
         self._original_shape: torch.Size = self._emb_module.weight.shape
         # Triton TBE's weight is a plain tensor attribute (not nn.Parameter),
         # same pattern as CUDA TBE's weights_dev.
-        # pyre-ignore[8]
+        # pyrefly: ignore[bad-assignment]
         self._unsharded_param: torch.Tensor = self._emb_module.weight
         self._shard_buf_nbytes: int = 0
         self._shard_buf: Optional[torch.Tensor] = None
@@ -3956,7 +3956,7 @@ class ShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBag):
         self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
 
         self.register_full_backward_pre_hook(
-            self._hybrid_sharded_backward_hook,  # pyre-ignore[6]
+            self._hybrid_sharded_backward_hook,  # pyrefly: ignore[bad-argument-type]
         )
 
     def _all_gather_table_weights(self) -> None:
@@ -3964,7 +3964,7 @@ class ShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBag):
             return
         self.ensure_reduce_scatter_complete()
 
-        shard_size = self._shard_buf.numel()
+        shard_size = self._shard_buf.numel()  # pyrefly: ignore[missing-attribute]
         padded_total_size = shard_size * self._env.num_sharding_groups()
 
         self._unsharded_param.untyped_storage().resize_(
@@ -3978,7 +3978,7 @@ class ShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBag):
                 dtype=self._unsharded_param.dtype,
                 device=self._unsharded_param.device,
             )
-            output_tensor.set_(
+            output_tensor.set_(  # pyrefly: ignore[no-matching-overload]
                 self._unsharded_param.untyped_storage(),
                 0,  # storage_offset
                 (padded_total_size,),  # size
@@ -3991,9 +3991,9 @@ class ShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBag):
                 group=self._env.replica_pg,
                 async_op=False,
             )
-        # pyre-ignore[16]
+        # pyrefly: ignore[missing-attribute]
         self._emb_module.weight = self._unsharded_param[: self._original_shape.numel()]
-        # pyre-ignore[16]
+        # pyrefly: ignore[missing-attribute]
         self._shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
@@ -4047,7 +4047,7 @@ class ShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBag):
                     dtype=self._emb_module.weight.dtype,
                     device=self._emb_module.weight.device,
                 )
-                # pyre-ignore[16]
+                # pyrefly: ignore[missing-attribute]
                 self._shard_buf_nbytes = self._shard_buf.untyped_storage().nbytes()
             else:
                 self._shard_buf.untyped_storage().resize_(self._shard_buf_nbytes)
@@ -4062,14 +4062,16 @@ class ShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBag):
                 )
 
             self._async_event = torch.cuda.Event(enable_timing=False, blocking=False)
-            # pyre-ignore[16]
+            # pyrefly: ignore[missing-attribute]
             self._async_event.record(self._async_stream)
 
             def resize_callback() -> None:
-                # pyre-ignore[29]
+                # pyrefly: ignore[not-callable]
                 self._emb_module.weight.untyped_storage().resize_(0)
-                self._emb_module.weight = self._shard_buf  # pyre-ignore[16]
-                self._input_tensor.untyped_storage().resize_(0)  # pyre-ignore[29]
+                # pyrefly: ignore[bad-assignment]
+                self._emb_module.weight = self._shard_buf
+                # pyrefly: ignore[missing-attribute]
+                self._input_tensor.untyped_storage().resize_(0)
                 self._input_tensor = None
 
             return ReduceScatterResizeAwaitable(
