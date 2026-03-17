@@ -613,7 +613,9 @@ class ShardPerfContext:
         caching_ratio = sharding_option.cache_load_factor
         if caching_ratio is None:
             caching_ratio = (
-                sharder.fused_params.get("cache_load_factor")  # pyre-ignore[16]
+                sharder.fused_params.get(
+                    "cache_load_factor"
+                )  # pyrefly: ignore[missing-attribute]
                 if hasattr(sharder, "fused_params") and sharder.fused_params
                 else None
             )
@@ -771,15 +773,15 @@ class ShardPerfContext:
                 hasattr(module, "_feature_processor")
                 and hasattr(module._feature_processor, "feature_processor_modules")
                 and isinstance(
-                    module._feature_processor.feature_processor_modules,  # pyre-ignore[16]
+                    module._feature_processor.feature_processor_modules,  # pyrefly: ignore[missing-attribute]
                     nn.ModuleDict,
                 )
                 and sharding_option.name
-                in module._feature_processor.feature_processor_modules.keys()  # pyre-ignore[16]
+                in module._feature_processor.feature_processor_modules.keys()  # pyrefly: ignore[missing-attribute]
             ):
                 has_feature_processor = True
             if isinstance(module, EmbeddingBagCollectionInterface):
-                is_weighted = module.is_weighted()  # pyre-ignore[29]
+                is_weighted = module.is_weighted()  # pyrefly: ignore[not-callable]
             elif (
                 constraints
                 and constraints.get(sharding_option.name)

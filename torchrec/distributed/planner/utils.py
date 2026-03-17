@@ -90,7 +90,9 @@ def is_prefetch_pipelined(
     # TODO: remove after deprecating fused_params in sharder
     if not prefetch_pipeline:
         prefetch_pipeline = (
-            sharder.fused_params.get("prefetch_pipeline", False)  # pyre-ignore[16]
+            sharder.fused_params.get(
+                "prefetch_pipeline", False
+            )  # pyrefly: ignore[missing-attribute]
             if hasattr(sharder, "fused_params") and sharder.fused_params
             else False
         )

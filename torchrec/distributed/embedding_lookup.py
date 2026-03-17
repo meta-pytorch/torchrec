@@ -1014,7 +1014,7 @@ class GroupedPooledEmbeddingsLookup(
         """
         for emb_module in self._emb_modules:
             if hasattr(emb_module, "wait_for_forward"):
-                # pyre-ignore[16]: `wait_for_forward` is dynamically checked above
+                # pyrefly: ignore[not-callable]: `wait_for_forward` is dynamically checked above
                 emb_module.wait_for_forward()
 
     def get_resize_awaitables(self) -> List[LazyAwaitable[torch.Tensor]]:

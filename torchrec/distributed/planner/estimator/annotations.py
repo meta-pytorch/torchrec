@@ -254,7 +254,7 @@ def hbm_mem_bw(value: float) -> Callable[[Type[T]], Type[T]]:
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls.hbm_mem_bw = value  # pyre-ignore[16]
+        cls.hbm_mem_bw = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -276,7 +276,7 @@ def ddr_mem_bw(value: float) -> Callable[[Type[T]], Type[T]]:
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls.ddr_mem_bw = value  # pyre-ignore[16]
+        cls.ddr_mem_bw = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -298,7 +298,7 @@ def ssd_mem_bw(value: float) -> Callable[[Type[T]], Type[T]]:
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls.ssd_mem_bw = value  # pyre-ignore[16]
+        cls.ssd_mem_bw = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -321,7 +321,7 @@ def hbm_to_ddr_mem_bw(value: float) -> Callable[[Type[T]], Type[T]]:
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls.hbm_to_ddr_mem_bw = value  # pyre-ignore[16]
+        cls.hbm_to_ddr_mem_bw = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -363,7 +363,7 @@ def device_bw(
                 not hasattr(cls, "kernel_device_bandwidths")
                 or cls.kernel_device_bandwidths is None
             ):
-                cls.kernel_device_bandwidths = {}  # pyre-ignore[16]
+                cls.kernel_device_bandwidths = {}  # pyrefly: ignore[missing-attribute]
             else:
                 # Check if we're using an inherited dictionary by comparing with parent's
                 # If so, create a new copy for this class
@@ -375,7 +375,7 @@ def device_bw(
                     ):
                         cls.kernel_device_bandwidths = dict(
                             cls.kernel_device_bandwidths
-                        )  # pyre-ignore[16]
+                        )  # pyrefly: ignore[missing-attribute]
                         break
 
             # Normalize compute_kernel to a list for uniform processing
@@ -388,10 +388,11 @@ def device_bw(
             # Store with lowercase keys for case-insensitive lookup
             for kernel in kernels:
                 key = (device_str.lower(), kernel.lower())
-                cls.kernel_device_bandwidths[key] = bandwidth  # pyre-ignore[16]
+                # pyrefly: ignore[missing-attribute]
+                cls.kernel_device_bandwidths[key] = bandwidth
         else:
             # General device bandwidth (existing behavior)
-            cls.device_bw = bandwidth  # pyre-ignore[16]
+            cls.device_bw = bandwidth  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -419,7 +420,7 @@ def intra_host_bw(value: float) -> Callable[[Type[T]], Type[T]]:
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls.intra_host_bw = value  # pyre-ignore[16]
+        cls.intra_host_bw = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -442,7 +443,7 @@ def inter_host_bw(value: float) -> Callable[[Type[T]], Type[T]]:
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls.inter_host_bw = value  # pyre-ignore[16]
+        cls.inter_host_bw = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -514,8 +515,10 @@ def forward_compute(
         method: Callable[..., float],
         target_sharding_type: Optional[Union[str, List[str]]],
     ) -> Callable[..., float]:
-        method._is_custom_forward_compute = True  # pyre-ignore[16]
-        method._custom_sharding_type = target_sharding_type  # pyre-ignore[16]
+        method._is_custom_forward_compute = True  # pyrefly: ignore[missing-attribute]
+        method._custom_sharding_type = (  # pyrefly: ignore[missing-attribute]
+            target_sharding_type
+        )
         return method
 
     # Case 1: @forward_compute (no parentheses)
@@ -589,8 +592,10 @@ def backward_compute(
         method: Callable[..., float],
         target_sharding_type: Optional[Union[str, List[str]]],
     ) -> Callable[..., float]:
-        method._is_custom_backward_compute = True  # pyre-ignore[16]
-        method._custom_sharding_type = target_sharding_type  # pyre-ignore[16]
+        method._is_custom_backward_compute = True  # pyrefly: ignore[missing-attribute]
+        method._custom_sharding_type = (  # pyrefly: ignore[missing-attribute]
+            target_sharding_type
+        )
         return method
 
     # Case 1: @backward_compute (no parentheses)
@@ -638,7 +643,7 @@ def prefetch_compute(
                 # Custom prefetch logic
                 return expected_cache_fetches * ctx.shard_embedding_dim / self.custom_prefetch_bw
     """
-    method._is_custom_prefetch_compute = True  # pyre-ignore[16]
+    method._is_custom_prefetch_compute = True  # pyrefly: ignore[missing-attribute]
     return method
 
 
@@ -699,8 +704,10 @@ def input_dist_comms(
         method: Callable[..., float],
         target_sharding_type: Optional[Union[str, List[str]]],
     ) -> Callable[..., float]:
-        method._is_custom_input_dist_comms = True  # pyre-ignore[16]
-        method._custom_sharding_type = target_sharding_type  # pyre-ignore[16]
+        method._is_custom_input_dist_comms = True  # pyrefly: ignore[missing-attribute]
+        method._custom_sharding_type = (  # pyrefly: ignore[missing-attribute]
+            target_sharding_type
+        )
         return method
 
     # Case 1: @input_dist_comms (no parentheses)
@@ -789,8 +796,10 @@ def fwd_comms(
         method: Callable[..., float],
         target_sharding_type: Optional[Union[str, List[str]]],
     ) -> Callable[..., float]:
-        method._is_custom_fwd_comms = True  # pyre-ignore[16]
-        method._custom_sharding_type = target_sharding_type  # pyre-ignore[16]
+        method._is_custom_fwd_comms = True  # pyrefly: ignore[missing-attribute]
+        method._custom_sharding_type = (  # pyrefly: ignore[missing-attribute]
+            target_sharding_type
+        )
         return method
 
     # Case 1: @fwd_comms (no parentheses)
@@ -879,8 +888,10 @@ def bwd_comms(
         method: Callable[..., float],
         target_sharding_type: Optional[Union[str, List[str]]],
     ) -> Callable[..., float]:
-        method._is_custom_bwd_comms = True  # pyre-ignore[16]
-        method._custom_sharding_type = target_sharding_type  # pyre-ignore[16]
+        method._is_custom_bwd_comms = True  # pyrefly: ignore[missing-attribute]
+        method._custom_sharding_type = (  # pyrefly: ignore[missing-attribute]
+            target_sharding_type
+        )
         return method
 
     # Case 1: @bwd_comms (no parentheses)
@@ -974,8 +985,10 @@ def output_write_size(
         method: Callable[..., float],
         target_sharding_type: Optional[Union[str, List[str]]],
     ) -> Callable[..., float]:
-        method._is_custom_output_write_size = True  # pyre-ignore[16]
-        method._custom_sharding_type = target_sharding_type  # pyre-ignore[16]
+        method._is_custom_output_write_size = True  # pyrefly: ignore[missing-attribute]
+        method._custom_sharding_type = (  # pyrefly: ignore[missing-attribute]
+            target_sharding_type
+        )
         return method
 
     # Case 1: @output_write_size (no parentheses)
@@ -1029,7 +1042,7 @@ def use_min_dim_for_lookup(value: bool = True) -> Callable[[Type[T]], Type[T]]:
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls._use_min_dim_for_lookup = value  # pyre-ignore[16]
+        cls._use_min_dim_for_lookup = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -1058,7 +1071,7 @@ def use_block_usage_penalty(value: bool = True) -> Callable[[Type[T]], Type[T]]:
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls._use_block_usage_penalty = value  # pyre-ignore[16]
+        cls._use_block_usage_penalty = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -1085,7 +1098,7 @@ def use_bytes_for_input_read_size(value: bool = True) -> Callable[[Type[T]], Typ
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls._use_bytes_for_input_read_size = value  # pyre-ignore[16]
+        cls._use_bytes_for_input_read_size = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -1108,7 +1121,7 @@ def input_data_type_size(value: float) -> Callable[[Type[T]], Type[T]]:
     """
 
     def decorator(cls: Type[T]) -> Type[T]:
-        cls._input_data_type_size = value  # pyre-ignore[16]
+        cls._input_data_type_size = value  # pyrefly: ignore[missing-attribute]
         return cls
 
     return decorator
@@ -1138,7 +1151,7 @@ def supported_sharding_types(*sharding_types: str) -> Callable[[Type[T]], Type[T
 
     def decorator(cls: Type[T]) -> Type[T]:
         # Store as a frozenset for O(1) lookup, lowercase for case-insensitive matching
-        cls._supported_sharding_types = frozenset(  # pyre-ignore[16]
+        cls._supported_sharding_types = frozenset(  # pyrefly: ignore[missing-attribute]
             st.lower() for st in sharding_types
         )
         return cls
@@ -1200,8 +1213,10 @@ def fwd_coefficient(
     """
 
     def decorator(method: Callable[..., Any]) -> Callable[..., Any]:
-        method._is_fwd_coefficient = True  # pyre-ignore[16]
-        method._coefficient_sharding_type = sharding_type  # pyre-ignore[16]
+        method._is_fwd_coefficient = True  # pyrefly: ignore[missing-attribute]
+        method._coefficient_sharding_type = (  # pyrefly: ignore[missing-attribute]
+            sharding_type
+        )
         return method
 
     return decorator
@@ -1233,8 +1248,10 @@ def bwd_coefficient(
     """
 
     def decorator(method: Callable[..., Any]) -> Callable[..., Any]:
-        method._is_bwd_coefficient = True  # pyre-ignore[16]
-        method._coefficient_sharding_type = sharding_type  # pyre-ignore[16]
+        method._is_bwd_coefficient = True  # pyrefly: ignore[missing-attribute]
+        method._coefficient_sharding_type = (  # pyrefly: ignore[missing-attribute]
+            sharding_type
+        )
         return method
 
     return decorator
@@ -1258,7 +1275,7 @@ def prefetch_coefficient() -> Callable[[Callable[..., Any]], Callable[..., Any]]
     """
 
     def decorator(method: Callable[..., Any]) -> Callable[..., Any]:
-        method._is_prefetch_coefficient = True  # pyre-ignore[16]
+        method._is_prefetch_coefficient = True  # pyrefly: ignore[missing-attribute]
         return method
 
     return decorator

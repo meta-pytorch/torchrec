@@ -336,7 +336,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         )
         self._sparse_future: Optional[Future[In]] = None
 
-    # pyre-ignore[14]
+    # pyrefly: ignore[bad-override]
     def _pipeline_model(
         self,
         batch: In,
@@ -540,7 +540,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         else:
             return self._copy_to_gpu(batch, context)
 
-    # pyre-ignore[14]
+    # pyrefly: ignore[bad-override]
     def enqueue_batch(self, dataloader_iter: Iterator[In]) -> bool:
         """
         Load a batch from the dataloader, create context, and append to
@@ -728,8 +728,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
                 def _copy_work() -> In:
                     # pyrefly: ignore [bad-argument-type]
                     with self._stream_context(self._memcpy_stream):
-                        # pyrefly: ignore [redundant-cast]
-                        return _to_device(cast(In, batch), self._device, True)
+                        return _to_device(batch, self._device, True)
 
                 future_batch = self._copy_executor.submit(_copy_work)
                 return cast(In, future_batch), context

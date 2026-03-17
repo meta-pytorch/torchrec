@@ -693,7 +693,7 @@ class TestMCH(unittest.TestCase):
         self.assertTrue(m._eviction_policy_name is None)
         self.assertTrue(m._eviction_module is None)
 
-    # pyre-ignore[56]
+    # pyrefly: ignore
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",

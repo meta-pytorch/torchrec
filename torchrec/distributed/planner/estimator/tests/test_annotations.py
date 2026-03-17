@@ -47,10 +47,13 @@ class FwdCoefficientDecoratorTest(unittest.TestCase):
         method = config.get_table_wise_fwd
 
         self.assertTrue(hasattr(method, "_is_fwd_coefficient"))
-        self.assertTrue(method._is_fwd_coefficient)  # pyre-ignore[16]
+        self.assertTrue(
+            method._is_fwd_coefficient
+        )  # pyrefly: ignore[missing-attribute]
         self.assertTrue(hasattr(method, "_coefficient_sharding_type"))
         self.assertEqual(
-            method._coefficient_sharding_type, "table_wise"  # pyre-ignore[16]
+            method._coefficient_sharding_type,
+            "table_wise",  # pyrefly: ignore[missing-attribute]
         )
 
     def test_fwd_coefficient_decorator_with_multiple_sharding_types(self) -> None:
@@ -64,9 +67,12 @@ class FwdCoefficientDecoratorTest(unittest.TestCase):
         config = TestConfig()
         method = config.get_fwd
 
-        self.assertTrue(method._is_fwd_coefficient)  # pyre-ignore[16]
+        self.assertTrue(
+            # pyrefly: ignore[missing-attribute]
+            method._is_fwd_coefficient
+        )
         self.assertEqual(
-            method._coefficient_sharding_type,  # pyre-ignore[16]
+            method._coefficient_sharding_type,  # pyrefly: ignore[missing-attribute]
             ["table_wise", "row_wise"],
         )
 
@@ -81,8 +87,14 @@ class FwdCoefficientDecoratorTest(unittest.TestCase):
         config = TestConfig()
         method = config.get_fwd_all
 
-        self.assertTrue(method._is_fwd_coefficient)  # pyre-ignore[16]
-        self.assertIsNone(method._coefficient_sharding_type)  # pyre-ignore[16]
+        self.assertTrue(
+            # pyrefly: ignore[missing-attribute]
+            method._is_fwd_coefficient
+        )
+        self.assertIsNone(
+            # pyrefly: ignore[missing-attribute]
+            method._coefficient_sharding_type
+        )
 
     def test_get_fwd_coefficient_returns_coefficient_for_matching_sharding_type(
         self,
@@ -98,7 +110,9 @@ class FwdCoefficientDecoratorTest(unittest.TestCase):
         result = get_fwd_coefficient(config, "table_wise")
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["emb_lookup"], 1.5)  # pyre-ignore[16]
+        self.assertEqual(
+            result["emb_lookup"], 1.5
+        )  # pyrefly: ignore[missing-attribute]
 
     def test_get_fwd_coefficient_returns_none_for_non_matching_sharding_type(
         self,
@@ -162,10 +176,13 @@ class BwdCoefficientDecoratorTest(unittest.TestCase):
         method = config.get_row_wise_bwd
 
         self.assertTrue(hasattr(method, "_is_bwd_coefficient"))
-        self.assertTrue(method._is_bwd_coefficient)  # pyre-ignore[16]
+        self.assertTrue(
+            method._is_bwd_coefficient
+        )  # pyrefly: ignore[missing-attribute]
         self.assertTrue(hasattr(method, "_coefficient_sharding_type"))
         self.assertEqual(
-            method._coefficient_sharding_type, "row_wise"  # pyre-ignore[16]
+            method._coefficient_sharding_type,
+            "row_wise",  # pyrefly: ignore[missing-attribute]
         )
 
     def test_get_bwd_coefficient_returns_coefficient_for_matching_sharding_type(
@@ -182,7 +199,9 @@ class BwdCoefficientDecoratorTest(unittest.TestCase):
         result = get_bwd_coefficient(config, "row_wise")
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["emb_lookup"], 3.0)  # pyre-ignore[16]
+        self.assertEqual(
+            result["emb_lookup"], 3.0
+        )  # pyrefly: ignore[missing-attribute]
 
     def test_get_bwd_coefficient_returns_none_for_non_matching_sharding_type(
         self,
@@ -218,7 +237,9 @@ class PrefetchCoefficientDecoratorTest(unittest.TestCase):
         method = config.get_prefetch
 
         self.assertTrue(hasattr(method, "_is_prefetch_coefficient"))
-        self.assertTrue(method._is_prefetch_coefficient)  # pyre-ignore[16]
+        self.assertTrue(
+            method._is_prefetch_coefficient
+        )  # pyrefly: ignore[missing-attribute]
 
     def test_get_prefetch_coefficient_returns_coefficients(self) -> None:
         """Test get_prefetch_coefficient returns prefetch coefficients."""
@@ -236,7 +257,8 @@ class PrefetchCoefficientDecoratorTest(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(
-            result["expected_num_lookups_coefficient"], 0.5  # pyre-ignore[16]
+            result["expected_num_lookups_coefficient"],
+            0.5,  # pyrefly: ignore[missing-attribute]
         )
 
     def test_get_prefetch_coefficient_returns_none_when_no_decorator(self) -> None:
@@ -265,7 +287,7 @@ class DeviceBwDecoratorTest(unittest.TestCase):
         config = TestConfig()
 
         self.assertTrue(hasattr(config, "device_bw"))
-        self.assertEqual(config.device_bw, 100.0)  # pyre-ignore[16]
+        self.assertEqual(config.device_bw, 100.0)  # pyrefly: ignore[missing-attribute]
 
     def test_device_bw_decorator_with_specific_device_and_kernel(self) -> None:
         """Test @device_bw decorator with specific device and compute kernel."""
@@ -278,10 +300,13 @@ class DeviceBwDecoratorTest(unittest.TestCase):
 
         self.assertTrue(hasattr(config, "kernel_device_bandwidths"))
         self.assertIn(
-            ("cuda", "fused"), config.kernel_device_bandwidths  # pyre-ignore[16]
+            ("cuda", "fused"),
+            config.kernel_device_bandwidths,  # pyrefly: ignore[missing-attribute]
         )
         self.assertEqual(
-            config.kernel_device_bandwidths[("cuda", "fused")],  # pyre-ignore[16]
+            config.kernel_device_bandwidths[
+                ("cuda", "fused")
+            ],  # pyrefly: ignore[missing-attribute]
             200.0,
         )
 
@@ -296,17 +321,21 @@ class DeviceBwDecoratorTest(unittest.TestCase):
         config = TestConfig()
 
         self.assertIn(
-            ("cuda", "fused"), config.kernel_device_bandwidths  # pyre-ignore[16]
+            ("cuda", "fused"),
+            config.kernel_device_bandwidths,  # pyrefly: ignore[missing-attribute]
         )
         self.assertIn(
-            ("cuda", "dense"), config.kernel_device_bandwidths  # pyre-ignore[16]
+            ("cuda", "dense"),
+            config.kernel_device_bandwidths,  # pyrefly: ignore[missing-attribute]
         )
         self.assertEqual(
-            config.kernel_device_bandwidths[("cuda", "fused")],  # pyre-ignore[16]
+            # pyrefly: ignore[missing-attribute]
+            config.kernel_device_bandwidths[("cuda", "fused")],
             200.0,
         )
         self.assertEqual(
-            config.kernel_device_bandwidths[("cuda", "dense")],  # pyre-ignore[16]
+            # pyrefly: ignore[missing-attribute]
+            config.kernel_device_bandwidths[("cuda", "dense")],
             150.0,
         )
 
@@ -326,7 +355,9 @@ class OutputWriteSizeDecoratorTest(unittest.TestCase):
         method = config.custom_output_write
 
         self.assertTrue(hasattr(method, "_is_custom_output_write_size"))
-        self.assertTrue(method._is_custom_output_write_size)  # pyre-ignore[16]
+        self.assertTrue(
+            method._is_custom_output_write_size
+        )  # pyrefly: ignore[missing-attribute]
 
     def test_get_output_write_size_returns_method_for_matching_sharding_type(
         self,
@@ -370,10 +401,15 @@ class SupportedShardingTypesDecoratorTest(unittest.TestCase):
         config = TestConfig()
 
         self.assertTrue(hasattr(config, "_supported_sharding_types"))
-        self.assertIn("table_wise", config._supported_sharding_types)  # pyre-ignore[16]
-        self.assertIn("row_wise", config._supported_sharding_types)  # pyre-ignore[16]
+        self.assertIn(
+            "table_wise", config._supported_sharding_types
+        )  # pyrefly: ignore[missing-attribute]
+        self.assertIn(
+            "row_wise", config._supported_sharding_types
+        )  # pyrefly: ignore[missing-attribute]
         self.assertNotIn(
-            "column_wise", config._supported_sharding_types  # pyre-ignore[16]
+            "column_wise",
+            config._supported_sharding_types,  # pyrefly: ignore[missing-attribute]
         )
 
 
@@ -405,13 +441,19 @@ class MultipleCoefficientDecoratorTest(unittest.TestCase):
         bwd_rw = get_bwd_coefficient(config, "row_wise")
 
         self.assertIsNotNone(fwd_tw)
-        self.assertEqual(fwd_tw["emb_lookup"], 1.0)  # pyre-ignore[16]
+        self.assertEqual(
+            fwd_tw["emb_lookup"], 1.0
+        )  # pyrefly: ignore[missing-attribute]
 
         self.assertIsNotNone(fwd_rw)
-        self.assertEqual(fwd_rw["emb_lookup"], 1.5)  # pyre-ignore[16]
+        self.assertEqual(
+            fwd_rw["emb_lookup"], 1.5
+        )  # pyrefly: ignore[missing-attribute]
 
         self.assertIsNotNone(bwd_tw)
-        self.assertEqual(bwd_tw["emb_lookup"], 2.0)  # pyre-ignore[16]
+        self.assertEqual(
+            bwd_tw["emb_lookup"], 2.0
+        )  # pyrefly: ignore[missing-attribute]
 
         # No bwd for row_wise
         self.assertIsNone(bwd_rw)
@@ -435,7 +477,8 @@ class MultipleCoefficientDecoratorTest(unittest.TestCase):
 
         self.assertIsNotNone(fwd)
         self.assertIsNotNone(prefetch)
-        self.assertEqual(fwd["emb_lookup"], 1.0)  # pyre-ignore[16]
+        self.assertEqual(fwd["emb_lookup"], 1.0)  # pyrefly: ignore[missing-attribute]
         self.assertEqual(
-            prefetch["expected_num_lookups_coefficient"], 0.5  # pyre-ignore[16]
+            prefetch["expected_num_lookups_coefficient"],
+            0.5,  # pyrefly: ignore[missing-attribute]
         )
