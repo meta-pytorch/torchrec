@@ -35,6 +35,7 @@ from torch.distributed._tensor.placement_types import Placement
 from torch.nn.modules.module import _addindent
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.types import (
+    compute_storage_usage,
     get_tensor_size_bytes,
     ModuleSharder,
     ParameterStorage,
@@ -43,6 +44,7 @@ from torchrec.distributed.types import (
     ShardedTensorMetadata,
     ShardingType,
     ShardMetadata,
+    StorageUsageType,
 )
 from torchrec.modules.embedding_configs import (
     DataType,
@@ -587,6 +589,12 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
         List of system resources and corresponding usage given a compute device and
         compute kernel
         """
+        from torch._utils_internal import justknobs_check
+
+        if justknobs_check("pytorch/torchrec:enable_sharder_data"):
+            return compute_storage_usage(
+                tensor, compute_device_type, compute_kernel, StorageUsageType.BASE
+            )
         tensor_bytes = get_tensor_size_bytes(tensor)
         if compute_kernel in {
             EmbeddingComputeKernel.FUSED_UVM.value,
@@ -690,6 +698,12 @@ class BaseQuantEmbeddingSharder(ModuleSharder[M]):
         List of system resources and corresponding usage given a compute device and
         compute kernel
         """
+        from torch._utils_internal import justknobs_check
+
+        if justknobs_check("pytorch/torchrec:enable_sharder_data"):
+            return compute_storage_usage(
+                tensor, compute_device_type, compute_kernel, StorageUsageType.BASE_QUANT
+            )
         tensor_bytes = get_tensor_size_bytes(tensor) + tensor.shape[0] * 4
         if compute_kernel in {
             EmbeddingComputeKernel.QUANT_UVM.value,

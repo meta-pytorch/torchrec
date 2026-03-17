@@ -47,6 +47,7 @@ from torchrec.distributed.planner.types import (
     CollectiveType,
     ParameterConstraints,
     Perf,
+    SharderDataMap,
     ShardEstimator,
     ShardingOption,
     Topology,
@@ -1711,19 +1712,29 @@ class EmbeddingPerfEstimator(ShardEstimator):
         self,
         sharding_options: List[ShardingOption],
         sharder_map: Optional[Dict[str, ModuleSharder[nn.Module]]] = None,
+        sharder_data_map: Optional[SharderDataMap] = None,
     ) -> None:
         """
         Estimates the wall time of given sharding options
         Args:
             sharding_options: List of sharding options to estimate
-            sharder_map: Map of sharder names to sharder instances
+            sharder_map: Optional map of sharder names to ModuleSharder instances
+            sharder_data_map: Optional map of sharder names to SharderData instances
+                (used when enable_sharder_data killswitch is on)
         """
-
-        if not sharder_map:
-            assert not sharding_options, "sharder_map not provided for sharding_options"
-            return
-
         assert self._topology is not None, "Topology must be set to use estimate method"
+
+        from torch._utils_internal import justknobs_check
+
+        use_sharder_data = justknobs_check("pytorch/torchrec:enable_sharder_data")
+        if use_sharder_data:
+            assert (
+                sharder_data_map is not None
+            ), "sharder_data_map required when enable_sharder_data is on"
+        else:
+            assert (
+                sharder_map is not None
+            ), "sharder_map required when enable_sharder_data is off"
 
         num_feature_processors = 0
         for sharding_option in sharding_options:
@@ -1731,24 +1742,43 @@ class EmbeddingPerfEstimator(ShardEstimator):
             # (raises ValueError if not supported)
             self._config.validate_sharding_type(sharding_option.sharding_type)
 
-            sharder_key = sharder_name(type(sharding_option.module[1]))
-            sharder = sharder_map[sharder_key]
+            if justknobs_check(
+                "pytorch/torchrec:enable_precomputed_sharding_option_fields"
+            ):
+                sharder_key = sharding_option.module_type_key
+            else:
+                sharder_key = sharder_name(type(sharding_option.module[1]))
 
             shard_sizes = [shard.size for shard in sharding_option.shards]
 
-            # Build all contexts at once using shard_sizes list
-            # This follows OSS pattern: extract common params ONCE per sharding_option
-            contexts = ShardPerfContext.build_shard_perf_contexts(
-                config=self._config,
-                shard_sizes=shard_sizes,
-                sharding_option=sharding_option,
-                topology=self._topology,
-                constraints=self._constraints,
-                sharder=sharder,
-                is_inference=self._is_inference,
-                use_batch_inputs_for_expected_cache_fetches=self._use_batch_inputs_for_expected_cache_fetches,
-                use_linear_regression_prefetch_estimate=self._use_linear_regression_prefetch_estimate,
-            )
+            # Build contexts using the appropriate version based on killswitch
+            contexts: List[ShardPerfContext] = []
+            if sharder_data_map is not None:
+                sharder_data = sharder_data_map[sharder_key]
+                contexts = ShardPerfContext.build_shard_perf_contexts_v2(
+                    config=self._config,
+                    shard_sizes=shard_sizes,
+                    sharding_option=sharding_option,
+                    topology=self._topology,
+                    constraints=self._constraints,
+                    sharder_data=sharder_data,
+                    is_inference=self._is_inference,
+                    use_batch_inputs_for_expected_cache_fetches=self._use_batch_inputs_for_expected_cache_fetches,
+                    use_linear_regression_prefetch_estimate=self._use_linear_regression_prefetch_estimate,
+                )
+            elif sharder_map is not None:
+                sharder = sharder_map[sharder_key]
+                contexts = ShardPerfContext.build_shard_perf_contexts(
+                    config=self._config,
+                    shard_sizes=shard_sizes,
+                    sharding_option=sharding_option,
+                    topology=self._topology,
+                    constraints=self._constraints,
+                    sharder=sharder,
+                    is_inference=self._is_inference,
+                    use_batch_inputs_for_expected_cache_fetches=self._use_batch_inputs_for_expected_cache_fetches,
+                    use_linear_regression_prefetch_estimate=self._use_linear_regression_prefetch_estimate,
+                )
 
             # Update is_weighted from first context (common across all shards)
             if contexts:

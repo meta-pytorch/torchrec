@@ -328,6 +328,7 @@ class MemoryStashingManager:
 
         # Collect CUDA embedding weight tensors from TBE groups marked for stashing
         tensors: List[torch.Tensor] = []
+        # pyrefly: ignore[not-iterable]
         for emb_module in module._emb_modules:
             if not hasattr(emb_module, "_emb_module"):
                 continue

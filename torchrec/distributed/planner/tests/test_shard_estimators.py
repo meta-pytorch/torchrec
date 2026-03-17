@@ -49,10 +49,13 @@ from torchrec.distributed.tests.test_sequence_model import TestSequenceSparseNN
 from torchrec.distributed.types import (
     CacheParams,
     CacheStatistics,
+    compute_storage_usage,
+    get_tensor_size_bytes,
     ModuleSharder,
     MultiPassPrefetchConfig,
     PipelineType,
     ShardingType,
+    StorageUsageType,
 )
 from torchrec.modules.embedding_configs import (
     DataType,
@@ -1711,3 +1714,82 @@ class TestEmbeddingOffloadStats(unittest.TestCase):
             ]
         )
         torch.testing.assert_close(miss_rates, torch.tensor([0.0, 0.0, 0.0]))
+
+
+class TestComputeStorageUsage(unittest.TestCase):
+    def test_base_quant_hbm(self) -> None:
+        tensor = torch.zeros(100, 64)
+        result = compute_storage_usage(
+            tensor,
+            compute_device_type="cuda",
+            compute_kernel="fused",
+            storage_usage_type=StorageUsageType.BASE_QUANT,
+        )
+        expected = get_tensor_size_bytes(tensor) + tensor.shape[0] * 4
+        self.assertEqual(result, {"hbm": expected})
+
+    def test_base_quant_uvm(self) -> None:
+        tensor = torch.zeros(100, 64)
+        result = compute_storage_usage(
+            tensor,
+            compute_device_type="cuda",
+            compute_kernel="quant_uvm",
+            storage_usage_type=StorageUsageType.BASE_QUANT,
+        )
+        expected = get_tensor_size_bytes(tensor) + tensor.shape[0] * 4
+        self.assertEqual(result, {"ddr": expected})
+
+    def test_base_fused_uvm(self) -> None:
+        tensor = torch.zeros(100, 64)
+        result = compute_storage_usage(
+            tensor,
+            compute_device_type="cuda",
+            compute_kernel="fused_uvm",
+            storage_usage_type=StorageUsageType.BASE,
+        )
+        expected = get_tensor_size_bytes(tensor)
+        self.assertEqual(result, {"ddr": expected})
+
+    def test_base_cuda(self) -> None:
+        tensor = torch.zeros(100, 64)
+        result = compute_storage_usage(
+            tensor,
+            compute_device_type="cuda",
+            compute_kernel="fused",
+            storage_usage_type=StorageUsageType.BASE,
+        )
+        expected = get_tensor_size_bytes(tensor)
+        self.assertEqual(result, {"hbm": expected})
+
+    def test_base_cpu(self) -> None:
+        tensor = torch.zeros(100, 64)
+        result = compute_storage_usage(
+            tensor,
+            compute_device_type="cpu",
+            compute_kernel="fused",
+            storage_usage_type=StorageUsageType.BASE,
+        )
+        expected = get_tensor_size_bytes(tensor)
+        self.assertEqual(result, {"ddr": expected})
+
+    def test_default_cuda(self) -> None:
+        tensor = torch.zeros(100, 64)
+        result = compute_storage_usage(
+            tensor,
+            compute_device_type="cuda",
+            compute_kernel="fused",
+            storage_usage_type=StorageUsageType.DEFAULT,
+        )
+        expected = get_tensor_size_bytes(tensor)
+        self.assertEqual(result, {"hbm": expected})
+
+    def test_unknown_device_defaults_to_hbm(self) -> None:
+        tensor = torch.zeros(100, 64)
+        result = compute_storage_usage(
+            tensor,
+            compute_device_type="tpu",
+            compute_kernel="fused",
+            storage_usage_type=StorageUsageType.DEFAULT,
+        )
+        expected = get_tensor_size_bytes(tensor)
+        self.assertEqual(result, {"hbm": expected})

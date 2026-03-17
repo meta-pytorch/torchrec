@@ -536,6 +536,8 @@ def _populate_zero_collision_tbe_params(
         optimizer_state_dtypes_for_st = kvzch_tbe_config.optimizer_state_dtypes_for_st
         load_ckpt_without_opt = True
 
+    enrichment_policy = kvzch_tbe_config.enrichment_policy if kvzch_tbe_config else None
+
     tbe_params["kv_zch_params"] = KVZCHParams(
         bucket_offsets=bucket_offsets,
         bucket_sizes=bucket_sizes,
@@ -546,6 +548,7 @@ def _populate_zero_collision_tbe_params(
         load_ckpt_without_opt=load_ckpt_without_opt,
         optimizer_type_for_st=optimizer_type_for_st,
         optimizer_state_dtypes_for_st=optimizer_state_dtypes_for_st,
+        enrichment_policy=enrichment_policy,
     )
 
 
@@ -2735,9 +2738,10 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
 
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         embs = super().forward(features)
-        self._async_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._async_stream):
-            self._rs_awaitable = self._reduce_scatter_weights_async()
+        if self.training:
+            self._async_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._async_stream):
+                self._rs_awaitable = self._reduce_scatter_weights_async()
         return embs
 
     def _reduce_scatter_weights_async(self) -> ReduceScatterResizeAwaitable:
@@ -4618,9 +4622,10 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
     # pyrefly: ignore [bad-override]
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         embs = super().forward(features)
-        self._async_stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self._async_stream):
-            self._rs_awaitable = self._reduce_scatter_weights_async()
+        if self.training:
+            self._async_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(self._async_stream):
+                self._rs_awaitable = self._reduce_scatter_weights_async()
         return embs
 
     def _reduce_scatter_weights_async(self) -> ReduceScatterResizeAwaitable:

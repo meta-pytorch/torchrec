@@ -724,6 +724,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
                 def _copy_work() -> In:
                     # pyrefly: ignore [bad-argument-type]
                     with self._stream_context(self._memcpy_stream):
+                        # pyrefly: ignore [redundant-cast]
                         return _to_device(cast(In, batch), self._device, True)
 
                 future_batch = self._copy_executor.submit(_copy_work)
