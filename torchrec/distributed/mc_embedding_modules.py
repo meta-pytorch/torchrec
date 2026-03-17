@@ -129,6 +129,7 @@ class BaseShardedManagedCollisionEmbeddingCollection(
                 ),
             )
         )
+        self._free_features_storage_early: bool = False
         self._return_remapped_features: bool = module._return_remapped_features
         self._allow_in_place_embed_weight_update: bool = (
             module._allow_in_place_embed_weight_update
