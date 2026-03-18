@@ -16,10 +16,12 @@ from torchrec import EmbeddingBagCollection, EmbeddingConfig
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.planner.constants import BATCH_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.perf_models import NoopPerfModel
 from torchrec.distributed.planner.planners import EmbeddingShardingPlanner, extract_plan
 from torchrec.distributed.planner.proposers import EmbeddingOffloadScaleupProposer
+from torchrec.distributed.planner.shard_estimators import EmbeddingStorageEstimator
 from torchrec.distributed.planner.stats import EmbeddingStats
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
@@ -42,6 +44,7 @@ from torchrec.distributed.types import (
     DataType,
     EmbeddingModuleShardingPlan,
     KeyValueParams,
+    ModuleSharder,
     ShardingPlan,
     ShardingType,
 )
@@ -1307,3 +1310,381 @@ class TestExtractPlan(unittest.TestCase):
             self.assertEqual(result_so.shards, loaded_so.shards)
             self.assertEqual(len(result_so.shards), 1)
             self.assertEqual(result_so.shards[0].size, [200, 128])
+
+
+class TestStorageEstimation(unittest.TestCase):
+    """Regression tests for planner storage estimation consistency.
+
+    These tests validate that storage estimates for known model configurations
+    remain stable. Changes to estimator code (e.g., how batch_sizes are passed,
+    or switching between estimator implementations) can silently alter storage
+    estimates, causing models near the capacity boundary to fail with
+    "insufficient storage" errors. See T258946334 for context.
+    """
+
+    def setUp(self) -> None:
+        self.topology = Topology(world_size=2, compute_device="cuda")
+
+    def test_storage_estimates_table_wise(self) -> None:
+        """Validate storage estimates for table-wise sharding remain consistent.
+
+        This test creates a representative model and runs the full enumeration +
+        storage estimation pipeline. If estimator code changes cause different
+        storage values, this test will catch it.
+        """
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_0",
+                feature_names=["feature_0"],
+            ),
+            EmbeddingBagConfig(
+                num_embeddings=200,
+                embedding_dim=128,
+                name="table_1",
+                feature_names=["feature_1"],
+            ),
+        ]
+
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+
+        storage_estimator = EmbeddingStorageEstimator(topology=self.topology)
+        enumerator = EmbeddingEnumerator(
+            topology=self.topology,
+            batch_size=BATCH_SIZE,
+            estimator=storage_estimator,
+        )
+
+        sharding_options = enumerator.enumerate(
+            module=model,
+            sharders=[
+                cast(
+                    ModuleSharder[torch.nn.Module],
+                    EmbeddingBagCollectionSharder(),
+                )
+            ],
+        )
+
+        # Collect storage estimates keyed by (table_name, compute_kernel, sharding_type)
+        storage_by_option: Dict[tuple, list[tuple[int, int]]] = {}
+        for so in sharding_options:
+            key = (so.name, so.compute_kernel, so.sharding_type)
+            storage_by_option[key] = [
+                (shard.storage.hbm, shard.storage.ddr)
+                for shard in so.shards
+                if shard.storage is not None
+            ]
+
+        # Validate that all sharding options have storage estimates populated
+        for key, shard_storages in storage_by_option.items():
+            table_name, compute_kernel, sharding_type = key
+            self.assertTrue(
+                len(shard_storages) > 0,
+                f"No storage estimates for {table_name} "
+                f"({compute_kernel}, {sharding_type})",
+            )
+            for hbm, ddr in shard_storages:
+                # Storage estimates must be non-negative
+                self.assertGreaterEqual(
+                    hbm,
+                    0,
+                    f"Negative HBM for {table_name} "
+                    f"({compute_kernel}, {sharding_type})",
+                )
+                self.assertGreaterEqual(
+                    ddr,
+                    0,
+                    f"Negative DDR for {table_name} "
+                    f"({compute_kernel}, {sharding_type})",
+                )
+
+        # Validate specific known estimates for fused table-wise sharding.
+        # These values are the baseline; if they change, it signals an estimator
+        # regression that could push models over the storage boundary.
+        tw_fused_table_0 = storage_by_option.get(("table_0", "fused", "table_wise"))
+        tw_fused_table_1 = storage_by_option.get(("table_1", "fused", "table_wise"))
+
+        self.assertIsNotNone(
+            tw_fused_table_0,
+            "Missing fused table-wise sharding option for table_0",
+        )
+        self.assertIsNotNone(
+            tw_fused_table_1,
+            "Missing fused table-wise sharding option for table_1",
+        )
+
+        # table_0: 100 rows * 64 dim * 4 bytes = 25600 bytes for embedding tensor
+        # table_1: 200 rows * 128 dim * 4 bytes = 102400 bytes for embedding tensor
+        # Storage includes tensor + optimizer state. Assert the estimates are
+        # proportional to table sizes and within expected bounds.
+        table_0_hbm = tw_fused_table_0[0][0]
+        table_1_hbm = tw_fused_table_1[0][0]
+
+        # table_1 has 4x the storage of table_0 (200*128 vs 100*64), so its
+        # HBM estimate should be larger.
+        self.assertGreater(
+            table_1_hbm,
+            table_0_hbm,
+            "table_1 (200x128) should have larger HBM estimate than table_0 (100x64)",
+        )
+
+        # The HBM estimate for table_0 should be at least the raw tensor size
+        # (25600 bytes) since storage includes the tensor itself.
+        raw_table_0_bytes = 100 * 64 * 4  # num_embeddings * dim * sizeof(float32)
+        self.assertGreaterEqual(
+            table_0_hbm,
+            raw_table_0_bytes,
+            f"table_0 HBM ({table_0_hbm}) should be >= raw tensor size "
+            f"({raw_table_0_bytes})",
+        )
+
+        raw_table_1_bytes = 200 * 128 * 4
+        self.assertGreaterEqual(
+            table_1_hbm,
+            raw_table_1_bytes,
+            f"table_1 HBM ({table_1_hbm}) should be >= raw tensor size "
+            f"({raw_table_1_bytes})",
+        )
+
+        # Snapshot the exact values so any estimator change triggers a test
+        # failure. Update these values intentionally if the estimator is changed
+        # on purpose, after verifying the new estimates don't break production
+        # models.
+        #
+        # table_0: 100 rows * 64 dim * 4 bytes = 25600 bytes raw tensor
+        #   + optimizer state + IO = 295936 bytes HBM
+        # table_1: 200 rows * 128 dim * 4 bytes = 102400 bytes raw tensor
+        #   + optimizer state + IO = 634880 bytes HBM
+        EXPECTED_TABLE_0_TW_FUSED_HBM = 295936
+        EXPECTED_TABLE_1_TW_FUSED_HBM = 634880
+
+        # fmt: off
+        self.assertEqual(
+            table_0_hbm, EXPECTED_TABLE_0_TW_FUSED_HBM,
+            f"table_0 fused TW HBM estimate changed from {EXPECTED_TABLE_0_TW_FUSED_HBM} "
+            f"to {table_0_hbm} — verify this does not cause insufficient storage "
+            "errors for production models",
+        )
+        self.assertEqual(
+            table_1_hbm, EXPECTED_TABLE_1_TW_FUSED_HBM,
+            f"table_1 fused TW HBM estimate changed from {EXPECTED_TABLE_1_TW_FUSED_HBM} "
+            f"to {table_1_hbm} — verify this does not cause insufficient storage "
+            "errors for production models",
+        )
+        # fmt: on
+
+    def test_storage_estimates_row_wise(self) -> None:
+        """Validate storage estimates for row-wise sharding remain consistent."""
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=1000,
+                embedding_dim=64,
+                name="table_0",
+                feature_names=["feature_0"],
+            ),
+        ]
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+
+        storage_estimator = EmbeddingStorageEstimator(topology=self.topology)
+        enumerator = EmbeddingEnumerator(
+            topology=self.topology,
+            batch_size=BATCH_SIZE,
+            estimator=storage_estimator,
+        )
+
+        sharding_options = enumerator.enumerate(
+            module=model,
+            sharders=[
+                cast(
+                    ModuleSharder[torch.nn.Module],
+                    EmbeddingBagCollectionSharder(),
+                )
+            ],
+        )
+
+        rw_options = [
+            so
+            for so in sharding_options
+            if so.sharding_type == "row_wise" and so.compute_kernel == "fused"
+        ]
+        self.assertTrue(
+            len(rw_options) > 0,
+            "No fused row-wise sharding options found for table_0",
+        )
+        rw_option = rw_options[0]
+
+        # For row-wise sharding with world_size=2, the table is split into 2 shards
+        self.assertEqual(
+            len(rw_option.shards),
+            2,
+            "Expected 2 shards for row-wise with world_size=2",
+        )
+
+        # Both shards should have roughly equal storage since rows are evenly split
+        shard_0_storage = rw_option.shards[0].storage
+        shard_1_storage = rw_option.shards[1].storage
+        self.assertIsNotNone(shard_0_storage, "shard 0 storage should not be None")
+        self.assertIsNotNone(shard_1_storage, "shard 1 storage should not be None")
+        assert shard_0_storage is not None  # for type narrowing
+        assert shard_1_storage is not None  # for type narrowing
+
+        # Verify the row distribution before asserting storage equality
+        shard_0_rows = rw_option.shards[0].size[0]
+        shard_1_rows = rw_option.shards[1].size[0]
+        self.assertEqual(
+            shard_0_rows,
+            shard_1_rows,
+            f"Expected equal row distribution for 1000 rows with world_size=2, "
+            f"but got shard_0={shard_0_rows} rows, shard_1={shard_1_rows} rows",
+        )
+        self.assertEqual(
+            shard_0_rows,
+            500,
+            f"Expected 500 rows per shard (1000 / 2), got {shard_0_rows}",
+        )
+
+        shard_0_hbm = shard_0_storage.hbm
+        shard_1_hbm = shard_1_storage.hbm
+        self.assertEqual(
+            shard_0_hbm,
+            shard_1_hbm,
+            "Row-wise shards should have equal HBM estimates for even row counts",
+        )
+
+        # Each shard holds half the table: 500 rows * 64 dim * 4 bytes = 128000 bytes
+        raw_shard_bytes = 500 * 64 * 4
+        self.assertGreaterEqual(
+            shard_0_hbm,
+            raw_shard_bytes,
+            f"RW shard HBM ({shard_0_hbm}) should be >= raw shard size "
+            f"({raw_shard_bytes})",
+        )
+
+    def test_storage_estimates_with_batch_sizes(self) -> None:
+        """Validate that batch_sizes in constraints are correctly reflected in storage
+        estimates.
+
+        This specifically guards against regressions like D93786471 where changes
+        to how batch_sizes are passed to the storage estimator can alter estimates.
+        """
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_0",
+                feature_names=["feature_0"],
+            ),
+        ]
+
+        # Run estimation with default batch size
+        storage_estimator_default = EmbeddingStorageEstimator(
+            topology=self.topology,
+        )
+        enumerator_default = EmbeddingEnumerator(
+            topology=self.topology,
+            batch_size=BATCH_SIZE,
+            estimator=storage_estimator_default,
+        )
+        model_default = TestSparseNN(tables=tables, weighted_tables=[])
+        options_default = enumerator_default.enumerate(
+            module=model_default,
+            sharders=[
+                cast(
+                    ModuleSharder[torch.nn.Module],
+                    EmbeddingBagCollectionSharder(),
+                )
+            ],
+        )
+
+        # Run estimation with custom batch_sizes in constraints
+        custom_batch_size = BATCH_SIZE * 2
+        constraints = {
+            "table_0": ParameterConstraints(
+                batch_sizes=[custom_batch_size],
+            ),
+        }
+        storage_estimator_custom = EmbeddingStorageEstimator(
+            topology=self.topology,
+            constraints=constraints,
+        )
+        enumerator_custom = EmbeddingEnumerator(
+            topology=self.topology,
+            batch_size=BATCH_SIZE,
+            estimator=storage_estimator_custom,
+            constraints=constraints,
+        )
+        model_custom = TestSparseNN(tables=tables, weighted_tables=[])
+        options_custom = enumerator_custom.enumerate(
+            module=model_custom,
+            sharders=[
+                cast(
+                    ModuleSharder[torch.nn.Module],
+                    EmbeddingBagCollectionSharder(),
+                )
+            ],
+        )
+
+        # With larger batch sizes, storage for IO-related components should be
+        # >= the default batch size estimates for sharding types that have
+        # batch-dependent IO (e.g. table-wise).
+        sorted_default = sorted(
+            options_default,
+            key=lambda x: (x.name, x.compute_kernel, x.sharding_type),
+        )
+        sorted_custom = sorted(
+            options_custom,
+            key=lambda x: (x.name, x.compute_kernel, x.sharding_type),
+        )
+
+        # Verify both enumerations produced the same set of sharding options
+        self.assertEqual(
+            len(sorted_default),
+            len(sorted_custom),
+            f"Default and custom enumerations produced different numbers of "
+            f"sharding options: {len(sorted_default)} vs {len(sorted_custom)}",
+        )
+        default_keys = [
+            (so.name, so.compute_kernel, so.sharding_type) for so in sorted_default
+        ]
+        custom_keys = [
+            (so.name, so.compute_kernel, so.sharding_type) for so in sorted_custom
+        ]
+        self.assertEqual(
+            default_keys,
+            custom_keys,
+            "Default and custom enumerations produced different sharding option keys",
+        )
+
+        for so_default, so_custom in zip(sorted_default, sorted_custom):
+            self.assertEqual(so_default.name, so_custom.name)
+            self.assertEqual(so_default.compute_kernel, so_custom.compute_kernel)
+            self.assertEqual(so_default.sharding_type, so_custom.sharding_type)
+
+            for shard_d, shard_c in zip(so_default.shards, so_custom.shards):
+                if shard_d.storage is not None and shard_c.storage is not None:
+                    if so_default.sharding_type in (
+                        "table_wise",
+                        "column_wise",
+                    ):
+                        # Table-wise and column-wise sharding have IO buffers
+                        # that scale directly with batch size, so doubling
+                        # batch_size must strictly increase HBM.
+                        self.assertGreater(
+                            shard_c.storage.hbm,
+                            shard_d.storage.hbm,
+                            f"Doubling batch_size should strictly increase HBM "
+                            f"for {so_default.name} ({so_default.compute_kernel}"
+                            f", {so_default.sharding_type})",
+                        )
+                    else:
+                        # For other sharding types (e.g. row_wise,
+                        # data_parallel), IO buffers may not scale with batch
+                        # size, so equality is acceptable.
+                        self.assertGreaterEqual(
+                            shard_c.storage.hbm,
+                            shard_d.storage.hbm,
+                            f"Doubling batch_size should not decrease HBM for "
+                            f"{so_default.name} ({so_default.compute_kernel}, "
+                            f"{so_default.sharding_type})",
+                        )
