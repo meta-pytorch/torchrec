@@ -120,11 +120,20 @@ class GradientClippingOptimizer(OptimizerWrapper):
                     p._local_tensor if isinstance(p, DTensor) else p
                     for p in self._replicate_params
                 ]
-                torch.nn.utils.clip_grad_norm_(
-                    parameters=replicate_params,
-                    max_norm=self._max_gradient,
-                    norm_type=self._norm_type,
-                )
+                # Filter out parameters with empty gradients to avoid
+                # torch._foreach_norm failing on empty tensors with infinity
+                # norm. This matches the filtering in _get_grads().
+                replicate_params = [
+                    p
+                    for p in replicate_params
+                    if p.grad is not None and p.grad.numel() > 0
+                ]
+                if replicate_params:
+                    torch.nn.utils.clip_grad_norm_(
+                        parameters=replicate_params,
+                        max_norm=self._max_gradient,
+                        norm_type=self._norm_type,
+                    )
             else:
                 self.clip_grad_norm_()
 
