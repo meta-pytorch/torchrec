@@ -2470,6 +2470,36 @@ class ZeroCollisionEmbeddingCache(ZeroCollisionKeyValueEmbedding):
         )
 
 
+class ZeroCollisionEmbeddingEnrichmentCache(ZeroCollisionKeyValueEmbedding):
+    def __init__(
+        self,
+        config: GroupedEmbeddingConfig,
+        pg: Optional[dist.ProcessGroup] = None,
+        device: Optional[torch.device] = None,
+        backend_type: BackendType = BackendType.SSD,
+    ) -> None:
+        super().__init__(
+            config,
+            pg,
+            device,
+            backend_type,
+            True,  # embedding_cache_mode
+        )
+
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        # in the case of embedding_cache_mode, we don't need backward pass, so call forward in no_grad mode
+        with torch.no_grad():
+            return super().forward(features)
+
+    def update(self, embeddings: KeyedJaggedTensor) -> None:
+        """
+        Update the embedding table with the new embeddings.
+        """
+        self.emb_module.direct_write_embedding(
+            embeddings.values(), embeddings.offsets(), embeddings.weights()
+        )
+
+
 class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule):
     def __init__(
         self,

@@ -44,6 +44,7 @@ from torchrec.distributed.batched_embedding_kernel import (
     SparseType,
     TritonBatchedFusedEmbeddingBag,
     ZeroCollisionEmbeddingCache,
+    ZeroCollisionEmbeddingEnrichmentCache,
     ZeroCollisionKeyValueEmbedding,
     ZeroCollisionKeyValueEmbeddingBag,
 )
@@ -286,12 +287,27 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
         elif config.compute_kernel == EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE:
             # for dram kv
             if config.enable_embedding_update:
-                return ZeroCollisionEmbeddingCache(
-                    config=config,
-                    pg=pg,
-                    device=device,
-                    backend_type=BackendType.DRAM,
-                )
+                kv_zch_params = None
+                if (
+                    config.fused_params
+                    and "kvzch_tbe_config" in config.fused_params
+                    and config.is_using_virtual_table()
+                ):
+                    kv_zch_params = config.fused_params.get("kvzch_tbe_config")
+                if kv_zch_params and kv_zch_params.enrichment_policy is not None:
+                    return ZeroCollisionEmbeddingEnrichmentCache(
+                        config=config,
+                        pg=pg,
+                        device=device,
+                        backend_type=BackendType.DRAM,
+                    )
+                else:
+                    return ZeroCollisionEmbeddingCache(
+                        config=config,
+                        pg=pg,
+                        device=device,
+                        backend_type=BackendType.DRAM,
+                    )
             else:
                 return ZeroCollisionKeyValueEmbedding(
                     config=config,
