@@ -19,6 +19,46 @@ free-threaded Python 3.13t), a threading.Lock would be needed.
 from concurrent.futures import Future
 from typing import Any, Callable
 
+import torch
+
+
+def transfer_tensors_to_cpu(
+    tensors: dict[str, Any],
+) -> tuple[dict[str, Any], torch.cuda.Event | None]:
+    """Move all CUDA tensors to CPU with non-blocking transfer.
+
+    Returns a copy of the dict with CPU tensors plus a CUDA event to
+    synchronize on before accessing values. The event is recorded on the
+    source tensor's stream (not the default cuda:0 stream) to correctly
+    handle multi-GPU setups.
+    """
+    source_device: torch.device | None = None
+    for v in tensors.values():
+        if isinstance(v, torch.Tensor) and v.is_cuda:
+            source_device = v.device
+            break
+
+    cpu_tensors = {
+        k: (
+            v.to(device="cpu", non_blocking=True)
+            if isinstance(v, torch.Tensor) and v.is_cuda
+            else v
+        )
+        for k, v in tensors.items()
+    }
+
+    if source_device is not None:
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(source_device))
+    else:
+        event = None
+    return cpu_tensors, event
+
+
+def device_supports_async(device: torch.device) -> bool:
+    """Check if the device supports asynchronous (non-blocking) DtoH transfer."""
+    return device.type == "cuda"
+
 
 class DeferrableMetrics:
     """
@@ -127,13 +167,17 @@ class DeferrableMetrics:
         if self._resolved:
             self._data.update(dict_other)
         elif self._future is not None:
+            cpu_dict, event = transfer_tensors_to_cpu(dict_other)
+
             original_future = self._future
             merged_future: Future[dict[str, Any]] = Future()
 
             def _on_complete(f: Future[dict[str, Any]]) -> None:
                 try:
+                    if event is not None:
+                        event.synchronize()
                     result = dict(f.result())
-                    result.update(dict_other)
+                    result.update(cpu_dict)
                     merged_future.set_result(result)
                 except Exception as e:
                     merged_future.set_exception(e)
