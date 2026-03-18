@@ -86,6 +86,8 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         super().__init__(*args, **kwargs)
         self._model_out_device = model_out_device
         self._shutdown_event: threading.Event = threading.Event()
+        self._compute_shutdown_event: threading.Event = threading.Event()
+        self._shutdown_complete: bool = False
         self._captured_exception_event: threading.Event = threading.Event()
         self._captured_exception: Optional[Exception] = None
 
@@ -190,11 +192,13 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             )
             if transfer_completed_event is not None:
                 transfer_completed_event.synchronize()
+
             labels, predictions, weights, required_inputs = parse_task_model_outputs(
                 self.rec_tasks,
                 cpu_model_out,
                 self.get_required_inputs(),
             )
+
             if required_inputs:
                 metric_update_job.kwargs["required_inputs"] = required_inputs
 
@@ -212,17 +216,26 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
     @override
     def shutdown(self) -> None:
-        """
-        Stop the worker thread gracefully, processing all remaining queue items.
-        """
+        """Stop worker threads gracefully. Idempotent."""
 
-        logger.info("Gracefully shutting down CPUOffloadedRecMetricModule...")
+        if self._shutdown_complete:
+            return
+
+        logger.info(
+            f"Gracefully shutting down CPUOffloadedRecMetricModule... "
+            f"update_queue={self.update_queue.qsize()}, "
+            f"compute_queue={self.compute_queue.qsize()}"
+        )
+
         self._shutdown_event.set()
-
+        update_timeout = 30.0 + self.update_queue.qsize() * 0.05
         if self.update_thread.is_alive():
-            self.update_thread.join(timeout=30.0)
+            self.update_thread.join(timeout=update_timeout)
+
+        self._compute_shutdown_event.set()
+        compute_timeout = min(30.0 + self.compute_queue.qsize() * 60.0, 600.0)
         if self.compute_thread.is_alive():
-            self.compute_thread.join(timeout=30.0)
+            self.compute_thread.join(timeout=compute_timeout)
 
         self.update_job_time_logger.log_percentiles()
         self.update_queue_size_logger.log_percentiles()
@@ -239,7 +252,14 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             raise RecMetricException(
                 f"compute thread did not shut down gracefully. remaining queue size: {self.compute_queue.qsize()}"
             )
+
+        # Re-raise exception from dead worker thread.
+        if self._captured_exception_event.is_set():
+            assert self._captured_exception is not None
+            raise self._captured_exception
+
         logger.info("CPUOffloadedRecMetricModule has been successfully shutdown.")
+        self._shutdown_complete = True
 
     @override
     def compute(self) -> DeferrableMetrics:
@@ -339,6 +359,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                         (time.time() - compute_start_ms) * 1000
                     )
                     self.compute_count += 1
+
                     self._adjust_compute_interval()
                     return computed_metrics
 
@@ -360,7 +381,15 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 raise e
 
         remaining = self._flush_remaining_work(self.update_queue)
-        logger.info(f"Flushed {remaining} remaining items during shutdown.")
+        logger.info(f"Flushed {remaining} remaining update items during shutdown.")
+
+        # Enqueue a final SynchronizationMarker so the compute thread publishes
+        # any updates that occurred after the last compute interval.
+        if self.rec_metrics:
+            # pyrefly: ignore[implicit-import]
+            final_future = concurrent.futures.Future()
+            self._process_synchronization_marker(SynchronizationMarker(final_future))
+            logger.info("Enqueued final SynchronizationMarker for remaining updates.")
 
     def _compute_loop(self) -> None:
         """
@@ -369,9 +398,20 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         torch.multiprocessing._set_thread_name(metric_compute_thread_name)
         logger.info(f"Started thread {torch.multiprocessing._get_thread_name()}")
 
-        while not self._shutdown_event.is_set():
+        while not self._compute_shutdown_event.is_set():
             try:
                 self._do_work(self.compute_queue)
+            except RuntimeError as e:
+                if (
+                    self._compute_shutdown_event.is_set()
+                    or self._shutdown_event.is_set()
+                ):
+                    logger.warning(f"Ignoring compute error during shutdown: {e}")
+                    break
+                logger.exception(f"Exception in compute loop: {e}")
+                self._captured_exception = e
+                self._captured_exception_event.set()
+                raise e
             except Exception as e:
                 logger.exception(f"Exception in compute loop: {e}")
                 self._captured_exception = e
@@ -434,8 +474,20 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             elif isinstance(job, SynchronizationMarker):
                 self._process_synchronization_marker(job)
             elif isinstance(job, MetricComputeJob):
-                computed_metrics = self._process_metric_compute_job(job)
-                job.future.set_result(computed_metrics)
+                try:
+                    computed_metrics = self._process_metric_compute_job(job)
+                    job.future.set_result(computed_metrics)
+                except RuntimeError as e:
+                    if (
+                        self._compute_shutdown_event.is_set()
+                        or self._shutdown_event.is_set()
+                    ):
+                        logger.warning(
+                            f"Ignoring compute error during shutdown flush: {e}"
+                        )
+                        job.future.set_exception(e)
+                    else:
+                        raise
             items_processed += 1
             metric_job_queue.task_done()
         return items_processed

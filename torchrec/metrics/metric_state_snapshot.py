@@ -10,6 +10,7 @@
 import copy
 from typing import Any, cast, Dict, Optional
 
+import torch
 from torch import nn
 from torchrec.metrics.rec_metric import (
     RecComputeMode,
@@ -105,7 +106,17 @@ def _load_into_reduced_states(
         reduction_fn = computation._reductions[attr_name]
         if callable(reduction_fn) and isinstance(original_value, list):
             reduced_value = reduction_fn(original_value)
+            if isinstance(reduced_value, list):
+                reduced_value = [
+                    v.clone() if isinstance(v, torch.Tensor) else v
+                    for v in reduced_value
+                ]
+            elif isinstance(reduced_value, torch.Tensor):
+                reduced_value = reduced_value.clone()
         else:
-            reduced_value = original_value
+            if isinstance(original_value, torch.Tensor):
+                reduced_value = original_value.clone()
+            else:
+                reduced_value = original_value
 
         reduced_states[cache_key] = reduced_value
