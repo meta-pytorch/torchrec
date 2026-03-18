@@ -487,7 +487,7 @@ class cmd_conf:
 
     Example 1: direct decorating (see the overloaded __new__ method below)
     ```
-    @cmd_conf  # you might need "pyre-ignore [56]"
+    @cmd_conf  # you might need "pyrefly: ignore"
     def main(
         run_option: RunOptions,
         table_config: EmbeddingTablesConfig,

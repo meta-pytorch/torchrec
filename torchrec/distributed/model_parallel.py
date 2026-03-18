@@ -30,7 +30,7 @@ try:
         TritonTableBatchedEmbeddingBags,
     )
 except ImportError:
-    _SHARDED_TBE_TYPES: tuple[type, ...] = (  # pyre-ignore[9]
+    _SHARDED_TBE_TYPES: tuple[type, ...] = (  # pyrefly: ignore[bad-assignment]
         SplitTableBatchedEmbeddingBagsCodegen,
     )
 
@@ -958,7 +958,7 @@ class HybridEvalDMP(DistributedModelParallel):
     ) -> None:
         super().__init__(module, init_data_parallel=init_data_parallel, **kwargs)
 
-    # pyre-ignore[14]: inconsistent override
+    # pyrefly: ignore[bad-override]: inconsistent override
     def to(self, *args: Any, **kwargs: Any) -> "HybridEvalDMP":
         def _selective_to(mod: nn.Module) -> None:
             for key, param in mod._parameters.items():

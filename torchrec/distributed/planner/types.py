@@ -654,9 +654,10 @@ class TopologyFactory:
 
         # Add optional parameters from configs
         TopologyFactory._add_trainer_params(topology_kwargs, trainer_config, hardware)
-        TopologyFactory._add_hardware_params(topology_kwargs, hardware)
+        TopologyFactory._add_hardware_params(topology_kwargs, hardware, kernel)
         TopologyFactory._add_comms_params(topology_kwargs, hardware, kernel)
 
+        # TODO: add eventlogger in future
         return Topology(**topology_kwargs)
 
     @staticmethod
@@ -696,16 +697,39 @@ class TopologyFactory:
             kwargs["custom_topology_data"] = custom_topology_data
 
     @staticmethod
-    def _add_hardware_params(kwargs: Dict[str, Any], hardware: HardwareConfig) -> None:
-        """Add hardware config parameters (memory bandwidths)."""
-        if hardware.hbm_mem_bw is not None:
-            kwargs["hbm_mem_bw"] = hardware.hbm_mem_bw
-        if hardware.ddr_mem_bw is not None:
-            kwargs["ddr_mem_bw"] = hardware.ddr_mem_bw
-        if hardware.hbm_to_ddr_mem_bw is not None:
-            kwargs["hbm_to_ddr_mem_bw"] = hardware.hbm_to_ddr_mem_bw
-        if hardware.ssd_mem_bw is not None:
-            kwargs["ssd_mem_bw"] = hardware.ssd_mem_bw
+    def _add_hardware_params(
+        kwargs: Dict[str, Any], hardware: HardwareConfig, kernel: KernelConfig
+    ) -> None:
+        """Add hardware config parameters (memory bandwidths).
+
+        When use_hardware_based_bandwidth=True: use hardware-detected values
+        (falls back to TorchRec defaults if hardware values are None)
+
+        When use_hardware_based_bandwidth=False: use TorchRec defaults
+        (matches old legacy path which doesn't set these, so Topology uses defaults)
+        """
+        if kernel.use_hardware_based_bandwidth:
+            # Hardware-based path: use hardware values, fall back to TorchRec defaults
+            kwargs["hbm_mem_bw"] = (
+                hardware.hbm_mem_bw if hardware.hbm_mem_bw is not None else HBM_MEM_BW
+            )
+            kwargs["ddr_mem_bw"] = (
+                hardware.ddr_mem_bw if hardware.ddr_mem_bw is not None else DDR_MEM_BW
+            )
+            kwargs["ssd_mem_bw"] = (
+                hardware.ssd_mem_bw if hardware.ssd_mem_bw is not None else SSD_MEM_BW
+            )
+            kwargs["hbm_to_ddr_mem_bw"] = (
+                hardware.hbm_to_ddr_mem_bw
+                if hardware.hbm_to_ddr_mem_bw is not None
+                else HBM_TO_DDR_MEM_BW
+            )
+        else:
+            # Default path: match Topology defaults (old legacy path doesn't set these)
+            kwargs["hbm_mem_bw"] = HBM_MEM_BW
+            kwargs["ddr_mem_bw"] = DDR_MEM_BW
+            kwargs["ssd_mem_bw"] = SSD_MEM_BW
+            kwargs["hbm_to_ddr_mem_bw"] = HBM_TO_DDR_MEM_BW
 
     @staticmethod
     def _add_comms_params(
@@ -713,15 +737,37 @@ class TopologyFactory:
         hardware: HardwareConfig,
         kernel: KernelConfig,
     ) -> None:
-        """Add communication bandwidth parameters."""
-        # generalized_comms_bandwidths takes precedence over individual bandwidths
+        """Add communication bandwidth parameters.
+
+        When generalized_comms_bandwidths is provided (from get_bw_info_for_curr_capability()
+        when use_hardware_based_bandwidth=True): use it directly.
+
+        When use_hardware_based_bandwidth=True but no generalized_comms_bandwidths:
+        use hardware-detected intra/inter bandwidth values.
+
+        When use_hardware_based_bandwidth=False: use TorchRec defaults
+        (matches old legacy path which creates BasicCommsBandwidths() with defaults)
+        """
         if kernel.generalized_comms_bandwidths is not None:
+            # Hardware-based path with generalized bandwidths from
+            # get_bw_info_for_curr_capability()
             kwargs["generalized_comms_bandwidths"] = kernel.generalized_comms_bandwidths
+        elif kernel.use_hardware_based_bandwidth:
+            # Hardware-based path: use hardware values, fall back to TorchRec defaults
+            kwargs["intra_host_bw"] = (
+                hardware.intra_host_bw
+                if hardware.intra_host_bw is not None
+                else INTRA_NODE_BANDWIDTH
+            )
+            kwargs["inter_host_bw"] = (
+                hardware.inter_host_bw
+                if hardware.inter_host_bw is not None
+                else CROSS_NODE_BANDWIDTH
+            )
         else:
-            if hardware.intra_host_bw is not None:
-                kwargs["intra_host_bw"] = hardware.intra_host_bw
-            if hardware.inter_host_bw is not None:
-                kwargs["inter_host_bw"] = hardware.inter_host_bw
+            # Default path: match Topology defaults (old legacy path)
+            kwargs["intra_host_bw"] = INTRA_NODE_BANDWIDTH
+            kwargs["inter_host_bw"] = CROSS_NODE_BANDWIDTH
 
 
 class Topology:
@@ -1088,7 +1134,7 @@ class ShardingOption:
                 "feature_processor_modules",
             )
             and isinstance(
-                # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+                # pyrefly: ignore[missing-attribute]: `Module` has no attribute `_feature_processor`
                 child_module._feature_processor.feature_processor_modules,
                 nn.ModuleDict,
             )
@@ -1096,12 +1142,12 @@ class ShardingOption:
         self._has_feature_processor: bool = (
             _module_has_fp
             and name
-            # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+            # pyrefly: ignore[missing-attribute]: `Module` has no attribute `_feature_processor`
             in child_module._feature_processor.feature_processor_modules.keys()
         )
         if hasattr(child_module, "is_weighted") and callable(child_module.is_weighted):
             if isinstance(child_module, EmbeddingBagCollectionInterface):
-                # pyre-ignore[29]: `Module` has no attribute `is_weighted`
+                # pyrefly: ignore[not-callable]: `Module` has no attribute `is_weighted`
                 self.is_weighted = child_module.is_weighted()
 
     @property

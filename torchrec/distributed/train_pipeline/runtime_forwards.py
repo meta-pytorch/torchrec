@@ -236,7 +236,7 @@ class CPUEmbeddingPipelinedForward(EmbeddingPipelinedForward):
     which are populated by Stage 2 (``_copy_to_gpu``) of ``EvalPipelineCPUSparse``.
     """
 
-    # pyre-ignore [2, 24]
+    # pyrefly: ignore
     def __call__(self, *input, **kwargs) -> Union[
         Awaitable[EmbeddingModuleRetType],
         Tuple[

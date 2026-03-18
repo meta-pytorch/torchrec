@@ -742,6 +742,7 @@ class ShardedEmbeddingBagCollection(
         # forward pass flow control
         self._has_uninitialized_input_dist: bool = True
         self._has_features_permute: bool = True
+        self._free_features_storage_early: bool = False
         # Get all fused optimizers and combine them.
         optims = []
         for lookup in self._lookups:
@@ -1725,12 +1726,20 @@ class ShardedEmbeddingBagCollection(
 
         with torch.no_grad():
             if self._has_features_permute:
+                original_features = features
                 features = features.permute(
                     self._features_order,
                     #  but got `Union[Module, Tensor]`.
                     # pyrefly: ignore [bad-argument-type]
                     self._features_order_tensor,
                 )
+                if self._free_features_storage_early:
+                    # Free original KJT tensor storage to reclaim HBM early.
+                    # permute() created independent tensors, so the original
+                    # batch KJT's data is no longer needed. The batch Python
+                    # object still exists but PipelinedForward ignores the
+                    # sparse features during model forward.
+                    original_features.clear_storage()
             if self._has_mean_pooling_callback:
                 ctx.divisor = _create_mean_pooling_divisor(
                     lengths=features.lengths(),
@@ -1868,7 +1877,7 @@ class ShardedEmbeddingBagCollection(
                 # use a separate stream. The wait_for_forward() method synchronizes via
                 # CUDA events recorded after the Triton kernel completes.
                 if hasattr(lookup, "wait_for_forward"):
-                    # pyre-ignore[29]: `wait_for_forward` is dynamically checked
+                    # pyrefly: ignore[not-callable]: `wait_for_forward` is dynamically checked
                     lookup.wait_for_forward()
                 if MemoryStashingManager.is_enabled():
                     stash_result = MemoryStashingManager.stash_embedding_weights(lookup)

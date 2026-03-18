@@ -469,7 +469,7 @@ class ManagedCollisionCollection(nn.Module):
         for i, (table, mc_module) in enumerate(self._managed_collision_modules.items()):
             kjt: KeyedJaggedTensor = feature_splits[i]
             remapped_ids_kjt: KeyedJaggedTensor = remapped_ids_splits[i]
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
+            # pyre-ignore[29]: `Union[Module, Tensor]` is not a function.
             per_table_runtime_meta = mc_module.lookup_runtime_meta(
                 kjt.values(), remapped_ids_kjt.values()
             )

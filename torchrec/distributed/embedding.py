@@ -503,6 +503,7 @@ class ShardedEmbeddingCollection(
         self._writable_embedding_names: set[str] = set()
 
         self._has_uninitialized_input_dist: bool = True
+        self._free_features_storage_early: bool = False
         logger.info(f"EC index dedup enabled: {self._use_index_dedup}.")
 
         self._enable_feature_score_weight_accumulation: bool = False
@@ -1510,6 +1511,7 @@ class ShardedEmbeddingCollection(
             self._has_uninitialized_input_dist = False
         with torch.no_grad():
             unpadded_features = None
+            original_features = features
             if features.variable_stride_per_key():
                 unpadded_features = features
                 features = pad_vbe_kjt_lengths(unpadded_features)
@@ -1521,6 +1523,12 @@ class ShardedEmbeddingCollection(
                     # pyrefly: ignore[bad-argument-type]
                     self._features_order_tensor,
                 )
+                # For non-VBE: free original KJT tensor storage now since
+                # permute() created independent tensors.
+                # For VBE: deferred until after _compute_sequence_vbe_context
+                # which still needs the original (unpadded) features.
+                if self._free_features_storage_early and unpadded_features is None:
+                    original_features.clear_storage()
             features_by_shards = features.split(self._feature_splits)
             features_by_shards = may_collect_feature_scores(
                 features_by_shards,
@@ -1551,6 +1559,15 @@ class ShardedEmbeddingCollection(
                 )
             if unpadded_features is not None:
                 self._compute_sequence_vbe_context(ctx, unpadded_features)
+                # Free original KJT tensor storage now that VBE context
+                # computation is done. permute() created independent tensors
+                # for the main input_dist path.
+                if (
+                    self._free_features_storage_early
+                    and need_permute
+                    and self._features_order
+                ):
+                    original_features.clear_storage()
 
         return KJTListSplitsAwaitable(
             awaitables,

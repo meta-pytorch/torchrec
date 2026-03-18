@@ -305,6 +305,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         enable_inplace_copy_batch: bool = False,
         multi_thread: bool = False,
         pipeline_depth: int = 2,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -315,6 +316,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
             context_type=CPUEmbeddingTrainPipelineContext,
             pipeline_postproc=pipeline_postproc,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         assert pipeline_depth in (1, 2), "pipeline_depth must be 1 or 2"
         self._pipeline_depth = pipeline_depth
@@ -334,7 +336,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         )
         self._sparse_future: Optional[Future[In]] = None
 
-    # pyre-ignore[14]
+    # pyrefly: ignore[bad-override]
     def _pipeline_model(
         self,
         batch: In,
@@ -538,7 +540,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         else:
             return self._copy_to_gpu(batch, context)
 
-    # pyre-ignore[14]
+    # pyrefly: ignore[bad-override]
     def enqueue_batch(self, dataloader_iter: Iterator[In]) -> bool:
         """
         Load a batch from the dataloader, create context, and append to
@@ -696,6 +698,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
         ] = None,
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -709,6 +712,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enqueue_batch_after_forward=False,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         self._copy_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
         self.batches: Deque[Optional[In]] = cast(Deque[Optional[In]], FutureDeque())
@@ -724,8 +728,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
                 def _copy_work() -> In:
                     # pyrefly: ignore [bad-argument-type]
                     with self._stream_context(self._memcpy_stream):
-                        # pyrefly: ignore [redundant-cast]
-                        return _to_device(cast(In, batch), self._device, True)
+                        return _to_device(batch, self._device, True)
 
                 future_batch = self._copy_executor.submit(_copy_work)
                 return cast(In, future_batch), context
@@ -797,6 +800,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -810,6 +814,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         self._output_dist_site = OutputDistSite(
             fqn=site_fqn, sharding_type=sharding_type
@@ -933,6 +938,7 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -946,6 +952,7 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         self._output_dist_site = OutputDistSite(
             fqn=site_fqn, sharding_type=sharding_type
@@ -1082,6 +1089,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1095,6 +1103,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
         )
         if isinstance(site_fqn, str):
             self._injection_site = InjectionSite(fqn=site_fqn)

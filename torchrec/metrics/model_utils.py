@@ -56,6 +56,8 @@ def parse_model_outputs(
     weight_name: str,
     model_out: Dict[str, torch.Tensor],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if label_name not in model_out:
+        raise ValueError(f"Label name {label_name} not found in model output")
     labels = model_out[label_name].squeeze()
     if not prediction_name:
         assert not weight_name, "weight name must be empty if prediction name is empty"

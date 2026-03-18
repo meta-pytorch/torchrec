@@ -131,11 +131,14 @@ class ShardedManagedCollisionEmbeddingBagCollection(
             skip_permute = False
             if self._managed_collision_collection._features_order:
                 skip_permute = True
+                original_features = features
                 features = features.permute(
                     self._managed_collision_collection._features_order,
                     # pyrefly: ignore[bad-argument-type]
                     self._managed_collision_collection._features_order_tensor,
                 )
+                if self._free_features_storage_early:
+                    original_features.clear_storage()
 
             # TODO: Consider turning this into a hook inside mc_modules and remove skip_permute
             #   from mc_modules, and fix all the private methods to be public.

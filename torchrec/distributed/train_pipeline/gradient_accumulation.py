@@ -147,7 +147,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         # Only replace optimizer in pipeline when GA is enabled
         # This avoids unintended side effects when GA is disabled
         if config.is_enabled and hasattr(pipeline, "_optimizer"):
-            # pyre-ignore[16]: pipeline may not have _optimizer
+            # pyrefly: ignore[missing-attribute]: pipeline may not have _optimizer
             pipeline._optimizer = self._optimizer_wrapper
 
     def _should_sync_grad(self, is_last_batch: bool = False) -> bool:
@@ -185,7 +185,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
 
         # Check for DMP-wrapped DDP
         if hasattr(model, "_dmp_wrapped_module"):
-            # pyre-ignore[16]: model may not have _dmp_wrapped_module
+            # pyrefly: ignore[missing-attribute]: model may not have _dmp_wrapped_module
             dmp = model._dmp_wrapped_module
             if hasattr(dmp, "no_sync"):
                 # pyrefly: ignore[not-callable]
@@ -193,7 +193,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
 
         # Check for direct DDP
         if hasattr(model, "no_sync"):
-            # pyre-ignore[29]: model is typed as nn.Module; no_sync exists on DDP subclasses
+            # pyrefly: ignore[not-callable]: model is typed as nn.Module; no_sync exists on DDP subclasses
             return model.no_sync()
 
         return contextlib.nullcontext()
