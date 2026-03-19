@@ -902,6 +902,7 @@ class ShardedEmbeddingBagCollection(
                         getattr(config, "virtual_table_eviction_policy", None)
                         # TODO: Need to check if attribute exists for BC
                     ),
+                    stash_weights=getattr(config, "stash_weights", False),
                 ),
                 param_sharding=parameter_sharding,
                 param=param,
