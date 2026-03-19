@@ -1,0 +1,44 @@
+# Production-like metric scaling benchmark
+# Tests ZORM overhead with 20 tasks x 5 metrics (~25% update overhead)
+# Uses lighter embeddings so metric update is a meaningful fraction of iter time
+#
+# Usage:
+#   buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:benchmark_train_pipeline -- \
+#     --yaml_config=fbcode/torchrec/distributed/benchmark/yaml/metric_scaling_prod.yml
+RunOptions:
+  world_size: 2
+  num_batches: 10
+  num_benchmarks: 3
+  num_profiles: 1
+  num_iters: 100
+  profile_dir: "."
+  name: "metric_scaling_prod"
+  loglevel: "info"
+PipelineConfig:
+  pipeline: "sparse"
+ModelInputConfig:
+  num_float_features: 100
+  feature_pooling_avg: 10
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 100
+    submodule_kwargs:
+      dense_arch_out_size: 128
+      over_arch_out_size: 1024
+      over_arch_hidden_layers: 5
+      dense_arch_hidden_sizes: [128, 128, 128]
+      skip_regroup: true
+EmbeddingTablesConfig:
+  num_unweighted_features: 10
+  num_weighted_features: 5
+  embedding_feature_dim: 32
+PlannerConfig:
+  pooling_factors: [10.0]
+RecMetricConfig:
+  enable_metrics: true
+  metrics: [ne, calibration, ctr, mse, auc]
+  num_tasks: 20
+  rec_compute_mode: "unfused"
+  compute_interval: 25
+  window_size: 10000000
