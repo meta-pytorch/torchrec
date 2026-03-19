@@ -242,6 +242,60 @@ class TestGradientClippingOptimizer(unittest.TestCase):
 
         mock_clip_grad_norm.assert_not_called()
 
+    def test_clip_inf_norm_with_empty_grad_no_sharded_params(self) -> None:
+        """Test that infinity norm gradient clipping handles empty gradients
+        when there are no sharded parameters (uses torch.nn.utils.clip_grad_norm_ path).
+
+        This is a regression test for T256567466 / T260346508 where
+        torch._foreach_norm raises an error on empty tensors with infinity norm
+        during optimizer init_state().
+        """
+        param_1 = Variable(torch.tensor([3.0, 4.0]), requires_grad=True)
+        param_2 = Variable(torch.tensor([]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1, "param_2": param_2},
+            {},
+            [{"params": [param_1, param_2]}],
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer,
+            max_gradient=1.0,
+            clipping=GradientClipping.NORM,
+            norm_type=float("inf"),
+        )
+
+        # Simulate empty gradient (as happens during init_state)
+        param_1.grad = torch.tensor([1.0, 2.0])
+        param_2.grad = torch.tensor([])
+
+        # This should not raise RuntimeError about empty tensor infinity norm
+        gradient_clipping_optimizer.step()
+
+    def test_clip_inf_norm_all_empty_grads_no_sharded_params(self) -> None:
+        """Test that infinity norm gradient clipping handles the case where
+        all parameters have empty gradients and there are no sharded params."""
+        param_1 = Variable(torch.tensor([]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1},
+            {},
+            [{"params": [param_1]}],
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer,
+            max_gradient=1.0,
+            clipping=GradientClipping.NORM,
+            norm_type=float("inf"),
+        )
+
+        param_1.grad = torch.tensor([])
+
+        # This should not raise - should gracefully handle empty params
+        gradient_clipping_optimizer.step()
+
 
 class TestGetGrads(unittest.TestCase):
     def test_get_grads_returns_gradients(self) -> None:

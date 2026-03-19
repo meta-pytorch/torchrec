@@ -10,15 +10,23 @@
 
 import random
 import unittest
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import hypothesis.strategies as st
 import torch
+from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
+    BackendType,
+    EnrichmentPolicy,
+    EnrichmentType,
+)
 from hypothesis import given, settings
 from torchrec.distributed.batched_embedding_kernel import ZeroCollisionKeyValueEmbedding
 from torchrec.distributed.embedding import EmbeddingCollectionContext
-from torchrec.distributed.embedding_lookup import EmbeddingComputeKernel
+from torchrec.distributed.embedding_lookup import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingsLookup,
+)
 from torchrec.distributed.embedding_sharding import (
     _get_compute_kernel_type,
     _get_grouping_fused_params,
@@ -633,3 +641,212 @@ class TestECBucketMetadata(unittest.TestCase):
                     for table in tables
                 ]
                 self.assertEqual(zch_kv_emb._bucket_spec, expected_tuple)
+
+
+class TestCreateEmbeddingKernelEnrichment(unittest.TestCase):
+    """Tests for _create_embedding_kernel routing with enrichment policy."""
+
+    def _make_dram_vt_config(
+        self,
+        enable_embedding_update: bool = True,
+        fused_params: Optional[Dict[str, Any]] = None,
+    ) -> GroupedEmbeddingConfig:
+        tables = [
+            ShardedEmbeddingTable(
+                name="table_0",
+                data_type=DataType.FP32,
+                pooling=PoolingType.NONE,
+                has_feature_processor=False,
+                feature_names=["feature_0"],
+                compute_kernel=EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
+                embedding_dim=64,
+                num_embeddings=10000,
+                use_virtual_table=True,
+            )
+        ]
+        return GroupedEmbeddingConfig(
+            data_type=DataType.FP32,
+            pooling=PoolingType.NONE,
+            is_weighted=False,
+            has_feature_processor=False,
+            compute_kernel=EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
+            embedding_tables=tables,
+            fused_params=fused_params,
+            enable_embedding_update=enable_embedding_update,
+        )
+
+    @patch(
+        "torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingEnrichmentCache"
+    )
+    @patch("torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingCache")
+    def test_enrichment_policy_routes_to_enrichment_cache(
+        self,
+        mock_zc_cache_cls: MagicMock,
+        mock_zc_enrichment_cls: MagicMock,
+    ) -> None:
+        """When enrichment_policy with truthy enrichment_type is set,
+        should route to ZeroCollisionEmbeddingEnrichmentCache."""
+        enrichment_policy = EnrichmentPolicy(
+            enrichment_type=EnrichmentType.IGR_LASER_SID,
+        )
+        kvzch_tbe_config = MagicMock()
+        kvzch_tbe_config.enrichment_policy = enrichment_policy
+
+        config = self._make_dram_vt_config(
+            fused_params={"kvzch_tbe_config": kvzch_tbe_config},
+        )
+
+        lookup = GroupedEmbeddingsLookup([], device=torch.device("cpu"))
+        lookup._create_embedding_kernel(config, None, torch.device("cpu"))
+
+        mock_zc_enrichment_cls.assert_called_once_with(
+            config=config,
+            pg=None,
+            device=torch.device("cpu"),
+            backend_type=BackendType.DRAM,
+        )
+        mock_zc_cache_cls.assert_not_called()
+
+    @patch(
+        "torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingEnrichmentCache"
+    )
+    @patch("torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingCache")
+    def test_no_enrichment_policy_routes_to_cache(
+        self,
+        mock_zc_cache_cls: MagicMock,
+        mock_zc_enrichment_cls: MagicMock,
+    ) -> None:
+        """When no enrichment_policy is set, should route to ZeroCollisionEmbeddingCache."""
+        kvzch_tbe_config = MagicMock()
+        kvzch_tbe_config.enrichment_policy = None
+
+        config = self._make_dram_vt_config(
+            fused_params={"kvzch_tbe_config": kvzch_tbe_config},
+        )
+
+        lookup = GroupedEmbeddingsLookup([], device=torch.device("cpu"))
+        lookup._create_embedding_kernel(config, None, torch.device("cpu"))
+
+        mock_zc_cache_cls.assert_called_once_with(
+            config=config,
+            pg=None,
+            device=torch.device("cpu"),
+            backend_type=BackendType.DRAM,
+        )
+        mock_zc_enrichment_cls.assert_not_called()
+
+    @patch(
+        "torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingEnrichmentCache"
+    )
+    @patch("torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingCache")
+    def test_no_kvzch_tbe_config_routes_to_cache(
+        self,
+        mock_zc_cache_cls: MagicMock,
+        mock_zc_enrichment_cls: MagicMock,
+    ) -> None:
+        """When fused_params has no kvzch_tbe_config, should route to ZeroCollisionEmbeddingCache."""
+        config = self._make_dram_vt_config(
+            fused_params={"other_param": "value"},
+        )
+
+        lookup = GroupedEmbeddingsLookup([], device=torch.device("cpu"))
+        lookup._create_embedding_kernel(config, None, torch.device("cpu"))
+
+        mock_zc_cache_cls.assert_called_once_with(
+            config=config,
+            pg=None,
+            device=torch.device("cpu"),
+            backend_type=BackendType.DRAM,
+        )
+        mock_zc_enrichment_cls.assert_not_called()
+
+    @patch(
+        "torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingEnrichmentCache"
+    )
+    @patch("torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingCache")
+    @patch("torchrec.distributed.embedding_lookup.ZeroCollisionKeyValueEmbedding")
+    def test_embedding_update_disabled_routes_to_kv_embedding(
+        self,
+        mock_kv_emb_cls: MagicMock,
+        mock_zc_cache_cls: MagicMock,
+        mock_zc_enrichment_cls: MagicMock,
+    ) -> None:
+        """When enable_embedding_update is False, should route to ZeroCollisionKeyValueEmbedding."""
+        config = self._make_dram_vt_config(
+            enable_embedding_update=False,
+        )
+
+        lookup = GroupedEmbeddingsLookup([], device=torch.device("cpu"))
+        lookup._create_embedding_kernel(config, None, torch.device("cpu"))
+
+        mock_kv_emb_cls.assert_called_once_with(
+            config=config,
+            pg=None,
+            device=torch.device("cpu"),
+            backend_type=BackendType.DRAM,
+        )
+        mock_zc_cache_cls.assert_not_called()
+        mock_zc_enrichment_cls.assert_not_called()
+
+    @patch(
+        "torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingEnrichmentCache"
+    )
+    @patch("torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingCache")
+    def test_enrichment_policy_with_multiple_enrichment_types(
+        self,
+        mock_zc_cache_cls: MagicMock,
+        mock_zc_enrichment_cls: MagicMock,
+    ) -> None:
+        """Verify routing for different non-zero EnrichmentType values."""
+        for enrichment_type in [
+            EnrichmentType.IGR_LASER_SID,
+            EnrichmentType.IGR_LASER_EMBEDDING,
+        ]:
+            mock_zc_cache_cls.reset_mock()
+            mock_zc_enrichment_cls.reset_mock()
+
+            enrichment_policy = EnrichmentPolicy(
+                enrichment_type=enrichment_type,
+            )
+            kvzch_tbe_config = MagicMock()
+            kvzch_tbe_config.enrichment_policy = enrichment_policy
+
+            config = self._make_dram_vt_config(
+                fused_params={"kvzch_tbe_config": kvzch_tbe_config},
+            )
+
+            lookup = GroupedEmbeddingsLookup([], device=torch.device("cpu"))
+            lookup._create_embedding_kernel(config, None, torch.device("cpu"))
+
+            mock_zc_enrichment_cls.assert_called_once_with(
+                config=config,
+                pg=None,
+                device=torch.device("cpu"),
+                backend_type=BackendType.DRAM,
+            )
+            mock_zc_cache_cls.assert_not_called()
+
+    @patch(
+        "torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingEnrichmentCache"
+    )
+    @patch("torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingCache")
+    def test_no_fused_params_routes_to_cache(
+        self,
+        mock_zc_cache_cls: MagicMock,
+        mock_zc_enrichment_cls: MagicMock,
+    ) -> None:
+        """When fused_params is None, should route to ZeroCollisionEmbeddingCache."""
+        config = self._make_dram_vt_config(
+            fused_params=None,
+        )
+
+        lookup = GroupedEmbeddingsLookup([], device=torch.device("cpu"))
+        lookup._create_embedding_kernel(config, None, torch.device("cpu"))
+
+        mock_zc_cache_cls.assert_called_once_with(
+            config=config,
+            pg=None,
+            device=torch.device("cpu"),
+            backend_type=BackendType.DRAM,
+        )
+        mock_zc_enrichment_cls.assert_not_called()
