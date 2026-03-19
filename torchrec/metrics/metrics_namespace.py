@@ -98,6 +98,10 @@ class MetricName(MetricNameBase):
     DATA_LABEL_AVERAGE = "data_label_average"
     LABEL_AVERAGE = "label_average"
     PREDICTION_AVERAGE = "prediction_average"
+    NUM_POSITIVE_SAMPLES = "num_positive_samples"
+    SUM_WEIGHTS = "sum_weights"
+    NUM_MISSING_LABELS = "num_missing_labels"
+    WEIGHTED_SUM_PREDICTIONS = "weighted_sum_predictions"
 
 
 class MetricNamespaceBase(StrValueMixin, Enum):
@@ -162,6 +166,10 @@ class MetricNamespace(MetricNamespaceBase):
     NMSE = "nmse"
 
     AVERAGE = "average"
+    NUM_POSITIVE_SAMPLES = "num_positive_samples"
+    SUM_WEIGHTS = "sum_weights"
+    NUM_MISSING_LABELS = "num_missing_labels"
+    WEIGHTED_SUM_PREDICTIONS = "weighted_sum_predictions"
 
 
 class MetricPrefix(StrValueMixin, Enum):

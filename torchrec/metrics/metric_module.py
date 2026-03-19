@@ -57,6 +57,8 @@ from torchrec.metrics.ne import NEMetric
 from torchrec.metrics.ne_positive import NEPositiveMetric
 from torchrec.metrics.ne_with_recalibration import RecalibratedNEMetric
 from torchrec.metrics.nmse import NMSEMetric
+from torchrec.metrics.num_missing_labels import NumMissingLabelsMetric
+from torchrec.metrics.num_positive_samples import NumPositiveSamplesMetric
 from torchrec.metrics.output import OutputMetric
 from torchrec.metrics.precision import PrecisionMetric
 from torchrec.metrics.precision_session import PrecisionSessionMetric
@@ -68,11 +70,13 @@ from torchrec.metrics.scalar import ScalarMetric
 from torchrec.metrics.segmented_ne import SegmentedNEMetric
 from torchrec.metrics.serving_calibration import ServingCalibrationMetric
 from torchrec.metrics.serving_ne import ServingNEMetric
+from torchrec.metrics.sum_weights import SumWeightsMetric
 from torchrec.metrics.tensor_weighted_avg import TensorWeightedAvgMetric
 from torchrec.metrics.throughput import ThroughputMetric
 from torchrec.metrics.tower_qps import TowerQPSMetric
 from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
+from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetric
 from torchrec.metrics.xauc import XAUCMetric
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -111,6 +115,10 @@ REC_METRICS_MAPPING: Dict[RecMetricEnumBase, Type[RecMetric]] = {
     RecMetricEnum.NMSE: NMSEMetric,
     RecMetricEnum.AVERAGE: AverageMetric,
     RecMetricEnum.MULTI_LABEL_PRECISION: MultiLabelPrecisionMetric,
+    RecMetricEnum.NUM_MISSING_LABELS: NumMissingLabelsMetric,
+    RecMetricEnum.WEIGHTED_SUM_PREDICTIONS: WeightedSumPredictionsMetric,
+    RecMetricEnum.NUM_POSITIVE_SAMPLES: NumPositiveSamplesMetric,
+    RecMetricEnum.SUM_WEIGHTS: SumWeightsMetric,
 }
 
 
