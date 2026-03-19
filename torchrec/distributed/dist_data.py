@@ -1019,8 +1019,8 @@ class VariableBatchPooledEmbeddingsAllToAll(nn.Module):
         r0_batch_size_per_feature_pre_a2a = [2, 1, 3]
         r1_batch_size_per_feature_pre_a2a = [1, 2, 2]
 
-        # r0 should recieve f0: 2 (from r0), f1: 1 (from r1), f2: 3 (from r1)
-        # r1 should recieve f0: 1 (from r0), f1: 2 (from r1), f2: 2 (from r1)
+        # r0 should receive f0: 2 (from r0), f1: 1 (from r1), f2: 3 (from r1)
+        # r1 should receive f0: 1 (from r0), f1: 2 (from r1), f2: 2 (from r1)
 
         rank0_output = a2a(
             t0, r0_batch_size_per_rank_per_feature, r0_batch_size_per_feature_pre_a2a
