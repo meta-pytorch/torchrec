@@ -2126,6 +2126,8 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         device (torch.device): device where device transfer, sparse data dist, and
             forward/backward pass will happen.
         apply_jit (bool): apply torch.jit.script to non-pipelined (unsharded) modules.
+        pipeline_postproc (bool): If True, enables pipelining of post-processing
+            operations. Default: False.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -2137,6 +2139,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         optimizer: torch.optim.Optimizer,
         device: torch.device,
         apply_jit: bool = False,
+        pipeline_postproc: bool = False,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
     ) -> None:
@@ -2146,6 +2149,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             device,
             execute_all_batches=True,
             apply_jit=apply_jit,
+            pipeline_postproc=pipeline_postproc,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
         )
