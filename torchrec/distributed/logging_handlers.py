@@ -6,9 +6,11 @@
 # LICENSE file in the root directory of this source tree.
 
 import contextlib
+import functools
 import logging
 from collections import defaultdict
-from typing import Dict, Generator, Optional
+from enum import Enum
+from typing import Any, Callable, Dict, Generator, Optional, TypeVar
 
 from torchrec.distributed.logging_utils import EventLoggingHandlerBase, EventType
 
@@ -23,12 +25,91 @@ Cap1Logger = "Cap1Logger"
 Cap01Logger = "Cap01Logger"
 MethodLogger = "MethodLogger"
 
+F = TypeVar("F", bound=Callable[..., Any])
+
+
+class TorchrecComponent(Enum):
+    """Enum representing different TorchRec components for event logging."""
+
+    PLANNER = "planner"
+    SHARDER = "sharder"
+    TRAIN_PIPELINE = "train_pipeline"
+    INPUT_DIST = "input_dist"
+    OUTPUT_DIST = "output_dist"
+    LOOKUP = "lookup"
+    REC_METRICS = "rec_metrics"
+
 
 class EventLoggingHandler(EventLoggingHandlerBase):
     """No-op event logging handler for open-source builds.
 
     This class can be used to add event logging implementation to Torchrec Components
     """
+
+    @classmethod
+    def event_logger(
+        cls,
+        component: TorchrecComponent,
+        prefix: str = "",
+        n: Optional[int] = None,
+        add_wait_counter: bool = False,
+    ) -> Callable[[F], F]:
+        """
+        Decorator that wraps a method with EventLoggingHandler.log_event_context
+        or n_batch_log_event_context.
+
+        The event name is constructed as "{prefix}{func.__qualname__}".
+
+        Args:
+            component: TorchrecComponent enum value for logging
+            prefix: Optional prefix to prepend to the qualname (default: "")
+            n: If provided, use n_batch_log_event_context to log only every
+                n batches. If None (default), use log_event_context.
+            add_wait_counter: If True, a _WaitCounter is managed for the
+                duration of the decorated function. Defaults to False.
+
+        Example::
+
+            class MyPlanner:
+                @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
+                def plan(self, module, sharders):
+                    # This will log event_name="MyPlanner.plan"
+                    ...
+
+                @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER, prefix="v2_")
+                def collective_plan(self, module, sharders):
+                    # This will log event_name="v2_MyPlanner.collective_plan"
+                    ...
+
+                @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER, n=1000)
+                def frequent_op(self, data):
+                    # This will log only every 1000 batches
+                    ...
+        """
+
+        def decorator(func: F) -> F:
+            @functools.wraps(func)
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                event_name = f"{prefix}{func.__qualname__}"
+                if n is None:
+                    ctx = cls.log_event_context(
+                        component=component.value,
+                        event_name=event_name,
+                        add_wait_counter=add_wait_counter,
+                    )
+                else:
+                    ctx = cls.n_batch_log_event_context(
+                        component=component.value,
+                        event_name=event_name,
+                        n=n,
+                        add_wait_counter=add_wait_counter,
+                    )
+                with ctx:
+                    return func(*args, **kwargs)
+
+            return wrapper  # pyre-ignore[7]
+
+        return decorator
 
     @classmethod
     def log_event(
