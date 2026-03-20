@@ -7,8 +7,6 @@
 
 # pyre-strict
 
-#!/usr/bin/env python3
-
 import abc
 from typing import Dict, List, Mapping, Optional
 
@@ -25,16 +23,15 @@ class FeatureProcessor(nn.Module):
     Abstract base class for feature processor.
 
     Args:
-        features (JaggedTensor]): feature representation
+        features (JaggedTensor): feature representation
 
     Returns:
         JaggedTensor: modified JT
 
-
     Example::
         jt = JaggedTensor(...)
         fp = FeatureProcessor(...)
-        fp_jt = FeatureProcessor(fp)
+        fp_jt = fp(jt)
     """
 
     @abc.abstractmethod
@@ -44,7 +41,7 @@ class FeatureProcessor(nn.Module):
     ) -> JaggedTensor:
         """
         Args:
-        features (JaggedTensor]): feature representation
+        features (JaggedTensor): feature representation
 
         Returns:
             JaggedTensor: modified JT
@@ -84,7 +81,7 @@ class PositionWeightedModule(FeatureProcessor):
     ) -> JaggedTensor:
         """
         Args:
-            features (JaggedTensor]): feature representation
+            features (JaggedTensor): feature representation
 
         Returns:
             JaggedTensor: same as input features with `weights` field being populated.
@@ -107,7 +104,7 @@ class PositionWeightedModule(FeatureProcessor):
     def pre_process_input(self, features: JaggedTensor) -> None:
         """
         Args:
-            features (JaggedTensor]): feature representation
+            features (JaggedTensor): feature representation
 
         Returns:
             torch.Tensor: position weights
@@ -124,14 +121,13 @@ class FeatureProcessorsCollection(nn.Module):
     Abstract base class for feature processor.
 
     Args:
-        features (KeyedJaggedTensor]): feature representation
+        features (KeyedJaggedTensor): feature representation
 
     Returns:
         KeyedJaggedTensor: modified KJT
 
-
     Example::
-        kjt = JaggedTensor(...)
+        kjt = KeyedJaggedTensor(...)
         grouped_fp = FeatureProcessorsCollection(...)
         fp_kjt = grouped_fp(kjt)
     """
@@ -143,10 +139,10 @@ class FeatureProcessorsCollection(nn.Module):
     ) -> KeyedJaggedTensor:
         """
         Args:
-        features (JaggedTensor]): feature representation
+        features (KeyedJaggedTensor): feature representation
 
         Returns:
-            JaggedTensor: modified JT
+            KeyedJaggedTensor: modified KJT
         """
         pass
 

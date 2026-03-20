@@ -54,6 +54,10 @@ class RecMetricEnum(RecMetricEnumBase):
     NMSE = "nmse"
     AVERAGE = "average"
     MULTI_LABEL_PRECISION = "multi_label_precision"
+    NUM_POSITIVE_SAMPLES = "num_positive_samples"
+    SUM_WEIGHTS = "sum_weights"
+    NUM_MISSING_LABELS = "num_missing_labels"
+    WEIGHTED_SUM_PREDICTIONS = "weighted_sum_predictions"
 
 
 @dataclass(unsafe_hash=True, eq=True)
