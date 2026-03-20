@@ -7,7 +7,7 @@
 
 #!/usr/bin/env python3
 
-from .comm import (
+from .comm import (  # noqa: F401
     broadcast_ids_to_evict,
     broadcast_transform_result,
     gather_global_ids,
