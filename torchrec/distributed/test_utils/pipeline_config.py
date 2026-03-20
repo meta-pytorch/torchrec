@@ -66,7 +66,7 @@ class PipelineConfig:
         kwargs = default_kwargs | self.kwargs
         if "sharding_type" in kwargs:
             kwargs["sharding_type"] = ShardingType(kwargs["sharding_type"])
-        if self.pipeline in ("base", "sparse", "sparse_lite"):
+        if self.pipeline in ("base", "sparse", "sparse_lite", "prefetch"):
             for key in ("site_fqn", "sharding_type"):
                 if key in kwargs:
                     kwargs.pop(key)
