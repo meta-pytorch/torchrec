@@ -12,7 +12,7 @@ import queue
 import threading
 import time
 import unittest
-from typing import Callable, cast
+from typing import Any, Callable, cast
 from unittest.mock import patch
 
 import torch
@@ -22,7 +22,8 @@ from torchrec.metrics.cpu_offloaded_metric_module import (
     CPUOffloadedRecMetricModule,
     MetricUpdateJob,
 )
-from torchrec.metrics.metric_module import RecMetricModule
+from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
+from torchrec.metrics.metrics_config import DefaultMetricsConfig
 from torchrec.metrics.rec_metric import RecMetricException, RecMetricList
 from torchrec.metrics.test_utils import gen_test_tasks
 from torchrec.metrics.test_utils.mock_metrics import (
@@ -228,11 +229,16 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_async_compute_after_shutdown(self) -> None:
         self.cpu_module.shutdown()
 
-        future = self.cpu_module.async_compute()
+        result = self.cpu_module.async_compute()
 
-        self.assertRaisesRegex(
-            RecMetricException, "metric processor thread is shut down.", future.result
+        captured_error: list[Exception] = []
+        result.subscribe(
+            callback=lambda _: None,
+            on_error=lambda e: captured_error.append(e),
         )
+        self.assertEqual(len(captured_error), 1)
+        self.assertIsInstance(captured_error[0], RecMetricException)
+        self.assertIn("metric processor thread is shut down.", str(captured_error[0]))
 
     def test_update_after_shutdown(self) -> None:
         self.cpu_module.shutdown()
@@ -631,6 +637,32 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_no_dtoh_transfer_for_cpu_device(self) -> None:
         self._run_dtoh_transfer_test(use_cuda=False)
 
+    def test_generate_metric_module_creates_cpu_offloaded_module(self) -> None:
+        module_kwargs = {
+            "model_out_device": torch.device("cpu"),
+            "update_queue_size": 50,
+            "compute_queue_size": 75,
+        }
+
+        module = generate_metric_module(
+            metric_class=CPUOffloadedRecMetricModule,
+            metrics_config=DefaultMetricsConfig,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+            module_kwargs=module_kwargs,
+        )
+
+        self.assertIsInstance(module, CPUOffloadedRecMetricModule)
+
+        self.assertEqual(module._model_out_device, torch.device("cpu"))
+        self.assertEqual(module.update_queue.maxsize, 50)
+        self.assertEqual(module.compute_queue.maxsize, 75)
+
+        module.shutdown()
+
 
 @skip_if_asan_class
 class CPUOffloadedMetricModuleDistributedTest(MultiProcessTestBase):
@@ -773,12 +805,20 @@ def _compare_metric_results_worker(
             expected_states=standard_state_dict,
         )
 
-    standard_results = standard_module.compute()
+    standard_results = standard_module.compute().resolve()
 
-    future = cpu_offloaded_module.async_compute()
+    deferrable = cpu_offloaded_module.async_compute()
 
-    # Wait for async compute to finish. Compare the input to each update()
-    offloaded_results = future.result(timeout=10.0)
+    # Wait for async compute to finish via subscribe. Compare the input to each update()
+    offloaded_event = threading.Event()
+    offloaded_results: dict[str, Any] = {}
+
+    def _on_results(data: dict[str, Any]) -> None:
+        offloaded_results.update(data)
+        offloaded_event.set()
+
+    deferrable.subscribe(_on_results)
+    offloaded_event.wait(timeout=10.0)
     for (
         offloaded_predictions,
         offloaded_labels,
