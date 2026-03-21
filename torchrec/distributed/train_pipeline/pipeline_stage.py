@@ -28,6 +28,7 @@ import torch
 from torch.profiler import record_function
 from torch.utils.hooks import RemovableHandle
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
+from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
@@ -619,6 +620,9 @@ class SparseDataDistUtil(Generic[In]):
         """
         DEPRECATED: exists for backward compatibility
         """
+        one_time_rank0_logger.warning(
+            "SparseDataDistUtil is using deprecated load_prefetch"
+        )
         # Version=0 did
         # module_input_post_prefetch = module_input_post_prefetch_for_next_batch
         # module_contexts_post_prefetch = module_contexts_post_prefetch_for_next_batch
