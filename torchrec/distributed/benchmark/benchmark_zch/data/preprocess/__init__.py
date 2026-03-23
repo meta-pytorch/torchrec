@@ -8,5 +8,5 @@
 # pyre-strict
 from .criteo_kaggle import get_criteo_kaggle_dataloader  # noqa: F401
 from .kuairand_1k import get_kuairand_1k_dataloader  # noqa: F401
-from .kuairand_27k import get_kuairand_27k_dataloader
-from .movielens_1m import get_movielens_1m_dataloader
+from .kuairand_27k import get_kuairand_27k_dataloader  # noqa: F401
+from .movielens_1m import get_movielens_1m_dataloader  # noqa: F401
