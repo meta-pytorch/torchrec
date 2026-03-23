@@ -27,7 +27,7 @@ from typing import (
 
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
-from torchrec.distributed.planner.constants import BIGINT_DTYPE, NUM_POOLINGS
+from torchrec.distributed.planner.constants import BIGINT_DTYPE
 from torchrec.distributed.planner.shard_estimators import (
     _calculate_shard_io_sizes,
     get_num_poolings,

@@ -27,7 +27,6 @@ from torchrec.distributed.planner.estimator.annotations import (
     bwd_coefficient,
     forward_compute,
     fwd_coefficient,
-    prefetch_coefficient,
 )
 from torchrec.distributed.planner.estimator.estimator import (
     ColumnWiseEvaluator,
@@ -44,7 +43,6 @@ from torchrec.distributed.planner.estimator.estimator import (
 from torchrec.distributed.planner.estimator.types import (
     HardwarePerfConfig,
     PerfCoefficient,
-    PrefetchCoefficients,
     ShardPerfContext,
 )
 from torchrec.distributed.planner.types import CollectiveType, GeneralizedCommsBandwidth
