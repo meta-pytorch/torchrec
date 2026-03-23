@@ -11,7 +11,6 @@ import unittest
 from typing import cast, Dict, List, Optional
 
 import torch
-from torch import nn
 from torchrec import EmbeddingBagCollection, EmbeddingConfig
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
