@@ -14,7 +14,7 @@ import sys
 from collections import OrderedDict
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
 
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
