@@ -130,6 +130,14 @@ class PipelineConfig:
         }
 
         match self.pipeline:
+            case "base":
+                return TrainPipelineBase(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    enable_inplace_copy_batch=self.enable_inplace_copy_batch,
+                    **self.get_kwargs(),
+                )
             case "semi":
                 return TrainPipelineSemiSync(
                     model=model,
