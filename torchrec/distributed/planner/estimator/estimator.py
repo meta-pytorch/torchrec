@@ -21,7 +21,6 @@ import math
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Type
 
-from torch._utils_internal import justknobs_check
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import (
     BATCHED_COPY_PERF_FACTOR,
@@ -52,7 +51,6 @@ from torchrec.distributed.planner.types import (
     ShardingOption,
     Topology,
 )
-from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.types import ShardingType
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -1727,12 +1725,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
             # (raises ValueError if not supported)
             self._config.validate_sharding_type(sharding_option.sharding_type)
 
-            if justknobs_check(
-                "pytorch/torchrec:enable_precomputed_sharding_option_fields"
-            ):
-                sharder_key = sharding_option.module_type_key
-            else:
-                sharder_key = sharder_name(type(sharding_option.module[1]))
+            sharder_key = sharding_option.module_type_key
 
             shard_sizes = [shard.size for shard in sharding_option.shards]
 
