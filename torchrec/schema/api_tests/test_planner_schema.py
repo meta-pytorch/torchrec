@@ -30,6 +30,7 @@ from torchrec.distributed.planner.types import (
     Partitioner,
     PerfModel,
     Proposer,
+    SharderDataMap,
     ShardEstimator,
     ShardingOption,
     ShardingPlan,
@@ -165,7 +166,7 @@ class StableEmbeddingPerfEstimator:
     def estimate(
         self,
         sharding_options: List[ShardingOption],
-        sharder_map: Optional[Dict[str, ModuleSharder[nn.Module]]] = None,
+        sharder_data_map: SharderDataMap,
     ) -> None:
         pass
 
@@ -184,7 +185,7 @@ class StableEmbeddingStorageEstimator:
     def estimate(
         self,
         sharding_options: List[ShardingOption],
-        sharder_map: Optional[Dict[str, ModuleSharder[nn.Module]]] = None,
+        sharder_data_map: SharderDataMap,
     ) -> None:
         pass
 
