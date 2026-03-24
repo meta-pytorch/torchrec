@@ -246,6 +246,7 @@ class ShardedManagedCollisionCollection(
         self._output_dists: List[nn.Module] = []
         self._create_output_dists()
         self._use_index_dedup = use_index_dedup
+        logger.info(f"MC EC index dedup enabled: {self._use_index_dedup}.")
         self._initialize_torch_state()
         self.post_lookup_tracker_fn: Optional[
             Callable[
