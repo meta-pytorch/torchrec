@@ -18,7 +18,9 @@ free-threaded Python 3.13t), a threading.Lock would be needed.
 
 import logging
 from concurrent.futures import Future
-from typing import Any, Callable
+from typing import Any, Callable, Tuple
+
+import torch
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -138,13 +140,17 @@ class DeferrableMetrics:
         if self._resolved:
             self._data.update(dict_other)
         elif self._future is not None:
+            cpu_dict, event = transfer_tensors_to_cpu(dict_other)
+
             original_future = self._future
             merged_future: Future[dict[str, Any]] = Future()
 
             def _on_complete(f: Future[dict[str, Any]]) -> None:
                 try:
+                    if event is not None:
+                        event.synchronize()
                     result = dict(f.result())
-                    result.update(dict_other)
+                    result.update(cpu_dict)
                     merged_future.set_result(result)
                 except Exception as e:
                     merged_future.set_exception(e)
@@ -164,3 +170,48 @@ class DeferrableMetrics:
         if self._resolved:
             return f"DeferrableMetrics(resolved, {len(self._data)} keys)"
         return "DeferrableMetrics(pending)"
+
+
+def device_supports_async(device: torch.device) -> bool:
+    """Check if a device supports non-blocking async transfers (CUDA events)."""
+    return device.type == "cuda"
+
+
+def transfer_tensors_to_cpu(
+    tensors: dict[str, Any],
+) -> Tuple[dict[str, Any], "torch.cuda.Event | None"]:
+    """Transfer GPU tensors to CPU using non-blocking copies.
+
+    Returns the CPU tensor dict and a CUDA event that tracks completion.
+    For CPU-only inputs, returns the dict as-is with None event.
+    Non-tensor values are preserved unchanged.
+
+    Records the CUDA event on the source tensor's device stream (not the
+    default device) to avoid metric corruption on non-rank-0 processes.
+    """
+    has_cuda = any(
+        isinstance(v, torch.Tensor) and v.device.type == "cuda"
+        for v in tensors.values()
+    )
+    if not has_cuda:
+        return tensors, None
+
+    # Detect source device from first CUDA tensor
+    source_device: torch.device | None = None
+    for v in tensors.values():
+        if isinstance(v, torch.Tensor) and v.device.type == "cuda":
+            source_device = v.device
+            break
+
+    cpu_tensors = {
+        k: v.to(device="cpu", non_blocking=True) if isinstance(v, torch.Tensor) else v
+        for k, v in tensors.items()
+    }
+
+    # Record event on the source tensor's device, not the default device
+    assert source_device is not None
+    with torch.cuda.device(source_device):
+        event = torch.cuda.Event()
+        event.record()
+
+    return cpu_tensors, event
