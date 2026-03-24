@@ -8,7 +8,8 @@
 # pyre-strict
 
 import logging
-from typing import Any, Dict, List, Optional, Type
+from dataclasses import dataclass
+from typing import Any, cast, Dict, List, Optional, Type, Union
 
 import torch
 from torch import distributed as dist
@@ -222,6 +223,77 @@ def _state_reduction_sum(state: torch.Tensor) -> torch.Tensor:
     return state.sum(dim=0)
 
 
+@dataclass
+class GroupingKeyConfig:
+    """Configuration for a single grouping key.
+
+    Args:
+        name: The name of the tensor containing the grouping key values.
+        num_groups: Number of groups for this grouping key.
+        cast_keys_to_int: Whether to cast the grouping key values to int64.
+    """
+
+    name: str
+    num_groups: int = 1
+    cast_keys_to_int: bool = False
+
+
+def _normalize_grouping_keys_config(
+    grouping_keys: Union[str, List[str], List[Dict[str, Any]], List[GroupingKeyConfig]],
+    num_groups: int,
+    cast_keys_to_int: bool,
+) -> List[GroupingKeyConfig]:
+    """Normalize grouping_keys input to a list of GroupingKeyConfig objects.
+
+    Args:
+        grouping_keys: Can be:
+            - A string (single key name) - uses num_groups and cast_keys_to_int
+            - A list of strings (multiple key names) - each uses num_groups and cast_keys_to_int
+            - A list of dicts with keys: name, num_groups (optional), cast_keys_to_int (optional)
+            - A list of GroupingKeyConfig objects
+        num_groups: Default number of groups (used when grouping_keys is a string or list of strings)
+        cast_keys_to_int: Default cast setting (used when grouping_keys is a string or list of strings)
+
+    Returns:
+        List of GroupingKeyConfig objects
+    """
+    if isinstance(grouping_keys, str):
+        return [
+            GroupingKeyConfig(
+                name=grouping_keys,
+                num_groups=num_groups,
+                cast_keys_to_int=cast_keys_to_int,
+            )
+        ]
+
+    configs = []
+    for item in grouping_keys:
+        if isinstance(item, str):
+            configs.append(
+                GroupingKeyConfig(
+                    name=item,
+                    num_groups=num_groups,
+                    cast_keys_to_int=cast_keys_to_int,
+                )
+            )
+        elif isinstance(item, dict):
+            configs.append(
+                GroupingKeyConfig(
+                    name=item["name"],
+                    num_groups=item.get("num_groups", num_groups),
+                    cast_keys_to_int=item.get("cast_keys_to_int", cast_keys_to_int),
+                )
+            )
+        elif isinstance(item, GroupingKeyConfig):
+            configs.append(item)
+        else:
+            raise ValueError(
+                f"Invalid grouping_keys item type: {type(item)}. "
+                "Expected str, dict, or GroupingKeyConfig."
+            )
+    return configs
+
+
 class SegmentedNEMetricComputation(RecMetricComputation):
     r"""
     This class implements the RecMetricComputation for Segmented NE, i.e. Normalized Entropy - for boolean labels.
@@ -234,8 +306,13 @@ class SegmentedNEMetricComputation(RecMetricComputation):
 
     Args:
         include_logloss (bool): return vanilla logloss as one of metrics results, on top of segmented NE.
-        num_groups (int): number of groups to segment NE by.
-        grouping_keys (str): name of the tensor containing the label by which results will be segmented. This tensor should be of type torch.int64.
+        num_groups (int): number of groups to segment NE by. This is the default for all grouping_keys.
+        grouping_keys (Union[str, List[str], List[Dict], List[GroupingKeyConfig]]): Specifies the grouping key(s).
+            Can be:
+            - A string (single key name)
+            - A list of strings (multiple key names, each using the same num_groups)
+            - A list of dicts with keys: "name" (required), "num_groups" (optional), "cast_keys_to_int" (optional)
+            - A list of GroupingKeyConfig objects
         cast_keys_to_int (bool): whether to cast grouping_keys to torch.int64. Only works if grouping_keys is of type torch.float32.
     """
 
@@ -244,44 +321,91 @@ class SegmentedNEMetricComputation(RecMetricComputation):
         *args: Any,
         include_logloss: bool = False,
         num_groups: int = 1,
-        grouping_keys: str = "grouping_keys",
+        grouping_keys: Union[
+            str, List[str], List[Dict[str, Any]], List[GroupingKeyConfig]
+        ] = "grouping_keys",
         cast_keys_to_int: bool = False,
         **kwargs: Any,
     ) -> None:
         self._include_logloss: bool = include_logloss
         super().__init__(*args, **kwargs)
-        self._num_groups = num_groups  # would there be checkpointing issues with this? maybe make this state
-        self._grouping_keys = grouping_keys
+
+        # Normalize grouping_keys to a list of GroupingKeyConfig
+        self._grouping_key_configs = _normalize_grouping_keys_config(
+            grouping_keys, num_groups, cast_keys_to_int
+        )
+
+        # Track whether we're in single-default-key mode for backward compat.
+        # Use no prefix/suffix when:
+        #   - Original input was a plain string (not wrapped in a list), OR
+        #   - There is exactly one config with the default name "grouping_keys"
+        self._is_single_default_key: bool = isinstance(grouping_keys, str) or (
+            len(self._grouping_key_configs) == 1
+            and self._grouping_key_configs[0].name == "grouping_keys"
+        )
+
+        # For backward compatibility only: expose _num_groups and _grouping_keys
+        # as instance attributes. These are ONLY used by legacy code that might
+        # access them directly. The actual metric computation uses each config's
+        # own num_groups, so this has no impact on correctness.
+        # We use the first config's values since legacy code expected a single key.
+        self._num_groups = self._grouping_key_configs[0].num_groups
+        self._grouping_keys = self._grouping_key_configs[0].name
         self._cast_keys_to_int = cast_keys_to_int
-        self._add_state(
-            "cross_entropy_sum",
-            torch.zeros((self._n_tasks, num_groups), dtype=torch.double),
-            add_window_state=False,
-            dist_reduce_fx=_state_reduction_sum,
-            persistent=True,
-        )
-        self._add_state(
-            "weighted_num_samples",
-            torch.zeros((self._n_tasks, num_groups), dtype=torch.double),
-            add_window_state=False,
-            dist_reduce_fx=_state_reduction_sum,
-            persistent=True,
-        )
-        self._add_state(
-            "pos_labels",
-            torch.zeros((self._n_tasks, num_groups), dtype=torch.double),
-            add_window_state=False,
-            dist_reduce_fx=_state_reduction_sum,
-            persistent=True,
-        )
-        self._add_state(
-            "neg_labels",
-            torch.zeros((self._n_tasks, num_groups), dtype=torch.double),
-            add_window_state=False,
-            dist_reduce_fx=_state_reduction_sum,
-            persistent=True,
-        )
+
         self.eta = 1e-12
+
+        # Create states for each grouping key config
+        for config in self._grouping_key_configs:
+            state_prefix = self._get_state_prefix(config.name)
+            self._add_state(
+                f"{state_prefix}cross_entropy_sum",
+                torch.zeros((self._n_tasks, config.num_groups), dtype=torch.double),
+                add_window_state=True,
+                dist_reduce_fx=_state_reduction_sum,
+                persistent=True,
+            )
+            self._add_state(
+                f"{state_prefix}weighted_num_samples",
+                torch.zeros((self._n_tasks, config.num_groups), dtype=torch.double),
+                add_window_state=True,
+                dist_reduce_fx=_state_reduction_sum,
+                persistent=True,
+            )
+            self._add_state(
+                f"{state_prefix}pos_labels",
+                torch.zeros((self._n_tasks, config.num_groups), dtype=torch.double),
+                add_window_state=True,
+                dist_reduce_fx=_state_reduction_sum,
+                persistent=True,
+            )
+            self._add_state(
+                f"{state_prefix}neg_labels",
+                torch.zeros((self._n_tasks, config.num_groups), dtype=torch.double),
+                add_window_state=True,
+                dist_reduce_fx=_state_reduction_sum,
+                persistent=True,
+            )
+
+    def _get_state_prefix(self, key_name: str) -> str:
+        """Get the state prefix for a grouping key.
+
+        For backward compatibility, if the metric was created with a single
+        default key (string input or single "grouping_keys"), use no prefix.
+        """
+        if self._is_single_default_key:
+            return ""
+        return f"{key_name}_"
+
+    def _get_description_suffix(self, key_name: str) -> str:
+        """Get the description suffix for metric reports.
+
+        For backward compatibility, if the metric was created with a single
+        default key, don't add a suffix.
+        """
+        if self._is_single_default_key:
+            return ""
+        return f"@{key_name}"
 
     def update(
         self,
@@ -293,104 +417,149 @@ class SegmentedNEMetricComputation(RecMetricComputation):
     ) -> None:
         if predictions is None or weights is None:
             raise RecMetricException(
-                f"Inputs 'predictions' and 'weights' and '{self._grouping_keys}' should not be None for NEMetricComputation update"
+                "Inputs 'predictions' and 'weights' should not be None for SegmentedNEMetricComputation update"
             )
-        elif (
-            "required_inputs" not in kwargs
-            or kwargs["required_inputs"].get(self._grouping_keys) is None
-        ):
+
+        if "required_inputs" not in kwargs:
             raise RecMetricException(
-                f"Required inputs for SegmentedNEMetricComputation update should contain {self._grouping_keys}, got kwargs: {kwargs}"
+                f"Required inputs for SegmentedNEMetricComputation update should be provided, got kwargs: {kwargs}"
             )
-        elif kwargs["required_inputs"][self._grouping_keys].dtype != torch.int64:
-            if (
-                self._cast_keys_to_int
-                and kwargs["required_inputs"][self._grouping_keys].dtype
-                == torch.float32
-            ):
-                kwargs["required_inputs"][self._grouping_keys] = kwargs[
-                    "required_inputs"
-                ][self._grouping_keys].to(torch.int64)
-            else:
+
+        required_inputs = kwargs["required_inputs"]
+        num_samples = predictions.shape[-1]
+
+        # Process each grouping key configuration
+        for config in self._grouping_key_configs:
+            key_name = config.name
+            state_prefix = self._get_state_prefix(key_name)
+
+            if required_inputs.get(key_name) is None:
                 raise RecMetricException(
-                    f"Grouping keys expected to have type torch.int64 or torch.float32 with cast_keys_to_int set to true, got {kwargs['required_inputs'][self._grouping_keys].dtype}."
+                    f"Required inputs for SegmentedNEMetricComputation update should contain '{key_name}', got keys: {list(required_inputs.keys())}"
                 )
 
-        grouping_keys = kwargs["required_inputs"][self._grouping_keys]
-        # When labels is 2D, we're in a fused mode (either FUSED_TASKS_COMPUTATION or FUSED_TASKS_AND_STATES_COMPUTATION)
-        # The states update and NE computation need to be done differently.
-        # On fused path, we need to group all tasks together to compute NE and update states for all tasks in one tensor.
-        if (
-            self._compute_mode == RecComputeMode.FUSED_TASKS_COMPUTATION
-            or self._compute_mode == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
-        ):
-            states = get_segemented_ne_states_fused(
-                labels,
-                predictions,
-                weights,
-                grouping_keys,
-                eta=self.eta,
-                num_groups=self._num_groups,
-                n_tasks=self._n_tasks,
-            )
-        else:
-            states = get_segemented_ne_states(
-                labels,
-                predictions,
-                weights,
-                grouping_keys,
-                eta=self.eta,
-                num_groups=self._num_groups,
-            )
+            grouping_keys_tensor = required_inputs[key_name]
 
-        for state_name, state_value in states.items():
-            state = getattr(self, state_name)
-            state += state_value
+            # Validate and cast dtype
+            if grouping_keys_tensor.dtype != torch.int64:
+                if config.cast_keys_to_int and grouping_keys_tensor.dtype in (
+                    torch.float32,
+                    torch.float64,
+                ):
+                    grouping_keys_tensor = grouping_keys_tensor.to(torch.int64)
+                else:
+                    raise RecMetricException(
+                        f"Grouping key '{key_name}' expected to have type torch.int64 or torch.float32/torch.float64 with cast_keys_to_int set to true, got {grouping_keys_tensor.dtype}."
+                    )
+
+            # Compute states for this grouping key
+            if (
+                self._compute_mode == RecComputeMode.FUSED_TASKS_COMPUTATION
+                or self._compute_mode
+                == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION
+            ):
+                states = get_segemented_ne_states_fused(
+                    labels,
+                    predictions,
+                    weights,
+                    grouping_keys_tensor,
+                    eta=self.eta,
+                    num_groups=config.num_groups,
+                    n_tasks=self._n_tasks,
+                )
+            else:
+                states = get_segemented_ne_states(
+                    labels,
+                    predictions,
+                    weights,
+                    grouping_keys_tensor,
+                    eta=self.eta,
+                    num_groups=config.num_groups,
+                )
+
+            # Update states with proper prefix
+            for state_name, state_value in states.items():
+                full_state_name = f"{state_prefix}{state_name}"
+                state = getattr(self, full_state_name)
+                state += state_value
+                self._aggregate_window_state(full_state_name, state_value, num_samples)
 
     def _compute_fused(self) -> List[MetricComputationReport]:
         reports = []
-        computed_ne = compute_ne_fused(
-            # pyrefly: ignore[bad-argument-type]
-            self.cross_entropy_sum,
-            # pyrefly: ignore[bad-argument-type]
-            self.weighted_num_samples,
-            # pyrefly: ignore[bad-argument-type]
-            self.pos_labels,
-            # pyrefly: ignore[bad-argument-type]
-            self.neg_labels,
-            num_groups=self._num_groups,
-            n_tasks=self._n_tasks,
-            eta=self.eta,
-        )
-        for group in range(self._num_groups):
-            reports.append(
-                MetricComputationReport(
-                    name=MetricName.SEGMENTED_NE,
-                    metric_prefix=MetricPrefix.LIFETIME,
-                    value=computed_ne[:, group],
-                    description="_" + str(group),
-                ),
-            )
 
-        if self._include_logloss:
-            log_loss_groups = compute_logloss(
-                # pyrefly: ignore[bad-argument-type]
-                self.cross_entropy_sum,
-                # pyrefly: ignore[bad-argument-type]
-                self.pos_labels,
-                # pyrefly: ignore[bad-argument-type]
-                self.neg_labels,
+        for config in self._grouping_key_configs:
+            key_name = config.name
+            state_prefix = self._get_state_prefix(key_name)
+            description_suffix = self._get_description_suffix(key_name)
+
+            # Compute lifetime NE
+            computed_ne = compute_ne_fused(
+                getattr(self, f"{state_prefix}cross_entropy_sum"),
+                getattr(self, f"{state_prefix}weighted_num_samples"),
+                getattr(self, f"{state_prefix}pos_labels"),
+                getattr(self, f"{state_prefix}neg_labels"),
+                num_groups=config.num_groups,
+                n_tasks=self._n_tasks,
                 eta=self.eta,
             )
-            for group in range(self._num_groups):
+            # Compute window NE
+            window_computed_ne = compute_ne_fused(
+                self.get_window_state(f"{state_prefix}cross_entropy_sum"),
+                self.get_window_state(f"{state_prefix}weighted_num_samples"),
+                self.get_window_state(f"{state_prefix}pos_labels"),
+                self.get_window_state(f"{state_prefix}neg_labels"),
+                num_groups=config.num_groups,
+                n_tasks=self._n_tasks,
+                eta=self.eta,
+            )
+            for group in range(config.num_groups):
                 reports.append(
                     MetricComputationReport(
-                        name=MetricName.LOG_LOSS,
+                        name=MetricName.SEGMENTED_NE,
                         metric_prefix=MetricPrefix.LIFETIME,
-                        value=log_loss_groups[:, group],
-                        description="_" + str(group),
-                    )
+                        value=computed_ne[:, group],
+                        description=f"_{group}{description_suffix}",
+                    ),
                 )
+                reports.append(
+                    MetricComputationReport(
+                        name=MetricName.SEGMENTED_NE,
+                        metric_prefix=MetricPrefix.WINDOW,
+                        value=window_computed_ne[:, group],
+                        description=f"_{group}{description_suffix}",
+                    ),
+                )
+
+            if self._include_logloss:
+                log_loss_groups = compute_logloss(
+                    getattr(self, f"{state_prefix}cross_entropy_sum"),
+                    getattr(self, f"{state_prefix}pos_labels"),
+                    getattr(self, f"{state_prefix}neg_labels"),
+                    eta=self.eta,
+                )
+                window_log_loss_groups = compute_logloss(
+                    self.get_window_state(f"{state_prefix}cross_entropy_sum"),
+                    self.get_window_state(f"{state_prefix}pos_labels"),
+                    self.get_window_state(f"{state_prefix}neg_labels"),
+                    eta=self.eta,
+                )
+                for group in range(config.num_groups):
+                    reports.append(
+                        MetricComputationReport(
+                            name=MetricName.LOG_LOSS,
+                            metric_prefix=MetricPrefix.LIFETIME,
+                            value=log_loss_groups[:, group],
+                            description=f"_{group}{description_suffix}",
+                        )
+                    )
+                    reports.append(
+                        MetricComputationReport(
+                            name=MetricName.LOG_LOSS,
+                            metric_prefix=MetricPrefix.WINDOW,
+                            value=window_log_loss_groups[:, group],
+                            description=f"_{group}{description_suffix}",
+                        )
+                    )
 
         return reports
 
@@ -402,49 +571,82 @@ class SegmentedNEMetricComputation(RecMetricComputation):
         ):
             return self._compute_fused()
 
-        computed_ne = compute_ne(
-            # pyrefly: ignore[bad-index]
-            self.cross_entropy_sum[0],
-            # pyrefly: ignore[bad-index]
-            self.weighted_num_samples[0],
-            # pyrefly: ignore[bad-index]
-            self.pos_labels[0],
-            # pyrefly: ignore[bad-index]
-            self.neg_labels[0],
-            num_groups=self._num_groups,
-            eta=self.eta,
-        )
+        # For non-fused mode, iterate over all grouping key configs
+        for config in self._grouping_key_configs:
+            key_name = config.name
+            state_prefix = self._get_state_prefix(key_name)
+            description_suffix = self._get_description_suffix(key_name)
 
-        for group in range(self._num_groups):
-            reports.append(
-                MetricComputationReport(
-                    name=MetricName.SEGMENTED_NE,
-                    metric_prefix=MetricPrefix.LIFETIME,
-                    value=computed_ne[group],
-                    description="_" + str(group),
-                ),
-            )
-
-        if self._include_logloss:
-            log_loss_groups = compute_logloss(
-                # pyrefly: ignore[bad-index]
-                self.cross_entropy_sum[0],
-                # pyrefly: ignore[bad-index]
-                self.pos_labels[0],
-                # pyrefly: ignore[bad-index]
-                self.neg_labels[0],
+            # Compute lifetime NE
+            computed_ne = compute_ne(
+                getattr(self, f"{state_prefix}cross_entropy_sum")[0],
+                getattr(self, f"{state_prefix}weighted_num_samples")[0],
+                getattr(self, f"{state_prefix}pos_labels")[0],
+                getattr(self, f"{state_prefix}neg_labels")[0],
+                num_groups=config.num_groups,
                 eta=self.eta,
             )
 
-            for group in range(self._num_groups):
+            # Compute window NE
+            window_computed_ne = compute_ne(
+                self.get_window_state(f"{state_prefix}cross_entropy_sum")[0],
+                self.get_window_state(f"{state_prefix}weighted_num_samples")[0],
+                self.get_window_state(f"{state_prefix}pos_labels")[0],
+                self.get_window_state(f"{state_prefix}neg_labels")[0],
+                num_groups=config.num_groups,
+                eta=self.eta,
+            )
+
+            for group in range(config.num_groups):
                 reports.append(
                     MetricComputationReport(
-                        name=MetricName.LOG_LOSS,
+                        name=MetricName.SEGMENTED_NE,
                         metric_prefix=MetricPrefix.LIFETIME,
-                        value=log_loss_groups[group],
-                        description="_" + str(group),
-                    )
+                        value=computed_ne[group],
+                        description=f"_{group}{description_suffix}",
+                    ),
                 )
+                reports.append(
+                    MetricComputationReport(
+                        name=MetricName.SEGMENTED_NE,
+                        metric_prefix=MetricPrefix.WINDOW,
+                        value=window_computed_ne[group],
+                        description=f"_{group}{description_suffix}",
+                    ),
+                )
+
+            if self._include_logloss:
+                log_loss_groups = compute_logloss(
+                    getattr(self, f"{state_prefix}cross_entropy_sum")[0],
+                    getattr(self, f"{state_prefix}pos_labels")[0],
+                    getattr(self, f"{state_prefix}neg_labels")[0],
+                    eta=self.eta,
+                )
+
+                window_log_loss_groups = compute_logloss(
+                    self.get_window_state(f"{state_prefix}cross_entropy_sum")[0],
+                    self.get_window_state(f"{state_prefix}pos_labels")[0],
+                    self.get_window_state(f"{state_prefix}neg_labels")[0],
+                    eta=self.eta,
+                )
+
+                for group in range(config.num_groups):
+                    reports.append(
+                        MetricComputationReport(
+                            name=MetricName.LOG_LOSS,
+                            metric_prefix=MetricPrefix.LIFETIME,
+                            value=log_loss_groups[group],
+                            description=f"_{group}{description_suffix}",
+                        )
+                    )
+                    reports.append(
+                        MetricComputationReport(
+                            name=MetricName.LOG_LOSS,
+                            metric_prefix=MetricPrefix.WINDOW,
+                            value=window_log_loss_groups[group],
+                            description=f"_{group}{description_suffix}",
+                        )
+                    )
 
         return reports
 
@@ -481,8 +683,20 @@ class SegmentedNEMetric(RecMetric):
             process_group=process_group,
             **kwargs,
         )
-        if "grouping_keys" not in kwargs:
-            self._required_inputs.add("grouping_keys")
-        else:
-            # pyrefly: ignore[bad-argument-type]
-            self._required_inputs.add(kwargs["grouping_keys"])
+        # Handle required inputs for grouping_keys
+        grouping_keys_value = kwargs.get("grouping_keys", "grouping_keys")
+        grouping_keys: Union[
+            str, List[str], List[Dict[str, Any]], List[GroupingKeyConfig]
+        ] = cast(
+            Union[str, List[str], List[Dict[str, Any]], List[GroupingKeyConfig]],
+            grouping_keys_value,
+        )
+        num_groups: int = cast(int, kwargs.get("num_groups", 1))
+        cast_keys_to_int: bool = cast(bool, kwargs.get("cast_keys_to_int", False))
+
+        # Normalize to list of configs to extract all required input names
+        configs = _normalize_grouping_keys_config(
+            grouping_keys, num_groups, cast_keys_to_int
+        )
+        for config in configs:
+            self._required_inputs.add(config.name)
