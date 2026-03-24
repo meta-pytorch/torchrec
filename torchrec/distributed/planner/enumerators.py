@@ -155,7 +155,9 @@ class EmbeddingEnumerator(Enumerator):
             self._last_stored_module == module
             and self._last_stored_sharders == sharders
         ):
-            # pyrefly: ignore[bad-argument-type]
+            assert (
+                self._last_stored_search_space is not None
+            ), "Cache invariant: _last_stored_search_space must be set atomically with module/sharders"
             return copy.deepcopy(self._last_stored_search_space)
 
         self._sharder_map = {
