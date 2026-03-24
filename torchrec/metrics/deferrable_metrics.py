@@ -16,8 +16,11 @@ resolve() will see a consistent state. If used outside CPython (e.g.,
 free-threaded Python 3.13t), a threading.Lock would be needed.
 """
 
+import logging
 from concurrent.futures import Future
 from typing import Any, Callable
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class DeferrableMetrics:
@@ -26,7 +29,7 @@ class DeferrableMetrics:
 
     Provides a unified interface for both sync and async metric access:
     - subscribe(callback): async access, always works
-    - resolve(): sync access, fails fast if backed by Future
+    - resolve(): sync access, blocks with warning if backed by Future
     - update(other): deferred merge
     - is_resolved(): check without blocking
 
@@ -50,7 +53,7 @@ class DeferrableMetrics:
 
     def subscribe(
         self,
-        callback: Callable[[dict[str, Any]], None],
+        callback: Callable[[dict[str, Any]], Any],
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         """Register a callback for when metrics are available.
@@ -79,16 +82,24 @@ class DeferrableMetrics:
     def resolve(self) -> dict[str, Any]:
         """Synchronously return the resolved metrics dict.
 
-        Fails fast with RuntimeError if backed by a Future.
-        Only use in contexts where CPU-offloaded metrics are disabled
-        (eval, inference, tests).
+        If backed by a Future (ZORM active), blocks until resolved and logs a
+        warning. Prefer subscribe() for async access in the training path to
+        preserve ZORM's QPS benefit.
         """
         if not self._resolved:
-            raise RuntimeError(
-                "Cannot synchronously resolve DeferrableMetrics backed by a "
-                "Future. Use subscribe() for async access, or ensure "
-                "CPU-offloaded metrics are disabled for this code path."
-            )
+            if self._future is not None:
+                logger.warning(
+                    "DeferrableMetrics.resolve() called on Future-backed metrics. "
+                    "This blocks the training path and defeats ZORM's async benefit. "
+                    "Use subscribe() for async access."
+                )
+                result = self._future.result()
+                self._data = result
+                self._resolved = True
+            else:
+                raise RuntimeError(
+                    "DeferrableMetrics is in an invalid state: not resolved and no Future."
+                )
         return self._data
 
     def update(self, other: "dict[str, Any] | DeferrableMetrics") -> None:
