@@ -13,7 +13,6 @@ from typing import cast, Dict, List, Optional, Tuple, Type
 
 import torch
 import torchrec.optim as trec_optim
-from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import (
     BIGINT_DTYPE,
@@ -39,7 +38,6 @@ from torchrec.distributed.types import (
     CacheStatistics,
     compute_storage_usage,
     KeyValueParams,
-    ModuleSharder,
     PipelineType,
     ShardingType,
 )
@@ -96,37 +94,19 @@ class EmbeddingPerfEstimator(ShardEstimator):
     def estimate(
         self,
         sharding_options: List[ShardingOption],
-        sharder_map: Optional[Dict[str, ModuleSharder[nn.Module]]] = None,
-        sharder_data_map: Optional[SharderDataMap] = None,
+        sharder_data_map: SharderDataMap,
     ) -> None:
         """
         Estimates the wall time of a given sharding option.
 
         Args:
             sharding_options (List[ShardingOption]): list of sharding options.
-            sharder_map (Optional[Dict[str, ModuleSharder[nn.Module]]]): sharder map.
-            sharder_data_map (Optional[SharderDataMap]): sharder data map
-                (used when enable_sharder_data killswitch is on).
+            sharder_data_map (SharderDataMap): sharder data map.
         """
-        from torch._utils_internal import justknobs_check
-
-        use_sharder_data = justknobs_check("pytorch/torchrec:enable_sharder_data")
-        if use_sharder_data:
-            assert (
-                sharder_data_map is not None
-            ), "sharder_data_map required when enable_sharder_data is on"
-            return self._estimator.estimate(
-                sharding_options,
-                sharder_data_map=sharder_data_map,
-            )
-        else:
-            assert (
-                sharder_map is not None
-            ), "sharder_map required when enable_sharder_data is off"
-            return self._estimator.estimate(
-                sharding_options,
-                sharder_map=sharder_map,
-            )
+        self._estimator.estimate(
+            sharding_options,
+            sharder_data_map=sharder_data_map,
+        )
 
 
 class EmbeddingStorageEstimator(ShardEstimator):
@@ -170,31 +150,18 @@ class EmbeddingStorageEstimator(ShardEstimator):
     def estimate(
         self,
         sharding_options: List[ShardingOption],
-        sharder_map: Optional[Dict[str, ModuleSharder[nn.Module]]] = None,
-        sharder_data_map: Optional[SharderDataMap] = None,
+        sharder_data_map: SharderDataMap,
     ) -> None:
         """
         Estimate the storage cost of each sharding option.
 
         Args:
             sharding_options (List[ShardingOption]): list of sharding options.
-            sharder_map (Optional[Dict[str, ModuleSharder[nn.Module]]]): sharder map.
-            sharder_data_map (Optional[SharderDataMap]): sharder data map
-                (used when enable_sharder_data killswitch is on).
+            sharder_data_map (SharderDataMap): sharder data map.
         """
-        from torch._utils_internal import justknobs_check
-
-        use_sharder_data = justknobs_check("pytorch/torchrec:enable_sharder_data")
-        if use_sharder_data:
-            assert (
-                sharder_data_map is not None
-            ), "sharder_data_map required when enable_sharder_data is on"
-        else:
-            assert (
-                sharder_map is not None
-            ), "sharder_map required when enable_sharder_data is off"
-
         for sharding_option in sharding_options:
+            from torch._utils_internal import justknobs_check
+
             if justknobs_check(
                 "pytorch/torchrec:enable_precomputed_sharding_option_fields"
             ):
@@ -202,24 +169,12 @@ class EmbeddingStorageEstimator(ShardEstimator):
             else:
                 sharder_key = sharder_name(type(sharding_option.module[1]))
 
-            sharder_data: Optional[SharderData] = None
-            sharder: Optional[ModuleSharder[nn.Module]] = None
-            if sharder_data_map is not None:
-                sharder_data = sharder_data_map[sharder_key]
-            elif sharder_map is not None:
-                sharder = sharder_map[sharder_key]
+            sharder_data = sharder_data_map[sharder_key]
 
             caching_ratio = sharding_option.cache_load_factor
             # TODO: remove after deprecating fused_params in sharder
             if caching_ratio is None:
-                if sharder_data is not None:
-                    caching_ratio = sharder_data.fused_params.get("cache_load_factor")
-                elif sharder is not None:
-                    caching_ratio = (
-                        sharder.fused_params.get("cache_load_factor")  # pyre-ignore[16]
-                        if hasattr(sharder, "fused_params") and sharder.fused_params
-                        else None
-                    )
+                caching_ratio = sharder_data.fused_params.get("cache_load_factor")
             constraints: Optional[ParameterConstraints] = (
                 self._constraints.get(sharding_option.name, None)
                 if self._constraints
@@ -238,20 +193,9 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 if constraints and constraints.key_value_params
                 else None
             )
-            if sharder_data is not None:
-                kv_cache_load_factor: float = sharder_data.fused_params.get(
-                    "cache_load_factor", KV_CACHING_RATIO
-                )
-            elif sharder is not None:
-                kv_cache_load_factor: float = (
-                    # pyrefly: ignore[missing-attribute]
-                    sharder.fused_params.get("cache_load_factor", KV_CACHING_RATIO)
-                    # pyrefly: ignore[missing-attribute]
-                    if sharder.fused_params
-                    else KV_CACHING_RATIO
-                )
-            else:
-                kv_cache_load_factor = KV_CACHING_RATIO
+            kv_cache_load_factor: float = sharder_data.fused_params.get(
+                "cache_load_factor", KV_CACHING_RATIO
+            )
             use_virtual_table: bool = (
                 constraints.use_virtual_table if constraints else False
             )
@@ -273,71 +217,31 @@ class EmbeddingStorageEstimator(ShardEstimator):
             )
             # TODO: remove after deprecating fused_params in sharder
             if mpp_conf is None:
-                if sharder_data is not None:
-                    mpp_conf = sharder_data.fused_params.get(
-                        "multipass_prefetch_config"
-                    )
-                elif sharder is not None:
-                    mpp_conf = (
-                        sharder.fused_params.get("multipass_prefetch_config", None)
-                        if hasattr(sharder, "fused_params") and sharder.fused_params
-                        else None
-                    )
-            if sharder_data is not None:
-                shard_storages = calculate_shard_storages_v2(
-                    sharder_data=sharder_data,
-                    sharding_type=sharding_option.sharding_type,
-                    tensor=sharding_option.tensor,
-                    compute_device=self._topology.compute_device,
-                    compute_kernel=sharding_option.compute_kernel,
-                    shard_sizes=[shard.size for shard in sharding_option.shards],
-                    batch_sizes=batch_sizes,
-                    world_size=self._topology.world_size,
-                    local_world_size=self._topology.intra_group_size,
-                    input_lengths=sharding_option.input_lengths,
-                    num_poolings=num_poolings,
-                    caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
-                    is_pooled=sharding_option.is_pooled,
-                    input_data_type_size=input_data_type_size,
-                    output_data_type_size=output_data_type_size,
-                    pipeline_type=self._pipeline_type,
-                    count_ephemeral_storage_cost=self._run_embedding_at_peak_memory,
-                    is_inference=self._is_inference,
-                    multipass_prefetch_max_pass=(
-                        mpp_conf.num_passes if mpp_conf else None
-                    ),
-                    key_value_params=key_value_params,
-                    kv_cache_load_factor=kv_cache_load_factor,
-                    use_virtual_table=use_virtual_table,
-                )
-            else:
-                assert sharder is not None
-                shard_storages = calculate_shard_storages(
-                    sharder=sharder,
-                    sharding_type=sharding_option.sharding_type,
-                    tensor=sharding_option.tensor,
-                    compute_device=self._topology.compute_device,
-                    compute_kernel=sharding_option.compute_kernel,
-                    shard_sizes=[shard.size for shard in sharding_option.shards],
-                    batch_sizes=batch_sizes,
-                    world_size=self._topology.world_size,
-                    local_world_size=self._topology.intra_group_size,
-                    input_lengths=sharding_option.input_lengths,
-                    num_poolings=num_poolings,
-                    caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
-                    is_pooled=sharding_option.is_pooled,
-                    input_data_type_size=input_data_type_size,
-                    output_data_type_size=output_data_type_size,
-                    pipeline_type=self._pipeline_type,
-                    count_ephemeral_storage_cost=self._run_embedding_at_peak_memory,
-                    is_inference=self._is_inference,
-                    multipass_prefetch_max_pass=(
-                        mpp_conf.num_passes if mpp_conf else None
-                    ),
-                    key_value_params=key_value_params,
-                    kv_cache_load_factor=kv_cache_load_factor,
-                    use_virtual_table=use_virtual_table,
-                )
+                mpp_conf = sharder_data.fused_params.get("multipass_prefetch_config")
+            shard_storages = calculate_shard_storages(
+                sharder_data=sharder_data,
+                sharding_type=sharding_option.sharding_type,
+                tensor=sharding_option.tensor,
+                compute_device=self._topology.compute_device,
+                compute_kernel=sharding_option.compute_kernel,
+                shard_sizes=[shard.size for shard in sharding_option.shards],
+                batch_sizes=batch_sizes,
+                world_size=self._topology.world_size,
+                local_world_size=self._topology.intra_group_size,
+                input_lengths=sharding_option.input_lengths,
+                num_poolings=num_poolings,
+                caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
+                is_pooled=sharding_option.is_pooled,
+                input_data_type_size=input_data_type_size,
+                output_data_type_size=output_data_type_size,
+                pipeline_type=self._pipeline_type,
+                count_ephemeral_storage_cost=self._run_embedding_at_peak_memory,
+                is_inference=self._is_inference,
+                multipass_prefetch_max_pass=mpp_conf.num_passes if mpp_conf else None,
+                key_value_params=key_value_params,
+                kv_cache_load_factor=kv_cache_load_factor,
+                use_virtual_table=use_virtual_table,
+            )
             for shard, storage in zip(sharding_option.shards, shard_storages):
                 shard.storage = storage
 
@@ -386,212 +290,6 @@ def calculate_pipeline_io_cost(
 
 
 def calculate_shard_storages(
-    sharder: ModuleSharder[nn.Module],
-    sharding_type: str,
-    tensor: torch.Tensor,
-    compute_device: str,
-    compute_kernel: str,
-    shard_sizes: List[List[int]],
-    batch_sizes: List[int],
-    world_size: int,
-    local_world_size: int,
-    input_lengths: List[float],
-    num_poolings: List[float],
-    caching_ratio: float,
-    is_pooled: bool,
-    input_data_type_size: float,
-    output_data_type_size: float,
-    pipeline_type: PipelineType = PipelineType.NONE,
-    count_ephemeral_storage_cost: bool = False,
-    is_inference: bool = False,
-    multipass_prefetch_max_pass: Optional[int] = None,
-    key_value_params: Optional[KeyValueParams] = None,
-    kv_cache_load_factor: float = KV_CACHING_RATIO,
-    use_virtual_table: bool = False,
-) -> List[Storage]:
-    """
-    Calculates estimated storage sizes for each sharded tensor, comprised of input,
-    output, tensor, gradient, and optimizer sizes.
-
-    Args:
-        sharder (ModuleSharder[nn.Module]): sharder for module that supports sharding.
-        sharding_type (str): provided ShardingType value.
-        tensor (torch.Tensor): tensor to be sharded.
-        compute_device (str): compute device to be used.
-        compute_kernel (str): compute kernel to be used.
-        shard_sizes (List[List[int]]): list of dimensions of each sharded tensor.
-        batch_sizes (List[int]): batch size for each input feature.
-        world_size (int): total number of devices in topology.
-        local_world_size (int): total number of devices in host group topology.
-        input_lengths (List[float]): average input lengths synonymous with pooling
-            factors.
-        num_poolings (List[float]): average number of poolings per sample
-            (typically 1.0).
-        caching_ratio (float): ratio of HBM to DDR memory for UVM caching.
-        is_pooled (bool): True if embedding output is pooled (ie. `EmbeddingBag`), False
-            if unpooled/sequential (ie. `Embedding`).
-        input_data_type_size (int): number of bytes of input data type.
-        output_data_type_size (int): number of bytes of output data type.
-        pipeline_type: PipelineType: pipeline type if for training.
-        is_inference: bool, whether the model is for inference.
-        key_value_params (Optional[KeyValueParams]): fused params for SSD/DRAM KV cache.
-
-    Returns:
-        List[Storage]: storage object for each device in topology.
-    """
-    input_sizes, output_sizes = _calculate_shard_io_sizes(
-        sharding_type=sharding_type,
-        batch_sizes=batch_sizes,
-        world_size=world_size,
-        local_world_size=local_world_size,
-        input_lengths=input_lengths,
-        emb_dim=tensor.shape[1],
-        shard_sizes=shard_sizes,
-        input_data_type_size=input_data_type_size,
-        output_data_type_size=output_data_type_size,
-        num_poolings=num_poolings,
-        is_pooled=is_pooled,
-    )
-
-    tensor_storage = sharder.storage_usage(tensor, compute_device, compute_kernel)
-    hbm_storage: int = tensor_storage.get("hbm", 0)
-    ddr_storage: int = tensor_storage.get("ddr", 0)
-
-    table_cached = _is_table_cached(compute_kernel)
-    if table_cached:
-        hbm_storage = round(ddr_storage * caching_ratio)
-
-    optimizer_class = getattr(tensor, "_optimizer_classes", [None])[0]
-
-    hbm_specific_sizes: List[int] = _calculate_storage_specific_sizes(
-        storage=hbm_storage,
-        shape=tensor.shape,
-        shard_sizes=shard_sizes,
-        sharding_type=sharding_type,
-        optimizer_class=optimizer_class,
-        is_inference=is_inference,
-        clf=caching_ratio if table_cached else None,
-    )
-    ddr_specific_sizes: List[int] = _calculate_storage_specific_sizes(
-        storage=ddr_storage,
-        shape=tensor.shape,
-        shard_sizes=shard_sizes,
-        sharding_type=sharding_type,
-        optimizer_class=optimizer_class,
-        is_inference=is_inference,
-    )
-    ssd_specific_sizes: List[int] = [
-        hbm_specific_size + ddr_specific_size
-        for hbm_specific_size, ddr_specific_size in zip(
-            _calculate_storage_specific_sizes(
-                storage=tensor_storage.get("hbm", 0),
-                shape=tensor.shape,
-                shard_sizes=shard_sizes,
-                sharding_type=sharding_type,
-                optimizer_class=optimizer_class,
-                is_inference=is_inference,
-                clf=caching_ratio if table_cached else None,
-            ),
-            _calculate_storage_specific_sizes(
-                storage=tensor_storage.get("ddr", 0),
-                shape=tensor.shape,
-                shard_sizes=shard_sizes,
-                sharding_type=sharding_type,
-                optimizer_class=optimizer_class,
-                is_inference=is_inference,
-            ),
-        )
-    ]
-
-    if (
-        compute_kernel
-        in {
-            EmbeddingComputeKernel.KEY_VALUE.value,
-            EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
-            EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
-        }
-        or use_virtual_table
-    ):
-        # KVZCH does not have dedicated inference compute kernel, so we use use_virtual_table
-        # to settup ddr_specific_sizes
-        key_value_params = key_value_params or KeyValueParams(
-            max_l1_cache_size=0, l2_cache_size=0
-        )
-
-        hbm_specific_sizes = [
-            min(
-                (key_value_params.max_l1_cache_size or 0) * 1024 * 1024,
-                math.ceil(
-                    tensor.shape[0]  # num_embeddings
-                    * kv_cache_load_factor
-                    * tensor.element_size()  # size of one column
-                    * tensor.shape[1],  # number of columns in embedding
-                ),
-            )
-            for _ in hbm_specific_sizes
-        ]
-        ddr_specific_sizes = [
-            # TODO: revisit the logic for SSD virtual table
-            0
-            for _ in ddr_specific_sizes
-        ]
-
-    hbm_sizes: List[int] = [
-        (
-            hbm_specific_size
-            + calculate_pipeline_io_cost(
-                input_size=input_size,
-                output_size=output_size,
-                prefetch_size=input_size if table_cached else 0,
-                pipeline_type=pipeline_type,
-                multipass_prefetch_max_pass=multipass_prefetch_max_pass,
-                count_ephemeral_storage_cost=count_ephemeral_storage_cost,
-                is_inference=is_inference,
-            )
-            if compute_device in {"cuda", "mtia"}
-            else 0
-        )
-        for input_size, output_size, hbm_specific_size in zip(
-            input_sizes,
-            output_sizes,
-            hbm_specific_sizes,
-        )
-    ]
-    ddr_sizes: List[int] = [
-        (
-            input_size + output_size + ddr_specific_size
-            if compute_device == "cpu" and not is_inference
-            else ddr_specific_size
-        )
-        for input_size, output_size, ddr_specific_size in zip(
-            input_sizes,
-            output_sizes,
-            ddr_specific_sizes,
-        )
-    ]
-    ssd_sizes: List[int] = [
-        (
-            ssd_specific_size
-            if compute_kernel
-            in {
-                EmbeddingComputeKernel.KEY_VALUE.value,
-            }
-            else 0
-        )
-        for ssd_specific_size in ssd_specific_sizes
-    ]
-
-    return [
-        Storage(
-            hbm=hbm_size,
-            ddr=ddr_size,
-            ssd=ssd_size,
-        )
-        for hbm_size, ddr_size, ssd_size in zip(hbm_sizes, ddr_sizes, ssd_sizes)
-    ]
-
-
-def calculate_shard_storages_v2(
     sharder_data: SharderData,
     sharding_type: str,
     tensor: torch.Tensor,

@@ -80,27 +80,8 @@ def sharder_name(t: Type[Any]) -> str:
 
 
 def is_prefetch_pipelined(
-    sharding_option: ShardingOption, sharder: ModuleSharder[nn.Module]
-) -> bool:
-    prefetch_pipeline = (
-        sharding_option.cache_params.prefetch_pipeline
-        if sharding_option.cache_params
-        else None
-    )
-    # TODO: remove after deprecating fused_params in sharder
-    if not prefetch_pipeline:
-        prefetch_pipeline = (
-            sharder.fused_params.get(
-                "prefetch_pipeline", False
-            )  # pyrefly: ignore[missing-attribute]
-            if hasattr(sharder, "fused_params") and sharder.fused_params
-            else False
-        )
-    return prefetch_pipeline
-
-
-def is_prefetch_pipelined_v2(
-    sharding_option: ShardingOption, sharder_data: SharderData
+    sharding_option: ShardingOption,
+    sharder_data: SharderData,
 ) -> bool:
     prefetch_pipeline = (
         sharding_option.cache_params.prefetch_pipeline
@@ -113,65 +94,8 @@ def is_prefetch_pipelined_v2(
 
 
 def extract_comm_data_type_size(
-    sharder: ModuleSharder[nn.Module], sharding_option: ShardingOption
-) -> Tuple[float, float, float, float]:
-    table_data_type_size = sharding_option.tensor.element_size()
-
-    fwd_a2a_comm_data_type_size = table_data_type_size
-    bwd_a2a_comm_data_type_size = table_data_type_size
-    fwd_sr_comm_data_type_size = table_data_type_size
-    bwd_sr_comm_data_type_size = table_data_type_size
-
-    if sharder.qcomm_codecs_registry is not None:
-        qcomm_codecs_registry = sharder.qcomm_codecs_registry
-        if (
-            sharding_option.is_pooled
-            and CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name in qcomm_codecs_registry
-        ):
-            codecs = sharder.qcomm_codecs_registry[
-                CommOp.POOLED_EMBEDDINGS_ALL_TO_ALL.name
-            ]
-            fwd_a2a_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.forward.quantized_dtype
-            ).element_size()
-            bwd_a2a_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.backward.quantized_dtype
-            ).element_size()
-
-        if (
-            not sharding_option.is_pooled
-            and CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name in qcomm_codecs_registry
-        ):
-            codecs = qcomm_codecs_registry[CommOp.SEQUENCE_EMBEDDINGS_ALL_TO_ALL.name]
-            fwd_a2a_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.forward.quantized_dtype
-            ).element_size()
-            bwd_a2a_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.backward.quantized_dtype
-            ).element_size()
-
-        if (
-            sharding_option.is_pooled
-            and CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name in qcomm_codecs_registry
-        ):
-            codecs = qcomm_codecs_registry[CommOp.POOLED_EMBEDDINGS_REDUCE_SCATTER.name]
-            fwd_sr_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.forward.quantized_dtype
-            ).element_size()
-            bwd_sr_comm_data_type_size = torch.tensor(
-                [], dtype=codecs.backward.quantized_dtype
-            ).element_size()
-
-    return (
-        fwd_a2a_comm_data_type_size,
-        bwd_a2a_comm_data_type_size,
-        fwd_sr_comm_data_type_size,
-        bwd_sr_comm_data_type_size,
-    )
-
-
-def extract_comm_data_type_size_v2(
-    sharding_option: ShardingOption, sharder_data: SharderData
+    sharding_option: ShardingOption,
+    sharder_data: SharderData,
 ) -> Tuple[float, float, float, float]:
     table_data_type_size = sharding_option.tensor.element_size()
 
