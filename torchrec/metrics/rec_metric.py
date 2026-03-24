@@ -916,7 +916,7 @@ class RecMetricList(nn.Module):
 
     def __init__(self, rec_metrics: List[RecMetric]) -> None:
         # TODO(stellaya): consider to inherit from TorchMetrics.MetricCollection.
-        # The prequsite to use MetricCollection is that RecMetric inherits from
+        # The prerequisite to use MetricCollection is that RecMetric inherits from
         # TorchMetrics.Metric or TorchMetrics.MetricCollection
 
         super().__init__()

@@ -854,7 +854,7 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
         ctx: NullShardedModuleContext,
         features: KeyedJaggedTensor,
     ) -> ListOfKJTList:
-        # TODO: resolve incompatiblity with different contexts
+        # TODO: resolve incompatibility with different contexts
         if self._has_uninitialized_output_dist:
             self._create_output_dist(features.device())
             self._has_uninitialized_output_dist = False

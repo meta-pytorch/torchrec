@@ -155,7 +155,7 @@ class BaseShardedManagedCollisionEmbeddingCollection(
         ctx: ShrdCtx,
         features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KJTList]]:
-        # TODO: resolve incompatiblity with different contexts
+        # TODO: resolve incompatibility with different contexts
         return self._managed_collision_collection.input_dist(
             # pyrefly: ignore[bad-argument-type]
             ctx,

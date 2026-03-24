@@ -13,7 +13,7 @@ Deep Factorization-Machine Modules
 The following modules are based off the `Deep Factorization-Machine (DeepFM) paper
 <https://arxiv.org/pdf/1703.04247.pdf>`_
 
-* Class DeepFM implents the DeepFM Framework
+* Class DeepFM implements the DeepFM Framework
 * Class FactorizationMachine implements FM as noted in the above paper.
 
 """
