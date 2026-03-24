@@ -43,11 +43,12 @@ class TestDeferrableMetrics(unittest.TestCase):
         dm = DeferrableMetrics(f)
         self.assertFalse(dm.is_resolved())
 
-    def test_future_backed_resolve_raises(self) -> None:
+    def test_future_backed_resolve_blocks(self) -> None:
         f: Future[dict] = Future()
         dm = DeferrableMetrics(f)
-        with self.assertRaisesRegex(RuntimeError, "Cannot synchronously resolve"):
-            dm.resolve()
+        f.set_result({"val": 42})
+        self.assertEqual(dm.resolve(), {"val": 42})
+        self.assertTrue(dm.is_resolved())
 
     def test_future_backed_subscribe(self) -> None:
         f: Future[dict] = Future()
