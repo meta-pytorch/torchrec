@@ -22,7 +22,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
-from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import (
     BIGINT_DTYPE,
@@ -50,14 +49,11 @@ from torchrec.distributed.planner.types import (
 )
 from torchrec.distributed.planner.utils import (
     extract_comm_data_type_size,
-    extract_comm_data_type_size_v2,
     get_num_poolings,
     is_prefetch_pipelined,
-    is_prefetch_pipelined_v2,
 )
-from torchrec.distributed.types import ModuleSharder, ShardingType
+from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
-from torchrec.modules.embedding_modules import EmbeddingBagCollectionInterface
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -582,88 +578,14 @@ class ShardPerfContext:
         sharding_option: ShardingOption,
         topology: Topology,
         constraints: Optional[Dict[str, ParameterConstraints]],
-        sharder: ModuleSharder[nn.Module],
-        is_inference: bool = False,
-        use_batch_inputs_for_expected_cache_fetches: bool = False,
-        use_linear_regression_prefetch_estimate: bool = False,
-    ) -> List["ShardPerfContext"]:
-        """
-        Build list of ShardPerfContexts from ShardingOption and Topology using a live
-        ModuleSharder.
-
-        Args:
-            config: Hardware performance configuration
-            shard_sizes: List of [hash_size, emb_dim] for each shard
-            sharding_option: The sharding option being evaluated
-            topology: Device topology with bandwidth and world size info
-            constraints: Optional parameter constraints
-            sharder: Module sharder for this option
-            is_inference: Whether this is for inference
-            use_batch_inputs_for_expected_cache_fetches: If True, expected_cache_fetches
-                is computed as expected_miss_rate * batch_inputs (total lookups per batch).
-                If False (default), uses expected_miss_rate * expected_unique_lookups.
-            use_linear_regression_prefetch_estimate: If True, clamps num_unique_lookups
-                to min(num_unique_lookups, batch_inputs, hash_size) before computing
-                prefetch time.
-
-        Returns:
-            List of ShardPerfContext instances, one per shard.
-        """
-        # Get caching ratio
-        caching_ratio = sharding_option.cache_load_factor
-        if caching_ratio is None:
-            caching_ratio = (
-                sharder.fused_params.get(
-                    "cache_load_factor"
-                )  # pyrefly: ignore[missing-attribute]
-                if hasattr(sharder, "fused_params") and sharder.fused_params
-                else None
-            )
-
-        # Get data type sizes
-        (
-            fwd_a2a_comm_data_type_size,
-            bwd_a2a_comm_data_type_size,
-            fwd_sr_comm_data_type_size,
-            bwd_sr_comm_data_type_size,
-        ) = extract_comm_data_type_size(sharder, sharding_option)
-
-        # Check prefetch pipeline
-        prefetch_pipeline = is_prefetch_pipelined(sharding_option, sharder)
-
-        return cls._build_contexts(
-            config=config,
-            shard_sizes=shard_sizes,
-            sharding_option=sharding_option,
-            topology=topology,
-            constraints=constraints,
-            caching_ratio=caching_ratio,
-            fwd_a2a_comm_data_type_size=fwd_a2a_comm_data_type_size,
-            bwd_a2a_comm_data_type_size=bwd_a2a_comm_data_type_size,
-            fwd_sr_comm_data_type_size=fwd_sr_comm_data_type_size,
-            bwd_sr_comm_data_type_size=bwd_sr_comm_data_type_size,
-            prefetch_pipeline=prefetch_pipeline,
-            is_inference=is_inference,
-            use_batch_inputs_for_expected_cache_fetches=use_batch_inputs_for_expected_cache_fetches,
-            use_linear_regression_prefetch_estimate=use_linear_regression_prefetch_estimate,
-        )
-
-    @classmethod
-    def build_shard_perf_contexts_v2(
-        cls,
-        config: HardwarePerfConfig,
-        shard_sizes: List[List[int]],
-        sharding_option: ShardingOption,
-        topology: Topology,
-        constraints: Optional[Dict[str, ParameterConstraints]],
         sharder_data: SharderData,
         is_inference: bool = False,
         use_batch_inputs_for_expected_cache_fetches: bool = False,
         use_linear_regression_prefetch_estimate: bool = False,
     ) -> List["ShardPerfContext"]:
         """
-        Build list of ShardPerfContexts from ShardingOption and Topology using a
-        SharderData snapshot.
+        Build list of ShardPerfContexts from ShardingOption and Topology using
+        SharderData.
 
         Args:
             config: Hardware performance configuration
@@ -694,10 +616,10 @@ class ShardPerfContext:
             bwd_a2a_comm_data_type_size,
             fwd_sr_comm_data_type_size,
             bwd_sr_comm_data_type_size,
-        ) = extract_comm_data_type_size_v2(sharding_option, sharder_data)
+        ) = extract_comm_data_type_size(sharding_option, sharder_data)
 
         # Check prefetch pipeline
-        prefetch_pipeline = is_prefetch_pipelined_v2(sharding_option, sharder_data)
+        prefetch_pipeline = is_prefetch_pipelined(sharding_option, sharder_data)
 
         return cls._build_contexts(
             config=config,
@@ -734,7 +656,7 @@ class ShardPerfContext:
         use_batch_inputs_for_expected_cache_fetches: bool = False,
         use_linear_regression_prefetch_estimate: bool = False,
     ) -> List["ShardPerfContext"]:
-        """Shared context-building logic for both build_shard_perf_contexts variants."""
+        """Shared context-building logic for build_shard_perf_contexts."""
         # Get num_poolings and batch_sizes
         num_poolings = get_num_poolings(constraints, sharding_option)
         batch_sizes = (
@@ -750,46 +672,17 @@ class ShardPerfContext:
         ), "Provided `pooling_factors`, `num_poolings`, and `batch_sizes` constraints must match."
 
         # Check for feature processor and determine is_weighted
-        from torch._utils_internal import justknobs_check
-
-        if justknobs_check(
-            "pytorch/torchrec:enable_precomputed_sharding_option_fields"
+        has_feature_processor = sharding_option.has_feature_processor
+        if sharding_option.is_weighted is not None:
+            is_weighted = sharding_option.is_weighted
+        elif (
+            constraints
+            and constraints.get(sharding_option.name)
+            and constraints[sharding_option.name].is_weighted
         ):
-            has_feature_processor = sharding_option.has_feature_processor
-            if sharding_option.is_weighted is not None:
-                is_weighted = sharding_option.is_weighted
-            elif (
-                constraints
-                and constraints.get(sharding_option.name)
-                and constraints[sharding_option.name].is_weighted
-            ):
-                is_weighted = constraints[sharding_option.name].is_weighted
-            else:
-                is_weighted = False
+            is_weighted = constraints[sharding_option.name].is_weighted
         else:
-            module = sharding_option.module[1]
-            has_feature_processor = False
-            if (
-                hasattr(module, "_feature_processor")
-                and hasattr(module._feature_processor, "feature_processor_modules")
-                and isinstance(
-                    module._feature_processor.feature_processor_modules,  # pyrefly: ignore[missing-attribute]
-                    nn.ModuleDict,
-                )
-                and sharding_option.name
-                in module._feature_processor.feature_processor_modules.keys()  # pyrefly: ignore[missing-attribute]
-            ):
-                has_feature_processor = True
-            if isinstance(module, EmbeddingBagCollectionInterface):
-                is_weighted = module.is_weighted()  # pyrefly: ignore[not-callable]
-            elif (
-                constraints
-                and constraints.get(sharding_option.name)
-                and constraints[sharding_option.name].is_weighted
-            ):
-                is_weighted = constraints[sharding_option.name].is_weighted
-            else:
-                is_weighted = False
+            is_weighted = False
 
         is_weighted = is_weighted or has_feature_processor
 

@@ -65,7 +65,7 @@ def _compute_auc_helper(
     sorted_indices = torch.argsort(predictions, descending=True, dim=-1)
     sorted_labels = torch.index_select(labels, dim=0, index=sorted_indices)
     if apply_bin:
-        # TODO - [add flag to set bining dyamically] for use with soft labels, >=0.039 --> 1, <0.039 --> 0
+        # TODO - [add flag to set binning dynamically] for use with soft labels, >=0.039 --> 1, <0.039 --> 0
         sorted_labels = torch.ge(sorted_labels, 0.039).to(dtype=sorted_labels.dtype)
     sorted_weights = torch.index_select(weights, dim=0, index=sorted_indices)
     if sorted_weights.numel() > 0:

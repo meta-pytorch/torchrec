@@ -36,9 +36,7 @@ from torch.nn.modules.module import _addindent
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.types import (
     compute_storage_usage,
-    get_tensor_size_bytes,
     ModuleSharder,
-    ParameterStorage,
     QuantizedCommCodecs,
     ShardedModule,
     ShardedTensorMetadata,
@@ -589,29 +587,9 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
         List of system resources and corresponding usage given a compute device and
         compute kernel
         """
-        from torch._utils_internal import justknobs_check
-
-        if justknobs_check("pytorch/torchrec:enable_sharder_data"):
-            return compute_storage_usage(
-                tensor, compute_device_type, compute_kernel, StorageUsageType.BASE
-            )
-        tensor_bytes = get_tensor_size_bytes(tensor)
-        if compute_kernel in {
-            EmbeddingComputeKernel.FUSED_UVM.value,
-            EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
-        }:
-            assert compute_device_type in {"cuda"}
-            return {ParameterStorage.DDR.value: tensor_bytes}
-        else:
-            assert compute_device_type in {"cuda", "cpu", "mtia"}
-            storage_map = {
-                "cuda": ParameterStorage.HBM,
-                "cpu": ParameterStorage.DDR,
-                "mtia": ParameterStorage.HBM,
-            }
-            return {
-                storage_map[compute_device_type].value: get_tensor_size_bytes(tensor)
-            }
+        return compute_storage_usage(
+            tensor, compute_device_type, compute_kernel, StorageUsageType.BASE
+        )
 
 
 class BaseGroupedFeatureProcessor(nn.Module):
@@ -698,25 +676,6 @@ class BaseQuantEmbeddingSharder(ModuleSharder[M]):
         List of system resources and corresponding usage given a compute device and
         compute kernel
         """
-        from torch._utils_internal import justknobs_check
-
-        if justknobs_check("pytorch/torchrec:enable_sharder_data"):
-            return compute_storage_usage(
-                tensor, compute_device_type, compute_kernel, StorageUsageType.BASE_QUANT
-            )
-        tensor_bytes = get_tensor_size_bytes(tensor) + tensor.shape[0] * 4
-        if compute_kernel in {
-            EmbeddingComputeKernel.QUANT_UVM.value,
-            EmbeddingComputeKernel.QUANT_UVM_CACHING.value,
-        }:
-            assert compute_device_type in {"cuda"}
-            return {ParameterStorage.DDR.value: tensor_bytes}
-        else:
-            assert compute_device_type in {"cuda", "cpu", "mtia"}
-            storage_map = {
-                "cuda": ParameterStorage.HBM,
-                "cpu": ParameterStorage.DDR,
-                # TODO: Update it later. Setting for MTIA is same as CPU's for now.
-                "mtia": ParameterStorage.DDR,
-            }
-            return {storage_map[compute_device_type].value: tensor_bytes}
+        return compute_storage_usage(
+            tensor, compute_device_type, compute_kernel, StorageUsageType.BASE_QUANT
+        )

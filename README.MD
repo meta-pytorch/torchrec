@@ -27,7 +27,7 @@ To begin learning about TorchRec, check out:
 - Quantization support for reduced precision training and inference, along with optimizing a TorchRec model for C++ inference.
 - Common modules for RecSys.
 - RecSys datasets (criteo click logs and movielens)
-- Examples of end-to-end training such the dlrm event prediction model trained on criteo click logs dataset.
+- Examples of end-to-end training such as the DLRM event prediction model trained on criteo click logs dataset.
 
 
 ## Installation

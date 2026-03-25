@@ -23,7 +23,7 @@ class CrossNet(torch.nn.Module):
     `Cross Network <https://arxiv.org/abs/1708.05123>`_:
 
     Cross Net is a stack of "crossing" operations on a tensor of shape :math:`(*, N)`
-    to the same shape, effectively creating :math:`N` learnable polynomical functions
+    to the same shape, effectively creating :math:`N` learnable polynomial functions
     over the input tensor.
 
     In this module, the crossing operations are defined based on a full rank matrix

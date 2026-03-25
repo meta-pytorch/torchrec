@@ -34,7 +34,7 @@ def _fx_wrap_lookup(
     is_weighted: bool,
     values_dtype: torch.dtype,
     device: torch.device,
-    lookup: TensorJaggedIndexSelectLookup,  # This type enforement is a hack to make it work with torch.jit.script
+    lookup: TensorJaggedIndexSelectLookup,  # This type enforcement is a hack to make it work with torch.jit.script
     weigth_dtype: Optional[torch.dtype] = None,
 ) -> KeyedJaggedTensor:
     jt_lookup: JaggedTensor = lookup.lookup(ids)

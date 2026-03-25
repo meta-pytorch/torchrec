@@ -21,7 +21,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 def tower_input_params(module: nn.Module) -> Tuple[bool, bool]:
     """
-    Utilty to compute the mapping of tower KJT args to pass to the embedding modules.
+    Utility to compute the mapping of tower KJT args to pass to the embedding modules.
 
     Args:
         module (nn.Module):
