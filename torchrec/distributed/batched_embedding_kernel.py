@@ -396,6 +396,7 @@ def _populate_zero_collision_tbe_params(
         if not isinstance(table.virtual_table_eviction_policy, NoEvictionPolicy):
             enabled = True
     kvzch_tbe_config = None
+    fs_eviction_enabled: bool = False
     if enabled:
         counter_thresholds = [0] * len(config.embedding_tables)
         ttls_in_mins = [0] * len(config.embedding_tables)
@@ -458,6 +459,7 @@ def _populate_zero_collision_tbe_params(
                         raise ValueError(
                             f"Do not support multiple eviction strategy in one tbe {eviction_strategy} and 5 for tables {table_names}"
                         )
+                    fs_eviction_enabled = True
                 elif isinstance(policy_t, TimestampBasedEvictionPolicy):
                     training_id_eviction_trigger_count[i] = (
                         policy_t.training_id_eviction_trigger_count
@@ -549,6 +551,7 @@ def _populate_zero_collision_tbe_params(
         optimizer_type_for_st=optimizer_type_for_st,
         optimizer_state_dtypes_for_st=optimizer_state_dtypes_for_st,
         enrichment_policy=enrichment_policy,
+        feature_score_collection_enabled=fs_eviction_enabled,
     )
 
 
@@ -3338,6 +3341,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
         _populate_zero_collision_tbe_params(
             ssd_tbe_params, self._bucket_spec, config, backend_type
         )
+        self._kv_zch_params: KVZCHParams = ssd_tbe_params["kv_zch_params"]
         compute_kernel = config.embedding_tables[0].compute_kernel
         embedding_location = compute_kernel_to_embedding_location(compute_kernel)
 
@@ -3634,9 +3638,62 @@ class ZeroCollisionKeyValueEmbeddingBag(
         self._split_weights_res = None
         self._optim.set_sharded_embedding_weight_ids(sharded_embedding_weight_ids=None)
 
-        return super().forward(
-            features, vbe_output=vbe_output, vbe_output_offsets=vbe_output_offsets
-        )
+        forward_args: Dict[str, Any] = {}
+        identities_and_metadata = self._get_hash_zch_identities_and_metadata(features)
+        if identities_and_metadata is not None:
+            hash_zch_identities, hash_zch_runtime_meta = identities_and_metadata
+            forward_args["hash_zch_identities"] = hash_zch_identities
+            if hash_zch_runtime_meta is not None:
+                forward_args["hash_zch_runtime_meta"] = hash_zch_runtime_meta
+
+        weights = features.weights_or_none()
+        if weights is not None and not torch.is_floating_point(weights):
+            weights = None
+        per_sample_weights = None
+        score_weights = None
+        if weights is not None and weights.dtype == torch.float64:
+            fp32_weights = weights.view(torch.float32)
+            per_sample_weights = fp32_weights[:, 0]
+            score_weights = fp32_weights[:, 1]
+        elif weights is not None and weights.dtype == torch.float32:
+            if self._kv_zch_params.feature_score_collection_enabled:
+                score_weights = weights.view(-1)
+            else:
+                per_sample_weights = weights.view(-1)
+        if features.variable_stride_per_key():
+            if isinstance(self.emb_module, DenseTableBatchedEmbeddingBagsCodegen):
+                forward_args.update(
+                    {
+                        "batch_size_per_feature_per_rank": features.stride_per_key_per_rank(),
+                        "weights": score_weights,
+                    }
+                )
+            if isinstance(
+                self.emb_module,
+                (SplitTableBatchedEmbeddingBagsCodegen, SSDTableBatchedEmbeddingBags),
+            ):
+                forward_args.update(
+                    {
+                        "batch_size_per_feature_per_rank": features.stride_per_key_per_rank(),
+                        "vbe_output": vbe_output,
+                        "vbe_output_offsets": vbe_output_offsets,
+                        "weights": score_weights,
+                    }
+                )
+
+        if len(forward_args) == 0:
+            return self.emb_module(
+                indices=features.values().to(self._embedding_table_index_type),
+                offsets=features.offsets().to(self._embedding_table_index_type),
+                per_sample_weights=per_sample_weights,
+            )
+        else:
+            return self.emb_module(
+                indices=features.values().to(self._embedding_table_index_type),
+                offsets=features.offsets().to(self._embedding_table_index_type),
+                per_sample_weights=per_sample_weights,
+                **forward_args,
+            )
 
 
 class BatchedFusedEmbeddingBag(
