@@ -9,7 +9,7 @@
 
 """Torchrec Datasets
 
-Torchrec contains two popular recys datasets, the `Kaggle/Criteo Display Advertising <https://www.kaggle.com/c/criteo-display-ad-challenge/>`_ Dataset
+Torchrec contains two popular RecSys datasets, the `Kaggle/Criteo Display Advertising <https://www.kaggle.com/c/criteo-display-ad-challenge/>`_ Dataset
 and the `MovieLens 20M <https://grouplens.org/datasets/movielens/20m/>`_ Dataset.
 
 Additionally, it contains a RandomDataset, which is useful to generate random data in the same format as the above.

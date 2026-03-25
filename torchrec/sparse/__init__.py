@@ -20,7 +20,7 @@ information.
 
 KeyedJaggedTensor
 
-KeyedJaggedTensor has additional "Key" information. Keyed on first dimesion,
+KeyedJaggedTensor has additional "Key" information. Keyed on first dimension,
 and jagged on last dimension. Please refer to KeyedJaggedTensor docstring for full example and
 further information.
 

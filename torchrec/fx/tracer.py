@@ -117,7 +117,7 @@ class Tracer(torch.fx.Tracer):
                 type_expr=NoWait,
             )
 
-        # Not equivalent to when LazyAwaitable.wait() is called in eager. Here can be called earlier, as attr was not requested and this is not guranteed to be torch function
+        # Not equivalent to when LazyAwaitable.wait() is called in eager. Here can be called earlier, as attr was not requested and this is not guaranteed to be torch function
         # TODO(ivankobzarev): support equivalent timing of LazyAwaitable
         if isinstance(a, LazyAwaitable):
             if a._result is None:
