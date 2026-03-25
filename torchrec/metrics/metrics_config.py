@@ -195,6 +195,7 @@ class MetricsConfig:
     should_validate_update: bool = False
     enable_pt2_compile: bool = False
     should_clone_update_inputs: bool = False
+    use_cpu_offloaded_rec_metric_module: bool = False
 
     def __post_init__(self) -> None:
         for metric_enum, metric_def in self.rec_metrics.items():
