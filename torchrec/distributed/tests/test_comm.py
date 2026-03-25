@@ -114,6 +114,7 @@ def _test_async_sync_compile(
     sync_fwd_out = out.clone()
     _assert_close(sync_fwd_out, async_fwd_out)
 
+    sync_bwd_out: Optional[torch.Tensor] = None
     if not compile_config.skip_sync_backward:
         out.retain_grad()
         out.backward(out)
@@ -151,6 +152,7 @@ def _test_async_sync_compile(
                 out.backward(out)
                 compile_bwd_out = _grad_detach_clone(input_tensor_compile)
 
+                assert sync_bwd_out is not None
                 _assert_close(compile_bwd_out, sync_bwd_out)
 
 
