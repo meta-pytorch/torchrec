@@ -39,6 +39,9 @@ from torchrec.distributed.planner.types import (
     BasicCommsBandwidths,
     ParameterConstraints,
     Perf,
+    Shard,
+    SharderData,
+    ShardingOption,
     Topology,
 )
 from torchrec.distributed.quant_embeddingbag import QuantEmbeddingBagCollectionSharder
@@ -1632,6 +1635,55 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
             hbms.append(sharding_options[0].shards[0].storage.hbm)
 
         self.assertEqual(hbms[0], hbms[1])
+
+    def test_zero_dimension_tensor_raises_value_error(self) -> None:
+        topology = Topology(world_size=2, compute_device="cuda")
+        estimator = EmbeddingStorageEstimator(topology=topology)
+
+        # Construct a ShardingOption directly with a zero-dimension tensor
+        # to simulate the crash path: prod(shape)==0 in _calculate_tensor_sizes
+        zero_dim_tensor = torch.zeros(100, 0, device="meta")
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_dummy",
+                feature_names=["feature_0"],
+            )
+        ]
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+        # Get a valid module reference from the model
+        ebc_module = model.sparse.ebc
+        assert isinstance(ebc_module, torch.nn.Module)
+
+        sharding_option = ShardingOption(
+            name="table_zero_dim",
+            tensor=zero_dim_tensor,
+            module=("sparse.ebc", ebc_module),
+            input_lengths=[1.0],
+            batch_size=BATCH_SIZE,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            partition_by="host",
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=[Shard(size=[100, 0], offset=[0, 0])],
+        )
+
+        sharder_data_map = {
+            sharding_option.module_type_key: SharderData(
+                fused_params={},
+                qcomm_dtype_sizes={},
+                storage_usage_type=StorageUsageType.DEFAULT,
+            ),
+        }
+
+        with self.assertRaises(ValueError) as ctx:
+            estimator.estimate([sharding_option], sharder_data_map=sharder_data_map)
+
+        error_msg = str(ctx.exception)
+        self.assertIn("table_zero_dim", error_msg)
+        self.assertIn("tensor.shape=", error_msg)
+        self.assertIn("sharding_type=", error_msg)
+        self.assertIn("compute_kernel=", error_msg)
 
 
 class TestEmbeddingOffloadStats(unittest.TestCase):

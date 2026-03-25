@@ -211,30 +211,42 @@ class EmbeddingStorageEstimator(ShardEstimator):
             # TODO: remove after deprecating fused_params in sharder
             if mpp_conf is None:
                 mpp_conf = sharder_data.fused_params.get("multipass_prefetch_config")
-            shard_storages = calculate_shard_storages(
-                sharder_data=sharder_data,
-                sharding_type=sharding_option.sharding_type,
-                tensor=sharding_option.tensor,
-                compute_device=self._topology.compute_device,
-                compute_kernel=sharding_option.compute_kernel,
-                shard_sizes=[shard.size for shard in sharding_option.shards],
-                batch_sizes=batch_sizes,
-                world_size=self._topology.world_size,
-                local_world_size=self._topology.intra_group_size,
-                input_lengths=sharding_option.input_lengths,
-                num_poolings=num_poolings,
-                caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
-                is_pooled=sharding_option.is_pooled,
-                input_data_type_size=input_data_type_size,
-                output_data_type_size=output_data_type_size,
-                pipeline_type=self._pipeline_type,
-                count_ephemeral_storage_cost=self._run_embedding_at_peak_memory,
-                is_inference=self._is_inference,
-                multipass_prefetch_max_pass=mpp_conf.num_passes if mpp_conf else None,
-                key_value_params=key_value_params,
-                kv_cache_load_factor=kv_cache_load_factor,
-                use_virtual_table=use_virtual_table,
-            )
+            try:
+                shard_storages = calculate_shard_storages(
+                    sharder_data=sharder_data,
+                    sharding_type=sharding_option.sharding_type,
+                    tensor=sharding_option.tensor,
+                    compute_device=self._topology.compute_device,
+                    compute_kernel=sharding_option.compute_kernel,
+                    shard_sizes=[shard.size for shard in sharding_option.shards],
+                    batch_sizes=batch_sizes,
+                    world_size=self._topology.world_size,
+                    local_world_size=self._topology.intra_group_size,
+                    input_lengths=sharding_option.input_lengths,
+                    num_poolings=num_poolings,
+                    caching_ratio=caching_ratio if caching_ratio else UVM_CACHING_RATIO,
+                    is_pooled=sharding_option.is_pooled,
+                    input_data_type_size=input_data_type_size,
+                    output_data_type_size=output_data_type_size,
+                    pipeline_type=self._pipeline_type,
+                    count_ephemeral_storage_cost=self._run_embedding_at_peak_memory,
+                    is_inference=self._is_inference,
+                    multipass_prefetch_max_pass=(
+                        mpp_conf.num_passes if mpp_conf else None
+                    ),
+                    key_value_params=key_value_params,
+                    kv_cache_load_factor=kv_cache_load_factor,
+                    use_virtual_table=use_virtual_table,
+                )
+            except ZeroDivisionError as e:
+                raise ValueError(
+                    f"Failed to calculate sharding plan: {str(e)} "
+                    f"Context: table_name='{sharding_option.name}', "
+                    f"module_path='{sharding_option.path}', "
+                    f"tensor.shape={sharding_option.tensor.shape}, "
+                    f"sharding_type='{sharding_option.sharding_type}', "
+                    f"compute_kernel='{sharding_option.compute_kernel}'"
+                ) from e
             for shard, storage in zip(sharding_option.shards, shard_storages):
                 shard.storage = storage
 
