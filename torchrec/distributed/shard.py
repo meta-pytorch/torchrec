@@ -297,6 +297,7 @@ def _shard_modules(  # noqa: C901
                         child,
                         # pyrefly: ignore[bad-argument-type]
                         sharded_params,
+                        # pyrefly: ignore[bad-argument-type]
                         env,
                         device,
                         child_path,

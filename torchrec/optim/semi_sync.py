@@ -68,12 +68,18 @@ class SemisyncOptimizer(KeyedOptimizer):
         assert global_params is not None, "global params must be provided"
         # Determine parameters for global optimizer
         global_params_list = list(global_params)
-        self._worker_model_params: list[torch.Tensor] = (
-            # pyrefly: ignore[bad-index]
-            [param for pgroup in global_params_list for param in pgroup["params"]]
-            if isinstance(global_params_list[0], dict)
-            else global_params_list
-        )
+        worker_model_params: list[torch.Tensor]
+        if isinstance(global_params_list[0], dict):
+            worker_model_params = [
+                param
+                for pgroup in global_params_list
+                for param in pgroup["params"]  # pyrefly: ignore[bad-index]
+            ]
+        else:
+            worker_model_params = [
+                p for p in global_params_list if isinstance(p, torch.Tensor)
+            ]
+        self._worker_model_params: list[torch.Tensor] = worker_model_params
 
         # Semi-sync configuration
 
