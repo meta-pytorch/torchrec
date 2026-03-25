@@ -224,7 +224,7 @@ class EmbeddingStats(Stats):
                 shard=shard,
                 sharding_option=sharding_option,
                 world_size=topology.world_size,
-                local_world_size=topology.local_world_size,
+                local_world_size=topology.intra_group_size,
                 constraints=constraints,
             )
             sharding_type_abbr = _get_sharding_type_abbr(shard.sharding_type)
