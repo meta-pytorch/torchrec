@@ -7,13 +7,13 @@
 
 # pyre-strict
 
+from concurrent.futures import Future
 from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DeviceMesh
-from torchrec.metrics.deferrable_metrics import DeferrableMetrics
-from torchrec.metrics.metric_module import RecMetricModule
+from torchrec.metrics.metric_module import MetricValue, RecMetricModule
 
 
 class NoOpMetricModule(RecMetricModule):
@@ -36,11 +36,11 @@ class NoOpMetricModule(RecMetricModule):
     def should_compute(self) -> bool:
         return False
 
-    def compute(self) -> DeferrableMetrics:
-        return DeferrableMetrics({})
+    def compute(self) -> Dict[str, MetricValue]:
+        return {}
 
-    def local_compute(self) -> DeferrableMetrics:
-        return DeferrableMetrics({})
+    def local_compute(self) -> Dict[str, MetricValue]:
+        return {}
 
     def sync(self) -> None:
         pass
@@ -70,5 +70,6 @@ class NoOpMetricModule(RecMetricModule):
     def shutdown(self) -> None:
         pass
 
-    def async_compute(self) -> DeferrableMetrics:
-        return DeferrableMetrics({})
+    # pyrefly: ignore[bad-override]
+    def async_compute(self, future: Future[Dict[str, MetricValue]]) -> None:
+        pass
