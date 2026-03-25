@@ -43,6 +43,8 @@ from torchrec.distributed.planner.types import (
     ParameterConstraints,
     Perf,
     PlanDebugStats,
+    SharderData,
+    SharderDataMap,
     ShardingOption,
     Stats,
     Storage,
@@ -53,7 +55,6 @@ from torchrec.distributed.planner.utils import (
     _find_imbalance_tables,
     bytes_to_gb,
     bytes_to_mb,
-    sharder_name as get_sharder_name,
 )
 from torchrec.distributed.types import (
     ModuleSharder,
@@ -254,11 +255,14 @@ class EmbeddingStats(Stats):
         )
 
         if debug:
+            sharder_data_map: Optional[SharderDataMap] = None
+            if enumerator is not None:
+                sharder_data_map = getattr(enumerator, "_sharder_data_map", None)
             formatted_param_table = self._log_sharding_plan(
                 best_plan=best_plan,
                 sharding_plan=sharding_plan,
-                sharders=sharders,
                 constraints=constraints,
+                sharder_data_map=sharder_data_map,
             )
 
         self._stats_table.clear()
@@ -787,7 +791,7 @@ class EmbeddingStats(Stats):
         best_plan: List[ShardingOption],
         sharding_plan: ShardingPlan,
         constraints: Optional[Dict[str, ParameterConstraints]] = None,
-        sharders: Optional[List[ModuleSharder[nn.Module]]] = None,
+        sharder_data_map: Optional[SharderDataMap] = None,
     ) -> List[str]:
         def _get_embedding_dim(so: ShardingOption) -> str:
             embedding_dim = (
@@ -800,12 +804,11 @@ class EmbeddingStats(Stats):
             return embedding_dim
 
         def _get_cache_load_factor(
-            sharder: Optional[ModuleSharder[nn.Module]], so: ShardingOption
+            so: ShardingOption,
+            sd: Optional[SharderData] = None,
         ) -> str:
             sharder_cache_load_factor = (
-                sharder.fused_params.get("cache_load_factor")
-                if hasattr(sharder, "fused_params") and sharder.fused_params
-                else None
+                sd.fused_params.get("cache_load_factor") if sd else None
             )
             cache_load_factor = "None"
             # Surfacing cache load factor does not make sense if not using uvm caching.
@@ -864,13 +867,6 @@ class EmbeddingStats(Stats):
             for so in best_plan
         ]
 
-        sharder_map: Dict[str, ModuleSharder[nn.Module]] = {
-            get_sharder_name(sharder.module_type): sharder
-            # pyrefly: ignore[not-iterable]
-            for sharder in sharders
-            if sharders
-        }
-
         if include_batch_sizes := any(feat_batch_sizes):
             param_table[0].append("Batch Sizes")
             param_table[1].append("-------------")
@@ -898,11 +894,17 @@ class EmbeddingStats(Stats):
             num_poolings = str(round(sum(num_poolings), 3))
             output = "pooled" if so.is_pooled else "sequence"
             weighted = "weighted" if so.is_weighted else "unweighted"
-            sharder = sharder_map.get(so.module_type_key, None)
-            sharder_name = type(sharder).__name__
+            sd = (
+                sharder_data_map.get(so.module_type_key, None)
+                if sharder_data_map
+                else None
+            )
+            sharder_name = (
+                so.module_type_key.rsplit(".", 1)[-1] + "Sharder" if sd else "NoneType"
+            )
             num_features = len(so.input_lengths)
             embedding_dim = _get_embedding_dim(so)
-            cache_load_factor = _get_cache_load_factor(sharder, so)
+            cache_load_factor = _get_cache_load_factor(so, sd)
             hash_size = so.tensor.shape[0]
             param_table.append(
                 # pyrefly: ignore[bad-argument-type]
