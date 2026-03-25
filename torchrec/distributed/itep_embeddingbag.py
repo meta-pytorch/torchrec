@@ -134,6 +134,8 @@ class ShardedITEPEmbeddingBagCollection(
             pruning_interval=module._itep_module.pruning_interval,
             enable_pruning=module._itep_module.enable_pruning,
             pg=env.process_group,
+            device_mesh=env.device_mesh,
+            output_dtensor=env.output_dtensor,
         )
 
     def prefetch(
@@ -416,6 +418,8 @@ class ShardedITEPEmbeddingCollection(
             table_name_to_sharding_type=self.table_name_to_sharding_type,
             enable_pruning=module._itep_module.enable_pruning,
             pg=env.process_group,
+            device_mesh=env.device_mesh,
+            output_dtensor=env.output_dtensor,
         )
 
     # pyrefly: ignore[bad-override]

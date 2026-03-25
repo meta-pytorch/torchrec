@@ -16,9 +16,13 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 import torch
 from torch import distributed as dist, nn
 from torch.distributed._shard.metadata import ShardMetadata
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate, Shard as DTShard
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.embedding_types import ShardedEmbeddingTable, ShardingType
+from torchrec.distributed.shards_wrapper import LocalShardsWrapper
 from torchrec.distributed.types import Shard, ShardedTensor, ShardedTensorMetadata
 from torchrec.modules.embedding_modules import reorder_inverse_indices
 from torchrec.modules.pruning_logger import PruningLogger, PruningLoggerDefault
@@ -73,6 +77,8 @@ class GenericITEPModule(nn.Module):
         pg: Optional[dist.ProcessGroup] = None,
         table_name_to_sharding_type: Optional[Dict[str, str]] = None,
         pruning_logger_type: Type[PruningLogger] = PruningLoggerDefault,
+        device_mesh: Optional[DeviceMesh] = None,
+        output_dtensor: bool = False,
     ) -> None:
         self.pruning_logger: Type[PruningLogger] = pruning_logger_type
         with self.pruning_logger.pruning_logger(
@@ -97,6 +103,8 @@ class GenericITEPModule(nn.Module):
             self.table_name_to_sharding_type: Dict[str, str] = (
                 table_name_to_sharding_type
             )
+            self._device_mesh: Optional[DeviceMesh] = device_mesh
+            self._output_dtensor: bool = output_dtensor
 
             # Map each feature to a physical address_lookup/row_util buffer
             self.feature_table_map: Dict[str, int] = {}
@@ -734,15 +742,34 @@ class RowwiseShardedITEPModule(GenericITEPModule):
                 itp_global_metadata.tensor_properties.requires_grad = False
                 # Build local shard metadata
                 local_idx = self._get_local_metadata_idx(table)
-                itp_local_medadata = global_shards_metadata[local_idx]
+                itp_local_metadata = global_shards_metadata[local_idx]
 
-                destination[key] = (
-                    ShardedTensor._init_from_local_shards_and_global_metadata(
-                        local_shards=[Shard(buffer_param, itp_local_medadata)],
-                        sharded_tensor_metadata=itp_global_metadata,
-                        process_group=pg,
+                if self._output_dtensor and self._device_mesh is not None:
+                    placements: tuple[Replicate | DTShard, ...] = (
+                        (Replicate(), DTShard(0))
+                        if self._device_mesh.ndim == 2
+                        else (DTShard(0),)
                     )
-                )
+                    destination[key] = DTensor.from_local(
+                        # pyrefly: ignore[no-matching-overload]
+                        local_tensor=LocalShardsWrapper(
+                            local_shards=[buffer_param.view(-1, 1)],
+                            local_offsets=[(itp_local_metadata.shard_offsets[0], 0)],
+                        ),
+                        device_mesh=self._device_mesh,
+                        placements=placements,
+                        shape=torch.Size([global_unpruned_hash_size, 1]),
+                        stride=(1, 1),
+                        run_check=False,
+                    )
+                else:
+                    destination[key] = (
+                        ShardedTensor._init_from_local_shards_and_global_metadata(
+                            local_shards=[Shard(buffer_param, itp_local_metadata)],
+                            sharded_tensor_metadata=itp_global_metadata,
+                            process_group=pg,
+                        )
+                    )
             else:
                 destination[key] = buffer_param
 
@@ -763,7 +790,26 @@ class RowwiseShardedITEPModule(GenericITEPModule):
         for key, dst_param in self.state_dict().items():
             if key in state_dict:
                 src_param = state_dict[key]
-                if isinstance(dst_param, ShardedTensor):
+                if isinstance(dst_param, DTensor):
+                    if isinstance(src_param, DTensor):
+                        local_tensor = src_param._local_tensor
+                        if isinstance(local_tensor, LocalShardsWrapper):
+                            src_data = local_tensor.local_shards()[0]
+                        else:
+                            src_data = local_tensor
+                    elif isinstance(src_param, ShardedTensor):
+                        src_data = src_param.local_shards()[0].tensor
+                    else:
+                        src_data = src_param
+
+                    dst_local = dst_param._local_tensor
+                    if isinstance(dst_local, LocalShardsWrapper):
+                        dst_local.local_shards()[0].detach().copy_(
+                            src_data.view_as(dst_local.local_shards()[0])
+                        )
+                    else:
+                        dst_local.detach().copy_(src_data.view_as(dst_local))
+                elif isinstance(dst_param, ShardedTensor):
                     assert isinstance(src_param, ShardedTensor)
                     assert len(dst_param.local_shards()) == len(
                         src_param.local_shards()
