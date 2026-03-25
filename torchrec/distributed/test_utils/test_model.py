@@ -15,7 +15,6 @@ from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type, Union
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
-from torchrec import EmbeddingCollection
 from torchrec.distributed.embedding_types import EmbeddingTableConfig
 from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.utils import CopyableMixin
@@ -25,7 +24,10 @@ from torchrec.modules.embedding_configs import (
     EmbeddingBagConfig,
     EmbeddingConfig,
 )
-from torchrec.modules.embedding_modules import EmbeddingBagCollection
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
 from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerCollection
 from torchrec.modules.feature_processor import PositionWeightedProcessor
 from torchrec.modules.feature_processor_ import PositionWeightedModuleCollection
