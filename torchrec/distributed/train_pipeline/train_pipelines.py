@@ -91,6 +91,9 @@ try:
     # dependencies
     from torchrec.distributed.logger import _torchrec_method_logger
 except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.import_failure._torchrec_method_logger"
+    )
 
     def _torchrec_method_logger(*args, **kwargs):
         """A no-op decorator that accepts any arguments."""
@@ -107,6 +110,9 @@ logger: logging.Logger = logging.getLogger(__name__)
 try:
     from torchrec.distributed.comm_ops import torchrec_use_sync_collectives
 except ImportError:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.import_failure.torchrec_use_sync_collectives"
+    )
     logger.warning("torchrec_use_sync_collectives is not available")
 
 
@@ -120,6 +126,9 @@ has_2d_support = True
 try:
     from torchrec.distributed.model_parallel import DMPCollection
 except ImportError:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.import_failure.DMPCollection"
+    )
     logger.warning("DMPCollection is not available. 2D sharding is not supported.")
     has_2d_support = False
 
@@ -164,7 +173,7 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
                 "Embedding weight sync is disabled."
             )
             return
-
+        one_time_rank0_logger.info(f"2D sharding used in {self.__class__.__name__}")
         index = context.index
         assert (
             index is not None
@@ -575,6 +584,24 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._model_fwd: Callable[[Optional[In]], Tuple[torch.Tensor, Out]] = (
             custom_model_fwd if custom_model_fwd else model
         )
+
+        super().__init__()
+
+        # DEPRECATED FIELDS
+        self._batch_i: Optional[In] = None
+        self._batch_ip1: Optional[In] = None
+        self._batch_ip2: Optional[In] = None
+        self._context: TrainPipelineContext = context_type(version=0)
+
+        self._init_2d_sharding(dmp_collection_sync_interval_batches)
+
+    def _init_2d_sharding(
+        self, dmp_collection_sync_interval_batches: Optional[int]
+    ) -> None:
+        """
+        This function is called in the init of the train pipeline, when 2D sharding is enabled.
+        It will sync DMPs every N batches (default to 1, i.e. every batch, None to disable)
+        """
         self._dmp_collection_sync_interval_batches = (
             dmp_collection_sync_interval_batches
         )
@@ -584,14 +611,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
                 f"{self._dmp_collection_sync_interval_batches} batches"
             )
-
-        super().__init__()
-
-        # DEPRECATED FIELDS
-        self._batch_i: Optional[In] = None
-        self._batch_ip1: Optional[In] = None
-        self._batch_ip2: Optional[In] = None
-        self._context: TrainPipelineContext = context_type(version=0)
+            one_time_rank0_logger.info(
+                f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
+                f"{self._dmp_collection_sync_interval_batches} batches"
+            )
 
     def detach(self) -> torch.nn.Module:
         """
@@ -1038,6 +1061,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         """
         DEPRECATED: exists for backward compatibility on TrainPipelineContext.version 0
         """
+        one_time_rank0_logger.warning(
+            f"{self.__class__.__name__} is using deprecated _copy_batch_to_gpu"
+        )
         self._set_module_context(self._context)
         batch, _ = self.copy_batch_to_gpu(dataloader_iter)
         return batch
@@ -1047,6 +1073,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         DEPRECATED: exists for backward compatibility
         Waits for batch to finish getting copied to GPU, then starts the input dist.
         """
+        one_time_rank0_logger.warning(
+            f"{self.__class__.__name__} is using deprecated _start_sparse_data_dist"
+        )
         self._set_module_context(self._context)
         self.start_sparse_data_dist(batch, self._context)
 
@@ -1056,6 +1085,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         Waits on the input dist splits requests to get the input dist tensors requests,
         and populates the context with them.
         """
+        one_time_rank0_logger.warning(
+            f"{self.__class__.__name__} is using deprecated _wait_sparse_data_dist"
+        )
         self._set_module_context(self._context)
         with record_function("## wait_sparse_data_dist ##"):
             # pyrefly: ignore [bad-argument-type]
@@ -1072,6 +1104,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         """
         DEPRECATED: exists for backward compatibility
         """
+        one_time_rank0_logger.warning(
+            f"{self.__class__.__name__} is using deprecated _fill_pipeline"
+        )
         # pipeline is already filled
         if self._batch_i and self._batch_ip1:
             return
@@ -1964,6 +1999,9 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         Raises:
             StopIteration: if the dataloader iterator is exhausted on the first batch.
         """
+        one_time_rank0_logger.warning(
+            f"{self.__class__.__name__} is using deprecated _fill_pipeline"
+        )
         # pipeline is already filled
         if self._batch_i and self._batch_ip1 and self._batch_ip2:
             return
