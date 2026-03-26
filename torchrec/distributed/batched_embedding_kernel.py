@@ -2498,7 +2498,7 @@ class ZeroCollisionEmbeddingEnrichmentCache(ZeroCollisionKeyValueEmbedding):
         """
         Update the embedding table with the new embeddings.
         """
-        self.emb_module.direct_write_embedding(
+        self.emb_module.enrichment_query_id(
             embeddings.values(), embeddings.offsets(), embeddings.weights()
         )
 
