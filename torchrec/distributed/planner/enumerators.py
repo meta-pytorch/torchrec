@@ -155,7 +155,7 @@ class EmbeddingEnumerator(Enumerator):
             self._last_stored_module == module
             and self._last_stored_sharders == sharders
         ):
-            # pyrefly: ignore[bad-argument-type]
+            assert self._last_stored_search_space is not None
             return copy.deepcopy(self._last_stored_search_space)
 
         self._sharder_map = {

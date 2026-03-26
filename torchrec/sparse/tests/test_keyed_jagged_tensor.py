@@ -1520,6 +1520,8 @@ class TestKeyedJaggedTensor(unittest.TestCase):
             lengths=torch.IntTensor([1, 0, 2, 3]),
             weights=torch.Tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
         )
+        assert kjt._lengths is not None
+        assert kjt._weights is not None
         self.assertGreater(kjt._values.untyped_storage().nbytes(), 0)
         self.assertGreater(kjt._lengths.untyped_storage().nbytes(), 0)
         self.assertGreater(kjt._weights.untyped_storage().nbytes(), 0)

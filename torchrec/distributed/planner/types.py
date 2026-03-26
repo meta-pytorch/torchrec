@@ -16,6 +16,7 @@ from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.planner.constants import (
     BATCH_SIZE,
     BWD_COMPUTE_MULTIPLIER,
@@ -657,7 +658,7 @@ class TopologyFactory:
         TopologyFactory._add_hardware_params(topology_kwargs, hardware, kernel)
         TopologyFactory._add_comms_params(topology_kwargs, hardware, kernel)
 
-        # TODO: add eventlogger in future
+        one_time_rank0_logger.info("TopologyFactor.create_topology called.")
         return Topology(**topology_kwargs)
 
     @staticmethod

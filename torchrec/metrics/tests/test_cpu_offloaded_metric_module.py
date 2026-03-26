@@ -12,7 +12,7 @@ import queue
 import threading
 import time
 import unittest
-from typing import Any, Callable, cast
+from typing import Callable, cast
 from unittest.mock import patch
 
 import torch
@@ -228,16 +228,11 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_async_compute_after_shutdown(self) -> None:
         self.cpu_module.shutdown()
 
-        result = self.cpu_module.async_compute()
+        future = self.cpu_module.async_compute()
 
-        captured_error: list[Exception] = []
-        result.subscribe(
-            callback=lambda _: None,
-            on_error=lambda e: captured_error.append(e),
+        self.assertRaisesRegex(
+            RecMetricException, "metric processor thread is shut down.", future.result
         )
-        self.assertEqual(len(captured_error), 1)
-        self.assertIsInstance(captured_error[0], RecMetricException)
-        self.assertIn("metric processor thread is shut down.", str(captured_error[0]))
 
     def test_update_after_shutdown(self) -> None:
         self.cpu_module.shutdown()
@@ -778,20 +773,12 @@ def _compare_metric_results_worker(
             expected_states=standard_state_dict,
         )
 
-    standard_results = standard_module.compute().resolve()
+    standard_results = standard_module.compute()
 
-    deferrable = cpu_offloaded_module.async_compute()
+    future = cpu_offloaded_module.async_compute()
 
-    # Wait for async compute to finish via subscribe. Compare the input to each update()
-    offloaded_event = threading.Event()
-    offloaded_results: dict[str, Any] = {}
-
-    def _on_results(data: dict[str, Any]) -> None:
-        offloaded_results.update(data)
-        offloaded_event.set()
-
-    deferrable.subscribe(_on_results)
-    offloaded_event.wait(timeout=10.0)
+    # Wait for async compute to finish. Compare the input to each update()
+    offloaded_results = future.result(timeout=10.0)
     for (
         offloaded_predictions,
         offloaded_labels,

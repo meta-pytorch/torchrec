@@ -24,7 +24,6 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessTestBase,
 )
 from torchrec.metrics.auc import _state_reduction, AUCMetric
-from torchrec.metrics.deferrable_metrics import DeferrableMetrics
 from torchrec.metrics.metric_module import (
     generate_metric_module,
     MetricsResult,
@@ -180,7 +179,7 @@ class MetricModuleTest(unittest.TestCase):
                 )
                 self.assertEqual(len(metric_module.state_metrics), 1)
                 metric_module.update(MagicMock())
-                ret = metric_module.compute().resolve()
+                ret = metric_module.compute()
                 rec_metric_list_patch.stop()
                 metric_module.rec_metrics.compute.assert_called_once()
                 self.assertTrue("ne-ne|lifetime_ne" in ret)
@@ -935,7 +934,7 @@ class MetricModuleTest(unittest.TestCase):
         )
         metric_module.update(gen_test_batch(128))
         result = metric_module.local_compute()
-        self.assertIsInstance(result, DeferrableMetrics)
+        self.assertIsInstance(result, dict)
 
     def test_get_required_inputs(self) -> None:
         metric_module = generate_metric_module(
@@ -992,8 +991,8 @@ class MetricModuleTest(unittest.TestCase):
         metric_module.load_state_dict(state_dict)
         metric_module.update(gen_test_batch(128))
         result = metric_module.compute()
-        self.assertIsInstance(result, DeferrableMetrics)
-        self.assertTrue(len(result.resolve()) > 0)
+        self.assertIsInstance(result, dict)
+        self.assertTrue(len(result) > 0)
 
     def test_load_state_dict_without_trained_batches_key(self) -> None:
         metric_module = generate_metric_module(
@@ -1015,8 +1014,8 @@ class MetricModuleTest(unittest.TestCase):
         metric_module.load_state_dict(state_dict)
         metric_module.update(gen_test_batch(128))
         result = metric_module.compute()
-        self.assertIsInstance(result, DeferrableMetrics)
-        self.assertTrue(len(result.resolve()) > 0)
+        self.assertIsInstance(result, dict)
+        self.assertTrue(len(result) > 0)
 
 
 def metric_module_gather_state(
@@ -1051,7 +1050,7 @@ def metric_module_gather_state(
             test_batches.append(test_batch)
             metric_module.update(test_batch)
 
-        computed_value = metric_module.compute().resolve()
+        computed_value = metric_module.compute()
         states = metric_module.get_pre_compute_states(pg=ctx.pg)
 
         torch.distributed.barrier(ctx.pg)
@@ -1067,7 +1066,7 @@ def metric_module_gather_state(
             process_group=dist.new_group(ranks=[rank], backend="nccl"),
         )
         new_metric_module.load_pre_compute_states(states)
-        new_computed_value = new_metric_module.compute().resolve()
+        new_computed_value = new_metric_module.compute()
 
         for metric, tensor in computed_value.items():
             new_tensor = new_computed_value[metric]
