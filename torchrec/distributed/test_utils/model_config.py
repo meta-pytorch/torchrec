@@ -27,6 +27,7 @@ from torchrec.distributed.test_utils.test_model import (
     TestMixedEmbeddingSparseArch,
     TestMixedSequenceOverArch,
     TestMixedSequenceOverArchLargeActivation,
+    TestModelWithPreproc,
     TestOverArch,
     TestOverArchLarge,
     TestOverArchRegroupModule,
@@ -273,6 +274,30 @@ class MixedEmbeddingConfig(BaseModelConfig):
         )
 
 
+@dataclass
+class TestModelWithPreprocConfig(BaseModelConfig):
+    """Configuration for TestModelWithPreproc model (model with postproc modules)."""
+
+    postproc_module: Optional[nn.Module] = None
+    run_postproc_inline: bool = False
+
+    def generate_model(
+        self,
+        tables: List[EmbeddingBagConfig],
+        weighted_tables: List[EmbeddingBagConfig],
+        dense_device: torch.device,
+        **kwargs: Any,
+    ) -> nn.Module:
+        return TestModelWithPreproc(
+            tables=tables,
+            weighted_tables=weighted_tables,
+            device=dense_device,
+            postproc_module=self.postproc_module,
+            num_float_features=self.num_float_features,
+            run_postproc_inline=self.run_postproc_inline,
+        )
+
+
 def create_model_config(model_name: str, **kwargs: Any) -> BaseModelConfig:
     """
     deprecated function, please use ModelSelectionConfig.create_model_config instead
@@ -284,6 +309,7 @@ def create_model_config(model_name: str, **kwargs: Any) -> BaseModelConfig:
         "deepfm": DeepFMConfig,
         "dlrm": DLRMConfig,
         "mixed_embedding": MixedEmbeddingConfig,
+        "test_model_with_preproc": TestModelWithPreprocConfig,
     }
 
     if model_name not in model_configs:
@@ -318,6 +344,8 @@ class ModelSelectionConfig:
                 return DLRMConfig
             case "mixed_embedding":
                 return MixedEmbeddingConfig
+            case "test_model_with_preproc":
+                return TestModelWithPreprocConfig
             case _:
                 raise ValueError(f"Unknown model name: {self.model_name}")
 
