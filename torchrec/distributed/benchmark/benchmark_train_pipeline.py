@@ -24,6 +24,7 @@ import itertools
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -232,6 +233,14 @@ def runner(
             process_group=ctx.pg,
         )
 
+        # Pre-allocate synthetic model_out to avoid CUDA allocator noise
+        # in the timing loop. Values don't matter for benchmarking overhead.
+        metric_model_out = (
+            metric_config.generate_model_output(run_option.batch_size, ctx.device)
+            if metric_module is not None
+            else None
+        )
+
         def _func_to_benchmark(
             bench_inputs: List[ModelInput],
             model: nn.Module,
@@ -241,6 +250,11 @@ def runner(
             if metric_module is not None:
                 metric_module.reset()
                 metric_module.trained_batches = 0
+
+            progress_times_ms: List[float] = []
+            update_times_ms: List[float] = []
+            compute_times_ms: List[float] = []
+
             if run_option.num_iters is not None:
                 dataloader = itertools.islice(
                     itertools.cycle(bench_inputs), run_option.num_iters
@@ -249,25 +263,57 @@ def runner(
                 dataloader = iter(bench_inputs)
             while True:
                 try:
+                    torch.cuda.synchronize()
+                    t0 = time.perf_counter()
                     output = pipeline.progress(dataloader)
+                    torch.cuda.synchronize()
+                    progress_times_ms.append((time.perf_counter() - t0) * 1000.0)
+
                     if metric_module is not None and output is not None:
-                        # Reduce to 1D [batch_size] for binary classification
-                        # metrics (NE, AUC). The model produces [batch_size,
-                        # over_arch_out_size] which would cause OOM in metric
-                        # sync (dist.all_gather accumulates all predictions).
-                        pred = output.detach().mean(dim=-1)
-                        model_out = {
-                            "prediction": pred,
-                            "label": torch.rand_like(pred),
-                            "weight": torch.ones_like(pred),
-                        }
+                        t1 = time.perf_counter()
+                        assert metric_model_out is not None
                         with record_function("## metric_update ##"):
-                            metric_module.update(model_out)
+                            metric_module.update(metric_model_out)
+                        torch.cuda.synchronize()
+                        update_times_ms.append((time.perf_counter() - t1) * 1000.0)
                         if metric_module.should_compute():
+                            t2 = time.perf_counter()
                             with record_function("## metric_compute ##"):
                                 metric_module.compute()
+                            torch.cuda.synchronize()
+                            compute_times_ms.append((time.perf_counter() - t2) * 1000.0)
                 except StopIteration:
                     break
+
+            if rank == 0 and progress_times_ms:
+                avg_progress = sum(progress_times_ms) / len(progress_times_ms)
+                avg_update = (
+                    sum(update_times_ms) / len(update_times_ms)
+                    if update_times_ms
+                    else 0.0
+                )
+                avg_compute = (
+                    sum(compute_times_ms) / len(compute_times_ms)
+                    if compute_times_ms
+                    else 0.0
+                )
+                update_pct = (
+                    avg_update / avg_progress * 100.0 if avg_progress > 0 else 0.0
+                )
+                compute_pct = (
+                    avg_compute / avg_progress * 100.0 if avg_progress > 0 else 0.0
+                )
+                print(
+                    f"[Metric Timing] iters={len(progress_times_ms)} "
+                    f"avg_progress={avg_progress:.2f}ms "
+                    f"avg_update={avg_update:.2f}ms ({update_pct:.1f}%) "
+                    f"avg_compute={avg_compute:.2f}ms ({compute_pct:.1f}%) "
+                    f"compute_calls={len(compute_times_ms)} "
+                    f"n_tasks={metric_config.num_tasks} "
+                    f"n_metrics={len(metric_config.metrics)} "
+                    f"mode={metric_config.rec_compute_mode}",
+                    flush=True,
+                )
 
         pipeline = pipeline_config.generate_pipeline(
             model=sharded_model,
