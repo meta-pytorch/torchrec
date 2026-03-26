@@ -18,6 +18,7 @@ import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.planner.constants import BATCH_SIZE, MAX_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.partitioners import (
@@ -330,6 +331,7 @@ class EmbeddingPlannerBase(ShardingPlanner):
             assert timeout_seconds > 0, "Timeout must be positive"
         self._timeout_seconds = timeout_seconds
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def collective_plan(
         self,
         module: nn.Module,
@@ -484,6 +486,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         self._num_plans: int = 0
         self._best_plan: Optional[List[ShardingOption]] = None
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def collective_plan(
         self,
         module: nn.Module,
@@ -520,8 +523,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             sharders,
         )
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     @_torchrec_method_logger()
-    # pyrefly: ignore[bad-param-name-override]
     def plan(
         self,
         module: nn.Module,
@@ -540,6 +543,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         """
         self._num_proposals = 0
         self._num_plans = 0
+
         start_time = perf_counter()
         best_plan = None
         lowest_storage = Storage(MAX_SIZE, MAX_SIZE, MAX_SIZE)
@@ -919,6 +923,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
             Callable[[List[ShardingOption]], List[ShardingOption]]
         ] = ([] if callbacks is None else callbacks)
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def collective_plan(
         self,
         module: nn.Module,
@@ -948,6 +953,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
             sharders,
         )
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def plan(
         self,
         module: nn.Module,
