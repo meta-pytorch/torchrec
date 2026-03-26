@@ -97,7 +97,7 @@ def to_sharding_plan(
 ) -> ShardingPlan:
 
     compute_device = topology.compute_device
-    local_size = topology.local_world_size
+    local_size = topology.intra_group_size
 
     plan = {}
     for sharding_option in sharding_options:
