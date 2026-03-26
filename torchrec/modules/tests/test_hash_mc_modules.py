@@ -1169,6 +1169,31 @@ class TestMCH(unittest.TestCase):
         )
         self.assertFalse(m2.is_sharded)
 
+    def test_reserved_indices_for_buckets(self) -> None:
+        """Test getting reserved indices for each bucket over 4 ranks."""
+        # table_size = 80
+        # 4 ranks, so each rank holds 20 rows
+        # 8 buckets, so each rank gets two buckets and each bucket holds 10 rows.
+        # each bucket has size 10, and 10 percent of them are reserved so 1 row.
+        m = HashZchManagedCollisionModule(
+            zch_size=80,
+            device=torch.device("cpu"),
+            total_num_buckets=8,
+            percent_reserved_slots=10.0,
+            opt_in_prob=1,
+        )
+        # Since the buckets are all the same size, then local reserved indices
+        #  are all the same, so forloop over all 4 shards.
+        for shard_id_range in [(0, 20), (20, 40), (40, 60), (60, 80)]:
+            m1 = m.rebuild_with_output_id_range(shard_id_range)
+            reserved_indices = m1.get_indices_of_reserved_slots_per_bucket()
+            torch.testing.assert_close(
+                reserved_indices,
+                torch.tensor([9, 19]),
+                rtol=0,
+                atol=0,
+            )
+
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
