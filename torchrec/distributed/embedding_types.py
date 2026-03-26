@@ -28,7 +28,7 @@ from typing import (
 )
 
 import torch
-from fbgemm_gpu.split_table_batched_embeddings_ops_training import EmbeddingLocation
+from fbgemm_gpu.split_table_batched_embeddings_ops_common import EmbeddingLocation
 from torch import fx, nn
 from torch.distributed._tensor import DeviceMesh
 from torch.distributed._tensor.placement_types import Placement
