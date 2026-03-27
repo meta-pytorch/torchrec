@@ -1086,6 +1086,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                         best_plan=best_plan,
                         constraints=self._constraints,
                         sharders=sharders,
+                        enumerator=self._enumerators[group],
                         debug=self._debug,
                     )
             else:
@@ -1149,6 +1150,7 @@ class HeteroEmbeddingShardingPlanner(ShardingPlanner):
                         best_plan=last_proposal,
                         constraints=self._constraints,
                         sharders=sharders,
+                        enumerator=self._enumerators[group],
                         debug=self._debug,
                     )
 

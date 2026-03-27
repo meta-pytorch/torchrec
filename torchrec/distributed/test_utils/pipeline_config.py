@@ -60,10 +60,13 @@ class PipelineConfig:
     pipeline: str = "base"
     enable_inplace_copy_batch: bool = False
     free_features_storage_early: bool = False
+    pipeline_postproc: bool = False
     kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def get_kwargs(self, **default_kwargs) -> Dict[str, Any]:
         kwargs = default_kwargs | self.kwargs
+        if self.pipeline_postproc:
+            kwargs["pipeline_postproc"] = True
         if "sharding_type" in kwargs:
             kwargs["sharding_type"] = ShardingType(kwargs["sharding_type"])
         if self.pipeline in ("base", "sparse", "sparse_lite", "prefetch"):
@@ -72,6 +75,8 @@ class PipelineConfig:
                     kwargs.pop(key)
         if self.pipeline in ("sparse-emb-stash",):
             kwargs.pop("sharding_type", None)
+        if self.pipeline in ("base", "eval-sdd"):
+            kwargs.pop("pipeline_postproc", None)
         return kwargs
 
     def generate_pipeline(

@@ -53,8 +53,10 @@ from torchrec.distributed.planner.types import (
 )
 from torchrec.distributed.planner.utils import (
     _find_imbalance_tables,
+    build_sharder_data_map,
     bytes_to_gb,
     bytes_to_mb,
+    sharder_name as _sharder_name,
 )
 from torchrec.distributed.types import (
     ModuleSharder,
@@ -258,6 +260,10 @@ class EmbeddingStats(Stats):
             sharder_data_map: Optional[SharderDataMap] = None
             if enumerator is not None:
                 sharder_data_map = getattr(enumerator, "_sharder_data_map", None)
+            if sharder_data_map is None and sharders:
+                sharder_data_map = build_sharder_data_map(
+                    {_sharder_name(s.module_type): s for s in sharders}
+                )
             formatted_param_table = self._log_sharding_plan(
                 best_plan=best_plan,
                 sharding_plan=sharding_plan,
@@ -393,6 +399,15 @@ class EmbeddingStats(Stats):
             output_data_type_size=output_data_type_size,
             num_poolings=num_poolings,
             is_pooled=sharding_option.is_pooled,
+        )
+
+        assert len(ranks) == len(input_sizes), (
+            f"ranks/io_sizes length mismatch for {sharding_option.fqn}: "
+            f"ParameterSharding has {len(ranks)} ranks but "
+            f"ShardingOption has {len(sharding_option.shards)} shards "
+            f"(produced {len(input_sizes)} io entries). "
+            f"This usually means the plan was constructed with mismatched "
+            f"ParameterSharding.ranks and ShardingOption.shards."
         )
 
         input_sizes = [bytes_to_mb(input_size) for input_size in input_sizes]
