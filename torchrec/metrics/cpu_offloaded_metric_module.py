@@ -126,7 +126,9 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         self.update_thread.start()
         self.compute_thread.start()
 
-        logger.info("CPUOffloadedRecMetricModule initialization complete.")
+        logger.info(
+            f"CPUOffloadedRecMetricModule initialization complete with {model_out_device.type=}, {update_queue_size=}, {compute_queue_size=}."
+        )
 
     @override
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
