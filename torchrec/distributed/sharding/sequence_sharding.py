@@ -7,7 +7,7 @@
 
 # pyre-strict
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import torch
@@ -17,6 +17,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
 
 
+@dataclass
 class SequenceShardingContext(EmbeddingShardingContext):
     """
     Stores KJTAllToAll context and reuses it in SequenceEmbeddingsAllToAll.
@@ -33,43 +34,23 @@ class SequenceShardingContext(EmbeddingShardingContext):
             input dist.
     """
 
-    # Torch Dynamo does not support default_factory=list:
-    # https://github.com/pytorch/pytorch/issues/120108
-    # TODO(ivankobzarev): Make this a dataclass once supported
+    features_before_input_dist: Optional[KeyedJaggedTensor] = None
+    input_splits: List[int] = field(default_factory=list)
+    output_splits: List[int] = field(default_factory=list)
+    sparse_features_recat: Optional[torch.Tensor] = None
+    unbucketize_permute_tensor: Optional[torch.Tensor] = None
+    lengths_after_input_dist: Optional[torch.Tensor] = None
 
-    def __init__(
-        self,
-        # Fields of EmbeddingShardingContext
-        batch_size_per_rank: Optional[List[int]] = None,
-        batch_size_per_rank_per_feature: Optional[List[List[int]]] = None,
-        batch_size_per_feature_pre_a2a: Optional[List[int]] = None,
-        variable_batch_per_feature: bool = False,
-        # Fields of SequenceShardingContext
-        features_before_input_dist: Optional[KeyedJaggedTensor] = None,
-        input_splits: Optional[List[int]] = None,
-        output_splits: Optional[List[int]] = None,
-        sparse_features_recat: Optional[torch.Tensor] = None,
-        unbucketize_permute_tensor: Optional[torch.Tensor] = None,
-        lengths_after_input_dist: Optional[torch.Tensor] = None,
-    ) -> None:
-        super().__init__(
-            batch_size_per_rank,
-            batch_size_per_rank_per_feature,
-            batch_size_per_feature_pre_a2a,
-            variable_batch_per_feature,
-        )
-        self.features_before_input_dist: Optional[KeyedJaggedTensor] = (
-            features_before_input_dist
-        )
-        self.input_splits: List[int] = input_splits if input_splits is not None else []
-        self.output_splits: List[int] = (
-            output_splits if output_splits is not None else []
-        )
-        self.sparse_features_recat: Optional[torch.Tensor] = sparse_features_recat
-        self.unbucketize_permute_tensor: Optional[torch.Tensor] = (
-            unbucketize_permute_tensor
-        )
-        self.lengths_after_input_dist: Optional[torch.Tensor] = lengths_after_input_dist
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:disable_none_context_fields"
+        ):
+            return
+        if self.input_splits is None:
+            self.input_splits = []  # pyrefly: ignore[bad-assignment]
+        if self.output_splits is None:
+            self.output_splits = []  # pyrefly: ignore[bad-assignment]
 
     def record_stream(self, stream: torch.Stream) -> None:
         if self.features_before_input_dist is not None:

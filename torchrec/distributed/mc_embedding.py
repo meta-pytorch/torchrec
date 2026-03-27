@@ -9,6 +9,7 @@
 
 #!/usr/bin/env python3
 
+from dataclasses import dataclass
 from typing import Any, cast, Dict, List, Optional, Type
 
 import torch
@@ -33,21 +34,10 @@ from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingColle
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
+@dataclass
 class ManagedCollisionEmbeddingCollectionContext(EmbeddingCollectionContext):
-
-    def __init__(
-        self,
-        sharding_contexts: Optional[List[SequenceShardingContext]] = None,
-        input_features: Optional[List[KeyedJaggedTensor]] = None,
-        reverse_indices: Optional[List[torch.Tensor]] = None,
-        evictions_per_table: Optional[Dict[str, Optional[torch.Tensor]]] = None,
-        remapped_kjt: Optional[KJTList] = None,
-    ) -> None:
-        super().__init__(sharding_contexts, input_features, reverse_indices)
-        self.evictions_per_table: Optional[Dict[str, Optional[torch.Tensor]]] = (
-            evictions_per_table
-        )
-        self.remapped_kjt: Optional[KJTList] = remapped_kjt
+    evictions_per_table: Optional[Dict[str, Optional[torch.Tensor]]] = None
+    remapped_kjt: Optional[KJTList] = None
 
     def record_stream(self, stream: torch.Stream) -> None:
         super().record_stream(stream)

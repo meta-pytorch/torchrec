@@ -11,6 +11,7 @@ import copy
 import logging
 import warnings
 from collections import defaultdict, deque, OrderedDict
+from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import (
     Any,
@@ -301,24 +302,30 @@ def _pin_and_move(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
     )
 
 
+@dataclass
 class EmbeddingCollectionContext(Multistreamable):
-    # Torch Dynamo does not support default_factory=list:
-    # https://github.com/pytorch/pytorch/issues/120108
-    # TODO(ivankobzarev): Make this a dataclass once supported
+    sharding_contexts: List[SequenceShardingContext] = field(default_factory=list)
+    input_features: List[KeyedJaggedTensor] = field(default_factory=list)
+    reverse_indices: List[torch.Tensor] = field(default_factory=list)
+    seq_vbe_ctx: List[SequenceVBEContext] = field(default_factory=list)
+    table_name_to_unpruned_hash_sizes: Dict[str, int] = field(default_factory=dict)
 
-    def __init__(
-        self,
-        sharding_contexts: Optional[List[SequenceShardingContext]] = None,
-        input_features: Optional[List[KeyedJaggedTensor]] = None,
-        reverse_indices: Optional[List[torch.Tensor]] = None,
-        seq_vbe_ctx: Optional[List[SequenceVBEContext]] = None,
-    ) -> None:
-        super().__init__()
-        self.sharding_contexts: List[SequenceShardingContext] = sharding_contexts or []
-        self.input_features: List[KeyedJaggedTensor] = input_features or []
-        self.reverse_indices: List[torch.Tensor] = reverse_indices or []
-        self.seq_vbe_ctx: List[SequenceVBEContext] = seq_vbe_ctx or []
-        self.table_name_to_unpruned_hash_sizes: Dict[str, int] = {}
+    def __post_init__(self) -> None:
+        if torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:disable_none_context_fields"
+        ):
+            return
+        if self.sharding_contexts is None:
+            self.sharding_contexts = []  # pyrefly: ignore[bad-assignment]
+        if self.input_features is None:
+            self.input_features = []  # pyrefly: ignore[bad-assignment]
+        if self.reverse_indices is None:
+            self.reverse_indices = []  # pyrefly: ignore[bad-assignment]
+        if self.seq_vbe_ctx is None:
+            self.seq_vbe_ctx = []  # pyrefly: ignore[bad-assignment]
+        if self.table_name_to_unpruned_hash_sizes is None:
+            # pyrefly: ignore[bad-assignment]
+            self.table_name_to_unpruned_hash_sizes = {}
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
