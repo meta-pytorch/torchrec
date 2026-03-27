@@ -853,6 +853,7 @@ class EmbeddingStats(Stats):
                 "Emb Dim (CW Dim)",
                 "Hash Size",
                 "Ranks",
+                "UE Group",
             ],
             [
                 "-----",  # FQN
@@ -871,6 +872,7 @@ class EmbeddingStats(Stats):
                 "------------------",  # Emb Dim (CW Dim)
                 "-----------",  # Hash Size
                 "-------",  # Ranks
+                "----------",  # UE Group
             ],
         ]
         feat_batch_sizes = [
@@ -921,6 +923,11 @@ class EmbeddingStats(Stats):
             embedding_dim = _get_embedding_dim(so)
             cache_load_factor = _get_cache_load_factor(so, sd)
             hash_size = so.tensor.shape[0]
+            ue_group = (
+                constraints[so.name].ue_group or ""
+                if constraints and so.name in constraints
+                else ""
+            )
             param_table.append(
                 # pyrefly: ignore[bad-argument-type]
                 [
@@ -940,6 +947,7 @@ class EmbeddingStats(Stats):
                     embedding_dim,
                     hash_size,
                     ",".join(ranks) if sharding_plan.plan else "None",
+                    ue_group,
                 ]
             )
             if include_batch_sizes:
