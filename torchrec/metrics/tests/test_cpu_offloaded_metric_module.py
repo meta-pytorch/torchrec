@@ -12,7 +12,7 @@ import queue
 import threading
 import time
 import unittest
-from typing import Callable, cast
+from typing import Any, Callable, cast
 from unittest.mock import patch
 
 import torch
@@ -22,7 +22,9 @@ from torchrec.metrics.cpu_offloaded_metric_module import (
     CPUOffloadedRecMetricModule,
     MetricUpdateJob,
 )
-from torchrec.metrics.metric_module import RecMetricModule
+from torchrec.metrics.deferrable_metrics import transfer_tensors_to_cpu
+from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
+from torchrec.metrics.metrics_config import DefaultMetricsConfig
 from torchrec.metrics.rec_metric import RecMetricException, RecMetricList
 from torchrec.metrics.test_utils import gen_test_tasks
 from torchrec.metrics.test_utils.mock_metrics import (
@@ -106,7 +108,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             "task1-weight": torch.tensor([5.0, 1.0, 0.0]).to("cuda:0"),
         }
 
-        cpu_output, transfer_event = self.cpu_module._transfer_to_cpu(output)
+        cpu_output, transfer_event = transfer_tensors_to_cpu(output)
+        self.assertIsNotNone(transfer_event)
+        assert transfer_event is not None
         wait_until_true(transfer_event.query)
 
         self.assertEqual(len(cpu_output), 3)
@@ -228,11 +232,16 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_async_compute_after_shutdown(self) -> None:
         self.cpu_module.shutdown()
 
-        future = self.cpu_module.async_compute()
+        result = self.cpu_module.async_compute()
 
-        self.assertRaisesRegex(
-            RecMetricException, "metric processor thread is shut down.", future.result
+        captured_error: list[Exception] = []
+        result.subscribe(
+            callback=lambda _: None,
+            on_error=lambda e: captured_error.append(e),
         )
+        self.assertEqual(len(captured_error), 1)
+        self.assertIsInstance(captured_error[0], RecMetricException)
+        self.assertIn("metric processor thread is shut down.", str(captured_error[0]))
 
     def test_update_after_shutdown(self) -> None:
         self.cpu_module.shutdown()
@@ -520,6 +529,59 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
         cpu_module_indexed.shutdown()
 
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2,
+        "Not enough GPUs, this test requires at least 2 GPUs",
+    )
+    def test_transfer_tensors_to_cpu_event_on_source_device_stream(self) -> None:
+        """
+        Regression test for ZORM metric corruption on non-rank-0 processes.
+
+        Bug: transfer_tensors_to_cpu recorded the CUDA event on cuda:0 (default)
+        instead of the source tensor's device (cuda:N), making event.synchronize()
+        a no-op on non-rank-0 processes.
+
+        Verifies the event tracks cuda:1's stream via event.query(): with the bug,
+        the event on idle cuda:0 completes immediately; with the fix, it stays
+        pending behind cuda:1's queued work.
+        """
+        with torch.cuda.device(0):
+            source_tensors = {
+                "predictions": torch.ones(1024, device="cuda:1") * 3.14,
+                "labels": torch.ones(1024, device="cuda:1"),
+                "weights": torch.ones(1024, device="cuda:1") * 2.0,
+            }
+
+            busy = torch.randn(8192, 8192, device="cuda:1")
+            for _ in range(50):
+                busy = busy @ busy
+
+            cpu_tensors, event = transfer_tensors_to_cpu(source_tensors)
+            self.assertIsNotNone(event)
+            assert event is not None
+
+            self.assertFalse(
+                event.query(),
+                "CUDA event completed immediately — it was recorded on the "
+                "wrong stream (cuda:0 instead of cuda:1).",
+            )
+
+            event.synchronize()
+            torch.testing.assert_close(
+                cpu_tensors["predictions"],
+                torch.ones(1024) * 3.14,
+            )
+            torch.testing.assert_close(
+                cpu_tensors["labels"],
+                torch.ones(1024),
+            )
+            torch.testing.assert_close(
+                cpu_tensors["weights"],
+                torch.ones(1024) * 2.0,
+            )
+
+    # pyre-ignore[56]
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -563,11 +625,13 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         )
 
         transfer_call_info: list = []
-        original_transfer_to_cpu = offloaded_module._transfer_to_cpu
+        original_transfer = transfer_tensors_to_cpu
 
-        def tracking_transfer_to_cpu(model_out: dict) -> tuple:
+        def tracking_transfer(
+            tensors: dict,
+        ) -> tuple:
             transfer_call_info.append(threading.current_thread().name)
-            return original_transfer_to_cpu(model_out)
+            return original_transfer(tensors)
 
         model_out = {
             "task1-prediction": torch.tensor([0.5, 0.7]),
@@ -579,10 +643,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             for tensor in model_out.values():
                 self.assertEqual(tensor.device.type, "cuda")
 
-        with patch.object(
-            offloaded_module,
-            "_transfer_to_cpu",
-            side_effect=tracking_transfer_to_cpu,
+        with patch(
+            "torchrec.metrics.cpu_offloaded_metric_module.transfer_tensors_to_cpu",
+            side_effect=tracking_transfer,
         ):
             offloaded_module.update(model_out)
             wait_until_true(offloaded_metric.update_called)
@@ -591,7 +654,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.assertEqual(
                 len(transfer_call_info),
                 1,
-                "_transfer_to_cpu should be called exactly once for CUDA device",
+                "transfer_tensors_to_cpu should be called exactly once for CUDA device",
             )
             self.assertEqual(
                 transfer_call_info[0],
@@ -603,7 +666,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.assertEqual(
                 len(transfer_call_info),
                 0,
-                "_transfer_to_cpu should NOT be called when device is CPU",
+                "transfer_tensors_to_cpu should NOT be called when device is CPU",
             )
 
         self.assertTrue(offloaded_metric.predictions_update_calls is not None)
@@ -630,6 +693,32 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
     def test_no_dtoh_transfer_for_cpu_device(self) -> None:
         self._run_dtoh_transfer_test(use_cuda=False)
+
+    def test_generate_metric_module_creates_cpu_offloaded_module(self) -> None:
+        module_kwargs = {
+            "model_out_device": torch.device("cpu"),
+            "update_queue_size": 50,
+            "compute_queue_size": 75,
+        }
+
+        module = generate_metric_module(
+            metric_class=CPUOffloadedRecMetricModule,
+            metrics_config=DefaultMetricsConfig,
+            batch_size=128,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+            module_kwargs=module_kwargs,
+        )
+
+        self.assertIsInstance(module, CPUOffloadedRecMetricModule)
+
+        self.assertEqual(module._model_out_device, torch.device("cpu"))
+        self.assertEqual(module.update_queue.maxsize, 50)
+        self.assertEqual(module.compute_queue.maxsize, 75)
+
+        module.shutdown()
 
 
 @skip_if_asan_class
@@ -773,12 +862,20 @@ def _compare_metric_results_worker(
             expected_states=standard_state_dict,
         )
 
-    standard_results = standard_module.compute()
+    standard_results = standard_module.compute().resolve()
 
-    future = cpu_offloaded_module.async_compute()
+    deferrable = cpu_offloaded_module.async_compute()
 
-    # Wait for async compute to finish. Compare the input to each update()
-    offloaded_results = future.result(timeout=10.0)
+    # Wait for async compute to finish via subscribe. Compare the input to each update()
+    offloaded_event = threading.Event()
+    offloaded_results: dict[str, Any] = {}
+
+    def _on_results(data: dict[str, Any]) -> None:
+        offloaded_results.update(data)
+        offloaded_event.set()
+
+    deferrable.subscribe(_on_results)
+    offloaded_event.wait(timeout=10.0)
     for (
         offloaded_predictions,
         offloaded_labels,
