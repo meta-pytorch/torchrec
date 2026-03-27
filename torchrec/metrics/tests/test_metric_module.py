@@ -14,6 +14,7 @@ import multiprocessing
 import os
 import tempfile
 import unittest
+from collections.abc import Mapping
 from typing import Any, Callable, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
@@ -934,7 +935,7 @@ class MetricModuleTest(unittest.TestCase):
         )
         metric_module.update(gen_test_batch(128))
         result = metric_module.local_compute()
-        self.assertIsInstance(result, dict)
+        self.assertIsInstance(result, Mapping)
 
     def test_get_required_inputs(self) -> None:
         metric_module = generate_metric_module(
@@ -991,7 +992,7 @@ class MetricModuleTest(unittest.TestCase):
         metric_module.load_state_dict(state_dict)
         metric_module.update(gen_test_batch(128))
         result = metric_module.compute()
-        self.assertIsInstance(result, dict)
+        self.assertIsInstance(result, Mapping)
         self.assertTrue(len(result) > 0)
 
     def test_load_state_dict_without_trained_batches_key(self) -> None:
@@ -1014,7 +1015,7 @@ class MetricModuleTest(unittest.TestCase):
         metric_module.load_state_dict(state_dict)
         metric_module.update(gen_test_batch(128))
         result = metric_module.compute()
-        self.assertIsInstance(result, dict)
+        self.assertIsInstance(result, Mapping)
         self.assertTrue(len(result) > 0)
 
 

@@ -8,12 +8,17 @@
 # pyre-strict
 
 import unittest
+from collections.abc import Mapping
 from concurrent.futures import Future
+from unittest.mock import patch
 
 from torchrec.metrics.deferrable_metrics import DeferrableMetrics
 
 
 class TestDeferrableMetrics(unittest.TestCase):
+    def setUp(self) -> None:
+        DeferrableMetrics._warned = False
+
     def test_resolved_basic(self) -> None:
         data = {"a": 1, "b": 2}
         dm = DeferrableMetrics(data)
@@ -43,11 +48,12 @@ class TestDeferrableMetrics(unittest.TestCase):
         dm = DeferrableMetrics(f)
         self.assertFalse(dm.is_resolved())
 
-    def test_future_backed_resolve_raises(self) -> None:
+    def test_future_backed_resolve_blocks(self) -> None:
         f: Future[dict] = Future()
         dm = DeferrableMetrics(f)
-        with self.assertRaisesRegex(RuntimeError, "Cannot synchronously resolve"):
-            dm.resolve()
+        f.set_result({"val": 42})
+        self.assertEqual(dm.resolve(), {"val": 42})
+        self.assertTrue(dm.is_resolved())
 
     def test_future_backed_subscribe(self) -> None:
         f: Future[dict] = Future()
@@ -94,14 +100,82 @@ class TestDeferrableMetrics(unittest.TestCase):
         self.assertIsInstance(result, DeferrableMetrics)
         self.assertIs(result, dm)
 
-    def test_not_a_mapping(self) -> None:
+    def test_mapping_getitem(self) -> None:
+        dm = DeferrableMetrics({"a": 1, "b": 2})
+        self.assertEqual(dm["a"], 1)
+        self.assertEqual(dm["b"], 2)
+        with self.assertRaises(KeyError):
+            _ = dm["nonexistent"]
+
+    def test_mapping_iter(self) -> None:
+        dm = DeferrableMetrics({"x": 10, "y": 20})
+        self.assertEqual(set(dm), {"x", "y"})
+
+    def test_mapping_len(self) -> None:
+        dm = DeferrableMetrics({"a": 1, "b": 2, "c": 3})
+        self.assertEqual(len(dm), 3)
+
+    def test_mapping_items_keys_values(self) -> None:
+        dm = DeferrableMetrics({"a": 1, "b": 2})
+        self.assertEqual(dict(dm.items()), {"a": 1, "b": 2})
+        self.assertEqual(set(dm.keys()), {"a", "b"})
+        self.assertEqual(set(dm.values()), {1, 2})
+
+    def test_mapping_isinstance(self) -> None:
         dm = DeferrableMetrics({"a": 1})
-        with self.assertRaisesRegex(TypeError, ""):
-            _ = dm["a"]  # pyrefly: ignore
-        with self.assertRaisesRegex(TypeError, ""):
-            len(dm)  # pyrefly: ignore
-        with self.assertRaisesRegex(TypeError, ""):
-            list(dm)  # pyrefly: ignore
+        self.assertIsInstance(dm, Mapping)
+
+    def test_dict_update_from_deferrable(self) -> None:
+        dm = DeferrableMetrics({"a": 1, "b": 2})
+        d: dict[str, int] = {"c": 3}
+        d.update(dm)
+        self.assertEqual(d, {"a": 1, "b": 2, "c": 3})
+
+    def test_dict_unpacking(self) -> None:
+        dm = DeferrableMetrics({"a": 1, "b": 2})
+        result = {**dm}
+        self.assertEqual(result, {"a": 1, "b": 2})
+
+    def test_in_operator(self) -> None:
+        dm = DeferrableMetrics({"a": 1, "b": 2})
+        self.assertIn("a", dm)
+        self.assertNotIn("c", dm)
+
+    def test_get_method(self) -> None:
+        dm = DeferrableMetrics({"a": 1})
+        self.assertEqual(dm.get("a"), 1)
+        self.assertIsNone(dm.get("missing"))
+        self.assertEqual(dm.get("missing", 42), 42)
+
+    def test_warn_sync_access_on_future_backed(self) -> None:
+        f: Future[dict] = Future()
+        f.set_result({"a": 1})
+        dm = DeferrableMetrics(f)
+        with patch("torchrec.metrics.deferrable_metrics.logger") as mock_logger:
+            _ = dm["a"]
+            mock_logger.warning.assert_called_once()
+
+    def test_warn_once_per_process(self) -> None:
+        f1: Future[dict] = Future()
+        f1.set_result({"a": 1})
+        dm1 = DeferrableMetrics(f1)
+        f2: Future[dict] = Future()
+        f2.set_result({"b": 2})
+        dm2 = DeferrableMetrics(f2)
+        with patch("torchrec.metrics.deferrable_metrics.logger") as mock_logger:
+            _ = dm1["a"]
+            _ = dm2["b"]
+            _ = list(dm1)
+            _ = len(dm2)
+            self.assertEqual(mock_logger.warning.call_count, 1)
+
+    def test_no_warn_on_resolved(self) -> None:
+        dm = DeferrableMetrics({"a": 1})
+        with patch("torchrec.metrics.deferrable_metrics.logger") as mock_logger:
+            _ = dm["a"]
+            _ = list(dm)
+            _ = len(dm)
+            mock_logger.warning.assert_not_called()
 
     def test_repr(self) -> None:
         dm_resolved = DeferrableMetrics({"a": 1, "b": 2})
@@ -114,6 +188,7 @@ class TestDeferrableMetrics(unittest.TestCase):
         dm = DeferrableMetrics({})
         self.assertTrue(dm.is_resolved())
         self.assertEqual(dm.resolve(), {})
+        self.assertEqual(len(dm), 0)
 
     def test_update_deferrable_to_deferrable(self) -> None:
         f1: Future[dict] = Future()
@@ -157,3 +232,26 @@ class TestDeferrableMetrics(unittest.TestCase):
         dm = DeferrableMetrics(original)
         original["a"] = 999
         self.assertEqual(dm.resolve()["a"], 1)
+
+    def test_subscribe_no_on_error_future_raises(self) -> None:
+        f: Future[dict] = Future()
+        dm = DeferrableMetrics(f)
+        received: list[dict] = []
+        dm.subscribe(lambda d: received.append(d))
+        f.set_exception(ValueError("boom"))
+        self.assertEqual(received, [])
+        self.assertFalse(dm.is_resolved())
+
+    def test_mapping_equality(self) -> None:
+        dm = DeferrableMetrics({"a": 1, "b": 2})
+        self.assertEqual(dm, {"a": 1, "b": 2})
+        self.assertNotEqual(dm, {"a": 1})
+        self.assertEqual(dm, DeferrableMetrics({"a": 1, "b": 2}))
+
+    def test_resolve_future_exception_propagates(self) -> None:
+        f: Future[dict] = Future()
+        dm = DeferrableMetrics(f)
+        f.set_exception(ValueError("compute failed"))
+        with self.assertRaises(ValueError):
+            dm.resolve()
+        self.assertFalse(dm.is_resolved())

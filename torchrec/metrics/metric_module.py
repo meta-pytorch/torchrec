@@ -32,6 +32,7 @@ from torchrec.metrics.calibration_with_recalibration import (
     RecalibratedCalibrationMetric,
 )
 from torchrec.metrics.ctr import CTRMetric
+from torchrec.metrics.deferrable_metrics import DeferrableMetrics
 from torchrec.metrics.hindsight_target_pr import HindsightTargetPRMetric
 from torchrec.metrics.mae import MAEMetric
 from torchrec.metrics.metrics_config import (
@@ -132,13 +133,15 @@ MetricValue = Union[torch.Tensor, float]
 MetricsResult = Dict[str, MetricValue]
 # pyrefly: ignore[implicit-import]
 MetricsFuture = concurrent.futures.Future[MetricsResult]
-MetricsOutput = Union[MetricsResult, MetricsFuture]
+MetricsOutput = Union[MetricsResult, MetricsFuture, DeferrableMetrics]
 
 # Looser types for publishing metrics with additional metadata
 PublishableMetrics = Dict[str, Any]
 # pyrefly: ignore[implicit-import]
 PublishableMetricsFuture = concurrent.futures.Future[PublishableMetrics]
-PublishableMetricsOutput = Union[PublishableMetrics, PublishableMetricsFuture]
+PublishableMetricsOutput = Union[
+    PublishableMetrics, PublishableMetricsFuture, DeferrableMetrics
+]
 
 
 class StateMetric(abc.ABC):
@@ -363,7 +366,7 @@ class RecMetricModule(nn.Module):
     def should_compute(self) -> bool:
         return self.trained_batches % self.compute_interval_steps == 0
 
-    def compute(self) -> MetricsResult:
+    def compute(self) -> DeferrableMetrics:
         r"""compute() is called when the global metrics are required, usually
         right before logging the metrics results to the data sink.
         """
@@ -384,16 +387,16 @@ class RecMetricModule(nn.Module):
                                 for metric_name, metric_value in component.get_metrics().items()
                             }
                         )
-            return ret
+            return DeferrableMetrics(ret)
 
-    def local_compute(self) -> MetricsResult:
+    def local_compute(self) -> DeferrableMetrics:
         r"""local_compute() is called when per-trainer metrics are required. It's
         can be used for debugging. Currently only rec_metrics is supported.
         """
         ret: MetricsResult = {}
         if self.rec_metrics:
             ret.update(self.rec_metrics.local_compute())
-        return ret
+        return DeferrableMetrics(ret)
 
     def sync(self) -> None:
         self.rec_metrics.sync()
@@ -583,7 +586,7 @@ class RecMetricModule(nn.Module):
     def shutdown(self) -> None:
         logger.info("Initiating graceful shutdown...")
 
-    def async_compute(self) -> MetricsFuture:
+    def async_compute(self) -> DeferrableMetrics:
         raise RecMetricException("async_compute is not supported in RecMetricModule")
 
 
