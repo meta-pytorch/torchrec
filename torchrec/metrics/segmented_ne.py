@@ -181,36 +181,26 @@ def get_segemented_ne_states_fused(
     num_groups: int,
     n_tasks: int,
 ) -> Dict[str, torch.Tensor]:
-    groups = torch.unique(grouping_keys)
-    buffer = torch.zeros((4, n_tasks, num_groups), device=labels.device)
-    cross_entropy, weighted_num_samples, pos_labels, neg_labels = buffer.unbind(0)
-    for group in groups:
-        group_mask = grouping_keys == group
+    # labels, predictions, weights: (n_tasks, num_samples)
+    # grouping_keys: (num_samples,) with integer values in [0, num_groups)
 
-        group_labels = labels[:, group_mask]
-        group_predictions = predictions[:, group_mask]
-        group_weights = weights[:, group_mask]
+    # Compute per-sample cross-entropy across all groups at once
+    ce = compute_cross_entropy(labels, predictions, weights, eta)
 
-        ce_sum_group = torch.sum(
-            compute_cross_entropy(
-                labels=group_labels,
-                predictions=group_predictions,
-                weights=group_weights,
-                eta=eta,
-            ),
-            dim=-1,
-        )
+    # Build scatter index: (n_tasks, num_samples), same group index across tasks
+    group_idx = grouping_keys.long().unsqueeze(0).expand(n_tasks, -1)
 
-        weighted_num_samples_group = torch.sum(group_weights, dim=-1)
-        pos_labels_group = torch.sum(group_weights * group_labels, dim=-1)
-        neg_labels_group = torch.sum(group_weights * (1.0 - group_labels), dim=-1)
+    # Accumulate per-group sums via scatter_add_ (no GPU sync points)
+    def _scatter_sum(values: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros(n_tasks, num_groups, dtype=torch.double, device=values.device)
+        out.scatter_add_(1, group_idx, values.double())
+        return out
 
-        cross_entropy[:, group] = ce_sum_group
-        weighted_num_samples[:, group] = weighted_num_samples_group
-        pos_labels[:, group] = pos_labels_group
-        neg_labels[:, group] = neg_labels_group
+    cross_entropy = _scatter_sum(ce)
+    weighted_num_samples = _scatter_sum(weights)
+    pos_labels = _scatter_sum(weights * labels)
+    neg_labels = _scatter_sum(weights * (1.0 - labels))
 
-    # tensor size for each value is (num_groups)
     return {
         "cross_entropy_sum": cross_entropy,
         "weighted_num_samples": weighted_num_samples,
