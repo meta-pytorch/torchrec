@@ -7,12 +7,74 @@
 
 # pyre-strict
 
+import abc
 import logging
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from torchrec.modules.hash_mc_evictions import HashZchEvictionConfig
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+class ScalarLoggerBackend(abc.ABC):
+    """
+    Base class for ScalarLogger reporting backends.
+
+    Subclass this to implement custom metric reporting (e.g., TensorBoard, console, file).
+    The ``report`` method receives pre-formatted log messages and structured rate metrics.
+    """
+
+    @abc.abstractmethod
+    def report(
+        self,
+        log_message: str,
+        name: str,
+        run_type: str,
+        step: int,
+        rate_metrics: Dict[str, float],
+    ) -> None:
+        """
+        Report computed metrics.
+
+        Args:
+            log_message: Pre-formatted log message for console/file output.
+            name: The embedding table name.
+            run_type: "train" or "eval".
+            step: Current reporting step number.
+            rate_metrics: Dict of metric_name to value for structured reporting.
+                Keys: hit_rate, insert_rate, collision_rate, eviction_rate,
+                opt_in_rate, avg_eviction_age, table_usage_ratio.
+        """
+        ...
+
+
+class ConsoleScalarLoggerBackend(ScalarLoggerBackend):
+    """
+    Logs metrics to console or file using Python's logging module.
+
+    This is the default backend for ScalarLogger.
+
+    Args:
+        log_file_path: path to the log file. If empty, logs to console only.
+    """
+
+    def __init__(self, log_file_path: str = "") -> None:
+        self._logger: logging.Logger = logging.getLogger(__name__)
+        if log_file_path != "":
+            file_handler = logging.FileHandler(log_file_path, mode="w")
+            self._logger.addHandler(file_handler)
+
+    def report(
+        self,
+        log_message: str,
+        name: str,
+        run_type: str,
+        step: int,
+        rate_metrics: Dict[str, float],
+    ) -> None:
+        self._logger.info(log_message)
 
 
 class ScalarLogger(torch.nn.Module):
@@ -25,6 +87,8 @@ class ScalarLogger(torch.nn.Module):
         frequency: frequency of reporting metrics.
         start_bucket: start bucket of the rank.
         log_file_path: path to the log file. If not provided, logs will be printed to console.
+        backend: optional reporting backend. If not provided, defaults to
+            ConsoleScalarLoggerBackend with the given log_file_path.
 
     Example::
         logger = ScalarLogger(...)
@@ -46,6 +110,7 @@ class ScalarLogger(torch.nn.Module):
         device: torch.device,
         disable_fallback: bool,
         log_file_path: str = "",
+        backend: Optional[ScalarLoggerBackend] = None,
     ) -> None:
         super().__init__()
 
@@ -94,16 +159,12 @@ class ScalarLogger(torch.nn.Module):
         self._opt_in_cnt: int = 0
         self._sum_eviction_age: float = 0.0
 
-        self.logger: logging.Logger = logging.getLogger()
-        if (
-            log_file_path != ""
-        ):  # if a log file path is provided, create a file handler to output logs to the file
-            file_handler = logging.FileHandler(
-                log_file_path, mode="w"
-            )  # initialize file handler
-            self.logger.addHandler(file_handler)  # add file handler to logger
+        if backend is not None:
+            self._backend: ScalarLoggerBackend = backend
+        else:
+            self._backend = ConsoleScalarLoggerBackend(log_file_path=log_file_path)
 
-        self.logger.info(
+        logger.info(
             f"ScalarLogger: {self._name=}, {self._device=}, "
             f"{self._zch_size=}, {self._frequency=}, {self._start_bucket=}, "
             f"{self._num_buckets_per_rank=}, {self._num_reserved_slots_per_bucket=}, "
@@ -224,7 +285,7 @@ class ScalarLogger(torch.nn.Module):
             )
 
             # log the metrics to console (if no log file path is provided) or to the file (if a log file path is provided)
-            self.logger.info(
+            log_message = (
                 f"{self._name=}, {run_type=}, "
                 f"{self._total_cnt=}, {self._hit_cnt=}, {hit_rate=}, "
                 f"{self._insert_cnt=}, {insert_rate=}, "
@@ -232,6 +293,24 @@ class ScalarLogger(torch.nn.Module):
                 f"{self._eviction_cnt=}, {eviction_rate=}, {avg_eviction_age=}, "
                 f"{self._opt_in_cnt=}, {opt_in_rate=}, "
                 f"{total_unused_slots=}, {table_usage_ratio=}"
+            )
+
+            self._backend.report(
+                log_message=log_message,
+                name=self._name,
+                run_type=run_type,
+                # pyre-ignore[6]: Expected `int` for 4th positional argument
+                # pyrefly: ignore[not-callable]
+                step=int(self._scalar_logger_steps.item()),
+                rate_metrics={
+                    "hit_rate": hit_rate,
+                    "insert_rate": insert_rate,
+                    "collision_rate": collision_rate,
+                    "eviction_rate": eviction_rate,
+                    "opt_in_rate": opt_in_rate,
+                    "avg_eviction_age": avg_eviction_age,
+                    "table_usage_ratio": table_usage_ratio,
+                },
             )
 
             # reset the counter after reporting
