@@ -31,14 +31,21 @@ from typing import (
 
 import torch
 from torch.autograd.profiler import record_function
-from torchrec.distributed.comm_ops import Request  # noqa: F401
+from torchrec.distributed.comm_ops import (  # noqa: F401
+    Request,
+    torchrec_use_sync_collectives,
+)
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding import EmbeddingCollectionAwaitable  # noqa: F401
 from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionAwaitable,  # noqa: F401
 )
-from torchrec.distributed.logger import one_time_rank0_logger
-from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
+from torchrec.distributed.logger import _torchrec_method_logger, one_time_rank0_logger
+from torchrec.distributed.model_parallel import (
+    DistributedModelParallel,
+    DMPCollection,
+    ShardedModule,
+)
 from torchrec.distributed.train_pipeline.backward_injection import (
     BackwardHookWork,
     InjectionSite,
@@ -84,53 +91,9 @@ from torchrec.pt2.utils import default_pipeline_input_transformer
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Pipelineable
 
-try:
-    # This is a safety measure against torch package issues for when
-    # Torchrec is included in the inference side model code. We should
-    # remove this once we are sure all model side packages have the required
-    # dependencies
-    from torchrec.distributed.logger import _torchrec_method_logger
-except Exception:
-    torch._C._log_api_usage_once(
-        "torchrec.distributed.train_pipeline.import_failure._torchrec_method_logger"
-    )
-
-    def _torchrec_method_logger(*args, **kwargs):
-        """A no-op decorator that accepts any arguments."""
-
-        def decorator(func):
-            return func
-
-        return decorator
-
-
 logger: logging.Logger = logging.getLogger(__name__)
 
-# This is required to support older torch package export for older models
-try:
-    from torchrec.distributed.comm_ops import torchrec_use_sync_collectives
-except ImportError:
-    torch._C._log_api_usage_once(
-        "torchrec.distributed.train_pipeline.import_failure.torchrec_use_sync_collectives"
-    )
-    logger.warning("torchrec_use_sync_collectives is not available")
-
-
 torch.ops.import_module("fbgemm_gpu.sparse_ops")
-
-
-# Note: doesn't make much sense but better than throwing.
-# Somehow some users would mess up their dependency when using torch package,
-# and we cannot fix their problem sorry
-has_2d_support = True
-try:
-    from torchrec.distributed.model_parallel import DMPCollection
-except ImportError:
-    torch._C._log_api_usage_once(
-        "torchrec.distributed.train_pipeline.import_failure.DMPCollection"
-    )
-    logger.warning("DMPCollection is not available. 2D sharding is not supported.")
-    has_2d_support = False
 
 
 class ModelDetachedException(Exception):
@@ -160,11 +123,7 @@ class TrainPipeline(abc.ABC, Generic[In, Out]):
         Only enabled if DMPCollection is used to shard the model.
         Otherwise this is a no op.
         """
-        if (
-            not has_2d_support
-            or not isinstance(model, DMPCollection)
-            or interval_batches is None
-        ):
+        if not isinstance(model, DMPCollection) or interval_batches is None:
             return
 
         if not context:
