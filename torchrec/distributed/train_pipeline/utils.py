@@ -25,6 +25,7 @@ from typing import (
     Optional,
     Tuple,
     Type,
+    TYPE_CHECKING,
 )
 
 import torch
@@ -36,6 +37,9 @@ from torchrec.distributed.embedding_sharding import (
     KJTSplitsAllToAllMeta,
 )
 from torchrec.distributed.embedding_types import KJTList
+
+if TYPE_CHECKING:
+    from torchrec.distributed.embedding_types import EarlyReleasableInputs
 from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
@@ -152,6 +156,36 @@ def _wait_for_events(
         batch.record_stream(stream)
 
 
+def _clear_releasable_inputs(context: TrainPipelineContext) -> None:
+    """Clear deferred KJT feature storage from a context's module contexts.
+
+    Called after all pipelined modules' input_dist calls are complete, so it's
+    safe to free the original batch KJT tensor storage. Each module has already
+    permuted and extracted its features into independent tensors.
+    """
+    # module contexts for the current batch are in module_contexts_next_batch or module_contexts.
+    contexts_dict = (
+        context.module_contexts_next_batch
+        if context.version == 0
+        else context.module_contexts
+    )
+    for module_ctx in contexts_dict.values():
+        early_released: EarlyReleasableInputs | None = getattr(
+            module_ctx, "early_releasable_inputs", None
+        )
+        if early_released is not None:
+            assert (
+                len(early_released) == 2
+            ), "expecting early_releasable_inputs types with 2 KJT elements"
+            id_list, id_score_list = early_released
+            if id_list is not None:
+                id_list.clear_storage()
+            if id_score_list is not None:
+                id_score_list.clear_storage()
+            # pyre-ignore[16]: `Optional` has no attribute `early_releasable_inputs`.
+            module_ctx.early_releasable_inputs = None
+
+
 def _start_data_dist(
     pipelined_modules: List[ShardedModule],
     batch: Pipelineable,
@@ -195,6 +229,12 @@ def _start_data_dist(
         context.input_dist_splits_requests[forward.name] = module.input_dist(
             module_ctx, *args, **kwargs
         )
+
+    # All pipelined modules' input_dist calls are complete. Safe to clear deferred
+    # KJT feature storage now — each sharded module has already permuted and extracted
+    # its features, so the original input batch KJT storage can be cleared to free up HBM.
+    _clear_releasable_inputs(context)
+
     _fuse_input_dist_splits(context)
 
 

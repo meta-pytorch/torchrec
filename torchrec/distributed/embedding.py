@@ -41,6 +41,7 @@ from torchrec.distributed.embedding_sharding import (
 )
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
+    EarlyReleasableInputs,
     EmbeddingComputeKernel,
     KJTList,
     ShardedEmbeddingModule,
@@ -319,6 +320,7 @@ class EmbeddingCollectionContext(Multistreamable):
         self.reverse_indices: List[torch.Tensor] = reverse_indices or []
         self.seq_vbe_ctx: List[SequenceVBEContext] = seq_vbe_ctx or []
         self.table_name_to_unpruned_hash_sizes: Dict[str, int] = {}
+        self.early_releasable_inputs: Optional[EarlyReleasableInputs] = None
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
@@ -1523,12 +1525,13 @@ class ShardedEmbeddingCollection(
                     # pyrefly: ignore[bad-argument-type]
                     self._features_order_tensor,
                 )
-                # For non-VBE: free original KJT tensor storage now since
-                # permute() created independent tensors.
+                # For non-VBE: defer clearing original KJT tensor storage
+                # until after all pipelined modules' input_dist calls
+                # complete, to avoid freeing shared features.
                 # For VBE: deferred until after _compute_sequence_vbe_context
                 # which still needs the original (unpadded) features.
                 if self._free_features_storage_early and unpadded_features is None:
-                    original_features.clear_storage()
+                    ctx.early_releasable_inputs = (original_features, None)
             features_by_shards = features.split(self._feature_splits)
             features_by_shards = may_collect_feature_scores(
                 features_by_shards,
@@ -1559,15 +1562,15 @@ class ShardedEmbeddingCollection(
                 )
             if unpadded_features is not None:
                 self._compute_sequence_vbe_context(ctx, unpadded_features)
-                # Free original KJT tensor storage now that VBE context
-                # computation is done. permute() created independent tensors
-                # for the main input_dist path.
+                # Defer clearing original KJT tensor storage now that VBE
+                # context computation is done. permute() created independent
+                # tensors for the main input_dist path.
                 if (
                     self._free_features_storage_early
                     and need_permute
                     and self._features_order
                 ):
-                    original_features.clear_storage()
+                    ctx.early_releasable_inputs = (original_features, None)
 
         return KJTListSplitsAwaitable(
             awaitables,
