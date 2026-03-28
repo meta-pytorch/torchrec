@@ -15,13 +15,13 @@ from torchrec.sparse.jagged_tensor import JaggedTensor
 
 class KeyedJaggedTensorPoolLookupTest(unittest.TestCase):
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
-        "Not enough GPUs, this test requires at least two GPUs",
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
     )
     def test_uvm_caching_int64_lookup(
         self,
     ) -> None:
-        device = torch.device("cuda:0")
+        device = torch.device("cuda")
 
         pool_size, feature_max_lengths = 4, {"f1": 2, "f2": 4}
         lookup = UVMCachingInt64Lookup(
