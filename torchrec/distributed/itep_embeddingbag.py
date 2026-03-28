@@ -339,12 +339,9 @@ class ITEPEmbeddingBagCollectionSharder(
         return types
 
 
+@dataclass
 class ITEPEmbeddingCollectionContext(EmbeddingCollectionContext):
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.is_reindexed: bool = False
-        self.table_name_to_unpruned_hash_sizes: Dict[str, int] = {}
+    is_reindexed: bool = False
 
 
 class ShardedITEPEmbeddingCollection(
