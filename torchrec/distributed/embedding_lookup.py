@@ -765,31 +765,6 @@ class GroupedPooledEmbeddingsLookup(
                         ),
                     )
 
-    def _merge_variable_batch_embeddings(
-        self, embeddings: List[torch.Tensor], splits: List[List[int]]
-    ) -> torch.Tensor:
-        assert len(embeddings) > 1 and len(splits) > 1
-
-        logger.info(
-            "[Deprecated] Merge VBE embeddings from the following TBEs "
-            f"(world size: {self._world_size}):\n"
-            + "\n".join(
-                [
-                    f"\t{module.__class__.__name__}:{len(split)} splits"
-                    for module, split in zip(self._emb_modules, splits)
-                ]
-            )
-        )
-
-        split_embs = [e.split(s) for e, s in zip(embeddings, splits)]
-        combined_embs = [
-            emb
-            for rank in range(self._world_size)
-            for n, embs in zip(self._feature_splits, split_embs)
-            for emb in embs[n * rank : n * rank + n]
-        ]
-        return torch.cat(combined_embs)
-
     def _vbe_splits(
         self, features_by_group: List[KeyedJaggedTensor]
     ) -> List[List[int]]:
@@ -965,21 +940,10 @@ class GroupedPooledEmbeddingsLookup(
         """Merges the TBE output when VBE is enabled and multiple TBEs are
         involved.
 
-        If opt-in for the preallocated merge approach, an 1D empty tensor will be
-        preallocated for TBEs to handle the merging logic. Otherwise, the output
-        will be split and then merged via `torch.cat`.
+        An 1D empty tensor will be preallocated for TBEs to handle the merging
+        logic.
         """
         vbe_splits = self._vbe_splits(features_by_group)
-
-        # If we do not opt-in to pre-allocate the VBE output, we need to run
-        # forward for each TBE individually and merge the results via
-        # `torch.cat`.
-        if not torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:killswitch_enable_preallocated_vbe_merge"
-        ):
-            return self._merge_variable_batch_embeddings(
-                self._forward(features_by_group), vbe_splits
-            )
 
         vbe_output, vbe_offsets = self._create_vbe_output_and_offsets(
             vbe_splits, device
