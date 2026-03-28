@@ -47,6 +47,7 @@ from torchrec.distributed.embedding_sharding import (
 )
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
+    EarlyReleasableInputs,
     EmbeddingComputeKernel,
     KJTList,
     ShardedEmbeddingModule,
@@ -464,6 +465,7 @@ class EmbeddingBagCollectionContext(Multistreamable):
     inverse_indices: Optional[Tuple[List[str], torch.Tensor]] = None
     variable_batch_per_feature: bool = False
     divisor: Optional[torch.Tensor] = None
+    early_releasable_inputs: Optional[EarlyReleasableInputs] = None
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
@@ -1756,12 +1758,10 @@ class ShardedEmbeddingBagCollection(
                     self._features_order_tensor,
                 )
                 if self._free_features_storage_early:
-                    # Free original KJT tensor storage to reclaim HBM early.
-                    # permute() created independent tensors, so the original
-                    # batch KJT's data is no longer needed. The batch Python
-                    # object still exists but PipelinedForward ignores the
-                    # sparse features during model forward.
-                    original_features.clear_storage()
+                    # Defer clearing original KJT tensor storage until after
+                    # all pipelined modules' input_dist calls complete, to
+                    # avoid freeing shared features that other modules need.
+                    ctx.early_releasable_inputs = (original_features, None)
             if self._has_mean_pooling_callback:
                 ctx.divisor = _create_mean_pooling_divisor(
                     lengths=features.lengths(),

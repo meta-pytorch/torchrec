@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
@@ -138,7 +139,8 @@ class ShardedManagedCollisionEmbeddingBagCollection(
                     self._managed_collision_collection._features_order_tensor,
                 )
                 if self._free_features_storage_early:
-                    original_features.clear_storage()
+                    # pyrefly: ignore[missing-attribute]
+                    ctx.early_releasable_inputs = (original_features, None)
 
             # TODO: Consider turning this into a hook inside mc_modules and remove skip_permute
             #   from mc_modules, and fix all the private methods to be public.
