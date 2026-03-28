@@ -16,7 +16,7 @@ from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from torchrec.distributed.logger import one_time_rank0_logger
+from torchrec.distributed.logger import one_time_logger, one_time_rank0_logger
 from torchrec.distributed.planner.constants import (
     BATCH_SIZE,
     BWD_COMPUTE_MULTIPLIER,
@@ -637,29 +637,35 @@ class TopologyFactory:
         Raises:
             ValueError: If validation fails on any config.
         """
-        hardware = hardware_config or HardwareConfig()
-        kernel = kernel_config or KernelConfig()
+        try:
+            hardware = hardware_config or HardwareConfig()
+            kernel = kernel_config or KernelConfig()
 
-        # Validate configs
-        trainer_config.validate()
-        kernel.validate()
+            # Validate configs
+            trainer_config.validate()
+            kernel.validate()
 
-        # Build topology kwargs with precedence resolution
-        topology_kwargs: Dict[str, Any] = {
-            "world_size": trainer_config.world_size,
-            "compute_device": kernel.compute_device,
-            "bwd_compute_multiplier": kernel.bwd_compute_multiplier,
-            "weighted_feature_bwd_compute_multiplier": kernel.weighted_feature_bwd_compute_multiplier,
-            "uneven_sharding_perf_multiplier": kernel.uneven_sharding_perf_multiplier,
-        }
+            # Build topology kwargs with precedence resolution
+            topology_kwargs: Dict[str, Any] = {
+                "world_size": trainer_config.world_size,
+                "compute_device": kernel.compute_device,
+                "bwd_compute_multiplier": kernel.bwd_compute_multiplier,
+                "weighted_feature_bwd_compute_multiplier": kernel.weighted_feature_bwd_compute_multiplier,
+                "uneven_sharding_perf_multiplier": kernel.uneven_sharding_perf_multiplier,
+            }
 
-        # Add optional parameters from configs
-        TopologyFactory._add_trainer_params(topology_kwargs, trainer_config, hardware)
-        TopologyFactory._add_hardware_params(topology_kwargs, hardware, kernel)
-        TopologyFactory._add_comms_params(topology_kwargs, hardware, kernel)
+            # Add optional parameters from configs
+            TopologyFactory._add_trainer_params(
+                topology_kwargs, trainer_config, hardware
+            )
+            TopologyFactory._add_hardware_params(topology_kwargs, hardware, kernel)
+            TopologyFactory._add_comms_params(topology_kwargs, hardware, kernel)
 
-        one_time_rank0_logger.info("TopologyFactor.create_topology called.")
-        return Topology(**topology_kwargs)
+            one_time_rank0_logger.info("TopologyFactor.create_topology called.")
+            return Topology(**topology_kwargs)
+        except Exception as e:
+            one_time_logger.error(f"TopologyFactor.create_topology failed: {e}")
+            raise e
 
     @staticmethod
     def _add_trainer_params(
