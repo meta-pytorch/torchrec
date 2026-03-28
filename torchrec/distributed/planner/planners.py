@@ -14,6 +14,7 @@ from functools import reduce
 from time import perf_counter
 from typing import Callable, cast, Dict, List, Optional, Tuple, Union
 
+import torch
 import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
@@ -78,6 +79,9 @@ try:
     # dependencies
     from torchrec.distributed.logger import _torchrec_method_logger
 except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.planner.planners.import_failure._torchrec_method_logger"
+    )
 
     def _torchrec_method_logger(*args, **kwargs):
         """A no-op decorator that accepts any arguments."""

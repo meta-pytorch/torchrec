@@ -47,6 +47,8 @@ try:
 
 except Exception:
     # BC for torch versions without compiler and torch deploy path
+    torch._C._log_api_usage_once("torchrec.pt2.checks.import_failure.torch_compiler")
+
     def is_torchdynamo_compiling() -> bool:
         return False
 
