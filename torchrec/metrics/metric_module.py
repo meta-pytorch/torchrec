@@ -78,6 +78,7 @@ from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
 from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetric
 from torchrec.metrics.xauc import XAUCMetric
+from torchrec.utils.experimental import experimental
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -482,6 +483,7 @@ class RecMetricModule(nn.Module):
 
         return result
 
+    @experimental
     def get_pre_compute_states(
         self, pg: Optional[Union[dist.ProcessGroup, DeviceMesh]] = None
     ) -> Dict[str, Dict[str, Dict[str, Union[torch.Tensor, List[torch.Tensor]]]]]:
@@ -538,6 +540,7 @@ class RecMetricModule(nn.Module):
 
         return aggregated_states
 
+    @experimental
     def load_pre_compute_states(
         self,
         source: Dict[
