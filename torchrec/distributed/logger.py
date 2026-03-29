@@ -115,7 +115,8 @@ def _get_or_create_logger(destination: str) -> logging.Logger:
     )
     logging_handler.setFormatter(formatter)
     logger.propagate = False
-    logger.addHandler(logging_handler)
+    if not logger.handlers:
+        logger.addHandler(logging_handler)
     return logger
 
 

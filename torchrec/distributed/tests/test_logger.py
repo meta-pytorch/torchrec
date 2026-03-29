@@ -272,6 +272,7 @@ class TestLoggerUtils(unittest.TestCase):
     def test_get_or_create_logger(self, mock_get_logger: mock.MagicMock) -> None:
         """Test _get_or_create_logger function."""
         mock_logger = mock.MagicMock(spec=logging.Logger)
+        mock_logger.handlers = []
         mock_get_logger.return_value = mock_logger
 
         # Test with SingleRankStaticLogger destination
