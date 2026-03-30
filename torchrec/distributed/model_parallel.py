@@ -30,6 +30,9 @@ try:
         TritonTableBatchedEmbeddingBags,
     )
 except ImportError:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.model_parallel.import_failure.TritonTableBatchedEmbeddingBags"
+    )
     _SHARDED_TBE_TYPES: tuple[type, ...] = (  # pyrefly: ignore[bad-assignment]
         SplitTableBatchedEmbeddingBagsCodegen,
     )
