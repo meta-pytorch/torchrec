@@ -36,8 +36,10 @@ from torchrec.distributed.types import (
     ModuleSharder,
     ShardingEnv,
     ShardingPlan,
+    ShardingPlanner,
     ShardingType,
 )
+from torchrec.fb.distributed.planner.lp_planner import LinearProgrammingPlanner
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -200,7 +202,7 @@ class PlannerConfig:
     def generate_planner(
         self,
         tables: List[EmbeddingBagConfig],
-    ) -> Union[EmbeddingShardingPlanner, HeteroEmbeddingShardingPlanner]:
+    ) -> ShardingPlanner:
         """
         Generate an embedding sharding planner based on the specified configuration.
 
@@ -235,6 +237,13 @@ class PlannerConfig:
 
         if self.planner_type == "embedding":
             return EmbeddingShardingPlanner(
+                topology=topology,
+                batch_size=self.batch_size,
+                constraints=constraints if constraints else None,
+                storage_reservation=storage_reservation,
+            )
+        elif self.planner_type == "lp":
+            return LinearProgrammingPlanner(
                 topology=topology,
                 batch_size=self.batch_size,
                 constraints=constraints if constraints else None,
@@ -357,12 +366,7 @@ class ShardingConfig:
         self,
         model: nn.Module,
         pg: dist.ProcessGroup,
-        planner: Optional[
-            Union[
-                EmbeddingShardingPlanner,
-                HeteroEmbeddingShardingPlanner,
-            ]
-        ] = None,
+        planner: Optional[ShardingPlanner] = None,
     ) -> Tuple[List[ModuleSharder[nn.Module]], Optional[ShardingPlan]]:
         """
         Convert fused params, create sharders, and run the planner.
@@ -376,7 +380,7 @@ class ShardingConfig:
         plan = None
         if planner is not None:
             if pg is not None:
-                plan = planner.collective_plan(model, sharders, pg)
+                plan = planner.collective_plan(model, sharders, pg)  # pyre-ignore[28]
             else:
                 # pyrefly: ignore[bad-argument-type, missing-argument]
                 plan = planner.plan(model, sharders)
@@ -388,12 +392,7 @@ class ShardingConfig:
         model: nn.Module,
         pg: dist.ProcessGroup,
         device: torch.device,
-        planner: Optional[
-            Union[
-                EmbeddingShardingPlanner,
-                HeteroEmbeddingShardingPlanner,
-            ]
-        ] = None,
+        planner: Optional[ShardingPlanner] = None,
     ) -> DistributedModelParallel:
         """
         Generate a standard DistributedModelParallel model.
@@ -416,12 +415,7 @@ class ShardingConfig:
         model: nn.Module,
         pg: dist.ProcessGroup,
         device: torch.device,
-        planner: Optional[
-            Union[
-                EmbeddingShardingPlanner,
-                HeteroEmbeddingShardingPlanner,
-            ]
-        ] = None,
+        planner: Optional[ShardingPlanner] = None,
     ) -> HybridEvalDMP:
         """
         Generate a HybridEvalDMP model for split-device placement.
@@ -486,12 +480,7 @@ class ShardingConfig:
         model: nn.Module,
         pg: dist.ProcessGroup,
         device: torch.device,
-        planner: Optional[
-            Union[
-                EmbeddingShardingPlanner,
-                HeteroEmbeddingShardingPlanner,
-            ]
-        ] = None,
+        planner: Optional[ShardingPlanner] = None,
     ) -> Tuple[nn.Module, Optimizer]:
         """
         Generate a sharded model and optimizer for distributed training.
