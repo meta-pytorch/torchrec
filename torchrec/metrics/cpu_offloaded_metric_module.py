@@ -18,12 +18,13 @@ from torch import distributed as dist
 from torch.monitor import _WaitCounter
 from torch.profiler import record_function
 from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
+from torchrec.metrics.deferrable_metrics import DeferrableMetrics
 from torchrec.metrics.metric_job_types import (
     MetricComputeJob,
     MetricUpdateJob,
     SynchronizationMarker,
 )
-from torchrec.metrics.metric_module import MetricsFuture, MetricsResult, RecMetricModule
+from torchrec.metrics.metric_module import MetricsResult, RecMetricModule
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.rec_metric import RecMetricException
@@ -270,13 +271,13 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         logger.info("CPUOffloadedRecMetricModule has been successfully shutdown.")
 
     @override
-    def compute(self) -> MetricsResult:
+    def compute(self) -> DeferrableMetrics:
         raise RecMetricException(
             "CPUOffloadedRecMetricModule does not support compute(). Use async_compute() instead."
         )
 
     @override
-    def async_compute(self) -> MetricsFuture:
+    def async_compute(self) -> DeferrableMetrics:
         """
         Entry point for asynchronous metric compute. It enqueues a synchronization marker
         to the update queue.
@@ -290,7 +291,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             metrics_future.set_exception(
                 RecMetricException("metric processor thread is shut down.")
             )
-            return metrics_future
+            return DeferrableMetrics(metrics_future)
 
         if self._captured_exception_event.is_set():
             assert self._captured_exception is not None
@@ -298,7 +299,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         self.update_queue.put_nowait(SynchronizationMarker(metrics_future))
         self.update_queue_size_logger.add(self.update_queue.qsize())
-        return metrics_future
+        return DeferrableMetrics(metrics_future)
 
     def _process_synchronization_marker(
         self, synchronization_marker: SynchronizationMarker
@@ -361,7 +362,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
                 with record_function("## metric_compute ##"):
                     compute_start_ms = time.time()
-                    computed_metrics = self.comms_module.compute()
+                    computed_metrics = self.comms_module.compute().resolve()
                     self.compute_job_time_logger.add((time.time() - start_ms) * 1000)
                     self.compute_metrics_time_logger.add(
                         (time.time() - compute_start_ms) * 1000
