@@ -50,6 +50,9 @@ try:
     # dependencies
     from torchrec.distributed.logger import _torchrec_method_logger
 except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.planner.shard_estimators.import_failure._torchrec_method_logger"
+    )
 
     def _torchrec_method_logger(*args, **kwargs):
         """A no-op decorator that accepts any arguments."""

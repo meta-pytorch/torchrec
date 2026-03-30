@@ -11,7 +11,6 @@ import os
 import unittest
 from collections import defaultdict
 from typing import Any, Callable, cast, Dict, List, Optional, OrderedDict, Tuple
-from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
