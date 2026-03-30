@@ -98,6 +98,7 @@ try:
         log_offloading_summary,
         log_planner_config,
         log_storage_reservation,
+        log_table_assignment,
         OptimizationTechnique,
         StackLayer,
         TrainingOptimizationLogger,
@@ -106,6 +107,7 @@ except ImportError:
     log_offloading_summary = None  # pyre-ignore[9]
     log_planner_config = None  # pyre-ignore[9]
     log_storage_reservation = None  # pyre-ignore[9]
+    log_table_assignment = None  # pyre-ignore[9]
     OptimizationTechnique = None  # pyre-ignore[9]
     StackLayer = None  # pyre-ignore[9]
     TrainingOptimizationLogger = None  # pyre-ignore[9]
@@ -779,6 +781,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 logger.debug("Failed to log planning_result", exc_info=True)
 
             log_offloading_summary(best_plan, self.__class__.__name__)
+            log_table_assignment(best_plan, self.__class__.__name__)
 
             return sharding_plan
         else:
