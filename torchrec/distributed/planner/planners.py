@@ -97,6 +97,7 @@ try:
     from torchrec.fb.distributed.training_optimization_logger import (
         log_offloading_summary,
         log_planner_config,
+        log_proposer_result,
         log_search_space_summary,
         log_storage_reservation,
         log_table_assignment,
@@ -108,6 +109,7 @@ try:
 except ImportError:
     log_offloading_summary = None  # pyre-ignore[9]
     log_planner_config = None  # pyre-ignore[9]
+    log_proposer_result = None  # pyre-ignore[9]
     log_search_space_summary = None  # pyre-ignore[9]
     log_storage_reservation = None  # pyre-ignore[9]
     log_table_assignment = None  # pyre-ignore[9]
@@ -654,6 +656,9 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     loaded_sharding_options=loaded_sharding_options,
                 )
 
+        winning_proposer_name: str = ""
+        winning_proposer_idx: int = -1
+
         # Loaded plan is validated successfully and can be used for generate the sharding plan, skipping new plan generation.
         if loaded_best_plan:
             logger.info(
@@ -671,7 +676,10 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 proposer.load(search_space=search_space, enumerator=self._enumerator)
 
             start = time.time()
-            for proposer in self._proposers:
+            for proposer_idx, proposer in enumerate(self._proposers):
+                proposer_proposals = 0
+                proposer_plans = 0
+                proposer_best_rating: Optional[float] = None
                 proposal = proposer.propose()
 
                 while proposal:
@@ -696,6 +704,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                         continue
 
                     self._num_proposals += 1
+                    proposer_proposals += 1
                     try:
                         # plan is just proposal where shard.rank is populated
                         plan = self._partitioner.partition(
@@ -703,10 +712,18 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                             storage_constraint=storage_constraint,
                         )
                         self._num_plans += 1
+                        proposer_plans += 1
                         perf_rating = self._perf_model.rate(plan=plan)
+                        if (
+                            proposer_best_rating is None
+                            or perf_rating < proposer_best_rating
+                        ):
+                            proposer_best_rating = perf_rating
                         if perf_rating < best_perf_rating:
                             best_perf_rating = perf_rating
                             best_plan = copy.deepcopy(plan)
+                            winning_proposer_name = proposer.__class__.__name__
+                            winning_proposer_idx = proposer_idx
                         proposal_cache[proposal_key] = (True, plan, perf_rating)
                         proposer.feedback(
                             partitionable=True,
@@ -741,6 +758,16 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     # clear shard.rank for each sharding_option
                     reset_shard_rank(proposal)
                     proposal = proposer.propose()
+
+                log_proposer_result(
+                    planner_type=self.__class__.__name__,
+                    proposer_name=proposer.__class__.__name__,
+                    proposer_index=proposer_idx,
+                    num_proposals=proposer_proposals,
+                    num_plans=proposer_plans,
+                    best_perf_rating=proposer_best_rating,
+                    is_winning_proposer=(winning_proposer_idx == proposer_idx),
+                )
 
         if best_plan:
             for callback in self._callbacks:
@@ -783,6 +810,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                         "num_proposals": str(self._num_proposals),
                         "num_plans": str(self._num_plans),
                         "duration_s": str(round(end_time - start_time, 3)),
+                        "winning_proposer": winning_proposer_name,
                     },
                 )
             except Exception:
