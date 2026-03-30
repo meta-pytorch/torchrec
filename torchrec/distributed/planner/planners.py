@@ -19,6 +19,7 @@ import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.planner.constants import BATCH_SIZE, MAX_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.partitioners import (
@@ -90,6 +91,13 @@ except Exception:
             return func
 
         return decorator
+
+
+from torchrec.fb.distributed.training_optimization_logger import (
+    OptimizationTechnique,
+    StackLayer,
+    TrainingOptimizationLogger,
+)
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -715,6 +723,23 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 )
 
             validate_rank_assignment(sharding_plan, self._topology)
+
+            try:
+                TrainingOptimizationLogger.log(
+                    layer=StackLayer.TORCHREC,
+                    event_name="planning_result",
+                    event_type=EventType.SUCCESS,
+                    technique=OptimizationTechnique.EMO,
+                    metadata={
+                        "planner_type": self.__class__.__name__,
+                        "num_proposals": str(self._num_proposals),
+                        "num_plans": str(self._num_plans),
+                        "duration_s": str(round(end_time - start_time, 3)),
+                    },
+                )
+            except Exception:
+                logger.debug("Failed to log planning_result", exc_info=True)
+
             return sharding_plan
         else:
             global_storage_capacity = reduce(
@@ -773,6 +798,23 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     enumerator=self._enumerator,
                     debug=self._debug,
                 )
+
+            try:
+                TrainingOptimizationLogger.log(
+                    layer=StackLayer.TORCHREC,
+                    event_name="planning_result",
+                    event_type=EventType.FAILURE,
+                    technique=OptimizationTechnique.EMO,
+                    metadata={
+                        "planner_type": self.__class__.__name__,
+                        "num_proposals": str(self._num_proposals),
+                        "num_plans": str(self._num_plans),
+                        "duration_s": str(round(end_time - start_time, 3)),
+                    },
+                    error_message=str(last_planner_error),
+                )
+            except Exception:
+                logger.debug("Failed to log planning_result", exc_info=True)
 
             if not lowest_storage.fits_in(global_storage_constraints):
                 raise PlannerError(
