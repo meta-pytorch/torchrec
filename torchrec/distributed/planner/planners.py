@@ -97,6 +97,7 @@ try:
     from torchrec.fb.distributed.training_optimization_logger import (
         log_offloading_summary,
         log_planner_config,
+        log_search_space_summary,
         log_storage_reservation,
         log_table_assignment,
         log_table_constraints,
@@ -107,6 +108,7 @@ try:
 except ImportError:
     log_offloading_summary = None  # pyre-ignore[9]
     log_planner_config = None  # pyre-ignore[9]
+    log_search_space_summary = None  # pyre-ignore[9]
     log_storage_reservation = None  # pyre-ignore[9]
     log_table_assignment = None  # pyre-ignore[9]
     log_table_constraints = None  # pyre-ignore[9]
@@ -632,6 +634,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         if not search_space:
             # No shardable parameters
             return ShardingPlan({})
+
+        log_search_space_summary(search_space, self.__class__.__name__)
 
         loaded_sharding_options = None
         loaded_best_plan: List[ShardingOption] = []
