@@ -99,6 +99,7 @@ try:
         log_planner_config,
         log_storage_reservation,
         log_table_assignment,
+        log_table_constraints,
         OptimizationTechnique,
         StackLayer,
         TrainingOptimizationLogger,
@@ -108,6 +109,7 @@ except ImportError:
     log_planner_config = None  # pyre-ignore[9]
     log_storage_reservation = None  # pyre-ignore[9]
     log_table_assignment = None  # pyre-ignore[9]
+    log_table_constraints = None  # pyre-ignore[9]
     OptimizationTechnique = None  # pyre-ignore[9]
     StackLayer = None  # pyre-ignore[9]
     TrainingOptimizationLogger = None  # pyre-ignore[9]
@@ -620,6 +622,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 ),
             }
         )
+        if self._constraints:
+            log_table_constraints(self._constraints, self.__class__.__name__)
 
         search_space = self._enumerator.enumerate(
             module=module,
