@@ -524,6 +524,12 @@ class DataLoadingThread(Thread, Generic[In]):
         self._to_device_non_blocking = to_device_non_blocking
         self._buffered: Optional[In] = None
         self._buffer_empty_event.set()
+        one_time_rank0_logger.info(
+            f"{self.__class__.__name__} created with device={device}, "
+            f"to_device_non_blocking={to_device_non_blocking}, "
+            f"memcpy_stream_priority={memcpy_stream_priority}, "
+            f"memcpy_stream={'provided' if memcpy_stream is not None else 'auto-created' if self._memcpy_stream is not None else 'None'}"
+        )
 
     def run(self) -> None:
         if self._device.type == "cuda" and torch.cuda.is_available():
@@ -558,12 +564,12 @@ class DataLoadingThread(Thread, Generic[In]):
                 self._buffer_filled_event.set()
 
     def stop(self) -> None:
-        logger.info("Stopping data loading thread...")
+        logger.info(f"{self.__class__.__name__}: Stopping data loading thread...")
         self._stop = True
         # Unblock any thread that are waiting for these events.
         self._buffer_filled_event.set()
         self._buffer_empty_event.set()
-        logger.info("Data loading thread stopped.")
+        logger.info(f"{self.__class__.__name__}: Data loading thread stopped.")
 
     def get_next_batch(self, none_throws: bool = False) -> Optional[In]:
         """
