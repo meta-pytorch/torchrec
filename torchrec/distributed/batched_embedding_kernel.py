@@ -3969,10 +3969,16 @@ class TritonBatchedFusedEmbeddingBag(
         weights = features.weights_or_none()
         if weights is not None and not torch.is_floating_point(weights):
             weights = None
+        forward_kwargs: Dict[str, Any] = {}
+        if features.variable_stride_per_key():
+            forward_kwargs["batch_size_per_feature_per_rank"] = (
+                features.stride_per_key_per_rank()
+            )
         return self._emb_module(
             indices=features.values().long(),
             offsets=features.offsets().long(),
             per_sample_weights=weights,
+            **forward_kwargs,
         )
 
     def named_buffers(
