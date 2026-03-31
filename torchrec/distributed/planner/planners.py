@@ -93,6 +93,18 @@ except Exception:
         return decorator
 
 
+from torchrec.distributed.logging_handlers import (
+    TorchrecComponent,
+    TrainingOptimizationLogger,
+)
+from torchrec.distributed.logging_utils import (
+    EventScope,
+    EventType,
+    OptimizationTechnique,
+    StackLayer,
+)
+
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 
@@ -719,6 +731,21 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 )
 
             validate_rank_assignment(sharding_plan, self._topology)
+
+            TrainingOptimizationLogger.log(
+                layer=StackLayer.TORCHREC,
+                event_name="planning_result",
+                event_type=EventType.INFO,
+                technique=OptimizationTechnique.EMO,
+                component=TorchrecComponent.PLANNER,
+                event_scope=EventScope.JOB,
+                metadata={
+                    "planner_type": self.__class__.__name__,
+                    "num_proposals": str(self._num_proposals),
+                    "num_plans": str(self._num_plans),
+                },
+            )
+
             return sharding_plan
         else:
             global_storage_capacity = reduce(
@@ -777,6 +804,21 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     enumerator=self._enumerator,
                     debug=self._debug,
                 )
+
+            TrainingOptimizationLogger.log(
+                layer=StackLayer.TORCHREC,
+                event_name="planning_result",
+                event_type=EventType.INFO,
+                technique=OptimizationTechnique.EMO,
+                component=TorchrecComponent.PLANNER,
+                event_scope=EventScope.JOB,
+                metadata={
+                    "planner_type": self.__class__.__name__,
+                    "num_proposals": str(self._num_proposals),
+                    "num_plans": str(self._num_plans),
+                },
+                error_message=str(last_planner_error),
+            )
 
             if not lowest_storage.fits_in(global_storage_constraints):
                 raise PlannerError(
