@@ -231,7 +231,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         future = self.cpu_module.async_compute()
 
         self.assertRaisesRegex(
-            RecMetricException, "metric processor thread is shut down.", future.result
+            RecMetricException, "metric processor thread is shut down.", future.resolve
         )
 
     def test_update_after_shutdown(self) -> None:
@@ -773,12 +773,12 @@ def _compare_metric_results_worker(
             expected_states=standard_state_dict,
         )
 
-    standard_results = standard_module.compute()
+    standard_results = standard_module.compute().resolve()
 
     future = cpu_offloaded_module.async_compute()
 
     # Wait for async compute to finish. Compare the input to each update()
-    offloaded_results = future.result(timeout=10.0)
+    offloaded_results = future.resolve()
     for (
         offloaded_predictions,
         offloaded_labels,

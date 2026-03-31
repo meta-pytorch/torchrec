@@ -26,6 +26,7 @@ To update the golden snapshot after intentional changes:
     python -m torchrec.metrics.tests.test_metric_fqn_backward_compatibility --update-golden
 """
 
+import inspect
 import json
 import os
 import sys
@@ -48,7 +49,7 @@ from torchrec.metrics.gauc import GAUCMetric
 from torchrec.metrics.hindsight_target_pr import HindsightTargetPRMetric
 from torchrec.metrics.mae import MAEMetric
 from torchrec.metrics.metric_module import RecMetricModule
-from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
+from torchrec.metrics.metrics_config import BatchSizeStage, RecComputeMode, RecTaskInfo
 from torchrec.metrics.mse import MSEMetric
 from torchrec.metrics.multi_label_precision import MultiLabelPrecisionMetric
 from torchrec.metrics.multiclass_recall import MulticlassRecallMetric
@@ -63,7 +64,7 @@ from torchrec.metrics.output import OutputMetric
 from torchrec.metrics.precision import PrecisionMetric
 from torchrec.metrics.precision_session import PrecisionSessionMetric
 from torchrec.metrics.rauc import RAUCMetric
-from torchrec.metrics.rec_metric import RecMetric, RecMetricList
+from torchrec.metrics.rec_metric import RecMetric, RecMetricException, RecMetricList
 from torchrec.metrics.recall import RecallMetric
 from torchrec.metrics.recall_session import RecallSessionMetric
 from torchrec.metrics.scalar import ScalarMetric
@@ -221,6 +222,12 @@ METRICS_TO_TEST: List[
     (CalibrationMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (CTRMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (MSEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    (
+        MSEMetric,
+        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        {"include_r_squared": True},
+        ["with_r_squared"],
+    ),
     (MAEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (WeightedAvgMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (AccuracyMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
@@ -523,6 +530,14 @@ class MetricFQNBackwardCompatibilityTest(unittest.TestCase):
     def test_mse_metric(self) -> None:
         self._check_metric_compatibility(
             MSEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
+        )
+
+    def test_mse_metric_with_r_squared(self) -> None:
+        self._check_metric_compatibility(
+            MSEMetric,
+            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            variant="with_r_squared",
+            include_r_squared=True,
         )
 
     def test_mae_metric(self) -> None:
@@ -1092,31 +1107,13 @@ class MetricCoverageTest(unittest.TestCase):
     }
 
     @unittest.skipIf(
-        sys.version < "3.11", "concurrent.futures._base.Future is type but not a class"
+        sys.version_info < (3, 11),
+        "concurrent.futures._base.Future is type but not a class",
     )
     def test_all_recmetrics_are_covered(self) -> None:
-        import importlib
-        import pkgutil
-
-        import torchrec.metrics
-
-        discovered_metrics: Set[str] = set()
-
-        package_path = torchrec.metrics.__path__
-        for _, module_name, _ in pkgutil.iter_modules(package_path):
-            try:
-                module = importlib.import_module(f"torchrec.metrics.{module_name}")
-                for attr_name in dir(module):
-                    attr = getattr(module, attr_name)
-                    if (
-                        isinstance(attr, type)
-                        and issubclass(attr, RecMetric)
-                        and attr is not RecMetric
-                        and not attr_name.startswith("_")
-                    ):
-                        discovered_metrics.add(attr_name)
-            except ImportError:
-                continue
+        discovered_metrics: Set[str] = {
+            cls.__name__ for cls in _discover_all_recmetric_subclasses()
+        }
 
         covered_metrics: Set[str] = {
             metric_class.__name__ for metric_class, _, _, _ in METRICS_TO_TEST
@@ -1136,6 +1133,501 @@ class MetricCoverageTest(unittest.TestCase):
                 f"3. Run the tests to generate the golden snapshot\n\n"
                 f"If the metric should be excluded, add it to EXCLUDED_METRICS with a reason."
             )
+
+
+# Cross-config state_dict tests: detect config-dependent keys and verify
+# cross-config loads succeed with strict=True. New conditional-state params
+# must be added to KNOWN_CONDITIONAL_STATE with a proper always-pop hook.
+
+_BATCH_SIZE_STAGES_ALTERNATIVE: List[BatchSizeStage] = [
+    BatchSizeStage(batch_size=256, max_iters=1),
+    BatchSizeStage(batch_size=512, max_iters=None),
+]
+
+_BASE_RECMETRIC_PARAMS: Set[str] = {
+    "self",
+    "args",
+    "kwargs",
+    "world_size",
+    "my_rank",
+    "batch_size",
+    "tasks",
+    "compute_mode",
+    "window_size",
+    "fused_update_limit",
+    "compute_on_all_ranks",
+    "should_validate_update",
+    "process_group",
+    "enable_pt2_compile",
+    "should_clone_update_inputs",
+}
+
+_BASE_COMPUTATION_PARAMS: Set[str] = {
+    "self",
+    "args",
+    "kwargs",
+    "my_rank",
+    "batch_size",
+    "n_tasks",
+    "tasks",
+    "window_size",
+    "compute_on_all_ranks",
+    "should_validate_update",
+    "compute_mode",
+    "process_group",
+    "fused_update_limit",
+    "allow_missing_label_with_zero_weight",
+    "session_metric_def",
+}
+
+_PARAM_ALTERNATIVES: Dict[str, List[Any]] = {
+    "batch_size_stages": [_BATCH_SIZE_STAGES_ALTERNATIVE],
+    "description": ["test_description"],
+    "is_negative_task_mask": [[True]],
+    "label_names": [["label_a", "label_b"]],
+}
+
+
+def _get_metric_specific_params(
+    metric_cls: Type[RecMetric],
+) -> Dict[str, inspect.Parameter]:
+    """Get non-base params from metric and computation class signatures."""
+    params: Dict[str, inspect.Parameter] = {}
+
+    for name, param in inspect.signature(metric_cls.__init__).parameters.items():
+        if name not in _BASE_RECMETRIC_PARAMS:
+            params[name] = param
+
+    comp_cls = getattr(metric_cls, "_computation_class", None)
+    if comp_cls is not None:
+        for name, param in inspect.signature(comp_cls.__init__).parameters.items():
+            if name not in _BASE_COMPUTATION_PARAMS and name not in params:
+                params[name] = param
+
+    return params
+
+
+def _generate_alternatives(
+    param: inspect.Parameter,
+) -> List[Any]:
+    """Auto-generate alternative values for a param based on its default."""
+    name = param.name
+    default = param.default
+
+    if name in _PARAM_ALTERNATIVES:
+        return _PARAM_ALTERNATIVES[name]
+
+    if default is inspect.Parameter.empty:
+        return []
+
+    if isinstance(default, bool):
+        return [not default]
+    if isinstance(default, int):
+        return [default + 1]
+    if isinstance(default, float):
+        return [default + 1.0]
+    if isinstance(default, str):
+        return [default + "_alt"]
+    return []
+
+
+# Params that produce different state_dict keys. Uses strings (includes ThroughputMetric/nn.Module).
+KNOWN_CONDITIONAL_STATE: Set[Tuple[str, str]] = {
+    ("MSEMetric", "include_r_squared"),
+    ("MultiLabelPrecisionMetric", "label_names"),
+    ("MultiLabelPrecisionMetric", "num_labels"),
+    ("ThroughputMetric", "batch_size_stages"),
+    ("TowerQPSMetric", "batch_size_stages"),
+}
+
+# Params that do NOT affect state_dict keys. Every non-base param must be here
+# or in KNOWN_CONDITIONAL_STATE.
+KNOWN_SAFE_PARAMS: Set[Tuple[str, str]] = {
+    ("AUCMetric", "apply_bin"),
+    ("AUCMetric", "grouped_auc"),
+    ("AUPRCMetric", "grouped_auprc"),
+    ("AccuracyMetric", "threshold"),
+    ("HindsightTargetPRMetric", "target_precision"),
+    ("NDCGMetric", "exponential_gain"),
+    ("NDCGMetric", "is_negative_task_mask"),
+    ("NDCGMetric", "k"),
+    ("NDCGMetric", "remove_single_length_sessions"),
+    ("NDCGMetric", "report_ndcg_as_decreasing_curve"),
+    ("NDCGMetric", "scale_by_weights_tensor"),
+    ("NDCGMetric", "session_key"),
+    ("NEMetric", "include_logloss"),
+    ("PrecisionMetric", "threshold"),
+    ("RAUCMetric", "grouped_rauc"),
+    ("RecalibratedCalibrationMetric", "recalibration_coefficient"),
+    ("RecalibratedNEMetric", "include_logloss"),
+    ("RecalibratedNEMetric", "recalibration_coefficient"),
+    ("RecallMetric", "threshold"),
+    ("SegmentedNEMetric", "cast_keys_to_int"),
+    ("SegmentedNEMetric", "grouping_keys"),
+    ("SegmentedNEMetric", "include_logloss"),
+    ("SegmentedNEMetric", "num_groups"),  # changes tensor shapes, not key names
+    ("TensorWeightedAvgMetric", "description"),
+    ("TowerQPSMetric", "warmup_steps"),
+}
+
+# Subset with proper always-pop hooks (cross-config load tests use these).
+RECMETRIC_CONDITIONAL_STATE: Dict[Tuple[Type[RecMetric], str], List[Any]] = {
+    (MSEMetric, "include_r_squared"): [True],
+    (TowerQPSMetric, "batch_size_stages"): [_BATCH_SIZE_STAGES_ALTERNATIVE],
+}
+
+_RECMETRIC_COMMON_KWARGS: Dict[str, Any] = {
+    "world_size": 1,
+    "my_rank": 0,
+    "batch_size": 32,
+    "compute_mode": RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+    "window_size": 100,
+}
+
+_THROUGHPUT_COMMON_KWARGS: Dict[str, Any] = {
+    "batch_size": 32,
+    "world_size": 1,
+    "window_seconds": 100,
+    "warmup_steps": 10,
+}
+
+
+_cached_recmetric_subclasses: Optional[Set[Type[RecMetric]]] = None
+
+
+def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
+    """Discover all RecMetric subclasses in torchrec.metrics."""
+    global _cached_recmetric_subclasses
+    if _cached_recmetric_subclasses is not None:
+        return _cached_recmetric_subclasses
+
+    import importlib
+    import pkgutil
+
+    import torchrec.metrics
+
+    subclasses: Set[Type[RecMetric]] = set()
+    for _, module_name, _ in pkgutil.iter_modules(torchrec.metrics.__path__):
+        try:
+            module = importlib.import_module(f"torchrec.metrics.{module_name}")
+            for attr_name in dir(module):
+                attr = getattr(module, attr_name)
+                if (
+                    isinstance(attr, type)
+                    and issubclass(attr, RecMetric)
+                    and attr is not RecMetric
+                    and not attr_name.startswith("_")
+                ):
+                    subclasses.add(attr)
+        except ImportError:
+            continue
+    _cached_recmetric_subclasses = subclasses
+    return subclasses
+
+
+def _get_default_keys_cached(
+    metric_cls: Type[RecMetric],
+    cls_name: str,
+    default_keys_cache: Optional[Dict[str, Set[str]]] = None,
+) -> Optional[Set[str]]:
+    """Get default state_dict keys for a metric, using cache if available."""
+    if default_keys_cache is not None and cls_name in default_keys_cache:
+        return default_keys_cache[cls_name]
+    try:
+        default_keys = set(extract_state_dict_keys(metric_cls))
+    except (TypeError, ValueError, KeyError, RecMetricException):
+        return None
+    if default_keys_cache is not None:
+        default_keys_cache[cls_name] = default_keys
+    return default_keys
+
+
+def _probe_alternatives(
+    metric_cls: Type[RecMetric],
+    param_name: str,
+    alternatives: List[Any],
+    default_keys: Set[str],
+) -> Optional[str]:
+    """Probe alternative param values. Returns 'misclassified', 'unprobed', or None."""
+    tested_any = False
+    for alt_value in alternatives:
+        try:
+            variant_keys = set(
+                extract_state_dict_keys(metric_cls, **{param_name: alt_value})
+            )
+            tested_any = True
+        except (TypeError, ValueError, KeyError, RecMetricException):
+            continue
+        if default_keys != variant_keys:
+            return "misclassified"
+    if not tested_any:
+        return "unprobed"
+    return None
+
+
+def _classify_known_safe_param(
+    cls_name: str,
+    param_name: str,
+    metrics_by_name: Dict[str, Type[RecMetric]],
+    default_keys_cache: Optional[Dict[str, Set[str]]] = None,
+) -> Optional[str]:
+    """Classify a KNOWN_SAFE_PARAMS entry. Returns category or None if verified safe."""
+    metric_cls = metrics_by_name.get(cls_name)
+    if metric_cls is None:
+        return "stale"
+    params = _get_metric_specific_params(metric_cls)
+    if param_name not in params:
+        return "stale"
+    alternatives = _generate_alternatives(params[param_name])
+    if not alternatives:
+        return "unprobed"
+    default_keys = _get_default_keys_cached(metric_cls, cls_name, default_keys_cache)
+    if default_keys is None:
+        return "unprobed"
+    return _probe_alternatives(metric_cls, param_name, alternatives, default_keys)
+
+
+class ConditionalStateRegistryTest(unittest.TestCase):
+
+    @unittest.skipIf(
+        sys.version_info < (3, 11),
+        "concurrent.futures._base.Future is type but not a class",
+    )
+    def test_validate_state_affecting_params_recmetrics(self) -> None:
+        all_metrics = _discover_all_recmetric_subclasses()
+        for metric_cls in all_metrics:
+            try:
+                default_keys = set(extract_state_dict_keys(metric_cls))
+            except (TypeError, ValueError, KeyError, RecMetricException):
+                continue
+            for param_name, param in _get_metric_specific_params(metric_cls).items():
+                alternatives = _generate_alternatives(param)
+                if not alternatives:
+                    continue
+                for alt_value in alternatives:
+                    with self.subTest(metric=metric_cls.__name__, param=param_name):
+                        try:
+                            variant_keys = set(
+                                extract_state_dict_keys(
+                                    metric_cls, **{param_name: alt_value}
+                                )
+                            )
+                        except (TypeError, ValueError, KeyError, RecMetricException):
+                            continue
+
+                        if default_keys != variant_keys:
+                            self.assertIn(
+                                (metric_cls.__name__, param_name),
+                                KNOWN_CONDITIONAL_STATE,
+                                f"{metric_cls.__name__}.{param_name} affects "
+                                f"state_dict keys but is not in "
+                                f"KNOWN_CONDITIONAL_STATE. "
+                                f"Added: {variant_keys - default_keys}, "
+                                f"Removed: {default_keys - variant_keys}",
+                            )
+
+    @unittest.skipIf(
+        sys.version_info < (3, 11),
+        "concurrent.futures._base.Future is type but not a class",
+    )
+    def test_all_params_categorized(self) -> None:
+        all_metrics = _discover_all_recmetric_subclasses()
+        uncategorized = []
+        for metric_cls in all_metrics:
+            for param_name in _get_metric_specific_params(metric_cls):
+                pair = (metric_cls.__name__, param_name)
+                if (
+                    pair not in KNOWN_CONDITIONAL_STATE
+                    and pair not in KNOWN_SAFE_PARAMS
+                ):
+                    uncategorized.append(pair)
+
+        if uncategorized:
+            formatted = "\n".join(
+                f'    ("{cls}", "{param}"),' for cls, param in sorted(uncategorized)
+            )
+            self.fail(
+                f"Found {len(uncategorized)} uncategorized metric param(s).\n"
+                f"Each param must be in KNOWN_CONDITIONAL_STATE (if it conditionally\n"
+                f"registers buffers/state) or KNOWN_SAFE_PARAMS (if it does not).\n"
+                f"Add these to the appropriate set:\n{formatted}"
+            )
+
+    @unittest.skipIf(
+        sys.version_info < (3, 11),
+        "concurrent.futures._base.Future is type but not a class",
+    )
+    def test_none_default_params_have_test_values(self) -> None:
+        all_metrics = _discover_all_recmetric_subclasses()
+        missing = []
+        for metric_cls in all_metrics:
+            for param_name, param in _get_metric_specific_params(metric_cls).items():
+                if param.default is None and param_name not in _PARAM_ALTERNATIVES:
+                    missing.append((metric_cls.__name__, param_name))
+
+        if missing:
+            formatted = "\n".join(
+                f'    "{p}",' for _, p in sorted(set(missing), key=lambda x: x[1])
+            )
+            self.fail(
+                f"Found None-default params without _PARAM_ALTERNATIVES entries.\n"
+                f"These params can't be auto-probed for conditional state.\n"
+                f"Add test values to _PARAM_ALTERNATIVES for:\n{formatted}"
+            )
+
+    @unittest.skipIf(
+        sys.version_info < (3, 11),
+        "concurrent.futures._base.Future is type but not a class",
+    )
+    def test_known_safe_params_are_actually_safe(self) -> None:
+        all_metrics = _discover_all_recmetric_subclasses()
+        metrics_by_name = {cls.__name__: cls for cls in all_metrics}
+        default_keys_cache: Dict[str, Set[str]] = {}
+        buckets: Dict[str, List[Tuple[str, str]]] = {
+            "stale": [],
+            "misclassified": [],
+            "unprobed": [],
+        }
+        for cls_name, param_name in sorted(KNOWN_SAFE_PARAMS):
+            category = _classify_known_safe_param(
+                cls_name, param_name, metrics_by_name, default_keys_cache
+            )
+            if category is not None:
+                buckets[category].append((cls_name, param_name))
+
+        error_messages = {
+            "stale": "Stale entries (param not in any signature)",
+            "misclassified": (
+                "Misclassified (actually affects state_dict keys, "
+                "move to KNOWN_CONDITIONAL_STATE)"
+            ),
+        }
+        errors = []
+        for key, label in error_messages.items():
+            if buckets[key]:
+                formatted = "\n".join(f'    ("{c}", "{p}"),' for c, p in buckets[key])
+                errors.append(f"{label}:\n{formatted}")
+        if errors:
+            self.fail("KNOWN_SAFE_PARAMS issues:\n" + "\n\n".join(errors))
+
+    def test_validate_state_affecting_params_throughput(self) -> None:
+        default_metric = ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS)
+        variant_metric = ThroughputMetric(
+            **_THROUGHPUT_COMMON_KWARGS,
+            batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
+        )
+        default_keys = set(default_metric.state_dict().keys())
+        variant_keys = set(variant_metric.state_dict().keys())
+
+        if default_keys != variant_keys:
+            self.assertIn(
+                ("ThroughputMetric", "batch_size_stages"),
+                KNOWN_CONDITIONAL_STATE,
+                f"ThroughputMetric.batch_size_stages affects state_dict "
+                f"keys but is not in KNOWN_CONDITIONAL_STATE. "
+                f"Added keys: {variant_keys - default_keys}, "
+                f"Removed keys: {default_keys - variant_keys}",
+            )
+
+
+class CrossConfigLoadTest(unittest.TestCase):
+
+    def _make_common_kwargs(self) -> Dict[str, Any]:
+        return {**_RECMETRIC_COMMON_KWARGS, "tasks": [create_test_task("task1")]}
+
+    def _assert_cross_config_load(
+        self,
+        metric_cls: Type[RecMetric],
+        param_name: str,
+        alt_value: Any,
+        direction: str,
+    ) -> None:
+        common_kwargs = self._make_common_kwargs()
+        if direction == "variant_to_default":
+            src = metric_cls(**common_kwargs, **{param_name: alt_value})
+            dst = metric_cls(**common_kwargs)
+        else:
+            src = metric_cls(**common_kwargs)
+            dst = metric_cls(**common_kwargs, **{param_name: alt_value})
+        dst.load_state_dict(src.state_dict(), strict=True)
+
+    def test_cross_config_load_variant_to_default(self) -> None:
+        for (
+            metric_cls,
+            param_name,
+        ), alternatives in RECMETRIC_CONDITIONAL_STATE.items():
+            for alt_value in alternatives:
+                with self.subTest(
+                    metric=metric_cls.__name__,
+                    param=param_name,
+                    direction="variant_to_default",
+                ):
+                    self._assert_cross_config_load(
+                        metric_cls, param_name, alt_value, "variant_to_default"
+                    )
+
+    def test_cross_config_load_default_to_variant(self) -> None:
+        for (
+            metric_cls,
+            param_name,
+        ), alternatives in RECMETRIC_CONDITIONAL_STATE.items():
+            for alt_value in alternatives:
+                with self.subTest(
+                    metric=metric_cls.__name__,
+                    param=param_name,
+                    direction="default_to_variant",
+                ):
+                    self._assert_cross_config_load(
+                        metric_cls, param_name, alt_value, "default_to_variant"
+                    )
+
+    def test_throughput_cross_config_load_variant_to_default(self) -> None:
+        variant = ThroughputMetric(
+            **_THROUGHPUT_COMMON_KWARGS,
+            batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
+        )
+        default = ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS)
+        default.load_state_dict(variant.state_dict(), strict=True)
+
+    def test_throughput_cross_config_load_default_to_variant(self) -> None:
+        default = ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS)
+        variant = ThroughputMetric(
+            **_THROUGHPUT_COMMON_KWARGS,
+            batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
+        )
+        variant.load_state_dict(default.state_dict(), strict=True)
+
+    def test_multi_label_precision_cross_config_load_fails_without_hook(self) -> None:
+        variant_kwargs: Dict[str, Any] = {
+            **self._make_common_kwargs(),
+            "num_labels": 3,
+        }
+        default_kwargs: Dict[str, Any] = {
+            **self._make_common_kwargs(),
+            "num_labels": 1,
+        }
+        variant = MultiLabelPrecisionMetric(**variant_kwargs)
+        default = MultiLabelPrecisionMetric(**default_kwargs)
+
+        with self.assertRaises(RuntimeError):
+            default.load_state_dict(variant.state_dict(), strict=True)
+
+    def test_multi_label_precision_label_names_cross_config_load_fails(self) -> None:
+        kwargs_a: Dict[str, Any] = {
+            **self._make_common_kwargs(),
+            "num_labels": 1,
+            "label_names": ["cat"],
+        }
+        kwargs_b: Dict[str, Any] = {
+            **self._make_common_kwargs(),
+            "num_labels": 1,
+            "label_names": ["dog"],
+        }
+        variant_a = MultiLabelPrecisionMetric(**kwargs_a)
+        variant_b = MultiLabelPrecisionMetric(**kwargs_b)
+
+        with self.assertRaises(RuntimeError):
+            variant_b.load_state_dict(variant_a.state_dict(), strict=True)
 
 
 class DCPCheckpointClientSimulationTest(unittest.TestCase):
