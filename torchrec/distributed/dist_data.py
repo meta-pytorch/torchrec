@@ -50,6 +50,50 @@ except ImportError:
 
 logger: logging.Logger = logging.getLogger()
 
+_INT32_MAX: int = 2_147_483_647
+_INT64_MAX: int = 9_223_372_036_854_775_807
+
+_DTYPE_MAX: Dict[torch.dtype, int] = {
+    torch.int32: _INT32_MAX,
+    torch.int64: _INT64_MAX,
+}
+
+
+def _check_int_overflow(
+    caller: str,
+    values: List[int],
+    value_name: str,
+    target_dtype: torch.dtype = torch.int32,
+    **context: object,
+) -> bool:
+    """Check if any value in the list overflows the target dtype or is negative.
+
+    Raises RuntimeError when corruption is detected so that training fails early
+    instead of producing silent data corruption. Used to debug S641918 (corrupted
+    batch sizes causing int32 overflow in _get_recat).
+
+    Returns True if overflow was detected (only reachable if caller catches the
+    RuntimeError).
+    """
+    if not values:
+        return False
+    dtype_max = _DTYPE_MAX.get(target_dtype)
+    if dtype_max is None:
+        return False
+    max_val = max(values)
+    min_val = min(values)
+    if max_val > dtype_max or min_val < 0:
+        context_str = ", ".join(f"{k}={v}" for k, v in context.items())
+        msg = (
+            f"{caller}: corrupted {value_name} detected "
+            f"(target_dtype={target_dtype}). "
+            f"max={max_val}, min={min_val}, "
+            f"values={values}, {context_str}"
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+    return False
+
 
 def _get_recat(
     local_split: int,
@@ -119,6 +163,31 @@ def _get_recat(
             output_offset = [0] + list(
                 itertools.accumulate(permuted_batch_size_per_feature)
             )
+
+            _check_int_overflow(
+                "_get_recat",
+                # pyre-ignore[6]
+                batch_size_per_rank,
+                "batch_size_per_rank",
+                local_split=local_split,
+                num_splits=num_splits,
+                stagger=stagger,
+            )
+            _check_int_overflow(
+                "_get_recat",
+                input_offset,
+                "input_offset",
+                local_split=local_split,
+                num_splits=num_splits,
+            )
+            _check_int_overflow(
+                "_get_recat",
+                output_offset,
+                "output_offset",
+                local_split=local_split,
+                num_splits=num_splits,
+            )
+
             recat_tensor = torch.tensor(
                 recat,
                 device=device,
@@ -283,6 +352,21 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
 
         ret = self._output_tensor.view(self.num_workers, -1).T.tolist()
 
+        # Check for int32 overflow in AllToAll output. Although the output
+        # tensor may be int64, stride_per_rank values flow downstream to
+        # _get_recat which creates int32 tensors. See S641918.
+        if ret:
+            _check_int_overflow(
+                "SplitsAllToAllAwaitable",
+                ret[-1],
+                "AllToAll output last_row (stride_per_rank)",
+                target_dtype=torch.int32,
+                num_workers=self.num_workers,
+                num_tensors=len(ret),
+                output_tensor_shape=list(self._output_tensor.shape),
+                output_tensor_dtype=self._output_tensor.dtype,
+            )
+
         if not torch.jit.is_scripting() and is_torchdynamo_compiling():
             for i in range(len(ret)):
                 for j in range(len(ret[i])):
@@ -342,6 +426,19 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
         self._keys = keys
         self._stagger = stagger
         self._stride_per_rank = stride_per_rank
+
+        if stride_per_rank is not None:
+            _check_int_overflow(
+                "KJTAllToAllTensorsAwaitable",
+                stride_per_rank,
+                "stride_per_rank (BEFORE _get_recat)",
+                rank=pg.rank(),
+                world_size=pg.size(),
+                splits=splits,
+                local_split=splits[pg.rank()],
+                keys=keys,
+            )
+
         self._recat: Optional[torch.Tensor] = _get_recat(
             local_split=splits[pg.rank()],
             num_splits=len(splits),
@@ -490,6 +587,20 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
             if self._input.variable_stride_per_key()
             else [self._input.stride()] * self._workers
         )
+
+        # Log the input stride before AllToAll to verify it is not
+        # already corrupted at the source. See S641918.
+        if not self._input.variable_stride_per_key():
+            _check_int_overflow(
+                "KJTAllToAllSplitsAwaitable.__init__",
+                [self._input.stride()],
+                "input stride (BEFORE AllToAll)",
+                rank=pg.rank(),
+                world_size=self._workers,
+                keys=keys,
+                splits=splits,
+            )
+
         if self._workers == 1:
             return
 
@@ -521,6 +632,20 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
             else:
                 self._output_splits = output_list[:-1]
                 self._stride_per_rank = output_list[-1]
+
+            # Log stride_per_rank right after AllToAll to detect corrupted
+            # batch sizes at the earliest point. See S641918.
+            if self._stride_per_rank is not None:
+                _check_int_overflow(
+                    "KJTAllToAllSplitsAwaitable",
+                    self._stride_per_rank,
+                    "stride_per_rank (received from AllToAll)",
+                    rank=self._pg.rank(),
+                    world_size=self._workers,
+                    input_stride=self._input.stride(),
+                    splits=self._splits,
+                    keys=self._keys,
+                )
 
             if is_torchdynamo_compiling():
                 rank: int = self._pg.rank()
