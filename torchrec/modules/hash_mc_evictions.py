@@ -64,8 +64,8 @@ class HashZchEvictionScorer:
 class HashZchSingleTtlScorer(HashZchEvictionScorer):
     def gen_score(self, feature: JaggedTensor, device: torch.device) -> torch.Tensor:
         assert (
-            self._config.single_ttl is not None and self._config.single_ttl > 0
-        ), "To use scorer HashZchSingleTtlScorer, a positive single_ttl is required."
+            self._config.single_ttl is not None
+        ), "To use scorer HashZchSingleTtlScorer, a single_ttl is required."
 
         return torch.full_like(
             feature.values(),
