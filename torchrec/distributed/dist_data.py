@@ -72,8 +72,7 @@ def _check_int_overflow(
     instead of producing silent data corruption. Used to debug S641918 (corrupted
     batch sizes causing int32 overflow in _get_recat).
 
-    Returns True if overflow was detected (only reachable if caller catches the
-    RuntimeError).
+    Returns False if no overflow was detected. Raises RuntimeError on overflow.
     """
     if not values:
         return False
