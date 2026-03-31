@@ -27,6 +27,8 @@ from typing import (
 
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.planner.constants import BIGINT_DTYPE
 from torchrec.distributed.planner.shard_estimators import (
     _calculate_shard_io_sizes,
@@ -244,6 +246,17 @@ class EmbeddingStats(Stats):
             best_plan=best_plan,
             dense_storage=dense_storage,
             kjt_storage=kjt_storage,
+        )
+
+        _observability_log_storage_and_perf(
+            reserved_hbm_percent=reserved_hbm_percent,
+            dense_storage=dense_storage,
+            kjt_storage=kjt_storage,
+            sparse_hbm=sparse_hbm,
+            used_hbm=used_hbm,
+            used_ddr=used_ddr,
+            perf=perf,
+            world_size=topology.world_size,
         )
 
         formatted_table = self._log_rank_mem_usage_and_perf(
@@ -1076,6 +1089,48 @@ def _compute_mem_usage_and_perf(
     used_hbm = [hbm + dense_storage.hbm + kjt_storage.hbm for hbm in sparse_hbm]
     used_ddr = [ddr + dense_storage.ddr + kjt_storage.ddr for ddr in used_ddr]
     return sparse_hbm, used_hbm, used_ddr, perf
+
+
+def _observability_log_storage_and_perf(
+    reserved_hbm_percent: float,
+    dense_storage: Storage,
+    kjt_storage: Storage,
+    sparse_hbm: List[int],
+    used_hbm: List[int],
+    used_ddr: List[int],
+    perf: List[Perf],
+    world_size: int,
+) -> None:
+    metadata: Dict[str, str] = {
+        "reserved_hbm_percent": str(reserved_hbm_percent),
+        "dense_storage_hbm": str(dense_storage.hbm),
+        "dense_storage_ddr": str(dense_storage.ddr),
+        "dense_storage_ssd": str(dense_storage.ssd),
+        "kjt_storage_hbm": str(kjt_storage.hbm),
+        "kjt_storage_ddr": str(kjt_storage.ddr),
+        "kjt_storage_ssd": str(kjt_storage.ssd),
+    }
+    for rank in range(world_size):
+        metadata[f"rank_{rank}_sparse_hbm"] = str(sparse_hbm[rank])
+        metadata[f"rank_{rank}_used_hbm"] = str(used_hbm[rank])
+        metadata[f"rank_{rank}_used_ddr"] = str(used_ddr[rank])
+        metadata[f"rank_{rank}_perf_fwd_compute"] = str(perf[rank].fwd_compute)
+        metadata[f"rank_{rank}_perf_fwd_comms"] = str(perf[rank].fwd_comms)
+        metadata[f"rank_{rank}_perf_bwd_compute"] = str(perf[rank].bwd_compute)
+        metadata[f"rank_{rank}_perf_bwd_comms"] = str(perf[rank].bwd_comms)
+        metadata[f"rank_{rank}_perf_input_dist_comms"] = str(
+            perf[rank].input_dist_comms
+        )
+        metadata[f"rank_{rank}_perf_prefetch_compute"] = str(
+            perf[rank].prefetch_compute
+        )
+        metadata[f"rank_{rank}_perf_total"] = str(perf[rank].total)
+    EventLoggingHandler.log_event(
+        component=TorchrecComponent.PLANNER.value,
+        event_name="EmbeddingStats.log",
+        event_type=EventType.INFO,
+        metadata=metadata,
+    )
 
 
 def _format_storage_breakdown(storage: Storage) -> str:
