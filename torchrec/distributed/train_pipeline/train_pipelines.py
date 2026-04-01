@@ -929,13 +929,16 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
 
         Args:
             site: Injection site specification.
-                  e.g., OutputDistSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE)
+                  e.g., InjectionSite(fqn="sparse_arch.ebc", tensor_finder=OutputDistTensorFinder(sharding_type=ShardingType.TABLE_WISE))
             work: Callable that receives the pipeline instance.
                   Executed sequentially with other work at same site.
 
         Example:
             pipeline.register_backward_hook(
-                site=OutputDistSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE),
+                site=InjectionSite(
+                    fqn="sparse_arch.ebc",
+                    tensor_finder=OutputDistTensorFinder(sharding_type=ShardingType.TABLE_WISE),
+                ),
                 work=lambda p: p._optimizer.step(),
             )
         """
