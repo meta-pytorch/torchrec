@@ -23,6 +23,35 @@ class EventType(Enum):
     INFO = "INFO"
 
 
+@unique
+class StackLayer(Enum):
+    """Layer in the training stack where the event originates."""
+
+    TORCHREC = "torchrec"
+    FBGEMM = "fbgemm"
+    FRAMEWORK = "framework"
+    DPP = "dpp"
+
+
+@unique
+class OptimizationTechnique(Enum):
+    """Training optimization techniques."""
+
+    EMO = "emo"
+    ITEP = "itep"
+    ALBT = "albt"
+    SSD_OFFLOADING = "ssd_offloading"
+
+
+@unique
+class EventScope(Enum):
+    """Scope of the logged event."""
+
+    JOB = "job"
+    TABLE = "table"
+    TBE = "tbe"
+
+
 class EventLoggingHandlerBase(abc.ABC):
     """Abstract base class for event logging handlers.
 
