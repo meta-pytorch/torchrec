@@ -309,22 +309,13 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
 
         if self._tb_logging_frequency > 0 and self._device.type != "meta":
             assert self._name is not None
-            self._scalar_logger = ScalarLogger(
-                name=self._name,
-                zch_size=self._zch_size,
-                frequency=self._tb_logging_frequency,
-                start_bucket=self._start_bucket,
-                num_buckets_per_rank=self._end_bucket - self._start_bucket,
-                num_reserved_slots_per_bucket=self.get_reserved_slots_per_bucket(),
-                device=self._device,
-                disable_fallback=self._disable_fallback,
-            )
+            self._scalar_logger = self._create_scalar_logger()
         else:
             logger.info(
                 f"ScalarLogger is disabled because {self._tb_logging_frequency=} and {self._device.type=}"
             )
 
-        identities, metadata = torch.ops.fbgemm.create_zch_buffer(
+        identities, metadata = self._create_zch_buffer(
             size=self._zch_size,
             support_evict=self._eviction_module is not None,
             device=self._device,
@@ -390,6 +381,77 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, "
             f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
             f"{self._no_bag=}"
+        )
+
+    def _create_zch_buffer(
+        self,
+        size: int,
+        support_evict: bool,
+        device: torch.device,
+        long_type: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return torch.ops.fbgemm.create_zch_buffer(
+            size=size,
+            support_evict=support_evict,
+            device=device,
+            long_type=long_type,
+        )
+
+    def _zero_collision_hash(
+        self,
+        input: torch.Tensor,
+        identities: torch.Tensor,
+        max_probe: int,
+        circular_probe: bool,
+        exp_hours: int,
+        readonly: bool,
+        local_sizes: Optional[torch.Tensor],
+        offsets: Optional[torch.Tensor],
+        metadata: Optional[torch.Tensor],
+        output_on_uvm: bool,
+        disable_fallback: bool,
+        _modulo_identity_DPRECATED: bool,
+        input_metadata: Optional[torch.Tensor],
+        eviction_threshold: int,
+        eviction_policy: int,
+        opt_in_prob: int,
+        num_reserved_slots: int,
+        opt_in_rands: Optional[torch.Tensor],
+        runtime_meta: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return torch.ops.fbgemm.zero_collision_hash(
+            input=input,
+            identities=identities,
+            max_probe=max_probe,
+            circular_probe=circular_probe,
+            exp_hours=exp_hours,
+            readonly=readonly,
+            local_sizes=local_sizes,
+            offsets=offsets,
+            metadata=metadata,
+            output_on_uvm=output_on_uvm,
+            disable_fallback=disable_fallback,
+            _modulo_identity_DPRECATED=_modulo_identity_DPRECATED,
+            input_metadata=input_metadata,
+            eviction_threshold=eviction_threshold,
+            eviction_policy=eviction_policy,
+            opt_in_prob=opt_in_prob,
+            num_reserved_slots=num_reserved_slots,
+            opt_in_rands=opt_in_rands,
+            runtime_meta=runtime_meta,
+        )
+
+    def _create_scalar_logger(self) -> ScalarLogger:
+        assert self._name is not None
+        return ScalarLogger(
+            name=self._name,
+            zch_size=self._zch_size,
+            frequency=self._tb_logging_frequency,
+            start_bucket=self._start_bucket,
+            num_buckets_per_rank=self._end_bucket - self._start_bucket,
+            num_reserved_slots_per_bucket=self.get_reserved_slots_per_bucket(),
+            device=self._device,
+            disable_fallback=self._disable_fallback,
         )
 
     @property
@@ -578,7 +640,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 )
 
                 num_reserved_slots = self.get_reserved_slots_per_bucket()
-                remapped_ids, evictions = torch.ops.fbgemm.zero_collision_hash(
+                remapped_ids, evictions = self._zero_collision_hash(
                     input=values,
                     identities=self._hash_zch_identities,
                     max_probe=self._max_probe,
