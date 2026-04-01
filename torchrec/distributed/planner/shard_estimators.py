@@ -14,6 +14,7 @@ from typing import cast, Dict, List, Optional, Tuple, Type
 import torch
 import torchrec.optim as trec_optim
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.planner.constants import (
     BIGINT_DTYPE,
     DEFAULT_PERF_ESTIMATOR,
@@ -94,6 +95,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
             is_inference=is_inference,
         )
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def estimate(
         self,
         sharding_options: List[ShardingOption],
@@ -150,6 +152,7 @@ class EmbeddingStorageEstimator(ShardEstimator):
         self._run_embedding_at_peak_memory = run_embedding_at_peak_memory
         self._is_inference = is_inference
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def estimate(
         self,
         sharding_options: List[ShardingOption],

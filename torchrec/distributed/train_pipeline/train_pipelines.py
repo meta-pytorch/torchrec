@@ -38,6 +38,7 @@ from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionAwaitable,  # noqa: F401
 )
 from torchrec.distributed.logger import one_time_rank0_logger
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.backward_injection import (
     BackwardHookWork,
@@ -309,6 +310,9 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                         cur_batch, self._device, non_blocking=True
                     )
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         if not self._connected:
             self._connect(dataloader_iter)
@@ -401,6 +405,9 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
         self._iter = 0
         self._cur_batch: Optional[In] = None
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         self._state = PipelineState.IDLE
         if self._iter == 0:
@@ -762,6 +769,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         with record_function(f"## backward {batch_id} ##"):
             torch.sum(losses, dim=0).backward()
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
         For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
@@ -1246,6 +1256,9 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
         with record_function(f"## wait_for_batch {batch_id} ##"):
             _wait_for_batch(cast(In, self.batches[0]), self._memcpy_stream)
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         self._state = PipelineState.IDLE
 
@@ -1425,6 +1438,9 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
                         stream_context=self._stream_context,
                     )
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
         For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
@@ -1636,6 +1652,9 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             return
         self._optimizer.step()
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         # attach the model just in case the user forgets to call it, especially when the user
         # pauses the pipeline.progress and detach the model for other purpose.
@@ -2029,6 +2048,9 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         self._batch_ip1 = self._copy_batch_to_gpu(dataloader_iter)
         self._start_sparse_data_dist(self._batch_ip1)
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
         Executes one training iteration with prefetch pipelining.
@@ -2203,6 +2225,9 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             self._batch_loader.stop()
         self._batch_loader = None
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         if not self._batch_loader:
             self._batch_loader = DataLoadingThread(
@@ -2262,6 +2287,9 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 
 class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
         For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
@@ -2572,6 +2600,9 @@ class StagedTrainPipeline(TrainPipeline[In, Optional[StageOut]]):
         if self.on_flush_end is not None:
             self.on_flush_end()
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(
         self,
         dataloader_iter: Iterator[In],
@@ -2710,6 +2741,9 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
             torch.compile(**self.compiled_autograd_options)
         )
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         # attach the model just in case the user forgets to call it, especially when the user
         # pauses the pipeline.progress and detach the model for other purpose.
