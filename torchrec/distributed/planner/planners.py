@@ -97,6 +97,7 @@ from torchrec.distributed.logging_handlers import (
     log_offloading_summary,
     log_planner_config,
     log_planning_result,
+    log_search_space_summary,
     log_storage_reservation,
     log_table_assignment,
     log_table_constraints,
@@ -623,6 +624,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         if not search_space:
             # No shardable parameters
             return ShardingPlan({})
+
+        log_search_space_summary(search_space, self.__class__.__name__)
 
         loaded_sharding_options = None
         loaded_best_plan: List[ShardingOption] = []
