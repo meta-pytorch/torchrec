@@ -10,7 +10,7 @@ import functools
 import logging
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Callable, Dict, Generator, Optional, TypeVar
+from typing import Any, Callable, Dict, Generator, List, Optional, TypeVar
 
 from torchrec.distributed.logging_utils import (
     EventLoggingHandlerBase,
@@ -207,6 +207,11 @@ def log_planning_result(
     error_message: Optional[str] = None,
     **extra_metadata: str,
 ) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_offloading_summary(best_plan: List, planner_type: str) -> None:  # type: ignore[type-arg]
     """No-op OSS stub."""
     pass
 
