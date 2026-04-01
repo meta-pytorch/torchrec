@@ -19,24 +19,6 @@ import torch.distributed as dist
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-
-try:
-    from deeplearning.fbgemm.fbgemm_gpu.fb.triton.triton_table_batched_embeddings import (
-        TritonTableBatchedEmbeddingBags,
-    )
-
-    _SHARDED_TBE_TYPES: tuple[type, ...] = (
-        SplitTableBatchedEmbeddingBagsCodegen,
-        TritonTableBatchedEmbeddingBags,
-    )
-except ImportError:
-    torch._C._log_api_usage_once(
-        "torchrec.distributed.model_parallel.import_failure.TritonTableBatchedEmbeddingBags"
-    )
-    _SHARDED_TBE_TYPES: tuple[type, ...] = (  # pyrefly: ignore[bad-assignment]
-        SplitTableBatchedEmbeddingBagsCodegen,
-    )
-
 from torch import nn
 from torch.autograd.profiler import record_function
 from torch.distributed.algorithms.ddp_comm_hooks import (
@@ -1634,7 +1616,7 @@ class DMPCollection(DistributedModelParallel):
             module: nn.Module,
             prev_module: nn.Module,
         ) -> None:
-            if isinstance(module, _SHARDED_TBE_TYPES):
+            if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
                 sharded_modules.append((module, prev_module))
             # pyrefly: ignore[invalid-argument]
             if not isinstance(module, tuple(modules_to_skip)) and hasattr(
@@ -1663,7 +1645,7 @@ class DMPCollection(DistributedModelParallel):
             module: nn.Module,
             prev_module: nn.Module,
         ) -> None:
-            if isinstance(module, _SHARDED_TBE_TYPES):
+            if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
                 sharded_modules.append((module, prev_module))
             # pyrefly: ignore[invalid-argument]
             if isinstance(module, sharded_module):
