@@ -22,6 +22,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, Dict, List, Optional, Type
 
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.planner.constants import (
     BATCHED_COPY_PERF_FACTOR,
     DP_ELEMENTWISE_KERNELS_PERF_FACTOR,
@@ -1706,6 +1707,7 @@ class EmbeddingPerfEstimator(ShardEstimator):
     def is_inference(self) -> bool:
         return self._is_inference
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER, prefix="v2_")
     def estimate(
         self,
         sharding_options: List[ShardingOption],
