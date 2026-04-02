@@ -29,9 +29,15 @@ from torchrec.distributed.benchmark.embedding_collection_wrappers import (
     get_tables,
 )
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel, ShardingType
-from torchrec.distributed.test_utils.emb_sharder import TestEBCSharder
+from torchrec.distributed.model_parallel import DistributedModelParallel
+from torchrec.distributed.planner.types import ParameterConstraints
+from torchrec.distributed.test_utils.emb_sharder import TestEBCSharder, TestECSharder
 from torchrec.distributed.types import DataType
-from torchrec.modules.embedding_modules import EmbeddingBagCollection
+from torchrec.modules.embedding_configs import EmbeddingConfig, NoEvictionPolicy
+from torchrec.modules.embedding_modules import (
+    EmbeddingBagCollection,
+    EmbeddingCollection,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 
@@ -47,6 +53,10 @@ BENCH_SHARDING_TYPES: List[ShardingType] = [
 BENCH_COMPILE_MODES: List[CompileMode] = [
     CompileMode.EAGER,
     # CompileMode.FX_SCRIPT,
+]
+
+WRITE_BENCH_SHARDING_TYPES: List[ShardingType] = [
+    ShardingType.ROW_WISE,
 ]
 
 
@@ -118,6 +128,148 @@ def benchmark_ebc(
         benchmark_func_kwargs={"optimizer": optimizer},
         **args_kwargs,
     )
+
+
+def write_func_to_benchmark(
+    model: torch.nn.Module,
+    bench_inputs: List[KeyedJaggedTensor],
+    embedding_dim: int = 64,
+) -> None:
+    for bench_input in bench_inputs:
+        # Construct write input: KJT with weights containing the embedding values.
+        # The write path expects a KJT whose keys are the writable feature names,
+        # with weights of shape [num_values, embedding_dim] as the new embeddings.
+        total_values = int(bench_input.lengths().sum().item())
+        write_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=bench_input.keys(),
+            values=bench_input.values(),
+            lengths=bench_input.lengths(),
+            weights=torch.rand(
+                total_values,
+                embedding_dim,
+                dtype=torch.float32,
+                device=bench_input.values().device,
+            ),
+        )
+
+        assert isinstance(model, DistributedModelParallel)
+        model.write(write_kjt)
+
+
+def write_read_func_to_benchmark(
+    model: torch.nn.Module,
+    bench_inputs: List[KeyedJaggedTensor],
+    embedding_dim: int = 64,
+) -> None:
+    for bench_input in bench_inputs:
+        # Write: construct KJT with random embedding weights and write to model.
+        total_values = int(bench_input.lengths().sum().item())
+        write_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=bench_input.keys(),
+            values=bench_input.values(),
+            lengths=bench_input.lengths(),
+            weights=torch.rand(
+                total_values,
+                embedding_dim,
+                dtype=torch.float32,
+                device=bench_input.values().device,
+            ),
+        )
+        assert isinstance(model, DistributedModelParallel)
+        model.write(write_kjt)
+        # Read: forward pass to read back embeddings.
+        model(bench_input)
+
+
+def benchmark_ec_write(
+    tables: List[Tuple[int, int]],
+    args: argparse.Namespace,
+    output_dir: str,
+    pooling_configs: Optional[List[int]] = None,
+    variable_batch_embeddings: bool = False,
+) -> List[BenchmarkResult]:
+    total_num_buckets = 20
+    # Round up num_embeddings to be divisible by total_num_buckets
+    aligned_tables = [
+        (((num + total_num_buckets - 1) // total_num_buckets) * total_num_buckets, dim)
+        for num, dim in tables
+    ]
+    table_configs = get_tables(aligned_tables, is_pooled=False, data_type=DataType.FP32)
+    # Set enable_embedding_update and virtual table configs for write support
+    ec_tables = []
+    for table in table_configs:
+        assert isinstance(table, EmbeddingConfig)
+        table.enable_embedding_update = True
+        table.use_virtual_table = True
+        table.total_num_buckets = total_num_buckets
+        table.virtual_table_eviction_policy = NoEvictionPolicy()
+        # make type checking happy
+        ec_tables.append(table)
+
+    sharder = TestECSharder(
+        sharding_type="",  # sharding_type gets populated during benchmarking
+        kernel_type=EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+    )
+
+    module = EmbeddingCollection(
+        tables=ec_tables,
+        device=torch.device("cuda"),
+    ).cpu()
+
+    torch.cuda.empty_cache()
+
+    IGNORE_ARGNAME = ["output_dir", "embedding_config_json", "max_num_embeddings"]
+    args_kwargs = {
+        argname: getattr(args, argname)
+        for argname in dir(args)
+        if not argname.startswith("_") and argname not in IGNORE_ARGNAME
+    }
+
+    if pooling_configs:
+        args_kwargs["pooling_configs"] = pooling_configs
+
+    args_kwargs["variable_batch_embeddings"] = variable_batch_embeddings
+
+    # DRAM_VIRTUAL_TABLE is a guarded compute kernel - must be explicitly
+    # specified via ParameterConstraints or the planner will filter it out.
+    constraints = {
+        table.name: ParameterConstraints(
+            compute_kernels=[EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value],
+        )
+        for table in table_configs
+    }
+
+    # Benchmark write-only, then write+read
+    results: List[BenchmarkResult] = []
+    results.extend(
+        benchmark_ebc_module(
+            module=module,
+            sharder=sharder,
+            sharding_types=WRITE_BENCH_SHARDING_TYPES,
+            compile_modes=BENCH_COMPILE_MODES,
+            tables=table_configs,
+            output_dir=output_dir,
+            benchmark_func_kwargs={"embedding_dim": table_configs[0].embedding_dim},
+            constraints=constraints,
+            func_to_benchmark=write_func_to_benchmark,
+            **args_kwargs,
+        )
+    )
+    results.extend(
+        benchmark_ebc_module(
+            module=module,
+            sharder=sharder,
+            sharding_types=WRITE_BENCH_SHARDING_TYPES,
+            compile_modes=BENCH_COMPILE_MODES,
+            tables=table_configs,
+            output_dir=output_dir,
+            benchmark_func_kwargs={"embedding_dim": table_configs[0].embedding_dim},
+            constraints=constraints,
+            func_to_benchmark=write_read_func_to_benchmark,
+            **args_kwargs,
+        )
+    )
+    return results
 
 
 def main() -> None:
@@ -200,6 +352,37 @@ def main() -> None:
                 num_requests=num_requests,
             )
         )
+
+    ### Benchmark EC write and write+read
+    output_dir = args.output_dir + f"/run_{datetime_sfx}"
+    output_dir += "_ec_write"
+
+    if not os.path.exists(output_dir):
+        os.mkdir(output_dir)
+
+    tables_info = "\nTABLE SIZES:"
+    for i, (num, dim) in enumerate(shrunk_table_sizes):
+        mb = int(float(num * dim) / 1024 / 1024) * 4
+        tables_info += f"\nTABLE[{i}][{num:9}, {dim:4}] {mb:6}Mb"
+
+    report = f"REPORT BENCHMARK {datetime_sfx} world_size:{args.world_size} batch_size:{args.batch_size}\n"
+    report += "Module: EmbeddingCollection_write\n"
+    report += tables_info
+    report += "\n"
+    report += f"num_requests:{num_requests:8}\n"
+    report_file = f"{output_dir}/run.report"
+
+    benchmark_results_per_module.append(
+        benchmark_ec_write(shrunk_table_sizes, args, output_dir, pooling_configs)
+    )
+    write_report_funcs_per_module.append(
+        partial(
+            write_report,
+            report_file=report_file,
+            report_str=report,
+            num_requests=num_requests,
+        )
+    )
 
     for i, write_report_func in enumerate(write_report_funcs_per_module):
         write_report_func(benchmark_results_per_module[i])
