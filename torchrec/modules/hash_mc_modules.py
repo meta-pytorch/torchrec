@@ -22,6 +22,11 @@ from torchrec.modules.hash_mc_metrics import ScalarLogger
 from torchrec.modules.mc_modules import ManagedCollisionModule
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
+try:
+    torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:faster_hash_ops")
+except (OSError, RuntimeError):
+    pass
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 
