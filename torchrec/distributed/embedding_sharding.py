@@ -10,7 +10,7 @@
 import abc
 import copy
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import filterfalse
 from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
@@ -990,33 +990,24 @@ T = TypeVar("T")
 W = TypeVar("W")
 
 
+@dataclass
 class EmbeddingShardingContext(Multistreamable):
-    # Torch Dynamo does not support default_factory=list:
-    # https://github.com/pytorch/pytorch/issues/120108
-    # TODO(ivankobzarev) Make this a dataclass once supported
+    batch_size_per_rank: List[int] = field(default_factory=list)
+    batch_size_per_rank_per_feature: List[List[int]] = field(default_factory=list)
+    batch_size_per_feature_pre_a2a: List[int] = field(default_factory=list)
+    variable_batch_per_feature: bool = False
 
-    def __init__(
-        self,
-        batch_size_per_rank: Optional[List[int]] = None,
-        batch_size_per_rank_per_feature: Optional[List[List[int]]] = None,
-        batch_size_per_feature_pre_a2a: Optional[List[int]] = None,
-        variable_batch_per_feature: bool = False,
-    ) -> None:
-        super().__init__()
-        self.batch_size_per_rank: List[int] = (
-            batch_size_per_rank if batch_size_per_rank is not None else []
-        )
-        self.batch_size_per_rank_per_feature: List[List[int]] = (
-            batch_size_per_rank_per_feature
-            if batch_size_per_rank_per_feature is not None
-            else []
-        )
-        self.batch_size_per_feature_pre_a2a: List[int] = (
-            batch_size_per_feature_pre_a2a
-            if batch_size_per_feature_pre_a2a is not None
-            else []
-        )
-        self.variable_batch_per_feature: bool = variable_batch_per_feature
+    def __post_init__(self) -> None:
+        if torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:disable_none_context_fields"
+        ):
+            return
+        if self.batch_size_per_rank is None:
+            self.batch_size_per_rank = []  # pyrefly: ignore[bad-assignment]
+        if self.batch_size_per_rank_per_feature is None:
+            self.batch_size_per_rank_per_feature = []  # pyrefly: ignore[bad-assignment]
+        if self.batch_size_per_feature_pre_a2a is None:
+            self.batch_size_per_feature_pre_a2a = []  # pyrefly: ignore[bad-assignment]
 
     def record_stream(self, stream: torch.Stream) -> None:
         pass
