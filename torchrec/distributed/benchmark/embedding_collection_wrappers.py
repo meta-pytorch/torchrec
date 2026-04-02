@@ -48,6 +48,7 @@ from torchrec.distributed.planner.constants import DEFAULT_PERF_ESTIMATOR
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
 from torchrec.distributed.planner.shard_estimators import EmbeddingStorageEstimator
+from torchrec.distributed.planner.types import ParameterConstraints
 from torchrec.distributed.shard import _shard_modules
 from torchrec.distributed.test_utils.multi_process import MultiProcessContext
 from torchrec.distributed.test_utils.test_model import ModelInput
@@ -285,6 +286,7 @@ def _transform_module(
     benchmark_unsharded_module: bool = False,
     pod_size: Optional[int] = None,
     local_world_size: Optional[int] = None,
+    constraints: Optional[Dict[str, ParameterConstraints]] = None,
 ) -> torch.nn.Module:
     """
     Transform a module for distributed benchmarking with optional topology awareness.
@@ -304,6 +306,8 @@ def _transform_module(
             When set, enables proper intra_group_size calculation for multi-host
             NVLink domains like GB200.
         local_world_size: Number of GPUs per host. If not set, defaults to world_size.
+        constraints: Per-table parameter constraints for the sharding planner.
+            Required for guarded compute kernels like DRAM_VIRTUAL_TABLE.
 
     Returns:
         Transformed (sharded) module ready for benchmarking
@@ -345,9 +349,11 @@ def _transform_module(
         planner = EmbeddingShardingPlanner(
             topology=topology,
             batch_size=batch_size,
+            constraints=constraints,
             enumerator=EmbeddingEnumerator(
                 topology=topology,
                 batch_size=batch_size,
+                constraints=constraints,
                 estimator=[
                     EmbeddingPerfEstimatorFactory.create(
                         DEFAULT_PERF_ESTIMATOR, topology=topology
@@ -436,6 +442,7 @@ def _init_module_and_run_benchmark(
     benchmark_unsharded_module: bool = False,
     pod_size: Optional[int] = None,
     local_world_size: Optional[int] = None,
+    constraints: Optional[Dict[str, ParameterConstraints]] = None,
 ) -> BenchmarkResult:
     """
     Initialize module and run benchmark with optional topology awareness.
@@ -473,6 +480,7 @@ def _init_module_and_run_benchmark(
         benchmark_unsharded_module: Whether to benchmark unsharded version
         pod_size: Number of hosts per NVLink domain (topology_domain_multiple)
         local_world_size: Number of GPUs per host
+        constraints: Per-table parameter constraints for the sharding planner
     """
 
     if rank >= 0:
@@ -521,6 +529,7 @@ def _init_module_and_run_benchmark(
             benchmark_unsharded_module=benchmark_unsharded_module,
             pod_size=pod_size,
             local_world_size=local_world_size,
+            constraints=constraints,
         )
 
         if benchmark_unsharded_module:
@@ -574,6 +583,7 @@ def benchmark_ebc_module(
     device_type: str = "cuda",
     pod_size: Optional[int] = None,
     local_world_size: Optional[int] = None,
+    constraints: Optional[Dict[str, ParameterConstraints]] = None,
 ) -> List[BenchmarkResult]:
     """
     Benchmark EmbeddingBagCollection (EBC) and QuantEmbeddingBagCollection (QEBC) modules.
@@ -700,6 +710,7 @@ def benchmark_ebc_module(
                     pooling_configs=pooling_configs,
                     pod_size=pod_size,
                     local_world_size=local_world_size,
+                    constraints=constraints,
                 )
             else:
                 res = _init_module_and_run_benchmark(
@@ -723,6 +734,7 @@ def benchmark_ebc_module(
                     benchmark_unsharded_module=benchmark_unsharded,
                     pod_size=pod_size,
                     local_world_size=local_world_size,
+                    constraints=constraints,
                 )
 
             gc.collect()
