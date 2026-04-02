@@ -9,11 +9,13 @@
 
 # pyre-strict
 
+import unittest
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn as nn
 from torchrec.distributed import DistributedModelParallel
+from torchrec.distributed.dist_data import _get_recat
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.global_settings import set_propogate_device
 from torchrec.distributed.sharding_plan import (
@@ -271,6 +273,197 @@ class TestEmbeddingUpdate(MultiProcessTestBase):
             update_through_dmp=True,
             expected_failure_msg="No writable sharded modules found",
         )
+
+
+class TestDistInit2DWeightsVariableBatch(unittest.TestCase):
+    """
+    Unit tests for KeyedJaggedTensor.dist_init with 2D weights and variable
+    batch sizes per rank.
+
+    When stride_per_rank has different values across ranks, dist_init's
+    non-variable_stride_per_key branch calls permute_1D_sparse_data (the vec
+    kernel) instead of permute_2D_sparse_data. This exercises the fix in
+    permute_1D_data_kernel_vec that adds correct 2D weights support.
+    """
+
+    def _reference_permute_1d_2d_weights(
+        self,
+        recat: torch.Tensor,
+        lengths: torch.Tensor,
+        values: torch.Tensor,
+        weights_2d: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Python reference for permute_1D_sparse_data with 2D weights.
+
+        recat[i] = input segment index for output segment i.
+        lengths[j] = number of values in input segment j.
+        weights_2d has shape [total_indices, embedding_dim].
+
+        The CPU kernel returns 1D weights (flattening 2D input), so this
+        Python loop is used as ground truth instead.
+        """
+        input_offsets = torch.cat(
+            [torch.zeros(1, dtype=torch.int64), lengths.long().cumsum(0)]
+        )
+        perm_lengths = lengths[recat.long()]
+        out_offsets = torch.cat(
+            [torch.zeros(1, dtype=torch.int64), perm_lengths.long().cumsum(0)]
+        )
+        total_out = int(perm_lengths.sum().item())
+        embedding_dim = weights_2d.size(1)
+
+        perm_values = torch.empty(total_out, dtype=values.dtype)
+        perm_weights = torch.empty(total_out, embedding_dim, dtype=weights_2d.dtype)
+        for i, r in enumerate(recat.tolist()):
+            src = int(input_offsets[r].item())
+            length = int(lengths[r].item())
+            dst = int(out_offsets[i].item())
+            perm_values[dst : dst + length] = values[src : src + length]
+            perm_weights[dst : dst + length] = weights_2d[src : src + length]
+        return perm_lengths.int(), perm_values, perm_weights
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_dist_init_2d_weights_variable_batch_per_rank(self) -> None:
+        """
+        Verify that dist_init correctly permutes 2D weights [N, embedding_dim]
+        when stride_per_rank differs across ranks (variable batch per rank).
+
+        Setup:
+          - 2 keys, world_size=2, stride_per_rank=[3, 5] (rank0≠rank1)
+          - single_batch_per_rank=False  →  permute_1D_sparse_data is called
+          - weights shape: [total_indices, embedding_dim] — the 2D case
+
+        Compared against a Python reference loop (CPU kernel flattens 2D
+        weights to 1D and cannot serve as ground truth).
+        """
+        device = torch.device("cuda:0")
+        keys = ["feature_0", "feature_1"]
+        num_keys = len(keys)
+        world_size = 2
+        # Different strides trigger the variable-batch branch in dist_init,
+        # which calls permute_1D_sparse_data with 2D weights.
+        stride_per_rank = [3, 5]
+        embedding_dim = 64
+
+        # After AllToAll, lengths has num_keys * sum(stride_per_rank) segments:
+        #   [key0_r0(3), key0_r1(5), key1_r0(3), key1_r1(5)]
+        torch.manual_seed(42)
+        num_segments = num_keys * sum(stride_per_rank)
+        lengths = torch.randint(1, 4, (num_segments,), dtype=torch.int32)
+        total_indices = int(lengths.sum().item())
+        values = torch.randint(0, 1000, (total_indices,), dtype=torch.int32)
+        # 2D weights: each index has an embedding_dim-dimensional weight row
+        weights_2d = torch.rand(total_indices, embedding_dim, dtype=torch.float32)
+
+        # _get_recat with different batch_size_per_rank calls
+        # expand_into_jagged_permute to produce an element-level permutation of
+        # the lengths array. dist_init then passes this as the segment permute
+        # to permute_1D_sparse_data.
+        recat_cpu = _get_recat(
+            local_split=num_keys,
+            num_splits=world_size,
+            device=torch.device("cpu"),
+            batch_size_per_rank=stride_per_rank,
+        )
+        recat_cuda = _get_recat(
+            local_split=num_keys,
+            num_splits=world_size,
+            device=device,
+            batch_size_per_rank=stride_per_rank,
+        )
+        assert recat_cpu is not None
+
+        # Python reference (CPU kernel cannot serve as ground truth since it
+        # flattens 2D weights to 1D)
+        ref_lengths, ref_values, ref_weights = self._reference_permute_1d_2d_weights(
+            recat_cpu, lengths, values, weights_2d
+        )
+
+        # CUDA: goes through permute_1D_data_kernel_vec with 2D weights fix
+        cuda_kjt = KeyedJaggedTensor.dist_init(
+            keys=keys,
+            tensors=[
+                lengths.to(device),
+                values.to(device),
+                weights_2d.to(device),
+            ],
+            variable_stride_per_key=False,
+            num_workers=world_size,
+            recat=recat_cuda,
+            stride_per_rank=stride_per_rank,
+        )
+
+        torch.testing.assert_close(cuda_kjt.lengths().cpu(), ref_lengths)
+        torch.testing.assert_close(cuda_kjt.values().cpu(), ref_values)
+        assert cuda_kjt.weights() is not None
+        torch.testing.assert_close(cuda_kjt.weights().cpu(), ref_weights)
+        # Confirm weights remain 2D after permutation
+        self.assertEqual(cuda_kjt.weights().dim(), 2)
+        self.assertEqual(cuda_kjt.weights().size(1), embedding_dim)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_dist_init_2d_weights_various_embedding_dims(self) -> None:
+        """
+        Test dist_init with 2D weights for embedding_dim values that exercise
+        both vec4 (dim divisible by 4) and scalar fallback (dim not divisible
+        by 4) code paths in permute_1D_data_kernel_vec.
+        """
+        device = torch.device("cuda:0")
+        keys = ["feature_0", "feature_1", "feature_2"]
+        num_keys = len(keys)
+        world_size = 2
+        stride_per_rank = [4, 7]  # different → variable-batch branch
+
+        for embedding_dim in [4, 7, 8, 16, 64]:
+            with self.subTest(embedding_dim=embedding_dim):
+                torch.manual_seed(embedding_dim)
+                num_segments = num_keys * sum(stride_per_rank)
+                lengths = torch.randint(1, 5, (num_segments,), dtype=torch.int32)
+                total_indices = int(lengths.sum().item())
+                values = torch.randint(0, 1000, (total_indices,), dtype=torch.int32)
+                weights_2d = torch.rand(
+                    total_indices, embedding_dim, dtype=torch.float32
+                )
+
+                recat_cpu = _get_recat(
+                    local_split=num_keys,
+                    num_splits=world_size,
+                    device=torch.device("cpu"),
+                    batch_size_per_rank=stride_per_rank,
+                )
+                recat_cuda = _get_recat(
+                    local_split=num_keys,
+                    num_splits=world_size,
+                    device=device,
+                    batch_size_per_rank=stride_per_rank,
+                )
+                assert recat_cpu is not None
+
+                ref_lengths, ref_values, ref_weights = (
+                    self._reference_permute_1d_2d_weights(
+                        recat_cpu, lengths, values, weights_2d
+                    )
+                )
+
+                cuda_kjt = KeyedJaggedTensor.dist_init(
+                    keys=keys,
+                    tensors=[
+                        lengths.to(device),
+                        values.to(device),
+                        weights_2d.to(device),
+                    ],
+                    variable_stride_per_key=False,
+                    num_workers=world_size,
+                    recat=recat_cuda,
+                    stride_per_rank=stride_per_rank,
+                )
+
+                assert cuda_kjt.weights() is not None
+                torch.testing.assert_close(cuda_kjt.lengths().cpu(), ref_lengths)
+                torch.testing.assert_close(cuda_kjt.values().cpu(), ref_values)
+                torch.testing.assert_close(cuda_kjt.weights().cpu(), ref_weights)
+                self.assertEqual(cuda_kjt.weights().size(1), embedding_dim)
 
 
 def sharded_embedding_update(

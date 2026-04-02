@@ -3665,7 +3665,6 @@ class ZeroCollisionKeyValueEmbeddingBag(
                 forward_args.update(
                     {
                         "batch_size_per_feature_per_rank": features.stride_per_key_per_rank(),
-                        "weights": score_weights,
                     }
                 )
             if isinstance(
@@ -3677,7 +3676,6 @@ class ZeroCollisionKeyValueEmbeddingBag(
                         "batch_size_per_feature_per_rank": features.stride_per_key_per_rank(),
                         "vbe_output": vbe_output,
                         "vbe_output_offsets": vbe_output_offsets,
-                        "weights": score_weights,
                     }
                 )
 
@@ -3685,12 +3683,14 @@ class ZeroCollisionKeyValueEmbeddingBag(
             return self.emb_module(
                 indices=features.values().to(self._embedding_table_index_type),
                 offsets=features.offsets().to(self._embedding_table_index_type),
+                weights=score_weights,
                 per_sample_weights=per_sample_weights,
             )
         else:
             return self.emb_module(
                 indices=features.values().to(self._embedding_table_index_type),
                 offsets=features.offsets().to(self._embedding_table_index_type),
+                weights=score_weights,
                 per_sample_weights=per_sample_weights,
                 **forward_args,
             )
