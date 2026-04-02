@@ -65,6 +65,7 @@ from torchrec.distributed.types import (
     ShardedModule,
     ShardedTensor,
     ShardingEnv,
+    ShardingEnv2D,
     ShardingType,
 )
 from torchrec.distributed.utils import append_prefix
@@ -264,11 +265,17 @@ class ShardedManagedCollisionCollection(
         ] = None
 
     def _initialize_torch_state(self) -> None:
+        # Creates ShardedTensor using self._env_rank.
         self._model_parallel_mc_buffer_name_to_sharded_tensor = OrderedDict()
         shardable_params = set(
             self.sharded_parameter_names(prefix="_managed_collision_modules")
         )
-
+        # 2D-Sharding: Use global rank since process_group is based on global rank
+        global_rank = (
+            self._env.global_rank
+            if isinstance(self._env, ShardingEnv2D)
+            else self._env.rank
+        )
         for fqn, tensor in self.state_dict().items():
             if fqn not in shardable_params:
                 continue
@@ -293,12 +300,16 @@ class ShardedManagedCollisionCollection(
                             metadata=ShardMetadata(
                                 shard_offsets=shard_offsets,
                                 shard_sizes=sharded_sizes,
-                                placement=(f"rank:{self._env.rank}/{tensor.device}"),
+                                placement=f"rank:{global_rank}/{tensor.device}",
                             ),
                         )
                     ],
                     torch.Size(global_sizes),
-                    process_group=self._env.process_group,
+                    process_group=(
+                        self._env.sharding_pg
+                        if isinstance(self._env, ShardingEnv2D)
+                        else self._env.process_group
+                    ),
                 )
             )
 
@@ -417,7 +428,11 @@ class ShardedManagedCollisionCollection(
                             torch.tensor(
                                 [zch_size], dtype=torch.int64, device=self._device
                             ),
-                            group=self._env.process_group,
+                            group=(
+                                self._env.sharding_pg
+                                if isinstance(self._env, ShardingEnv2D)
+                                else self._env.process_group
+                            ),
                         )
                     else:
                         zch_size_by_rank[0] = torch.tensor(
