@@ -39,6 +39,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.profiler import record_function
 from torchmetrics import Metric
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.types import get_tensor_size_bytes
 from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
 from torchrec.metrics.metrics_namespace import (
@@ -598,6 +600,18 @@ class RecMetric(nn.Module, abc.ABC):
 
         return predictions, labels, weights, kwargs
 
+    @staticmethod
+    def _get_tensor_size_metadata(name: str, tensor: RecModelOutput) -> Dict[str, str]:
+        if isinstance(tensor, torch.Tensor):
+            return {
+                f"{name}_numel": str(tensor.numel()),
+                f"{name}_shape": str(list(tensor.shape)),
+            }
+        else:
+            return {
+                f"{name}_numel": str({k: v.numel() for k, v in tensor.items()}),
+            }
+
     def _update(
         self,
         *,
@@ -606,6 +620,18 @@ class RecMetric(nn.Module, abc.ABC):
         weights: Optional[RecModelOutput],
         **kwargs: Dict[str, Any],
     ) -> None:
+        metadata: Dict[str, str] = {}
+        metadata.update(self._get_tensor_size_metadata("predictions", predictions))
+        metadata.update(self._get_tensor_size_metadata("labels", labels))
+        if weights is not None:
+            metadata.update(self._get_tensor_size_metadata("weights", weights))
+        # n_batch_log_event samples every 1000 calls to avoid logging to Scuba every batch.
+        EventLoggingHandler.n_batch_log_event(
+            component=TorchrecComponent.REC_METRICS.value,
+            event_name="update",
+            event_type=EventType.INFO,
+            metadata=metadata,
+        )
         with torch.no_grad():
             if self._should_clone_update_inputs:
                 predictions, labels, weights, kwargs = self.clone_update_inputs(
