@@ -175,7 +175,7 @@ class CustomTopologyData:
     Custom device data for individual device in a topology.
     """
 
-    supported_fields = ["ddr_cap", "hbm_cap"]
+    supported_fields = ["ddr_cap", "hbm_cap", "ssd_cap"]
 
     def __init__(
         self,
@@ -680,9 +680,21 @@ class TopologyFactory:
             kwargs["pod_size"] = trainer.pod_size
 
         # Memory capacities: trainer > hardware > defaults
-        hbm_cap = trainer.hbm_cap_bytes or hardware.hbm_cap_bytes
-        ddr_cap = trainer.ddr_cap_bytes or hardware.ddr_cap_bytes
-        ssd_cap = trainer.ssd_cap_bytes or hardware.ssd_cap_bytes
+        hbm_cap = (
+            trainer.hbm_cap_bytes
+            if trainer.hbm_cap_bytes is not None
+            else hardware.hbm_cap_bytes
+        )
+        ddr_cap = (
+            trainer.ddr_cap_bytes
+            if trainer.ddr_cap_bytes is not None
+            else hardware.ddr_cap_bytes
+        )
+        ssd_cap = (
+            trainer.ssd_cap_bytes
+            if trainer.ssd_cap_bytes is not None
+            else hardware.ssd_cap_bytes
+        )
 
         # Handle dry-run mode overrides
         if trainer.is_dry_run:
@@ -826,9 +838,9 @@ class Topology:
 
         hbm_per_device = [0] * world_size
         if self._compute_device == "cuda" or self._compute_device == "mtia":
-            hbm_per_device = [hbm_cap if hbm_cap else HBM_CAP] * world_size
-        ddr_cap_per_rank = [ddr_cap if ddr_cap else DDR_CAP] * world_size
-        ssd_cap_per_rank = [ssd_cap if ssd_cap else SSD_CAP] * world_size
+            hbm_per_device = [hbm_cap if hbm_cap is not None else HBM_CAP] * world_size
+        ddr_cap_per_rank = [ddr_cap if ddr_cap is not None else DDR_CAP] * world_size
+        ssd_cap_per_rank = [ssd_cap if ssd_cap is not None else SSD_CAP] * world_size
 
         if custom_topology_data:
             if custom_topology_data.has_data("hbm_cap"):
