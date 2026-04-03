@@ -1724,6 +1724,7 @@ def hash_planner_context_inputs(
         topology.compute_device,
         rounded_devices,
         topology.local_world_size,
+        topology.intra_group_size,
         topology.hbm_mem_bw,
         topology.ddr_mem_bw,
         topology.ssd_mem_bw,
