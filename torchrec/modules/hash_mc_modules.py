@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import fbgemm_gpu  # @manual = "//deeplearning/fbgemm/fbgemm_gpu:fbgemm_gpu"
 import torch
+import torch.distributed as dist
 from torchrec.modules.hash_mc_evictions import (
     get_kernel_from_policy,
     HashZchEvictionConfig,
@@ -287,6 +288,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self._eviction_policy_name: Optional[HashZchEvictionPolicyName] = (
             eviction_policy_name
         )
+        self._eviction_flag: int = get_kernel_from_policy(self._eviction_policy_name)
         self._eviction_config: Optional[HashZchEvictionConfig] = eviction_config
         self._eviction_module: Optional[HashZchEvictionModule] = (
             HashZchEvictionModule(
@@ -462,6 +464,18 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
     @property
     def device(self) -> torch.device:
         return _get_device(self._hash_zch_identities)
+
+    @property
+    def max_probe(self) -> int:
+        return self._max_probe
+
+    @property
+    def disable_fallback(self) -> bool:
+        return self._disable_fallback
+
+    @property
+    def eviction_flag(self) -> int:
+        return self._eviction_flag
 
     def buckets(self) -> int:
         return self._buckets
@@ -644,7 +658,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     output_offset=self._output_global_offset_tensor,
                 )
 
-                num_reserved_slots = self.get_reserved_slots_per_bucket()
+                num_reserved_slots: int = self.get_reserved_slots_per_bucket()
                 remapped_ids, evictions = self._zero_collision_hash(
                     input=values,
                     identities=self._hash_zch_identities,
@@ -662,7 +676,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     _modulo_identity_DPRECATED=False,  # deprecated, always False
                     input_metadata=input_metadata,
                     eviction_threshold=eviction_threshold,
-                    eviction_policy=get_kernel_from_policy(self._eviction_policy_name),
+                    eviction_policy=self._eviction_flag,
                     opt_in_prob=self._opt_in_prob,
                     num_reserved_slots=num_reserved_slots,
                     opt_in_rands=opt_in_rands,
@@ -801,6 +815,186 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             # force the counter to be 0 for the ids not found in emb table.
             metadata[not_hit_indices_mask] = 0
             return metadata.reshape(-1)
+
+    def get_indices_of_reserved_slots_per_bucket(self) -> Optional[torch.Tensor]:
+        """Get the range of indices of reserved slots per bucket of identities."""
+        num_slots = self.get_reserved_slots_per_bucket()
+
+        if num_slots == -1:
+            # If reserved slots isn't used.
+            return None
+
+        size = self.input_mapper._zch_size_per_training_rank  # length of buckets
+        off = self.input_mapper._train_rank_offsets  # offsets of buckets
+        indices = torch.cat(
+            [
+                # pyre-ignore[6]: ignore[no-matching-overload]
+                torch.arange(
+                    off[i] + size[i] - num_slots,  # pyre-ignore[26]
+                    off[i] + size[i],  # pyre-ignore[26]
+                    device=self.device,
+                )
+                for i in range(self._start_bucket, self._end_bucket)
+            ]
+        )
+        if self._output_global_offset_tensor is not None:
+            indices -= self._output_global_offset_tensor
+        return indices
+
+    def sync_identities(
+        self,
+        is_root_node: bool,
+        num_replica_gp: int,
+        replica_ranks: List[int],
+        replica_pg: dist.ProcessGroup,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Syncs identities/metadata for 2D-sharding from all other replica nodes to root node.
+        The root node then finds the best top K global indices for each rank and
+        broadcasts them back to all other replica nodes. The local identities are then
+        updated to be global identities.
+
+        Args:
+            is_root_node (bool): whether the current node is the root replica node
+            num_replica_gp (int): number of replica groups
+            replica_ranks (List[int]): list of global ranks in the replica group
+            replica_pg (ProcessGroup): process group for the replica group
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                survived: Which local identities survived the sync/merging
+                rank_to_global: Mapping from identities in rank i to the best identites_global
+        """
+        # Get all necessary tensors for ZCH
+        identity_table = self._hash_zch_identities
+        meta_table = self._hash_zch_metadata
+        assert meta_table is not None
+
+        # Gather all identities/metadata from all other replicas
+        gathered_identities = None
+        gathered_metadata = None
+        if is_root_node:
+            # If root-node, then gather all of the identities and metadata from all other replica nodes.
+            gathered_identities = [
+                torch.full_like(identity_table, -1) for _ in range(num_replica_gp)
+            ]
+            gathered_metadata = [
+                torch.full_like(meta_table, -1) for _ in range(num_replica_gp)
+            ]
+
+        dist.gather(
+            identity_table,
+            gather_list=gathered_identities,
+            dst=replica_ranks[0],
+            group=replica_pg,
+        )
+        dist.gather(
+            meta_table,
+            gather_list=gathered_metadata,
+            dst=replica_ranks[0],
+            group=replica_pg,
+        )
+
+        # X_global are the 'final' identities/metadata after merging.
+        identity_global = torch.full_like(identity_table, -1)
+        metadata_global = torch.full_like(meta_table, -1)
+        # num_reserved_slots needed to get correct hash positions.
+        num_reserved_slots: int = self.get_reserved_slots_per_bucket()
+
+        # The root node should grab the best top items from all other replica nodes
+        if is_root_node:
+            identity_global = identity_table.clone()
+            metadata_global = meta_table.clone()
+            for i in range(1, num_replica_gp):
+                # Remove -1 due to potential insertion
+                identities = gathered_identities[i].squeeze()  # pyre-ignore[58]
+                indices = torch.where(identities != -1)[0]
+                identities = identities[indices]
+                metadata = gathered_metadata[i].squeeze()[indices]  # pyre-ignore[58]
+
+                # Compute the local sizes and offsets for correct hash position!
+                inds, local_sizes, offsets = self.input_mapper(
+                    values=identities,
+                    output_offset=self._output_global_offset_tensor,
+                )
+
+                # Grab the best top items by running `process_item_zch` onto root node identites
+                _ = torch.ops.fbgemm.zero_collision_hash(
+                    input=inds,
+                    input_metadata=metadata,
+                    identities=identity_global,
+                    metadata=metadata_global,
+                    max_probe=self.max_probe,
+                    local_sizes=local_sizes,
+                    offsets=offsets,
+                    circular_probe=True,
+                    output_on_uvm=False,
+                    _modulo_identity_DPRECATED=False,
+                    exp_hours=-1,
+                    disable_fallback=True,
+                    eviction_threshold=2**31 - 1,  # Always ensures eviction
+                    eviction_policy=self.eviction_flag,
+                    opt_in_prob=self._opt_in_prob,
+                    num_reserved_slots=num_reserved_slots,  # Needed to get correct hash position
+                )
+
+        # All ranks waits until their corresponding root node finshes the syncing
+        dist.barrier(group=replica_pg)
+
+        # Perform broadcast from root node to all other replica nodes
+        dist.broadcast(
+            tensor=identity_global,
+            src=replica_ranks[0],
+            group=replica_pg,
+        )
+        dist.broadcast(
+            tensor=metadata_global,
+            src=replica_ranks[0],
+            group=replica_pg,
+        )
+
+        # Remove -1
+        inds = identity_table.squeeze()
+        nonzero_ids = inds != -1
+        inds = inds[nonzero_ids]
+
+        # Compute local sizes and offsets for correct hash position
+        inds, local_sizes, offsets = self.input_mapper(
+            values=inds,
+            output_offset=self._output_global_offset_tensor,
+        )
+
+        # Find mapping from rank i to the best top K global indices
+        rank_to_global_exist, _ = torch.ops.fbgemm.zero_collision_hash(
+            input=inds,
+            identities=identity_global,
+            max_probe=self.max_probe,
+            local_sizes=local_sizes,
+            offsets=offsets,
+            circular_probe=True,
+            output_on_uvm=False,
+            _modulo_identity_DPRECATED=False,
+            readonly=True,
+            exp_hours=-1,
+            disable_fallback=True,  # must be True here
+            opt_in_prob=self._opt_in_prob,  # Needed to get correct hash position
+            num_reserved_slots=num_reserved_slots,
+        )
+        rank_to_global = torch.full_like(identity_table.squeeze(), -1)
+        rank_to_global[nonzero_ids] = rank_to_global_exist
+
+        # If both identity_table and identity_global have -1, then
+        #   rank_to_global will map all -1 to the same slot in identity_global
+        #   that has -1. We ignore these by masking with `nonzero_ids` below,
+        #   as they represent empty rows with no embedding data to move.
+        found_in_global = rank_to_global != -1
+        survived = nonzero_ids & found_in_global
+
+        # Update the local table and its metadata
+        identity_table.copy_(identity_global)
+        meta_table.copy_(metadata_global)
+
+        return survived, rank_to_global
 
 
 @torch.fx.wrap
