@@ -15,22 +15,31 @@ pass of EC (EmbeddingCollection) and EBC (EmbeddingBagCollection) modules.
 Work functions are registered at specific injection sites and executed during
 the backward all-to-all communication phase.
 
+An ``InjectionSite`` pairs a module FQN with a ``GradTensorFinder`` strategy
+that determines which tensor to attach the backward hook to. Built-in finders:
+- ``FirstGradTensorFinder``: finds the first ``requires_grad`` tensor in output/input
+- ``OutputDistTensorFinder``: extracts ``dummy_tensor`` from EBC/EC output dist awaitables
+
 Example usage:
     from torchrec.distributed.train_pipeline.backward_injection import (
-        OutputDistSite,
+        InjectionSite,
+        OutputDistTensorFinder,
     )
     from torchrec.distributed.types import ShardingType
 
     # Register hooks on the pipeline
     pipeline.register_backward_hook(
-        OutputDistSite(fqn="sparse_arch.ebc", sharding_type=ShardingType.TABLE_WISE),
+        InjectionSite(
+            fqn="sparse_arch.ebc",
+            tensor_finder=OutputDistTensorFinder(sharding_type=ShardingType.TABLE_WISE),
+        ),
         lambda p: p._optimizer.step(),
     )
 """
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, TYPE_CHECKING
+from typing import Any, Callable, Optional, Protocol, runtime_checkable, TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -53,56 +62,66 @@ logger: logging.Logger = logging.getLogger(__name__)
 BackwardHookWork = Callable[["TrainPipeline"], None]
 
 
+@runtime_checkable
+class GradTensorFinder(Protocol):
+    """
+    Strategy for locating the tensor to attach a backward hook to.
+
+    Receives the module's forward input and output, and returns the tensor
+    on which to register the backward hook. Return ``None`` if no suitable
+    tensor is found.
+    """
+
+    def __call__(
+        self, module_input: Any, module_output: Any
+    ) -> Optional[torch.Tensor]: ...
+
+
 @dataclass(frozen=True)
-class InjectionSite:
+class FirstGradTensorFinder:
     """
-    Base class for backward hook injection sites.
+    Finds the first tensor with ``requires_grad=True`` from a module's
+    forward output (or input if ``use_input=True``).
 
-    Attributes:
-        fqn: Fully qualified name of the target module (e.g., "sparse_arch.ebc")
+    Handles single tensors, tuples/lists, dicts, and nested combinations.
     """
 
-    fqn: str
-    use_output_tensor: bool = True
+    use_input: bool = False
 
-    def find_target_module(self, model: nn.Module) -> Optional[nn.Module]:
-        """
-        Finds the module matching ``self.fqn`` in the model.
-
-        Returns:
-            The matching module, or ``None`` if not found.
-        """
-        try:
-            return model.get_submodule(self.fqn)
-        except AttributeError:
-            return None
-
-    def find_grad_tensor(self, output: Any) -> Optional[torch.Tensor]:
-        """
-        Finds the first tensor with ``requires_grad=True`` from a module output.
-
-        Handles single tensors, tuples/lists, dicts, and nested combinations.
-
-        Args:
-            output: The module's forward output.
-
-        Returns:
-            The first grad-requiring tensor, or ``None`` if none found.
-        """
-        if isinstance(output, torch.Tensor):
-            if output.requires_grad:
-                return output
-        elif isinstance(output, (tuple, list)):
-            for item in output:
-                t = self.find_grad_tensor(item)
+    def _search(self, data: Any) -> Optional[torch.Tensor]:
+        if isinstance(data, torch.Tensor):
+            if data.requires_grad:
+                return data
+        elif isinstance(data, (tuple, list)):
+            for item in data:
+                t = self._search(item)
                 if t is not None:
                     return t
-        elif isinstance(output, dict):
-            for v in output.values():
-                t = self.find_grad_tensor(v)
+        elif isinstance(data, dict):
+            for v in data.values():
+                t = self._search(v)
                 if t is not None:
                     return t
         return None
+
+    def __call__(self, module_input: Any, module_output: Any) -> Optional[torch.Tensor]:
+        data = module_input if self.use_input else module_output
+        return self._search(data)
+
+
+@dataclass(frozen=True)
+class InjectionSite:
+    """
+    Backward hook injection site = module FQN + tensor finding strategy.
+
+    Attributes:
+        fqn: Fully qualified name of the target module (e.g., "sparse_arch.ebc")
+        tensor_finder: Strategy for locating the tensor to attach the backward
+            hook to. Must conform to the ``GradTensorFinder`` protocol.
+    """
+
+    fqn: str
+    tensor_finder: GradTensorFinder
 
 
 def register_backward_hook(
@@ -130,8 +149,9 @@ def register_backward_hook(
         RuntimeError: If no grad-requiring tensor is found in the
             module's output during forward.
     """
-    target = site.find_target_module(model)
-    if target is None:
+    try:
+        target = model.get_submodule(site.fqn)
+    except AttributeError:
         raise ValueError(
             f"register_backward_hook: module '{site.fqn}' not found in model."
         )
@@ -141,10 +161,7 @@ def register_backward_hook(
         input: Any,
         output: Any,
     ) -> None:
-        if site.use_output_tensor:
-            tensor = site.find_grad_tensor(output)
-        else:
-            tensor = site.find_grad_tensor(input)
+        tensor = site.tensor_finder(input, output)
         if tensor is None:
             raise RuntimeError(
                 f"register_hook: no grad-requiring tensor in "
@@ -156,37 +173,23 @@ def register_backward_hook(
 
 
 @dataclass(frozen=True)
-class OutputDistSite(InjectionSite):
+class OutputDistTensorFinder:
     """
-    Injection site for hooking during backward all-to-all on output dist tensors.
+    Extracts the ``dummy_tensor`` from an EC/EBC output dist awaitable
+    matching the given sharding type.
 
-    Targets the ``dummy_tensor`` of the EC/EBC output dist awaitable matching
-    the given module FQN and sharding type.
+    For pipelined modules, the forward output is an EC/EBC awaitable.
+    This finder extracts the per-sharding awaitable matching
+    ``self.sharding_type`` and returns its ``dummy_tensor``.
 
     Attributes:
-        fqn: Fully qualified name of the EC/EBC module (e.g., "sparse_arch.ebc")
         sharding_type: The sharding type to target (e.g., ShardingType.TABLE_WISE)
     """
 
     sharding_type: ShardingType = ShardingType.TABLE_WISE
 
-    def find_grad_tensor(self, output: Any) -> Optional[torch.Tensor]:
-        """
-        Finds the dummy tensor from the output dist awaitable matching
-        this site's sharding type.
-
-        For pipelined modules, the forward output is an EC/EBC awaitable.
-        This method extracts the per-sharding awaitable matching
-        ``self.sharding_type`` and returns its ``dummy_tensor``.
-
-        Args:
-            output: The pipelined module's forward output (an EC/EBC awaitable,
-                possibly MC tuple-wrapped).
-
-        Returns:
-            The dummy tensor for the matching sharding type, or ``None`` if
-            not found.
-        """
+    def __call__(self, module_input: Any, module_output: Any) -> Optional[torch.Tensor]:
+        output = module_output
 
         # Handle MC EC/EBC tuple wrapping
         if isinstance(output, tuple):
@@ -218,7 +221,7 @@ class OutputDistSite(InjectionSite):
         ):
             if isinstance(w, NoWait):
                 continue
-            # pyrefly: ignore[unsupported-operation]
+
             if ShardingType(st) == self.sharding_type:
                 tensor_awaitable = getattr(w, "_tensor_awaitable", None)
                 if isinstance(tensor_awaitable, Request):
@@ -226,6 +229,5 @@ class OutputDistSite(InjectionSite):
                 return None
 
         raise RuntimeError(
-            f"Could not find awaitable for module {self.fqn} "
-            f"with sharding type: {self.sharding_type}"
+            f"Could not find awaitable for sharding type: {self.sharding_type}"
         )

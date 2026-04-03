@@ -28,8 +28,9 @@ from torch.autograd.profiler import record_function
 from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.train_pipeline.backward_injection import (
+    FirstGradTensorFinder,
     InjectionSite,
-    OutputDistSite,
+    OutputDistTensorFinder,
 )
 from torchrec.distributed.train_pipeline.pipeline_context import (
     CPUEmbeddingTrainPipelineContext,
@@ -776,7 +777,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
 class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
     """
     Extends TrainPipelineSparseDist by moving the optimizer step into the backward
-    pass via OutputDistSite backward hook injection. This overlaps the optimizer
+    pass via OutputDistTensorFinder backward hook injection. This overlaps the optimizer
     computation with backward all-to-all communication, improving training throughput.
 
     The explicit optimizer.step() in progress() is removed; instead, the optimizer
@@ -816,8 +817,9 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
         )
-        self._output_dist_site = OutputDistSite(
-            fqn=site_fqn, sharding_type=sharding_type
+        self._output_dist_site = InjectionSite(
+            fqn=site_fqn,
+            tensor_finder=OutputDistTensorFinder(sharding_type=sharding_type),
         )
 
     def _pipeline_model(
@@ -913,11 +915,11 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
     This frees HBM occupied by optimizer state (e.g. Shampoo's Kronecker
     factors) between optimizer steps, making it available for forward/backward
     computation. The restore is triggered during the backward pass at the
-    specified OutputDistSite, overlapping the CPU->GPU transfer with backward
+    specified OutputDistTensorFinder site, overlapping the CPU->GPU transfer with backward
     all-to-all communication.
 
     Timeline per iteration:
-        forward -> backward [ restore_optimizer_state at OutputDistSite ] ->
+        forward -> backward [ restore_optimizer_state at output dist site ] ->
         optimizer.step() -> stash_optimizer_state
     """
 
@@ -954,8 +956,9 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
         )
-        self._output_dist_site = OutputDistSite(
-            fqn=site_fqn, sharding_type=sharding_type
+        self._output_dist_site = InjectionSite(
+            fqn=site_fqn,
+            tensor_finder=OutputDistTensorFinder(sharding_type=sharding_type),
         )
         # Set up shared CUDA streams for memory stashing
         MemoryStashingManager.set_streams(
@@ -1106,7 +1109,9 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
             free_features_storage_early=free_features_storage_early,
         )
         if isinstance(site_fqn, str):
-            self._injection_site = InjectionSite(fqn=site_fqn)
+            self._injection_site = InjectionSite(
+                fqn=site_fqn, tensor_finder=FirstGradTensorFinder()
+            )
         else:
             self._injection_site = site_fqn
 
