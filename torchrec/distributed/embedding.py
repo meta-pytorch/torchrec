@@ -42,7 +42,6 @@ from torchrec.distributed.embedding_sharding import (
 )
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
-    EarlyReleasableInputs,
     EmbeddingComputeKernel,
     KJTList,
     ShardedEmbeddingModule,
@@ -310,6 +309,7 @@ class EmbeddingCollectionContext(Multistreamable):
     reverse_indices: List[torch.Tensor] = field(default_factory=list)
     seq_vbe_ctx: List[SequenceVBEContext] = field(default_factory=list)
     table_name_to_unpruned_hash_sizes: Dict[str, int] = field(default_factory=dict)
+    early_releasable_inputs: list[KeyedJaggedTensor] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if torch._utils_internal.justknobs_check(
@@ -327,7 +327,6 @@ class EmbeddingCollectionContext(Multistreamable):
         if self.table_name_to_unpruned_hash_sizes is None:
             # pyrefly: ignore[bad-assignment]
             self.table_name_to_unpruned_hash_sizes = {}
-        self.early_releasable_inputs: Optional[EarlyReleasableInputs] = None
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
@@ -1538,7 +1537,7 @@ class ShardedEmbeddingCollection(
                 # For VBE: deferred until after _compute_sequence_vbe_context
                 # which still needs the original (unpadded) features.
                 if self._free_features_storage_early and unpadded_features is None:
-                    ctx.early_releasable_inputs = (original_features, None)
+                    ctx.early_releasable_inputs.append(original_features)
             features_by_shards = features.split(self._feature_splits)
             features_by_shards = may_collect_feature_scores(
                 features_by_shards,
@@ -1577,7 +1576,7 @@ class ShardedEmbeddingCollection(
                     and need_permute
                     and self._features_order
                 ):
-                    ctx.early_releasable_inputs = (original_features, None)
+                    ctx.early_releasable_inputs.append(original_features)
 
         return KJTListSplitsAwaitable(
             awaitables,

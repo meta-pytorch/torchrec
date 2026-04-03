@@ -47,7 +47,6 @@ from torchrec.distributed.embedding_sharding import (
 )
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
-    EarlyReleasableInputs,
     EmbeddingComputeKernel,
     KJTList,
     ShardedEmbeddingModule,
@@ -465,7 +464,7 @@ class EmbeddingBagCollectionContext(Multistreamable):
     inverse_indices: Optional[Tuple[List[str], torch.Tensor]] = None
     variable_batch_per_feature: bool = False
     divisor: Optional[torch.Tensor] = None
-    early_releasable_inputs: Optional[EarlyReleasableInputs] = None
+    early_releasable_inputs: list[KeyedJaggedTensor] = field(default_factory=list)
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
@@ -1761,7 +1760,7 @@ class ShardedEmbeddingBagCollection(
                     # Defer clearing original KJT tensor storage until after
                     # all pipelined modules' input_dist calls complete, to
                     # avoid freeing shared features that other modules need.
-                    ctx.early_releasable_inputs = (original_features, None)
+                    ctx.early_releasable_inputs.append(original_features)
             if self._has_mean_pooling_callback:
                 ctx.divisor = _create_mean_pooling_divisor(
                     lengths=features.lengths(),

@@ -25,7 +25,6 @@ from typing import (
     Optional,
     Tuple,
     Type,
-    TYPE_CHECKING,
 )
 
 import torch
@@ -37,9 +36,6 @@ from torchrec.distributed.embedding_sharding import (
     KJTSplitsAllToAllMeta,
 )
 from torchrec.distributed.embedding_types import KJTList
-
-if TYPE_CHECKING:
-    from torchrec.distributed.embedding_types import EarlyReleasableInputs
 from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
@@ -170,20 +166,12 @@ def _clear_releasable_inputs(context: TrainPipelineContext) -> None:
         else context.module_contexts
     )
     for module_ctx in contexts_dict.values():
-        early_released: EarlyReleasableInputs | None = getattr(
-            module_ctx, "early_releasable_inputs", None
+        early_released: list[KeyedJaggedTensor] = getattr(
+            module_ctx, "early_releasable_inputs", []
         )
-        if early_released is not None:
-            assert (
-                len(early_released) == 2
-            ), "expecting early_releasable_inputs types with 2 KJT elements"
-            id_list, id_score_list = early_released
-            if id_list is not None:
-                id_list.clear_storage()
-            if id_score_list is not None:
-                id_score_list.clear_storage()
-            # pyre-ignore[16]: `Optional` has no attribute `early_releasable_inputs`.
-            module_ctx.early_releasable_inputs = None
+        for kjt in early_released:
+            kjt.clear_storage()
+        early_released.clear()
 
 
 def _start_data_dist(

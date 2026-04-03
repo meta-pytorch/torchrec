@@ -140,7 +140,7 @@ class ShardedManagedCollisionEmbeddingBagCollection(
                 )
                 if self._free_features_storage_early:
                     # pyrefly: ignore[missing-attribute]
-                    ctx.early_releasable_inputs = (original_features, None)
+                    ctx.early_releasable_inputs.append(original_features)
 
             # TODO: Consider turning this into a hook inside mc_modules and remove skip_permute
             #   from mc_modules, and fix all the private methods to be public.
