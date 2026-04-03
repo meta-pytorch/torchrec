@@ -288,4 +288,9 @@ def log_table_constraints(constraints: Optional[Dict] = None, planner_type: str 
     pass
 
 
+def log_tbe_composition(grouped_configs: List, rank: int = 0) -> None:  # type: ignore[type-arg]
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)

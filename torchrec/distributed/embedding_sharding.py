@@ -619,9 +619,13 @@ def group_tables(
     assert all(table_weightedness) or not any(table_weightedness)
 
     grouped_embedding_configs_by_rank: List[List[GroupedEmbeddingConfig]] = []
-    for tables in tables_per_rank:
+    for rank, tables in enumerate(tables_per_rank):
         grouped_embedding_configs = _group_tables_per_rank(tables)
         grouped_embedding_configs_by_rank.append(grouped_embedding_configs)
+        if grouped_embedding_configs:
+            from torchrec.distributed.logging_handlers import log_tbe_composition
+
+            log_tbe_composition(grouped_embedding_configs, rank)
 
     return grouped_embedding_configs_by_rank
 
