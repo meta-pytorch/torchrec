@@ -1057,7 +1057,7 @@ class DMPCollectionContext(DMPCollectionConfig):
         optimizer_tensors_by_dtype: Optional[
             Dict["torch.dtype", List["torch.Tensor"]]
         ] = None,
-        hash_zch_modules: Optional[List[Tuple[nn.Module, nn.Module, str]]] = None,
+        hash_zch_modules: Optional[List[Tuple[nn.Module, str]]] = None,
     ) -> None:
         super().__init__(
             module=module,
@@ -1083,7 +1083,7 @@ class DMPCollectionContext(DMPCollectionConfig):
         self.optimizer_tensors_by_dtype: Dict["torch.dtype", List["torch.Tensor"]] = (
             optimizer_tensors_by_dtype if optimizer_tensors_by_dtype is not None else {}
         )
-        self.hash_zch_modules: List[Tuple[nn.Module, nn.Module, str]] = (
+        self.hash_zch_modules: List[Tuple[nn.Module, str]] = (
             hash_zch_modules if hash_zch_modules is not None else []
         )
 
