@@ -95,6 +95,7 @@ except Exception:
 
 from torchrec.distributed.logging_handlers import (
     log_offloading_summary,
+    log_planner_config,
     log_planning_result,
     log_storage_reservation,
 )
@@ -594,6 +595,21 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             original_hbm_per_rank=self._topology.devices[0].storage.hbm,
             available_hbm_per_rank=storage_constraint.devices[0].storage.hbm,
             planner_type=self.__class__.__name__,
+        )
+
+        log_planner_config(
+            {
+                "planner_type": self.__class__.__name__,
+                "proposers": ",".join(p.__class__.__name__ for p in self._proposers),
+                "partitioner": self._partitioner.__class__.__name__,
+                "perf_model": self._perf_model.__class__.__name__,
+                "timeout_s": (
+                    str(self._timeout_seconds) if self._timeout_seconds else "none"
+                ),
+                "num_table_constraints": (
+                    str(len(self._constraints)) if self._constraints else "0"
+                ),
+            }
         )
 
         search_space = self._enumerator.enumerate(
