@@ -1296,6 +1296,37 @@ class TestTopologyFactory(unittest.TestCase):
 
             self.assertEqual(topology.devices[0].storage.ssd, 500 * 1024**3)
 
+        with self.subTest("trainer_ssd_cap_zero_overrides_hardware"):
+            trainer_config = TrainerConfig(
+                world_size=8,
+                local_world_size=8,
+                ssd_cap_bytes=0,
+            )
+            hardware_config = HardwareConfig(ssd_cap_bytes=4 * 1024**4)
+
+            topology = TopologyFactory.create_topology(
+                trainer_config=trainer_config,
+                hardware_config=hardware_config,
+            )
+
+            self.assertEqual(topology.devices[0].storage.ssd, 0)
+
+        with self.subTest("custom_topology_data_ssd_cap"):
+            custom_data = CustomTopologyData(
+                data={"ssd_cap": [500 * 1024**3, 1000 * 1024**3]},
+                world_size=2,
+            )
+            trainer_config = TrainerConfig(
+                world_size=2,
+                local_world_size=2,
+                additional_params={"custom_topology_data": custom_data},
+            )
+
+            topology = TopologyFactory.create_topology(trainer_config=trainer_config)
+
+            self.assertEqual(topology.devices[0].storage.ssd, 500 * 1024**3)
+            self.assertEqual(topology.devices[1].storage.ssd, 1000 * 1024**3)
+
         with self.subTest("custom_topology_data_from_additional_params"):
             custom_data = CustomTopologyData(
                 data={"hbm_cap": [40 * 1024**3, 80 * 1024**3]},
