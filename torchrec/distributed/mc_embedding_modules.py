@@ -8,9 +8,10 @@
 # pyre-strict
 
 import logging
-from typing import Any, Dict, Iterator, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, Union
 
 import torch
+import torch.distributed as dist
 from torch.autograd.profiler import record_function
 from torchrec.distributed.embedding import (
     EmbeddingCollectionSharder,
@@ -273,6 +274,98 @@ class BaseShardedManagedCollisionEmbeddingCollection(
             yield append_prefix(prefix, fqn)
         for fqn, _ in self.named_buffers():
             yield append_prefix(prefix, fqn)
+
+    def sync_hash_zch_weights(
+        self,
+        table_name: str,
+        rank_to_global: torch.Tensor,
+        survived: torch.Tensor,
+        include_optimizer_state: bool,
+        allreduce_fn: Callable[
+            [
+                Dict[torch.dtype, List[torch.Tensor]],
+                str,
+                dist.AllreduceCoalescedOptions,
+            ],
+            None,
+        ],
+        indices_slots: Optional[torch.Tensor] = None,
+    ) -> None:
+        """
+        Sync the embedding weights and optimizers states.
+
+        Embedding weights that are still in the sync, are re-arranged to match the
+        global ordering. The weights of the identites that aren't found in
+        global are zeroed out. Certain replica may have identites that others don't,
+        the count of which replica has the that row is recorded, and then used when
+        doing the allreduce averaging. The rows for the reserved slots are averaged
+        out.
+
+        Args:
+            table_name (str): the name of the table to get tbe.
+            survived: Which local identities survived the sync/merging
+            rank_to_global: Mapping from this rank i to the global identity for syncing
+            include_optimizer_state (bool): whether to include optimizer state in the sync.
+            allreduce_fn (Callable): the function to perform allreduce.
+            indices_slots (Optional[torch.Tensor]): the indices of the reserved slots
+        """
+        # Grab tbe/optimizers
+        tbe, table_idx = self._table_to_tbe_and_index[table_name]
+        emb_t = tbe.split_embedding_weights()[table_idx]  # pyre-ignore[29]
+        optimizer = tbe.get_optimizer_state()  # pyre-ignore[29]
+        optim = optimizer[table_idx]["sum"] if optimizer else None
+
+        # Re-arrange embedding tables, align all tables to global hash identities
+        #  We use clone here because kernel async
+        emb_t[rank_to_global[survived]] = emb_t[survived].clone()
+        if optim is not None:
+            optim[rank_to_global[survived]] = optim[survived].clone()
+
+        # Zero out those that didn't survive global merge.
+        #  This shouldn't zero out the reserved slots of the identities
+        indices_zeroed = torch.where(rank_to_global == -1)[0]
+        emb_t[indices_zeroed] = 0.0
+        if optim is not None:
+            optim[indices_zeroed] = 0.0
+
+        # Do all reduce of tables/optimizers based on sums rather than Avg
+        #    because later we divide by count to be the right 'Avg'
+        opts = dist.AllreduceCoalescedOptions()
+        opts.reduceOp = dist.ReduceOp.SUM
+        allreduce_fn({emb_t.dtype: [emb_t]}, "## 2d_hash_weight_sync ##", opts)
+        if include_optimizer_state and optim is not None:
+            allreduce_fn({optim.dtype: [optim]}, "## 2d_hash_optimizer_sync ##", opts)
+
+        # Broadcast the counts of non-zero rows
+        emb_t_size = emb_t.shape[0]
+        nonzero_counts = torch.zeros(
+            (emb_t_size, 1),
+            device=emb_t.device,
+            requires_grad=False,
+            dtype=torch.int32,
+        )
+        nonzero_counts[rank_to_global[survived]] = 1
+
+        # Set the indices of the reserved slots to 1
+        #   this causes all embedding weights of reserved slots to be averaged
+        if indices_slots is not None:
+            nonzero_counts[indices_slots] = 1
+
+        # Allreduce the counts to get number of non-zero
+        opts = dist.AllreduceCoalescedOptions()
+        opts.reduceOp = dist.ReduceOp.SUM
+        allreduce_fn(
+            {nonzero_counts.dtype: [nonzero_counts]}, "## 2d_hash_counts_sync ##", opts
+        )
+        nonzero_counts[nonzero_counts == 0] = 1  # Handle division by zero
+
+        # Divide the embedding tables by the number of non-zero rows
+        emb_t /= nonzero_counts.to(emb_t.dtype)
+        if include_optimizer_state and optim is not None:
+            if optim.ndim == 2:
+                optim /= nonzero_counts.to(optim.dtype)
+            else:
+                optim /= nonzero_counts.to(optim.dtype).squeeze()
 
 
 M = TypeVar("M", bound=BaseManagedCollisionEmbeddingCollection)
