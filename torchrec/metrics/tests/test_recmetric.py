@@ -8,7 +8,8 @@
 # pyre-strict
 
 import unittest
-from typing import Any
+from typing import Any, Dict
+from unittest.mock import patch
 
 import torch
 from torchrec.metrics.metrics_config import BatchSizeStage, DefaultTaskInfo, RecTaskInfo
@@ -326,3 +327,80 @@ class RecMetricTest(unittest.TestCase):
         )
         res = ne.compute()
         self.assertIn("ne-DefaultTask|lifetime_ne", res)
+
+
+class RecMetricTensorSizeLoggingTest(unittest.TestCase):
+    def test_get_tensor_size_metadata_tensor(self) -> None:
+        tensor = torch.randn(4, 8)
+        metadata = RecMetric._get_tensor_size_metadata("predictions", tensor)
+        self.assertEqual(metadata["predictions_numel"], "32")
+        self.assertEqual(metadata["predictions_shape"], "[4, 8]")
+
+    def test_get_tensor_size_metadata_dict(self) -> None:
+        tensor_dict: Dict[str, torch.Tensor] = {
+            "task_a": torch.randn(4, 8),
+            "task_b": torch.randn(2, 3),
+        }
+        metadata = RecMetric._get_tensor_size_metadata("labels", tensor_dict)
+        self.assertIn("labels_numel", metadata)
+        self.assertNotIn("labels_shape", metadata)
+        numel_str = metadata["labels_numel"]
+        self.assertIn("'task_a': 32", numel_str)
+        self.assertIn("'task_b': 6", numel_str)
+
+    @patch(
+        "torchrec.metrics.rec_metric.EventLoggingHandler.n_batch_log_event",
+    )
+    def test_update_calls_log_event_with_tensor_metadata(
+        self, mock_log_event: Any
+    ) -> None:
+        ne = NEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=0,
+        )
+        model_output = gen_test_batch(128)
+        labels, predictions, weights, _ = parse_task_model_outputs(
+            [DefaultTaskInfo], model_output
+        )
+        ne.update(predictions=predictions, labels=labels, weights=weights)
+
+        mock_log_event.assert_called_once()
+        call_kwargs = mock_log_event.call_args[1]
+        self.assertEqual(call_kwargs["component"], "rec_metrics")
+        self.assertEqual(call_kwargs["event_name"], "update")
+        metadata = call_kwargs["metadata"]
+        self.assertIn("predictions_numel", metadata)
+        self.assertIn("labels_numel", metadata)
+        self.assertIn("weights_numel", metadata)
+
+    @patch(
+        "torchrec.metrics.rec_metric.EventLoggingHandler.n_batch_log_event",
+    )
+    def test_update_without_weights_omits_weights_metadata(
+        self, mock_log_event: Any
+    ) -> None:
+        ne = NEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=0,
+        )
+        model_output = gen_test_batch(128)
+        labels, predictions, _, _ = parse_task_model_outputs(
+            [DefaultTaskInfo], model_output
+        )
+        ne.update(predictions=predictions, labels=labels, weights=None)
+
+        mock_log_event.assert_called_once()
+        metadata = mock_log_event.call_args[1]["metadata"]
+        self.assertIn("predictions_numel", metadata)
+        self.assertIn("labels_numel", metadata)
+        self.assertNotIn("weights_numel", metadata)
