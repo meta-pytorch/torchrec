@@ -369,8 +369,6 @@ CompIn = TypeVar("CompIn", KJTList, ListOfKJTList, KeyedJaggedTensor)
 DistOut = TypeVar("DistOut")
 ShrdCtx = TypeVar("ShrdCtx", bound=Multistreamable)
 
-EarlyReleasableInputs = Tuple[Optional[KeyedJaggedTensor], Optional[KeyedJaggedTensor]]
-
 
 class ShardedEmbeddingModule(
     ShardedModule[CompIn, DistOut, Out, ShrdCtx],

@@ -38,7 +38,6 @@ from torchrec.distributed.embedding_sharding import (
 )
 from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
-    EarlyReleasableInputs,
     GroupedEmbeddingConfig,
     KJTList,
     ListOfKJTList,
@@ -85,7 +84,7 @@ class EmbeddingCollectionContext(Multistreamable):
     # VBE-Attributes for EBC
     inverse_indices: Optional[Tuple[List[str], torch.Tensor]] = None
     variable_batch_per_feature: bool = False
-    early_releasable_inputs: Optional[EarlyReleasableInputs] = None
+    early_releasable_inputs: list[KeyedJaggedTensor] = field(default_factory=list)
 
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
@@ -663,7 +662,7 @@ class ShardedManagedCollisionCollection(
                     self._features_order_tensor,
                 )
                 if self._free_features_storage_early:
-                    ctx.early_releasable_inputs = (original_features, None)
+                    ctx.early_releasable_inputs.append(original_features)
 
             feature_splits: List[KeyedJaggedTensor] = []
             if self.need_preprocess:

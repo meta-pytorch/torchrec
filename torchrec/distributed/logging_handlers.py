@@ -12,7 +12,13 @@ from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Dict, Generator, Optional, TypeVar
 
-from torchrec.distributed.logging_utils import EventLoggingHandlerBase, EventType
+from torchrec.distributed.logging_utils import (
+    EventLoggingHandlerBase,
+    EventScope,
+    EventType,
+    OptimizationTechnique,
+    StackLayer,
+)
 
 
 __all__: list[str] = []
@@ -156,6 +162,40 @@ class EventLoggingHandler(EventLoggingHandlerBase):
         component: str,
         event_name: str,
         n: int = 1,
+        metadata: Optional[Dict[str, str]] = None,
+        add_wait_counter: bool = False,
+    ) -> Generator[None, None, None]:
+        yield
+
+
+class TrainingOptimizationLogger(EventLoggingHandler):
+    """No-op training optimization logger for open-source builds."""
+
+    @classmethod
+    def log(
+        cls,
+        layer: StackLayer,
+        event_name: str,
+        event_type: EventType,
+        technique: OptimizationTechnique,
+        component: TorchrecComponent,
+        event_scope: EventScope,
+        metadata: Optional[Dict[str, str]] = None,
+        add_wait_counter: bool = False,
+        error_message: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+    ) -> None:
+        pass
+
+    @classmethod
+    @contextlib.contextmanager
+    def log_context(
+        cls,
+        layer: StackLayer,
+        event_name: str,
+        technique: OptimizationTechnique,
+        component: TorchrecComponent,
+        event_scope: EventScope,
         metadata: Optional[Dict[str, str]] = None,
         add_wait_counter: bool = False,
     ) -> Generator[None, None, None]:
