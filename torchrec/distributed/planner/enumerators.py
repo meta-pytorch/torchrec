@@ -55,12 +55,13 @@ from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerColle
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+
 # compute kernels that should only be used if users specified them
 GUARDED_COMPUTE_KERNELS: Set[EmbeddingComputeKernel] = {
-    EmbeddingComputeKernel.KEY_VALUE,
     EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,
     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
 }
+
 
 # sharding types that require explicit user specification for feature-processed modules
 # row wise sharding uses a different pipelined configuration for feature processing
