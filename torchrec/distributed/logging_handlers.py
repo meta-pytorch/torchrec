@@ -235,4 +235,26 @@ def log_planner_config(metadata: Optional[Dict[str, str]] = None) -> None:
     pass
 
 
+def log_stats_match(
+    table_name: str = "",
+    table_height: int = 0,
+    match_level: str = "",
+    min_working_set: int = 0,
+    recommended_cache_rows: int = 0,
+    global_batch_size: int = 0,
+    matched_height: Optional[int] = None,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_clf_computed(
+    table_name: str = "",
+    table_height: int = 0,
+    clf: float = 0.0,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
