@@ -257,4 +257,14 @@ def log_clf_computed(
     pass
 
 
+def log_cacheability_resolved(
+    table_name: str = "",
+    table_height: int = 0,
+    cacheability: float = 0.0,
+    expected_lookups: int = 0,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
