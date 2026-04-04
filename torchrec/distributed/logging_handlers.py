@@ -279,4 +279,9 @@ def log_kernel_changed(
     pass
 
 
+def log_table_assignment(best_plan: List, planner_type: str = "") -> None:  # type: ignore[type-arg]
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
