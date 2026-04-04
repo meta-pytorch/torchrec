@@ -299,4 +299,17 @@ def log_search_space_summary(search_space: List, planner_type: str = "") -> None
     pass
 
 
+def log_proposer_result(
+    planner_type: str = "",
+    proposer_name: str = "",
+    proposer_index: int = 0,
+    num_proposals: int = 0,
+    num_plans: int = 0,
+    best_perf_rating: Optional[float] = None,
+    is_winning_proposer: bool = False,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
