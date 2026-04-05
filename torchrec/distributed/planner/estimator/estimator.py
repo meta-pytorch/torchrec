@@ -166,7 +166,14 @@ class EmbeddingShardingPerfEvaluator(ABC):
         """
         Compute communication time for a two-level hierarchical collective.
 
-        This is used by TABLE_ROW_WISE which has:
+        NOTE: This base class method is NOT used by TableRowWiseEvaluator, which
+        overrides _default_fwd_comms and _default_bwd_comms directly. It uses
+        ctx.local_world_size for intra-host sizing, which is the physical
+        local_world_size — correct for RW but NOT for TWRW (which needs
+        intra_group_size). Any future subclass using this for TWRW must use
+        ctx.intra_group_size instead.
+
+        Used by:
         - Intra-host collective (within a node)
         - Inter-host collective (across nodes)
 
@@ -1314,27 +1321,26 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
     Evaluator for TABLE_ROW_WISE sharding.
 
     Differences from base (TABLE_WISE):
-    - batch_inputs divided by local_world_size
+    - batch_inputs divided by intra_group_size (TWRW group size)
     - Uses SR comm data type (always, unlike ROW_WISE which checks is_pooled)
     - No block_usage_penalty
-    - Forward: Reduce-scatter (intra) + All-to-all (inter)
+    - Forward: Reduce-scatter (intra, within TWRW group) + All-to-all (inter, across groups)
     - Backward: All-to-all (inter) + All-gather (intra) + batched_copy
-    - Prefetch divided by local_world_size
+    - Prefetch divided by intra_group_size
+
+    Note: intra_group_size = pod_size * local_world_size. For pod_size=1,
+    this equals local_world_size. For pod_size>1 (e.g. GB200_HP), the TWRW
+    group spans multiple physical nodes within the NVSwitch domain.
     """
 
     def get_batch_inputs_divisor(self, ctx: ShardPerfContext) -> int:
-        return ctx.local_world_size
+        return ctx.intra_group_size
 
     def _get_input_read_size(
         self, ctx: ShardPerfContext, config: Optional[HardwarePerfConfig] = None
     ) -> float:
         """
-        TABLE_ROW_WISE: input_read_size = (raw / local_world_size) * world_size * input_data_type_size.
-
-        This is different from ROW_WISE where world_size cancels out.
-
-        Note: TABLE_ROW_WISE always uses bytes (input_data_type_size), ignoring the
-        use_bytes_for_input_read_size config flag since legacy behavior was consistent.
+        TABLE_ROW_WISE: input_read_size = (raw / intra_group_size) * world_size * input_data_type_size.
         """
         effective_batch_inputs = ctx.batch_inputs / self.get_batch_inputs_divisor(
             ctx=ctx
@@ -1350,7 +1356,7 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
         self, ctx: ShardPerfContext, use_min_dim: bool = False
     ) -> float:
         """
-        TABLE_ROW_WISE: embedding_lookup_size = (raw / local_world_size) * world_size * emb_dim * table_data_type_size.
+        TABLE_ROW_WISE: embedding_lookup_size = (raw / intra_group_size) * world_size * emb_dim * table_data_type_size.
         """
         effective_batch_inputs = ctx.batch_inputs / self.get_batch_inputs_divisor(
             ctx=ctx
@@ -1368,13 +1374,10 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
     ) -> float:
         """
         TABLE_ROW_WISE: output_write_size uses batch_outputs * world_size * emb_dim.
-
-        This matches the OLD estimator formula exactly.
         """
         if ctx.is_pooled:
             size = ctx.batch_outputs * ctx.world_size * ctx.emb_dim * data_type_size
         else:
-            # For non-pooled (sequence), world_size factor cancels out in OLD estimator
             size = (
                 ctx.batch_outputs
                 / self.get_batch_inputs_divisor(ctx=ctx)
@@ -1395,31 +1398,13 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
         self, ctx: ShardPerfContext, config: HardwarePerfConfig
     ) -> float:
         """
-        TABLE_ROW_WISE: expected_lookups for prefetch (input_read_size in OLD estimator).
+        TABLE_ROW_WISE: expected_lookups for prefetch.
 
-        OLD estimator behavior:
-        - batch_inputs is pre-divided by local_world_size
-        - input_read_size = (batch_inputs/local_world_size) * world_size * input_data_type_size (bytes)
-        - if is_weighted: input_read_size *= 2
-
-        Note: We return the PRE-DIVISOR value since _default_prefetch_comp
-        will divide by prefetch_divisor (local_world_size) afterwards.
+        Uses intra_group_size as the divisor (matching the TWRW group size).
+        Returns PRE-DIVISOR value since _default_prefetch_comp divides by
+        prefetch_divisor (intra_group_size) afterwards.
         """
-        # TABLE_ROW_WISE uses bytes (includes input_data_type_size)
-        # Compute the full value (before division by local_world_size)
-        # Formula: (batch_inputs / local_world_size) * world_size * input_data_type_size
-        # But we return before local_world_size division, so:
-        # (batch_inputs * world_size * input_data_type_size) / local_world_size
-        # which equals ctx.batch_inputs * (world_size / local_world_size) * input_data_type_size
-        # Simplified: ctx.batch_inputs * num_hosts * input_data_type_size
-        #
-        # Actually, the OLD estimator passes input_read_size directly to
-        # _get_expected_cache_prefetch_time, then divides by local_world_size inside.
-        # So we need to compute: input_read_size = (batch_inputs/local_world_size) * world_size * input_data_type_size
-        # WITHOUT the division (since _default_prefetch_comp will divide)
-        #
-        # Let's compute: batch_inputs * (world_size / local_world_size) * input_data_type_size
-        effective_batch_inputs = ctx.batch_inputs / ctx.local_world_size
+        effective_batch_inputs = ctx.batch_inputs / ctx.intra_group_size
         expected_lookups = float(
             math.ceil(
                 effective_batch_inputs * ctx.world_size * ctx.input_data_type_size
@@ -1441,30 +1426,34 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
             ctx, self._get_comm_data_type_size(ctx, is_fwd=True)
         )
 
-        # Intra-host: reduce-scatter within the host
+        # Intra-group: reduce-scatter within the TWRW group (NVSwitch domain)
+        # local_world_size for bandwidth lookup: min(igs, lws) because if the
+        # group fits within one host, all GPUs are local; if it spans hosts,
+        # physical local_world_size determines the bandwidth tier.
+        intra_local_world_size = min(ctx.intra_group_size, ctx.local_world_size)
         intra_comms = self._compute_collective_comms(
             ctx=ctx,
             output_size=fwd_output_write_size,
             collective_type=CollectiveType.REDUCE_SCATTER,
-            world_size=ctx.local_world_size,
-            local_world_size=ctx.local_world_size,
+            world_size=ctx.intra_group_size,
+            local_world_size=intra_local_world_size,
         )
 
-        # Inter-host: all-to-all across hosts (only if num_hosts > 1)
+        # Inter-group: all-to-all across TWRW groups
+        num_groups = ctx.num_twrw_groups
         inter_comms = 0.0
-        if ctx.num_hosts > 1:
-            # Inter-host uses A2A data type and different output size
-            inter_host_fwd_output_write_size = (
+        if num_groups > 1:
+            inter_group_fwd_output_write_size = (
                 ctx.batch_outputs
-                * ctx.num_hosts
+                * num_groups
                 * ctx.emb_dim
                 * ctx.fwd_a2a_comm_data_type_size
             )
             inter_comms = self._compute_collective_comms(
                 ctx=ctx,
-                output_size=inter_host_fwd_output_write_size,
+                output_size=inter_group_fwd_output_write_size,
                 collective_type=CollectiveType.ALL_TO_ALL,
-                world_size=ctx.num_hosts,
+                world_size=num_groups,
                 local_world_size=1,
             )
 
@@ -1478,32 +1467,32 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
             ctx, self._get_comm_data_type_size(ctx, is_fwd=False)
         )
 
-        # Inter-host: all-to-all across hosts (only if num_hosts > 1)
+        # Inter-group: all-to-all across TWRW groups
+        num_groups = ctx.num_twrw_groups
         inter_comms = 0.0
-        if ctx.num_hosts > 1:
-
-            # Inter-host uses A2A data type and different output size
-            inter_host_bwd_output_write_size = (
+        if num_groups > 1:
+            inter_group_bwd_output_write_size = (
                 ctx.batch_outputs
-                * ctx.num_hosts
+                * num_groups
                 * ctx.emb_dim
                 * ctx.bwd_a2a_comm_data_type_size
             )
             inter_comms = self._compute_collective_comms(
                 ctx=ctx,
-                output_size=inter_host_bwd_output_write_size,
+                output_size=inter_group_bwd_output_write_size,
                 collective_type=CollectiveType.ALL_TO_ALL,
-                world_size=ctx.num_hosts,
+                world_size=num_groups,
                 local_world_size=1,
             )
 
-        # Intra-host: all-gather within the host
+        # Intra-group: all-gather within the TWRW group
+        intra_local_world_size = min(ctx.intra_group_size, ctx.local_world_size)
         intra_comms = self._compute_collective_comms(
             ctx=ctx,
             output_size=bwd_output_write_size,
             collective_type=CollectiveType.ALL_GATHER,
-            world_size=ctx.local_world_size,
-            local_world_size=ctx.local_world_size,
+            world_size=ctx.intra_group_size,
+            local_world_size=intra_local_world_size,
         )
 
         # Batched copy (same formula as ROW_WISE)
@@ -1516,8 +1505,8 @@ class TableRowWiseEvaluator(EmbeddingShardingPerfEvaluator):
         return inter_comms + intra_comms + bwd_batched_copy
 
     def get_prefetch_divisor(self, ctx: ShardPerfContext) -> int:
-        """TABLE_ROW_WISE divides prefetch by local_world_size (per OSS)."""
-        return ctx.local_world_size
+        """TABLE_ROW_WISE divides prefetch by intra_group_size."""
+        return ctx.intra_group_size
 
 
 class DataParallelEvaluator(EmbeddingShardingPerfEvaluator):
