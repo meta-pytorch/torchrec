@@ -9,6 +9,7 @@
 
 import itertools
 import logging
+from contextlib import nullcontext
 from typing import Dict, Generic, Iterable, List, Optional, Tuple, TypeVar, Union
 
 import torch
@@ -70,6 +71,8 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
     This pipeline is used in TrainPipelineSparseDist
     """
 
+    _use_main_stream_for_dist_init = False
+
     def __call__(self, *input, **kwargs) -> Awaitable:
         if self._name not in self._context.input_dist_tensors_requests:
             available_names = list(self._context.input_dist_tensors_requests.keys())
@@ -88,9 +91,14 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
         request = self._context.input_dist_tensors_requests.pop(self._name)
         assert isinstance(request, Awaitable)
         with record_function("## runtime_forward_assemble_KJT ##"):
+            stream_ctx = (
+                nullcontext()
+                if self._use_main_stream_for_dist_init
+                else torch.get_device_module(self._device).stream(self._stream)
+            )
             # Finish waiting on the dist_stream,
             # in case some delayed stream scheduling happens during the wait() call.
-            with torch.get_device_module(self._device).stream(self._stream):
+            with stream_ctx:
                 data = request.wait()
 
         # Make sure that both result of input_dist and context
