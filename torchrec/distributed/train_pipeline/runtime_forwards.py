@@ -9,6 +9,7 @@
 
 import itertools
 import logging
+from contextlib import nullcontext
 from typing import Dict, Generic, Iterable, List, Optional, Tuple, TypeVar, Union
 
 import torch
@@ -70,12 +71,11 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
     This pipeline is used in TrainPipelineSparseDist
     """
 
+    _use_main_stream_for_dist_init = False
+
     def __call__(self, *input, **kwargs) -> Awaitable:
         if self._name not in self._context.input_dist_tensors_requests:
             available_names = list(self._context.input_dist_tensors_requests.keys())
-            output_dist_names = list(
-                self._context.output_dist_embeddings_requests.keys()
-            )
             raise AssertionError(
                 f"Invalid PipelinedForward usage, input_dist of {self._name} "
                 f"is not available, probably consumed by others. "
@@ -84,17 +84,21 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
                 f"or the pipeline context was not properly populated for this "
                 f"iteration. Each embedding module (EBC, EC, etc.) can only be "
                 f"invoked once per forward pass when using pipelined training. "
-                f"Available input_dist names: {available_names}. "
-                f"Already completed output_dist names: {output_dist_names}."
+                f"Available input_dist names: {available_names}."
             )
         # we made a basic assumption that an embedding module (EBC, EC, etc.) should only be evoked only
         # once in the model's forward pass. For more details: https://github.com/meta-pytorch/torchrec/pull/3294
         request = self._context.input_dist_tensors_requests.pop(self._name)
         assert isinstance(request, Awaitable)
-        with record_function("## wait_sparse_data_dist ##"):
+        with record_function("## runtime_forward_assemble_KJT ##"):
+            stream_ctx = (
+                nullcontext()
+                if self._use_main_stream_for_dist_init
+                else torch.get_device_module(self._device).stream(self._stream)
+            )
             # Finish waiting on the dist_stream,
             # in case some delayed stream scheduling happens during the wait() call.
-            with torch.get_device_module(self._device).stream(self._stream):
+            with stream_ctx:
                 data = request.wait()
 
         # Make sure that both result of input_dist and context
@@ -113,9 +117,7 @@ class PipelinedForward(BaseForward[TrainPipelineContext]):
             data.record_stream(cur_stream)
             ctx.record_stream(cur_stream)
 
-        awaitable = self._module.compute_and_output_dist(ctx, data)
-        self._context.output_dist_embeddings_requests[self._name] = awaitable
-        return awaitable
+        return self._module.compute_and_output_dist(ctx, data)
 
 
 class EmbeddingPipelinedForward(BaseForward[EmbeddingTrainPipelineContext]):
