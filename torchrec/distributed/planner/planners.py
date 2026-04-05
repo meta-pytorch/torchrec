@@ -93,7 +93,10 @@ except Exception:
         return decorator
 
 
-from torchrec.distributed.logging_handlers import log_planning_result
+from torchrec.distributed.logging_handlers import (
+    log_offloading_summary,
+    log_planning_result,
+)
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -728,6 +731,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 num_proposals=str(self._num_proposals),
                 num_plans=str(self._num_plans),
             )
+
+            log_offloading_summary(best_plan, self.__class__.__name__)
 
             return sharding_plan
         else:
