@@ -30,7 +30,7 @@ from torch.distributed.tensor import DeviceMesh
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.collective_utils import create_on_rank_and_share_result
-from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.mc_embedding_modules import (
     BaseShardedManagedCollisionEmbeddingCollection,
@@ -325,6 +325,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
                     local_world_size=get_local_size(self._env.world_size),
                     world_size=self._env.world_size,
                     compute_device=self.device.type,
+                    pod_size=get_topology_domain_multiple(),
                 )
             )
             pg = self._env.process_group

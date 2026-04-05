@@ -82,12 +82,15 @@ def create_test_context(
     input_lengths: Optional[list] = None,  # pyrefly: ignore
     world_size: int = 8,
     local_world_size: int = 4,
+    intra_group_size: Optional[int] = None,
     device_bw: float = HBM_MEM_BW,
     is_pooled: bool = True,
     is_weighted: bool = False,
     comms_bw: float = 1000.0,
 ) -> ShardPerfContext:
     """Helper to create a ShardPerfContext for testing."""
+    if intra_group_size is None:
+        intra_group_size = local_world_size
     return ShardPerfContext(
         sharding_type=sharding_type,
         compute_kernel=compute_kernel,
@@ -98,6 +101,7 @@ def create_test_context(
         input_lengths=input_lengths or [10.0],
         world_size=world_size,
         local_world_size=local_world_size,
+        intra_group_size=intra_group_size,
         device_bw=device_bw,
         hbm_to_ddr_mem_bw=device_bw,
         is_pooled=is_pooled,
@@ -259,23 +263,49 @@ class TableRowWiseEvaluatorTest(unittest.TestCase):
         self.evaluator = TableRowWiseEvaluator()
         self.config = HardwarePerfConfig()
 
-    def test_batch_inputs_divisor_is_local_world_size(self) -> None:
-        """Test that TABLE_ROW_WISE divides batch inputs by local_world_size."""
-        ctx = create_test_context(world_size=8, local_world_size=4)
-        divisor = self.evaluator.get_batch_inputs_divisor(ctx)
-        self.assertEqual(divisor, 4)
+    def test_batch_inputs_divisor_is_intra_group_size(self) -> None:
+        """Test that TABLE_ROW_WISE divides batch inputs by intra_group_size."""
+        with self.subTest("pod_size_1"):
+            ctx = create_test_context(world_size=8, local_world_size=4)
+            self.assertEqual(self.evaluator.get_batch_inputs_divisor(ctx), 4)
+        with self.subTest("pod_size_gt_1"):
+            # GB200-like: lws=2, igs=4 (pod_size=2)
+            ctx = create_test_context(
+                world_size=64, local_world_size=2, intra_group_size=4
+            )
+            # Must use intra_group_size (4), not local_world_size (2)
+            self.assertEqual(self.evaluator.get_batch_inputs_divisor(ctx), 4)
 
-    def test_prefetch_divisor_is_local_world_size(self) -> None:
-        """Test that TABLE_ROW_WISE prefetch divisor is local_world_size."""
-        ctx = create_test_context(world_size=8, local_world_size=4)
-        divisor = self.evaluator.get_prefetch_divisor(ctx)
-        self.assertEqual(divisor, 4)
+    def test_prefetch_divisor_is_intra_group_size(self) -> None:
+        """Test that TABLE_ROW_WISE prefetch divisor is intra_group_size."""
+        with self.subTest("pod_size_1"):
+            ctx = create_test_context(world_size=8, local_world_size=4)
+            self.assertEqual(self.evaluator.get_prefetch_divisor(ctx), 4)
+        with self.subTest("pod_size_gt_1"):
+            ctx = create_test_context(
+                world_size=64, local_world_size=2, intra_group_size=4
+            )
+            self.assertEqual(self.evaluator.get_prefetch_divisor(ctx), 4)
 
     def test_compute_perf_returns_perf_object(self) -> None:
         """Test that compute_perf returns a Perf object."""
-        ctx = create_test_context(sharding_type=ShardingType.TABLE_ROW_WISE.value)
-        perf = self.evaluator.compute_perf(ctx, self.config)
-        self.assertIsNotNone(perf)
+        with self.subTest("pod_size_1"):
+            ctx = create_test_context(sharding_type=ShardingType.TABLE_ROW_WISE.value)
+            perf = self.evaluator.compute_perf(ctx, self.config)
+            self.assertIsNotNone(perf)
+        with self.subTest("pod_size_gt_1"):
+            # Verify no crash with pod_size > 1 topology
+            ctx = create_test_context(
+                sharding_type=ShardingType.TABLE_ROW_WISE.value,
+                world_size=64,
+                local_world_size=2,
+                intra_group_size=4,
+            )
+            perf = self.evaluator.compute_perf(ctx, self.config)
+            self.assertIsNotNone(perf)
+            # Verify num_twrw_groups is used (16 groups of 4, not 32 groups of 2)
+            self.assertEqual(ctx.num_twrw_groups, 16)
+            self.assertEqual(ctx.num_hosts, 32)
 
 
 class ColumnWiseEvaluatorTest(unittest.TestCase):

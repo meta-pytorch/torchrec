@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed._composable.contract import contract
-from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
 from torchrec.distributed.global_settings import get_propogate_device
 from torchrec.distributed.model_parallel import get_default_sharders
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
@@ -264,6 +264,7 @@ def _shard_modules(  # noqa: C901
                     local_world_size=get_local_size(env.world_size),
                     world_size=env.world_size,
                     compute_device=device.type,
+                    pod_size=get_topology_domain_multiple(),
                 )
             )
         pg = env.process_group
