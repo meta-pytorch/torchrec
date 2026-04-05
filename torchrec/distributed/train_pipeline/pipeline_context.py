@@ -35,9 +35,6 @@ class TrainPipelineContext:
         input_dist_tensors_requests (Dict[str, Awaitable[Any]]): Stores input dist
             requests in the tensors awaitable stage, which occurs after calling `wait()`
             on the splits awaitable.
-        output_dist_embeddings_requests (Dict[str, Awaitable[Any]]): Stores output dist
-            awaitables for pipelined modules, keyed by module FQN. Used for registering
-            backward hooks on the output dist tensors during the backward pass.
         module_contexts (Dict[str, Multistreamable]): Stores module contexts from the
             input dist for the current batch.
         module_contexts_next_batch (Dict[str, Multistreamable]): Stores module contexts
@@ -52,9 +49,6 @@ class TrainPipelineContext:
 
     input_dist_splits_requests: Dict[str, Awaitable[Any]] = field(default_factory=dict)
     input_dist_tensors_requests: Dict[str, Awaitable[Any]] = field(default_factory=dict)
-    output_dist_embeddings_requests: Dict[str, Awaitable[Any]] = field(
-        default_factory=dict
-    )
     module_contexts: Dict[str, Multistreamable] = field(default_factory=dict)
     module_contexts_next_batch: Dict[str, Multistreamable] = field(
         default_factory=dict
