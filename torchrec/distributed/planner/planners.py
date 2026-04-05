@@ -93,6 +93,13 @@ except Exception:
         return decorator
 
 
+from torchrec.distributed.logging_handlers import (
+    log_offloading_summary,
+    log_planning_result,
+    log_storage_reservation,
+)
+
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 
@@ -577,6 +584,18 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             global_hbm_available_gb=round(bytes_to_gb(global_storage_capacity.hbm), 3),
         )
 
+        dense_storage = getattr(self._storage_reservation, "_dense_storage", None)
+        kjt_storage = getattr(self._storage_reservation, "_kjt_storage", None)
+        log_storage_reservation(
+            reservation_type=storage_policy,
+            percentage=storage_percentage,
+            dense_hbm_bytes=dense_storage.hbm if dense_storage else None,
+            kjt_hbm_bytes=kjt_storage.hbm if kjt_storage else None,
+            original_hbm_per_rank=self._topology.devices[0].storage.hbm,
+            available_hbm_per_rank=storage_constraint.devices[0].storage.hbm,
+            planner_type=self.__class__.__name__,
+        )
+
         search_space = self._enumerator.enumerate(
             module=module,
             sharders=sharders,
@@ -719,6 +738,15 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 )
 
             validate_rank_assignment(sharding_plan, self._topology)
+
+            log_planning_result(
+                planner_type=self.__class__.__name__,
+                num_proposals=str(self._num_proposals),
+                num_plans=str(self._num_plans),
+            )
+
+            log_offloading_summary(best_plan, self.__class__.__name__)
+
             return sharding_plan
         else:
             global_storage_capacity = reduce(
@@ -777,6 +805,13 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     enumerator=self._enumerator,
                     debug=self._debug,
                 )
+
+            log_planning_result(
+                planner_type=self.__class__.__name__,
+                error_message=str(last_planner_error),
+                num_proposals=str(self._num_proposals),
+                num_plans=str(self._num_plans),
+            )
 
             if not lowest_storage.fits_in(global_storage_constraints):
                 raise PlannerError(
