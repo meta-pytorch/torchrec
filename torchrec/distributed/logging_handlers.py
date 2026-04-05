@@ -10,7 +10,7 @@ import functools
 import logging
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Callable, Dict, Generator, Optional, TypeVar
+from typing import Any, Callable, Dict, Generator, List, Optional, TypeVar
 
 from torchrec.distributed.logging_utils import (
     EventLoggingHandlerBase,
@@ -200,6 +200,56 @@ class TrainingOptimizationLogger(EventLoggingHandler):
         add_wait_counter: bool = False,
     ) -> Generator[None, None, None]:
         yield
+
+
+_UVM_KERNELS = frozenset(
+    {"fused_uvm_caching", "quant_uvm_caching", "fused_uvm", "quant_uvm"}
+)
+
+
+def detect_technique(
+    constraints: Optional[Dict] = None,  # type: ignore[type-arg]
+    best_plan: Optional[List] = None,  # type: ignore[type-arg]
+) -> OptimizationTechnique:
+    """Detect if EMO is active from constraints or plan. No-op OSS stub."""
+    return OptimizationTechnique.NONE
+
+
+def log_planning_result(
+    planner_type: str,
+    technique: OptimizationTechnique = OptimizationTechnique.NONE,
+    error_message: Optional[str] = None,
+    **extra_metadata: str,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_offloading_summary(best_plan: List, planner_type: str, technique: OptimizationTechnique = OptimizationTechnique.NONE) -> None:  # type: ignore[type-arg]
+    """No-op OSS stub."""
+    pass
+
+
+def log_storage_reservation(
+    reservation_type: str,
+    percentage: Optional[float] = None,
+    dense_hbm_bytes: Optional[int] = None,
+    kjt_hbm_bytes: Optional[int] = None,
+    original_hbm_per_rank: int = 0,
+    available_hbm_per_rank: int = 0,
+    planner_type: str = "",
+    technique: OptimizationTechnique = OptimizationTechnique.NONE,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_planner_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.NONE,
+) -> None:
+    """No-op OSS stub."""
+    pass
 
 
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
