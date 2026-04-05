@@ -10,7 +10,7 @@ import functools
 import logging
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Callable, Dict, Generator, Optional, TypeVar
+from typing import Any, Callable, Dict, Generator, List, Optional, TypeVar
 
 from torchrec.distributed.logging_utils import (
     EventLoggingHandlerBase,
@@ -200,6 +200,19 @@ class TrainingOptimizationLogger(EventLoggingHandler):
         add_wait_counter: bool = False,
     ) -> Generator[None, None, None]:
         yield
+
+
+_UVM_KERNELS = frozenset(
+    {"fused_uvm_caching", "quant_uvm_caching", "fused_uvm", "quant_uvm"}
+)
+
+
+def detect_technique(
+    constraints: Optional[Dict] = None,  # type: ignore[type-arg]
+    best_plan: Optional[List] = None,  # type: ignore[type-arg]
+) -> OptimizationTechnique:
+    """Detect if EMO is active from constraints or plan. No-op OSS stub."""
+    return OptimizationTechnique.NONE
 
 
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
