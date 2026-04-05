@@ -32,6 +32,7 @@ from torch.profiler import record_function
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
     FusedKJTListSplitsAwaitable,
+    KJTListAwaitable,
     KJTListSplitsAwaitable,
     KJTSplitsAllToAllMeta,
 )
@@ -172,6 +173,21 @@ def _clear_releasable_inputs(context: TrainPipelineContext) -> None:
         for kjt in early_released:
             kjt.clear_storage()
         early_released.clear()
+
+
+def _clear_input_dist_tensors(context: TrainPipelineContext) -> None:
+    """Free input tensor storage for all in-flight KJT AllToAll operations.
+
+    Iterates over input_dist_tensors_requests and calls clear_inputs() on each
+    KJTAllToAllTensorsAwaitable. This waits for the AllToAll collectives to
+    complete and frees the input tensor storage early, before _wait_impl() is
+    called during the model forward pass.
+    """
+    for request in context.input_dist_tensors_requests.values():
+        if isinstance(request, KJTListAwaitable):
+            for awaitable in request.awaitables:
+                if isinstance(awaitable, KJTAllToAllTensorsAwaitable):
+                    awaitable.clear_inputs()
 
 
 def _start_data_dist(
