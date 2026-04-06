@@ -10,7 +10,7 @@ import functools
 import logging
 from collections import defaultdict
 from enum import Enum
-from typing import Any, Callable, Dict, Generator, Optional, TypeVar
+from typing import Any, Callable, Dict, Generator, List, Optional, TypeVar
 
 from torchrec.distributed.logging_utils import (
     EventLoggingHandlerBase,
@@ -200,6 +200,11 @@ class TrainingOptimizationLogger(EventLoggingHandler):
         add_wait_counter: bool = False,
     ) -> Generator[None, None, None]:
         yield
+
+
+def detect_technique(items: List) -> OptimizationTechnique:  # type: ignore[type-arg]
+    """Detect if EMO is active. No-op OSS stub."""
+    return OptimizationTechnique.NONE
 
 
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
