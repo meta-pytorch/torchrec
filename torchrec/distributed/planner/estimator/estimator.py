@@ -166,7 +166,14 @@ class EmbeddingShardingPerfEvaluator(ABC):
         """
         Compute communication time for a two-level hierarchical collective.
 
-        This is used by TABLE_ROW_WISE which has:
+        NOTE: This base class method is NOT used by TableRowWiseEvaluator, which
+        overrides _default_fwd_comms and _default_bwd_comms directly. It uses
+        ctx.local_world_size for intra-host sizing, which is the physical
+        local_world_size — correct for RW but NOT for TWRW (which needs
+        intra_group_size). Any future subclass using this for TWRW must use
+        ctx.intra_group_size instead.
+
+        Used by:
         - Intra-host collective (within a node)
         - Inter-host collective (across nodes)
 
