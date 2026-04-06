@@ -1121,3 +1121,90 @@ class TestJsonSerializer(unittest.TestCase):
             qualname(EmbeddingBagCollection),
             "torchrec.modules.embedding_modules.EmbeddingBagCollection",
         )
+
+    def test_key_order_with_ebc_and_regroup_extra_args(self) -> None:
+        """Test prune_pytree_flatten_unflatten when the regroup node has
+        extra placeholder args (e.g. from unflatten adding mutation
+        intermediates with list arguments as placeholder inputs)."""
+        tb1_config = EmbeddingBagConfig(
+            name="t1",
+            embedding_dim=3,
+            num_embeddings=10,
+            feature_names=["f1"],
+        )
+        tb2_config = EmbeddingBagConfig(
+            name="t2",
+            embedding_dim=3,
+            num_embeddings=10,
+            feature_names=["f2"],
+        )
+        id_list_features = KeyedJaggedTensor.from_offsets_sync(
+            keys=["f1", "f2"],
+            values=torch.tensor([0, 1, 2, 3, 2]),
+            offsets=torch.tensor([0, 2, 3, 4, 5]),
+        )
+        ebc1 = EmbeddingBagCollection(
+            tables=[tb1_config, tb2_config],
+            is_weighted=False,
+        )
+        ebc2 = EmbeddingBagCollection(
+            tables=[tb2_config, tb1_config],
+            is_weighted=False,
+        )
+        ebc2.load_state_dict(ebc1.state_dict())
+        regroup = KTRegroupAsDict([["f1"], ["f2"]], ["group1", "group2"])
+
+        class mySparse(nn.Module):
+            def __init__(self, ebc, regroup):
+                super().__init__()
+                self.ebc = ebc
+                self.regroup = regroup
+                self.buf = nn.Buffer(torch.zeros(4, 3))
+
+            def forward(
+                self,
+                features: KeyedJaggedTensor,
+            ) -> Dict[str, torch.Tensor]:
+                kt = self.ebc(features)
+                result = self.regroup(keyed_tensors=[kt])
+                # Buffer mutation using cat (list arg) to exercise the
+                # multi-arg path in prune_pytree_flatten_unflatten
+                self.buf.copy_(torch.cat([result["group1"], result["group2"]], dim=0))
+                return result
+
+        class myModel(nn.Module):
+            def __init__(self, ebc, regroup):
+                super().__init__()
+                self.sparse = mySparse(ebc, regroup)
+
+            def forward(
+                self,
+                features: KeyedJaggedTensor,
+            ) -> Dict[str, torch.Tensor]:
+                return self.sparse(features)
+
+        model = myModel(ebc1, regroup)
+        eager_out = model(id_list_features)
+
+        model, sparse_fqns = encapsulate_ir_modules(model, JsonSerializer)
+        ep = torch.export.export(
+            model,
+            (id_list_features,),
+            {},
+            strict=False,
+            preserve_module_call_signature=(tuple(sparse_fqns)),
+        )
+        unflatten_ep = torch.export.unflatten(ep)
+        deserialized_model = decapsulate_ir_modules(
+            unflatten_ep,
+            JsonSerializer,
+            short_circuit_pytree_ebc_regroup=True,
+            finalize_interpreter_modules=True,
+        )
+
+        # pyrefly: ignore[missing-attribute]
+        deserialized_model.sparse.ebc = ebc2
+
+        deserialized_out = deserialized_model(id_list_features)
+        for key in eager_out.keys():
+            torch.testing.assert_close(deserialized_out[key], eager_out[key])
