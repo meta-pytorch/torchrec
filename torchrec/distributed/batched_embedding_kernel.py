@@ -74,10 +74,7 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
-from torchrec.distributed.fused_params import (
-    get_embedding_table_index_type,
-    get_embedding_table_offset_type,
-)
+from torchrec.distributed.model_tracker.types import IndexedLookup
 from torchrec.distributed.shards_wrapper import LocalShardsWrapper
 from torchrec.distributed.types import (
     LazyAwaitable,
@@ -1745,12 +1742,6 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
         self._feature_table_map: List[int] = []
         self.table_name_to_count: Dict[str, int] = {}
         self._param_per_table: Dict[str, TableBatchedEmbeddingSlice] = {}
-        self._embedding_table_index_type: torch.dtype = get_embedding_table_index_type(
-            config.fused_params
-        )
-        self._embedding_table_offset_type: torch.dtype = (
-            get_embedding_table_offset_type(config.fused_params)
-        )
 
         for idx, table_config in enumerate(self._config.embedding_tables):
             self._local_rows.append(table_config.local_rows)
@@ -1822,13 +1813,13 @@ class BaseBatchedEmbedding(BaseEmbedding, Generic[SplitWeightType]):
 
         if len(forward_args) == 0:
             return self.emb_module(
-                indices=features.values().to(self._embedding_table_index_type),
-                offsets=features.offsets().to(self._embedding_table_offset_type),
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
             )
         else:
             return self.emb_module(
-                indices=features.values().to(self._embedding_table_index_type),
-                offsets=features.offsets().to(self._embedding_table_offset_type),
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
                 **forward_args,
             )
 
@@ -2622,23 +2613,6 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
 
-    def wait_for_forward(self) -> None:
-        """
-        Wait for any pending Triton forward kernel to complete.
-
-        This should be called before collective operations (e.g., ALLTOALL for
-        output distribution) to ensure the forward kernel has completed on all
-        ranks. Without this synchronization, NCCL collectives may time out
-        because different ranks reach the collective at different times (since
-        Triton kernels run asynchronously).
-
-        The underlying TritonTableBatchedEmbeddingBags records a CUDA event after
-        the forward kernel completes, and this method waits on that event.
-        """
-        if hasattr(self._emb_module, "wait_for_forward"):
-            # pyrefly: ignore [not-callable]
-            self._emb_module.wait_for_forward()
-
 
 class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
     """
@@ -2940,12 +2914,6 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         self._lengths_per_emb: List[int] = []
         self.table_name_to_count: Dict[str, int] = {}
         self._param_per_table: Dict[str, TableBatchedEmbeddingSlice] = {}
-        self._embedding_table_index_type: torch.dtype = get_embedding_table_index_type(
-            config.fused_params
-        )
-        self._embedding_table_offset_type: torch.dtype = (
-            get_embedding_table_offset_type(config.fused_params)
-        )
 
         for idx, table_config in enumerate(self._config.embedding_tables):
             self._local_rows.append(table_config.local_rows)
@@ -3041,14 +3009,14 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
 
         if len(forward_args) == 0:
             return self.emb_module(
-                indices=features.values().to(self._embedding_table_index_type),
-                offsets=features.offsets().to(self._embedding_table_offset_type),
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
                 per_sample_weights=weights,
             )
         else:
             return self.emb_module(
-                indices=features.values().to(self._embedding_table_index_type),
-                offsets=features.offsets().to(self._embedding_table_offset_type),
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
                 per_sample_weights=weights,
                 **forward_args,
             )
@@ -3863,11 +3831,6 @@ class TritonBatchedFusedEmbeddingBag(
         optimizer = fused_params.get("optimizer", OptimType.EXACT_SGD)
         learning_rate = fused_params.get("learning_rate", 0.01)
         eps = fused_params.get("eps", 0.1)
-        output_dtype_sparse: SparseType = fused_params.get(
-            "output_dtype", SparseType.FP32
-        )
-        output_dtype = output_dtype_sparse.as_dtype()
-        stochastic_rounding = fused_params.get("stochastic_rounding", True)
 
         # Create Triton TBE module with feature_table_map for correct batch size handling
         self._emb_module: TritonTableBatchedEmbeddingBags = (
@@ -3875,8 +3838,6 @@ class TritonBatchedFusedEmbeddingBag(
                 embedding_specs=list(zip(self._local_rows, self._local_cols)),
                 feature_table_map=self._feature_table_map,
                 weights_precision=weights_precision.as_dtype(),
-                output_dtype=output_dtype,
-                stochastic_rounding=stochastic_rounding,
                 learning_rate=learning_rate,
                 eps=eps,
                 optimizer=optimizer,
@@ -3947,18 +3908,6 @@ class TritonBatchedFusedEmbeddingBag(
     @property
     def fused_optimizer(self) -> FusedOptimizer:
         return self._optim
-
-    def wait_for_forward(self) -> None:
-        """
-        Wait for any pending Triton forward kernel to complete on the current stream.
-
-        This is called before NCCL collectives (e.g., AllToAll in output_dist) to ensure
-        the embedding lookup has fully completed. While Triton kernels run on the same
-        stream as PyTorch operations, NCCL collectives may run on a separate NCCL stream.
-        This method ensures proper synchronization via CUDA events.
-        """
-        if hasattr(self._emb_module, "wait_for_forward"):
-            self._emb_module.wait_for_forward()
 
     def forward(
         self,
