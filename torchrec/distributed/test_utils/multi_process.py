@@ -242,7 +242,8 @@ def run_multi_process_func(
 ) -> List[Any]:
     """ """
     os.environ["MASTER_ADDR"] = str("localhost")
-    os.environ["MASTER_PORT"] = str(get_free_port())
+    if "MASTER_PORT" not in os.environ:
+        os.environ["MASTER_PORT"] = str(get_free_port())
     os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
     os.environ["NCCL_SOCKET_IFNAME"] = "lo"
 
