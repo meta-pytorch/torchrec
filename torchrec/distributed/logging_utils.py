@@ -37,6 +37,7 @@ class StackLayer(Enum):
 class OptimizationTechnique(Enum):
     """Training optimization techniques."""
 
+    NONE = "none"
     EMO = "emo"
     ITEP = "itep"
     ALBT = "albt"
