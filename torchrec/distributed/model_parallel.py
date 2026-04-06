@@ -428,7 +428,9 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         ):
             module_id_cache: Dict[int, ShardedModule] = {}
         else:
+            # pyrefly: ignore[bad-assignment]
             module_id_cache = None
+        # pyrefly: ignore[bad-argument-type]
         return self._shard_modules_impl(module, module_id_cache=module_id_cache)
 
     def _init_delta_tracker(
@@ -459,9 +461,11 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         ):
             module_id_cache: Dict[int, KeyedOptimizer] = {}
         else:
+            # pyrefly: ignore[bad-assignment]
             module_id_cache = None
         # pyre-ignore [6]
         return CombinedOptimizer(
+            # pyrefly: ignore[bad-argument-type]
             self._fused_optim_impl(module, [], module_id_cache=module_id_cache)
         )
 
@@ -484,7 +488,9 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
                         f"(module ID {module_id} at different path)"
                     )
                     return fused_optims
-                module_id_cache[module_id] = module.fused_optimizer
+                module_id_cache[module_id] = (  # pyrefly: ignore[unsupported-operation]
+                    module.fused_optimizer
+                )
             fused_optims.append((path, module.fused_optimizer))
             return fused_optims
 
@@ -530,12 +536,14 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             sharder_key = type(module)
             sharded_module = self._sharder_map[sharder_key].shard(
                 module,
+                # pyrefly: ignore[bad-argument-type]
                 module_sharding_plan,
                 self._env,
                 self.device,
                 path,
             )
             if module_id_cache is not None:
+                # pyrefly: ignore[unbound-name, unsupported-operation]
                 module_id_cache[module_id] = sharded_module
             return sharded_module
 
@@ -625,6 +633,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         prefix: str = "",
         keep_vars: bool = False,
     ) -> Dict[str, Any]:
+        # pyrefly: ignore[no-matching-overload]
         state_dict = get_module(self).state_dict(
             destination=destination, prefix=prefix, keep_vars=keep_vars
         )
@@ -1284,12 +1293,14 @@ class DMPCollection(DistributedModelParallel):
 
             sharded_module = self._sharder_map[sharder_key].shard(
                 module,
+                # pyrefly: ignore[bad-argument-type]
                 module_sharding_plan,
                 env,
                 self.device,
                 path,
             )
             if module_id_cache is not None:
+                # pyrefly: ignore[unbound-name]
                 module_id_cache[module_id] = sharded_module
             return sharded_module
 
@@ -1346,6 +1357,7 @@ class DMPCollection(DistributedModelParallel):
         replica_ranks = mesh[:, index_root[1][0]].tolist()
 
         for emb_kernel, table_name in ctx.hash_zch_modules:
+            # pyrefly: ignore[missing-attribute]
             mpzch = emb_kernel._managed_collision_collection._managed_collision_modules[
                 table_name
             ]
@@ -1360,6 +1372,7 @@ class DMPCollection(DistributedModelParallel):
             )
 
             # Sync the weights and optimizers of the table
+            # pyrefly: ignore[not-callable]
             emb_kernel.sync_hash_zch_weights(
                 table_name,
                 rank_to_global,
@@ -1487,6 +1500,7 @@ class DMPCollection(DistributedModelParallel):
         for ctx in self._ctxs:
             if ctx.sharding_strategy == ShardingStrategy.FULLY_SHARDED:
                 for _, sharded_module in ctx.modules_to_sync:
+                    # pyrefly: ignore[not-callable]
                     sharded_module.ensure_reduce_scatter_complete()
 
     def _register_sparse_arch_forward_hook(self, rs_awaitable_hook_module) -> None:
@@ -1616,10 +1630,12 @@ class DMPCollection(DistributedModelParallel):
                     if shards is not None:
                         for shard in shards:
                             if use_inter_host_allreduce:
+                                # pyrefly: ignore[missing-attribute]
                                 shard_rank = shard.placement._rank + (
                                     (rank // sharding_group_size) * sharding_group_size
                                 )
                             else:
+                                # pyrefly: ignore[missing-attribute]
                                 shard_rank = shard.placement._rank * step + group_start
                             shard.placement = _remote_device(
                                 f"rank:{shard_rank}/{self._device.type}:{shard_rank % get_local_size()}"
@@ -1691,6 +1707,7 @@ class DMPCollection(DistributedModelParallel):
             for _, child in module.named_children():
                 _find_sharded_modules(child, module)
 
+        # pyrefly: ignore[bad-argument-type]
         _find_sharded_modules(self._dmp_wrapped_module, None)
         return sharded_modules
 
