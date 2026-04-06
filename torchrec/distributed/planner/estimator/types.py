@@ -514,6 +514,7 @@ class ShardPerfContext:
     # Topology info
     world_size: int = 1
     local_world_size: int = 1
+    intra_group_size: int = 1  # pod_size * local_world_size; TWRW group size
 
     # Data type sizes
     input_data_type_size: float = BIGINT_DTYPE
@@ -759,6 +760,7 @@ class ShardPerfContext:
                 input_lengths=sharding_option.input_lengths,
                 world_size=topology.world_size,
                 local_world_size=topology.local_world_size,
+                intra_group_size=topology.intra_group_size,
                 input_data_type_size=input_data_type_size,
                 table_data_type_size=table_data_type_size,
                 output_data_type_size=output_data_type_size,
@@ -794,8 +796,13 @@ class ShardPerfContext:
 
     @property
     def num_hosts(self) -> int:
-        """Number of hosts in the topology."""
+        """Number of physical hosts in the topology."""
         return max(1, self.world_size // self.local_world_size)
+
+    @property
+    def num_twrw_groups(self) -> int:
+        """Number of TWRW groups (virtual hosts) in the topology."""
+        return max(1, self.world_size // self.intra_group_size)
 
     @property
     def batch_inputs(self) -> float:
