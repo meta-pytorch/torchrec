@@ -11,12 +11,15 @@ import logging
 import queue
 import threading
 import time
+import traceback
 from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 import torch
 from torch import distributed as dist
 from torch.monitor import _WaitCounter
 from torch.profiler import record_function
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+from torchrec.distributed.logging_utils import EventType
 from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
 from torchrec.metrics.deferrable_metrics import DeferrableMetrics
 from torchrec.metrics.metric_job_types import (
@@ -124,10 +127,46 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             "all_gather_time_ms", log_interval=10
         )
 
+        # Correctness counters
+        self._total_updates_enqueued: int = 0
+        self._total_updates_processed: int = 0
+        self._total_computes_enqueued: int = 0
+        self._total_computes_processed: int = 0
+        self._update_errors: int = 0
+        self._compute_errors: int = 0
+        self._last_processed_batch_id: int = -1
+        self._monotonicity_violations: int = 0
+
         self.update_thread.start()
         self.compute_thread.start()
 
         logger.info("CPUOffloadedRecMetricModule initialization complete.")
+        self._log_event(
+            "init",
+            EventType.INFO,
+            {
+                "model_out_device": str(model_out_device),
+                "update_queue_size": str(update_queue_size),
+                "compute_queue_size": str(compute_queue_size),
+            },
+        )
+
+    def _log_event(
+        self,
+        event_name: str,
+        event_type: EventType,
+        metadata: Optional[Dict[str, str]] = None,
+        error_message: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+    ) -> None:
+        EventLoggingHandler.log_event(
+            component=TorchrecComponent.REC_METRICS.value,
+            event_name=f"CPUOffloadedRecMetricModule.{event_name}",
+            event_type=event_type,
+            metadata=metadata,
+            error_message=error_message,
+            stack_trace=stack_trace,
+        )
 
     @override
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
@@ -161,8 +200,18 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                     kwargs=kwargs,
                 )
             )
+            self._total_updates_enqueued += 1
             self.update_queue_size_logger.add(self.update_queue.qsize())
         except queue.Full:
+            self._log_event(
+                "enqueue_update",
+                EventType.FAILURE,
+                {
+                    "update_queue_size": str(self.update_queue.qsize()),
+                    "total_updates_enqueued": str(self._total_updates_enqueued),
+                },
+                error_message="update metric queue is full",
+            )
             raise RecMetricException("update metric queue is full.")
 
     def _transfer_to_cpu(
@@ -237,7 +286,15 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             if self.throughput_metric:
                 self.throughput_metric.update()
 
-            self.update_job_time_logger.add((time.time() - start_time) * 1000)
+            elapsed_ms = (time.time() - start_time) * 1000
+            self.update_job_time_logger.add(elapsed_ms)
+            self._total_updates_processed += 1
+
+            # Monotonicity check: trained_batches should increase
+            batch_id = self.trained_batches
+            if batch_id <= self._last_processed_batch_id:
+                self._monotonicity_violations += 1
+            self._last_processed_batch_id = batch_id
 
     @override
     def shutdown(self) -> None:
@@ -260,15 +317,57 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         self.compute_metrics_time_logger.log_percentiles()
         self.all_gather_time_logger.log_percentiles()
 
+        correctness_metadata = {
+            "total_updates_enqueued": str(self._total_updates_enqueued),
+            "total_updates_processed": str(self._total_updates_processed),
+            "total_computes_enqueued": str(self._total_computes_enqueued),
+            "total_computes_processed": str(self._total_computes_processed),
+            "update_errors": str(self._update_errors),
+            "compute_errors": str(self._compute_errors),
+            "monotonicity_violations": str(self._monotonicity_violations),
+            "update_queue_remaining": str(self.update_queue.qsize()),
+            "compute_queue_remaining": str(self.compute_queue.qsize()),
+            "update_thread_alive": str(self.update_thread.is_alive()),
+            "compute_thread_alive": str(self.compute_thread.is_alive()),
+        }
+
+        updates_match = self._total_updates_enqueued == self._total_updates_processed
+        computes_match = self._total_computes_enqueued == self._total_computes_processed
+
+        if not updates_match or not computes_match or self._monotonicity_violations > 0:
+            logger.warning(
+                f"ZORM correctness issue: updates_match={updates_match}, "
+                f"computes_match={computes_match}, "
+                f"monotonicity_violations={self._monotonicity_violations}"
+            )
+
         if self.update_thread.is_alive():
+            self._log_event(
+                "shutdown",
+                EventType.FAILURE,
+                correctness_metadata,
+                error_message="update thread did not shut down gracefully",
+            )
             raise RecMetricException(
                 f"update thread did not shut down gracefully. remaining queue size: {self.update_queue.qsize()}"
             )
         if self.compute_thread.is_alive():
+            self._log_event(
+                "shutdown",
+                EventType.FAILURE,
+                correctness_metadata,
+                error_message="compute thread did not shut down gracefully",
+            )
             raise RecMetricException(
                 f"compute thread did not shut down gracefully. remaining queue size: {self.compute_queue.qsize()}"
             )
-        logger.info("CPUOffloadedRecMetricModule has been successfully shutdown.")
+
+        self._log_event("shutdown", EventType.SUCCESS, correctness_metadata)
+        logger.info(
+            f"CPUOffloadedRecMetricModule shutdown complete. "
+            f"updates={self._total_updates_processed}/{self._total_updates_enqueued}, "
+            f"computes={self._total_computes_processed}/{self._total_computes_enqueued}"
+        )
 
     @override
     def compute(self) -> DeferrableMetrics:
@@ -298,6 +397,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             raise self._captured_exception
 
         self.update_queue.put_nowait(SynchronizationMarker(metrics_future))
+        self._total_computes_enqueued += 1
         self.update_queue_size_logger.add(self.update_queue.qsize())
         return DeferrableMetrics(metrics_future)
 
@@ -368,6 +468,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                         (time.time() - compute_start_ms) * 1000
                     )
                     self.compute_count += 1
+                    self._total_computes_processed += 1
                     self._adjust_compute_interval()
                     return computed_metrics
 
@@ -383,7 +484,18 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             try:
                 self._do_work(self.update_queue)
             except Exception as e:
+                self._update_errors += 1
                 logger.exception(f"Exception in update loop: {e}")
+                self._log_event(
+                    "update_loop",
+                    EventType.FAILURE,
+                    {
+                        "update_queue_size": str(self.update_queue.qsize()),
+                        "total_updates_processed": str(self._total_updates_processed),
+                    },
+                    error_message=str(e),
+                    stack_trace=traceback.format_exc(),
+                )
                 self._captured_exception = e
                 self._captured_exception_event.set()
                 raise e
@@ -402,7 +514,18 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             try:
                 self._do_work(self.compute_queue)
             except Exception as e:
+                self._compute_errors += 1
                 logger.exception(f"Exception in compute loop: {e}")
+                self._log_event(
+                    "compute_loop",
+                    EventType.FAILURE,
+                    {
+                        "compute_queue_size": str(self.compute_queue.qsize()),
+                        "total_computes_processed": str(self._total_computes_processed),
+                    },
+                    error_message=str(e),
+                    stack_trace=traceback.format_exc(),
+                )
                 self._captured_exception = e
                 self._captured_exception_event.set()
                 raise e
