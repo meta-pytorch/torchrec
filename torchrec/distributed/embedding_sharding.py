@@ -17,6 +17,7 @@ from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 import torch
 from torch import distributed as dist, nn
 from torchrec.distributed.dist_data import (
+    _check_int_overflow,
     KJTAllToAllTensorsAwaitable,
     SplitsAllToAllAwaitable,
 )
@@ -880,6 +881,23 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
                 else []
             )
         ]
+
+        # Log the stride tensors being sent into the fused AllToAll.
+        # These are the input values — if they are already corrupted,
+        # the bug is upstream of the collective. See S641918.
+        if splits_tensors and pg is not None:
+            for idx, t in enumerate(splits_tensors):
+                t_list = t.tolist()
+                _check_int_overflow(
+                    "FusedKJTListSplitsAwaitable",
+                    t_list,
+                    f"splits_tensor[{idx}] (BEFORE fused AllToAll)",
+                    rank=pg.rank(),
+                    world_size=pg.size(),
+                    shape=list(t.shape),
+                    dtype=t.dtype,
+                )
+
         self._splits_awaitable: Optional[SplitsAllToAllAwaitable] = (
             SplitsAllToAllAwaitable(
                 input_tensors=splits_tensors,
@@ -908,6 +926,18 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
             else:
                 output_splits = splits[:-1]
                 stride_per_rank = splits[-1]
+
+            # Log corrupted stride_per_rank at the point where splits
+            # are unpacked. See S641918.
+            if stride_per_rank is not None:
+                _check_int_overflow(
+                    "ListOfKJTListSplitsAwaitable",
+                    stride_per_rank,
+                    "stride_per_rank",
+                    awaitable_splits=awaitable.splits,
+                    keys=awaitable.keys,
+                )
+
             tensors_awaitables.append(
                 KJTAllToAllTensorsAwaitable(
                     pg=awaitable.pg,
