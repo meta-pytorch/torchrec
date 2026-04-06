@@ -12,7 +12,12 @@ from collections.abc import Mapping
 from concurrent.futures import Future
 from unittest.mock import patch
 
-from torchrec.metrics.deferrable_metrics import DeferrableMetrics
+import torch
+from torchrec.metrics.deferrable_metrics import (
+    DeferrableMetrics,
+    device_supports_async,
+    transfer_tensors_to_cpu,
+)
 
 
 class TestDeferrableMetrics(unittest.TestCase):
@@ -255,3 +260,59 @@ class TestDeferrableMetrics(unittest.TestCase):
         with self.assertRaises(ValueError):
             dm.resolve()
         self.assertFalse(dm.is_resolved())
+
+    def test_future_backed_update_dict_with_dtoh(self) -> None:
+        f: Future[dict] = Future()
+        dm = DeferrableMetrics(f)
+        dm.update({"cpu_val": torch.tensor([1.0])})
+        f.set_result({"original": torch.tensor([2.0])})
+        received: list[dict] = []
+        dm.subscribe(lambda d: received.append(d))
+        self.assertEqual(len(received), 1)
+        torch.testing.assert_close(received[0]["original"], torch.tensor([2.0]))
+        torch.testing.assert_close(received[0]["cpu_val"], torch.tensor([1.0]))
+        self.assertEqual(received[0]["cpu_val"].device.type, "cpu")
+
+
+class TransferTensorsToCpuTest(unittest.TestCase):
+
+    def test_cpu_tensors_passthrough(self) -> None:
+        tensors: dict[str, torch.Tensor] = {
+            "predictions": torch.tensor([1.0, 2.0]),
+            "labels": torch.tensor([0.0, 1.0]),
+        }
+        cpu_tensors, event = transfer_tensors_to_cpu(tensors)
+        self.assertEqual(len(cpu_tensors), 2)
+        self.assertIsNone(event)
+        for key, tensor in cpu_tensors.items():
+            self.assertEqual(tensor.device.type, "cpu")
+            torch.testing.assert_close(tensor, tensors[key])
+
+    def test_non_tensor_values_preserved(self) -> None:
+        # pyre-ignore[6]
+        tensors: dict[str, torch.Tensor] = {
+            "predictions": torch.tensor([1.0]),
+            "name": "task1",
+            "count": 42,
+        }
+        cpu_tensors, event = transfer_tensors_to_cpu(tensors)
+        self.assertEqual(cpu_tensors["name"], "task1")
+        self.assertEqual(cpu_tensors["count"], 42)
+        torch.testing.assert_close(cpu_tensors["predictions"], torch.tensor([1.0]))
+
+    def test_empty_dict(self) -> None:
+        cpu_tensors, event = transfer_tensors_to_cpu({})
+        self.assertEqual(len(cpu_tensors), 0)
+        self.assertIsNone(event)
+
+
+class DeviceSupportsAsyncTest(unittest.TestCase):
+
+    def test_cuda_device_supported(self) -> None:
+        self.assertTrue(device_supports_async(torch.device("cuda")))
+
+    def test_cuda_indexed_device_supported(self) -> None:
+        self.assertTrue(device_supports_async(torch.device("cuda:1")))
+
+    def test_cpu_device_not_supported(self) -> None:
+        self.assertFalse(device_supports_async(torch.device("cpu")))
