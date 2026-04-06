@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding_sharding import EmbeddingShardingInfo
 from torchrec.distributed.types import (
     EmbeddingModuleShardingPlan,
@@ -242,6 +243,7 @@ def _prepare_shard_distribution_comm_ops(
     new_opt_state: Optional[Dict[str, Dict[str, Dict[str, ShardedTensor]]]] = None,
     has_optimizer: bool = False,
     process_group: Optional[dist.ProcessGroup] = None,
+    local_world_size: int = 8,
 ) -> None:
     """
     Prepares the point-to-point (P2P) communication operations required to redistribute sharded tensors
@@ -294,7 +296,7 @@ def _prepare_shard_distribution_comm_ops(
             # Update the shard size with new size
             shard_size = [shard_size[0], split_offsets[1] - split_offsets[0], shard_id]
 
-            intra = _is_intra_comm(src_rank, dst_rank, 8)
+            intra = _is_intra_comm(src_rank, dst_rank, local_world_size)
             # Create unique tag for P2P communication (32-bit limit for PyTorch)
 
             tag = _generate_tag(
@@ -381,7 +383,7 @@ def _prepare_shard_distribution_comm_ops(
 
         tensor_col_offset = 0
         for _, src_rank, tag, tag_opt, shard_size in receiving_shards_metadata:
-            intra = _is_intra_comm(src_rank, rank, 8)
+            intra = _is_intra_comm(src_rank, rank, local_world_size)
             end_col_offset = tensor_col_offset + shard_size[1]
             receving_tensor_view = local_tensor_dst[:, tensor_col_offset:end_col_offset]
             copy = False
@@ -796,6 +798,7 @@ def prepare_comm_ops(
         extend_shard_name=extend_shard_name,
         has_optimizer=has_optimizer,
         process_group=pg,
+        local_world_size=get_local_size(world_size),
     )
 
     return comm_dict
