@@ -217,4 +217,9 @@ def log_planning_result(
     pass
 
 
+def log_offloading_summary(best_plan: List, planner_type: str, technique: OptimizationTechnique = OptimizationTechnique.NONE) -> None:  # type: ignore[type-arg]
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
