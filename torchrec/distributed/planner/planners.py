@@ -93,6 +93,9 @@ except Exception:
         return decorator
 
 
+from torchrec.distributed.logging_handlers import log_planning_result
+
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 
@@ -720,6 +723,13 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 )
 
             validate_rank_assignment(sharding_plan, self._topology)
+
+            log_planning_result(
+                planner_type=self.__class__.__name__,
+                num_proposals=str(self._num_proposals),
+                num_plans=str(self._num_plans),
+            )
+
             return sharding_plan
         else:
             global_storage_capacity = reduce(
@@ -778,6 +788,13 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     enumerator=self._enumerator,
                     debug=self._debug,
                 )
+
+            log_planning_result(
+                planner_type=self.__class__.__name__,
+                error_message=str(last_planner_error),
+                num_proposals=str(self._num_proposals),
+                num_plans=str(self._num_plans),
+            )
 
             if not lowest_storage.fits_in(global_storage_constraints):
                 raise PlannerError(
