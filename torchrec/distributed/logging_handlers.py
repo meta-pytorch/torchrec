@@ -222,4 +222,18 @@ def log_offloading_summary(best_plan: List, planner_type: str, technique: Optimi
     pass
 
 
+def log_storage_reservation(
+    reservation_type: str,
+    percentage: Optional[float] = None,
+    dense_hbm_bytes: Optional[int] = None,
+    kjt_hbm_bytes: Optional[int] = None,
+    original_hbm_per_rank: int = 0,
+    available_hbm_per_rank: int = 0,
+    planner_type: str = "",
+    technique: OptimizationTechnique = OptimizationTechnique.NONE,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
