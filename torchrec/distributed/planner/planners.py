@@ -18,7 +18,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
-from torchrec.distributed.comm import get_local_size
+from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.planner.constants import BATCH_SIZE, MAX_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
@@ -102,7 +102,7 @@ def to_sharding_plan(
 ) -> ShardingPlan:
 
     compute_device = topology.compute_device
-    local_size = topology.intra_group_size
+    local_size = topology.local_world_size
 
     plan = {}
     for sharding_option in sharding_options:
@@ -301,6 +301,7 @@ class EmbeddingPlannerBase(ShardingPlanner):
                 local_world_size=get_local_size(),
                 world_size=dist.get_world_size(),
                 compute_device=compute_device,
+                pod_size=get_topology_domain_multiple(),
             )
         self._topology: Topology = topology
         self._batch_size: int = batch_size if batch_size else BATCH_SIZE
