@@ -119,21 +119,35 @@ def _get_recat(
             output_offset = [0] + list(
                 itertools.accumulate(permuted_batch_size_per_feature)
             )
-            recat_tensor = torch.tensor(
-                recat,
-                device=device,
-                dtype=torch.int32,
-            )
-            input_offset_tensor = torch.tensor(
-                input_offset,
-                device=device,
-                dtype=torch.int32,
-            )
-            output_offset_tensor = torch.tensor(
-                output_offset,
-                device=device,
-                dtype=torch.int32,
-            )
+
+            try:
+                recat_tensor = torch.tensor(
+                    recat,
+                    device=device,
+                    dtype=torch.int32,
+                )
+                input_offset_tensor = torch.tensor(
+                    input_offset,
+                    device=device,
+                    dtype=torch.int32,
+                )
+                output_offset_tensor = torch.tensor(
+                    output_offset,
+                    device=device,
+                    dtype=torch.int32,
+                )
+            except RuntimeError as e:
+                logger.error(
+                    f"_get_recat: int32 tensor creation failed: {e}. "
+                    f"batch_size_per_rank={batch_size_per_rank}, "
+                    f"input_offset={input_offset}, "
+                    f"output_offset={output_offset}, "
+                    f"local_split={local_split}, "
+                    f"num_splits={num_splits}, "
+                    f"stagger={stagger}. "
+                )
+                raise
+
             recat = torch.ops.fbgemm.expand_into_jagged_permute(
                 recat_tensor,
                 input_offset_tensor,
