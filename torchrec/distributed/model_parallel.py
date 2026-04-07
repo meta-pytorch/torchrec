@@ -426,7 +426,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         if torch._utils_internal.justknobs_check(
             "pytorch/torchrec:enable_module_id_cache_for_dmp_shard_modules"
         ):
-            module_id_cache: Dict[int, ShardedModule] = {}
+            module_id_cache: Optional[Dict[int, ShardedModule]] = {}
         else:
             module_id_cache = None
         return self._shard_modules_impl(module, module_id_cache=module_id_cache)
@@ -457,11 +457,11 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         if torch._utils_internal.justknobs_check(
             "pytorch/torchrec:enable_module_id_cache_for_dmp_shard_modules"
         ):
-            module_id_cache: Dict[int, KeyedOptimizer] = {}
+            module_id_cache: Optional[Dict[int, KeyedOptimizer]] = {}
         else:
             module_id_cache = None
-        # pyre-ignore [6]
         return CombinedOptimizer(
+            # pyre-ignore [6]
             self._fused_optim_impl(module, [], module_id_cache=module_id_cache)
         )
 
@@ -470,7 +470,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         module: nn.Module,
         fused_optims: List[Tuple[str, KeyedOptimizer]],
         path: str = "",
-        module_id_cache: Optional[Dict[str, KeyedOptimizer]] = None,
+        module_id_cache: Optional[Dict[int, KeyedOptimizer]] = None,
     ) -> List[Tuple[str, KeyedOptimizer]]:
         if isinstance(module, FusedOptimizerModule):
             if module_id_cache is not None:
@@ -502,14 +502,15 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         self,
         module: nn.Module,
         path: str = "",
-        module_id_cache: Optional[Dict[str, ShardedModule]] = None,
+        module_id_cache: Optional[Dict[int, ShardedModule]] = None,
     ) -> nn.Module:
         # pre-sharded module
         if isinstance(module, ShardedModule):
             return module
 
+        # Only used when module_id_cache is provided
+        module_id = id(module)
         if module_id_cache is not None:
-            module_id = id(module)
             if module_id in module_id_cache:
                 """
                 This is likely due to a single sparse module being used in multiple places in the model,
@@ -530,7 +531,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             sharder_key = type(module)
             sharded_module = self._sharder_map[sharder_key].shard(
                 module,
-                module_sharding_plan,
+                module_sharding_plan,  # pyre-ignore[6]
                 self._env,
                 self.device,
                 path,
@@ -625,6 +626,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         prefix: str = "",
         keep_vars: bool = False,
     ) -> Dict[str, Any]:
+        # pyre-ignore[6]
         state_dict = get_module(self).state_dict(
             destination=destination, prefix=prefix, keep_vars=keep_vars
         )
@@ -1247,8 +1249,9 @@ class DMPCollection(DistributedModelParallel):
         if isinstance(module, ShardedModule):
             return module
 
+        # Only used only when module_id_cache is provided
+        module_id: int = id(module)
         if module_id_cache is not None:
-            module_id = id(module)
             if module_id in module_id_cache:
                 """
                 This is likely due to a single sparse module being used in multiple places in the model,
@@ -1284,7 +1287,7 @@ class DMPCollection(DistributedModelParallel):
 
             sharded_module = self._sharder_map[sharder_key].shard(
                 module,
-                module_sharding_plan,
+                module_sharding_plan,  # pyre-ignore[6]
                 env,
                 self.device,
                 path,
@@ -1332,7 +1335,7 @@ class DMPCollection(DistributedModelParallel):
         """
         Syncs the DMP identites/metadata/weights of ManagedCollisionModule across process group.
 
-        It syncs the hash identities across replica by taking merging them all together.
+        It syncs the hash identities across replica by merging them all together.
         The weights of the identities that did not exist in the final merge are zeroed out.
         The weights of the identities that are in final merge are averaged across those replica
         that have them.
@@ -1346,13 +1349,17 @@ class DMPCollection(DistributedModelParallel):
         replica_ranks = mesh[:, index_root[1][0]].tolist()
 
         for emb_kernel, table_name in ctx.hash_zch_modules:
+            emb_kernel = cast(
+                BaseShardedManagedCollisionEmbeddingCollection, emb_kernel
+            )
             mpzch = emb_kernel._managed_collision_collection._managed_collision_modules[
                 table_name
             ]
+            # pyre-ignore[16]
             reserved_indices = mpzch.get_indices_of_reserved_slots_per_bucket()
 
             # Sync hash identities and metadata and get information about mapping
-            survived, rank_to_global = mpzch.sync_identities(
+            survived, rank_to_global = mpzch.sync_identities(  # pyre-ignore[16]
                 is_root_node,
                 num_replica_gp=len(mesh),
                 replica_ranks=replica_ranks,
@@ -1487,7 +1494,7 @@ class DMPCollection(DistributedModelParallel):
         for ctx in self._ctxs:
             if ctx.sharding_strategy == ShardingStrategy.FULLY_SHARDED:
                 for _, sharded_module in ctx.modules_to_sync:
-                    sharded_module.ensure_reduce_scatter_complete()
+                    sharded_module.ensure_reduce_scatter_complete()  # pyre-ignore[16]
 
     def _register_sparse_arch_forward_hook(self, rs_awaitable_hook_module) -> None:
         """
@@ -1615,12 +1622,14 @@ class DMPCollection(DistributedModelParallel):
                     shards = param_sharding.sharding_spec.shards
                     if shards is not None:
                         for shard in shards:
+                            assert shard.placement is not None
+                            shard_rank_val = cast(int, shard.placement._rank)
                             if use_inter_host_allreduce:
-                                shard_rank = shard.placement._rank + (
+                                shard_rank = shard_rank_val + (
                                     (rank // sharding_group_size) * sharding_group_size
                                 )
                             else:
-                                shard_rank = shard.placement._rank * step + group_start
+                                shard_rank = shard_rank_val * step + group_start
                             shard.placement = _remote_device(
                                 f"rank:{shard_rank}/{self._device.type}:{shard_rank % get_local_size()}"
                             )
@@ -1678,10 +1687,7 @@ class DMPCollection(DistributedModelParallel):
         # Post init DMP, save the embedding kernels
         sharded_modules: List[Tuple[nn.Module, nn.Module]] = []
 
-        def _find_sharded_modules(
-            module: nn.Module,
-            prev_module: nn.Module,
-        ) -> None:
+        def _find_sharded_modules(module: nn.Module, prev_module: nn.Module) -> None:
             if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
                 sharded_modules.append((module, prev_module))
             if isinstance(module, sharded_module):  # pyre-ignore[6]
@@ -1691,7 +1697,7 @@ class DMPCollection(DistributedModelParallel):
             for _, child in module.named_children():
                 _find_sharded_modules(child, module)
 
-        _find_sharded_modules(self._dmp_wrapped_module, None)
+        _find_sharded_modules(self._dmp_wrapped_module, None)  # pyre-ignore[6]
         return sharded_modules
 
     def _cache_sync_tensors(
