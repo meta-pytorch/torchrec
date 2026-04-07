@@ -207,4 +207,14 @@ def detect_technique(items: List) -> OptimizationTechnique:  # type: ignore[type
     return OptimizationTechnique.NONE
 
 
+def log_planning_result(
+    planner_type: str,
+    technique: OptimizationTechnique = OptimizationTechnique.NONE,
+    error_message: Optional[str] = None,
+    **extra_metadata: str,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
