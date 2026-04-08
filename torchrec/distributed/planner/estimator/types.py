@@ -22,7 +22,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Dict, FrozenSet, List, Optional, Tuple
 
-import torch
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import (
     BIGINT_DTYPE,
@@ -818,22 +817,10 @@ class ShardPerfContext:
         """
         Raw batch outputs.
 
-        For pooled: sum of num_poolings * batch_sizes, optionally scaled by
-        min(1, input_length) to account for sparse VBE features where
-        only a fraction of samples have data. Gated by JK
-        ``pytorch/torchrec:scale_batch_outputs_by_input_length``.
+        For pooled: sum of num_poolings * batch_sizes.
         For unpooled: same as batch_inputs.
         """
         if self.is_pooled:
-            if torch._utils_internal.justknobs_check(
-                "pytorch/torchrec:scale_batch_outputs_by_input_length"
-            ):
-                return sum(
-                    min(1.0, il) * x * y
-                    for il, x, y in zip(
-                        self.input_lengths, self.num_poolings, self.batch_sizes
-                    )
-                )
             return sum(x * y for x, y in zip(self.num_poolings, self.batch_sizes))
         return self.batch_inputs
 
