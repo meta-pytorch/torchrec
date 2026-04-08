@@ -207,4 +207,65 @@ def detect_technique(items: List) -> OptimizationTechnique:  # type: ignore[type
     return OptimizationTechnique.NONE
 
 
+def log_planning_result(
+    planner_type: str,
+    technique: OptimizationTechnique = OptimizationTechnique.NONE,
+    error_message: Optional[str] = None,
+    **extra_metadata: str,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_offloading_summary(best_plan: List, planner_type: str, technique: OptimizationTechnique = OptimizationTechnique.NONE) -> None:  # type: ignore[type-arg]
+    """No-op OSS stub."""
+    pass
+
+
+def log_storage_reservation(
+    reservation_type: str,
+    percentage: Optional[float] = None,
+    dense_hbm_bytes: Optional[int] = None,
+    kjt_hbm_bytes: Optional[int] = None,
+    original_hbm_per_rank: int = 0,
+    available_hbm_per_rank: int = 0,
+    planner_type: str = "",
+    technique: OptimizationTechnique = OptimizationTechnique.NONE,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_planner_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.NONE,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_stats_match(
+    table_name: str = "",
+    table_height: int = 0,
+    match_level: str = "",
+    min_working_set: int = 0,
+    recommended_cache_rows: int = 0,
+    global_batch_size: int = 0,
+    matched_height: Optional[int] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_clf_computed(
+    table_name: str = "",
+    table_height: int = 0,
+    clf: float = 0.0,
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
