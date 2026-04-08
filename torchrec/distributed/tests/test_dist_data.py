@@ -1497,3 +1497,55 @@ class TestJaggedTensorAllToAll(MultiProcessTestBase):
         self._run_multi_process_test(
             callable=self._test_jt_all_to_all, world_size=world_size
         )
+
+
+class GetRecatOverflowTest(unittest.TestCase):
+    def test_get_recat_logs_and_raises_on_int32_overflow(self) -> None:
+        """Verify that _get_recat raises RuntimeError and logs context when
+        batch_size_per_rank contains values that overflow int32."""
+        overflow_value = 2_147_483_648  # INT32_MAX + 1
+        with self.assertRaises(RuntimeError) as ctx, self.assertLogs(
+            level="ERROR"
+        ) as log:
+            _get_recat(
+                local_split=2,
+                num_splits=4,
+                stagger=1,
+                device=torch.device("cpu"),
+                batch_size_per_rank=[32, overflow_value, 32, 32],
+            )
+
+        self.assertIn("overflow", str(ctx.exception).lower())
+
+        logged = "\n".join(log.output)
+        self.assertIn("_get_recat", logged)
+        self.assertIn("batch_size_per_rank", logged)
+        self.assertIn(str(overflow_value), logged)
+        self.assertIn("input_offset", logged)
+        self.assertIn("output_offset", logged)
+
+    def test_get_recat_no_overflow_unchanged_behavior(self) -> None:
+        """Verify that _get_recat still returns a valid recat tensor when
+        batch_size_per_rank values are within int32 range."""
+        result = _get_recat(
+            local_split=2,
+            num_splits=4,
+            stagger=1,
+            device=torch.device("cpu"),
+            batch_size_per_rank=[32, 64, 32, 64],
+        )
+        self.assertIsNotNone(result)
+        self.assertIsInstance(result, torch.Tensor)
+
+    def test_get_recat_no_overflow_uniform_batch(self) -> None:
+        """Verify that _get_recat returns a valid recat tensor for the
+        non-variable-batch (uniform) path."""
+        result = _get_recat(
+            local_split=2,
+            num_splits=4,
+            stagger=1,
+            device=torch.device("cpu"),
+            batch_size_per_rank=[32, 32, 32, 32],
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.dtype, torch.int32)
