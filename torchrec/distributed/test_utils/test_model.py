@@ -298,26 +298,45 @@ class ModelInput(Pipelineable):
             global_idscore_offsets.append(offsets)
 
         if input_type == "kjt":
+            all_global_idlist_lengths = torch.cat(global_idlist_lengths)
+            all_global_idscore_lengths = (
+                torch.cat(global_idscore_lengths) if global_idscore_lengths else None
+            )
             global_idlist_input = KeyedJaggedTensor(
                 keys=idlist_features,
                 values=torch.cat(global_idlist_indices),
-                offsets=torch.cat(global_idlist_offsets) if use_offsets else None,
-                lengths=torch.cat(global_idlist_lengths) if not use_offsets else None,
+                offsets=(
+                    torch.cat(
+                        [
+                            all_global_idlist_lengths.new_zeros(1),
+                            torch.cumsum(all_global_idlist_lengths, dim=0),
+                        ]
+                    )
+                    if use_offsets
+                    else None
+                ),
+                lengths=all_global_idlist_lengths if not use_offsets else None,
             )
 
-            global_idscore_input = (
-                KeyedJaggedTensor(
+            global_idscore_input = None
+            if global_idscore_indices:
+                assert all_global_idscore_lengths is not None
+                global_idscore_input = KeyedJaggedTensor(
                     keys=idscore_features,
                     values=torch.cat(global_idscore_indices),
-                    offsets=torch.cat(global_idscore_offsets) if use_offsets else None,
-                    lengths=(
-                        torch.cat(global_idscore_lengths) if not use_offsets else None
+                    offsets=(
+                        torch.cat(
+                            [
+                                all_global_idscore_lengths.new_zeros(1),
+                                torch.cumsum(all_global_idscore_lengths, dim=0),
+                            ]
+                        )
+                        if use_offsets
+                        else None
                     ),
+                    lengths=(all_global_idscore_lengths if not use_offsets else None),
                     weights=torch.cat(global_idscore_weights),
                 )
-                if global_idscore_indices
-                else None
-            )
         elif input_type == "td":
             dict_of_nt = {
                 k: torch.nested.nested_tensor_from_jagged(
@@ -355,16 +374,12 @@ class ModelInput(Pipelineable):
         for r in range(world_size):
             local_idlist_lengths = []
             local_idlist_indices = []
-            local_idlist_offsets = []
 
             local_idscore_lengths = []
             local_idscore_indices = []
             local_idscore_weights = []
-            local_idscore_offsets = []
 
-            for lengths, indices, offsets in zip(
-                global_idlist_lengths, global_idlist_indices, global_idlist_offsets
-            ):
+            for lengths, indices in zip(global_idlist_lengths, global_idlist_indices):
                 local_idlist_lengths.append(
                     lengths[r * batch_size : r * batch_size + batch_size_by_rank[r]]
                 )
@@ -374,15 +389,10 @@ class ModelInput(Pipelineable):
                 local_idlist_indices.append(
                     indices[lengths_cumsum[r] : lengths_cumsum[r + 1]]
                 )
-                local_idlist_offsets.append(
-                    offsets[r * batch_size : r * batch_size + batch_size_by_rank[r] + 1]
-                )
-
-            for lengths, indices, weights, offsets in zip(
+            for lengths, indices, weights in zip(
                 global_idscore_lengths,
                 global_idscore_indices,
                 global_idscore_weights,
-                global_idscore_offsets,
             ):
                 local_idscore_lengths.append(
                     lengths[r * batch_size : r * batch_size + batch_size_by_rank[r]]
@@ -397,37 +407,53 @@ class ModelInput(Pipelineable):
                     weights[lengths_cumsum[r] : lengths_cumsum[r + 1]]
                 )
 
-                local_idscore_offsets.append(
-                    offsets[r * batch_size : r * batch_size + batch_size_by_rank[r] + 1]
-                )
-
             if input_type == "kjt":
+                # Compute proper cumulative offsets from local lengths.
+                # Cannot slice global offsets per-feature and concatenate because
+                # (a) for rank > 0, per-feature offsets don't start at 0 and
+                # (b) concatenated per-feature offsets are not monotonically
+                # increasing across features as KJT requires.
+                all_local_idlist_lengths = torch.cat(local_idlist_lengths)
+                all_local_idscore_lengths = (
+                    torch.cat(local_idscore_lengths) if local_idscore_lengths else None
+                )
                 local_idlist_input = KeyedJaggedTensor(
                     keys=idlist_features,
                     values=torch.cat(local_idlist_indices),
-                    offsets=torch.cat(local_idlist_offsets) if use_offsets else None,
-                    lengths=(
-                        torch.cat(local_idlist_lengths) if not use_offsets else None
+                    offsets=(
+                        torch.cat(
+                            [
+                                all_local_idlist_lengths.new_zeros(1),
+                                torch.cumsum(all_local_idlist_lengths, dim=0),
+                            ]
+                        )
+                        if use_offsets
+                        else None
                     ),
+                    lengths=(all_local_idlist_lengths if not use_offsets else None),
                 )
 
-                local_idscore_input = (
-                    KeyedJaggedTensor(
+                local_idscore_input = None
+                if local_idscore_indices:
+                    assert all_local_idscore_lengths is not None
+                    local_idscore_input = KeyedJaggedTensor(
                         keys=idscore_features,
                         values=torch.cat(local_idscore_indices),
                         offsets=(
-                            torch.cat(local_idscore_offsets) if use_offsets else None
+                            torch.cat(
+                                [
+                                    all_local_idscore_lengths.new_zeros(1),
+                                    torch.cumsum(all_local_idscore_lengths, dim=0),
+                                ]
+                            )
+                            if use_offsets
+                            else None
                         ),
                         lengths=(
-                            torch.cat(local_idscore_lengths)
-                            if not use_offsets
-                            else None
+                            all_local_idscore_lengths if not use_offsets else None
                         ),
                         weights=torch.cat(local_idscore_weights),
                     )
-                    if local_idscore_indices
-                    else None
-                )
             elif input_type == "td":
                 dict_of_nt = {
                     k: torch.nested.nested_tensor_from_jagged(
