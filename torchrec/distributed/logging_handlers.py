@@ -312,6 +312,16 @@ def log_search_space_summary(search_space: List, planner_type: str = "", techniq
     pass
 
 
+def log_search_space_augmented(
+    search_space_before: List,  # type: ignore[type-arg]
+    search_space_after: List,  # type: ignore[type-arg]
+    planner_type: str = "",
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_proposer_result(
     planner_type: str = "",
     proposer_name: str = "",
