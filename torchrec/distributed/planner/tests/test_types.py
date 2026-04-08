@@ -31,6 +31,7 @@ from torchrec.distributed.planner.types import (
     ParameterConstraints,
     Shard,
     ShardingOption,
+    Storage,
     Topology,
     TopologyFactory,
     TrainerConfig,
@@ -561,10 +562,20 @@ class TestHashPlannerContextInputsRounding(unittest.TestCase):
         ]
         return enumerator
 
-    def _create_mock_storage_reservation(self) -> MagicMock:
-        """Create a mock storage reservation."""
+    def _create_mock_storage_reservation(
+        self,
+        topology: Optional[Topology] = None,
+    ) -> MagicMock:
+        """Create a mock storage reservation with a real Topology."""
         storage_reservation = MagicMock()
-        storage_reservation._last_reserved_topology = "mock_topology"
+        if topology is None:
+            topology = Topology(
+                world_size=2,
+                compute_device="cuda",
+                hbm_cap=1024 * 1024 * 1024,
+                local_world_size=2,
+            )
+        storage_reservation.last_reserved_topology = topology
         return storage_reservation
 
     def test_rounding_produces_same_hash_for_small_memory_differences(self) -> None:
@@ -732,9 +743,14 @@ class TestHashPlannerContextInputsWithConstraints(unittest.TestCase):
         return enumerator
 
     def _create_mock_storage_reservation(self) -> MagicMock:
-        """Create a mock storage reservation."""
+        """Create a mock storage reservation with a real Topology."""
         storage_reservation = MagicMock()
-        storage_reservation._last_reserved_topology = "mock_topology"
+        storage_reservation.last_reserved_topology = Topology(
+            world_size=2,
+            compute_device="cuda",
+            hbm_cap=1024 * 1024 * 1024,
+            local_world_size=2,
+        )
         return storage_reservation
 
     def _create_topology(self) -> Topology:
@@ -1087,6 +1103,193 @@ class TestConsistentHashingBetweenProcesses(MultiProcessTestBase):
         )
         hashes = return_hash_dict.values()
         self.assertEqual(hashes[0], hashes[1], "hash values are different.")
+
+
+class TestHashStabilityAcrossMachines(unittest.TestCase):
+    """Tests that hash_planner_context_inputs produces stable hashes when
+    the same job runs on different machines with slightly different DDR.
+
+    Regression test for the cache-miss bug where MAST job restarts on
+    different machines produced different context hashes because
+    last_reserved_topology included unrounded DDR values.
+    """
+
+    def _create_mock_enumerator(
+        self,
+        with_real_shards: bool = False,
+    ) -> MagicMock:
+        enumerator = MagicMock()
+        if with_real_shards:
+            enumerator.last_stored_search_space = [
+                MagicMock(
+                    fqn="table_0",
+                    sharding_type=ShardingType.TABLE_WISE.value,
+                    compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                    shards=[
+                        Shard(
+                            size=[1000, 64],
+                            offset=[0, 0],
+                            storage=Storage(hbm=256000, ddr=0, ssd=0),
+                            rank=0,
+                        ),
+                    ],
+                    cache_params=None,
+                ),
+            ]
+        else:
+            enumerator.last_stored_search_space = [
+                MagicMock(
+                    fqn="table_0",
+                    sharding_type=ShardingType.TABLE_WISE.value,
+                    compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                    shards=(),
+                    cache_params=None,
+                ),
+            ]
+        return enumerator
+
+    def test_ddr_variation_in_reserved_topology_does_not_change_hash(
+        self,
+    ) -> None:
+        """Simulates the production bug: two machines report slightly
+        different DDR capacity (~283.34 GB vs ~283.35 GB).  The hash
+        must be identical because both round to the same 300 GB bucket.
+        """
+        DDR_MACHINE_A = 304_243_365_376  # ~283.35 GB
+        DDR_MACHINE_B = 304_233_892_864  # ~283.34 GB — different machine
+
+        topology_a = Topology(
+            world_size=8,
+            compute_device="cuda",
+            hbm_cap=191_503_138_816,
+            ddr_cap=DDR_MACHINE_A,
+            local_world_size=2,
+        )
+        topology_b = Topology(
+            world_size=8,
+            compute_device="cuda",
+            hbm_cap=191_503_138_816,
+            ddr_cap=DDR_MACHINE_B,
+            local_world_size=2,
+        )
+
+        enumerator = self._create_mock_enumerator()
+
+        # Simulate FixedPercentageStorageReservation: deepcopy + reduce HBM
+        reserved_a = deepcopy(topology_a)
+        reserved_b = deepcopy(topology_b)
+        for t in [reserved_a, reserved_b]:
+            for d in t.devices:
+                d.storage.hbm = int(0.7 * d.storage.hbm)
+
+        sr_a = MagicMock()
+        sr_a.__class__.__name__ = "FixedPercentageStorageReservation"
+        sr_a.last_reserved_topology = reserved_a
+
+        sr_b = MagicMock()
+        sr_b.__class__.__name__ = "FixedPercentageStorageReservation"
+        sr_b.last_reserved_topology = reserved_b
+
+        hash_a = hash_planner_context_inputs(
+            topology=topology_a,
+            batch_size=3072,
+            enumerator=enumerator,
+            storage_reservation=sr_a,
+            constraints=None,
+        )
+        hash_b = hash_planner_context_inputs(
+            topology=topology_b,
+            batch_size=3072,
+            enumerator=enumerator,
+            storage_reservation=sr_b,
+            constraints=None,
+        )
+
+        self.assertEqual(
+            hash_a,
+            hash_b,
+            f"Hash should be stable across machines with small DDR differences "
+            f"(DDR_A={DDR_MACHINE_A}, DDR_B={DDR_MACHINE_B})",
+        )
+
+    def test_large_ddr_difference_changes_hash(self) -> None:
+        """A genuinely different DDR capacity (e.g. 256 GB vs 512 GB)
+        should produce a different hash.
+        """
+        topology_small = Topology(
+            world_size=2,
+            compute_device="cuda",
+            ddr_cap=256 * 1024**3,
+            local_world_size=2,
+        )
+        topology_large = Topology(
+            world_size=2,
+            compute_device="cuda",
+            ddr_cap=512 * 1024**3,
+            local_world_size=2,
+        )
+
+        enumerator = self._create_mock_enumerator()
+
+        sr_small = MagicMock()
+        sr_small.last_reserved_topology = deepcopy(topology_small)
+        sr_large = MagicMock()
+        sr_large.last_reserved_topology = deepcopy(topology_large)
+
+        hash_small = hash_planner_context_inputs(
+            topology=topology_small,
+            batch_size=128,
+            enumerator=enumerator,
+            storage_reservation=sr_small,
+            constraints=None,
+        )
+        hash_large = hash_planner_context_inputs(
+            topology=topology_large,
+            batch_size=128,
+            enumerator=enumerator,
+            storage_reservation=sr_large,
+            constraints=None,
+        )
+
+        self.assertNotEqual(
+            hash_small,
+            hash_large,
+            "Hash should differ for genuinely different DDR capacities",
+        )
+
+    def test_hash_stable_with_real_shard_objects(self) -> None:
+        """Verify that real Shard objects (with Storage) produce stable
+        hashes regardless of topology DDR variation.
+        """
+        DDR_A = 304_243_365_376
+        DDR_B = 304_243_365_888  # differs by 512 bytes
+
+        results = []
+        for ddr in [DDR_A, DDR_B]:
+            topo = Topology(
+                world_size=2,
+                compute_device="cuda",
+                hbm_cap=191_503_138_816,
+                ddr_cap=ddr,
+                local_world_size=2,
+            )
+            enumerator = self._create_mock_enumerator(with_real_shards=True)
+            sr = MagicMock()
+            sr.last_reserved_topology = deepcopy(topo)
+            h = hash_planner_context_inputs(
+                topology=topo,
+                batch_size=128,
+                enumerator=enumerator,
+                storage_reservation=sr,
+                constraints=None,
+            )
+            results.append(h)
+
+        self.assertEqual(
+            results[0],
+            results[1],
+            "Hash should be stable with real Shard objects across DDR variation",
+        )
 
 
 class TestHardwareConfig(unittest.TestCase):
