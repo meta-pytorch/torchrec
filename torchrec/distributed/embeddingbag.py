@@ -327,6 +327,13 @@ def create_sharding_infos_by_sharding_device_group(
                 fused_params=per_table_fused_params,
             )
         )
+    if any(
+        info.embedding_config.stash_weights
+        for infos in sharding_type_device_group_to_sharding_infos.values()
+        for info in infos
+    ):
+        logger.info("EmbeddingMemoryStashing: stash_weights is enabled")
+
     return sharding_type_device_group_to_sharding_infos
 
 
