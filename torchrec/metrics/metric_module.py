@@ -20,8 +20,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DeviceMesh
-from torch.monitor import _WaitCounter
 from torch.profiler import record_function
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.metrics.accuracy import AccuracyMetric
 from torchrec.metrics.auc import AUCMetric
 from torchrec.metrics.auprc import AUPRCMetric
@@ -296,6 +296,9 @@ class RecMetricModule(nn.Module):
                 **kwargs,
             )
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.REC_METRICS, n=100, add_wait_counter=True
+    )
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
         r"""update() is called per batch, usually right after forward() to
         update the local states of metrics based on the model_output.
@@ -366,28 +369,30 @@ class RecMetricModule(nn.Module):
     def should_compute(self) -> bool:
         return self.trained_batches % self.compute_interval_steps == 0
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.REC_METRICS, add_wait_counter=True, n=100
+    )
     def compute(self) -> DeferrableMetrics:
         r"""compute() is called when the global metrics are required, usually
         right before logging the metrics results to the data sink.
         """
         self.compute_count += 1
         ret: MetricsResult = {}
-        with _WaitCounter("pytorch.wait_counter.rec_metrics.compute_job").guard():
-            with record_function("## RecMetricModule:compute ##"):
-                if self.rec_metrics:
-                    self._adjust_compute_interval()
-                    ret.update(self.rec_metrics.compute())
-                if self.throughput_metric:
-                    ret.update(self.throughput_metric.compute())
-                if self.state_metrics:
-                    for namespace, component in self.state_metrics.items():
-                        ret.update(
-                            {
-                                f"{compose_customized_metric_key(namespace, metric_name)}": metric_value
-                                for metric_name, metric_value in component.get_metrics().items()
-                            }
-                        )
-            return DeferrableMetrics(ret)
+        with record_function("## RecMetricModule:compute ##"):
+            if self.rec_metrics:
+                self._adjust_compute_interval()
+                ret.update(self.rec_metrics.compute())
+            if self.throughput_metric:
+                ret.update(self.throughput_metric.compute())
+            if self.state_metrics:
+                for namespace, component in self.state_metrics.items():
+                    ret.update(
+                        {
+                            f"{compose_customized_metric_key(namespace, metric_name)}": metric_value
+                            for metric_name, metric_value in component.get_metrics().items()
+                        }
+                    )
+        return DeferrableMetrics(ret)
 
     def local_compute(self) -> DeferrableMetrics:
         r"""local_compute() is called when per-trainer metrics are required. It's
