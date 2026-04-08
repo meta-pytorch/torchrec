@@ -618,10 +618,24 @@ def group_tables(
     ]
     assert all(table_weightedness) or not any(table_weightedness)
 
+    # Detect EMO at job level: check ALL tables across ALL ranks
+    from torchrec.distributed.logging_handlers import (
+        detect_technique,
+        log_tbe_composition,
+    )
+
+    _tbe_technique = detect_technique([t for tables in tables_per_rank for t in tables])
+
     grouped_embedding_configs_by_rank: List[List[GroupedEmbeddingConfig]] = []
-    for tables in tables_per_rank:
+    for rank, tables in enumerate(tables_per_rank):
         grouped_embedding_configs = _group_tables_per_rank(tables)
         grouped_embedding_configs_by_rank.append(grouped_embedding_configs)
+        if grouped_embedding_configs:
+            log_tbe_composition(
+                grouped_embedding_configs,
+                rank,
+                technique=_tbe_technique,
+            )
 
     return grouped_embedding_configs_by_rank
 
