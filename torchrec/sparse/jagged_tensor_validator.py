@@ -166,10 +166,7 @@ def _validate_keys(kjt: KeyedJaggedTensor) -> bool:
                     f"lengths size must be divisible by keys size, but got {lengths_size} and {len(keys)}"
                 )
         else:
-            if torch._utils_internal.justknobs_check(
-                "pytorch/torchrec:killswitch_enable_vbe_kjt_validation"
-            ):
-                _validate_vbe_properties(kjt, lengths_size)
+            _validate_vbe_properties(kjt, lengths_size)
     return True
 
 

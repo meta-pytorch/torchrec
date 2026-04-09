@@ -123,14 +123,11 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
     def input_dist(
         self, ctx: EmbeddingBagCollectionContext, features: KeyedJaggedTensor
     ) -> Awaitable[Awaitable[KJTList]]:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:enable_rw_feature_processor"
-        ):
-            if not self.is_pipelined and self._row_wise_sharded:
-                # transform input to support row based sharding when not pipelined
-                modify_input_for_feature_processor(
-                    features, self._feature_processors, self._is_collection
-                )
+        if not self.is_pipelined and self._row_wise_sharded:
+            # transform input to support row based sharding when not pipelined
+            modify_input_for_feature_processor(
+                features, self._feature_processors, self._is_collection
+            )
         return self._embedding_bag_collection.input_dist(ctx, features)
 
     def apply_feature_processors_to_kjt_list(self, dist_input: KJTList) -> KJTList:
@@ -278,7 +275,6 @@ class FeatureProcessedEmbeddingBagCollectionSharder(
         if compute_device_type in {"mtia"}:
             return [ShardingType.TABLE_WISE.value, ShardingType.COLUMN_WISE.value]
 
-        # No row wise because position weighted FP and RW don't play well together.
         types = [
             ShardingType.DATA_PARALLEL.value,
             ShardingType.TABLE_WISE.value,
@@ -286,15 +282,12 @@ class FeatureProcessedEmbeddingBagCollectionSharder(
             ShardingType.TABLE_COLUMN_WISE.value,
         ]
 
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:enable_rw_feature_processor"
-        ):
-            types.extend(
-                [
-                    ShardingType.TABLE_ROW_WISE.value,
-                    ShardingType.ROW_WISE.value,
-                    ShardingType.GRID_SHARD.value,
-                ]
-            )
+        types.extend(
+            [
+                ShardingType.TABLE_ROW_WISE.value,
+                ShardingType.ROW_WISE.value,
+                ShardingType.GRID_SHARD.value,
+            ]
+        )
 
         return types
