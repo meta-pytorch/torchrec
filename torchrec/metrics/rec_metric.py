@@ -144,6 +144,7 @@ class RecMetricComputation(Metric, abc.ABC):
         *args: Any,
         **kwargs: Any,
     ) -> None:
+        self._enable_pt2_compile: bool = kwargs.pop("enable_pt2_compile", False)
         metric_init_signature = inspect.signature(Metric.__init__)
         if "fuse_state_tensors" in metric_init_signature.parameters:
             kwargs["fuse_state_tensors"] = (
@@ -240,6 +241,12 @@ class RecMetricComputation(Metric, abc.ABC):
         self._batch_window_buffers[window_state_name].aggregate_state(
             getattr(self, window_state_name), curr_state=state, size=num_samples
         )
+
+    def _maybe_compile(self, fn: Callable) -> Callable:
+        """Wrap ``fn`` with ``torch.compile`` when PT2 compilation is enabled."""
+        if self._enable_pt2_compile:
+            return torch.compile(fn)
+        return fn
 
     @abc.abstractmethod
     # pyrefly: ignore[bad-override]
@@ -447,7 +454,11 @@ class RecMetric(nn.Module, abc.ABC):
                 compute_mode=compute_mode,
                 process_group=process_group,
                 # pyrefly: ignore[bad-argument-type]
-                **{**kwargs, **self._get_task_kwargs(task_config)},
+                **{
+                    **kwargs,
+                    **self._get_task_kwargs(task_config),
+                    "enable_pt2_compile": self.enable_pt2_compile,
+                },
             )
             required_inputs = self._get_task_required_inputs(task_config)
 

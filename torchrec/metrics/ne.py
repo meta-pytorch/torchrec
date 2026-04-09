@@ -145,6 +145,7 @@ class NEMetricComputation(RecMetricComputation):
             persistent=True,
         )
         self.eta = 1e-12
+        self._get_ne_states = self._maybe_compile(get_ne_states)
 
     def update(
         self,
@@ -158,7 +159,7 @@ class NEMetricComputation(RecMetricComputation):
             raise RecMetricException(
                 "Inputs 'predictions' and 'weights' should not be None for NEMetricComputation update"
             )
-        states = get_ne_states(labels, predictions, weights, self.eta)
+        states = self._get_ne_states(labels, predictions, weights, self.eta)
         num_samples = predictions.shape[-1]
 
         for state_name, state_value in states.items():

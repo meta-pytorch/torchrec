@@ -100,6 +100,7 @@ class XAUCMetricComputation(RecMetricComputation):
             dist_reduce_fx="sum",
             persistent=True,
         )
+        self._get_xauc_states = self._maybe_compile(get_xauc_states)
 
     def update(
         self,
@@ -113,7 +114,7 @@ class XAUCMetricComputation(RecMetricComputation):
             raise RecMetricException(
                 "Inputs 'predictions' and 'weights' should not be None for XAUCMetricComputation update"
             )
-        states = get_xauc_states(labels, predictions, weights)
+        states = self._get_xauc_states(labels, predictions, weights)
         num_samples = predictions.shape[-1]
         for state_name, state_value in states.items():
             state = getattr(self, state_name)
