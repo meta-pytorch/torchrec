@@ -203,10 +203,7 @@ def _start_data_dist(
         # and this info was done in the _rewrite_model by tracing the
         # entire model to get the arg_info_list
         args, kwargs = forward.args.build_args_kwargs(batch)
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:enable_rw_feature_processor"
-        ):
-            args, kwargs = module.preprocess_input(args, kwargs)
+        args, kwargs = module.preprocess_input(args, kwargs)
 
         # Start input distribution.
         module_ctx = module.create_context()
