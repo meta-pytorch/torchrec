@@ -71,6 +71,7 @@ class MAEMetricComputation(RecMetricComputation):
             dist_reduce_fx="sum",
             persistent=True,
         )
+        self._get_mae_states = self._maybe_compile(get_mae_states)
 
     def update(
         self,
@@ -84,7 +85,7 @@ class MAEMetricComputation(RecMetricComputation):
             raise RecMetricException(
                 "Inputs 'predictions' and 'weights' should not be None for MAEMetricComputation update"
             )
-        states = get_mae_states(labels, predictions, weights)
+        states = self._get_mae_states(labels, predictions, weights)
         num_samples = predictions.shape[-1]
         for state_name, state_value in states.items():
             state = getattr(self, state_name)

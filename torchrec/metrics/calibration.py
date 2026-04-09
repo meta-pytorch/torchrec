@@ -65,6 +65,7 @@ class CalibrationMetricComputation(RecMetricComputation):
             dist_reduce_fx="sum",
             persistent=True,
         )
+        self._get_calibration_states = self._maybe_compile(get_calibration_states)
 
     def update(
         self,
@@ -79,7 +80,7 @@ class CalibrationMetricComputation(RecMetricComputation):
                 "Inputs 'predictions' and 'weights' should not be None for CalibrationMetricComputation update"
             )
         num_samples = predictions.shape[-1]
-        for state_name, state_value in get_calibration_states(
+        for state_name, state_value in self._get_calibration_states(
             labels, predictions, weights
         ).items():
             state = getattr(self, state_name)
