@@ -776,5 +776,137 @@ class TestStashOptimizerState(unittest.TestCase):
                         )
 
 
+class TestEmsConfigWiring(unittest.TestCase):
+    """Tests that EMS config is correctly wired from EmbeddingBagConfig through to MemoryStashingManager."""
+
+    def test_ebc_stash_weights_propagates_to_stashing_manager(self) -> None:
+        """When stash_weights=True on EmbeddingBagConfig, MemoryStashingManager stashes that TBE group."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        device = torch.device("cuda:0")
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=device))
+
+        stash_weights = torch.ones((50, 32), device=device)
+        no_stash_weights = torch.ones((80, 64), device=device) * 2
+
+        stash_original = stash_weights.clone()
+        no_stash_original = no_stash_weights.clone()
+
+        # Build mock lookup where TBE groups have ShardedEmbeddingTable configs
+        # with stash_weights derived from the EmbeddingBagConfig value
+        emb_modules = []
+        for i, (weights, should_stash) in enumerate(
+            [(stash_weights, True), (no_stash_weights, False)]
+        ):
+            inner = Mock()
+            inner.weights_dev = weights
+            emb_module = Mock()
+            emb_module._emb_module = inner
+            emb_module._config = GroupedEmbeddingConfig(
+                data_type=DataType.FP32,
+                pooling=PoolingType.SUM,
+                is_weighted=False,
+                has_feature_processor=False,
+                compute_kernel=EmbeddingComputeKernel.FUSED,
+                embedding_tables=[
+                    ShardedEmbeddingTable(
+                        num_embeddings=weights.shape[0],
+                        embedding_dim=weights.shape[1],
+                        name=f"table_{i}",
+                        feature_names=[f"feature_{i}"],
+                        pooling=PoolingType.SUM,
+                        is_weighted=False,
+                        has_feature_processor=False,
+                        compute_kernel=EmbeddingComputeKernel.FUSED,
+                        local_rows=weights.shape[0],
+                        local_cols=weights.shape[1],
+                        stash_weights=should_stash,
+                    ),
+                ],
+            )
+            emb_modules.append(emb_module)
+
+        lookup = Mock(spec=["_emb_modules"])
+        lookup._emb_modules = emb_modules
+
+        result = MemoryStashingManager.stash_embedding_weights(lookup)
+        self.assertIsNotNone(result)
+
+        # Only the stash_weights=True TBE group should be stashed
+        self.assertEqual(stash_weights.untyped_storage().size(), 0)
+        # The stash_weights=False TBE group should NOT be stashed
+        self.assertGreater(no_stash_weights.untyped_storage().size(), 0)
+        self.assertTrue(torch.allclose(no_stash_weights, no_stash_original))
+
+        # Restore and verify
+        MemoryStashingManager.restore_embedding_weights()
+        result[0](None)  # await_restore
+        self.assertTrue(torch.allclose(stash_weights, stash_original))
+
+        MemoryStashingManager.reset()
+
+    def test_ebc_model_stash_weights_mutation(self) -> None:
+        """Simulates the factory bridge: setting stash_weights=True on EBC configs in a model."""
+        from torchrec.modules.embedding_configs import EmbeddingBagConfig
+        from torchrec.modules.embedding_modules import EmbeddingBagCollection
+
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name=f"table_{i}",
+                feature_names=[f"feat_{i}"],
+            )
+            for i in range(3)
+        ]
+
+        # Verify default is False
+        for t in tables:
+            self.assertFalse(t.stash_weights)
+
+        ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
+        model = nn.Module()
+        model.ebc = ebc
+
+        # Apply the same bridge logic as ads_rec_train_factory
+        for module in model.modules():
+            if isinstance(module, EmbeddingBagCollection):
+                for eb_config in module.embedding_bag_configs():
+                    eb_config.stash_weights = True
+
+        # Verify stash_weights is now True on all configs
+        for eb_config in ebc.embedding_bag_configs():
+            self.assertTrue(
+                eb_config.stash_weights,
+                f"{eb_config.name} should have stash_weights=True",
+            )
+
+    def test_ebc_model_stash_weights_not_set_when_disabled(self) -> None:
+        """When EMS is disabled, stash_weights remains False on all EBC configs."""
+        from torchrec.modules.embedding_configs import EmbeddingBagConfig
+        from torchrec.modules.embedding_modules import EmbeddingBagCollection
+
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name=f"table_{i}",
+                feature_names=[f"feat_{i}"],
+            )
+            for i in range(3)
+        ]
+
+        ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
+        model = nn.Module()
+        model.ebc = ebc
+
+        # Do NOT apply the bridge logic (EMS disabled)
+        for eb_config in ebc.embedding_bag_configs():
+            self.assertFalse(
+                eb_config.stash_weights,
+                f"{eb_config.name} should have stash_weights=False when EMS disabled",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
