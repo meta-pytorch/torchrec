@@ -99,6 +99,7 @@ from torchrec.distributed.logging_handlers import (
     log_planning_result,
     log_storage_reservation,
     log_table_assignment,
+    log_table_constraints,
 )
 
 
@@ -613,6 +614,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 ),
             }
         )
+        if self._constraints:
+            log_table_constraints(self._constraints, self.__class__.__name__)
 
         search_space = self._enumerator.enumerate(
             module=module,
