@@ -25,7 +25,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Any, List, Optional, Tuple
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -132,6 +132,7 @@ class RunOptions(BenchFuncConfig):
     ga_num_steps: int = 1
     num_iters: Optional[int] = None
     output_json: bool = False
+    sync_fwd: bool = True
 
 
 # single-rank runner
@@ -240,6 +241,18 @@ def runner(
             else None
         )
 
+        fwd_event = torch.cuda.Event(enable_timing=True)
+        if run_option.sync_fwd:
+
+            def sync_fwd_hook(
+                module: nn.Module,
+                inputs: Tuple[Any, ...],
+                outputs: Any,
+            ) -> None:
+                fwd_event.record()
+
+            sharded_model.register_forward_hook(sync_fwd_hook)
+
         def _func_to_benchmark(
             bench_inputs: List[ModelInput],
             model: nn.Module,
@@ -267,6 +280,7 @@ def runner(
                         if metric_module.should_compute():
                             with record_function("## metric_compute ##"):
                                 metric_module.compute()
+                    fwd_event.synchronize()
                 except StopIteration:
                     break
 

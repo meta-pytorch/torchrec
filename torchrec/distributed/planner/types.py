@@ -1434,6 +1434,7 @@ class PlannerErrorType(Enum):
     PLANNER_INPUT_CONTEXT_MISMATCH = "planner_input_context_mismatch"
     PLAN_LOADING_FAILED = "plan_loading_failed"
     INVALID_RANK_ASSIGNMENT = "invalid_rank_assignment"
+    INPUT_VALIDATION = "input_validation"
 
 
 class PlannerError(Exception):
@@ -1700,38 +1701,32 @@ def hash_sha256_str(hashable_list: List[Any]) -> str:
     return hash_digest
 
 
-def hash_planner_context_inputs(
+def _topology_hash_components(
     topology: Topology,
-    batch_size: int,
-    enumerator: Enumerator,
-    storage_reservation: StorageReservation,
-    constraints: Optional[Dict[str, ParameterConstraints]],
-    hash_function: Callable[[List[Any]], int] = hash_sha256_to_int,
-) -> int:
-    assert hasattr(
-        enumerator, "last_stored_search_space"
-    ), "This enumerator is not compatible with hashing"
-    assert (
-        enumerator.last_stored_search_space is not None
-    ), "Unable to hash planner context without an enumerator that has a precomputed search space"
-    search_space = enumerator.last_stored_search_space
-    storage_reservation_policy = type(storage_reservation).__name__
+    round_unit: int = HUNDRED_GB,
+) -> List[Any]:
+    """Extract hash-stable components from a Topology with storage rounding.
 
-    assert (
-        # pyrefly: ignore[missing-attribute]
-        storage_reservation._last_reserved_topology
-        is not None
-    ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
+    Device memory (HBM/DDR/SSD) is rounded to the nearest ``round_unit``
+    (default 100 GB) so that minor driver/OS differences across machines
+    do not change the hash.  Every other field is included verbatim.
 
-    # Round device memory to 1% to avoid hash mismatches due to minor driver version differences which does not impact the behavior of planner
+    This helper is the *single* place where topology normalisation happens.
+    Both ``hash_planner_context_inputs`` and ``hash_planner_context_inputs_str``
+    must use it for every Topology they include in the hash (raw topology,
+    ``_last_reserved_topology``, etc.).
+    """
     rounded_devices = []
     for device in topology.devices:
-        rounded_hbm = round_to_nearest(device.storage.hbm, HUNDRED_GB)
-        rounded_ddr = round_to_nearest(device.storage.ddr, HUNDRED_GB)
-        rounded_ssd = round_to_nearest(device.storage.ssd, HUNDRED_GB)
-        rounded_devices.append((device.rank, rounded_hbm, rounded_ddr, rounded_ssd))
-
-    topology_hash_components = [
+        rounded_devices.append(
+            (
+                device.rank,
+                round_to_nearest(device.storage.hbm, round_unit),
+                round_to_nearest(device.storage.ddr, round_unit),
+                round_to_nearest(device.storage.ssd, round_unit),
+            )
+        )
+    return [
         topology.world_size,
         topology.compute_device,
         rounded_devices,
@@ -1747,9 +1742,65 @@ def hash_planner_context_inputs(
         topology.weighted_feature_bwd_compute_multiplier,
         topology.uneven_sharding_perf_multiplier,
     ]
-    hashed_topology = hash_function(topology_hash_components)
 
-    hashable_list = [
+
+def _shard_hash_components(shard: "Shard") -> tuple:
+    """Extract hash-stable components from a Shard.
+
+    Uses explicit field extraction rather than ``__repr__()`` so the hash
+    is not affected by new fields added to ``Shard`` or by
+    machine-specific values leaking through ``Storage``/``Perf`` reprs.
+    """
+    return (
+        tuple(shard.size),
+        tuple(shard.offset),
+        shard.rank,
+        (
+            (shard.storage.hbm, shard.storage.ddr, shard.storage.ssd)
+            if shard.storage
+            else None
+        ),
+    )
+
+
+def _build_hashable_list(
+    topology: Topology,
+    batch_size: int,
+    enumerator: Enumerator,
+    storage_reservation: StorageReservation,
+    constraints: Optional[Dict[str, ParameterConstraints]],
+) -> List[Any]:
+    """Build the canonical hashable list for planner context inputs.
+
+    Shared by both ``hash_planner_context_inputs`` (int hash) and
+    ``hash_planner_context_inputs_str`` (str hash) so the two can never
+    drift apart.
+    """
+    assert hasattr(
+        enumerator, "last_stored_search_space"
+    ), "This enumerator is not compatible with hashing"
+    assert (
+        enumerator.last_stored_search_space is not None
+    ), "Unable to hash planner context without an enumerator that has a precomputed search space"
+
+    reserved_topology = storage_reservation.last_reserved_topology
+    assert (
+        reserved_topology is not None
+    ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
+
+    search_space = enumerator.last_stored_search_space
+    storage_reservation_policy = type(storage_reservation).__name__
+
+    # Hash topology components with storage rounding applied uniformly.
+    # Previously _last_reserved_topology was included as a raw Topology
+    # object, whose __repr__ embedded unrounded device DDR values that
+    # vary across machines — causing cache misses on MAST job restarts.
+    hashed_topology = hash_sha256_to_int(_topology_hash_components(topology))
+    hashed_reserved_topology = hash_sha256_to_int(
+        _topology_hash_components(reserved_topology)
+    )
+
+    return [
         hashed_topology,
         batch_size,
         [
@@ -1757,19 +1808,32 @@ def hash_planner_context_inputs(
                 shard_option.fqn,
                 shard_option.sharding_type,
                 shard_option.compute_kernel,
-                tuple(shard_option.shards),
+                tuple(_shard_hash_components(shard) for shard in shard_option.shards),
                 shard_option.cache_params,
             ]
             for shard_option in search_space
         ],
         storage_reservation_policy,
-        storage_reservation._last_reserved_topology,
+        hashed_reserved_topology,
         (
             tuple((k, v.__hash__()) for k, v in sorted(constraints.items()))
             if constraints
             else None
         ),
     ]
+
+
+def hash_planner_context_inputs(
+    topology: Topology,
+    batch_size: int,
+    enumerator: Enumerator,
+    storage_reservation: StorageReservation,
+    constraints: Optional[Dict[str, ParameterConstraints]],
+    hash_function: Callable[[List[Any]], int] = hash_sha256_to_int,
+) -> int:
+    hashable_list = _build_hashable_list(
+        topology, batch_size, enumerator, storage_reservation, constraints
+    )
     return hash_function(hashable_list)
 
 
@@ -1781,42 +1845,9 @@ def hash_planner_context_inputs_str(
     constraints: Optional[Dict[str, ParameterConstraints]],
     hash_function: Callable[[List[Any]], str] = hash_sha256_str,
 ) -> str:
-    assert hasattr(
-        enumerator, "last_stored_search_space"
-    ), "This enumerator is not compatible with hashing"
-    assert (
-        enumerator.last_stored_search_space is not None
-    ), "Unable to hash planner context without an enumerator that has a precomputed search space"
-    search_space = enumerator.last_stored_search_space
-    storage_reservation_policy = type(storage_reservation).__name__
-
-    assert (
-        # pyrefly: ignore[missing-attribute]
-        storage_reservation._last_reserved_topology
-        is not None
-    ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
-
-    hashable_list = [
-        topology,
-        batch_size,
-        [
-            [
-                shard_option.fqn,
-                shard_option.sharding_type,
-                shard_option.compute_kernel,
-                tuple(shard_option.shards),
-                shard_option.cache_params,
-            ]
-            for shard_option in search_space
-        ],
-        storage_reservation_policy,
-        storage_reservation._last_reserved_topology,
-        (
-            tuple((k, v.__hash__()) for k, v in sorted(constraints.items()))
-            if constraints
-            else None
-        ),
-    ]
+    hashable_list = _build_hashable_list(
+        topology, batch_size, enumerator, storage_reservation, constraints
+    )
     return hash_function(hashable_list)
 
 

@@ -423,12 +423,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         return copy_dmp
 
     def _init_dmp(self, module: nn.Module) -> nn.Module:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:enable_module_id_cache_for_dmp_shard_modules"
-        ):
-            module_id_cache: Optional[Dict[int, ShardedModule]] = {}
-        else:
-            module_id_cache = None
+        module_id_cache: Dict[int, ShardedModule] = {}
         return self._shard_modules_impl(module, module_id_cache=module_id_cache)
 
     def _init_delta_tracker(
@@ -454,12 +449,7 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         )
 
     def _init_optim(self, module: nn.Module) -> CombinedOptimizer:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:enable_module_id_cache_for_dmp_shard_modules"
-        ):
-            module_id_cache: Optional[Dict[int, KeyedOptimizer]] = {}
-        else:
-            module_id_cache = None
+        module_id_cache: Dict[int, KeyedOptimizer] = {}
         return CombinedOptimizer(
             # pyre-ignore [6]
             self._fused_optim_impl(module, [], module_id_cache=module_id_cache)

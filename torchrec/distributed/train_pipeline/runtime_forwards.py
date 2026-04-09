@@ -14,6 +14,22 @@ from typing import Dict, Generic, Iterable, List, Optional, Tuple, TypeVar, Unio
 import torch
 from torch import distributed as dist
 from torch.profiler import record_function
+
+# This is required to support older torch package exports that do not contain
+# _check_int_overflow. During repackaging the
+# old PackageImporter resolves dist_data from the frozen snapshot which may
+# predate this helper.
+try:
+    from torchrec.distributed.dist_data import _check_int_overflow
+except ImportError:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.import_failure._check_int_overflow"
+    )
+
+    def _check_int_overflow(*args: object, **kwargs: object) -> bool:  # type: ignore[misc]
+        return False
+
+
 from torchrec.distributed.embedding_sharding import KJTSplitsAllToAllMeta
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
@@ -390,9 +406,34 @@ class KJTAllToAllForward:
                 torch.tensor(splits, device=device) for splits in input_splits
             ]
             if not input.variable_stride_per_key():
+                input_stride = input.stride()
                 splits_tensors.append(
-                    torch.tensor([input.stride()] * self._pg.size(), device=device)
+                    torch.tensor([input_stride] * self._pg.size(), device=device)
                 )
+                # Log corrupted input stride before it enters the
+                # AllToAll pipeline.
+                _check_int_overflow(
+                    "KJTAllToAllForward",
+                    [input_stride],
+                    "input stride (BEFORE AllToAll)",
+                    rank=rank,
+                    world_size=self._pg.size(),
+                    local_keys=local_keys,
+                    splits=self._splits,
+                )
+
+            # Log all input split tensors being sent into AllToAll.
+            # If these are already corrupted, the bug is upstream.
+            for idx, splits in enumerate(input_splits):
+                _check_int_overflow(
+                    "KJTAllToAllForward",
+                    splits,
+                    f"input_splits[{idx}] (BEFORE AllToAll)",
+                    rank=rank,
+                    world_size=self._pg.size(),
+                    local_keys=local_keys,
+                )
+
             return KJTSplitsAllToAllMeta(
                 pg=self._pg,
                 _input=input,
