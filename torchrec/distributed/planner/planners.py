@@ -98,6 +98,7 @@ from torchrec.distributed.logging_handlers import (
     log_planner_config,
     log_planning_result,
     log_storage_reservation,
+    log_table_assignment,
 )
 
 
@@ -763,6 +764,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             )
 
             log_offloading_summary(best_plan, self.__class__.__name__)
+            log_table_assignment(best_plan, self.__class__.__name__)
 
             return sharding_plan
         else:
