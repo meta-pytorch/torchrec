@@ -1043,18 +1043,6 @@ class EmbeddingShardingContext(Multistreamable):
     batch_size_per_feature_pre_a2a: List[int] = field(default_factory=list)
     variable_batch_per_feature: bool = False
 
-    def __post_init__(self) -> None:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:disable_none_context_fields"
-        ):
-            return
-        if self.batch_size_per_rank is None:
-            self.batch_size_per_rank = []  # pyrefly: ignore[bad-assignment]
-        if self.batch_size_per_rank_per_feature is None:
-            self.batch_size_per_rank_per_feature = []  # pyrefly: ignore[bad-assignment]
-        if self.batch_size_per_feature_pre_a2a is None:
-            self.batch_size_per_feature_pre_a2a = []  # pyrefly: ignore[bad-assignment]
-
     def record_stream(self, stream: torch.Stream) -> None:
         pass
 

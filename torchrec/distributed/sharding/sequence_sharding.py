@@ -41,17 +41,6 @@ class SequenceShardingContext(EmbeddingShardingContext):
     unbucketize_permute_tensor: Optional[torch.Tensor] = None
     lengths_after_input_dist: Optional[torch.Tensor] = None
 
-    def __post_init__(self) -> None:
-        super().__post_init__()
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:disable_none_context_fields"
-        ):
-            return
-        if self.input_splits is None:
-            self.input_splits = []  # pyrefly: ignore[bad-assignment]
-        if self.output_splits is None:
-            self.output_splits = []  # pyrefly: ignore[bad-assignment]
-
     def record_stream(self, stream: torch.Stream) -> None:
         if self.features_before_input_dist is not None:
             # pyrefly: ignore[bad-argument-type]
