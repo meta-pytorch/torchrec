@@ -318,4 +318,9 @@ def log_tbe_composition(grouped_configs: List, rank: int = 0, technique: Optimiz
     pass
 
 
+def log_search_space_summary(search_space: List, planner_type: str = "", technique: OptimizationTechnique = OptimizationTechnique.NONE) -> None:  # type: ignore[type-arg]
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
