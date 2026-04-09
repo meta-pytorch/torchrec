@@ -279,4 +279,28 @@ def log_clf_computed(
     pass
 
 
+def log_cacheability_resolved(
+    table_name: str = "",
+    table_height: int = 0,
+    cacheability: float = 0.0,
+    expected_lookups: int = 0,
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_kernel_changed(
+    table_name: str = "",
+    action: str = "",
+    reason: str = "",
+    new_kernels: Optional[list] = None,  # type: ignore[type-arg]
+    table_height: Optional[int] = None,
+    cache_ratio: Optional[float] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
