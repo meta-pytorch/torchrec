@@ -542,7 +542,8 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         logger.info(
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
             f"execute_all_batches: {self._execute_all_batches} "
-            f"enable_inplace_copy_batch: {enable_inplace_copy_batch}"
+            f"enable_inplace_copy_batch: {enable_inplace_copy_batch} "
+            f"free_features_storage_early: {free_features_storage_early}"
         )
 
         if device.type == "cuda":
@@ -880,6 +881,11 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 if hasattr(module, "_free_features_storage_early"):
                     # pyrefly: ignore [bad-argument-type]
                     module._free_features_storage_early = True
+                    fqn = getattr(module.forward, "name", "unknown")
+                    logger.info(
+                        f"free_features_storage_early enabled on "
+                        f"{fqn}({type(module).__name__})"
+                    )
         # initializes input dist, so we can override input dist forwards
         self.start_sparse_data_dist(batch, context)
         self._original_kjt_dist_forwards = _override_input_dist_forwards(
