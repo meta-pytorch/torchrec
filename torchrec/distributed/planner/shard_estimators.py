@@ -606,20 +606,11 @@ def _calculate_dp_shard_io_sizes(
     batch_inputs = sum(
         [x * y * z for x, y, z in zip(input_lengths, num_poolings, batch_sizes)]
     )
-    if is_pooled:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:scale_batch_outputs_by_input_length"
-        ):
-            batch_outputs = sum(
-                [
-                    min(1.0, il) * x * y
-                    for il, x, y in zip(input_lengths, num_poolings, batch_sizes)
-                ]
-            )
-        else:
-            batch_outputs = sum([x * y for x, y in zip(num_poolings, batch_sizes)])
-    else:
-        batch_outputs = batch_inputs
+    batch_outputs = (
+        sum([x * y for x, y in zip(num_poolings, batch_sizes)])
+        if is_pooled
+        else batch_inputs
+    )
 
     input_sizes = [math.ceil(batch_inputs * input_data_type_size)] * num_shards
     output_sizes = [
@@ -642,20 +633,11 @@ def _calculate_tw_shard_io_sizes(
     batch_inputs = sum(
         [x * y * z for x, y, z in zip(input_lengths, num_poolings, batch_sizes)]
     )
-    if is_pooled:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:scale_batch_outputs_by_input_length"
-        ):
-            batch_outputs = sum(
-                [
-                    min(1.0, il) * x * y
-                    for il, x, y in zip(input_lengths, num_poolings, batch_sizes)
-                ]
-            )
-        else:
-            batch_outputs = sum([x * y for x, y in zip(num_poolings, batch_sizes)])
-    else:
-        batch_outputs = batch_inputs
+    batch_outputs = (
+        sum([x * y for x, y in zip(num_poolings, batch_sizes)])
+        if is_pooled
+        else batch_inputs
+    )
 
     input_sizes = [math.ceil(batch_inputs * world_size * input_data_type_size)]
     output_sizes = [
@@ -678,20 +660,11 @@ def _calculate_cw_shard_io_sizes(
     batch_inputs = sum(
         [x * y * z for x, y, z in zip(input_lengths, num_poolings, batch_sizes)]
     )
-    if is_pooled:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:scale_batch_outputs_by_input_length"
-        ):
-            batch_outputs = sum(
-                [
-                    min(1.0, il) * x * y
-                    for il, x, y in zip(input_lengths, num_poolings, batch_sizes)
-                ]
-            )
-        else:
-            batch_outputs = sum([x * y for x, y in zip(num_poolings, batch_sizes)])
-    else:
-        batch_outputs = batch_inputs
+    batch_outputs = (
+        sum([x * y for x, y in zip(num_poolings, batch_sizes)])
+        if is_pooled
+        else batch_inputs
+    )
 
     input_sizes = [math.ceil(batch_inputs * world_size * input_data_type_size)] * len(
         shard_sizes
@@ -720,20 +693,11 @@ def _calculate_rw_shard_io_sizes(
         sum([x * y * z for x, y, z in zip(input_lengths, num_poolings, batch_sizes)])
         / world_size
     )
-    if is_pooled:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:scale_batch_outputs_by_input_length"
-        ):
-            batch_outputs = sum(
-                [
-                    min(1.0, il) * x * y
-                    for il, x, y in zip(input_lengths, num_poolings, batch_sizes)
-                ]
-            )
-        else:
-            batch_outputs = sum([x * y for x, y in zip(num_poolings, batch_sizes)])
-    else:
-        batch_outputs = batch_inputs
+    batch_outputs = (
+        sum([x * y for x, y in zip(num_poolings, batch_sizes)])
+        if is_pooled
+        else batch_inputs
+    )
 
     input_sizes = [
         (
@@ -772,20 +736,11 @@ def _calculate_twrw_shard_io_sizes(
         sum([x * y * z for x, y, z in zip(input_lengths, num_poolings, batch_sizes)])
         / local_world_size
     )
-    if is_pooled:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:scale_batch_outputs_by_input_length"
-        ):
-            batch_outputs = sum(
-                [
-                    min(1.0, il) * x * y
-                    for il, x, y in zip(input_lengths, num_poolings, batch_sizes)
-                ]
-            )
-        else:
-            batch_outputs = sum([x * y for x, y in zip(num_poolings, batch_sizes)])
-    else:
-        batch_outputs = batch_inputs
+    batch_outputs = (
+        sum([x * y for x, y in zip(num_poolings, batch_sizes)])
+        if is_pooled
+        else batch_inputs
+    )
 
     input_sizes = [
         (

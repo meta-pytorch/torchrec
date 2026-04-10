@@ -18,7 +18,6 @@ Tests the core dataclasses and config classes:
 """
 
 import unittest
-from unittest.mock import patch
 
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.estimator.annotations import (
@@ -437,87 +436,6 @@ class ShardPerfContextTest(unittest.TestCase):
             is_pooled=False,
         )
         self.assertEqual(ctx.batch_outputs, ctx.batch_inputs)
-
-    def test_batch_outputs_sparse_vbe_with_scaling(self) -> None:
-        """Test batch_outputs is scaled by min(1, input_length) for sparse VBE.
-
-        When input_length < 1.0, batch_outputs should be proportionally
-        smaller. Without this fix, all VBE features had the same
-        batch_outputs regardless of sparsity, causing up to 59,000x
-        overestimated comms volume for pooling_factor=0.001.
-        """
-        with patch("torch._utils_internal.justknobs_check", return_value=True):
-            ctx = ShardPerfContext(
-                input_lengths=[0.1, 10.0],
-                num_poolings=[1.0, 1.0],
-                batch_sizes=[100, 100],
-                is_pooled=True,
-            )
-            # min(1,0.1)*1*100 + min(1,10)*1*100 = 10 + 100 = 110
-            self.assertAlmostEqual(ctx.batch_outputs, 110.0)
-
-    def test_batch_outputs_sparse_vbe_without_scaling_overestimates(self) -> None:
-        """Test that without scaling, sparse VBE batch_outputs is overestimated.
-
-        With JK disabled (old behavior), batch_outputs ignores input_length,
-        treating sparse features the same as dense ones.
-        """
-        with patch("torch._utils_internal.justknobs_check", return_value=False):
-            ctx = ShardPerfContext(
-                input_lengths=[0.1, 10.0],
-                num_poolings=[1.0, 1.0],
-                batch_sizes=[100, 100],
-                is_pooled=True,
-            )
-            # Without scaling (old bug): 1*100 + 1*100 = 200
-            self.assertAlmostEqual(ctx.batch_outputs, 200.0)
-
-    def test_batch_outputs_extremely_sparse_vbe(self) -> None:
-        """Test batch_outputs with extremely sparse VBE (pooling_factor=0.001).
-
-        Demonstrates the production scenario from job aps-f1051869957 where
-        VBE tables with pooling_factor=0.001 had massively overestimated
-        comms volume.
-        """
-        with patch("torch._utils_internal.justknobs_check", return_value=True):
-            ctx = ShardPerfContext(
-                input_lengths=[0.001],
-                num_poolings=[1.0],
-                batch_sizes=[1000],
-                is_pooled=True,
-            )
-            # With scaling: min(1, 0.001)*1*1000 = 1.0
-            self.assertAlmostEqual(ctx.batch_outputs, 1.0)
-
-        with patch("torch._utils_internal.justknobs_check", return_value=False):
-            ctx2 = ShardPerfContext(
-                input_lengths=[0.001],
-                num_poolings=[1.0],
-                batch_sizes=[1000],
-                is_pooled=True,
-            )
-            # Without scaling: 1*1000 = 1000.0 (1000x overestimate!)
-            self.assertAlmostEqual(ctx2.batch_outputs, 1000.0)
-
-    def test_batch_outputs_dense_features_unaffected(self) -> None:
-        """Test that dense features (input_length >= 1) are unaffected by scaling."""
-        with patch("torch._utils_internal.justknobs_check", return_value=True):
-            ctx_scaled = ShardPerfContext(
-                input_lengths=[10.0, 20.0],
-                num_poolings=[1.0, 2.0],
-                batch_sizes=[32, 32],
-                is_pooled=True,
-            )
-        with patch("torch._utils_internal.justknobs_check", return_value=False):
-            ctx_unscaled = ShardPerfContext(
-                input_lengths=[10.0, 20.0],
-                num_poolings=[1.0, 2.0],
-                batch_sizes=[32, 32],
-                is_pooled=True,
-            )
-        # Both should be 96.0: min(1,10)*1*32 + min(1,20)*2*32 = 32+64 = 96
-        self.assertEqual(ctx_scaled.batch_outputs, 96.0)
-        self.assertEqual(ctx_unscaled.batch_outputs, 96.0)
 
     def test_is_uvm_caching_property(self) -> None:
         """Test is_uvm_caching computed property."""
