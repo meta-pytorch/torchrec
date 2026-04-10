@@ -77,6 +77,31 @@ from typing_extensions import ParamSpec
 # Module exports - intentionally empty as these are internal utilities
 __all__: list[str] = []
 
+
+class LazyStr:
+    """Lazy string wrapper that defers evaluation until the string is needed.
+
+    Wraps a callable that produces a string. The callable is only invoked
+    when ``__str__`` is called, which happens when the logging framework
+    formats the message. If the log level is not active, the callable is
+    never evaluated.
+
+    Usage::
+
+        logger.debug(LazyStr(lambda: f"freed {expensive()} KJTs"))
+    """
+
+    # Use __slots__ to avoid per-instance __dict__, saving memory and
+    # speeding up attribute access since these may be created frequently.
+    __slots__ = ("_fn",)
+
+    def __init__(self, fn: Callable[[], str]) -> None:
+        self._fn = fn
+
+    def __str__(self) -> str:
+        return self._fn()
+
+
 # Some inputs like can get extremely large.
 # Adding logic to limit the input size by truncating any args larger than this size
 ARG_SIZE_LIMIT = 800000
