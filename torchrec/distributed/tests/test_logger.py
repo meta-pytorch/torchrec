@@ -20,6 +20,9 @@ from torchrec.distributed.logger import (
     _get_or_create_logger,
     _torchrec_method_logger,
     ARG_SIZE_LIMIT,
+    LazyStr,
+    one_time_logger,
+    one_time_rank0_logger,
 )
 from torchrec.distributed.logging_handlers import _log_handlers, SingleRankStaticLogger
 
@@ -339,3 +342,46 @@ class TestLoggerUtils(unittest.TestCase):
                     self.assertEqual(msg_dict["group"], str(mock_process_group))
                     self.assertEqual(msg_dict["world_size"], "8")
                     self.assertEqual(msg_dict["rank"], "3")
+
+
+class TestLazyStr(unittest.TestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.count = 0
+
+        def counter() -> str:
+            self.count += 1
+            return f"call_{self.count}"
+
+        self.lazy_msg = LazyStr(counter)
+
+    def test_str_calls_fn(self) -> None:
+        """Test that __str__ invokes the wrapped callable."""
+        self.assertEqual(str(self.lazy_msg), "call_1")
+
+    def test_fn_not_called_until_str(self) -> None:
+        """Test that the callable is not evaluated at construction time."""
+        self.assertEqual(self.count, 0)
+        logging.info(self.lazy_msg)
+        self.assertEqual(self.count, 1)
+
+    def test_fn_called_each_time(self) -> None:
+        """Test that __str__ calls the callable on every invocation."""
+        self.assertEqual(str(self.lazy_msg), "call_1")
+        self.assertEqual(str(self.lazy_msg), "call_2")
+        logging.info("%s", self.lazy_msg)
+        self.assertEqual(self.count, 3)
+
+    def test_skipped_when_log_level_inactive(self) -> None:
+        """Test that LazyStr defers evaluation when log level filters the message."""
+        one_time_rank0_logger.setLevel(logging.INFO)
+        self.assertEqual(str(self.lazy_msg), "call_1")
+        for _ in range(3):
+            one_time_rank0_logger.debug(self.lazy_msg)
+        self.assertEqual(self.count, 1)
+
+    def test_with_one_time_logger(self) -> None:
+        """Test that LazyStr works with one_time_logger (Cap1Logger)."""
+        for _ in range(3):
+            one_time_logger.info(self.lazy_msg)
+        self.assertLess(self.count, 2)

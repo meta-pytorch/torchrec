@@ -311,23 +311,6 @@ class EmbeddingCollectionContext(Multistreamable):
     table_name_to_unpruned_hash_sizes: Dict[str, int] = field(default_factory=dict)
     early_releasable_inputs: list[KeyedJaggedTensor] = field(default_factory=list)
 
-    def __post_init__(self) -> None:
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:disable_none_context_fields"
-        ):
-            return
-        if self.sharding_contexts is None:
-            self.sharding_contexts = []  # pyrefly: ignore[bad-assignment]
-        if self.input_features is None:
-            self.input_features = []  # pyrefly: ignore[bad-assignment]
-        if self.reverse_indices is None:
-            self.reverse_indices = []  # pyrefly: ignore[bad-assignment]
-        if self.seq_vbe_ctx is None:
-            self.seq_vbe_ctx = []  # pyrefly: ignore[bad-assignment]
-        if self.table_name_to_unpruned_hash_sizes is None:
-            # pyrefly: ignore[bad-assignment]
-            self.table_name_to_unpruned_hash_sizes = {}
-
     def record_stream(self, stream: torch.Stream) -> None:
         for ctx in self.sharding_contexts:
             ctx.record_stream(stream)

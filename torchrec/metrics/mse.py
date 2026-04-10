@@ -118,6 +118,7 @@ class MSEMetricComputation(RecMetricComputation):
             dist_reduce_fx="sum",
             persistent=include_r_squared,
         )
+        self._get_mse_states = self._maybe_compile(get_mse_states)
 
     def update(
         self,
@@ -131,7 +132,7 @@ class MSEMetricComputation(RecMetricComputation):
             raise RecMetricException(
                 "Inputs 'predictions' and 'weights' should not be None for MSEMetricComputation update"
             )
-        states = get_mse_states(labels, predictions, weights)
+        states = self._get_mse_states(labels, predictions, weights)
         num_samples = predictions.shape[-1]
         for state_name, state_value in states.items():
             state = getattr(self, state_name)

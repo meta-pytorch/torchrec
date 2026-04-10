@@ -61,6 +61,7 @@ class CTRMetricComputation(RecMetricComputation):
             dist_reduce_fx="sum",
             persistent=True,
         )
+        self._get_ctr_states = self._maybe_compile(get_ctr_states)
 
     def update(
         self,
@@ -75,7 +76,7 @@ class CTRMetricComputation(RecMetricComputation):
                 "Inputs 'predictions' and 'weights' should not be None for CTRMetricComputation update"
             )
         num_samples = predictions.shape[-1]
-        for state_name, state_value in get_ctr_states(
+        for state_name, state_value in self._get_ctr_states(
             labels, predictions, weights
         ).items():
             state = getattr(self, state_name)

@@ -36,7 +36,7 @@ from torchrec.distributed.embedding_sharding import (
     KJTSplitsAllToAllMeta,
 )
 from torchrec.distributed.embedding_types import KJTList
-from torchrec.distributed.logger import one_time_rank0_logger
+from torchrec.distributed.logger import LazyStr, one_time_logger, one_time_rank0_logger
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
@@ -165,13 +165,22 @@ def _clear_releasable_inputs(context: TrainPipelineContext) -> None:
         if context.version == 0
         else context.module_contexts
     )
+    size = 0
     for module_ctx in contexts_dict.values():
         early_released: list[KeyedJaggedTensor] = getattr(
             module_ctx, "early_releasable_inputs", []
         )
         for kjt in early_released:
-            kjt.clear_storage()
+            size += kjt.clear_storage()
         early_released.clear()
+    if size > 0:
+
+        def get_kjt_size() -> str:
+            msg: str = f"clear_releasable_inputs {size / 1024**3:.2f} GB"
+            logger.info(msg)
+            return msg
+
+        one_time_logger.info(LazyStr(get_kjt_size))
 
 
 def _start_data_dist(
@@ -203,10 +212,7 @@ def _start_data_dist(
         # and this info was done in the _rewrite_model by tracing the
         # entire model to get the arg_info_list
         args, kwargs = forward.args.build_args_kwargs(batch)
-        if torch._utils_internal.justknobs_check(
-            "pytorch/torchrec:enable_rw_feature_processor"
-        ):
-            args, kwargs = module.preprocess_input(args, kwargs)
+        args, kwargs = module.preprocess_input(args, kwargs)
 
         # Start input distribution.
         module_ctx = module.create_context()

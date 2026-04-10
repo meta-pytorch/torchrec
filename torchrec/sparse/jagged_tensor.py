@@ -3122,7 +3122,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         return splits
 
     @torch.jit.unused
-    def clear_storage(self) -> None:
+    def clear_storage(self) -> int:
         """
         Frees the underlying storage of all internal tensors (_values, _lengths,
         _offsets, _weights) by resizing their untyped storage to zero.
@@ -3130,13 +3130,18 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         The Python KJT object remains alive but its tensor data is released,
         allowing GPU HBM to be reclaimed early.
         """
+        size = self._values.element_size() * self._values.numel()
         self._values.untyped_storage().resize_(0)
         if self._lengths is not None:
+            size += self._lengths.element_size() * self._lengths.numel()
             self._lengths.untyped_storage().resize_(0)
         if self._offsets is not None:
+            size += self._offsets.element_size() * self._offsets.numel()
             self._offsets.untyped_storage().resize_(0)
         if self._weights is not None:
+            size += self._weights.element_size() * self._weights.numel()
             self._weights.untyped_storage().resize_(0)
+        return size
 
     def dist_tensors(self) -> List[torch.Tensor]:
         tensors = [self.lengths(), self.values()]
