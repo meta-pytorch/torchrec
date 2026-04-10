@@ -160,11 +160,9 @@ class ModelInput(Pipelineable):
         # Generate global batch.
         global_idlist_lengths = []
         global_idlist_indices = []
-        global_idlist_offsets = []
 
         global_idscore_lengths = []
         global_idscore_indices = []
-        global_idscore_offsets = []
         global_idscore_weights = []
 
         for idx in range(len(idlist_ind_ranges)):
@@ -229,14 +227,8 @@ class ModelInput(Pipelineable):
                     device=device,
                 )
 
-            # Calculate offsets from lengths
-            offsets = torch.cat(
-                [torch.tensor([0], device=device), lengths.cumsum(0)]
-            ).to(offsets_dtype)
-
             global_idlist_lengths.append(lengths)
             global_idlist_indices.append(indices)
-            global_idlist_offsets.append(offsets)
 
         for idx, ind_range in enumerate(idscore_ind_ranges):
             lengths_ = torch.abs(
@@ -287,21 +279,27 @@ class ModelInput(Pipelineable):
                     device=device,
                 )
             weights = torch.rand((num_indices,), device=device)
-            # Calculate offsets from lengths
-            offsets = torch.cat(
-                [torch.tensor([0], device=device), lengths.cumsum(0)]
-            ).to(offsets_dtype)
 
             global_idscore_lengths.append(lengths)
             global_idscore_indices.append(indices)
             global_idscore_weights.append(weights)
-            global_idscore_offsets.append(offsets)
 
         if input_type == "kjt":
             global_idlist_input = KeyedJaggedTensor(
                 keys=idlist_features,
                 values=torch.cat(global_idlist_indices),
-                offsets=torch.cat(global_idlist_offsets) if use_offsets else None,
+                offsets=(
+                    torch.cat(
+                        [
+                            torch.zeros(1, dtype=offsets_dtype, device=device),
+                            torch.cat(global_idlist_lengths)
+                            .cumsum(0)
+                            .to(offsets_dtype),
+                        ]
+                    )
+                    if use_offsets
+                    else None
+                ),
                 lengths=torch.cat(global_idlist_lengths) if not use_offsets else None,
             )
 
@@ -309,7 +307,18 @@ class ModelInput(Pipelineable):
                 KeyedJaggedTensor(
                     keys=idscore_features,
                     values=torch.cat(global_idscore_indices),
-                    offsets=torch.cat(global_idscore_offsets) if use_offsets else None,
+                    offsets=(
+                        torch.cat(
+                            [
+                                torch.zeros(1, dtype=offsets_dtype, device=device),
+                                torch.cat(global_idscore_lengths)
+                                .cumsum(0)
+                                .to(offsets_dtype),
+                            ]
+                        )
+                        if use_offsets
+                        else None
+                    ),
                     lengths=(
                         torch.cat(global_idscore_lengths) if not use_offsets else None
                     ),
@@ -355,16 +364,12 @@ class ModelInput(Pipelineable):
         for r in range(world_size):
             local_idlist_lengths = []
             local_idlist_indices = []
-            local_idlist_offsets = []
 
             local_idscore_lengths = []
             local_idscore_indices = []
             local_idscore_weights = []
-            local_idscore_offsets = []
 
-            for lengths, indices, offsets in zip(
-                global_idlist_lengths, global_idlist_indices, global_idlist_offsets
-            ):
+            for lengths, indices in zip(global_idlist_lengths, global_idlist_indices):
                 local_idlist_lengths.append(
                     lengths[r * batch_size : r * batch_size + batch_size_by_rank[r]]
                 )
@@ -374,15 +379,11 @@ class ModelInput(Pipelineable):
                 local_idlist_indices.append(
                     indices[lengths_cumsum[r] : lengths_cumsum[r + 1]]
                 )
-                local_idlist_offsets.append(
-                    offsets[r * batch_size : r * batch_size + batch_size_by_rank[r] + 1]
-                )
 
-            for lengths, indices, weights, offsets in zip(
+            for lengths, indices, weights in zip(
                 global_idscore_lengths,
                 global_idscore_indices,
                 global_idscore_weights,
-                global_idscore_offsets,
             ):
                 local_idscore_lengths.append(
                     lengths[r * batch_size : r * batch_size + batch_size_by_rank[r]]
@@ -397,15 +398,22 @@ class ModelInput(Pipelineable):
                     weights[lengths_cumsum[r] : lengths_cumsum[r + 1]]
                 )
 
-                local_idscore_offsets.append(
-                    offsets[r * batch_size : r * batch_size + batch_size_by_rank[r] + 1]
-                )
-
             if input_type == "kjt":
                 local_idlist_input = KeyedJaggedTensor(
                     keys=idlist_features,
                     values=torch.cat(local_idlist_indices),
-                    offsets=torch.cat(local_idlist_offsets) if use_offsets else None,
+                    offsets=(
+                        torch.cat(
+                            [
+                                torch.zeros(1, dtype=offsets_dtype, device=device),
+                                torch.cat(local_idlist_lengths)
+                                .cumsum(0)
+                                .to(offsets_dtype),
+                            ]
+                        )
+                        if use_offsets
+                        else None
+                    ),
                     lengths=(
                         torch.cat(local_idlist_lengths) if not use_offsets else None
                     ),
@@ -416,7 +424,16 @@ class ModelInput(Pipelineable):
                         keys=idscore_features,
                         values=torch.cat(local_idscore_indices),
                         offsets=(
-                            torch.cat(local_idscore_offsets) if use_offsets else None
+                            torch.cat(
+                                [
+                                    torch.zeros(1, dtype=offsets_dtype, device=device),
+                                    torch.cat(local_idscore_lengths)
+                                    .cumsum(0)
+                                    .to(offsets_dtype),
+                                ]
+                            )
+                            if use_offsets
+                            else None
                         ),
                         lengths=(
                             torch.cat(local_idscore_lengths)
