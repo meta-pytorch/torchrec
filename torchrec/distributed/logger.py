@@ -58,7 +58,7 @@ Notes:
 import functools
 import inspect
 import logging
-from typing import Any, Callable, Dict, TypeVar
+from typing import Any, Callable, Dict, Optional, TypeVar
 
 from torch import distributed as dist
 from torchrec.distributed.logging_handlers import (
@@ -93,13 +93,16 @@ class LazyStr:
 
     # Use __slots__ to avoid per-instance __dict__, saving memory and
     # speeding up attribute access since these may be created frequently.
-    __slots__ = ("_fn",)
+    __slots__ = ("_fn", "_str")
 
     def __init__(self, fn: Callable[[], str]) -> None:
         self._fn = fn
+        self._str: Optional[str] = None
 
     def __str__(self) -> str:
-        return self._fn()
+        if self._str is None:
+            self._str = self._fn()
+        return self._str
 
 
 # Some inputs like can get extremely large.

@@ -362,15 +362,15 @@ class TestLazyStr(unittest.TestCase):
     def test_fn_not_called_until_str(self) -> None:
         """Test that the callable is not evaluated at construction time."""
         self.assertEqual(self.count, 0)
-        logging.info(self.lazy_msg)
+        logging.error(self.lazy_msg)
         self.assertEqual(self.count, 1)
 
     def test_fn_called_each_time(self) -> None:
-        """Test that __str__ calls the callable on every invocation."""
+        """Test that __str__ calls the callable only once."""
         self.assertEqual(str(self.lazy_msg), "call_1")
-        self.assertEqual(str(self.lazy_msg), "call_2")
-        logging.info("%s", self.lazy_msg)
-        self.assertEqual(self.count, 3)
+        self.assertEqual(str(self.lazy_msg), "call_1")
+        logging.error("%s", self.lazy_msg)
+        self.assertEqual(self.count, 1)
 
     def test_skipped_when_log_level_inactive(self) -> None:
         """Test that LazyStr defers evaluation when log level filters the message."""

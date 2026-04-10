@@ -7,7 +7,7 @@
 
 # pyre-strict
 
-from torchrec.distributed.test_utils.test_model_parallel import ModelParallelBase
+from torchrec.distributed.test_utils.test_model_parallel import _ModelParallelBase
 from torchrec.distributed.test_utils.test_model_parallel_base import (
     ModelParallelSparseOnlyBase,
     ModelParallelStateDictBase,
@@ -16,7 +16,7 @@ from torchrec.distributed.test_utils.test_model_parallel_base import (
 # CPU tests for Gloo.
 
 
-class ModelParallelTestGloo(ModelParallelBase):
+class ModelParallelTestGloo(_ModelParallelBase):
     backend = "gloo"
 
 

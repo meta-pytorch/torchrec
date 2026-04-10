@@ -7,8 +7,8 @@
 
 # pyre-strict
 
-from torchrec.distributed.test_utils.test_model_parallel import ModelParallelBase
+from torchrec.distributed.test_utils.test_model_parallel import _ModelParallelBase
 
 
-class ModelParallelTestNccl(ModelParallelBase):
+class ModelParallelTestNccl(_ModelParallelBase):
     backend = "nccl"
