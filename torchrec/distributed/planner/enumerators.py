@@ -115,6 +115,13 @@ class EmbeddingEnumerator(Enumerator):
             and topology._custom_topology_data.has_data(memory_type)
             else None
         )
+        # Check if any device in the topology has SSD capacity.
+        # If no device has ssd > 0, KEY_VALUE should be skipped during enumeration
+        # even if it's not in GUARDED_COMPUTE_KERNELS, because fits_in() would
+        # reject all KEY_VALUE shards anyway. Skipping early avoids expanding
+        # the search space (and potentially exceeding GridSearchProposer's
+        # max_proposals limit) with options that can never be selected.
+        self._has_ssd: bool = any(device.storage.ssd > 0 for device in topology.devices)
 
         if estimator:
             self._estimators: List[ShardEstimator] = (
@@ -414,6 +421,14 @@ class EmbeddingEnumerator(Enumerator):
         filtered_compute_kernels = list(
             set(constrained_compute_kernels) & set(allowed_compute_kernels)
         )
+
+        # Remove KEY_VALUE if no device has SSD capacity — avoids expanding
+        # the search space with infeasible options that fits_in() would reject.
+        if (
+            not self._has_ssd
+            and EmbeddingComputeKernel.KEY_VALUE.value in filtered_compute_kernels
+        ):
+            filtered_compute_kernels.remove(EmbeddingComputeKernel.KEY_VALUE.value)
 
         # special rules
         if EmbeddingComputeKernel.DENSE.value in filtered_compute_kernels:

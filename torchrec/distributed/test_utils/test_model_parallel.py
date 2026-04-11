@@ -319,12 +319,14 @@ class ModelParallelTestShared(MultiProcessTestBase):
 
 
 @skip_if_asan_class
-class ModelParallelBase(ModelParallelTestShared):
+class _ModelParallelBase(ModelParallelTestShared):
     # tests will skip if no backend specified
     backend = ""
 
     @classmethod
     def setUpClass(cls) -> None:
+        if cls.backend == "":
+            raise unittest.SkipTest("This test class is intentionally skipped.")
         if cls.backend not in ("nccl", "gloo"):
             raise unittest.SkipTest(f"No valid backend specified: {cls.backend}")
 

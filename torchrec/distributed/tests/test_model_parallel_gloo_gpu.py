@@ -7,10 +7,10 @@
 
 # pyre-strict
 
-from torchrec.distributed.test_utils.test_model_parallel import ModelParallelBase
+from torchrec.distributed.test_utils.test_model_parallel import _ModelParallelBase
 
 # GPU tests for Gloo.
 
 
-class ModelParallelTestGloo(ModelParallelBase):
+class ModelParallelTestGlooGPU(_ModelParallelBase):
     backend = "gloo"
