@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import sysconfig
 import unittest
 from typing import Dict
 from unittest.mock import patch
@@ -18,6 +19,10 @@ from torchrec.metrics.xauc import XAUCMetric
 
 WORLD_SIZE = 4
 BATCH_SIZE = 10
+
+
+def _is_free_threaded() -> bool:
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 
 
 def generate_model_output() -> Dict[str, torch._tensor.Tensor]:
@@ -58,6 +63,11 @@ class XAUCMetricTest(unittest.TestCase):
             msg=f"Actual: {actual_metric}, Expected: {expected_metric}",
         )
 
+    @unittest.skipIf(
+        _is_free_threaded(),
+        "torch.compile segfaults on free-threaded Python, "
+        "see https://dev-discuss.pytorch.org/t/torch-compile-support-for-python-3-14-completed/3276",
+    )
     def test_xauc_compile(self) -> None:
         xauc_compile = XAUCMetric(
             world_size=WORLD_SIZE,
