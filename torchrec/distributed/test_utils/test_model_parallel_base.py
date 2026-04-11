@@ -10,7 +10,7 @@
 import os
 import unittest
 from collections import defaultdict
-from typing import Any, Callable, cast, Dict, List, Optional, OrderedDict, Tuple
+from typing import Any, Callable, cast, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
 import torch
@@ -102,6 +102,7 @@ class InferenceModelParallelTestBase(unittest.TestCase):
         constraints: Optional[Dict[str, ParameterConstraints]] = None,
         # pyrefly: ignore[bad-function-definition]
         generate: ModelInputCallable = ModelInput.generate,
+        exclude_predfix: Optional[Union[str, List[str]]] = None,
     ) -> None:
         default_rank = 0
         cuda_device = torch.device(f"cuda:{default_rank}")
@@ -174,7 +175,11 @@ class InferenceModelParallelTestBase(unittest.TestCase):
         # materialize inference sharded model on one device for dense part
         local_model = local_model.copy(cuda_device)
 
-        copy_state_dict(local_model.state_dict(), global_model.state_dict())
+        copy_state_dict(
+            local_model.state_dict(),
+            global_model.state_dict(),
+            exclude_predfix=exclude_predfix,
+        )
 
         # Run a single training step of the sharded model.
         with torch.inference_mode():
