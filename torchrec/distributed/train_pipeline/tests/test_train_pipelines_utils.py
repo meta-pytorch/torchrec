@@ -136,6 +136,55 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(missing_keys, [])
         self.assertEqual(unexpected_keys, [])
 
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_rewrite_model_compiled_with_error_on_nested_fx_trace(self) -> None:
+        """Test that _rewrite_model can trace a compiled model even when
+        error_on_nested_fx_trace is True, thanks to the config.patch override.
+
+        The compiled module must contain ShardedModules so the FX tracer traces
+        *into* it (non-leaf), triggering dynamo's eval frame hook which checks
+        the error_on_nested_fx_trace config."""
+        sharding_type = ShardingType.TABLE_WISE.value
+        kernel_type = EmbeddingComputeKernel.FUSED.value
+        fused_params = {}
+
+        model = self._setup_model()
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type, fused_params
+        )
+
+        # Compile the sparse sub-module which contains ShardedModules (ebc,
+        # weighted_ebc).  Because it contains ShardedModules the FX tracer will
+        # treat it as non-leaf and trace into it, invoking the OptimizedModule's
+        # __call__ which goes through dynamo's eval frame and checks
+        # error_on_nested_fx_trace.
+        inner = sharded_model.module
+        # pyrefly: ignore[missing-attribute]
+        compiled_sparse = torch.compile(inner.sparse, backend="eager", fullgraph=False)
+        setattr(inner, "sparse", compiled_sparse)
+
+        # Set error_on_nested_fx_trace to True globally — without the fix in
+        # _rewrite_model this would cause tracing to raise an error.
+        original_value = torch._dynamo.config.error_on_nested_fx_trace
+        torch._dynamo.config.error_on_nested_fx_trace = True
+        try:
+            pipelined_forwards, _, original_forwards, _, _ = _rewrite_model(
+                model=sharded_model,
+                batch=None,
+                context=TrainPipelineContext(),
+                dist_stream=None,
+            )
+
+            # Verify that sharded modules were successfully pipelined
+            self.assertGreater(len(pipelined_forwards), 0)
+            for mod in pipelined_forwards:
+                self.assertIsInstance(mod.forward, PipelinedForward)
+        finally:
+            torch._dynamo.config.error_on_nested_fx_trace = original_value
+
     def test_pipelined_postproc_state_dict(self) -> None:
         class TestModule(torch.nn.Module):
             def __init__(self):
