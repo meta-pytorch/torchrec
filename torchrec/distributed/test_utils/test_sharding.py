@@ -675,13 +675,17 @@ def dynamic_sharding_test(
 def copy_state_dict(
     loc: Dict[str, Union[torch.Tensor, ShardedTensor, DTensor]],
     glob: Dict[str, torch.Tensor],
-    exclude_predfix: Optional[str] = None,
+    exclude_predfix: Optional[Union[str, List[str]]] = None,
 ) -> None:
     """
     Copies the contents of the global tensors in glob to the local tensors in loc.
     """
+    if isinstance(exclude_predfix, str):
+        exclude_predfix = [exclude_predfix]
     for name, tensor in loc.items():
-        if exclude_predfix is not None and name.startswith(exclude_predfix):
+        if exclude_predfix is not None and any(
+            name.startswith(p) for p in exclude_predfix
+        ):
             continue
         else:
             assert name in glob, name

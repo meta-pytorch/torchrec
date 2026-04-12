@@ -418,7 +418,19 @@ def _rewrite_model(  # noqa C901
             concrete_args = batch.to_proxy_tuple(model)
 
     tracer = Tracer(leaf_modules=_get_leaf_module_names(model))
-    graph = tracer.trace(model, concrete_args=concrete_args)
+
+    # When a compiled (torch.compile) module contains ShardedModules, the FX
+    # tracer will trace into it (non-leaf), which triggers dynamo's eval-frame
+    # hook. If error_on_nested_fx_trace is True, dynamo rejects the nested FX
+    # trace and raises an error.  Temporarily patch the config to False so the
+    # FX tracer can operate on compiled models regardless of the global setting.
+    if torch._utils_internal.justknobs_check(
+        "pytorch/torchrec:killswitch_rewrite_model_patch_nested_fx_trace",
+    ):
+        with torch._dynamo.config.patch(error_on_nested_fx_trace=False):
+            graph = tracer.trace(model, concrete_args=concrete_args)
+    else:
+        graph = tracer.trace(model, concrete_args=concrete_args)
 
     # Select sharded modules, which are top-level in the forward call graph,
     # i.e. don't have input transformations, i.e. rely only on 'builtins.getattr'.
