@@ -10,6 +10,7 @@ RunOptions:
   name: "prefetch_emo"
   memory_snapshot: True
   loglevel: "INFO"
+  sync_batch: True
   # export_stacks: True # enable this to export stack traces
 PipelineConfig:
   pipeline: "prefetch"  # "sparse"
@@ -51,3 +52,5 @@ PlannerConfig:
     large_table:
       compute_kernels: [fused_uvm_caching]
       sharding_types: [row_wise]
+      cache_params:
+        prefetch_pipeline: True

@@ -133,6 +133,7 @@ class RunOptions(BenchFuncConfig):
     num_iters: Optional[int] = None
     output_json: bool = False
     sync_fwd: bool = True
+    sync_batch: bool = False
 
 
 # single-rank runner
@@ -280,7 +281,10 @@ def runner(
                         if metric_module.should_compute():
                             with record_function("## metric_compute ##"):
                                 metric_module.compute()
-                    fwd_event.synchronize()
+                    if run_option.sync_fwd:
+                        fwd_event.synchronize()
+                    if run_option.sync_batch:
+                        torch.cuda.synchronize()
                 except StopIteration:
                     break
 
