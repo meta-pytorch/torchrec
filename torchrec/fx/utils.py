@@ -11,7 +11,7 @@ import inspect
 from typing import Any, Dict, List, Set
 
 import torch
-from torch.fx._symbolic_trace import is_fx_tracing
+from torch.fx._symbolic_trace import is_fx_symbolic_tracing
 
 # Not importing DistributedModelParallel here to avoid circular dependencies as DMP depends on torchrec.fx.tracer
 # def dmp_fx_trace_forward(dmp: DistributedModelParallel)
@@ -131,7 +131,7 @@ def _fx_marker(s: str, any_proxy_unused: Any) -> None:
 
 
 def fx_marker(s: str, any_proxy_unused: Any) -> None:
-    if is_fx_tracing():
+    if is_fx_symbolic_tracing():
         _fx_marker(s, any_proxy_unused)
 
 
@@ -147,5 +147,5 @@ def is_marker_node(node: torch.fx.Node, marker_name: str) -> bool:
 
 @torch.jit.ignore
 def assert_fx_safe(condition: bool, message: str) -> None:
-    if not is_fx_tracing():
+    if not is_fx_symbolic_tracing():
         assert condition, message

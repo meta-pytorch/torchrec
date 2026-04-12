@@ -12,7 +12,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from torch.fx._symbolic_trace import is_fx_tracing
+from torch.fx._symbolic_trace import is_fx_symbolic_tracing
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.test_utils.test_model import (
     ModelInput,
@@ -657,7 +657,7 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
                 input_list: List[Union[torch.Tensor, int]],
                 input_dict: Dict[str, Union[torch.Tensor, int]],
             ) -> ModelInput:
-                if not is_fx_tracing():
+                if not is_fx_symbolic_tracing():
                     for idx, value in enumerate(input_list):
                         if isinstance(value, torch.fx.Node):
                             test_runner.fail(
