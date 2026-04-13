@@ -25,6 +25,7 @@ from torchrec.distributed.test_utils.test_model import ModelInput, TestSparseNN
 from torchrec.distributed.train_pipeline.backward_injection import (
     FirstGradTensorFinder,
     InjectionSite,
+    InjectionTargetType,
     OutputDistTensorFinder,
     register_backward_hook,
 )
@@ -68,7 +69,9 @@ class InjectionSiteTest(unittest.TestCase):
 
     def test_register_hook_nonexistent_raises(self) -> None:
         site = InjectionSite(
-            fqn="nonexistent.module", tensor_finder=FirstGradTensorFinder()
+            fqn="nonexistent.module",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
         )
         with self.assertRaises(ValueError):
             register_backward_hook(site, SimpleModel(), lambda grad: None)
@@ -76,7 +79,11 @@ class InjectionSiteTest(unittest.TestCase):
     def test_register_hook_persists_and_removable(self) -> None:
         """Hook fires every iteration; removing it stops firing."""
         model = SimpleModel()
-        site = InjectionSite(fqn="layer_a", tensor_finder=FirstGradTensorFinder())
+        site = InjectionSite(
+            fqn="layer_a",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+        )
         call_count: List[int] = [0]
 
         handle = register_backward_hook(
@@ -142,6 +149,7 @@ def _run_output_dist_backward_hook_test(
             tensor_finder=OutputDistTensorFinder(
                 sharding_type=ShardingType(sharding_type)
             ),
+            target_type=InjectionTargetType.ACTIVATION,
         )
         register_backward_hook(
             site,
@@ -182,10 +190,15 @@ def _run_output_dist_backward_order_test(
             tensor_finder=OutputDistTensorFinder(
                 sharding_type=ShardingType(sharding_type)
             ),
+            target_type=InjectionTargetType.ACTIVATION,
         )
         register_backward_hook(ebc_site, dmp.module, lambda grad: order.append("ebc"))
 
-        dense_site = InjectionSite(fqn="dense", tensor_finder=FirstGradTensorFinder())
+        dense_site = InjectionSite(
+            fqn="dense",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+        )
         register_backward_hook(
             dense_site, dmp.module, lambda grad: order.append("dense")
         )
@@ -217,6 +230,7 @@ def _run_output_dist_multiple_hooks_test(
             tensor_finder=OutputDistTensorFinder(
                 sharding_type=ShardingType(sharding_type)
             ),
+            target_type=InjectionTargetType.ACTIVATION,
         )
         register_backward_hook(site, dmp.module, lambda grad: order.append("hook_0"))
         register_backward_hook(site, dmp.module, lambda grad: order.append("hook_1"))
@@ -249,6 +263,7 @@ def _run_output_dist_finder_mismatch_test(
             tensor_finder=OutputDistTensorFinder(
                 sharding_type=ShardingType(mismatched_sharding_type)
             ),
+            target_type=InjectionTargetType.ACTIVATION,
         )
         register_backward_hook(site, dmp.module, lambda grad: None)
 
