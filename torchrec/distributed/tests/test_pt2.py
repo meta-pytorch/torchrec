@@ -9,6 +9,7 @@
 import copy
 import itertools
 import sys
+import sysconfig
 import unittest
 from enum import auto, Enum
 from typing import Any, Dict, List, Tuple
@@ -63,6 +64,10 @@ from torchrec.sparse.jagged_tensor import (
     KeyedJaggedTensor,
     KeyedTensor,
 )
+
+
+def _is_free_threaded():
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
 
 
 def make_kjt(
@@ -267,6 +272,11 @@ def _test_compile_fwd_bwd(
             _assert_close(compile_bwd_out, eager_bwd_out)
 
 
+@unittest.skipIf(
+    _is_free_threaded(),
+    "torch.compile/torch.export segfaults on free-threaded Python, "
+    "see https://dev-discuss.pytorch.org/t/torch-compile-support-for-python-3-14-completed/3276",
+)
 class TestPt2(unittest.TestCase):
     def setUp(self):
         super().setUp()
