@@ -835,10 +835,15 @@ class ShardedEmbeddingCollection(
             # pyrefly: ignore[not-callable]
             lookup.purge()
 
-    def _initialize_torch_state(self) -> None:  # noqa
+    def _initialize_torch_state(self, skip_registering: bool = False) -> None:  # noqa
         """
         This provides consistency between this class and the EmbeddingCollection's
         nn.Module API calls (state_dict, named_modules, etc)
+
+        Args:
+            skip_registering (bool): If True, skips registering state_dict hooks. This is useful
+                for dynamic sharding where the state_dict hooks do not need to be
+                reregistered when being resharded. Default is False.
         """
 
         self.embeddings: nn.ModuleDict = nn.ModuleDict()
@@ -1167,12 +1172,13 @@ class ShardedEmbeddingCollection(
                     if skip_key in incompatible_keys.missing_keys:
                         incompatible_keys.missing_keys.remove(skip_key)
 
-        self.register_state_dict_pre_hook(self._pre_state_dict_hook)
-        self._register_state_dict_hook(post_state_dict_hook)
-        self._register_load_state_dict_pre_hook(
-            self._pre_load_state_dict_hook, with_module=True
-        )
-        self.register_load_state_dict_post_hook(_post_load_state_dict_hook)
+        if not skip_registering:
+            self.register_state_dict_pre_hook(self._pre_state_dict_hook)
+            self._register_state_dict_hook(post_state_dict_hook)
+            self._register_load_state_dict_pre_hook(
+                self._pre_load_state_dict_hook, with_module=True
+            )
+            self.register_load_state_dict_post_hook(_post_load_state_dict_hook)
 
         self.reset_parameters()
 
