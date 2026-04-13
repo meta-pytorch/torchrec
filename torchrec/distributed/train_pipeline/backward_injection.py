@@ -15,23 +15,48 @@ pass of EC (EmbeddingCollection) and EBC (EmbeddingBagCollection) modules.
 Work functions are registered at specific injection sites and executed during
 the backward all-to-all communication phase.
 
+Two hooking mechanisms are supported, selected via ``InjectionTargetType``:
+
+* **PARAM_GRAD** — uses ``torch.autograd.graph.register_multi_grad_hook`` on the
+  target module's trainable parameters.  This is **compile-safe**: unlike
+  forward hooks (which ``torch.compile`` can inline away), parameter
+  ``AccumulateGrad`` nodes survive compilation, so the hook fires reliably
+  under both eager and compiled (FMC) execution.
+
+* **ACTIVATION** — uses a forward hook on the target module.  Each forward pass,
+  the hook calls ``site.tensor_finder`` to locate an output tensor (e.g. the
+  ``dummy_tensor`` inside an output-dist awaitable), then registers a
+  per-tensor backward hook via ``tensor.register_hook``.  This is required
+  for sparse/pipelined modules where the backward hook must fire at a
+  specific point tied to the output-dist communication tensor.
+
 An ``InjectionSite`` pairs a module FQN with a ``GradTensorFinder`` strategy
-that determines which tensor to attach the backward hook to. Built-in finders:
-- ``FirstGradTensorFinder``: finds the first ``requires_grad`` tensor in output/input
-- ``OutputDistTensorFinder``: extracts ``dummy_tensor`` from EBC/EC output dist awaitables
+and a ``target_type`` that selects the hooking mechanism.
 
 Example usage:
     from torchrec.distributed.train_pipeline.backward_injection import (
         InjectionSite,
+        InjectionTargetType,
+        FirstGradTensorFinder,
         OutputDistTensorFinder,
     )
-    from torchrec.distributed.types import ShardingType
 
-    # Register hooks on the pipeline
+    # Dense module — compile-safe parameter-gradient hook
+    pipeline.register_backward_hook(
+        InjectionSite(
+            fqn="dense",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+        ),
+        lambda p: ...,
+    )
+
+    # Sparse module — forward-hook + tensor_finder
     pipeline.register_backward_hook(
         InjectionSite(
             fqn="sparse_arch.ebc",
             tensor_finder=OutputDistTensorFinder(sharding_type=ShardingType.TABLE_WISE),
+            target_type=InjectionTargetType.ACTIVATION,
         ),
         lambda p: p._optimizer.step(),
     )
@@ -39,7 +64,16 @@ Example usage:
 
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Protocol, runtime_checkable, TYPE_CHECKING
+from enum import Enum, unique
+from typing import (
+    Any,
+    Callable,
+    Optional,
+    Protocol,
+    runtime_checkable,
+    Sequence,
+    TYPE_CHECKING,
+)
 
 import torch
 from torch import nn
@@ -60,6 +94,25 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 # Type alias for work function that receives pipeline reference
 BackwardHookWork = Callable[["TrainPipeline"], None]
+
+
+@unique
+class InjectionTargetType(Enum):
+    """Selects the hooking mechanism used by ``register_backward_hook``.
+
+    Attributes:
+        PARAM_GRAD: Compile-safe hook via ``register_multi_grad_hook`` on the
+            module's trainable parameters.  Suitable for dense sub-modules
+            whose parameters participate directly in the loss.
+        ACTIVATION: Forward-hook + ``tensor_finder`` approach.  A forward hook
+            calls ``site.tensor_finder`` each forward pass to locate the
+            output tensor, then registers a per-tensor backward hook.
+            Required for sparse / pipelined modules (EC/EBC) where the
+            hook must fire at a specific output-dist communication point.
+    """
+
+    PARAM_GRAD = "param_grad"
+    ACTIVATION = "activation"
 
 
 @runtime_checkable
@@ -112,16 +165,22 @@ class FirstGradTensorFinder:
 @dataclass(frozen=True)
 class InjectionSite:
     """
-    Backward hook injection site = module FQN + tensor finding strategy.
+    Backward hook injection site = module FQN + tensor finding strategy
+    + target type selecting the hooking mechanism.
 
     Attributes:
-        fqn: Fully qualified name of the target module (e.g., "sparse_arch.ebc")
+        fqn: Fully qualified name of the target module (e.g., "sparse_arch.ebc").
         tensor_finder: Strategy for locating the tensor to attach the backward
-            hook to. Must conform to the ``GradTensorFinder`` protocol.
+            hook to.  Consulted only when ``target_type`` is ``ACTIVATION``;
+            ignored for ``PARAM_GRAD``.
+        target_type: Selects the hooking mechanism.  Use ``PARAM_GRAD`` for
+            compile-safe parameter-gradient hooks, ``ACTIVATION`` for
+            forward-hook + ``tensor_finder`` hooks.
     """
 
     fqn: str
     tensor_finder: GradTensorFinder
+    target_type: InjectionTargetType = InjectionTargetType.ACTIVATION
 
 
 def register_backward_hook(
@@ -132,22 +191,31 @@ def register_backward_hook(
     """
     Registers a backward hook at this injection site.
 
-    Installs a forward hook on the target module. Each forward pass, the
-    forward hook finds the first grad-requiring output tensor and registers
-    ``hook_fn`` as a backward hook on it. The forward hook persists across
-    iterations; call ``.remove()`` on the returned handle to unregister.
+    The hooking mechanism is selected by ``site.target_type``:
+
+    * **PARAM_GRAD** — ``torch.autograd.graph.register_multi_grad_hook`` on the
+      module's trainable parameters.  Compile-safe (``AccumulateGrad``
+      nodes survive ``torch.compile``).  ``tensor_finder`` is ignored.
+
+    * **ACTIVATION** — a forward hook that calls ``site.tensor_finder`` each
+      forward pass, then registers ``hook_fn`` on the discovered tensor
+      via ``tensor.register_hook``.  Required for pipelined EC/EBC modules.
 
     Args:
+        site: Injection site specification.
         model: The model containing the target module.
-        hook_fn: Backward hook function (receives gradient tensor).
+        hook_fn: Backward hook function (receives a gradient tensor).
 
     Returns:
-        A removable handle for the forward hook.
+        A removable handle; call ``.remove()`` to unregister.
 
     Raises:
-        ValueError: If the target module is not found in the model.
-        RuntimeError: If no grad-requiring tensor is found in the
-            module's output during forward.
+        ValueError: If the target module is not found in the model, has
+            no trainable parameters (PARAM_GRAD), or an unknown target type
+            is provided.
+        RuntimeError: If ``tensor_finder`` returns ``None`` during forward
+            (ACTIVATION) or if all parameter gradients are ``None`` during
+            backward (PARAM_GRAD).
     """
     try:
         target = model.get_submodule(site.fqn)
@@ -155,6 +223,59 @@ def register_backward_hook(
         raise ValueError(
             f"register_backward_hook: module '{site.fqn}' not found in model."
         )
+
+    match site.target_type:
+        case InjectionTargetType.PARAM_GRAD:
+            return _register_param_grad_hook(site, target, hook_fn)
+        case InjectionTargetType.ACTIVATION:
+            return _register_activation_hook(site, target, hook_fn)
+        case _:
+            raise ValueError(
+                f"register_backward_hook: unknown target_type '{site.target_type}'."
+            )
+
+
+def _register_param_grad_hook(
+    site: InjectionSite,
+    target: nn.Module,
+    hook_fn: Callable[[torch.Tensor], None],
+) -> torch.utils.hooks.RemovableHandle:
+    """Compile-safe hook via ``register_multi_grad_hook`` on parameters."""
+    params = [p for p in target.parameters() if p.requires_grad]
+    if not params:
+        raise ValueError(
+            f"register_backward_hook: no trainable parameters in module '{site.fqn}'."
+        )
+
+    def _multi_grad_callback(
+        grads: Sequence[torch.Tensor | None],
+    ) -> None:
+        """Invoke ``hook_fn`` with the first non-None gradient.
+
+        ``register_multi_grad_hook`` calls this once all tracked
+        parameters have accumulated their gradients.  We forward the
+        first available gradient tensor to the user-supplied
+        ``hook_fn``.
+
+        Raises:
+            RuntimeError: If every gradient in *grads* is ``None``.
+        """
+        grad = next((g for g in grads if g is not None), None)
+        if grad is None:
+            raise RuntimeError(
+                f"register_backward_hook: no non-None gradient found for module '{site.fqn}'."
+            )
+        hook_fn(grad)
+
+    return torch.autograd.graph.register_multi_grad_hook(params, _multi_grad_callback)
+
+
+def _register_activation_hook(
+    site: InjectionSite,
+    target: nn.Module,
+    hook_fn: Callable[[torch.Tensor], None],
+) -> torch.utils.hooks.RemovableHandle:
+    """Forward-hook + ``tensor_finder`` approach for sparse/pipelined modules."""
 
     def _fwd_hook(
         module: nn.Module,
@@ -164,7 +285,7 @@ def register_backward_hook(
         tensor = site.tensor_finder(input, output)
         if tensor is None:
             raise RuntimeError(
-                f"register_hook: no grad-requiring tensor in "
+                f"register_backward_hook: no grad-requiring tensor in "
                 f"output of '{site.fqn}'."
             )
         tensor.register_hook(hook_fn)

@@ -30,6 +30,7 @@ from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.train_pipeline.backward_injection import (
     FirstGradTensorFinder,
     InjectionSite,
+    InjectionTargetType,
     OutputDistTensorFinder,
 )
 from torchrec.distributed.train_pipeline.pipeline_context import (
@@ -820,6 +821,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
         self._output_dist_site = InjectionSite(
             fqn=site_fqn,
             tensor_finder=OutputDistTensorFinder(sharding_type=sharding_type),
+            target_type=InjectionTargetType.ACTIVATION,
         )
 
     def _pipeline_model(
@@ -1110,7 +1112,9 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         )
         if isinstance(site_fqn, str):
             self._injection_site = InjectionSite(
-                fqn=site_fqn, tensor_finder=FirstGradTensorFinder()
+                fqn=site_fqn,
+                tensor_finder=FirstGradTensorFinder(),
+                target_type=InjectionTargetType.PARAM_GRAD,
             )
         else:
             self._injection_site = site_fqn
