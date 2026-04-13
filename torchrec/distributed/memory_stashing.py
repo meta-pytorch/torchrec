@@ -14,8 +14,12 @@ from typing import Any, Callable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from torch.autograd.profiler import record_function
-from torchrec.distributed.embedding_types import GroupedEmbeddingConfig
+from torchrec.distributed.embedding_types import (
+    EmbeddingComputeKernel,
+    GroupedEmbeddingConfig,
+)
 from torchrec.distributed.logger import capped_logger, one_time_rank0_logger
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -47,6 +51,7 @@ class MemoryStashingManager:
     _device_to_host_stream: Optional[torch.cuda.Stream] = None
     _embedding_weight_restore_callbacks: List[Callable[..., None]] = []
     _optimizer_state_restore_callbacks: List[Callable[..., None]] = []
+    _emo_cache_restore_callbacks: List[Callable[..., None]] = []
     _stash_executor: Optional[ThreadPoolExecutor] = None
 
     @classmethod
@@ -96,6 +101,7 @@ class MemoryStashingManager:
         cls._device_to_host_stream = None
         cls._embedding_weight_restore_callbacks.clear()
         cls._optimizer_state_restore_callbacks.clear()
+        cls._emo_cache_restore_callbacks.clear()
         if cls._stash_executor is not None:
             cls._stash_executor.shutdown(wait=False)
             cls._stash_executor = None
@@ -362,6 +368,171 @@ class MemoryStashingManager:
 
         await_restore, restore = cls._stash_tensors(tensors, label="embedding")
         cls._embedding_weight_restore_callbacks.append(restore)
+        return await_restore, restore
+
+    @classmethod
+    def restore_emo_cache(
+        cls,
+        _grad: Optional[torch.Tensor] = None,
+        sync_event: Optional[torch.cuda.Event] = None,
+    ) -> None:
+        """Pop and call all EMO cache restore callbacks."""
+        one_time_rank0_logger.info(
+            f"restore_emo_cache: invoking {len(cls._emo_cache_restore_callbacks)} callbacks"
+        )
+        while cls._emo_cache_restore_callbacks:
+            cls._emo_cache_restore_callbacks.pop()(None, sync_event)
+
+    @classmethod
+    def stash_emo_cache(
+        cls,
+        lookup: nn.Module,
+        features: KeyedJaggedTensor,
+    ) -> Optional[
+        Tuple[
+            Callable[[Optional[torch.Tensor]], None],
+            Callable[[Optional[torch.Tensor]], None],
+        ]
+    ]:
+        """
+        Stash EMO cache (lxu_cache_weights) for MANAGED_CACHING TBE modules.
+
+        For tables using ``fused_uvm_caching`` (EMO), the actual HBM consumer
+        is ``lxu_cache_weights``, not ``weights_dev``. This method:
+
+        1. Flushes dirty cache lines back to ``weights_uvm`` (the authoritative
+           copy in host DDR).
+        2. Frees ``lxu_cache_weights`` HBM via ``resize_(0)``.
+        3. Returns restore callbacks that re-allocate the cache, reset cache
+           state, and re-prefetch the current batch rows so the TBE backward
+           (fused backward+optimizer) can update the correct cache slots.
+
+        Batch_i+1 prefetch is handled separately by the pipeline via
+        ``_restore_and_prefetch_embeddings`` which calls
+        ``sharded_module.prefetch()`` after this restore completes.
+
+        Args:
+            lookup: A lookup module (e.g., GroupedPooledEmbeddingsLookup)
+                containing TBE modules with MANAGED_CACHING tables.
+            features: The KeyedJaggedTensor used in the current forward pass.
+                Captured for re-prefetch at restore time.
+
+        Returns:
+            A tuple of (await_restore, restore) callbacks, or None if no
+            EMO caches were stashed.
+        """
+        # Handle DDP wrapper
+        module = lookup.module if hasattr(lookup, "module") else lookup
+
+        if not hasattr(module, "_emb_modules"):
+            return None
+
+        feature_splits = getattr(module, "_feature_splits", None)
+        if feature_splits is None:
+            return None
+
+        features_by_group = features.split(feature_splits)
+
+        # Collect EMO TBE modules and their features
+        # Each entry: (tbe_inner, group_features)
+        emo_stash_data: List[Tuple[Any, KeyedJaggedTensor]] = []
+
+        # pyre-ignore[16]: _emb_modules is dynamically set by lookup modules
+        for emb_module, group_features in zip(module._emb_modules, features_by_group):
+            config = getattr(emb_module, "_config", None)
+            if not isinstance(config, GroupedEmbeddingConfig):
+                continue
+
+            has_emo = any(
+                t.compute_kernel == EmbeddingComputeKernel.FUSED_UVM_CACHING
+                for t in config.embedding_tables
+            )
+            if not has_emo:
+                continue
+
+            inner = getattr(emb_module, "_emb_module", None)
+            if inner is None:
+                continue
+
+            if (
+                not hasattr(inner, "lxu_cache_weights")
+                or inner.lxu_cache_weights.numel() == 0
+            ):
+                continue
+
+            emo_stash_data.append((inner, group_features))
+
+        if not emo_stash_data:
+            return None
+
+        with record_function(f"## stash_emo_cache ({len(emo_stash_data)} TBEs) ##"):
+            orig_cache_sizes: List[int] = []
+            for inner, _group_features in emo_stash_data:
+                inner.flush()
+                orig_cache_sizes.append(
+                    inner.lxu_cache_weights.untyped_storage().size()
+                )
+                inner.lxu_cache_weights.untyped_storage().resize_(0)
+
+        total_freed_mb = sum(orig_cache_sizes) / (1024**2)
+        capped_logger.info(
+            f"stash_emo_cache: freed {len(emo_stash_data)} EMO caches, "
+            f"total {total_freed_mb:.2f} MB"
+        )
+
+        def restore(
+            _grad: Optional[torch.Tensor] = None,
+            sync_event: Optional[torch.cuda.Event] = None,
+        ) -> None:
+            """Restore EMO caches and re-prefetch batch_i for backward."""
+            with record_function(
+                f"## restore_emo_cache ({len(emo_stash_data)} TBEs) ##"
+            ):
+                for (tbe, group_features), orig_cache_size in zip(
+                    emo_stash_data, orig_cache_sizes
+                ):
+                    # Step 1: Re-allocate cache HBM
+                    tbe.lxu_cache_weights.untyped_storage().resize_(orig_cache_size)
+
+                    # Step 2: Invalidate all cache slots and reset LRU/LFU
+                    tbe.reset_cache_states()
+
+                    # Step 3: Clear stale prefetch state
+                    tbe.lxu_cache_locations_list.clear()
+                    if hasattr(tbe, "timesteps_prefetched"):
+                        tbe.timesteps_prefetched.clear()
+
+                    # Step 4: Reset locking counter for prefetch_pipeline
+                    if (
+                        hasattr(tbe, "lxu_cache_locking_counter")
+                        and tbe.lxu_cache_locking_counter is not None
+                        and tbe.lxu_cache_locking_counter.numel() > 0
+                    ):
+                        tbe.lxu_cache_locking_counter.fill_(0)
+
+                    # Step 5: Re-prefetch batch_i rows for backward.
+                    # With prefetch_pipeline=True, this locks batch_i slots.
+                    tbe.prefetch(
+                        indices=group_features.values(),
+                        offsets=group_features.offsets(),
+                    )
+
+                    # Step 6: Consume batch_i's prefetch state — pop cache
+                    # locations for backward and the corresponding timestep
+                    # so they stay in sync with lxu_cache_locations_list.
+                    if tbe.lxu_cache_locations_list:
+                        tbe.lxu_cache_locations = tbe.lxu_cache_locations_list.pop(0)
+                    if (
+                        hasattr(tbe, "timesteps_prefetched")
+                        and tbe.timesteps_prefetched
+                    ):
+                        tbe.timesteps_prefetched.pop(0)
+
+        def await_restore(_grad: Optional[torch.Tensor] = None) -> None:
+            """No-op: re-prefetch runs synchronously on the current stream."""
+            pass
+
+        cls._emo_cache_restore_callbacks.append(restore)
         return await_restore, restore
 
     @classmethod
