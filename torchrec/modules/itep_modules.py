@@ -19,6 +19,14 @@ from torch.distributed._shard.metadata import ShardMetadata
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.embedding_types import ShardedEmbeddingTable, ShardingType
+from torchrec.distributed.logging_handlers import (
+    log_itep_checkpoint_load,
+    log_itep_checkpoint_save,
+    log_itep_config,
+    log_itep_eviction,
+    log_itep_init_state,
+    log_itep_pruning_trigger,
+)
 from torchrec.distributed.types import Shard, ShardedTensor, ShardedTensorMetadata
 from torchrec.modules.embedding_modules import reorder_inverse_indices
 from torchrec.modules.pruning_logger import PruningLogger, PruningLoggerDefault
@@ -114,6 +122,18 @@ class GenericITEPModule(nn.Module):
                     "ITEP init: no lookups provided. Skipping init for dummy module."
                 )
 
+            log_itep_config(
+                {
+                    "enable_pruning": str(enable_pruning),
+                    "pruning_interval": str(pruning_interval),
+                    "num_tables": str(len(table_name_to_unpruned_hash_sizes)),
+                    "table_names": ",".join(
+                        sorted(table_name_to_unpruned_hash_sizes.keys())
+                    ),
+                    "has_pg": str(pg is not None),
+                }
+            )
+
     def print_itep_eviction_stats(
         self,
         pruned_indices_offsets: torch.Tensor,
@@ -188,6 +208,19 @@ class GenericITEPModule(nn.Module):
             )
             logger.info(
                 f"Performed ITEP in iter {cur_iter}, evicted {pruned_indices_total_length} ({pruned_indices_ratio:%}) indices."
+            )
+
+            log_itep_eviction(
+                {
+                    "cur_iter": str(cur_iter),
+                    "pruned_indices_total_length": str(
+                        int(pruned_indices_total_length)
+                    ),
+                    "pruned_ratio": f"{pruned_indices_ratio}",
+                    "num_tables_evicted": str(len(sorted_mapping)),
+                    "top_eviction_table": next(iter(sorted_mapping), "none"),
+                    "top_eviction_ratio": str(next(iter(sorted_mapping.values()), 0)),
+                }
             )
 
     def get_table_hash_sizes(self, table: ShardedEmbeddingTable) -> Tuple[int, int]:
@@ -326,6 +359,14 @@ class GenericITEPModule(nn.Module):
 
         logger.info(
             f"ITEP: done init_state with feature_table_map {self.feature_table_map} and buffer_offsets {self.buffer_offsets_list}"
+        )
+
+        log_itep_init_state(
+            {
+                "num_pruned_tables": str(idx),
+                "total_buffer_size": str(buffer_size),
+                "device": str(self.current_device),
+            }
         )
 
         # initialize address_lookup
@@ -503,6 +544,21 @@ class GenericITEPModule(nn.Module):
             # Print eviction stats
             self.print_itep_eviction_stats(
                 pruned_indices_offsets, pruned_indices_total_length, cur_iter
+            )
+
+            log_itep_pruning_trigger(
+                {
+                    "cur_iter": str(cur_iter),
+                    "pruned_indices_total_length": str(
+                        int(pruned_indices_total_length)
+                    ),
+                    "did_reset_momentum": str(
+                        pruned_indices_total_length > 0
+                        and cur_iter > self.pruning_interval
+                    ),
+                    "did_flush_uvm": str(int(pruned_indices_total_length) > 0),
+                    "pruning_interval": str(self.pruning_interval),
+                }
             )
 
         (
@@ -749,6 +805,16 @@ class RowwiseShardedITEPModule(GenericITEPModule):
         logger.info(
             f"ITEP: get_itp_state_dict for {suffix}), got {ckp_tables}, skippped {skipped_tables}"
         )
+
+        log_itep_checkpoint_save(
+            {
+                "suffix": suffix,
+                "num_saved_tables": str(len(ckp_tables)),
+                "num_skipped_tables": str(len(skipped_tables)),
+                "saved_tables": ",".join(ckp_tables),
+            }
+        )
+
         return destination
 
     # pyrefly: ignore[bad-override]
@@ -794,6 +860,16 @@ class RowwiseShardedITEPModule(GenericITEPModule):
         logger.info(
             f"ITEP: load_state_dict, loaded {loaded_keys}, missed {missing_keys}, , unexpected {unexpected_keys}"
         )
+
+        log_itep_checkpoint_load(
+            {
+                "num_loaded_keys": str(len(loaded_keys)),
+                "num_missing_keys": str(len(missing_keys)),
+                "num_unexpected_keys": str(len(unexpected_keys)),
+                "missing_keys": ",".join(missing_keys[:10]),
+            }
+        )
+
         return _IncompatibleKeys(missing_keys, unexpected_keys)
 
     # pyrefly: ignore[bad-override]
