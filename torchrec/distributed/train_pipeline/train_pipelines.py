@@ -69,7 +69,6 @@ from torchrec.distributed.train_pipeline.types import PipelineState
 from torchrec.distributed.train_pipeline.utils import (
     _override_input_dist_forwards,
     _pipeline_detach_model,
-    _prefetch_embeddings,
     _rewrite_model,
     _start_data_dist,
     _start_embedding_lookup,
@@ -77,6 +76,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _wait_for_batch,
     _wait_for_events,
     DataLoadingThread,
+    prefetch_embeddings,
     use_context_for_postprocs,
 )
 from torchrec.distributed.types import Awaitable, NoWait, ShardingType  # noqa: F401
@@ -1977,7 +1977,6 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
         )
-        self._context = PrefetchTrainPipelineContext(version=0)
         self._prefetch_stream: Optional[torch.Stream] = (
             (torch.get_device_module(device).Stream())
             if self._device.type in ["cuda", "mtia"]
@@ -1988,79 +1987,43 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             if self._device.type in ["cuda", "mtia"]
             else None
         )
-        self._batch_ip3: Optional[In] = None
-        self._staged_postproc_fwd_results: Dict[str, Any] = {}
 
-    def _start_sparse_data_dist(self, batch: Optional[In]) -> None:
+    def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
         """
-        Override to use a staging context for postprocs, preventing
-        postproc_fwd_results cache contamination in the shared v0 context.
-        """
-        if batch is None:
-            return
-        self._set_module_context(self._context)
-        staging_context = PrefetchTrainPipelineContext(version=0)
-        with record_function("## start_sparse_data_dist ##"):
-            # pyrefly: ignore [bad-argument-type]
-            with self._stream_context(self._data_dist_stream):
-                _wait_for_batch(batch, self._memcpy_stream)
-                with use_context_for_postprocs(
-                    self._pipelined_postprocs, staging_context
-                ):
-                    _start_data_dist(self._pipelined_modules, batch, self._context)
-        self._staged_postproc_fwd_results = staging_context.postproc_fwd_results
-
-    def _commit_postproc_results(self) -> None:
-        """
-        Swap staged postproc results into the live context so forward reads
-        the correct batch's postproc results.
-        """
-        self._context.postproc_fwd_results = self._staged_postproc_fwd_results
-        self._staged_postproc_fwd_results = {}
-
-    def _fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
-        """
-        DEPRECATED: exists for backward compatibility
-        Initializes the prefetch pipeline with batches.
 
         This method fills the pipeline with initial batches to enable overlapping of
         device transfer, input dist, and cache prefetching operations.
 
         Args:
             dataloader_iter: Iterator that produces training batches.
-
-        Raises:
-            StopIteration: if the dataloader iterator is exhausted on the first batch.
         """
-        one_time_rank0_logger.warning(
-            f"{self.__class__.__name__} is using deprecated _fill_pipeline"
-        )
         # pipeline is already filled
-        if self._batch_i and self._batch_ip1 and self._batch_ip2:
-            return
-        # executes last batch in pipeline
-        if self._execute_all_batches and (self._batch_i or self._batch_ip1):
+        if len(self.batches) >= 3:
             return
 
-        # batch 1
-        self._batch_i = self._copy_batch_to_gpu(dataloader_iter)
-        if self._batch_i is None:
-            raise StopIteration
+        # executes last batch in pipeline
+        if self.batches and self._execute_all_batches:
+            return
+
+        # Fetch data for the first iteration of the whole pipeline
+        if not self.enqueue_batch(dataloader_iter):
+            return
 
         self._init_pipelined_modules(
-            self._batch_i,
-            self._context,
+            cast(In, self.batches[0]),
+            self.contexts[0],
             # pyrefly: ignore [bad-argument-type]
             self._pipelined_forward_type,
         )
-        self._start_sparse_data_dist(self._batch_i)
-        self._wait_sparse_data_dist()
-        self._commit_postproc_results()
-        self._prefetch(self._batch_i)
 
-        # batch 2
-        self._batch_ip1 = self._copy_batch_to_gpu(dataloader_iter)
-        self._start_sparse_data_dist(self._batch_ip1)
+        self.wait_sparse_data_dist(self.contexts[0])
+        self._prefetch(cast(PrefetchTrainPipelineContext, self.contexts[0]))
+
+        # Fetch data for the second iteration of the whole pipeline
+        if not self.enqueue_batch(dataloader_iter):
+            return
+
+        self.start_sparse_data_dist(self.batches[1], self.contexts[1])
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -2087,25 +2050,50 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         Raises:
             StopIteration: if the dataloader iterator is exhausted.
         """
-        self._fill_pipeline(dataloader_iter)
+
+        self.fill_pipeline(dataloader_iter)
+
+        if not self.batches:
+            raise StopIteration
+
+        self._set_module_context(self.contexts[0])
 
         if self._model.training:
             with record_function("## zero_grad ##"):
                 self._optimizer.zero_grad()
 
         with record_function("## wait_for_batch ##"):
-            _wait_for_batch(cast(In, self._batch_i), self._prefetch_stream)
+            _wait_for_batch(cast(In, self.batches[0]), self._prefetch_stream)
 
-        self._batch_ip2 = self._copy_batch_to_gpu(dataloader_iter)
+        # batch i+2: load data and copy to gpu
+        self.enqueue_batch(dataloader_iter)
 
-        self._wait_sparse_data_dist()
+        # Wait for sparse data dist for batch i+1 (kicked off in previous
+        # iteration or fill_pipeline). This completes the splits all2all and
+        # populates input_dist_tensors_requests, which kicks off the tensor
+        # data all2all asynchronously. By doing this BEFORE forward, the
+        # tensor data transfer overlaps with forward compute.
+        if len(self.batches) >= 2:
+            self.wait_sparse_data_dist(self.contexts[1])
+
         # forward
         with record_function("## forward ##"):
-            losses, output = self._model_fwd(self._batch_i)
+            losses, output = self._model_fwd(self.batches[0])
 
-        self._commit_postproc_results()
+        # Free prefetch data from batch i (just used by forward) so the
+        # CUDA caching allocator can reuse those blocks for batch i+1's prefetch.
+        cast(
+            PrefetchTrainPipelineContext, self.contexts[0]
+        ).module_input_post_prefetch.clear()
+        cast(
+            PrefetchTrainPipelineContext, self.contexts[0]
+        ).module_contexts_post_prefetch.clear()
 
-        self._prefetch(self._batch_ip1)
+        # Prefetch for batch i+1 after forward. The tensor data all2all has
+        # had the entire forward pass to complete, so prefetch_embeddings'
+        # request.wait() should resolve quickly.
+        if len(self.batches) >= 2:
+            self._prefetch(cast(PrefetchTrainPipelineContext, self.contexts[1]))
 
         if self._model.training:
             # backward
@@ -2116,14 +2104,16 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             with record_function("## optimizer ##"):
                 self._optimizer.step()
 
-        self._start_sparse_data_dist(self._batch_ip2)
+        # Start sparse data dist for batch i+2 at the end, so it overlaps
+        # with the next iteration's early phases.
+        if len(self.batches) >= 3:
+            self.start_sparse_data_dist(self.batches[2], self.contexts[2])
 
-        self._batch_i = self._batch_ip1
-        self._batch_ip1 = self._batch_ip2
+        self.dequeue_batch()
 
         return output
 
-    def _prefetch(self, batch: Optional[In]) -> None:
+    def _prefetch(self, context: PrefetchTrainPipelineContext) -> None:
         """
         Prefetches embedding data from cache to GPU memory.
 
@@ -2133,30 +2123,21 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         pipeline context for use in the next forward pass.
 
         Args:
-            batch: The batch to prefetch embeddings for. If None, this method
-                returns early without prefetching.
+            context: The prefetch pipeline context containing input distribution
+                requests and module contexts for the batch to prefetch.
 
         Note:
             This operation runs on self._prefetch_stream to enable overlap with
             forward/backward computation on the default stream.
         """
-        if batch is None:
-            return
-        # pyrefly: ignore [missing-attribute]
-        self._context.module_input_post_prefetch.clear()
-        # pyrefly: ignore [missing-attribute]
-        self._context.module_contexts_post_prefetch.clear()
+        context.module_input_post_prefetch.clear()
+        context.module_contexts_post_prefetch.clear()
 
-        with record_function("## sharded_module_prefetch ##"):
+        with record_function(f"## sharded_module_prefetch {context.index} ##"):
             # pyrefly: ignore [bad-argument-type]
             with self._stream_context(self._prefetch_stream):
-                batch.record_stream(
-                    torch.get_device_module(self._device).current_stream()
-                )
-                data_per_pipelined_module = _prefetch_embeddings(
-                    batch,
-                    # pyrefly: ignore [bad-argument-type]
-                    self._context,
+                prefetch_embeddings(
+                    context,
                     self._pipelined_modules,
                     self._device,
                     # pyrefly: ignore [bad-argument-type]
@@ -2164,17 +2145,6 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                     self._data_dist_stream,
                     self._default_stream,
                 )
-                for sharded_module in self._pipelined_modules:
-                    forward = sharded_module.forward
-                    # pyrefly: ignore [missing-attribute]
-                    data = data_per_pipelined_module[forward._name]
-                    # pyrefly: ignore [missing-attribute]
-                    self._context.module_input_post_prefetch[forward._name] = data
-                    # pyrefly: ignore [missing-attribute]
-                    self._context.module_contexts_post_prefetch[forward._name] = (
-                        # pyrefly: ignore [missing-attribute]
-                        self._context.module_contexts.pop(forward._name)
-                    )
 
 
 class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):

@@ -66,7 +66,9 @@ class TrainPipelineContext:
 
 @dataclass
 class PrefetchTrainPipelineContext(TrainPipelineContext):
-    module_input_post_prefetch: Dict[str, Multistreamable] = field(default_factory=dict)
+    module_input_post_prefetch: Dict[str, Multistreamable | torch.Tensor] = field(
+        default_factory=dict
+    )
     module_contexts_post_prefetch: Dict[str, Multistreamable] = field(
         default_factory=dict
     )
