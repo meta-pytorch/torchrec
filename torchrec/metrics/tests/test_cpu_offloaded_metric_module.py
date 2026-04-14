@@ -689,6 +689,28 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_no_dtoh_transfer_for_cpu_device(self) -> None:
         self._run_dtoh_transfer_test(use_cuda=False)
 
+    def test_compute_count_increments_once_per_async_compute(self) -> None:
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.7]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+
+        self.assertEqual(self.cpu_module.compute_count, 0)
+
+        for expected_count in range(1, 4):
+            for _ in range(3):
+                self.cpu_module.update(model_out)
+
+            deferrable = self.cpu_module.async_compute()
+            result_event = threading.Event()
+            deferrable.subscribe(callback=lambda _, e=result_event: e.set())
+            self.assertTrue(
+                result_event.wait(timeout=15.0),
+                f"async_compute #{expected_count} did not complete",
+            )
+            self.assertEqual(self.cpu_module.compute_count, expected_count)
+
     def test_generate_metric_module_creates_cpu_offloaded_module(self) -> None:
         module_kwargs = {
             "model_out_device": torch.device("cpu"),

@@ -12,6 +12,7 @@
 import abc
 import inspect
 import itertools
+import logging
 import math
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -69,6 +70,8 @@ ComputeIterType = Iterator[
 ]
 
 MAX_BUFFER_COUNT = 1000
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class RecMetricException(Exception):
