@@ -53,6 +53,8 @@ class MemoryStashingManager:
     _optimizer_state_restore_callbacks: List[Callable[..., None]] = []
     _emo_cache_restore_callbacks: List[Callable[..., None]] = []
     _stash_executor: Optional[ThreadPoolExecutor] = None
+    _delay_stash: bool = False
+    _pending_stash_callbacks: List[Callable[[Optional[torch.Tensor]], None]] = []
 
     @classmethod
     def thread_submit(cls, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
@@ -94,6 +96,30 @@ class MemoryStashingManager:
         one_time_rank0_logger.info("MemoryStashingManager: streams initialized")
 
     @classmethod
+    def set_delay_stash(cls, delay: bool) -> None:
+        """Enable or disable delayed stashing.
+
+        When enabled, ``stash_embedding_weights`` collects tensors and records
+        a sync event but does NOT execute the D2H copy or free HBM.  The
+        caller must later invoke ``execute_pending_stashes`` to perform the
+        actual stash and register restore callbacks.
+        """
+        cls._delay_stash = delay
+
+    @classmethod
+    def execute_pending_stashes(cls) -> None:
+        """Execute all pending (delayed) stash operations.
+
+        For each pending stash, invokes the deferred callable which performs
+        the D2H copy, ``resize_(0)`` to free HBM, and registers the restore
+        callback so that a subsequent ``restore_embedding_weights`` call can
+        bring the data back.
+        """
+        for cb in cls._pending_stash_callbacks:
+            cb(None)
+        cls._pending_stash_callbacks.clear()
+
+    @classmethod
     def reset(cls) -> None:
         """Release all resources."""
         logger.info("MemoryStashingManager: resetting all resources")
@@ -102,6 +128,8 @@ class MemoryStashingManager:
         cls._embedding_weight_restore_callbacks.clear()
         cls._optimizer_state_restore_callbacks.clear()
         cls._emo_cache_restore_callbacks.clear()
+        cls._delay_stash = False
+        cls._pending_stash_callbacks.clear()
         if cls._stash_executor is not None:
             cls._stash_executor.shutdown(wait=False)
             cls._stash_executor = None
@@ -138,7 +166,9 @@ class MemoryStashingManager:
         tensors: List[torch.Tensor],
         label: str = "tensor",
         sync_event: Optional[torch.cuda.Event] = None,
+        delay: bool = False,
     ) -> Tuple[
+        Callable[[Optional[torch.Tensor]], None],
         Callable[[Optional[torch.Tensor]], None],
         Callable[[Optional[torch.Tensor]], None],
     ]:
@@ -146,10 +176,10 @@ class MemoryStashingManager:
         Stash a list of CUDA tensors from HBM to CPU asynchronously.
 
         Core implementation shared by ``stash_embedding_weights`` and
-        ``stash_optimizer_state``.  Starts an async copy of each tensor from
-        GPU (HBM) to pinned CPU memory using the shared D2H stream, then frees
-        HBM via ``record_stream`` + ``resize_(0)``.  Returns two callback
-        functions for the restore phase.
+        ``stash_optimizer_state``.  Wraps the D2H copy and HBM free into an
+        ``execute_stash`` callable.  In non-delayed mode the callable is
+        invoked immediately; in delayed mode it is returned for the caller
+        to invoke later.
 
         Args:
             tensors: CUDA tensors to stash.  Non-CUDA / empty tensors are
@@ -161,11 +191,20 @@ class MemoryStashingManager:
                 calling ``torch.cuda.current_stream()``.  This is required
                 when ``_stash_tensors`` runs on a background thread, where
                 ``current_stream()`` would return the wrong (idle) stream.
+            delay: If True, do NOT execute the stash immediately.  The
+                returned ``execute_stash`` callable must be invoked later
+                to perform the actual D2H copy and free HBM.  A sync event
+                is recorded automatically so that the deferred execution
+                waits for the correct GPU work.
 
         Returns:
-            A tuple of two callback functions:
+            A tuple of three callback functions:
             - await_restore: Pauses current stream awaiting restore completion
             - restore: Retrieves stashed data from CPU back to HBM asynchronously
+            - execute_stash: Performs the D2H copy and frees HBM.  Accepts an
+              optional ``torch.Tensor`` so it can be registered as a backward
+              hook.  In non-delayed mode it has already been called and is
+              safe to call again (no-op on empty tensor list).
         """
         # (hbm_tensor ref, cpu_buffer, original_storage_size)
         stash_data: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
@@ -173,46 +212,57 @@ class MemoryStashingManager:
         # Restore events populated by ``restore`` and consumed by ``await_restore``
         restore_events: List[torch.cuda.Event] = []
 
-        d2h_stream = cls.d2h_stream()
+        # For delayed mode, capture the current stream state now so
+        # execute_stash can correctly synchronize when called later.
+        if delay and sync_event is None:
+            sync_event = torch.cuda.Event()
+            sync_event.record(torch.cuda.current_stream())
 
-        # Ensure all operations on the caller's stream complete before we
-        # start copying — prevents reading while still being written.
-        # When sync_event is provided (background thread), use it instead
-        # of current_stream() which would return the wrong stream.
-        if sync_event is not None:
-            d2h_stream.wait_event(sync_event)
-        else:
-            d2h_stream.wait_stream(torch.cuda.current_stream())
+        def execute_stash(_grad: Optional[torch.Tensor] = None) -> None:
+            """Perform the D2H copy and free HBM."""
+            d2h_stream = cls.d2h_stream()
 
-        size_text = _tensor_size_text(tensors)
-        capped_logger.info(f"stash {label}: {len(tensors)} tensors, total {size_text}")
+            # Ensure all operations on the caller's stream complete before we
+            # start copying — prevents reading while still being written.
+            # When sync_event is provided (delayed or background thread), use
+            # it instead of current_stream() which may have advanced or be the
+            # wrong stream.
+            if sync_event is not None:
+                d2h_stream.wait_event(sync_event)
+            else:
+                d2h_stream.wait_stream(torch.cuda.current_stream())
 
-        # Start async copy from HBM to CPU
-        with record_function(f"stash {label} to host ({size_text})"):
-            with torch.cuda.stream(d2h_stream):
-                for tensor in tensors:
-                    # Create pinned CPU buffer for efficient async DMA transfer
-                    cpu_buffer = torch.empty(
-                        tensor.shape,
-                        dtype=tensor.dtype,
-                        device="cpu",
-                        pin_memory=True,
-                    )
-                    cpu_buffer.copy_(tensor, non_blocking=True)
-                    orig_storage_size = tensor.untyped_storage().size()
-                    stash_data.append((tensor, cpu_buffer, orig_storage_size))
+            size_text = _tensor_size_text(tensors)
+            capped_logger.info(
+                f"stash {label}: {len(tensors)} tensors, total {size_text}"
+            )
 
-                # Two-pass: free HBM storage only after all copies are
-                # enqueued.  Tensors may share the same underlying storage
-                # (e.g. views into an all-to-all output buffer), so freeing
-                # one tensor's storage before copying another would
-                # invalidate the shared data.
-                seen_storage_ptrs: set = set()
-                for tensor, _, _ in stash_data:
-                    storage_ptr = tensor.untyped_storage().data_ptr()
-                    if storage_ptr not in seen_storage_ptrs:
-                        seen_storage_ptrs.add(storage_ptr)
-                        tensor.untyped_storage().resize_(0)
+            # Start async copy from HBM to CPU
+            with record_function(f"stash {label} to host ({size_text})"):
+                with torch.cuda.stream(d2h_stream):
+                    for tensor in tensors:
+                        # Create pinned CPU buffer for efficient async DMA transfer
+                        cpu_buffer = torch.empty(
+                            tensor.shape,
+                            dtype=tensor.dtype,
+                            device="cpu",
+                            pin_memory=True,
+                        )
+                        cpu_buffer.copy_(tensor, non_blocking=True)
+                        orig_storage_size = tensor.untyped_storage().size()
+                        stash_data.append((tensor, cpu_buffer, orig_storage_size))
+
+                    # Two-pass: free HBM storage only after all copies are
+                    # enqueued.  Tensors may share the same underlying storage
+                    # (e.g. views into an all-to-all output buffer), so freeing
+                    # one tensor's storage before copying another would
+                    # invalidate the shared data.
+                    seen_storage_ptrs: set = set()
+                    for tensor, _, _ in stash_data:
+                        storage_ptr = tensor.untyped_storage().data_ptr()
+                        if storage_ptr not in seen_storage_ptrs:
+                            seen_storage_ptrs.add(storage_ptr)
+                            tensor.untyped_storage().resize_(0)
 
         def restore(
             _grad: Optional[torch.Tensor] = None,
@@ -278,7 +328,15 @@ class MemoryStashingManager:
             for restore_event in restore_events:
                 torch.cuda.current_stream().wait_event(restore_event)
 
-        return await_restore, restore
+        if not delay:
+            execute_stash()
+
+            def _noop_stash(_grad: Optional[torch.Tensor] = None) -> None:
+                pass
+
+            return await_restore, restore, _noop_stash
+
+        return await_restore, restore, execute_stash
 
     @classmethod
     def stash_embedding_weights(
@@ -286,6 +344,7 @@ class MemoryStashingManager:
         lookup: nn.Module,
     ) -> Optional[
         Tuple[
+            Callable[[Optional[torch.Tensor]], None],
             Callable[[Optional[torch.Tensor]], None],
             Callable[[Optional[torch.Tensor]], None],
         ]
@@ -297,23 +356,27 @@ class MemoryStashingManager:
         (pinned memory) using the shared D2H stream. HBM is freed immediately
         using ``record_stream`` to let the caching allocator handle stream
         ordering — no background thread or CPU-blocking synchronize needed.
-        Returns two callback functions for the restore phase.
 
         Args:
             lookup: A lookup module (e.g., GroupedPooledEmbeddingsLookup) containing
                 embedding modules with weights to stash.
 
         Returns:
-            A tuple of two callback functions, or None if no tensors were stashed:
+            A tuple of three callback functions, or None if no tensors qualify
+            for stashing (e.g., all tables have ``stash_weights=False``):
             - await_restore: Pauses current stream awaiting restore completion
             - restore: Retrieves stashed data from CPU back to HBM asynchronously
+            - execute_stash: Performs the actual D2H copy and frees HBM.  Takes
+              an optional ``torch.Tensor`` argument so it can be registered as
+              a backward hook.  In immediate mode this is a no-op (stash
+              already happened).  In delayed mode (``set_delay_stash(True)``),
+              this callable is auto-appended to the pending list and should be
+              triggered later via ``execute_pending_stashes()``.
 
         Usage:
-            >>> await_restore, restore = MemoryStashingManager.stash_embedding_weights(lookup)
-            >>> # ... HBM is freed via record_stream (allocator reclaims after D2H completes) ...
-            >>> # Before backward (or next forward):
-            >>> restore()  # Start async restore from CPU to HBM
-            >>> await_restore()  # Wait for restore to complete before using weights
+            >>> await_restore, restore, execute_stash = MemoryStashingManager.stash_embedding_weights(lookup)
+            >>> # In immediate mode: stash already happened, execute_stash is no-op
+            >>> # In delayed mode: call execute_pending_stashes() later to trigger
 
         Note:
             - Uses pinned CPU memory for efficient async transfers
@@ -322,6 +385,7 @@ class MemoryStashingManager:
               the D2H copy completes, avoiding GIL deadlocks from background threads
             - restore starts async copy, await_restore blocks GPU stream until complete
         """
+
         # Handle DDP wrapper - unwrap to get the actual module
         module = lookup.module if hasattr(lookup, "module") else lookup
 
@@ -366,9 +430,25 @@ class MemoryStashingManager:
         if not tensors:
             return None
 
-        await_restore, restore = cls._stash_tensors(tensors, label="embedding")
+        if cls._delay_stash:
+            await_restore, restore, execute_stash = cls._stash_tensors(
+                tensors, label="embedding", delay=True
+            )
+
+            # Wrap execute_stash to also register the restore callback,
+            # which only works after stash_data is populated.
+            def _deferred_stash(_grad: Optional[torch.Tensor] = None) -> None:
+                execute_stash(None)
+                cls._embedding_weight_restore_callbacks.append(restore)
+
+            cls._pending_stash_callbacks.append(_deferred_stash)
+            return await_restore, restore, _deferred_stash
+
+        await_restore, restore, execute_stash = cls._stash_tensors(
+            tensors, label="embedding"
+        )
         cls._embedding_weight_restore_callbacks.append(restore)
-        return await_restore, restore
+        return await_restore, restore, execute_stash
 
     @classmethod
     def restore_emo_cache(
@@ -595,7 +675,7 @@ class MemoryStashingManager:
             f"collected {len(tensors)} state tensors"
         )
 
-        await_restore, restore = cls._stash_tensors(
+        await_restore, restore, _execute_stash = cls._stash_tensors(
             tensors, label="optimizer state", sync_event=sync_event
         )
         cls._optimizer_state_restore_callbacks.append(restore)
