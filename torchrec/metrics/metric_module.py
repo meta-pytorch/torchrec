@@ -297,7 +297,7 @@ class RecMetricModule(nn.Module):
             )
 
     @EventLoggingHandler.event_logger(
-        TorchrecComponent.REC_METRICS, n=100, add_wait_counter=True
+        TorchrecComponent.REC_METRICS, n=1000, add_wait_counter=True
     )
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
         r"""update() is called per batch, usually right after forward() to
@@ -370,7 +370,7 @@ class RecMetricModule(nn.Module):
         return self.trained_batches % self.compute_interval_steps == 0
 
     @EventLoggingHandler.event_logger(
-        TorchrecComponent.REC_METRICS, add_wait_counter=True, n=100
+        TorchrecComponent.REC_METRICS, add_wait_counter=True, n=1000
     )
     def compute(self) -> DeferrableMetrics:
         r"""compute() is called when the global metrics are required, usually
