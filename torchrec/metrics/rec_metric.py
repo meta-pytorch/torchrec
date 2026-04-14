@@ -623,6 +623,183 @@ class RecMetric(nn.Module, abc.ABC):
                 f"{name}_numel": str({k: v.numel() for k, v in tensor.items()}),
             }
 
+    def _update_fused(
+        self,
+        predictions: RecModelOutput,
+        labels: RecModelOutput,
+        weights: Optional[RecModelOutput],
+        **kwargs: Dict[str, Any],
+    ) -> None:
+        """Process update for FUSED_TASKS compute modes.
+
+        Stacks per-task tensors into (n_tasks, batch_size) tensors and updates
+        the single fused metrics computation.
+        """
+        task_names = [task.name for task in self._tasks]
+
+        if not isinstance(predictions, torch.Tensor):
+            predictions = torch.stack(
+                [predictions[task_name] for task_name in task_names]
+            )
+
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.stack([labels[task_name] for task_name in task_names])
+        if weights is not None and not isinstance(weights, torch.Tensor):
+            weights = torch.stack([weights[task_name] for task_name in task_names])
+
+        assert isinstance(predictions, torch.Tensor) and isinstance(
+            labels, torch.Tensor
+        )
+
+        # Metrics such as TensorWeightedAvgMetric will have tensors that we also need to stack.
+        # Stack in task order: (n_tasks, batch_size)
+        if "required_inputs" in kwargs:
+            target_tensors: list[torch.Tensor] = []
+            for task in self._tasks:
+                if task.tensor_name and task.tensor_name in kwargs["required_inputs"]:
+                    target_tensors.append(kwargs["required_inputs"][task.tensor_name])
+
+            if target_tensors:
+                stacked_tensor = torch.stack(target_tensors)
+
+                # Reshape the stacked_tensor to size([len(self._tasks), self._batch_size])
+                stacked_tensor = stacked_tensor.view(len(self._tasks), -1)
+                assert isinstance(stacked_tensor, torch.Tensor)
+                kwargs["required_inputs"]["target_tensor"] = stacked_tensor
+
+        predictions = (
+            # Reshape the predictions to size([len(self._tasks), self._batch_size])
+            predictions.view(len(self._tasks), -1)
+            if predictions.dim() == labels.dim()
+            # predictions.dim() == labels.dim() + 1 for multiclass models
+            else predictions.view(len(self._tasks), -1, predictions.size()[-1])
+        )
+        labels = labels.view(len(self._tasks), -1)
+        if weights is None:
+            weights = self._create_default_weights(predictions)
+        else:
+            assert isinstance(weights, torch.Tensor)
+            weights = weights.view(len(self._tasks), -1)
+        if self._should_validate_update:
+            # has_valid_weights is a tensor of bool whose length equals to the number
+            # of tasks. Each value in it is corresponding to whether the weights
+            # are valid, i.e. are set to non-zero values for that task in this update.
+            # If has_valid_weights are Falses for all the tasks, we just ignore this
+            # update.
+            has_valid_weights = self._check_nonempty_weights(weights)
+            if torch.any(has_valid_weights):
+                # pyrefly: ignore[not-callable]
+                self._metrics_computations[0].update(
+                    predictions=predictions,
+                    labels=labels,
+                    weights=weights,
+                    **kwargs,
+                )
+                # pyrefly: ignore[not-callable]
+                self._metrics_computations[0].has_valid_update.logical_or_(
+                    has_valid_weights
+                )
+        else:
+            # pyrefly: ignore[not-callable]
+            self._metrics_computations[0].update(
+                predictions=predictions,
+                labels=labels,
+                weights=weights,
+                **kwargs,
+            )
+
+    def _update_unfused(
+        self,
+        predictions: RecModelOutput,
+        labels: RecModelOutput,
+        weights: Optional[RecModelOutput],
+        **kwargs: Dict[str, Any],
+    ) -> None:
+        """Process update for UNFUSED_TASKS compute modes.
+
+        Iterates over tasks and updates each metric computation independently.
+        """
+        for task, metric_ in zip(self._tasks, self._metrics_computations):
+            if task.name not in predictions:
+                continue
+            #  List[typing.Any], int, slice, Tensor, typing.Tuple[typing.Any,
+            #  ...]]` but got `str`.
+            # pyrefly: ignore[bad-index]
+            if torch.numel(predictions[task.name]) == 0:
+                #  List[typing.Any], int, slice, Tensor,
+                #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                # pyrefly: ignore[bad-index]
+                assert torch.numel(labels[task.name]) == 0
+                #  List[typing.Any], int, slice, Tensor,
+                #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                # pyrefly: ignore[bad-index]
+                assert weights is None or torch.numel(weights[task.name]) == 0
+                continue
+            task_predictions = (
+                #  List[typing.Any], int, slice, Tensor,
+                #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                # pyrefly: ignore[bad-index]
+                predictions[task.name].view(1, -1)
+                #  List[typing.Any], int, slice, Tensor,
+                #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                # pyrefly: ignore[bad-index]
+                if predictions[task.name].dim() == labels[task.name].dim()
+                # predictions[task.name].dim() == labels[task.name].dim() + 1 for multiclass models
+                #  List[typing.Any], int, slice, Tensor,
+                #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                # pyrefly: ignore[bad-index]
+                else predictions[task.name].view(
+                    1,
+                    -1,
+                    predictions[
+                        # pyrefly: ignore[bad-index]
+                        task.name
+                        #  List[typing.Any], int, slice, Tensor,
+                        #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                    ].size()[-1],
+                )
+            )
+            #  List[typing.Any], int, slice, Tensor, typing.Tuple[typing.Any,
+            #  ...]]` but got `str`.
+            # pyrefly: ignore[bad-index]
+            task_labels = labels[task.name].view(1, -1)
+            if weights is None:
+                task_weights = self._create_default_weights(task_predictions)
+            else:
+                #  List[typing.Any], int, slice, Tensor,
+                #  typing.Tuple[typing.Any, ...]]` but got `str`.
+                # pyrefly: ignore[bad-index]
+                task_weights = weights[task.name].view(1, -1)
+            if self._should_validate_update:
+                # has_valid_weights is a tensor with only 1 value corresponding to
+                # whether the weights are valid, i.e. are set to non-zero values for
+                # the task in this update.
+                # If has_valid_update[0] is False, we just ignore this update.
+                has_valid_weights = self._check_nonempty_weights(task_weights)
+                if has_valid_weights[0]:
+                    #  Tensor) -> Tensor, Module, Tensor]` is not a function.
+                    # pyrefly: ignore[not-callable]
+                    metric_.has_valid_update.logical_or_(has_valid_weights)
+                else:
+                    continue
+            if "required_inputs" in kwargs:
+                # Expand scalars to match the shape of the predictions
+                kwargs["required_inputs"] = {
+                    k: (
+                        v.view(task_labels.size())
+                        if v.numel() > 1
+                        else v.expand(task_labels.size())
+                    )
+                    for k, v in kwargs["required_inputs"].items()
+                }
+            # pyrefly: ignore[not-callable]
+            metric_.update(
+                predictions=task_predictions,
+                labels=task_labels,
+                weights=task_weights,
+                **kwargs,
+            )
+
     def _update(
         self,
         *,
@@ -653,168 +830,9 @@ class RecMetric(nn.Module, abc.ABC):
                 RecComputeMode.FUSED_TASKS_COMPUTATION,
                 RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION,
             ]:
-                task_names = [task.name for task in self._tasks]
-
-                if not isinstance(predictions, torch.Tensor):
-                    predictions = torch.stack(
-                        [predictions[task_name] for task_name in task_names]
-                    )
-
-                if not isinstance(labels, torch.Tensor):
-                    labels = torch.stack(
-                        [labels[task_name] for task_name in task_names]
-                    )
-                if weights is not None and not isinstance(weights, torch.Tensor):
-                    weights = torch.stack(
-                        [weights[task_name] for task_name in task_names]
-                    )
-
-                assert isinstance(predictions, torch.Tensor) and isinstance(
-                    labels, torch.Tensor
-                )
-
-                # Metrics such as TensorWeightedAvgMetric will have tensors that we also need to stack.
-                # Stack in task order: (n_tasks, batch_size)
-                if "required_inputs" in kwargs:
-                    target_tensors: list[torch.Tensor] = []
-                    for task in self._tasks:
-                        if (
-                            task.tensor_name
-                            and task.tensor_name in kwargs["required_inputs"]
-                        ):
-                            target_tensors.append(
-                                kwargs["required_inputs"][task.tensor_name]
-                            )
-
-                    if target_tensors:
-                        stacked_tensor = torch.stack(target_tensors)
-
-                        # Reshape the stacked_tensor to size([len(self._tasks), self._batch_size])
-                        stacked_tensor = stacked_tensor.view(len(self._tasks), -1)
-                        assert isinstance(stacked_tensor, torch.Tensor)
-                        kwargs["required_inputs"]["target_tensor"] = stacked_tensor
-
-                predictions = (
-                    # Reshape the predictions to size([len(self._tasks), self._batch_size])
-                    predictions.view(len(self._tasks), -1)
-                    if predictions.dim() == labels.dim()
-                    # predictions.dim() == labels.dim() + 1 for multiclass models
-                    else predictions.view(len(self._tasks), -1, predictions.size()[-1])
-                )
-                labels = labels.view(len(self._tasks), -1)
-                if weights is None:
-                    weights = self._create_default_weights(predictions)
-                else:
-                    assert isinstance(weights, torch.Tensor)
-                    weights = weights.view(len(self._tasks), -1)
-                if self._should_validate_update:
-                    # has_valid_weights is a tensor of bool whose length equals to the number
-                    # of tasks. Each value in it is corresponding to whether the weights
-                    # are valid, i.e. are set to non-zero values for that task in this update.
-                    # If has_valid_weights are Falses for all the tasks, we just ignore this
-                    # update.
-                    has_valid_weights = self._check_nonempty_weights(weights)
-                    if torch.any(has_valid_weights):
-                        # pyrefly: ignore[not-callable]
-                        self._metrics_computations[0].update(
-                            predictions=predictions,
-                            labels=labels,
-                            weights=weights,
-                            **kwargs,
-                        )
-                        # pyrefly: ignore[not-callable]
-                        self._metrics_computations[0].has_valid_update.logical_or_(
-                            has_valid_weights
-                        )
-                else:
-                    # pyrefly: ignore[not-callable]
-                    self._metrics_computations[0].update(
-                        predictions=predictions,
-                        labels=labels,
-                        weights=weights,
-                        **kwargs,
-                    )
+                self._update_fused(predictions, labels, weights, **kwargs)
             else:
-                for task, metric_ in zip(self._tasks, self._metrics_computations):
-                    if task.name not in predictions:
-                        continue
-                    #  List[typing.Any], int, slice, Tensor, typing.Tuple[typing.Any,
-                    #  ...]]` but got `str`.
-                    # pyrefly: ignore[bad-index]
-                    if torch.numel(predictions[task.name]) == 0:
-                        #  List[typing.Any], int, slice, Tensor,
-                        #  typing.Tuple[typing.Any, ...]]` but got `str`.
-                        # pyrefly: ignore[bad-index]
-                        assert torch.numel(labels[task.name]) == 0
-                        #  List[typing.Any], int, slice, Tensor,
-                        #  typing.Tuple[typing.Any, ...]]` but got `str`.
-                        # pyrefly: ignore[bad-index]
-                        assert weights is None or torch.numel(weights[task.name]) == 0
-                        continue
-                    task_predictions = (
-                        #  List[typing.Any], int, slice, Tensor,
-                        #  typing.Tuple[typing.Any, ...]]` but got `str`.
-                        # pyrefly: ignore[bad-index]
-                        predictions[task.name].view(1, -1)
-                        #  List[typing.Any], int, slice, Tensor,
-                        #  typing.Tuple[typing.Any, ...]]` but got `str`.
-                        # pyrefly: ignore[bad-index]
-                        if predictions[task.name].dim() == labels[task.name].dim()
-                        # predictions[task.name].dim() == labels[task.name].dim() + 1 for multiclass models
-                        #  List[typing.Any], int, slice, Tensor,
-                        #  typing.Tuple[typing.Any, ...]]` but got `str`.
-                        # pyrefly: ignore[bad-index]
-                        else predictions[task.name].view(
-                            1,
-                            -1,
-                            predictions[
-                                # pyrefly: ignore[bad-index]
-                                task.name
-                                #  List[typing.Any], int, slice, Tensor,
-                                #  typing.Tuple[typing.Any, ...]]` but got `str`.
-                            ].size()[-1],
-                        )
-                    )
-                    #  List[typing.Any], int, slice, Tensor, typing.Tuple[typing.Any,
-                    #  ...]]` but got `str`.
-                    # pyrefly: ignore[bad-index]
-                    task_labels = labels[task.name].view(1, -1)
-                    if weights is None:
-                        task_weights = self._create_default_weights(task_predictions)
-                    else:
-                        #  List[typing.Any], int, slice, Tensor,
-                        #  typing.Tuple[typing.Any, ...]]` but got `str`.
-                        # pyrefly: ignore[bad-index]
-                        task_weights = weights[task.name].view(1, -1)
-                    if self._should_validate_update:
-                        # has_valid_weights is a tensor with only 1 value corresponding to
-                        # whether the weights are valid, i.e. are set to non-zero values for
-                        # the task in this update.
-                        # If has_valid_update[0] is False, we just ignore this update.
-                        has_valid_weights = self._check_nonempty_weights(task_weights)
-                        if has_valid_weights[0]:
-                            #  Tensor) -> Tensor, Module, Tensor]` is not a function.
-                            # pyrefly: ignore[not-callable]
-                            metric_.has_valid_update.logical_or_(has_valid_weights)
-                        else:
-                            continue
-                    if "required_inputs" in kwargs:
-                        # Expand scalars to match the shape of the predictions
-                        kwargs["required_inputs"] = {
-                            k: (
-                                v.view(task_labels.size())
-                                if v.numel() > 1
-                                else v.expand(task_labels.size())
-                            )
-                            for k, v in kwargs["required_inputs"].items()
-                        }
-                    # pyrefly: ignore[not-callable]
-                    metric_.update(
-                        predictions=task_predictions,
-                        labels=task_labels,
-                        weights=task_weights,
-                        **kwargs,
-                    )
+                self._update_unfused(predictions, labels, weights, **kwargs)
 
     @pt2_compile_callable
     def update(

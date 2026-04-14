@@ -39,8 +39,12 @@ from torchrec.distributed.types import (
     ShardingPlanner,
     ShardingType,
 )
-from torchrec.fb.distributed.planner.lp_planner import LinearProgrammingPlanner
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+
+try:
+    from torchrec.fb.distributed.planner.lp_planner import LinearProgrammingPlanner
+except ImportError:
+    LinearProgrammingPlanner = None  # Not available in OSS
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -243,6 +247,11 @@ class PlannerConfig:
                 storage_reservation=storage_reservation,
             )
         elif self.planner_type == "lp":
+            if LinearProgrammingPlanner is None:
+                raise RuntimeError(
+                    "LinearProgrammingPlanner is not available in OSS. "
+                    "Use planner_type='embedding' or 'hetero' instead."
+                )
             return LinearProgrammingPlanner(
                 topology=topology,
                 batch_size=self.batch_size,

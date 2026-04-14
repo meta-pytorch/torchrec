@@ -1,5 +1,8 @@
-# this is a very basic sparse data dist config
-# runs on 2 ranks, showing traces with reasonable workloads
+# Unified EMO + EMS benchmark config
+# Combines fused_uvm_caching (EMO) with embedding memory stashing (EMS).
+# During forward, the EMO cache (lxu_cache_weights) is flushed + freed.
+# Before backward, the cache is restored via re-prefetch from UVM,
+# and batch_i+1 is prefetched for the next forward.
 RunOptions:
   world_size: 2
   num_batches: 10
@@ -7,13 +10,13 @@ RunOptions:
   num_profiles: 1
   sharding_type: table_wise
   profile_dir: "."
-  name: "prefetch_emo"
+  name: "prefetch_emo_ems"
   memory_snapshot: True
   loglevel: "INFO"
-  sync_batch: True
-  # export_stacks: True # enable this to export stack traces
 PipelineConfig:
-  pipeline: "prefetch"  # "sparse"
+  pipeline: "prefetch-ems"
+  kwargs:
+    site_fqn: "over.overarch.0"
 ModelInputConfig:
   num_float_features: 100
   feature_pooling_avg: 30
@@ -41,13 +44,14 @@ EmbeddingTablesConfig:
         embedding_dim: 512
         num_embeddings: 10_000_000
         feature_names: ["additional_0_1"]
+        stash_weights: true
     - []
     - - name: skipped_table
         embedding_dim: 128
         num_embeddings: 100_000
         feature_names: ["additional_2_1"]
 PlannerConfig:
-  pooling_factors: [30.0]  # Default pooling factor (no ModelInputConfig.feature_pooling_avg specified)
+  pooling_factors: [30.0]
   additional_constraints:
     large_table:
       compute_kernels: [fused_uvm_caching]

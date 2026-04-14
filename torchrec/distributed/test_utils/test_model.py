@@ -2869,7 +2869,7 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
         dense_r = self.dense(input.float_features)
         if (
             self._enable_activation_stashing
-            and not torch.fx._symbolic_trace.is_fx_tracing()
+            and not torch.fx._symbolic_trace.is_fx_symbolic_tracing()
         ):
             dense_r.register_hook(self._restore_callback)
         over_r = self.over(dense_r, sparse_output)
@@ -2932,7 +2932,7 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
             ec_embeddings = torch.cat(padded_embeddings, dim=1)
             if (
                 self._enable_activation_stashing
-                and not torch.fx._symbolic_trace.is_fx_tracing()
+                and not torch.fx._symbolic_trace.is_fx_symbolic_tracing()
             ):
                 await_restore, restore = MemoryStashingManager._stash_tensors(
                     [ec_result[e]._values for e in self._ec_features]

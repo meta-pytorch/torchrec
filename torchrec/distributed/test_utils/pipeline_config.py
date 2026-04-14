@@ -20,6 +20,7 @@ from torchrec.distributed.train_pipeline import (
 from torchrec.distributed.train_pipeline.experimental_pipelines import (
     EvalPipelineCPUSparse,
     TrainEvalHybridPipelineBase,
+    TrainPipelinePrefetchEMS,
     TrainPipelineSparseDistBwdOpt,
     TrainPipelineSparseDistEmbStash,
     TrainPipelineSparseDistOptStash,
@@ -73,7 +74,7 @@ class PipelineConfig:
             for key in ("site_fqn", "sharding_type"):
                 if key in kwargs:
                     kwargs.pop(key)
-        if self.pipeline in ("sparse-emb-stash",):
+        if self.pipeline in ("sparse-emb-stash", "prefetch-ems"):
             kwargs.pop("sharding_type", None)
         if self.pipeline in ("base", "eval-sdd"):
             kwargs.pop("pipeline_postproc", None)
@@ -131,6 +132,7 @@ class PipelineConfig:
             "sparse-bwd-opt": TrainPipelineSparseDistBwdOpt,
             "sparse-opt-stash": TrainPipelineSparseDistOptStash,
             "sparse-emb-stash": TrainPipelineSparseDistEmbStash,
+            "prefetch-ems": TrainPipelinePrefetchEMS,
             "eval-cpu-sparse": EvalPipelineCPUSparse,
         }
 

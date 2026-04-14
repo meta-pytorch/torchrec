@@ -30,6 +30,7 @@ from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.train_pipeline.backward_injection import (
     FirstGradTensorFinder,
     InjectionSite,
+    InjectionTargetType,
     OutputDistTensorFinder,
 )
 from torchrec.distributed.train_pipeline.pipeline_context import (
@@ -820,6 +821,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
         self._output_dist_site = InjectionSite(
             fqn=site_fqn,
             tensor_finder=OutputDistTensorFinder(sharding_type=sharding_type),
+            target_type=InjectionTargetType.ACTIVATION,
         )
 
     def _pipeline_model(
@@ -1110,7 +1112,9 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         )
         if isinstance(site_fqn, str):
             self._injection_site = InjectionSite(
-                fqn=site_fqn, tensor_finder=FirstGradTensorFinder()
+                fqn=site_fqn,
+                tensor_finder=FirstGradTensorFinder(),
+                target_type=InjectionTargetType.PARAM_GRAD,
             )
         else:
             self._injection_site = site_fqn
@@ -1133,3 +1137,152 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
                 MemoryStashingManager.restore_embedding_weights()
 
         self.register_backward_hook(self._injection_site, work)
+
+
+class TrainPipelinePrefetchEMS(TrainPipelineSparseDistEmbStash[In, Out]):
+    """
+    Extends TrainPipelineSparseDistEmbStash with unified EMO + EMS support.
+
+    For tables using ``fused_uvm_caching`` (EMO), the standard embedding
+    stash is a no-op because ``weights_dev`` is empty — the actual HBM
+    consumer is ``lxu_cache_weights``. This pipeline enables time-sharing
+    HBM between the embedding cache and dense compute by:
+
+    1. After forward: flushing dirty cache lines to ``weights_uvm``, then
+       freeing ``lxu_cache_weights`` HBM via ``resize_(0)`` on the D2H
+       stream (overlaps with dense forward).
+    2. During dense forward/backward: cache HBM is available for activations.
+    3. Before backward: restoring the cache and re-prefetching on the main
+       stream.
+
+    Timeline per iteration::
+
+        default stream:   forward ── restore+prefetch ── backward ── opt
+        d2h stream:            stash (flush+free) ──┘
+    """
+
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        optimizer: torch.optim.Optimizer,
+        device: torch.device,
+        site_fqn: Union[str, InjectionSite],
+        execute_all_batches: bool = True,
+        apply_jit: bool = False,
+        context_type: Type[TrainPipelineContext] = TrainPipelineContext,
+        pipeline_postproc: bool = False,
+        custom_model_fwd: Optional[
+            Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
+        ] = None,
+        dmp_collection_sync_interval_batches: Optional[int] = 1,
+        enqueue_batch_after_forward: bool = False,
+        enable_inplace_copy_batch: bool = False,
+        free_features_storage_early: bool = False,
+    ) -> None:
+        super().__init__(
+            model=model,
+            optimizer=optimizer,
+            device=device,
+            site_fqn=site_fqn,
+            execute_all_batches=execute_all_batches,
+            apply_jit=apply_jit,
+            context_type=context_type,
+            pipeline_postproc=pipeline_postproc,
+            custom_model_fwd=custom_model_fwd,
+            dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
+            enqueue_batch_after_forward=enqueue_batch_after_forward,
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
+            free_features_storage_early=free_features_storage_early,
+        )
+
+    def _restore_and_prefetch(self) -> None:
+        """
+        Restore stashed embedding weights and EMO caches (batch_i), then
+        prefetch batch_i+1 for the next forward pass.
+
+        Runs on the main stream before backward.
+        """
+        # Step 1: Restore stashed weights and EMO caches (re-prefetch batch_i)
+        MemoryStashingManager.restore_embedding_weights()
+        MemoryStashingManager.restore_emo_cache()
+
+        # Step 2: Prefetch batch_i+1 for next forward
+        if len(self.batches) < 2:
+            return
+
+        context_next = self.contexts[1]
+        for sharded_module in self._pipelined_modules:
+            forward = sharded_module.forward
+            # pyre-ignore[16]: _name is set by PipelinedForward
+            name = forward._name
+            if name not in context_next.input_dist_tensors_requests:
+                continue
+
+            # Peek at the awaitable — materialize if needed, but don't pop.
+            # Store back as LazyNoWait so PipelinedForward.__call__ can
+            # still consume it in the next iteration.
+            request = context_next.input_dist_tensors_requests[name]
+            if isinstance(request, LazyNoWait):
+                data = request._obj
+            else:
+                data = request.wait()
+                context_next.input_dist_tensors_requests[name] = LazyNoWait(data)
+
+            module_context = context_next.module_contexts.get(name)
+            sharded_module.prefetch(ctx=module_context, dist_input=data)
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        self._state = PipelineState.IDLE
+        if not self._model_attached:
+            self.attach(self._model)
+
+        self.fill_pipeline(dataloader_iter)
+
+        if not self.batches:
+            raise StopIteration
+
+        self._set_module_context(self.contexts[0])
+
+        if self._model.training:
+            with record_function("## zero_grad ##"):
+                self._optimizer.zero_grad()
+
+        self._wait_for_batch()
+
+        if len(self.batches) >= 2:
+            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+
+        if not self._enqueue_batch_after_forward:
+            self.enqueue_batch(dataloader_iter)
+
+        # forward — stash_emo_cache fires inside ShardedEBC.compute()
+        # on the d2h stream (overlaps with dense forward)
+        with record_function(f"## forward {self.contexts[0].index} ##"):
+            self._state = PipelineState.CALL_FWD
+            losses, output = self._model_fwd(self.batches[0])
+
+        if self._enqueue_batch_after_forward:
+            self.enqueue_batch(dataloader_iter)
+
+        if len(self.batches) >= 2:
+            self.wait_sparse_data_dist(self.contexts[1])
+
+        # Restore + prefetch on main stream before backward.
+        with record_function("## restore_and_prefetch ##"):
+            self._restore_and_prefetch()
+
+        if self._model.training:
+            self._state = PipelineState.CALL_BWD
+            self._backward(losses)
+
+            self.sync_embeddings(
+                self._model,
+                self._dmp_collection_sync_interval_batches,
+                self.contexts[0],
+            )
+
+            with record_function(f"## optimizer {self.contexts[0].index} ##"):
+                self._optimizer.step()
+
+        self.dequeue_batch()
+        return output
