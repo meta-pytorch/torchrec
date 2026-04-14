@@ -333,4 +333,20 @@ def log_itep_rowwise_shard(
     pass
 
 
+def log_itep_ien_pruning_stats(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_ien_pruning_decision(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
