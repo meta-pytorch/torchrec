@@ -349,4 +349,12 @@ def log_itep_ien_pruning_decision(
     pass
 
 
+def log_itep_itp_info(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
