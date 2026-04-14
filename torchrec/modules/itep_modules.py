@@ -26,6 +26,7 @@ from torchrec.distributed.logging_handlers import (
     log_itep_eviction,
     log_itep_init_state,
     log_itep_pruning_trigger,
+    log_itep_rowwise_shard,
 )
 from torchrec.distributed.types import Shard, ShardedTensor, ShardedTensorMetadata
 from torchrec.modules.embedding_modules import reorder_inverse_indices
@@ -700,6 +701,16 @@ class RowwiseShardedITEPModule(GenericITEPModule):
             logger.info(
                 f"ITEP: table {table.name} not pruned, because table name is not present in table_name_to_unpruned_hash_sizes."
             )
+
+        log_itep_rowwise_shard(
+            {
+                "table_name": table.name,
+                "sharding_type": sharding_type,
+                "local_rows": str(local_rows),
+                "local_unpruned_rows": str(local_unpruned_rows),
+                "is_pruned": str(table.name in self.table_name_to_unpruned_hash_sizes),
+            }
+        )
 
         return (local_rows, local_unpruned_rows)
 
