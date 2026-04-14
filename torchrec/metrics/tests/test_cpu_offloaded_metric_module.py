@@ -258,6 +258,16 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.assertFalse(self.cpu_module.update_thread.is_alive())
         self.assertFalse(self.cpu_module.compute_thread.is_alive())
 
+    def test_double_shutdown_is_idempotent(self) -> None:
+        self.cpu_module.shutdown()
+        self.assertFalse(self.cpu_module.update_thread.is_alive())
+        self.assertFalse(self.cpu_module.compute_thread.is_alive())
+
+        # Second call should be a no-op, not raise
+        self.cpu_module.shutdown()
+        self.assertFalse(self.cpu_module.update_thread.is_alive())
+        self.assertFalse(self.cpu_module.compute_thread.is_alive())
+
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
