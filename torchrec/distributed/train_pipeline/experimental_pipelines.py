@@ -1095,6 +1095,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
+        delay_stash: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1118,11 +1119,14 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
             )
         else:
             self._injection_site = site_fqn
+        self._delay_stash = delay_stash
 
         MemoryStashingManager.set_streams(
             self._memcpy_stream,  # pyrefly: ignore[bad-argument-type]
             torch.cuda.Stream(device=device),
         )
+        if delay_stash:
+            MemoryStashingManager.set_delay_stash(True)
 
     def _pipeline_model(
         self,
@@ -1131,6 +1135,16 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         pipelined_forward: Type[PipelinedForward] = PipelinedForward,
     ) -> None:
         super()._pipeline_model(batch, context, pipelined_forward)
+
+        if self._delay_stash:
+            # Register execute hook first — tensor hooks fire in registration
+            # order, so execute_pending_stashes runs before restore during
+            # backward.
+            def execute_work(_pipeline: Any) -> None:
+                with record_function("## execute_pending_stashes ##"):
+                    MemoryStashingManager.execute_pending_stashes()
+
+            self.register_backward_hook(self._injection_site, execute_work)
 
         def work(_pipeline: Any) -> None:
             with record_function("## restore_embedding_weights ##"):

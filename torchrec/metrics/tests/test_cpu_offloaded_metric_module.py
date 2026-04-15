@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 from torchrec.metrics.cpu_offloaded_metric_module import (
     CPUOffloadedRecMetricModule,
@@ -655,6 +656,174 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.assertEqual(module.compute_queue.maxsize, 75)
 
         module.shutdown()
+
+    def test_correctness_counters_after_update_and_compute(self) -> None:
+        """Verify correctness counters are incremented through update+compute cycle."""
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.7]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+
+        num_updates = 3
+        for _ in range(num_updates):
+            self.cpu_module.update(model_out)
+
+        self.assertEqual(self.cpu_module._total_updates_enqueued, num_updates)
+
+        future = self.cpu_module.async_compute()
+        self.assertEqual(self.cpu_module._total_computes_enqueued, 1)
+
+        future.resolve()
+
+        wait_until_true(lambda: self.cpu_module._total_updates_processed == num_updates)
+        self.assertEqual(self.cpu_module._total_updates_processed, num_updates)
+        self.assertEqual(self.cpu_module._total_computes_processed, 1)
+        self.assertEqual(self.cpu_module._update_errors, 0)
+        self.assertEqual(self.cpu_module._compute_errors, 0)
+
+    def test_log_event_called_on_init(self) -> None:
+        """Verify _log_event is called with INFO during __init__."""
+        with patch.object(CPUOffloadedRecMetricModule, "_log_event") as mock_log_event:
+            module = CPUOffloadedRecMetricModule(
+                model_out_device=torch.device("cpu"),
+                batch_size=self.batch_size,
+                world_size=self.world_size,
+                rec_tasks=self.tasks,
+                rec_metrics=self.rec_metrics,
+            )
+
+            mock_log_event.assert_called_once_with(
+                "init",
+                EventType.INFO,
+                {
+                    "model_out_device": "cpu",
+                    "update_queue_size": "100",
+                    "compute_queue_size": "100",
+                },
+            )
+            module.shutdown()
+
+    def test_shutdown_logs_success_event(self) -> None:
+        """Verify shutdown logs SUCCESS event with correctness metadata."""
+        with patch.object(self.cpu_module, "_log_event") as mock_log_event:
+            self.cpu_module.shutdown()
+
+            mock_log_event.assert_called_once()
+            args = mock_log_event.call_args
+            self.assertEqual(args[0][0], "shutdown")
+            self.assertEqual(args[0][1], EventType.SUCCESS)
+            metadata = args[0][2]
+            self.assertIn("total_updates_enqueued", metadata)
+            self.assertIn("total_updates_processed", metadata)
+            self.assertIn("update_thread_alive", metadata)
+
+    def test_update_error_counter_incremented_on_thread_exception(self) -> None:
+        """Verify _update_errors is incremented when update thread hits an exception."""
+        with patch.object(
+            self.cpu_module,
+            "_process_metric_update_job",
+            side_effect=RuntimeError("test error"),
+        ):
+            self.cpu_module.update(
+                {
+                    "task1-prediction": torch.tensor([0.5]),
+                    "task1-label": torch.tensor([0.7]),
+                    "task1-weight": torch.tensor([1.0]),
+                }
+            )
+
+            self.cpu_module._captured_exception_event.wait(timeout=5.0)
+            self.assertEqual(self.cpu_module._update_errors, 1)
+
+    def test_compute_error_counter_incremented_on_thread_exception(self) -> None:
+        """Verify _compute_errors is incremented when compute thread hits an exception."""
+        with patch.object(
+            self.cpu_module,
+            "_process_metric_compute_job",
+            side_effect=RuntimeError("test error"),
+        ):
+            self.cpu_module.async_compute()
+
+            self.cpu_module._captured_exception_event.wait(timeout=5.0)
+            self.assertEqual(self.cpu_module._compute_errors, 1)
+
+    def test_enqueue_update_logs_failure_on_queue_full(self) -> None:
+        """Verify FAILURE event is logged when update queue is full."""
+        cpu_module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=self.rec_metrics,
+            update_queue_size=1,
+        )
+
+        block_event = threading.Event()
+
+        def controlled_process_job(_: MetricUpdateJob) -> None:
+            block_event.wait()
+
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.5]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+
+        with patch.object(
+            cpu_module, "_process_metric_update_job", side_effect=controlled_process_job
+        ), patch.object(cpu_module, "_log_event") as mock_log_event:
+            cpu_module._update_rec_metrics(model_out)
+            cpu_module._update_rec_metrics(model_out)
+
+            with self.assertRaises(RecMetricException):
+                cpu_module._update_rec_metrics(model_out)
+
+            mock_log_event.assert_called_once()
+            args = mock_log_event.call_args
+            self.assertEqual(args[0][0], "enqueue_update")
+            self.assertEqual(args[0][1], EventType.FAILURE)
+
+            block_event.set()
+
+    def test_enqueue_compute_logs_failure_on_queue_full(self) -> None:
+        """Verify FAILURE event is logged when update queue is full during async_compute."""
+        cpu_module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=self.rec_metrics,
+            update_queue_size=1,
+        )
+
+        block_event = threading.Event()
+
+        def controlled_process_job(_: MetricUpdateJob) -> None:
+            block_event.wait()
+
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.5]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+
+        with patch.object(
+            cpu_module, "_process_metric_update_job", side_effect=controlled_process_job
+        ), patch.object(cpu_module, "_log_event") as mock_log_event:
+            # Fill the queue: 1 item being processed + 1 in queue = full
+            cpu_module._update_rec_metrics(model_out)
+            cpu_module._update_rec_metrics(model_out)
+
+            with self.assertRaises(RecMetricException):
+                cpu_module.async_compute()
+
+            mock_log_event.assert_called_once()
+            args = mock_log_event.call_args
+            self.assertEqual(args[0][0], "enqueue_compute")
+            self.assertEqual(args[0][1], EventType.FAILURE)
+
+            block_event.set()
 
 
 @skip_if_asan_class

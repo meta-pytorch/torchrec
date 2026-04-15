@@ -16,6 +16,7 @@ PipelineConfig:
   pipeline: "sparse-emb-stash"
   kwargs:
     site_fqn: "over.overarch.0"  # dense
+    # delay_stash: true
 ModelInputConfig:
   num_float_features: 100
   feature_pooling_avg: 30
