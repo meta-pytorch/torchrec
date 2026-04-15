@@ -1115,6 +1115,7 @@ class TestKeyedJaggedTensor(unittest.TestCase):
 
         # Non-KeyedJaggedTensor input
         non_kjt_input = "not a KeyedJaggedTensor instance"
+        # pyrefly: ignore[bad-argument-type]
         self.assertFalse(kjt_is_equal(kt, non_kjt_input))
 
     def test_meta_device_compatibility(self) -> None:

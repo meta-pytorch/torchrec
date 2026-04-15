@@ -139,6 +139,7 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
                 kjt_list.append(
                     apply_feature_processors_to_kjt(
                         features,
+                        # pyrefly: ignore[bad-argument-type]
                         self._feature_processors,
                     )
                 )
