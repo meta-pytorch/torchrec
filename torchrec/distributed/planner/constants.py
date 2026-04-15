@@ -24,9 +24,10 @@ BIGINT_DTYPE: int = 8
 
 HBM_CAP: int = 32 * 1024 * 1024 * 1024  # 32 GB
 DDR_CAP: int = 128 * 1024 * 1024 * 1024  # 128 GB
-SSD_CAP: int = 2 * 1024 * 1024 * 1024 * 1024  # 2 TB
+SSD_CAP: int = 0  # Disable SSD by default
 DDR_MEM_BW: float = 51 * 1024 * 1024 * 1024 / 1000  # bytes/ms
 HBM_MEM_BW: float = 897 * 1024 * 1024 * 1024 / 1000  # bytes/ms
+# Conservative value so planner only picks KEY_VALUE when HBM/DDR are full.
 SSD_MEM_BW: float = 100 * 1024 * 1024 / 1000  # bytes/ms
 # This can be smaller than DDR_MEM_BW because the PCI channel maybe shared
 # with other devices such as the FE NIC.
