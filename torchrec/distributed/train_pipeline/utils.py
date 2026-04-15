@@ -637,6 +637,78 @@ class DataLoadingThread(Thread, Generic[In]):
         return batch
 
 
+def prefetch_embeddings(
+    context: PrefetchTrainPipelineContext,
+    pipelined_modules: List[ShardedModule],
+    device: torch.device,
+    stream_context: Callable[[Optional[torch.Stream]], torch.cuda.StreamContext],
+    data_dist_stream: Optional[torch.Stream],
+    forward_stream: Optional[torch.Stream],
+) -> None:
+    """
+    Prefetches embeddings for the given batch.
+
+    This function processes each sharded module by:
+    1. Retrieving and waiting for the input distribution request for the module
+    2. Ensuring proper stream synchronization for the resulting data
+    3. Initiating the prefetch operation for the module
+
+    Args:
+        context: The prefetch pipeline context containing state information
+        pipelined_modules: List of sharded modules to process
+        device: The device to use for computation
+        stream_context: Context manager for stream operations
+        data_dist_stream: Stream used for data distribution operations
+        forward_stream: Default stream for operations
+    """
+
+    if data_dist_stream is None:
+        return
+
+    cur_stream = torch.get_device_module(device).current_stream()
+
+    for sharded_module in pipelined_modules:
+        forward = sharded_module.forward
+        assert isinstance(forward, PrefetchPipelinedForward)
+
+        assert forward._name in context.input_dist_tensors_requests
+        request = context.input_dist_tensors_requests.pop(forward._name)
+        assert isinstance(request, Awaitable)
+
+        with record_function(f"## _prefetch_embeddings {context.index} ##"):
+            # Finish waiting on the dist_stream,
+            # in case some delayed stream scheduling happens during the wait() call.
+            with stream_context(data_dist_stream):
+                dist_input = request.wait()
+                assert isinstance(
+                    dist_input, (torch.Tensor, Multistreamable)
+                ), f"{type(dist_input)} must implement Multistreamable interface"
+
+        # Ensure prefetch stream waits for data_dist stream's GPU work
+        # before launching prefetch kernels that read the dist output.
+        cur_stream.wait_stream(data_dist_stream)
+
+        # Make sure that both result of input_dist and context
+        # are properly transferred to the current stream.
+        module_context = context.module_contexts[forward._name]
+
+        dist_input.record_stream(cur_stream)
+        module_context.record_stream(cur_stream)
+        if forward_stream is not None:
+            dist_input.record_stream(forward_stream)
+            module_context.record_stream(forward_stream)
+
+        sharded_module.prefetch(
+            ctx=module_context,
+            dist_input=dist_input,
+            forward_stream=forward_stream,
+        )
+        context.module_input_post_prefetch[forward._name] = dist_input
+        context.module_contexts_post_prefetch[forward._name] = (
+            context.module_contexts.pop(forward._name)
+        )
+
+
 def _prefetch_embeddings(
     batch: In,
     context: PrefetchTrainPipelineContext,
