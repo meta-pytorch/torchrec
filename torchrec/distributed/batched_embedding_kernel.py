@@ -4656,6 +4656,8 @@ class BatchedDenseEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
                 weights_precision=weights_precision,
                 output_dtype=output_dtype,
                 use_mtia=device is not None and device.type == "mtia",
+                # Place embedding weights in host-mapped UVM for eval workflows.
+                uvm_host_mapped=fused_params.get("uvm_host_mapped", False),
             )
         )
         self._param_per_table: Dict[str, TableBatchedEmbeddingSlice] = dict(
