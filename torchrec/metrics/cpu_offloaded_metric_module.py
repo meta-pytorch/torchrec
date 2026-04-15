@@ -249,7 +249,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         }
 
     @EventLoggingHandler.event_logger(
-        TorchrecComponent.REC_METRICS, n=100, add_wait_counter=True
+        TorchrecComponent.REC_METRICS, n=1000, add_wait_counter=True
     )
     def _process_metric_update_job(self, metric_update_job: MetricUpdateJob) -> None:
         """
@@ -442,7 +442,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             self.compute_queue_size_logger.add(self.compute_queue.qsize())
 
     @EventLoggingHandler.event_logger(
-        TorchrecComponent.REC_METRICS, add_wait_counter=True, n=100
+        TorchrecComponent.REC_METRICS, add_wait_counter=True, n=1000
     )
     def _process_metric_compute_job(
         self, metric_compute_job: MetricComputeJob
