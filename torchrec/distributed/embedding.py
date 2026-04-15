@@ -1643,7 +1643,7 @@ class ShardedEmbeddingCollection(
                 if MemoryStashingManager.is_enabled():
                     stash_result = MemoryStashingManager.stash_embedding_weights(lookup)
                     if stash_result is not None:
-                        await_restore, _ = stash_result
+                        await_restore, *_ = stash_result
                         embs.register_hook(await_restore)
                 if hasattr(lookup, "get_resize_awaitables"):
                     # pyrefly: ignore[not-callable]

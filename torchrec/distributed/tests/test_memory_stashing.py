@@ -40,7 +40,9 @@ class TestStashTensors(unittest.TestCase):
         tensor = torch.randn(100, 64, device=self.device)
         original = tensor.clone()
 
-        await_restore, restore = MemoryStashingManager._stash_tensors([tensor])
+        await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
+            [tensor]
+        )
 
         # Verify HBM is freed
         self.assertEqual(tensor.untyped_storage().size(), 0)
@@ -59,7 +61,9 @@ class TestStashTensors(unittest.TestCase):
         t2 = torch.ones(80, 64, device=self.device) * 2
         originals = [t1.clone(), t2.clone()]
 
-        await_restore, restore = MemoryStashingManager._stash_tensors([t1, t2])
+        await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
+            [t1, t2]
+        )
 
         # All freed
         self.assertEqual(t1.untyped_storage().size(), 0)
@@ -75,7 +79,9 @@ class TestStashTensors(unittest.TestCase):
 
     def test_empty_list(self) -> None:
         """Test that an empty tensor list returns no-op callbacks."""
-        await_restore, restore = MemoryStashingManager._stash_tensors([])
+        await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
+            []
+        )
         # Should not raise
         restore(None)
         await_restore(None)
@@ -85,7 +91,9 @@ class TestStashTensors(unittest.TestCase):
         tensor = torch.randn(10, 5, device=self.device, requires_grad=True)
         version_before = tensor._version
 
-        await_restore, restore = MemoryStashingManager._stash_tensors([tensor])
+        await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
+            [tensor]
+        )
         restore(None)
         await_restore(None)
 
@@ -96,7 +104,9 @@ class TestStashTensors(unittest.TestCase):
         tensor = torch.randn(10, 5, device=self.device)
         original = tensor.clone()
 
-        await_restore, restore = MemoryStashingManager._stash_tensors([tensor])
+        await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
+            [tensor]
+        )
 
         dummy_grad = torch.tensor([1.0])
         restore(dummy_grad)
@@ -175,7 +185,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
-        await_restore, _restore = result
+        await_restore, _restore, _execute_stash = result
 
         # Verify HBM is freed
         self.assertEqual(original_weights.untyped_storage().size(), 0)
@@ -204,7 +214,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
-        await_restore, _restore = result
+        await_restore, _restore, _execute_stash = result
 
         # Verify all are stashed
         self.assertEqual(weights_1.untyped_storage().size(), 0)
@@ -235,7 +245,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
-        await_restore, _restore = result
+        await_restore, _restore, _execute_stash = result
 
         # Verify stash worked
         self.assertEqual(original_weights.untyped_storage().size(), 0)
@@ -263,7 +273,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         # Stash and restore
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
-        await_restore, _restore = result
+        await_restore, _restore, _execute_stash = result
 
         MemoryStashingManager.restore_embedding_weights()
         await_restore(None)
@@ -305,7 +315,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
-        await_restore, _restore = result
+        await_restore, _restore, _execute_stash = result
 
         # Only CUDA weights should be stashed
         self.assertEqual(cuda_weights.untyped_storage().size(), 0)
@@ -343,7 +353,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
-        await_restore, _restore = result
+        await_restore, _restore, _execute_stash = result
 
         # Valid weights should be stashed
         self.assertEqual(valid_weights.untyped_storage().size(), 0)
@@ -369,9 +379,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
-        await_restore, _restore = result
+        await_restore, _restore, _execute_stash = result
 
-        # Register restore via class method and await_restore as backward hook
+        # Register restore via class method
         output.register_hook(
             lambda _grad: MemoryStashingManager.restore_embedding_weights()
         )
@@ -400,7 +410,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
-        await_restore, _restore = result
+        await_restore, _restore, _execute_stash = result
 
         # Only the stash_weights=True group should be stashed
         self.assertEqual(stash_weights.untyped_storage().size(), 0)
@@ -449,7 +459,7 @@ class TestStashEmbeddingWeights(unittest.TestCase):
 
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
-        await_restore, _restore = result
+        await_restore, _restore, _execute_stash = result
 
         # Both should be stashed
         self.assertEqual(weights_1.untyped_storage().size(), 0)
