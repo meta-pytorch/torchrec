@@ -322,7 +322,7 @@ def construct_jagged_tensors_inference(
                 embeddings, 0, reverse_indices.to(torch.int32)
             )
         elif remove_padding:
-            embeddings = _slice_1d_tensor(embeddings, 0, lengths.sum().item())
+            embeddings = _slice_1d_tensor(embeddings, 0, int(lengths.sum().item()))
 
         ret: Dict[str, JaggedTensor] = {}
 

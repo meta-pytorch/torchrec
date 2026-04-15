@@ -198,6 +198,8 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
     Lookup modules for Sequence embeddings (i.e Embeddings)
     """
 
+    _dummy_embs_tensor: torch.Tensor
+
     def __init__(
         self,
         grouped_configs: List[GroupedEmbeddingConfig],
@@ -558,6 +560,8 @@ class GroupedPooledEmbeddingsLookup(
     """
     Lookup modules for Pooled embeddings (i.e EmbeddingBags)
     """
+
+    _dummy_embs_tensor: torch.Tensor
 
     def __init__(
         self,

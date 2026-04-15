@@ -122,6 +122,7 @@ class TestJaggedTensor(unittest.TestCase):
 
         # wrong type
         jt = "not a jagged tensor"
+        # pyrefly: ignore[bad-argument-type]
         self.assertFalse(jt_is_equal(jt, jt_1))
 
     def test_str(self) -> None:
