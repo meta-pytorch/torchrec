@@ -80,9 +80,6 @@ def _compute_lengths_from_hits(
 
 
 class TrainInputMapper(torch.nn.Module):
-    _zch_size_per_training_rank: torch.Tensor
-    _train_rank_offsets: torch.Tensor
-
     """
     Module used to generate sizes and offsets information corresponding to
     the train ranks for inference inputs. This is due to we currently merge
@@ -103,6 +100,9 @@ class TrainInputMapper(torch.nn.Module):
         mapper = TrainInputMapper(...)
         mapper(values, output_offset)
     """
+
+    _zch_size_per_training_rank: torch.Tensor
+    _train_rank_offsets: torch.Tensor
 
     def __init__(
         self,

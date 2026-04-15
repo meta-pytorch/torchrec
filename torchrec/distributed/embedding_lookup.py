@@ -559,6 +559,15 @@ class GroupedPooledEmbeddingsLookup(
 ):
     """
     Lookup modules for Pooled embeddings (i.e EmbeddingBags)
+
+    Args:
+        grouped_configs (List[GroupedEmbeddingConfig]): configs of multiple grouped embeddings
+        device: (Optional[torch.device]): default compute device
+        pg: (Optional[dist.ProcessGroup]): process group for the shard
+        feature_processor: (Optional[BaseGroupedFeatureProcessor]): feature processor on KJT
+        scale_weight_gradients: (bool): whether to scale feature weights by the gradient
+        sharding_type: (Optional[ShardingType]): sharding type for the grouped embeddings
+        env: (Optional[ShardingEnv]): sharding environment for the grouped embeddings
     """
 
     _dummy_embs_tensor: torch.Tensor
@@ -863,7 +872,7 @@ class GroupedPooledEmbeddingsLookup(
 
         return vbe_output, vbe_offsets
 
-    def _apply_fearture_processor_and_gradient_scaling(
+    def _apply_feature_processor_and_gradient_scaling(
         self,
         features: KeyedJaggedTensor,
         config: GroupedEmbeddingConfig,
@@ -907,7 +916,7 @@ class GroupedPooledEmbeddingsLookup(
             features_by_group,
             self._feature_score_auto_collections,
         ):
-            features = self._apply_fearture_processor_and_gradient_scaling(
+            features = self._apply_feature_processor_and_gradient_scaling(
                 features, config, fs_auto_collection
             )
             lookup = emb_op(features)
@@ -945,7 +954,7 @@ class GroupedPooledEmbeddingsLookup(
             features_by_group,
             vbe_offsets,
         ):
-            features = self._apply_fearture_processor_and_gradient_scaling(
+            features = self._apply_feature_processor_and_gradient_scaling(
                 features, config
             )
 
