@@ -1030,6 +1030,9 @@ def _mch_remap(
 
 
 class MCHManagedCollisionModule(ManagedCollisionModule):
+    _mch_sorted_raw_ids: torch.Tensor
+    _mch_remapped_ids_mapping: torch.Tensor
+
     """
     ZCH managed collision module
 

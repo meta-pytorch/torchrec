@@ -44,6 +44,7 @@ class TorchrecComponent(Enum):
     OUTPUT_DIST = "output_dist"
     LOOKUP = "lookup"
     REC_METRICS = "rec_metrics"
+    ITEP = "itep"
 
 
 class EventLoggingHandler(EventLoggingHandlerBase):
@@ -263,6 +264,94 @@ def log_clf_computed(
     table_height: int = 0,
     clf: float = 0.0,
     technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_init_state(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_eviction(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_pruning_trigger(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_checkpoint_save(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_checkpoint_load(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_table_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_rowwise_shard(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_ien_pruning_stats(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_ien_pruning_decision(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_itep_itp_info(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ITEP,
 ) -> None:
     """No-op OSS stub."""
     pass

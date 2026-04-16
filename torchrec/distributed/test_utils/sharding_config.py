@@ -93,8 +93,10 @@ class PlannerConfig:
         _HARDWARE_KEYS = [
             "hbm_cap",
             "ddr_cap",
+            "ssd_cap",
             "hbm_mem_bw",
             "ddr_mem_bw",
+            "ssd_mem_bw",
             "hbm_to_ddr_mem_bw",
             "intra_host_bw",
             "inter_host_bw",

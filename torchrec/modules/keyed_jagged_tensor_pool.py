@@ -236,7 +236,9 @@ class KeyedJaggedTensorPool(ObjectPool[KeyedJaggedTensor]):
             self._is_weighted,
             self._values_dtype,
             self._device,
+            # pyrefly: ignore[bad-argument-type]
             self._lookup,
+            # pyrefly: ignore[bad-argument-type]
             self._weights.dtype if self._is_weighted else None,
         )
 

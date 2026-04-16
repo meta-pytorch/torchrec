@@ -61,6 +61,7 @@ class FeatureProcessorDictWrapper(FeatureProcessorsCollection):
         self._feature_processors = feature_processors
 
     def forward(self, features: KeyedJaggedTensor) -> KeyedJaggedTensor:
+        # pyrefly: ignore[bad-argument-type]
         return apply_feature_processors_to_kjt(features, self._feature_processors)
 
 

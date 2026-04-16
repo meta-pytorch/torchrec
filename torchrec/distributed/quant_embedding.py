@@ -526,6 +526,9 @@ def _construct_jagged_tensors(
                     )
                 )
 
+        assert rw_feature_length_after_bucketize is not None
+        assert rw_unbucketize_tensor is not None
+        assert rw_bucket_mapping_tensor is not None
         return _construct_jagged_tensors_rw(
             input_embeddings,
             embedding_names,
@@ -1112,6 +1115,8 @@ class QuantEmbeddingCollectionSharder(
 
 
 class ShardedQuantEcInputDist(torch.nn.Module):
+    _features_order_tensor: torch.Tensor
+
     """
     This module implements distributed inputs of a ShardedQuantEmbeddingCollection.
 

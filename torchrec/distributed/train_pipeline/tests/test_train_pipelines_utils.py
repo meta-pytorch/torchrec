@@ -341,6 +341,7 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
                     # pyrefly: ignore[not-callable]
                     input = self.postproc_module(input)
                 else:
+                    # pyrefly: ignore[bad-argument-type, bad-assignment]
                     input = enrich_hstu_features(input, 0.3)
                 return self.dense_forward(input, self.sparse_forward(input))
 

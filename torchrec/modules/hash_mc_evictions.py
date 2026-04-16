@@ -106,7 +106,7 @@ class HashZchPerFeatureTtlScorer(HashZchEvictionScorer):
 
 @torch.fx.wrap
 def get_eviction_scorer(
-    policy_name: str, config: HashZchEvictionConfig
+    policy_name: HashZchEvictionPolicyName, config: HashZchEvictionConfig
 ) -> HashZchEvictionScorer:
     if policy_name == HashZchEvictionPolicyName.SINGLE_TTL_EVICTION:
         return HashZchSingleTtlScorer(config)

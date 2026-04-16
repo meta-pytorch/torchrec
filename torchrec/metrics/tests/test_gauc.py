@@ -32,7 +32,8 @@ class TestGAUCMetric(TestMetric):
         }
 
     @staticmethod
-    def _compute(states: Dict[str, torch.Tensor]) -> torch.Tensor:
+    # pyrefly: ignore[bad-override]
+    def _compute(states: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         return compute_window_auc(
             states["auc_sum"],
             states["num_samples"],
