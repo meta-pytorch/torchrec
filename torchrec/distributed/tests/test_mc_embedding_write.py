@@ -365,25 +365,6 @@ def _create_hashzch_sharded_arch(
     return sharded_sparse_arch  # pyre-fixme[7]
 
 
-def print_weights(train_module: torch.nn.Module) -> None:
-    for name, v in train_module.state_dict().items():
-        if "_managed_collision_modules" in name:
-            torch.set_printoptions(profile="full")
-            if isinstance(v, ShardedTensor):
-                assert len(v.local_shards()) == 1, len(v.local_shards())
-                t = v.local_shards()[0].tensor
-                logger.info(
-                    f"rank {torch.distributed.get_rank()}: table={name}: size={t.shape} {t=}"
-                )
-            else:
-                t = v
-                logger.info(
-                    f"rank {torch.distributed.get_rank()}: table={name}: size={t.shape}, values={t}"
-                )
-            torch.set_printoptions(profile="default")
-    torch.cuda.synchronize()
-
-
 def _test_input_dist_2d_weights_mapping(
     tables: List[EmbeddingConfig],
     rank: int,
@@ -1070,7 +1051,6 @@ def _test_overwrite_ids_state_dict(
             total_num_buckets=4,
             write_runtime_meta_dim=1,
         )
-        logger.info(f"rank {rank}: sharded_sparse_arch={sharded_sparse_arch}")
         mc_ec = sharded_sparse_arch._mc_ec
         assert isinstance(mc_ec, ShardedManagedCollisionEmbeddingCollection)
         mcc = mc_ec._managed_collision_collection
@@ -1086,12 +1066,6 @@ def _test_overwrite_ids_state_dict(
 
         loss, _ = sharded_sparse_arch(kjt_insert)
         torch.sum(torch.stack([v.sum() for v in loss.values()])).backward()
-        # Second forward to firmly insert
-        # loss2, _ = sharded_sparse_arch(kjt_insert)
-        # sum(v.sum() for v in loss2.values()).backward()
-        logger.info("print weights for step 1")
-        print_weights(sharded_sparse_arch)
-        logger.info(f"rank {rank}: step 2")
         # Step 2: Write KJT1 with IDs [100, 200, 300, 400] and unique weight fingerprints
         kjt1_ids = torch.LongTensor([100, 200, 300, 400])
         kjt1_weights = torch.stack(
@@ -1120,9 +1094,7 @@ def _test_overwrite_ids_state_dict(
         mc_ctx1 = ManagedCollisionCollectionContext(sharding_contexts=[])
         dist_out1 = mcc.input_dist(mc_ctx1, kjt1).wait().wait()
         mcc.compute(mc_ctx1, dist_out1)
-        logger.info("before print weights in step 2")
-        print_weights(sharded_sparse_arch)
-        logger.info(f"rank {rank}: step 3")
+
         # Step 3: Write KJT2 with IDs [300, 400, 500, 600] — overlapping 300/400
         kjt2_ids = torch.LongTensor([300, 400, 500, 600])
         kjt2_weights = torch.stack(
@@ -1151,8 +1123,7 @@ def _test_overwrite_ids_state_dict(
         mc_ctx2 = ManagedCollisionCollectionContext(sharding_contexts=[])
         dist_out2 = mcc.input_dist(mc_ctx2, kjt2).wait().wait()
         mcc.compute(mc_ctx2, dist_out2)
-        logger.info("before print weights in step 3")
-        print_weights(sharded_sparse_arch)
+
         # Step 4: Verify state_dict
         sd = sharded_sparse_arch.state_dict()
 
@@ -1174,7 +1145,6 @@ def _test_overwrite_ids_state_dict(
                     runtime_meta = val.local_shards()[0].tensor
                 else:
                     runtime_meta = val
-                logger.info(f"rank {rank}: runtime_meta={runtime_meta}")
 
         # Step 5: Verify per-MC-module that overwritten slots have KJT2 values
         for _table_name, mc_module in mcc._managed_collision_modules.items():
@@ -1228,10 +1198,6 @@ def _test_overwrite_ids_state_dict(
                     f"Rank {rank}: ID {raw_id} at slot {slot_idx}: "
                     f"expected runtime_meta={expected}, got {meta_row}"
                 )
-                logger.info(
-                    f"rank {rank}: ID {raw_id} slot {slot_idx} "
-                    f"runtime_meta={meta_row} matches expected={expected}"
-                )
 
 
 def _test_partial_insertion_state_dict(
@@ -1280,12 +1246,8 @@ def _test_partial_insertion_state_dict(
         ).to(ctx.device)
 
         loss, _ = sharded_sparse_arch(kjt_insert)
-        logger.info(f"{loss=}")
         torch.sum(torch.stack([v.sum() for v in loss.values()])).backward()
 
-        logger.info("before print weights in step 1")
-        print_weights(sharded_sparse_arch)
-        logger.info(f"rank {rank}: step 2")
         # Step 2: Write a KJT that includes both known and unknown IDs
         # IDs 100, 200, 300 are inserted; 3501, 3502, 3503 were never forward'd
         # Unknown IDs must be < input_hash_size (4000) to map to valid buckets.
@@ -1322,13 +1284,8 @@ def _test_partial_insertion_state_dict(
         mc_ctx = ManagedCollisionCollectionContext(sharding_contexts=[])
         dist_out = mcc.input_dist(mc_ctx, write_kjt).wait().wait()
         mcc.compute(mc_ctx, dist_out)
-        logger.info("before print weights in step 2")
-        print_weights(sharded_sparse_arch)
-        logger.info(f"rank {rank}: step 3")
-        # Step 3: Verify state_dict
-        # print_weights(sharded_sparse_arch)
 
-        # Step 4: Verify per-MC-module consistency
+        # Verify per-MC-module consistency
         for _table_name, mc_module in mcc._managed_collision_modules.items():
             # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
             identities: torch.Tensor = torch.flatten(
@@ -1360,10 +1317,6 @@ def _test_partial_insertion_state_dict(
                 assert torch.equal(meta_row, expected_tensor), (
                     f"Rank {rank}: known ID {raw_id} at slot {slot_idx}: "
                     f"expected runtime_meta={expected}, got {meta_row}"
-                )
-                logger.info(
-                    f"rank {rank}: known ID {raw_id} slot {slot_idx} "
-                    f"runtime_meta={meta_row} OK"
                 )
 
             # Verify consistency: every occupied slot (identity != -1)
@@ -1444,9 +1397,7 @@ def _test_eviction_clears_runtime_meta(
         for _ in range(3):
             loss, _ = sharded_sparse_arch(kjt1_insert)
             torch.sum(torch.stack([v.sum() for v in loss.values()])).backward()
-        logger.info("before print weights in step 1")
-        print_weights(sharded_sparse_arch)
-        logger.info(f"rank {rank}: step 2")
+
         # Step 2: Write runtime_meta for KJT1 IDs
         # Each ID gets a unique int64 fingerprint viewed as float32,
         # matching write_runtime_meta_dim=1.
@@ -1466,9 +1417,8 @@ def _test_eviction_clears_runtime_meta(
         mc_ctx1 = ManagedCollisionCollectionContext(sharding_contexts=[])
         dist_out1 = mcc.input_dist(mc_ctx1, write_kjt1).wait().wait()
         mcc.compute(mc_ctx1, dist_out1)
-        logger.info("before print weights in step 2")
-        print_weights(sharded_sparse_arch)
-        logger.info(f"rank {rank}: step 3")
+        mcc.evict()
+
         # Snapshot which KJT1 IDs are on this rank before eviction
         kjt1_slots_before: Dict[int, int] = {}  # raw_id -> slot_idx
         for _table_name, mc_module in mcc._managed_collision_modules.items():
@@ -1487,8 +1437,6 @@ def _test_eviction_clears_runtime_meta(
                     slot_idx = slot_mask.nonzero(as_tuple=True)[0][0].item()
                     kjt1_slots_before[raw_id] = slot_idx
 
-        logger.info(f"rank {rank}: KJT1 slots before eviction: {kjt1_slots_before}")
-
         # Step 3: Forward with new IDs to trigger eviction
         # Insert enough new IDs to force eviction of some KJT1 IDs
         kjt2_ids = torch.LongTensor(list(range(2000, 2025)))  # 25 new IDs
@@ -1502,9 +1450,7 @@ def _test_eviction_clears_runtime_meta(
         for _ in range(3):
             loss, _ = sharded_sparse_arch(kjt2_insert)
             torch.sum(torch.stack([v.sum() for v in loss.values()])).backward()
-        logger.info("before print weights in step 3")
-        print_weights(sharded_sparse_arch)
-        logger.info(f"rank {rank}: step 4")
+
         # Step 4: Write runtime_meta for KJT2 IDs
         kjt2_weights = torch.stack(
             [
@@ -1522,13 +1468,9 @@ def _test_eviction_clears_runtime_meta(
         mc_ctx2 = ManagedCollisionCollectionContext(sharding_contexts=[])
         dist_out2 = mcc.input_dist(mc_ctx2, write_kjt2).wait().wait()
         mcc.compute(mc_ctx2, dist_out2)
+        mcc.evict()
 
-        # Step 5: Verify state_dict
-        logger.info("before print weights in step 4")
-        print_weights(sharded_sparse_arch)
-        logger.info(f"rank {rank}: step 5")
-
-        # Step 6: Verify per-MC-module
+        # Step 5: Verify per-MC-module
         for _table_name, mc_module in mcc._managed_collision_modules.items():
             # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
             identities: torch.Tensor = torch.flatten(
@@ -1563,10 +1505,6 @@ def _test_eviction_clears_runtime_meta(
                         f"got {meta_row}"
                     )
                     survived_count += 1
-                    logger.info(
-                        f"rank {rank}: KJT1 ID {raw_id} survived at slot "
-                        f"{slot_idx}, runtime_meta={meta_row} OK"
-                    )
                 elif raw_id in kjt1_slots_before:
                     # This ID was on this rank before but got evicted
                     evicted_count += 1
@@ -1595,15 +1533,6 @@ def _test_eviction_clears_runtime_meta(
                             f"ID {raw_id} but still has old "
                             f"runtime_meta={old_expected}"
                         )
-                    logger.info(
-                        f"rank {rank}: KJT1 ID {raw_id} evicted from slot "
-                        f"{old_slot}, runtime_meta={meta_row}"
-                    )
-
-            logger.info(
-                f"rank {rank}: KJT1 survived={survived_count}, "
-                f"evicted={evicted_count}"
-            )
 
             # Verify KJT2 IDs have correct runtime_meta
             mapped_kjt2, _, _ = mc_module.input_mapper(  # pyre-fixme[29]
@@ -1626,11 +1555,6 @@ def _test_eviction_clears_runtime_meta(
                     f"Rank {rank}: KJT2 ID {raw_id} at slot {slot_idx}: "
                     f"expected runtime_meta={expected}, got {meta_row}"
                 )
-                logger.info(
-                    f"rank {rank}: KJT2 ID {raw_id} slot {slot_idx} "
-                    f"runtime_meta={meta_row} OK"
-                )
-
             # Verify unoccupied slots have zero runtime_meta
             for slot_idx in range(identities.numel()):
                 if identities[slot_idx].item() == -1:
@@ -1679,7 +1603,6 @@ def _test_full_table_eviction_overwrites_runtime_meta(
             max_probe=8,
             write_runtime_meta_dim=1,
         )
-        logger.info(f"{sharded_sparse_arch=}")
         mc_ec = sharded_sparse_arch._mc_ec
         assert isinstance(mc_ec, ShardedManagedCollisionEmbeddingCollection)
         mcc = mc_ec._managed_collision_collection
@@ -1697,10 +1620,6 @@ def _test_full_table_eviction_overwrites_runtime_meta(
         for _ in range(2):
             loss, _ = sharded_sparse_arch(kjt1_insert)
             torch.sum(torch.stack([v.sum() for v in loss.values()])).backward()
-
-        logger.info(f"rank {rank}: after KJT1 insertion")
-        print_weights(sharded_sparse_arch)
-
         # Verify all slots are occupied on this rank
         for _table_name, mc_module in mcc._managed_collision_modules.items():
             # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
@@ -1708,10 +1627,9 @@ def _test_full_table_eviction_overwrites_runtime_meta(
                 mc_module._hash_zch_identities.data
             )
             occupied = (identities != -1).sum().item()
-            logger.info(
-                f"rank {rank}: {occupied}/{identities.numel()} slots occupied "
-                f"after KJT1"
-            )
+            assert (
+                occupied == identities.numel()
+            ), f"rank {rank}: {occupied}/{identities.numel()} slots occupied after KJT1"
 
         # Step 2: Write runtime_meta for KJT1 IDs
         # Each ID gets fingerprint: ID 1000 -> 100.0, 1001 -> 101.0, ...
@@ -1731,9 +1649,7 @@ def _test_full_table_eviction_overwrites_runtime_meta(
         mc_ctx1 = ManagedCollisionCollectionContext(sharding_contexts=[])
         dist_out1 = mcc.input_dist(mc_ctx1, write_kjt1).wait().wait()
         mcc.compute(mc_ctx1, dist_out1)
-
-        logger.info(f"rank {rank}: after KJT1 runtime_meta write")
-        print_weights(sharded_sparse_arch)
+        mcc.evict()
 
         # Snapshot KJT1 slots and their runtime_meta before eviction
         kjt1_slots_before: Dict[int, Tuple[int, float]] = (
@@ -1755,11 +1671,6 @@ def _test_full_table_eviction_overwrites_runtime_meta(
                     slot_idx = slot_mask.nonzero(as_tuple=True)[0][0].item()
                     kjt1_slots_before[raw_id] = (slot_idx, float(100 + i))
 
-        logger.info(
-            f"rank {rank}: KJT1 slots before eviction: "
-            f"{list(kjt1_slots_before.keys())}"
-        )
-
         # Step 3: Forward KJT2 to evict some KJT1 IDs
         # Insert 25 new IDs — should evict some KJT1 IDs on each rank
         kjt2_ids = torch.LongTensor(list(range(2000, 2025)))  # 25 new IDs
@@ -1773,9 +1684,6 @@ def _test_full_table_eviction_overwrites_runtime_meta(
         for _ in range(2):
             loss, _ = sharded_sparse_arch(kjt2_insert)
             torch.sum(torch.stack([v.sum() for v in loss.values()])).backward()
-
-        logger.info(f"rank {rank}: after KJT2 insertion (eviction)")
-        print_weights(sharded_sparse_arch)
 
         # Step 4: Write runtime_meta for KJT2 IDs
         # Each ID gets fingerprint: ID 2000 -> 200.0, 2001 -> 201.0, ...
@@ -1795,9 +1703,7 @@ def _test_full_table_eviction_overwrites_runtime_meta(
         mc_ctx2 = ManagedCollisionCollectionContext(sharding_contexts=[])
         dist_out2 = mcc.input_dist(mc_ctx2, write_kjt2).wait().wait()
         mcc.compute(mc_ctx2, dist_out2)
-
-        logger.info(f"rank {rank}: after KJT2 runtime_meta write")
-        print_weights(sharded_sparse_arch)
+        mcc.evict()
 
         # Step 5: Verify per-MC-module
         for _table_name, mc_module in mcc._managed_collision_modules.items():
@@ -1833,10 +1739,6 @@ def _test_full_table_eviction_overwrites_runtime_meta(
                         f"got {meta_row}"
                     )
                     survived_count += 1
-                    logger.info(
-                        f"rank {rank}: KJT1 ID {raw_id} survived at slot "
-                        f"{slot_idx}, runtime_meta OK"
-                    )
                 elif raw_id in kjt1_slots_before:
                     evicted_count += 1
                     old_slot, old_expected = kjt1_slots_before[raw_id]
@@ -1851,15 +1753,7 @@ def _test_full_table_eviction_overwrites_runtime_meta(
                         f"Rank {rank}: evicted slot {old_slot} (was KJT1 ID "
                         f"{raw_id}) still has old runtime_meta={old_expected}"
                     )
-                    logger.info(
-                        f"rank {rank}: KJT1 ID {raw_id} evicted from slot "
-                        f"{old_slot}, runtime_meta={meta_row}"
-                    )
 
-            logger.info(
-                f"rank {rank}: KJT1 survived={survived_count}, "
-                f"evicted={evicted_count}"
-            )
             # --- Check KJT2 IDs ---
             mapped_kjt2, _, _ = mc_module.input_mapper(  # pyre-fixme[29]
                 values=kjt2_ids.to(ctx.device),
@@ -1880,9 +1774,6 @@ def _test_full_table_eviction_overwrites_runtime_meta(
                 assert torch.equal(meta_row, expected_tensor), (
                     f"Rank {rank}: KJT2 ID {raw_id} at slot {slot_idx}: "
                     f"expected runtime_meta={expected}, got {meta_row}"
-                )
-                logger.info(
-                    f"rank {rank}: KJT2 ID {raw_id} slot {slot_idx} " f"runtime_meta OK"
                 )
 
             # --- Check unoccupied slots have zero runtime_meta ---
