@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Any, ContextManager, Generic, Iterator, Optional, TYPE_CHECKING
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.train_pipeline.pipeline_context import In, Out
 
 if TYPE_CHECKING:
@@ -143,6 +144,7 @@ class GradientAccumulationWrapper(Generic[In, Out]):
         self._model = model
         self._config = config
         self._optimizer_wrapper = _GAOptimizerWrapper(optimizer, config)
+        self._cached_ddp_modules: list[Any] | None = None
 
         # Only replace optimizer in pipeline when GA is enabled
         # This avoids unintended side effects when GA is disabled
@@ -179,24 +181,102 @@ class GradientAccumulationWrapper(Generic[In, Out]):
 
     def _get_no_sync_context(self) -> ContextManager[None]:
         """
-        Returns the no_sync context manager for the model, or nullcontext if unavailable.
+        Returns a composite ``no_sync`` context manager that suppresses gradient
+        synchronization on **all** ``DistributedDataParallel`` modules in the
+        model tree, not just the outermost one.
+
+        Some sharded submodules — notably ``ShardedVariableLengthEmbeddingArch``
+        — wrap their DATA_PARALLEL lookups in their own internal DDP instances.
+        If ``no_sync()`` is only called on the outer DDP, those inner DDP
+        modules will still all-reduce on every backward pass, breaking gradient
+        accumulation for those parameters.
+
+        This method uses a cached list of DDP modules (computed once on first
+        call) and composes their ``no_sync()`` contexts with
+        ``contextlib.ExitStack`` so that a single ``with ctx:`` block
+        suppresses gradient sync everywhere.
         """
+        return self._compose_no_sync_contexts()
+
+    def _get_ddp_modules(self) -> list[Any]:
+        """
+        Discover and cache all modules that need ``no_sync()``.
+
+        The module tree is static after model construction, so this walk
+        is performed once and the result is reused on every subsequent
+        non-sync step — avoiding an O(num_modules) traversal in the
+        training-loop hot path.
+
+        After unwrapping ``DistributedModelParallel`` (if present), the method
+        uses a two-tier detection strategy:
+
+          1. **Root** (the outer wrapper) is added if it has ``no_sync``,
+             regardless of its concrete type. This broad check covers DDP,
+             FSDP, and any custom parallel wrapper.
+          2. **Descendants** are added only if they are ``isinstance`` of
+             ``DistributedDataParallel``. This strict check prevents
+             accidentally entering ``no_sync`` on non-DDP modules (e.g.
+             nested FSDP) that may have different ``no_sync`` semantics.
+
+        The asymmetry is intentional: the root is *known* to be the
+        top-level parallel wrapper (set by ``DistributedModelParallel``),
+        while descendants are arbitrary submodules that need positive
+        identification.
+        """
+        if self._cached_ddp_modules is not None:
+            return self._cached_ddp_modules
+
+        ddp_modules: list[Any] = []
         model = self._model
 
-        # Check for DMP-wrapped DDP
+        # Unwrap DMP to find the real module tree root.
+        root: torch.nn.Module = model
         if hasattr(model, "_dmp_wrapped_module"):
-            # pyrefly: ignore[missing-attribute]: model may not have _dmp_wrapped_module
-            dmp = model._dmp_wrapped_module
-            if hasattr(dmp, "no_sync"):
-                # pyrefly: ignore[not-callable]
-                return dmp.no_sync()
+            dmp_wrapped = model._dmp_wrapped_module
+            if isinstance(dmp_wrapped, torch.nn.Module):
+                root = dmp_wrapped
+            elif hasattr(dmp_wrapped, "no_sync"):
+                ddp_modules.append(dmp_wrapped)
 
-        # Check for direct DDP
-        if hasattr(model, "no_sync"):
-            # pyrefly: ignore[not-callable]: model is typed as nn.Module; no_sync exists on DDP subclasses
-            return model.no_sync()
+        # Collect the root module if it supports no_sync (broad check:
+        # covers DDP, FSDP, or any custom parallel wrapper).
+        if hasattr(root, "no_sync"):
+            ddp_modules.append(root)
 
-        return contextlib.nullcontext()
+        # Walk descendants for any inner DDP instances (e.g. VLE's
+        # internal DDP for DATA_PARALLEL lookups). Uses a strict
+        # isinstance check — only actual DDP modules are collected,
+        # not FSDP or other modules that happen to have no_sync.
+        # The hasattr guard is needed because root may not be an
+        # nn.Module (e.g. when _dmp_wrapped_module is a non-Module
+        # wrapper object and model itself lacks modules()).
+        if hasattr(root, "modules"):
+            for module in root.modules():
+                if module is not root and isinstance(module, DistributedDataParallel):
+                    ddp_modules.append(module)
+
+        self._cached_ddp_modules = ddp_modules
+        return ddp_modules
+
+    @contextlib.contextmanager
+    # pyre-ignore[3]: Return type must be annotated
+    def _compose_no_sync_contexts(self):
+        """
+        Enter ``no_sync()`` on every cached DDP module via ``ExitStack``.
+
+        Contexts are torn down in the correct order even if an exception
+        occurs.
+        """
+        ddp_modules = self._get_ddp_modules()
+
+        if not ddp_modules:
+            yield
+            return
+
+        with contextlib.ExitStack() as stack:
+            for ddp in ddp_modules:
+                stack.enter_context(ddp.no_sync())
+            yield
 
     def _flush_accumulated_gradients(self, steps_accumulated: int) -> bool:
         """
