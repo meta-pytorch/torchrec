@@ -719,6 +719,7 @@ class RecMetric(nn.Module, abc.ABC):
 
         Iterates over tasks and updates each metric computation independently.
         """
+        original_required_inputs = kwargs.get("required_inputs")
         for task, metric_ in zip(self._tasks, self._metrics_computations):
             if task.name not in predictions:
                 continue
@@ -782,15 +783,16 @@ class RecMetric(nn.Module, abc.ABC):
                     metric_.has_valid_update.logical_or_(has_valid_weights)
                 else:
                     continue
-            if "required_inputs" in kwargs:
-                # Expand scalars to match the shape of the predictions
+            if original_required_inputs is not None:
+                # Reshape from original inputs each iteration to avoid
+                # reading already-reshaped values from a prior task.
                 kwargs["required_inputs"] = {
                     k: (
                         v.view(task_labels.size())
                         if v.numel() > 1
                         else v.expand(task_labels.size())
                     )
-                    for k, v in kwargs["required_inputs"].items()
+                    for k, v in original_required_inputs.items()
                 }
             # pyrefly: ignore[not-callable]
             metric_.update(
