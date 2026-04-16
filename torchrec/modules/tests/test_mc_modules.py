@@ -583,3 +583,188 @@ class TestManagedCollisionCollection(unittest.TestCase):
         torch.testing.assert_close(
             runtime_meta.weights(), kjt.weights(), rtol=0, atol=0
         )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_remap_with_write_weights(self) -> None:
+        device = torch.device("cuda")
+        zch_size = 8
+        total_num_buckets = 2
+        write_dim = 2
+
+        embedding_configs = [
+            EmbeddingConfig(
+                name="t1",
+                embedding_dim=8,
+                num_embeddings=zch_size,
+                feature_names=["f1"],
+            ),
+        ]
+        mc_module = HashZchManagedCollisionModule(
+            zch_size=zch_size,
+            device=device,
+            name="t1",
+            total_num_buckets=total_num_buckets,
+            write_runtime_meta_dim=write_dim,
+        )
+        self.assertIsNotNone(mc_module._hash_zch_runtime_meta)
+        self.assertEqual(mc_module._hash_zch_runtime_meta.shape, (zch_size, write_dim))
+
+        mc_modules_dict = {
+            "t1": cast(
+                ManagedCollisionModule,
+                mc_module,
+            ),
+        }
+        mcc = ManagedCollisionCollection(
+            managed_collision_modules=mc_modules_dict,
+            embedding_configs=embedding_configs,
+        )
+
+        kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f1"],
+            values=torch.tensor([10, 20, 30], dtype=torch.int64, device=device),
+            lengths=torch.tensor([3], dtype=torch.int64, device=device),
+        )
+
+        # Call forward (which calls remap without write_weights)
+        output = mcc(kjt)
+        self.assertIsNotNone(output)
+        self.assertEqual(output.keys(), ["f1"])
+
+        # Insert IDs 40, 50 via forward first so they are in the identity tensor
+        kjt2 = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f1"],
+            values=torch.tensor([40, 50], dtype=torch.int64, device=device),
+            lengths=torch.tensor([2], dtype=torch.int64, device=device),
+        )
+        output2 = mcc(kjt2)
+        self.assertIsNotNone(output2)
+
+        # Now test remap with write_weights on the mc_module
+        jt = JaggedTensor(
+            values=torch.tensor([40, 50], dtype=torch.int64, device=device),
+            lengths=torch.tensor([2], dtype=torch.int64, device=device),
+        )
+        write_weights = torch.tensor(
+            [[100, 200], [300, 400]], dtype=torch.int64, device=device
+        )
+        remapped = mc_module.remap({"t1": jt}, write_weights=write_weights)
+        self.assertIn("t1", remapped)
+
+        # Verify the runtime meta was updated for inserted IDs.
+        # With disable_fallback=False, only IDs that pass the identity
+        # check get their runtime_meta updated.
+        remapped_ids = remapped["t1"].values()
+        looked_up = mc_module.lookup_custom_runtime_meta(remapped_ids)
+        self.assertEqual(looked_up.shape, (2, write_dim))
+
+        # Check each ID: if identity matches, runtime_meta should be updated
+        identities = mc_module._hash_zch_identities.data.flatten()
+        mapped_ids, _, _ = mc_module.input_mapper(
+            values=torch.tensor([40, 50], dtype=torch.int64, device=device),
+            output_offset=mc_module._output_global_offset_tensor,
+        )
+        for i in range(2):
+            slot = remapped_ids[i].item()
+            if identities[slot].item() == mapped_ids[i].item():
+                # ID was inserted — runtime_meta should match
+                torch.testing.assert_close(
+                    looked_up[i],
+                    write_weights[i],
+                    rtol=0,
+                    atol=0,
+                )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_lookup_custom_runtime_meta(self) -> None:
+        """Test ManagedCollisionCollection.lookup_custom_runtime_meta returns
+        correct runtime_meta for remapped IDs across multiple tables."""
+        device = torch.device("cuda")
+        zch_size = 8
+        total_num_buckets = 2
+        write_dim = 2
+
+        embedding_configs = [
+            EmbeddingConfig(
+                name="t1",
+                embedding_dim=8,
+                num_embeddings=zch_size,
+                feature_names=["f1"],
+            ),
+            EmbeddingConfig(
+                name="t2",
+                embedding_dim=8,
+                num_embeddings=zch_size,
+                feature_names=["f2"],
+            ),
+        ]
+        mc1 = HashZchManagedCollisionModule(
+            zch_size=zch_size,
+            device=device,
+            name="t1",
+            total_num_buckets=total_num_buckets,
+            write_runtime_meta_dim=write_dim,
+        )
+        mc2 = HashZchManagedCollisionModule(
+            zch_size=zch_size,
+            device=device,
+            name="t2",
+            total_num_buckets=total_num_buckets,
+            write_runtime_meta_dim=write_dim,
+        )
+        # Manually set runtime_meta with known values
+        mc1._hash_zch_runtime_meta = torch.nn.Parameter(
+            torch.arange(
+                0, zch_size * write_dim, dtype=torch.int64, device=device
+            ).reshape(zch_size, write_dim),
+            requires_grad=False,
+        )
+        mc2._hash_zch_runtime_meta = torch.nn.Parameter(
+            torch.arange(
+                100, 100 + zch_size * write_dim, dtype=torch.int64, device=device
+            ).reshape(zch_size, write_dim),
+            requires_grad=False,
+        )
+
+        mcc = ManagedCollisionCollection(
+            managed_collision_modules={
+                "t1": cast(ManagedCollisionModule, mc1),
+                "t2": cast(ManagedCollisionModule, mc2),
+            },
+            embedding_configs=embedding_configs,
+        )
+
+        # Create remapped KJT with known slot indices
+        remapped_kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f1", "f2"],
+            values=torch.tensor([0, 3, 1, 5], dtype=torch.int64, device=device),
+            lengths=torch.tensor([2, 2], dtype=torch.int64, device=device),
+        )
+
+        result = mcc.lookup_custom_runtime_meta(remapped_kjt)
+
+        # Values are split per table: f1 gets [0, 3], f2 gets [1, 5]
+        # t1 looks up slots [0, 3] -> meta rows [[0,1], [6,7]]
+        # t2 looks up slots [1, 5] -> meta rows [[102,103], [110,111]]
+        expected = torch.cat(
+            [
+                torch.index_select(
+                    mc1._hash_zch_runtime_meta,
+                    0,
+                    torch.tensor([0, 3], dtype=torch.int64, device=device),
+                ),
+                torch.index_select(
+                    mc2._hash_zch_runtime_meta,
+                    0,
+                    torch.tensor([1, 5], dtype=torch.int64, device=device),
+                ),
+            ],
+            dim=0,
+        )
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
