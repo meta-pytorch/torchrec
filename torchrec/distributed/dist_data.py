@@ -10,7 +10,8 @@
 import itertools
 import logging
 import os
-from typing import Callable, Dict, List, Optional
+from collections import defaultdict
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -583,6 +584,324 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
             stride_per_rank=self._stride_per_rank,
             stagger=self._stagger,
         )
+
+
+class FusedKJTAllToAllTensorsAwaitable(Awaitable[List[KeyedJaggedTensor]]):
+    """
+    Fuses KJT data A2A calls across multiple EBC modules.
+
+    Instead of issuing N independent dist.all_to_all_single calls (one per label per
+    EBC), this class groups tensors by label across all EBCs, concatenates them into
+    fused buffers, and issues one fused dist.all_to_all_single per unique label. The
+    results are then split back into per-EBC tensors and reconstructed into KJTs.
+
+    This extends the existing splits fusion (FusedKJTListSplitsAwaitable) to the
+    data phase.
+
+    Args:
+        pg: ProcessGroup for AlltoAll communication.
+        entries: List of (KJTSplitsAllToAllMeta, output_splits, stride_per_rank) tuples,
+            one per EBC/sharding-type awaitable to be fused.
+    """
+
+    def __init__(
+        self,
+        pg: dist.ProcessGroup,
+        # Each entry is (KJTSplitsAllToAllMeta, output_splits, stride_per_rank).
+        # Typed as Any to avoid circular import with embedding_sharding.
+        entries: List[Tuple[Any, List[List[int]], Optional[List[int]]]],
+    ) -> None:
+        super().__init__()
+        self._pg = pg
+        self._workers: int = pg.size()
+        self._device: torch.device = (
+            entries[0][0].device if entries else torch.device("cpu")
+        )
+        self._num_entries: int = len(entries)
+        self._cached_kjts: Optional[List[KeyedJaggedTensor]] = None
+
+        # Store per-entry metadata for reconstruction
+        self._per_entry_meta: List[
+            Tuple[
+                KeyedJaggedTensor,  # input KJT
+                List[int],  # splits
+                List[str],  # labels
+                List[str],  # keys
+                int,  # stagger
+                Dict[str, List[int]],  # input_splits by label
+                Dict[str, List[int]],  # output_splits by label
+                Optional[torch.Tensor],  # recat
+                Optional[List[int]],  # stride_per_rank
+            ]
+        ] = []
+
+        for meta, output_splits, stride_per_rank in entries:
+            if stride_per_rank is not None:
+                _check_int_overflow(
+                    "FusedKJTAllToAllTensorsAwaitable",
+                    stride_per_rank,
+                    "stride_per_rank (BEFORE _get_recat)",
+                    rank=pg.rank(),
+                    world_size=pg.size(),
+                    splits=meta.splits,
+                    local_split=meta.splits[pg.rank()],
+                    keys=meta.keys,
+                )
+
+            input_splits_dict: Dict[str, List[int]] = dict(
+                zip(meta.labels, meta.input_splits)
+            )
+            output_splits_dict: Dict[str, List[int]] = dict(
+                zip(meta.labels, output_splits)
+            )
+            recat = _get_recat(
+                local_split=meta.splits[pg.rank()],
+                num_splits=len(meta.splits),
+                stagger=meta.stagger,
+                device=meta.device,
+                batch_size_per_rank=stride_per_rank,
+            )
+            self._per_entry_meta.append(
+                (
+                    meta._input,
+                    meta.splits,
+                    meta.labels,
+                    meta.keys,
+                    meta.stagger,
+                    input_splits_dict,
+                    output_splits_dict,
+                    recat,
+                    stride_per_rank,
+                )
+            )
+
+        if self._workers == 1:
+            return
+
+        # Group tensors by label across all entries
+        # label -> [(entry_idx, input_tensor, input_split, output_split)]
+        label_groups: Dict[
+            str,
+            List[Tuple[int, torch.Tensor, List[int], List[int]]],
+        ] = defaultdict(list)
+
+        for entry_idx, (meta, output_splits, _stride_per_rank) in enumerate(entries):
+            for label, input_tensor, input_split, output_split in zip(
+                meta.labels,
+                meta.input_tensors,
+                meta.input_splits,
+                output_splits,
+            ):
+                label_groups[label].append(
+                    (entry_idx, input_tensor, input_split, output_split)
+                )
+
+        # For each label, reorder + concat + issue fused A2A
+        world_size = self._workers
+        self._fused_labels: List[str] = list(label_groups.keys())
+        self._fused_output_tensors: List[torch.Tensor] = []
+        self._fused_awaitables: List[dist.Work] = []
+        # Per label: list of (entry_idx, per_rank_output_sizes) for unfusing
+        self._unfuse_meta: List[List[Tuple[int, List[int]]]] = []
+
+        for label in self._fused_labels:
+            group = label_groups[label]
+            n_fused = len(group)
+
+            # Build fused input: interleave per-rank chunks across entries
+            # Input layout: [entry0_rank0, entry1_rank0, ..., entry0_rank1, ...]
+            chunks_per_rank: List[List[torch.Tensor]] = [[] for _ in range(world_size)]
+            fused_input_splits: List[int] = [0] * world_size
+            fused_output_splits: List[int] = [0] * world_size
+            unfuse_info: List[Tuple[int, List[int]]] = []
+
+            for entry_idx, input_tensor, in_split, out_split in group:
+                offset = 0
+                per_rank_out: List[int] = []
+                for rank in range(world_size):
+                    size = in_split[rank]
+                    chunks_per_rank[rank].append(input_tensor[offset : offset + size])
+                    offset += size
+                    fused_input_splits[rank] += size
+                    fused_output_splits[rank] += out_split[rank]
+                    per_rank_out.append(out_split[rank])
+                unfuse_info.append((entry_idx, per_rank_out))
+
+            self._unfuse_meta.append(unfuse_info)
+
+            # Flatten chunks in rank order
+            flat_chunks: List[torch.Tensor] = []
+            for rank in range(world_size):
+                flat_chunks.extend(chunks_per_rank[rank])
+
+            if flat_chunks:
+                fused_input = torch.cat(flat_chunks)
+            else:
+                fused_input = torch.empty(0, device=self._device)
+
+            # Determine output tensor shape
+            sample_tensor = group[0][1]
+            if sample_tensor.dim() == 2:
+                output_size = [sum(fused_output_splits), sample_tensor.size(1)]
+            else:
+                output_size = [sum(fused_output_splits)]
+
+            fused_output = torch.empty(
+                output_size, device=self._device, dtype=sample_tensor.dtype
+            )
+
+            with record_function(f"## all2all_data:kjt_fused {label} n={n_fused} ##"):
+                awaitable = dist.all_to_all_single(
+                    output=fused_output,
+                    input=fused_input,
+                    output_split_sizes=fused_output_splits,
+                    input_split_sizes=fused_input_splits,
+                    group=self._pg,
+                    async_op=True,
+                )
+
+            self._fused_output_tensors.append(fused_output)
+            self._fused_awaitables.append(awaitable)
+
+    def _wait_impl(self) -> List[KeyedJaggedTensor]:
+        if self._workers == 1:
+            kjts: List[KeyedJaggedTensor] = []
+            for (
+                input_kjt,
+                _splits,
+                _labels,
+                _keys,
+                _stagger,
+                _in_splits,
+                _out_splits,
+                _recat,
+                _stride_per_rank,
+            ) in self._per_entry_meta:
+                input_kjt.sync()
+                kjts.append(input_kjt)
+            return kjts
+
+        # Wait on all fused A2A calls
+        for awaitable in self._fused_awaitables:
+            awaitable.wait()
+
+        # Unfuse: split fused outputs back to per-entry tensors
+        # per_entry_tensors[entry_idx][label] = list of per-rank tensor chunks
+        per_entry_tensors: Dict[int, Dict[str, List[torch.Tensor]]] = defaultdict(dict)
+        world_size = self._workers
+
+        for label_idx, label in enumerate(self._fused_labels):
+            fused_output = self._fused_output_tensors[label_idx]
+            unfuse_info = self._unfuse_meta[label_idx]
+            n_entries = len(unfuse_info)
+
+            # Split fused output by rank first
+            fused_output_splits = [
+                sum(info[1][rank] for info in unfuse_info) for rank in range(world_size)
+            ]
+            rank_chunks = torch.split(fused_output, fused_output_splits)
+
+            # Within each rank's chunk, split by entry
+            for rank in range(world_size):
+                rank_chunk = rank_chunks[rank]
+                entry_sizes = [info[1][rank] for info in unfuse_info]
+                if sum(entry_sizes) == 0:
+                    entry_chunks = [rank_chunk[:0] for _ in range(n_entries)]
+                else:
+                    entry_chunks = torch.split(rank_chunk, entry_sizes)
+
+                for i, (entry_idx, _per_rank_out) in enumerate(unfuse_info):
+                    if label not in per_entry_tensors[entry_idx]:
+                        per_entry_tensors[entry_idx][label] = []
+                    per_entry_tensors[entry_idx][label].append(entry_chunks[i])
+
+        # Reconstruct per-entry KJTs
+        # For each entry, concatenate the per-rank pieces for each label,
+        # then call dist_init
+        kjts: List[KeyedJaggedTensor] = []
+        for entry_idx, (
+            input_kjt,
+            _splits,
+            labels,
+            keys,
+            stagger,
+            _in_splits,
+            _out_splits,
+            recat,
+            stride_per_rank,
+        ) in enumerate(self._per_entry_meta):
+            output_tensors: List[torch.Tensor] = []
+            for label in labels:
+                rank_pieces = per_entry_tensors[entry_idx][label]
+                output_tensors.append(torch.cat(rank_pieces))
+
+            kjt = type(input_kjt).dist_init(
+                keys=keys,
+                tensors=output_tensors,
+                variable_stride_per_key=input_kjt.variable_stride_per_key(),
+                num_workers=self._workers,
+                recat=recat,
+                stride_per_rank=stride_per_rank,
+                stagger=stagger,
+            )
+            kjts.append(kjt)
+
+        return kjts
+
+    def get_entry_meta(self, entry_idx: int) -> Tuple[
+        Dict[str, List[int]],  # input_splits
+        Dict[str, List[int]],  # output_splits
+        Optional[torch.Tensor],  # recat
+        Optional[List[int]],  # stride_per_rank
+    ]:
+        """Return per-EBC metadata for the proxy awaitable."""
+        (
+            _input_kjt,
+            _splits,
+            _labels,
+            _keys,
+            _stagger,
+            input_splits,
+            output_splits,
+            recat,
+            stride_per_rank,
+        ) = self._per_entry_meta[entry_idx]
+        return input_splits, output_splits, recat, stride_per_rank
+
+
+class _FusedKJTDataA2AProxyAwaitable(Awaitable[KeyedJaggedTensor]):
+    """
+    Proxy awaitable that references a shared FusedKJTAllToAllTensorsAwaitable.
+
+    Exposes the same per-EBC attributes (_input_splits, _output_splits, _recat,
+    _stride_per_rank) that _set_sharding_context_intra_a2a expects from
+    KJTAllToAllTensorsAwaitable.
+    """
+
+    def __init__(
+        self,
+        fused: FusedKJTAllToAllTensorsAwaitable,
+        entry_idx: int,
+    ) -> None:
+        super().__init__()
+        self._fused = fused
+        self._entry_idx = entry_idx
+
+        # Expose per-EBC attributes for _set_sharding_context_intra_a2a
+        (
+            self._input_splits,
+            self._output_splits,
+            self._recat,
+            self._stride_per_rank,
+        ) = fused.get_entry_meta(entry_idx)
+
+    def _wait_impl(self) -> KeyedJaggedTensor:
+        # All proxies share the same fused awaitable. The first proxy to call
+        # _wait_impl triggers the fused wait; subsequent proxies get cached results.
+        # Use _wait_impl() directly to bypass callbacks and Awaitable.wait() overhead.
+        if self._fused._cached_kjts is None:
+            self._fused._cached_kjts = self._fused._wait_impl()
+        return self._fused._cached_kjts[self._entry_idx]
 
 
 class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):

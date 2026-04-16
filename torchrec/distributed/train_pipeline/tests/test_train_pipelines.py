@@ -2505,3 +2505,79 @@ class TrainPipelineSparseDistCompAutogradTest(TrainPipelineSparseDistTest):
         execute_all_batches: bool,
     ) -> None:
         super().test_equal_to_non_pipelined()
+
+
+class FusedKJTDataA2AIntegrationTest(TrainPipelineSparseDistTestBase):
+    """Integration tests for fused KJT data A2A through the full pipeline."""
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_fused_data_a2a_pipeline_parity(self) -> None:
+        """Verify fused data A2A produces identical results to unfused through
+        the full TrainPipelineSparseDist pipeline."""
+        data = self._generate_data(num_batches=7, batch_size=32)
+        model = self._setup_model()
+
+        sharding_type = ShardingType.TABLE_WISE.value
+        kernel_type = EmbeddingComputeKernel.FUSED.value
+
+        # Baseline: unfused (feature gate OFF)
+        sharded_model_baseline, optim_baseline = (
+            self._generate_sharded_model_and_optimizer(
+                model, sharding_type, kernel_type
+            )
+        )
+
+        # Experiment: fused (feature gate ON)
+        sharded_model_fused, optim_fused = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type
+        )
+        copy_state_dict(
+            sharded_model_baseline.state_dict(),
+            sharded_model_fused.state_dict(),
+        )
+
+        # Baseline pipeline (unfused)
+        pipeline_baseline = self.pipeline_class(
+            model=sharded_model_baseline,
+            optimizer=optim_baseline,
+            device=self.device,
+        )
+
+        # Fused pipeline — mock feature gate ON at the import site in
+        # embedding_sharding where FusedKJTListSplitsAwaitable reads it.
+        # Note: with world_size=1 the fused A2A short-circuits (workers==1),
+        # so this tests that the gating and pipeline integration don't crash.
+        # Value-level parity of the fused reorder logic is covered by the
+        # multi-rank unit tests in test_dist_data.py.
+        with patch(
+            "torchrec.distributed.embedding_sharding.torch._utils_internal.justknobs_check",
+            side_effect=lambda name: name
+            == "pytorch/torchrec:enable_fused_kjt_data_a2a",
+        ):
+            pipeline_fused = self.pipeline_class(
+                model=sharded_model_fused,
+                optimizer=optim_fused,
+                device=self.device,
+            )
+
+        dataloader_baseline = iter(data)
+        dataloader_fused = iter(data)
+
+        for _batch in data[:-2]:
+            pred_baseline = pipeline_baseline.progress(dataloader_baseline)
+            with patch(
+                "torchrec.distributed.embedding_sharding.torch._utils_internal.justknobs_check",
+                side_effect=lambda name: name
+                == "pytorch/torchrec:enable_fused_kjt_data_a2a",
+            ):
+                pred_fused = pipeline_fused.progress(dataloader_fused)
+
+            if pred_baseline is not None and pred_fused is not None:
+                torch.testing.assert_close(
+                    pred_baseline,
+                    pred_fused,
+                    msg="Fused vs unfused pipeline output mismatch",
+                )
