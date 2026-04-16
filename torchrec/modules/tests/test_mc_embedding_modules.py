@@ -22,6 +22,7 @@ from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
 from torchrec.modules.mc_embedding_modules import (
     ManagedCollisionEmbeddingBagCollection,
     ManagedCollisionEmbeddingCollection,
+    return_custom_metadata,
     return_remapped_lengths_as_mask,
 )
 from torchrec.modules.mc_modules import (
@@ -584,3 +585,78 @@ class MCHManagedCollisionEmbeddingBagCollectionTest(unittest.TestCase):
         self.assertTrue(
             torch.equal(remapped_kjt_ec_true.lengths(), remapped_kjt_ec_false.lengths())
         )
+
+    def test_return_custom_metadata(self) -> None:
+        """Test that return_custom_metadata passes through the tensor unchanged."""
+        runtime_meta = torch.tensor([[1, 2], [3, 4]], dtype=torch.int64)
+        result = return_custom_metadata(runtime_meta)
+        self.assertTrue(torch.equal(result, runtime_meta))
+
+    def test_return_custom_metadata_empty(self) -> None:
+        """Test return_custom_metadata with an empty tensor."""
+        runtime_meta = torch.tensor([], dtype=torch.int64)
+        result = return_custom_metadata(runtime_meta)
+        self.assertTrue(torch.equal(result, runtime_meta))
+
+    def test_lookup_remapped_lengths_mask_and_runtime_meta(self) -> None:
+        """Test lookup_remapped_lengths_mask_and_runtime_meta returns correct
+        mask and runtime_meta for a ManagedCollisionEmbeddingCollection with
+        write_runtime_meta_dim > 0."""
+        device = torch.device("cpu")
+        zch_size = 8
+        write_dim = 2
+
+        embedding_configs = [
+            EmbeddingConfig(
+                name="t1",
+                embedding_dim=8,
+                num_embeddings=zch_size,
+                feature_names=["f1"],
+            ),
+        ]
+        ec = EmbeddingCollection(
+            tables=embedding_configs,
+            device=device,
+        )
+        mc_module = HashZchManagedCollisionModule(
+            zch_size=zch_size,
+            device=device,
+            total_num_buckets=2,
+            write_runtime_meta_dim=write_dim,
+        )
+        mcc = ManagedCollisionCollection(
+            managed_collision_modules={
+                "t1": cast(ManagedCollisionModule, mc_module),
+            },
+            embedding_configs=embedding_configs,
+        )
+        mc_ec = ManagedCollisionEmbeddingCollection(
+            ec,
+            mcc,
+            return_remapped_features=True,
+        )
+
+        kjt = KeyedJaggedTensor.from_lengths_sync(
+            keys=["f1"],
+            values=torch.tensor([10, 20, 30], dtype=torch.int64),
+            lengths=torch.tensor([1, 1, 1], dtype=torch.int64),
+        )
+
+        # Set known runtime_meta values
+        mc_module._hash_zch_runtime_meta = torch.nn.Parameter(
+            torch.arange(0, zch_size * write_dim, dtype=torch.int64).reshape(
+                zch_size, write_dim
+            ),
+            requires_grad=False,
+        )
+
+        # Use eval mode — lookup_remapped_lengths_mask_and_runtime_meta
+        # calls remap internally which requires readonly=True (eval mode)
+        mc_ec.eval()
+        mask, runtime_meta = mc_ec.lookup_remapped_lengths_mask_and_runtime_meta(kjt)
+
+        # mask should be boolean tensor from lengths
+        self.assertEqual(mask.dtype, torch.bool)
+        # runtime_meta should be a tensor with write_dim columns
+        self.assertEqual(runtime_meta.dim(), 2)
+        self.assertEqual(runtime_meta.shape[1], write_dim)
