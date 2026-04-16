@@ -849,9 +849,14 @@ def _run_benchmark_core(
     if output_dir and profile_iter_fn and device_type == "cuda":
 
         def _trace_handler(prof: torch.profiler.profile) -> None:
-            # pyrefly: ignore[missing-attribute]
-            total_avg = prof.profiler.total_average()
-            logger.info(f" TOTAL_AVERAGE:\n{name}\n{total_avg}")
+            try:
+                # pyrefly: ignore[missing-attribute]
+                total_avg = prof.profiler.total_average()
+                logger.info(f" TOTAL_AVERAGE:\n{name}\n{total_avg}")
+            except RecursionError:
+                logger.warning(
+                    f"Skipping total_average for {name} due to deep profiler event tree"
+                )
             if not all_rank_traces and rank > 0:
                 # only save trace for rank 0 when all_rank_traces is disabled
                 return
