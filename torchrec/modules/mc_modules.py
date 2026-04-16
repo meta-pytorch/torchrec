@@ -267,7 +267,12 @@ class ManagedCollisionModule(nn.Module):
         pass
 
     @abc.abstractmethod
-    def remap(self, features: Dict[str, JaggedTensor]) -> Dict[str, JaggedTensor]:
+    def remap(
+        self,
+        features: Dict[str, JaggedTensor],
+        mutate_miss_lengths: bool = True,
+        write_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, JaggedTensor]:
         pass
 
     @abc.abstractmethod
@@ -488,6 +493,25 @@ class ManagedCollisionCollection(nn.Module):
             stride_per_key_per_rank=features._stride_per_key_per_rank,
             inverse_indices=features.inverse_indices_or_none(),
         )
+
+    def lookup_custom_runtime_meta(
+        self,
+        remapped_ids: KeyedJaggedTensor,
+    ) -> torch.Tensor:
+        remapped_ids_splits: List[KeyedJaggedTensor] = remapped_ids.split(
+            self._table_feature_splits
+        )
+        runtime_metas: List[torch.Tensor] = []
+        for i, (_table, mc_module) in enumerate(
+            self._managed_collision_modules.items()
+        ):
+            # pyre-ignore[29]: `Union[Module, Tensor]` is not a function.
+            per_table_runtime_meta = mc_module.lookup_custom_runtime_meta(
+                remapped_ids_splits[i].values()
+            )
+            runtime_metas.append(per_table_runtime_meta)
+
+        return torch.cat(runtime_metas, dim=0)
 
 
 class MCHEvictionPolicyMetadataInfo(NamedTuple):
@@ -1384,7 +1408,12 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
 
         return features
 
-    def remap(self, features: Dict[str, JaggedTensor]) -> Dict[str, JaggedTensor]:
+    def remap(
+        self,
+        features: Dict[str, JaggedTensor],
+        mutate_miss_lengths: bool = True,
+        write_weights: Optional[torch.Tensor] = None,
+    ) -> Dict[str, JaggedTensor]:
         return _mch_remap(
             features,
             self._mch_sorted_raw_ids,

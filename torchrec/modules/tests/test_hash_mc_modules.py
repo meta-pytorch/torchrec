@@ -1846,6 +1846,159 @@ class TestMCH(unittest.TestCase):
         self.assertTrue(torch.equal(mask, torch.zeros(20, dtype=torch.bool)))
 
 
+class TestWriteRuntimeMeta(unittest.TestCase):
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_write_runtime_meta_dim_initialization(self) -> None:
+        m = HashZchManagedCollisionModule(
+            zch_size=10,
+            device=torch.device("cuda"),
+            total_num_buckets=2,
+            write_runtime_meta_dim=3,
+        )
+        self.assertIsNotNone(m._hash_zch_runtime_meta)
+        self.assertEqual(m._hash_zch_runtime_meta.shape, (10, 3))
+        self.assertEqual(m._hash_zch_runtime_meta.dtype, torch.int64)
+        self.assertFalse(m._hash_zch_runtime_meta.requires_grad)
+        # All zeros initially
+        torch.testing.assert_close(
+            m._hash_zch_runtime_meta,
+            torch.zeros(10, 3, dtype=torch.int64, device="cuda"),
+            rtol=0,
+            atol=0,
+        )
+
+    def test_write_runtime_meta_dim_zero_no_init(self) -> None:
+        m = HashZchManagedCollisionModule(
+            zch_size=10,
+            device=torch.device("cpu"),
+            total_num_buckets=2,
+            write_runtime_meta_dim=0,
+        )
+        self.assertIsNone(m._hash_zch_runtime_meta)
+
+    def test_write_runtime_meta_dim_conflicts_with_track_id_freq(self) -> None:
+        with self.assertRaises(AssertionError):
+            HashZchManagedCollisionModule(
+                zch_size=10,
+                device=torch.device("cpu"),
+                total_num_buckets=2,
+                write_runtime_meta_dim=3,
+                track_id_freq=True,
+            )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_remap_with_write_weights(self) -> None:
+        m = HashZchManagedCollisionModule(
+            zch_size=10,
+            device=torch.device("cuda"),
+            total_num_buckets=2,
+            write_runtime_meta_dim=2,
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=10,
+            ),
+            max_probe=4,
+        )
+        jt = JaggedTensor(
+            values=torch.tensor([10, 20, 30], dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([3], dtype=torch.int64, device="cuda"),
+        )
+        write_weights = torch.tensor(
+            [[100, 200], [300, 400], [500, 600]], dtype=torch.int64, device="cuda"
+        )
+        output = m.remap({"test": jt}, write_weights=write_weights)
+        self.assertIn("test", output)
+
+        # Verify runtime meta was updated for the inserted IDs
+        remapped_ids = output["test"].values()
+        looked_up = m.lookup_custom_runtime_meta(remapped_ids)
+        self.assertEqual(looked_up.shape, (3, 2))
+        # The looked up values should match the write_weights (viewed as int64)
+        torch.testing.assert_close(
+            looked_up,
+            write_weights.view(torch.int64),
+            rtol=0,
+            atol=0,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_lookup_custom_runtime_meta(self) -> None:
+        m = HashZchManagedCollisionModule(
+            zch_size=8,
+            device=torch.device("cuda"),
+            total_num_buckets=2,
+            write_runtime_meta_dim=1,
+        )
+        # Manually set runtime meta
+        m._hash_zch_runtime_meta = torch.nn.Parameter(
+            torch.arange(0, 8, dtype=torch.int64, device="cuda").unsqueeze(1),
+            requires_grad=False,
+        )
+        indices = torch.tensor([0, 3, 7], dtype=torch.int64, device="cuda")
+        result = m.lookup_custom_runtime_meta(indices)
+        torch.testing.assert_close(
+            result,
+            torch.tensor([[0], [3], [7]], dtype=torch.int64, device="cuda"),
+            rtol=0,
+            atol=0,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_eviction_zeroes_runtime_meta(self) -> None:
+        m = HashZchManagedCollisionModule(
+            zch_size=4,
+            device=torch.device("cuda"),
+            total_num_buckets=2,
+            write_runtime_meta_dim=1,
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(
+                features=[],
+                single_ttl=1,
+            ),
+            max_probe=4,
+        )
+        # Insert IDs with write_weights
+        jt = JaggedTensor(
+            values=torch.tensor([10, 20], dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([2], dtype=torch.int64, device="cuda"),
+        )
+        write_weights = torch.tensor([[99], [88]], dtype=torch.int64, device="cuda")
+        output = m.remap({"test": jt}, write_weights=write_weights)
+        remapped_ids = output["test"].values()
+
+        # Verify runtime meta was set
+        looked_up = m.lookup_custom_runtime_meta(remapped_ids)
+        self.assertTrue(torch.all(looked_up != 0))
+
+        # Insert new IDs to trigger eviction (TTL=1 means old entries expire)
+        jt2 = JaggedTensor(
+            values=torch.tensor([30, 40], dtype=torch.int64, device="cuda"),
+            lengths=torch.tensor([2], dtype=torch.int64, device="cuda"),
+        )
+        write_weights2 = torch.tensor([[77], [66]], dtype=torch.int64, device="cuda")
+        m.remap({"test": jt2}, write_weights=write_weights2)
+
+        # Evicted slots should have their runtime_meta zeroed
+        # Check that at least some slots are zero (eviction happened)
+        all_meta = m._hash_zch_runtime_meta.data
+        # After eviction, any evicted slot should be zeroed
+        has_zeros = torch.any(all_meta == 0)
+        self.assertTrue(has_zeros)
+
+
 @unittest.skipIf(
     torch.cuda.device_count() < 1,
     "Not enough GPUs, this test requires at least one GPU",

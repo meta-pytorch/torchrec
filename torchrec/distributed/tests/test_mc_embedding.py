@@ -1632,6 +1632,7 @@ class ComputeOutputLengthTest(unittest.TestCase):
         """Single-table path (len(splits) == 1): compute should use
         mc_input[table].lengths(), not features.lengths()."""
         smcc = object.__new__(ShardedManagedCollisionCollection)
+        smcc._use_2d_weights = False
         smcc._sharding_tables = [["table_0"]]
         smcc._sharding_per_table_feature_splits = [[2]]
         smcc._sharding_features = [["feature_0", "feature_1"]]
@@ -1647,7 +1648,9 @@ class ComputeOutputLengthTest(unittest.TestCase):
         mc_output_lengths = torch.tensor([1, 2, 2, 2])
 
         def mock_get_lookup_value(
-            table: str, features: KeyedJaggedTensor
+            table: str,
+            features: KeyedJaggedTensor,
+            write_weights: Optional[torch.Tensor] = None,
         ) -> Dict[str, JaggedTensor]:
             return {
                 table: JaggedTensor(
@@ -1674,6 +1677,7 @@ class ComputeOutputLengthTest(unittest.TestCase):
         """Multi-table path (len(splits) > 1): compute should use
         concatenated lengths from mc_module outputs, not features.lengths()."""
         smcc = object.__new__(ShardedManagedCollisionCollection)
+        smcc._use_2d_weights = False
         smcc._sharding_tables = [["table_0", "table_1"]]
         smcc._sharding_per_table_feature_splits = [[1, 1]]
         smcc._sharding_features = [["feature_0", "feature_1"]]
@@ -1689,7 +1693,9 @@ class ComputeOutputLengthTest(unittest.TestCase):
         mc_lengths_table_1 = torch.tensor([2, 2])
 
         def mock_get_lookup_value(
-            table: str, features: KeyedJaggedTensor
+            table: str,
+            features: KeyedJaggedTensor,
+            write_weights: Optional[torch.Tensor] = None,
         ) -> Dict[str, JaggedTensor]:
             if table == "table_0":
                 return {
@@ -1724,6 +1730,7 @@ class ComputeOutputLengthTest(unittest.TestCase):
         """When mc_module preserves lengths (standard MCH behavior),
         output lengths should match input lengths."""
         smcc = object.__new__(ShardedManagedCollisionCollection)
+        smcc._use_2d_weights = False
         smcc._sharding_tables = [["table_0"]]
         smcc._sharding_per_table_feature_splits = [[1]]
         smcc._sharding_features = [["feature_0"]]
@@ -1736,7 +1743,9 @@ class ComputeOutputLengthTest(unittest.TestCase):
         )
 
         def mock_get_lookup_value(
-            table: str, features: KeyedJaggedTensor
+            table: str,
+            features: KeyedJaggedTensor,
+            write_weights: Optional[torch.Tensor] = None,
         ) -> Dict[str, JaggedTensor]:
             return {
                 table: JaggedTensor(

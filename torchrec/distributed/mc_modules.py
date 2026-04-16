@@ -50,6 +50,7 @@ from torchrec.distributed.sharding.rw_sharding import (
     BaseRwEmbeddingSharding,
     InferRwSparseFeaturesDist,
     RwSparseFeaturesDist,
+    RwSparseFeaturesWriteDist,
 )
 from torchrec.distributed.sharding.sequence_sharding import (
     InferSequenceShardingContext,
@@ -241,8 +242,11 @@ class ShardedManagedCollisionCollection(
             module._table_name_to_config
         )
         self._has_uninitialized_input_dists: bool = True
+        self._has_uninitialized_write_input_dists: bool = True
+        self._use_2d_weights: bool = False
         self._free_features_storage_early: bool = False
         self._input_dists: List[nn.Module] = []
+        self._write_input_dists: List[nn.Module] = []
         self._managed_collision_modules = nn.ModuleDict()
         self._create_managed_collision_modules(module)
         self._output_dists: List[nn.Module] = []
@@ -558,6 +562,42 @@ class ShardedManagedCollisionCollection(
                 )
             )
 
+    def _create_write_input_dists(self) -> None:
+        for sharding, sharding_features in zip(
+            self._embedding_shardings,
+            self._sharding_features,
+        ):
+            assert isinstance(sharding, BaseRwEmbeddingSharding)
+            feature_num_buckets: List[int] = [
+                # pyrefly: ignore[not-callable]
+                self._managed_collision_modules[self._feature_to_table[f]].buckets()
+                for f in sharding_features
+            ]
+
+            input_sizes: List[int] = [
+                # pyrefly: ignore[not-callable]
+                self._managed_collision_modules[self._feature_to_table[f]].input_size()
+                for f in sharding_features
+            ]
+
+            feature_hash_sizes: List[int] = []
+            feature_total_num_buckets: List[int] = []
+            for input_size, num_buckets in zip(input_sizes, feature_num_buckets):
+                feature_hash_sizes.append(input_size)
+                feature_total_num_buckets.append(num_buckets)
+
+            write_dist = RwSparseFeaturesWriteDist(
+                # pyrefly: ignore[bad-argument-type]
+                pg=sharding._pg,
+                num_features=sharding._get_num_features(),
+                feature_hash_sizes=feature_hash_sizes,
+                feature_total_num_buckets=feature_total_num_buckets,
+                device=sharding._device,
+                is_sequence=True,
+                keep_original_indices=True,
+            )
+            self._write_input_dists.append(write_dist)
+
     def _create_dedup_indices(self) -> None:
         # validate we can linearize the features irrespective of feature split
         assert (
@@ -625,11 +665,25 @@ class ShardedManagedCollisionCollection(
                 kjt.offsets().to(torch.int64),
                 kjt.values().to(torch.int64),
             )
+            # Gather weights for unique indices if present.
+            # Since unique_indices[reverse_indices[i]] == indices[i],
+            # we can directly assign: dedup_weights[reverse_indices[i]] = weights[i]
+            dedup_weights = None
+            weights = kjt.weights_or_none()
+            if weights is not None and unique_indices.numel() > 0:
+                dedup_weights = torch.empty(
+                    unique_indices.numel(),
+                    *weights.shape[1:],
+                    dtype=weights.dtype,
+                    device=weights.device,
+                )
+                dedup_weights[reverse_indices] = weights
             dedup_features = KeyedJaggedTensor(
                 keys=kjt.keys(),
                 lengths=lengths,
                 offsets=offsets,
                 values=unique_indices,
+                weights=dedup_weights,
             )
 
             ctx.input_features.append(kjt)
@@ -639,6 +693,12 @@ class ShardedManagedCollisionCollection(
         return features_by_sharding
 
     # pyrefly: ignore[bad-override]
+    def _has_2d_weights(self, features: KeyedJaggedTensor) -> bool:
+        """Check if features have 2D weights (e.g., embedding vectors)."""
+        weights = features.weights_or_none()
+        # We can calculate it only once for all features.
+        return weights is not None and weights.dim() == 2
+
     def input_dist(
         self,
         ctx: ManagedCollisionCollectionContext,
@@ -648,6 +708,14 @@ class ShardedManagedCollisionCollection(
         if self._has_uninitialized_input_dists:
             self._create_input_dists(input_feature_names=features.keys())
             self._has_uninitialized_input_dists = False
+
+        # Detect 2D weights (e.g., embedding vectors for write path).
+        # Use RwSparseFeaturesWriteDist which supports 2D weight bucketization
+        # via block_bucketize_sparse_features_2d_weights + KJEAllToAll.
+        self._use_2d_weights = self._has_2d_weights(features)
+        if self._use_2d_weights and self._has_uninitialized_write_input_dists:
+            self._create_write_input_dists()
+            self._has_uninitialized_write_input_dists = False
 
         # TODO: Refactor mc_modules to make it generic with mc_embeddingbag/mc_embedding
         with torch.no_grad():
@@ -683,6 +751,7 @@ class ShardedManagedCollisionCollection(
                             table: JaggedTensor(
                                 values=kjt.values(),
                                 lengths=kjt.lengths(),
+                                weights=kjt.weights_or_none(),
                             )
                         }
                         # pyrefly: ignore[not-callable]
@@ -694,6 +763,11 @@ class ShardedManagedCollisionCollection(
                         keys=self._sharding_features[i],
                         values=torch.cat([jt.values() for jt in output.values()]),
                         lengths=torch.cat([jt.lengths() for jt in output.values()]),
+                        weights=(
+                            torch.cat([jt.weights() for jt in output.values()])
+                            if self._use_2d_weights
+                            else None
+                        ),
                         stride_per_key_per_rank=stride_per_key_per_rank_list or None,
                     )
                     feature_splits.append(shard_kjt)
@@ -703,14 +777,22 @@ class ShardedManagedCollisionCollection(
             if self._use_index_dedup:
                 feature_splits = self._dedup_indices(ctx, feature_splits)
 
+            # Select dist modules: use write dists for 2D weights, standard dists otherwise
+            dists = (
+                self._write_input_dists if self._use_2d_weights else self._input_dists
+            )
+
             awaitables = []
-            for feature_split, input_dist in zip(feature_splits, self._input_dists):
+            for feature_split, input_dist in zip(feature_splits, dists):
                 awaitables.append(input_dist(feature_split))
                 ctx.sharding_contexts.append(
                     SequenceShardingContext(
                         unbucketize_permute_tensor=(
                             input_dist.unbucketize_permute_tensor
-                            if isinstance(input_dist, RwSparseFeaturesDist)
+                            if isinstance(
+                                input_dist,
+                                (RwSparseFeaturesDist, RwSparseFeaturesWriteDist),
+                            )
                             else None
                         ),
                         # For VBE-Support for EBC
@@ -783,7 +865,10 @@ class ShardedManagedCollisionCollection(
         )
 
     def get_lookup_value(
-        self, table: str, features: KeyedJaggedTensor
+        self,
+        table: str,
+        features: KeyedJaggedTensor,
+        write_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, JaggedTensor]:
 
         mcm = self._managed_collision_modules[table]
@@ -803,7 +888,7 @@ class ShardedManagedCollisionCollection(
             # pyrefly: ignore[not-callable]
             mc_input = mcm.profile(mc_input)
             # pyrefly: ignore[not-callable]
-            mc_input = mcm.remap(mc_input)
+            mc_input = mcm.remap(mc_input, write_weights=write_weights)
             # This is for the purpose of remap the global index back to local index since the offset is key by table
             mc_input_unify = {
                 table: JaggedTensor(
@@ -825,7 +910,7 @@ class ShardedManagedCollisionCollection(
             # pyrefly: ignore[not-callable]
             mc_input = mcm.profile(mc_input)
             # pyrefly: ignore[not-callable]
-            mc_input = mcm.remap(mc_input)
+            mc_input = mcm.remap(mc_input, write_weights=write_weights)
             mc_input = self.global_to_local_index(mc_input)
         self._retrieve_and_track_hash_zch_identities_and_metadata(
             mcm, mc_input, mc_input[table].values()
@@ -856,19 +941,34 @@ class ShardedManagedCollisionCollection(
 
             values: torch.Tensor
             lengths: torch.Tensor
+            weights_2d = features.weights_or_none()
             if len(splits) > 1:
                 # features per shard split by tables
                 feature_splits = features.split(splits)
                 output: Dict[str, JaggedTensor] = {}
+                weight_offset = 0
                 for table, kjt in zip(tables, feature_splits):
-                    mc_input = self.get_lookup_value(table, kjt)
+                    table_write_weights = None
+                    if self._use_2d_weights:
+                        n = kjt.values().numel()
+                        table_write_weights = weights_2d[
+                            weight_offset : weight_offset + n
+                        ]
+                        weight_offset += n
+                    mc_input = self.get_lookup_value(
+                        table, kjt, write_weights=table_write_weights
+                    )
                     output.update(mc_input)
 
                 values = torch.cat([jt.values() for jt in output.values()])
                 lengths = torch.cat([jt.lengths() for jt in output.values()])
             else:
                 table: str = tables[0]
-                mc_input = self.get_lookup_value(table, features)
+                mc_input = self.get_lookup_value(
+                    table,
+                    features,
+                    write_weights=weights_2d if self._use_2d_weights else None,
+                )
                 values = mc_input[table].values()
                 lengths = mc_input[table].lengths()
             remapped_kjts.append(
@@ -876,8 +976,10 @@ class ShardedManagedCollisionCollection(
                     keys=fns,
                     values=values,
                     lengths=lengths,
-                    # original weights instead of features splits
-                    weights=features.weights_or_none(),
+                    # original weights instead of features splits. Exclude 2d weights as they are not used in EC lookup.
+                    weights=(
+                        features.weights_or_none() if not self._use_2d_weights else None
+                    ),
                     stride_per_key_per_rank=features._stride_per_key_per_rank,
                 )
             )
@@ -1423,6 +1525,7 @@ class ShardedQuantManagedCollisionCollection(
                             table: JaggedTensor(
                                 values=kjt.values(),
                                 lengths=kjt.lengths(),
+                                weights=kjt.weights_or_none(),
                             )
                         }
                         # pyrefly: ignore[not-callable]
