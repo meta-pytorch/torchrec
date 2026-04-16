@@ -2934,8 +2934,10 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
                 self._enable_activation_stashing
                 and not torch.fx._symbolic_trace.is_fx_symbolic_tracing()
             ):
-                await_restore, restore = MemoryStashingManager._stash_tensors(
-                    [ec_result[e]._values for e in self._ec_features]
+                await_restore, restore, _execute_stash = (
+                    MemoryStashingManager._stash_tensors(
+                        [ec_result[e]._values for e in self._ec_features]
+                    )
                 )
                 ec_embeddings.register_hook(await_restore)
                 cat_emb = torch.cat([ebc_embeddings, ec_embeddings], dim=1)
