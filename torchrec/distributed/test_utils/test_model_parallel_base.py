@@ -388,6 +388,7 @@ class ModelParallelSingleRankBase(unittest.TestCase):
                 local_world_size=trec_dist.comm.get_local_size(env.world_size),
                 world_size=env.world_size,
                 compute_device=self.device.type,
+                ssd_cap=2 * 1024**4,
             ),
             constraints=constraints,
         )
