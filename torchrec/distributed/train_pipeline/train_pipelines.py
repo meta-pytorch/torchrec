@@ -37,7 +37,7 @@ from torchrec.distributed.embedding import EmbeddingCollectionAwaitable  # noqa:
 from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionAwaitable,  # noqa: F401
 )
-from torchrec.distributed.logger import one_time_rank0_logger
+from torchrec.distributed.logger import LazyStr, one_time_logger, one_time_rank0_logger
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.backward_injection import (
@@ -67,6 +67,7 @@ from torchrec.distributed.train_pipeline.runtime_forwards import (
 from torchrec.distributed.train_pipeline.tracing import PipelinedPostproc
 from torchrec.distributed.train_pipeline.types import PipelineState
 from torchrec.distributed.train_pipeline.utils import (
+    _batch_tensor_size,
     _override_input_dist_forwards,
     _pipeline_detach_model,
     _rewrite_model,
@@ -238,6 +239,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         )
         self._batch_count = 0
         self._enable_inplace_copy_batch = enable_inplace_copy_batch
+        self._inplace_copy_batch_size_logged = False
         logger.info(
             f"train_pipeline uses enable_inplace_copy_batch: {enable_inplace_copy_batch}"
         )
@@ -295,6 +297,13 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
 
     def _copy_batch_to_gpu(self, cur_batch: In) -> None:
         if self._enable_inplace_copy_batch:
+            if not self._inplace_copy_batch_size_logged:
+                self._inplace_copy_batch_size_logged = True
+                size = _batch_tensor_size(cur_batch)
+
+                one_time_logger.info(
+                    LazyStr(lambda: f"inplace_copy_batch size {size / 1024**3:.2f} GB")
+                )
             with record_function("## inplace_copy_batch_to_gpu ##"):
                 self._cur_batch = _to_device(
                     cur_batch,
@@ -538,6 +547,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._enable_inplace_copy_batch = enable_inplace_copy_batch
         self._free_features_storage_early = free_features_storage_early
         self._batch_count = 0
+        self._inplace_copy_batch_size_logged = False
 
         logger.info(
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
@@ -1012,6 +1022,15 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         with record_function(f"## inplace_copy_batch_to_gpu {context.index} ##"):
             batch = self._next_batch(dataloader_iter)
             if batch is not None:
+                if not self._inplace_copy_batch_size_logged:
+                    self._inplace_copy_batch_size_logged = True
+                    size = _batch_tensor_size(batch)
+
+                    one_time_logger.info(
+                        LazyStr(
+                            lambda: f"inplace_copy_batch size {size / 1024**3:.2f} GB"
+                        )
+                    )
                 batch = _to_device(
                     batch,
                     self._device,

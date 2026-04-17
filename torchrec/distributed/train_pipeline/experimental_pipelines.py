@@ -25,7 +25,7 @@ from typing import (
 
 import torch
 from torch.autograd.profiler import record_function
-from torchrec.distributed.logger import one_time_rank0_logger
+from torchrec.distributed.logger import LazyStr, one_time_logger, one_time_rank0_logger
 from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.train_pipeline.backward_injection import (
@@ -47,6 +47,7 @@ from torchrec.distributed.train_pipeline.runtime_forwards import (
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
 from torchrec.distributed.train_pipeline.types import PipelineState
 from torchrec.distributed.train_pipeline.utils import (
+    _batch_tensor_size,
     _override_input_dist_forwards,
     _rewrite_model,
     _start_data_dist,
@@ -754,6 +755,15 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
         with record_function(f"## inplace_copy_batch_to_gpu {context.index} ##"):
             batch = self._next_batch(dataloader_iter)
             if batch is not None:
+                if not self._inplace_copy_batch_size_logged:
+                    self._inplace_copy_batch_size_logged = True
+                    size = _batch_tensor_size(batch)
+
+                    one_time_logger.info(
+                        LazyStr(
+                            lambda: f"inplace_copy_batch size {size / 1024**3:.2f} GB"
+                        )
+                    )
                 future_batch = self._copy_executor.submit(
                     _to_device,
                     batch,
