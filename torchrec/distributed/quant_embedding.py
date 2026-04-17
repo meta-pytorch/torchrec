@@ -1115,14 +1115,12 @@ class QuantEmbeddingCollectionSharder(
 
 
 class ShardedQuantEcInputDist(torch.nn.Module):
-    _features_order_tensor: torch.Tensor
-
     """
     This module implements distributed inputs of a ShardedQuantEmbeddingCollection.
 
     Args:
         input_feature_names (List[str]): EmbeddingCollection feature names.
-        sharding_type_to_sharding (Dict[
+        sharding_type_device_group_to_sharding (Dict[
             str,
             EmbeddingSharding[
                 InferSequenceShardingContext,
@@ -1137,7 +1135,7 @@ class ShardedQuantEcInputDist(torch.nn.Module):
     Example::
 
         sqec_input_dist = ShardedQuantEcInputDist(
-            sharding_type_to_sharding={
+            sharding_type_device_group_to_sharding={
                 ShardingType.TABLE_WISE: InferTwSequenceEmbeddingSharding(
                     [],
                     ShardingEnv(
@@ -1159,6 +1157,8 @@ class ShardedQuantEcInputDist(torch.nn.Module):
 
         sqec_input_dist(features)
     """
+
+    _features_order_tensor: torch.Tensor
 
     def __init__(
         self,

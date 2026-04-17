@@ -404,3 +404,48 @@ class RecMetricTensorSizeLoggingTest(unittest.TestCase):
         self.assertIn("predictions_numel", metadata)
         self.assertIn("labels_numel", metadata)
         self.assertNotIn("weights_numel", metadata)
+
+    def test_unfused_required_inputs_not_mutated_across_tasks(self) -> None:
+        """Verify that scalar required_inputs are reshaped from originals on each
+        task iteration, not from already-reshaped values of a prior iteration.
+
+        Uses different batch sizes per task (4 vs 6) so that task_labels.size()
+        differs across iterations. Without the fix, expand(1, 4) on iteration 1
+        produces a tensor with numel=4; on iteration 2, numel > 1 routes to
+        view(1, 6) which fails because 4 elements cannot be viewed as (1, 6).
+        """
+        task_names = ["t1", "t2"]
+        tasks = gen_test_tasks(task_names)
+        ne = NEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=4,
+            tasks=tasks,
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=0,
+        )
+        # Different batch sizes per task to trigger the bug.
+        predictions = {
+            "t1": torch.rand(4, dtype=torch.double),
+            "t2": torch.rand(6, dtype=torch.double),
+        }
+        labels = {
+            "t1": torch.rand(4, dtype=torch.double),
+            "t2": torch.rand(6, dtype=torch.double),
+        }
+        weights = {
+            "t1": torch.ones(4, dtype=torch.double),
+            "t2": torch.ones(6, dtype=torch.double),
+        }
+        # Scalar required_input: numel=1, triggers expand() path.
+        required_inputs = {"scale": torch.tensor([5.0])}
+
+        # Should not raise — without the fix, iteration 2 would crash with
+        # RuntimeError because view(1, 6) cannot reshape 4 elements.
+        ne.update(
+            predictions=predictions,
+            labels=labels,
+            weights=weights,
+            required_inputs=required_inputs,
+        )

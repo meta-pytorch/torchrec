@@ -742,3 +742,262 @@ class FullTrainingLoopTest(unittest.TestCase):
         grad_after_second = model.weight.grad.clone()
 
         self.assertFalse(torch.equal(grad_after_first, grad_after_second))
+
+
+class _MockDDPModule(torch.nn.Module):
+    """Mock module that simulates DistributedDataParallel with no_sync support.
+
+    Tracks how many times no_sync is entered/exited so tests can verify that
+    GradientAccumulationWrapper discovers and suppresses gradient sync on
+    nested DDP instances (not just the outermost one).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.no_sync_entered: int = 0
+        self.no_sync_exited: int = 0
+        self._param = torch.nn.Parameter(torch.zeros(1))
+
+    @contextlib.contextmanager
+    def no_sync(self) -> Iterator[None]:
+        self.no_sync_entered += 1
+        try:
+            yield
+        finally:
+            self.no_sync_exited += 1
+
+
+class _ModelWithNestedDDP(torch.nn.Module):
+    """Model that contains an inner DDP-like module, mimicking the VLE pattern.
+
+    ShardedVariableLengthEmbeddingArch wraps its DATA_PARALLEL lookups in
+    their own DistributedDataParallel instances.  This mock replicates that
+    structure so we can verify that GradientAccumulationWrapper propagates
+    no_sync to those inner DDP modules.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dense_layer = torch.nn.Linear(10, 5)
+        # Simulates VLE's internal DDP wrapper for DP lookup tables
+        self.inner_ddp = _MockDDPModule()
+
+
+class NestedDDPNoSyncTest(unittest.TestCase):
+    """Tests that _get_no_sync_context propagates to nested DDP modules.
+
+    Regression test for the VLE (Variable Length Embedding) gradient
+    accumulation bug: ShardedVariableLengthEmbeddingArch creates its own
+    internal DDP for DATA_PARALLEL lookups. The original implementation
+    only called no_sync() on the outer DDP, so those inner DDP modules
+    would all-reduce on every backward pass — even intermediate GA
+    micro-batches that should only accumulate locally.
+    """
+
+    def setUp(self) -> None:
+        self._patcher = patch(
+            "torchrec.distributed.train_pipeline.gradient_accumulation.DistributedDataParallel",
+            _MockDDPModule,
+        )
+        self._patcher.start()
+
+    def tearDown(self) -> None:
+        self._patcher.stop()
+
+    def _make_wrapper_with_nested_ddp(
+        self,
+        num_steps: int = 4,
+        num_warmup_steps: int = 1,
+        num_batches: int = 100,
+    ) -> tuple[
+        _ModelWithNestedDDP,
+        _MockDDPModule,
+        GradientAccumulationWrapper[Any, Any],
+    ]:
+        """Create a GradientAccumulationWrapper around a model with nested DDP.
+
+        The model itself does NOT have no_sync (it's not wrapped in an
+        outer DDP), but it contains an inner DDP child module. This is the
+        exact pattern that VLE creates.
+        """
+        model = _ModelWithNestedDDP()
+        inner_ddp = model.inner_ddp
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = _MockPipeline(num_batches=num_batches)
+        config = GradientAccumulationConfig(
+            is_enabled=True,
+            num_steps=num_steps,
+            num_warmup_steps=num_warmup_steps,
+        )
+        wrapper = GradientAccumulationWrapper(pipeline, optimizer, model, config)
+        return model, inner_ddp, wrapper
+
+    def test_inner_ddp_discovered_by_no_sync_context(self) -> None:
+        """_get_no_sync_context enters no_sync on the inner DDP module."""
+        _, inner_ddp, wrapper = self._make_wrapper_with_nested_ddp()
+        wrapper.set_step(1)  # non-boundary, non-warmup → should use no_sync
+        self.assertFalse(wrapper._should_sync_grad())
+
+        with wrapper._get_no_sync_context():
+            self.assertEqual(inner_ddp.no_sync_entered, 1)
+        self.assertEqual(inner_ddp.no_sync_exited, 1)
+
+    def test_dmp_wrapped_non_module_with_no_sync(self) -> None:
+        """When _dmp_wrapped_module is NOT an nn.Module but has no_sync,
+        its no_sync context is entered."""
+
+        class _NonModuleWrapper:
+            def __init__(self) -> None:
+                self.no_sync_entered: int = 0
+                self.no_sync_exited: int = 0
+
+            @contextlib.contextmanager
+            def no_sync(self) -> Iterator[None]:
+                self.no_sync_entered += 1
+                try:
+                    yield
+                finally:
+                    self.no_sync_exited += 1
+
+        non_module_wrapper = _NonModuleWrapper()
+        model = torch.nn.Linear(10, 5)
+        model._dmp_wrapped_module = non_module_wrapper  # type: ignore[assignment]
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = _MockPipeline(num_batches=100)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        wrapper = GradientAccumulationWrapper(pipeline, optimizer, model, config)
+
+        wrapper.set_step(1)
+        with wrapper._get_no_sync_context():
+            self.assertEqual(non_module_wrapper.no_sync_entered, 1)
+        self.assertEqual(non_module_wrapper.no_sync_exited, 1)
+
+    def test_multiple_sibling_ddp_modules(self) -> None:
+        """Multiple sibling DDP modules at the same level all get no_sync."""
+        model = torch.nn.Module()
+        model._param = torch.nn.Parameter(torch.zeros(1))
+        inner_ddp_1 = _MockDDPModule()
+        inner_ddp_2 = _MockDDPModule()
+        model.add_module("inner_ddp_1", inner_ddp_1)
+        model.add_module("inner_ddp_2", inner_ddp_2)
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = _MockPipeline(num_batches=100)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        wrapper = GradientAccumulationWrapper(pipeline, optimizer, model, config)
+
+        wrapper.set_step(1)
+        with wrapper._get_no_sync_context():
+            self.assertEqual(inner_ddp_1.no_sync_entered, 1)
+            self.assertEqual(inner_ddp_2.no_sync_entered, 1)
+        self.assertEqual(inner_ddp_1.no_sync_exited, 1)
+        self.assertEqual(inner_ddp_2.no_sync_exited, 1)
+
+    def test_deeply_nested_ddp_modules(self) -> None:
+        """DDP modules nested multiple levels deep are discovered."""
+        model = torch.nn.Module()
+        model._param = torch.nn.Parameter(torch.zeros(1))
+        middle_layer = torch.nn.Module()
+        deep_ddp = _MockDDPModule()
+        middle_layer.add_module("deep_ddp", deep_ddp)
+        model.add_module("middle_layer", middle_layer)
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = _MockPipeline(num_batches=100)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        wrapper = GradientAccumulationWrapper(pipeline, optimizer, model, config)
+
+        wrapper.set_step(1)
+        with wrapper._get_no_sync_context():
+            self.assertEqual(deep_ddp.no_sync_entered, 1)
+        self.assertEqual(deep_ddp.no_sync_exited, 1)
+
+    def test_inner_ddp_no_sync_used_on_non_boundary_steps(self) -> None:
+        """Inner DDP gets no_sync on non-boundary, post-warmup steps."""
+        _, inner_ddp, wrapper = self._make_wrapper_with_nested_ddp(
+            num_steps=4, num_warmup_steps=1, num_batches=8
+        )
+
+        dummy_iter: Iterator[Any] = iter([])
+        for _ in range(8):
+            wrapper.progress(dummy_iter)
+
+        # Steps: 0=sync(first), 1=no_sync, 2=no_sync, 3=sync(boundary),
+        #         4=no_sync, 5=no_sync, 6=no_sync, 7=sync(boundary)
+        self.assertEqual(inner_ddp.no_sync_entered, 5)
+        self.assertEqual(inner_ddp.no_sync_exited, 5)
+
+    def test_inner_ddp_no_sync_not_used_during_warmup(self) -> None:
+        """Inner DDP no_sync should NOT be entered during warmup."""
+        _, inner_ddp, wrapper = self._make_wrapper_with_nested_ddp(
+            num_steps=4, num_warmup_steps=4, num_batches=4
+        )
+
+        dummy_iter: Iterator[Any] = iter([])
+        for _ in range(4):
+            wrapper.progress(dummy_iter)
+
+        self.assertEqual(inner_ddp.no_sync_entered, 0)
+
+    def test_both_outer_and_inner_ddp_get_no_sync(self) -> None:
+        """When model has BOTH outer DDP (via _dmp_wrapped_module) and inner
+        DDP, both should get no_sync."""
+        model = _ModelWithNestedDDP()
+        inner_ddp = model.inner_ddp
+
+        # Wrap the model in a mock DMP that has an outer DDP
+        outer_ddp = _MockDDPModule()
+        outer_ddp.add_module("inner_model", model)
+
+        dmp_model = torch.nn.Module()
+        dmp_model._dmp_wrapped_module = outer_ddp  # type: ignore[assignment]
+
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = _MockPipeline(num_batches=100)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        wrapper = GradientAccumulationWrapper(pipeline, optimizer, dmp_model, config)
+
+        wrapper.set_step(1)  # non-boundary, non-warmup
+        with wrapper._get_no_sync_context():
+            self.assertEqual(outer_ddp.no_sync_entered, 1)
+            self.assertEqual(inner_ddp.no_sync_entered, 1)
+
+        self.assertEqual(outer_ddp.no_sync_exited, 1)
+        self.assertEqual(inner_ddp.no_sync_exited, 1)
+
+    def test_no_ddp_modules_yields_without_error(self) -> None:
+        """Model with no DDP modules at all should yield without error."""
+        model = torch.nn.Linear(10, 5)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=True)
+        pipeline = _MockPipeline(num_batches=100)
+        config = GradientAccumulationConfig(
+            is_enabled=True, num_steps=4, num_warmup_steps=1
+        )
+        wrapper = GradientAccumulationWrapper(pipeline, optimizer, model, config)
+
+        wrapper.set_step(1)
+        entered = False
+        with wrapper._get_no_sync_context():
+            entered = True
+        self.assertTrue(entered, "no_sync context should yield successfully")
+
+    def test_inner_ddp_no_sync_exited_on_exception(self) -> None:
+        """Inner DDP no_sync is properly exited even if body raises."""
+        _, inner_ddp, wrapper = self._make_wrapper_with_nested_ddp()
+        wrapper.set_step(1)
+
+        with self.assertRaises(RuntimeError):
+            with wrapper._get_no_sync_context():
+                self.assertEqual(inner_ddp.no_sync_entered, 1)
+                raise RuntimeError("test error")
+
+        self.assertEqual(inner_ddp.no_sync_exited, 1)

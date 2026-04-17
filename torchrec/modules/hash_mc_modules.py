@@ -80,9 +80,6 @@ def _compute_lengths_from_hits(
 
 
 class TrainInputMapper(torch.nn.Module):
-    _zch_size_per_training_rank: torch.Tensor
-    _train_rank_offsets: torch.Tensor
-
     """
     Module used to generate sizes and offsets information corresponding to
     the train ranks for inference inputs. This is due to we currently merge
@@ -103,6 +100,9 @@ class TrainInputMapper(torch.nn.Module):
         mapper = TrainInputMapper(...)
         mapper(values, output_offset)
     """
+
+    _zch_size_per_training_rank: torch.Tensor
+    _train_rank_offsets: torch.Tensor
 
     def __init__(
         self,
@@ -252,6 +252,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         read_only_suffix: str = "_readonly",
         enable_per_feature_lookups: bool = False,
         no_bag: bool = False,
+        write_runtime_meta_dim: int = 0,
     ) -> None:
         if output_segments is None:
             assert (
@@ -302,6 +303,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             else None
         )
         self._opt_in_prob: int = opt_in_prob
+        self._write_runtime_meta_dim: int = write_runtime_meta_dim
         assert (
             percent_reserved_slots >= 0 and percent_reserved_slots < 100
         ), "percent_reserved_slots must be in [0, 100)"
@@ -312,7 +314,9 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             ), "percent_reserved_slots must be positive when opt_in_prob is positive"
         self._disable_fallback: bool = disable_fallback
         self._track_id_freq: bool = track_id_freq
-
+        assert not (
+            self._track_id_freq and self._write_runtime_meta_dim > 0
+        ), f"_hash_zch_runtime_meta is used for either tracking id frequency or saving custom metadata, but not both. Got {self._track_id_freq=} and {self._write_runtime_meta_dim=}."
         if torch.jit.is_scripting() or self._is_inference or self._name is None:
             self._tb_logging_frequency = 0
 
@@ -342,6 +346,17 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 requires_grad=False,
             )
 
+        if self._write_runtime_meta_dim > 0:
+            # Used to save custom metadata for each ID. For example, we can save the another paired ID of each ID in this tensor. If self._write_runtime_meta_dim is 2, it means we save two additional features for a given ID in idenitiy tensor.
+            # Only support int64 dtype for now, but we can extend to float features by torch.view().
+            self._hash_zch_runtime_meta = torch.nn.Parameter(
+                torch.zeros(
+                    (self._zch_size, self._write_runtime_meta_dim),
+                    dtype=torch.int64,
+                    device=self._device,
+                ),
+                requires_grad=False,
+            )
         self._max_probe = max_probe
         self._buckets = total_num_buckets
         self.register_buffer(
@@ -389,7 +404,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{inference_dispatch_div_train_world_size=}, "
             f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, "
             f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
-            f"{self._no_bag=}"
+            f"{self._no_bag=}, {self._write_runtime_meta_dim=}"
         )
 
     def _create_zch_buffer(
@@ -600,6 +615,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self,
         features: Dict[str, JaggedTensor],
         mutate_miss_lengths: bool = True,
+        write_weights: Optional[torch.Tensor] = None,
     ) -> Dict[str, JaggedTensor]:
         readonly: bool = False
         if self._output_global_offset_tensor is not None:
@@ -682,8 +698,29 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     opt_in_prob=self._opt_in_prob,
                     num_reserved_slots=num_reserved_slots,
                     opt_in_rands=opt_in_rands,
-                    runtime_meta=self._hash_zch_runtime_meta,
+                    # When we use _hash_zch_runtime_meta to save custom metadata, don't pass _hash_zch_runtime_meta to the kernel.
+                    # runtime_meta is managed externally via update_runtime_meta()
+                    # and should not be incremented by the kernel.
+                    runtime_meta=(
+                        None
+                        if self._write_runtime_meta_dim > 0
+                        else self._hash_zch_runtime_meta
+                    ),
                 )
+                # Zero out runtime_meta at evicted slots so it follows
+                # the same eviction behavior as the identity tensor.
+                if (
+                    self._write_runtime_meta_dim > 0
+                    and self._hash_zch_runtime_meta is not None
+                    and evictions is not None
+                    and evictions.numel() > 0
+                ):
+                    self._hash_zch_runtime_meta.data[evictions] = 0
+                # Update runtime_meta with write weights after remap.
+                # remapped_ids are local here (before global offset is added).
+                # Only works without enabling per feature look-up.
+                if write_weights is not None:
+                    self.update_runtime_meta(values, remapped_ids, write_weights)
                 lengths: torch.Tensor = feature.lengths()
                 offsets: Optional[torch.Tensor] = feature.offsets()
                 hit_indices: torch.Tensor = remapped_ids != -1
@@ -801,6 +838,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             read_only_suffix=self._read_only_suffix,
             enable_per_feature_lookups=self._enable_per_feature_lookups,
             no_bag=self._no_bag,
+            write_runtime_meta_dim=self._write_runtime_meta_dim,
         )
 
     def lookup_runtime_meta(
@@ -817,6 +855,67 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             # force the counter to be 0 for the ids not found in emb table.
             metadata[not_hit_indices_mask] = 0
             return metadata.reshape(-1)
+
+    def lookup_custom_runtime_meta(
+        self,
+        remapped_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        assert self._hash_zch_runtime_meta is not None
+        return torch.index_select(self._hash_zch_runtime_meta, 0, remapped_ids)
+
+    def update_runtime_meta(
+        self,
+        raw_ids: torch.Tensor,
+        remapped_ids: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> None:
+        """
+        Update _hash_zch_runtime_meta at the remapped slot indices with the
+        provided weights, but only for IDs that were actually inserted into
+        the identity tensor.
+
+        With disable_fallback=False, the kernel always returns a valid slot
+        index, but the ID may not have been inserted (collision fallback).
+        This method verifies insertion by checking that the identity tensor
+        at the remapped slot matches the input ID (after input_mapper
+        transformation). Only matching slots are updated.
+
+        Eviction consistency: _hash_zch_runtime_meta is NOT passed to the
+        FBGEMM zero_collision_hash kernel (to prevent the kernel from
+        incrementing it as a frequency counter). Instead, eviction is handled
+        explicitly in remap(): when the kernel evicts a slot, we zero out
+        _hash_zch_runtime_meta at that slot. This ensures identity tensor
+        and runtime_meta follow the same eviction behavior.
+
+        Args:
+            raw_ids: 1D tensor of input IDs (post input_mapper).
+            remapped_ids: 1D tensor of remapped slot indices. Shape [N].
+            weights: tensor of per-ID metadata. Shape [N] or [N, D].
+                If 1D, reshaped to [N, 1].
+        """
+        if weights.dim() == 1:
+            weights = weights.unsqueeze(1)
+
+        if not self._disable_fallback:
+            # With disable_fallback=False, the kernel always returns a valid
+            # slot index, but the ID may not have been inserted (collision
+            # fallback). Verify by checking that the identity tensor at the
+            # remapped slot matches the input ID (after input_mapper).
+            inserted_mask = (
+                torch.flatten(self._hash_zch_identities).data[remapped_ids] == raw_ids
+            )
+            # Filter to only successfully inserted IDs.
+            remapped_ids = remapped_ids[inserted_mask]
+            weights = weights[inserted_mask]
+
+        assert self._hash_zch_runtime_meta is not None, (
+            "_hash_zch_runtime_meta must be initialized before update. "
+            "Shape should be set to [N, embedding_dim] during sharding."
+        )
+        # weights may be float if they are passed from training forward. Convert it to int64 via torch.view() without precision loss.
+        self._hash_zch_runtime_meta.data[remapped_ids] = weights.view(
+            self._hash_zch_runtime_meta.dtype
+        )
 
     def get_indices_of_reserved_slots_per_bucket(self) -> Optional[torch.Tensor]:
         """Get the range of indices of reserved slots per bucket of identities."""

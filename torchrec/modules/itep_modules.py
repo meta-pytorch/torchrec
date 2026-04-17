@@ -19,19 +19,51 @@ from torch.distributed._shard.metadata import ShardMetadata
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.embedding_types import ShardedEmbeddingTable, ShardingType
-from torchrec.distributed.logging_handlers import (
-    log_itep_checkpoint_load,
-    log_itep_checkpoint_save,
-    log_itep_config,
-    log_itep_eviction,
-    log_itep_init_state,
-    log_itep_pruning_trigger,
-    log_itep_rowwise_shard,
-)
 from torchrec.distributed.types import Shard, ShardedTensor, ShardedTensorMetadata
 from torchrec.modules.embedding_modules import reorder_inverse_indices
 from torchrec.modules.pruning_logger import PruningLogger, PruningLoggerDefault
 from torchrec.sparse.jagged_tensor import _pin_and_move, _to_offsets, KeyedJaggedTensor
+
+try:
+    # This is a safety measure against torch package issues for when
+    # Torchrec is included in the inference side model code. We should
+    # remove this once we are sure all model side packages have the required
+    # dependencies
+    from torchrec.distributed.logging_handlers import (
+        log_itep_checkpoint_load,
+        log_itep_checkpoint_save,
+        log_itep_config,
+        log_itep_eviction,
+        log_itep_init_state,
+        log_itep_pruning_trigger,
+        log_itep_rowwise_shard,
+    )
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.modules.itep_modules.import_failure.logging_handlers"
+    )
+
+    def log_itep_checkpoint_load(*args, **kwargs) -> None:
+        pass
+
+    def log_itep_checkpoint_save(*args, **kwargs) -> None:
+        pass
+
+    def log_itep_config(*args, **kwargs) -> None:
+        pass
+
+    def log_itep_eviction(*args, **kwargs) -> None:
+        pass
+
+    def log_itep_init_state(*args, **kwargs) -> None:
+        pass
+
+    def log_itep_pruning_trigger(*args, **kwargs) -> None:
+        pass
+
+    def log_itep_rowwise_shard(*args, **kwargs) -> None:
+        pass
+
 
 try:
     torch.ops.load_library(

@@ -141,6 +141,12 @@ class BenchmarkResult:
     short_name: str
     gpu_elapsed_time: torch.Tensor  # milliseconds
     cpu_elapsed_time: torch.Tensor  # milliseconds
+    cpu_utilization: (
+        torch.Tensor
+    )  # ratio of process CPU time (user+kernel) to elapsed time
+    normalized_cpu_utilization: (
+        torch.Tensor
+    )  # cpu_utilization divided by number of CPU cores
     gpu_mem_stats: List[GPUMemoryStats]  # GPU memory stats per rank
     cpu_mem_stats: List[CPUMemoryStats]  # CPU memory stats per rank
     rank: int = -1
@@ -153,6 +159,14 @@ class BenchmarkResult:
         cpu_runtime = (
             "CPU Runtime (P90)",
             f"{self.runtime_percentile(90, device='cpu'):.2f} ms",
+        )
+        cpu_util = (
+            "CPU Utilization (P90)",
+            f"{self.cpu_utilization_percentile(90):.2%}",
+        )
+        norm_cpu_util = (
+            "Normalized CPU Util (P90)",
+            f"{self.normalized_cpu_utilization_percentile(90):.2%}",
         )
         cpu_mem = "CPU Peak RSS (P90)", f"{self.cpu_mem_percentile(90)/1000:.2f} GB"
 
@@ -183,6 +197,8 @@ class BenchmarkResult:
         for h, c in [
             gpu_runtime,
             cpu_runtime,
+            cpu_util,
+            norm_cpu_util,
             mem_alloc,
             mem_reserved,
             mem_used,
@@ -208,6 +224,8 @@ class BenchmarkResult:
             "  Runtime:",
             f"    GPU (P90):              {self.runtime_percentile(90, device='gpu'):.2f} ms",
             f"    CPU (P90):              {self.runtime_percentile(90, device='cpu'):.2f} ms",
+            f"    CPU Utilization (P90):  {self.cpu_utilization_percentile(90):.2%}",
+            f"    Normalized CPU Util (P90):  {self.normalized_cpu_utilization_percentile(90):.2%}",
         ]
 
         if len(self.gpu_mem_stats) > 0:
@@ -240,6 +258,10 @@ class BenchmarkResult:
             "short_name": self.short_name,
             "gpu_runtime_p90_ms": float(self.runtime_percentile(90, device="gpu")),
             "cpu_runtime_p90_ms": float(self.runtime_percentile(90, device="cpu")),
+            "cpu_utilization_p90": float(self.cpu_utilization_percentile(90)),
+            "normalized_cpu_utilization_p90": float(
+                self.normalized_cpu_utilization_percentile(90)
+            ),
             "cpu_peak_rss_p90_mb": float(self.cpu_mem_percentile(90)),
         }
         if len(self.gpu_mem_stats) > 0:
@@ -275,6 +297,38 @@ class BenchmarkResult:
         timings = self.gpu_elapsed_time if device == "gpu" else self.cpu_elapsed_time
         return torch.quantile(
             timings,
+            percentile / 100.0,
+            interpolation=interpolation,
+        )
+
+    def cpu_utilization_percentile(
+        self,
+        percentile: int = 50,
+        interpolation: str = "nearest",
+    ) -> torch.Tensor:
+        """Return the CPU utilization percentile.
+
+        CPU utilization is the ratio of process CPU time (user + kernel)
+        to active CPU elapsed time.
+        """
+        return torch.quantile(
+            self.cpu_utilization,
+            percentile / 100.0,
+            interpolation=interpolation,
+        )
+
+    def normalized_cpu_utilization_percentile(
+        self,
+        percentile: int = 50,
+        interpolation: str = "nearest",
+    ) -> torch.Tensor:
+        """Return the normalized CPU utilization percentile.
+
+        Normalized CPU utilization divides the raw CPU utilization by the
+        number of CPU cores on the system.
+        """
+        return torch.quantile(
+            self.normalized_cpu_utilization,
             percentile / 100.0,
             interpolation=interpolation,
         )
@@ -423,6 +477,8 @@ def multi_process_benchmark(
         short_name=benchmark_res_per_rank[0].short_name,
         gpu_elapsed_time=benchmark_res_per_rank[0].gpu_elapsed_time,
         cpu_elapsed_time=benchmark_res_per_rank[0].cpu_elapsed_time,
+        cpu_utilization=benchmark_res_per_rank[0].cpu_utilization,
+        normalized_cpu_utilization=benchmark_res_per_rank[0].normalized_cpu_utilization,
         gpu_mem_stats=[
             GPUMemoryStats(rank, 0, 0, 0, 0, 0) for rank in range(world_size)
         ],
@@ -702,6 +758,294 @@ def init_argparse_and_args() -> argparse.Namespace:
     return args
 
 
+def _pre_gpu_load(pre_gpu_load: int, device_type: str) -> None:
+    """Run dummy matmul operations to simulate a loaded GPU allocator."""
+    if pre_gpu_load > 0 and device_type == "cuda":
+        _tmp = torch.rand(32768, 32768, device="cuda")
+        for _ in range(pre_gpu_load):
+            _tmp = _tmp * torch.rand(32768, 32768, device="cuda")
+
+
+class PerfWrapper:
+    """Wraps per-iteration CUDA + CPU measurements around a benchmark callable.
+
+    Provides ``start`` / ``end`` methods to bracket each ``run_iter_fn`` call,
+    accumulating CUDA events, active CPU time, and process CPU usage
+    (user + kernel) per iteration.  After all iterations, helper properties
+    compute the tensors needed to build a ``BenchmarkResult``.
+    """
+
+    def __init__(
+        self,
+        num_benchmarks: int,
+        rank: int,
+        reset_accumulated_memory_stats: bool = True,
+    ) -> None:
+        self._start_events: List[torch.cuda.Event] = [
+            torch.cuda.Event(enable_timing=True) for _ in range(num_benchmarks)
+        ]
+        self._end_events: List[torch.cuda.Event] = [
+            torch.cuda.Event(enable_timing=True) for _ in range(num_benchmarks)
+        ]
+        self._cpu_times_active_ns: List[int] = []
+        self._wall_times_ns: List[int] = []
+        self._peak_rss_kbs: List[int] = []
+        self._gpu_mem_stats: List[GPUMemoryStats] = []
+        self._num_benchmarks = num_benchmarks
+        self._cur: int = 0
+        self._device: int = rank if rank >= 0 else 0
+        self._reset_accumulated_memory_stats = reset_accumulated_memory_stats
+
+        # Scratch state for in-flight measurement
+        self._cpu_start_active_ns: int = 0
+        self._wall_start_ns: int = 0
+
+    def _start(self) -> None:
+        """Record the start of an iteration."""
+        torch.cuda.reset_peak_memory_stats(self._device)
+        if self._reset_accumulated_memory_stats:
+            torch.cuda.reset_accumulated_memory_stats(self._device)
+        self._start_events[self._cur].record()
+        self._cpu_start_active_ns = time.process_time_ns()
+        self._wall_start_ns = time.perf_counter_ns()
+
+    def _end(self) -> None:
+        """Record the end of an iteration."""
+        wall_end_ns = time.perf_counter_ns()
+        cpu_end_active_ns = time.process_time_ns()
+        self._end_events[self._cur].record()
+
+        self._cpu_times_active_ns.append(cpu_end_active_ns - self._cpu_start_active_ns)
+        self._wall_times_ns.append(wall_end_ns - self._wall_start_ns)
+        self._peak_rss_kbs.append(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+        self._gpu_mem_stats.append(GPUMemoryStats.for_device(self._device))
+        self._cur += 1
+
+    def measure(self, fn: Callable[[], None]) -> None:
+        """Run ``fn`` bracketed by start/end measurement."""
+        self._start()
+        fn()
+        self._end()
+
+    def _trim_outliers(self, values: List[float]) -> torch.Tensor:
+        """Convert to tensor, dropping the first and last iterations to remove outliers.
+
+        When ``num_benchmarks >= 5`` the first and last entries are stripped
+        to remove warm-up and cool-down outliers.  Otherwise all values are
+        kept (or a single zero is returned when there are none).
+        """
+        if self._num_benchmarks >= 5:
+            return torch.tensor(values[1:-1], dtype=torch.float)
+        elif self._num_benchmarks > 0:
+            return torch.tensor(values, dtype=torch.float)
+        else:
+            return torch.zeros(1, dtype=torch.float)
+
+    @property
+    def cpu_elapsed_time(self) -> torch.Tensor:
+        """Per-iteration active CPU time in milliseconds."""
+        return self._trim_outliers([t / 1e6 for t in self._cpu_times_active_ns])
+
+    @property
+    def cpu_utilization(self) -> torch.Tensor:
+        """Ratio of active CPU time to wall-clock time."""
+        wall_time = self._trim_outliers([t / 1e6 for t in self._wall_times_ns])
+        return self.cpu_elapsed_time / wall_time.clamp(min=1e-6)
+
+    @property
+    def normalized_cpu_utilization(self) -> torch.Tensor:
+        """Ratio of active CPU time to wall-clock time, normalized by CPU core count."""
+        num_cores = os.cpu_count() or 1
+        return self.cpu_utilization / num_cores
+
+    @property
+    def peak_rss_mbs(self) -> int:
+        """P90 peak RSS in megabytes across iterations."""
+        return int(
+            torch.quantile(
+                self._trim_outliers([kb / 1024 for kb in self._peak_rss_kbs]),
+                0.9,
+                interpolation="nearest",
+            ).item()
+        )
+
+    @property
+    def gpu_mem_stats_p90(self) -> GPUMemoryStats:
+        """P90 GPU memory stats across iterations."""
+
+        def _p90(values: List[int]) -> int:
+            return int(
+                torch.quantile(
+                    self._trim_outliers([float(v) for v in values]),
+                    0.9,
+                    interpolation="nearest",
+                ).item()
+            )
+
+        return GPUMemoryStats(
+            rank=self._device,
+            malloc_retries=_p90([s.malloc_retries for s in self._gpu_mem_stats]),
+            max_mem_allocated_mbs=_p90(
+                [s.max_mem_allocated_mbs for s in self._gpu_mem_stats]
+            ),
+            max_mem_reserved_mbs=_p90(
+                [s.max_mem_reserved_mbs for s in self._gpu_mem_stats]
+            ),
+            free_mbs=_p90([s.free_mbs for s in self._gpu_mem_stats]),
+            total_mbs=_p90([s.total_mbs for s in self._gpu_mem_stats]),
+        )
+
+    def gpu_elapsed_time(self, rank: int, world_size: int) -> torch.Tensor:
+        """Per-iteration GPU time in milliseconds.
+
+        Must be called after all CUDA devices have been synchronized.
+        """
+        if rank == -1:
+            for di in range(world_size):
+                torch.cuda.synchronize(di)
+        else:
+            torch.cuda.synchronize(rank)
+
+        all_times = [
+            s.elapsed_time(e) for s, e in zip(self._start_events, self._end_events)
+        ]
+        return self._trim_outliers(all_times)
+
+    def to_benchmark_result(
+        self,
+        name: str,
+        rank: int,
+        world_size: int,
+    ) -> BenchmarkResult:
+        """Build a complete ``BenchmarkResult`` from accumulated measurements."""
+        return BenchmarkResult(
+            short_name=name,
+            gpu_elapsed_time=self.gpu_elapsed_time(rank, world_size),
+            cpu_elapsed_time=self.cpu_elapsed_time,
+            cpu_utilization=self.cpu_utilization,
+            normalized_cpu_utilization=self.normalized_cpu_utilization,
+            gpu_mem_stats=[self.gpu_mem_stats_p90],
+            cpu_mem_stats=[CPUMemoryStats(rank, self.peak_rss_mbs)],
+            rank=rank,
+        )
+
+
+def _run_cuda_benchmark(
+    run_iter_fn: Callable[[], None],
+    num_benchmarks: int,
+    rank: int,
+    reset_accumulated_memory_stats: bool = True,
+) -> PerfWrapper:
+    """Run benchmark iterations on CUDA, collecting GPU/CPU timing and memory stats.
+
+    Returns a ``PerfWrapper`` containing raw per-iteration measurements.
+    Call ``to_benchmark_result(name, rank, world_size)`` on the result to
+    obtain a ``BenchmarkResult``.
+    """
+    perf = PerfWrapper(num_benchmarks, rank, reset_accumulated_memory_stats)
+
+    for i in range(num_benchmarks):
+        # Ensure that outstanding GPU work from the previous iteration has
+        # finished so that we do not attribute its wait time to the next
+        # CPU measurement.
+        if i > 0:
+            torch.cuda.synchronize(rank if rank >= 0 else 0)
+
+        perf.measure(run_iter_fn)
+
+    return perf
+
+
+def _run_cpu_benchmark(
+    run_iter_fn: Callable[[], None],
+    num_benchmarks: int,
+) -> List[float]:
+    """Collect wall-clock timing for CPU-only benchmarks.
+
+    Returns raw per-iteration elapsed times in seconds (from ``timeit``).
+    The caller is responsible for constructing a ``BenchmarkResult``.
+    """
+    return timeit.repeat(run_iter_fn, number=1, repeat=num_benchmarks)
+
+
+def _run_cuda_profiling(
+    name: str,
+    profile_iter_fn: Callable[[Any], None],
+    rank: int,
+    output_dir: str,
+    pre_gpu_load: int,
+    export_stacks: bool,
+    all_rank_traces: bool,
+    memory_snapshot: bool,
+) -> None:
+    """Run optional CUDA profiling with chrome trace export and memory snapshot."""
+
+    def _trace_handler(prof: torch.profiler.profile) -> None:
+        try:
+            # pyrefly: ignore[missing-attribute]
+            total_avg = prof.profiler.total_average()
+            logger.info(f" TOTAL_AVERAGE:\n{name}\n{total_avg}")
+        except RecursionError:
+            logger.warning(
+                f"Skipping total_average for {name} due to deep profiler event tree"
+            )
+        if not all_rank_traces and rank > 0:
+            # only save trace for rank 0 when all_rank_traces is disabled
+            return
+        trace_file = f"{output_dir}/{create_trace_file_name(name, rank)}"
+        logger.info(f" PROFILE[{name}].chrome_trace:{trace_file}")
+        prof.export_chrome_trace(trace_file)
+
+        if export_stacks:
+            prof.export_stacks(
+                f"{output_dir}/stacks-cpu-{name}.stacks", "self_cpu_time_total"
+            )
+            prof.export_stacks(
+                f"{output_dir}/stacks-cuda-{name}.stacks", "self_cuda_time_total"
+            )
+
+    _pre_gpu_load(pre_gpu_load, "cuda")
+
+    if memory_snapshot and (all_rank_traces or rank == 0):
+        torch.cuda.empty_cache()
+        torch.cuda.memory._record_memory_history(
+            max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
+        )
+
+    # Optional allocator warm-up to create fragmentation similar to production
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
+        record_shapes=True,
+        profile_memory=True,
+        with_flops=True,
+        with_modules=True,
+        with_stack=export_stacks,
+        on_trace_ready=_trace_handler,
+    ) as prof:
+        profile_iter_fn(prof)
+
+    # Synchronize again after profiling to guarantee deterministic ordering
+    if rank == -1:
+        for di in range(torch.cuda.device_count()):
+            torch.cuda.synchronize(torch.device(f"cuda:{di}"))
+    else:
+        torch.cuda.synchronize(rank)
+
+    if memory_snapshot and (all_rank_traces or rank == 0):
+        try:
+            torch.cuda.memory._dump_snapshot(
+                f"{output_dir}/memory-{name}-rank{rank}.pickle"
+            )
+        except Exception as e:
+            logger.error(f"Failed to capture memory snapshot {e}")
+
+        # Stop recording memory snapshot history.
+        torch.cuda.memory._record_memory_history(enabled=None)
+
+
 def _run_benchmark_core(
     name: str,
     run_iter_fn: Callable[[], None],
@@ -745,176 +1089,46 @@ def _run_benchmark_core(
             usage: https://docs.pytorch.org/memory_viz
     """
 
-    def _reset_memory_stats() -> None:
-        if device_type != "cuda":
-            return
-        ranks = range(world_size) if rank == -1 else [rank]
-        for di in ranks:
-            torch.cuda.reset_peak_memory_stats(di)
-            if reset_accumulated_memory_stats:
-                torch.cuda.reset_accumulated_memory_stats(di)
+    # Preparation
+    _pre_gpu_load(pre_gpu_load, device_type)
 
-    def pre_gpu_load_fn() -> None:
-        if pre_gpu_load > 0 and device_type == "cuda":
-            _tmp = torch.rand(32768, 32768, device="cuda")
-            for _ in range(pre_gpu_load):
-                _tmp = _tmp * torch.rand(32768, 32768, device="cuda")
-
-    # Preparation & memory reset
-    pre_gpu_load_fn()
-    _reset_memory_stats()
-
-    # Timings
-    start_events, end_events, times = [], [], []
-
+    # Timings and memory statistics collection
     if device_type == "cuda":
-        start_events = [
-            torch.cuda.Event(enable_timing=True) for _ in range(num_benchmarks)
-        ]
-        end_events = [
-            torch.cuda.Event(enable_timing=True) for _ in range(num_benchmarks)
-        ]
-        # Capture per-iteration active CPU cycles (excludes time the thread is truly idle/asleep) using `process_time_ns`.
-        cpu_times_active_ns: List[int] = []
-
-        for i in range(num_benchmarks):
-            # Ensure that outstanding GPU work from the previous iteration has
-            # finished so that we do not attribute its wait time to the next
-            # CPU measurement.
-            if i > 0:
-                torch.cuda.synchronize(rank if rank >= 0 else 0)
-
-            start_events[i].record()
-            cpu_start_active_ns = time.process_time_ns()
-
-            run_iter_fn()
-
-            cpu_end_active_ns = time.process_time_ns()
-            end_events[i].record()
-            cpu_times_active_ns.append(cpu_end_active_ns - cpu_start_active_ns)
-
-        # Convert to milliseconds and drop the first iteration
-
-        cpu_elapsed_time = (
-            torch.tensor([t / 1e6 for t in cpu_times_active_ns[1:]], dtype=torch.float)
-            if num_benchmarks >= 5  # count from 2nd iteration to remove outliers
-            else (
-                torch.tensor([t / 1e6 for t in cpu_times_active_ns], dtype=torch.float)
-                if num_benchmarks > 0
-                else torch.zeros(1, dtype=torch.float)
-            )
+        perf = _run_cuda_benchmark(
+            run_iter_fn,
+            num_benchmarks,
+            rank,
+            reset_accumulated_memory_stats,
         )
-
-        # Make sure all kernels are finished before reading timers / stats
-        if rank == -1:
-            for di in range(world_size):
-                torch.cuda.synchronize(di)
-        else:
-            torch.cuda.synchronize(rank)
-
-        gpu_elapsed_time = (
-            torch.tensor(
-                [s.elapsed_time(e) for s, e in zip(start_events[1:], end_events[1:])]
-            )
-            if num_benchmarks >= 5  # count from 2nd iteration to remove outliers
-            else (
-                torch.tensor(
-                    [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-                )
-                if num_benchmarks > 0
-                else torch.zeros(1, dtype=torch.float)
-            )
-        )
-    else:
-        # For CPU-only benchmarks we fall back to wall-clock timing via ``timeit``.
-        times = timeit.repeat(run_iter_fn, number=1, repeat=num_benchmarks)
+        result = perf.to_benchmark_result(name, rank, world_size)
+    else:  # CPU benchmarking
+        times = _run_cpu_benchmark(run_iter_fn, num_benchmarks)
         cpu_elapsed_time = torch.tensor(times) * 1e3  # convert to ms
-
-        # mirror CPU timings for overall consistency
-        gpu_elapsed_time = cpu_elapsed_time.clone()
-
-    # Memory statistics collection
-    gpu_mem_stats: List[GPUMemoryStats] = []
-    cpu_mem_stats = [CPUMemoryStats.for_process(rank)]
-
-    if device_type == "cuda":
-        if rank == -1:
-            for di in range(world_size):
-                gpu_mem_stats.append(GPUMemoryStats.for_device(di))
-        else:
-            gpu_mem_stats.append(GPUMemoryStats.for_device(rank))
-    # CPU memory stats are collected for both GPU and CPU-only runs
+        result = BenchmarkResult(
+            short_name=name,
+            gpu_elapsed_time=cpu_elapsed_time.clone(),
+            cpu_elapsed_time=cpu_elapsed_time,
+            cpu_utilization=torch.zeros_like(cpu_elapsed_time),
+            normalized_cpu_utilization=torch.zeros_like(cpu_elapsed_time),
+            gpu_mem_stats=[],
+            cpu_mem_stats=[CPUMemoryStats.for_process(rank)],
+            rank=rank,
+        )
 
     # Optional detailed profiling
     if output_dir and profile_iter_fn and device_type == "cuda":
+        _run_cuda_profiling(
+            name=name,
+            profile_iter_fn=profile_iter_fn,
+            rank=rank,
+            output_dir=output_dir,
+            pre_gpu_load=pre_gpu_load,
+            export_stacks=export_stacks,
+            all_rank_traces=all_rank_traces,
+            memory_snapshot=memory_snapshot,
+        )
 
-        def _trace_handler(prof: torch.profiler.profile) -> None:
-            # pyrefly: ignore[missing-attribute]
-            total_avg = prof.profiler.total_average()
-            logger.info(f" TOTAL_AVERAGE:\n{name}\n{total_avg}")
-            if not all_rank_traces and rank > 0:
-                # only save trace for rank 0 when all_rank_traces is disabled
-                return
-            trace_file = f"{output_dir}/{create_trace_file_name(name, rank)}"
-            logger.info(f" PROFILE[{name}].chrome_trace:{trace_file}")
-            prof.export_chrome_trace(trace_file)
-
-            if export_stacks:
-                prof.export_stacks(
-                    f"{output_dir}/stacks-cpu-{name}.stacks", "self_cpu_time_total"
-                )
-                prof.export_stacks(
-                    f"{output_dir}/stacks-cuda-{name}.stacks", "self_cuda_time_total"
-                )
-
-        pre_gpu_load_fn()
-        if memory_snapshot and (all_rank_traces or rank == 0):
-            torch.cuda.empty_cache()
-            torch.cuda.memory._record_memory_history(
-                max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
-            )
-
-        # Optional allocator warm-up to create fragmentation similar to production
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            record_shapes=True,
-            profile_memory=True,
-            with_flops=True,
-            with_modules=True,
-            with_stack=export_stacks,
-            on_trace_ready=_trace_handler,
-        ) as prof:
-            profile_iter_fn(prof)
-
-        # Synchronize again after profiling to guarantee deterministic ordering
-        if rank == -1:
-            for di in range(torch.cuda.device_count()):
-                torch.cuda.synchronize(torch.device(f"cuda:{di}"))
-        else:
-            torch.cuda.synchronize(rank)
-
-        if memory_snapshot and (all_rank_traces or rank == 0):
-            try:
-                torch.cuda.memory._dump_snapshot(
-                    f"{output_dir}/memory-{name}-rank{rank}.pickle"
-                )
-            except Exception as e:
-                logger.error(f"Failed to capture memory snapshot {e}")
-
-            # Stop recording memory snapshot history.
-            torch.cuda.memory._record_memory_history(enabled=None)
-
-    return BenchmarkResult(
-        short_name=name,
-        gpu_elapsed_time=gpu_elapsed_time,
-        cpu_elapsed_time=cpu_elapsed_time,
-        gpu_mem_stats=gpu_mem_stats,
-        cpu_mem_stats=cpu_mem_stats,
-        rank=rank,
-    )
+    return result
 
 
 def benchmark_model_with_warmup(
