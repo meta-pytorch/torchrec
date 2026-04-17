@@ -93,12 +93,33 @@ except Exception:
         return decorator
 
 
-from torchrec.distributed.logging_handlers import (
-    log_offloading_summary,
-    log_planner_config,
-    log_planning_result,
-    log_storage_reservation,
-)
+try:
+    # This is a safety measure against torch package issues for when
+    # Torchrec is included in the inference side model code. We should
+    # remove this once we are sure all model side packages have the required
+    # dependencies
+    from torchrec.distributed.logging_handlers import (
+        log_offloading_summary,
+        log_planner_config,
+        log_planning_result,
+        log_storage_reservation,
+    )
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.planner.planners.import_failure.logging_handlers"
+    )
+
+    def log_offloading_summary(*args, **kwargs) -> None:
+        pass
+
+    def log_planner_config(*args, **kwargs) -> None:
+        pass
+
+    def log_planning_result(*args, **kwargs) -> None:
+        pass
+
+    def log_storage_reservation(*args, **kwargs) -> None:
+        pass
 
 
 logger: logging.Logger = logging.getLogger(__name__)
