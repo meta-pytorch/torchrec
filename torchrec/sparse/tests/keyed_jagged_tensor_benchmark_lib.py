@@ -233,6 +233,7 @@ def benchmark_kjt(
         cpu_elapsed_time=torch.tensor(times),
         cpu_utilization=torch.zeros(len(times)),
         normalized_cpu_utilization=torch.zeros(len(times)),
+        qps=torch.zeros(len(times)),
         gpu_mem_stats=[GPUMemoryStats(0, 0, 0, 0, 0, 0)],
         cpu_mem_stats=[CPUMemoryStats.for_process(0)],
     )

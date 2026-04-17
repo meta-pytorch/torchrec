@@ -247,6 +247,8 @@ def runner(
         bench_inputs=[{}],
         prof_inputs=[{}] * run_option.num_profiles,
         benchmark_func_kwargs={},
+        # Input is empty, actual traffic is determined by the benchmark function
+        sample_count=0,
         **run_option.benchmark_func_kwargs(),
     )
 
