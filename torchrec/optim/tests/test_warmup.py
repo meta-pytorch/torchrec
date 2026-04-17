@@ -72,3 +72,54 @@ class TestWarmupOptimizer(unittest.TestCase):
             warmup_optimizer_1.state_dict()["state"]["__warmup"],
             warmup_optimizer_2.state_dict()["state"]["__warmup"],
         )
+
+    def test_interpolate_policy(self) -> None:
+        param_1_t = torch.tensor([1.0, 2.0])
+        param_1 = Variable(param_1_t)
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1}, defaultdict(dict), [{"params": [param_1], "lr": 1.0}]
+        )
+        warmup_optimizer = WarmupOptimizer(
+            keyed_optimizer,
+            stages=[
+                WarmupStage(
+                    WarmupPolicy.INTERPOLATE,
+                    max_iters=200,
+                    start_interpolating_iters=100,
+                    value=0.01,
+                    end_value=0.1,
+                    lr_scale=1,
+                ),
+            ],
+            lr=1.0,
+        )
+
+        # At iter 0 (before start_interpolating_iters=100), the formula gives:
+        # multiplier = 0.01 + (0.1 - 0.01) * (0 - 100) / (200 - 100) = 0.01 - 0.09 = -0.08
+        # But typically INTERPOLATE is used starting from start_interpolating_iters
+        # Let's step to iteration 100 and verify
+        for _ in range(100):
+            warmup_optimizer.zero_grad()
+            warmup_optimizer.step()
+
+        # At iter 100: multiplier = 0.01 + (0.1 - 0.01) * (100 - 100) / (200 - 100) = 0.01
+        lr_at_100 = list(warmup_optimizer.param_groups)[0]["lr"]
+        self.assertAlmostEqual(lr_at_100, 0.01, places=5)
+
+        # Step 50 more times to iter 150
+        for _ in range(50):
+            warmup_optimizer.zero_grad()
+            warmup_optimizer.step()
+
+        # At iter 150: multiplier = 0.01 + (0.1 - 0.01) * (150 - 100) / (200 - 100) = 0.01 + 0.045 = 0.055
+        lr_at_150 = list(warmup_optimizer.param_groups)[0]["lr"]
+        self.assertAlmostEqual(lr_at_150, 0.055, places=5)
+
+        # Step 50 more times to iter 200
+        for _ in range(50):
+            warmup_optimizer.zero_grad()
+            warmup_optimizer.step()
+
+        # At iter 200: multiplier = 0.01 + (0.1 - 0.01) * (200 - 100) / (200 - 100) = 0.1
+        lr_at_200 = list(warmup_optimizer.param_groups)[0]["lr"]
+        self.assertAlmostEqual(lr_at_200, 0.1, places=5)
