@@ -886,6 +886,7 @@ def sharding_single_rank_test_single_process(
             compute_device=device.type,
             local_world_size=node_group_size if node_group_size else local_size,
             pod_size=pod_size,
+            ssd_cap=2 * 1024**4,
         ),
         constraints=constraints,
     )
@@ -898,6 +899,7 @@ def sharding_single_rank_test_single_process(
                     world_size=config.sharding_group_size,
                     compute_device=device.type,
                     local_world_size=config.node_group_size,
+                    ssd_cap=2 * 1024**4,
                 ),
                 constraints=constraints,
             )
