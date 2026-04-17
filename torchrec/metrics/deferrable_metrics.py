@@ -23,7 +23,47 @@ from collections.abc import Iterator, Mapping
 from concurrent.futures import Future
 from typing import Any, Callable
 
+import torch
+
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def device_supports_async(device: torch.device) -> bool:
+    """Check if a device supports non-blocking async transfers (CUDA events)."""
+    return device.type == "cuda"
+
+
+def transfer_tensors_to_cpu(
+    tensors: dict[str, Any],
+) -> tuple[dict[str, Any], torch.cuda.Event | None]:
+    """Transfer GPU tensors to CPU using non-blocking copies.
+
+    Returns the CPU tensor dict and a CUDA event that tracks completion.
+    For CPU-only inputs, returns the dict as-is with None event.
+    Non-tensor values are preserved unchanged.
+
+    Records the CUDA event on the source tensor's device stream (not the
+    default device) to avoid metric corruption on non-rank-0 processes.
+    All tensors are assumed to be on the same device.
+    """
+    source_device: torch.device | None = None
+    for v in tensors.values():
+        if isinstance(v, torch.Tensor) and v.device.type == "cuda":
+            source_device = v.device
+            break
+    if source_device is None:
+        return tensors, None
+
+    cpu_tensors = {
+        k: v.to(device="cpu", non_blocking=True) if isinstance(v, torch.Tensor) else v
+        for k, v in tensors.items()
+    }
+
+    with torch.cuda.device(source_device):
+        event = torch.cuda.Event()
+        event.record()
+
+    return cpu_tensors, event
 
 
 class DeferrableMetrics(Mapping[str, Any]):
