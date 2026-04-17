@@ -668,7 +668,7 @@ class TestManagedCollisionCollection(unittest.TestCase):
             output_offset=mc_module._output_global_offset_tensor,
         )
         for i in range(2):
-            slot = remapped_ids[i].item()
+            slot = int(remapped_ids[i].item())
             if identities[slot].item() == mapped_ids[i].item():
                 # ID was inserted — runtime_meta should match
                 torch.testing.assert_close(

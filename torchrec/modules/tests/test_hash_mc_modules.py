@@ -1993,7 +1993,7 @@ class TestWriteRuntimeMeta(unittest.TestCase):
 
         # Evicted slots should have their runtime_meta zeroed
         # Check that at least some slots are zero (eviction happened)
-        all_meta = m._hash_zch_runtime_meta.data
+        all_meta = none_throws(m._hash_zch_runtime_meta).data
         # After eviction, any evicted slot should be zeroed
         has_zeros = torch.any(all_meta == 0)
         self.assertTrue(has_zeros)
