@@ -317,6 +317,11 @@ def runner(
             prof_inputs=bench_inputs,
             func_to_benchmark=_func_to_benchmark,
             benchmark_func_kwargs={"model": sharded_model, "pipeline": pipeline},
+            sample_count=(
+                input_config.batch_size * run_option.num_iters
+                if run_option.num_iters is not None
+                else input_config.batch_size * run_option.num_batches
+            ),
             **run_option.benchmark_func_kwargs(rank=rank),
         )
 
@@ -372,6 +377,7 @@ def run_pipeline(
             GPUMemoryStats(rank, 0, 0, 0, 0, 0) for rank in range(world_size)
         ],
         cpu_mem_stats=[CPUMemoryStats(rank, 0) for rank in range(world_size)],
+        qps=benchmark_res_per_rank[0].qps,
         rank=0,
     )
 

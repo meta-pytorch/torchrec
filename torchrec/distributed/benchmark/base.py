@@ -149,6 +149,7 @@ class BenchmarkResult:
     )  # cpu_utilization divided by number of CPU cores
     gpu_mem_stats: List[GPUMemoryStats]  # GPU memory stats per rank
     cpu_mem_stats: List[CPUMemoryStats]  # CPU memory stats per rank
+    qps: torch.Tensor  # per-iteration queries per second
     rank: int = -1
 
     def __str__(self) -> str:
@@ -169,6 +170,7 @@ class BenchmarkResult:
             f"{self.normalized_cpu_utilization_percentile(90):.2%}",
         )
         cpu_mem = "CPU Peak RSS (P90)", f"{self.cpu_mem_percentile(90)/1000:.2f} GB"
+        qps = ("QPS (P90)", f"{int(self.qps_percentile(90))}")
 
         short_name_length = 35
 
@@ -204,6 +206,7 @@ class BenchmarkResult:
             mem_used,
             malloc_retries,
             cpu_mem,
+            qps,
         ]:
             if len(h) == 0:
                 continue
@@ -246,6 +249,8 @@ class BenchmarkResult:
                 "  CPU Memory:",
                 f"    Peak RSS (P90):         {self.cpu_mem_percentile(90)/1000:.2f} GB",
                 "",
+                f"  QPS (P90):                  {int(self.qps_percentile(90))}",
+                "",
                 "=" * 60,
             ]
         )
@@ -269,6 +274,7 @@ class BenchmarkResult:
             d["gpu_peak_reserved_p90_mb"] = float(self.max_mem_reserved_percentile(90))
             d["gpu_mem_used_p90_mb"] = float(self.device_mem_used(90))
             d["gpu_malloc_retries_p90"] = float(self.mem_retries(90))
+        d["qps_p90"] = int(self.qps_percentile(90))
         return d
 
     @classmethod
@@ -329,6 +335,18 @@ class BenchmarkResult:
         """
         return torch.quantile(
             self.normalized_cpu_utilization,
+            percentile / 100.0,
+            interpolation=interpolation,
+        )
+
+    def qps_percentile(
+        self,
+        percentile: int = 50,
+        interpolation: str = "nearest",
+    ) -> torch.Tensor:
+        """Return the QPS (queries per second) percentile."""
+        return torch.quantile(
+            self.qps.float(),
             percentile / 100.0,
             interpolation=interpolation,
         )
@@ -483,6 +501,7 @@ def multi_process_benchmark(
             GPUMemoryStats(rank, 0, 0, 0, 0, 0) for rank in range(world_size)
         ],
         cpu_mem_stats=[CPUMemoryStats(rank, 0) for rank in range(world_size)],
+        qps=benchmark_res_per_rank[0].qps,
         rank=0,
     )
 
@@ -780,6 +799,7 @@ class PerfWrapper:
         num_benchmarks: int,
         rank: int,
         reset_accumulated_memory_stats: bool = True,
+        sample_count: int = 0,
     ) -> None:
         self._start_events: List[torch.cuda.Event] = [
             torch.cuda.Event(enable_timing=True) for _ in range(num_benchmarks)
@@ -791,6 +811,8 @@ class PerfWrapper:
         self._wall_times_ns: List[int] = []
         self._peak_rss_kbs: List[int] = []
         self._gpu_mem_stats: List[GPUMemoryStats] = []
+        self._qps_list: List[int] = []
+        self._sample_count = sample_count
         self._num_benchmarks = num_benchmarks
         self._cur: int = 0
         self._device: int = rank if rank >= 0 else 0
@@ -815,10 +837,18 @@ class PerfWrapper:
         cpu_end_active_ns = time.process_time_ns()
         self._end_events[self._cur].record()
 
+        wall_elapsed_ns = wall_end_ns - self._wall_start_ns
         self._cpu_times_active_ns.append(cpu_end_active_ns - self._cpu_start_active_ns)
-        self._wall_times_ns.append(wall_end_ns - self._wall_start_ns)
+        self._wall_times_ns.append(wall_elapsed_ns)
         self._peak_rss_kbs.append(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
         self._gpu_mem_stats.append(GPUMemoryStats.for_device(self._device))
+
+        wall_elapsed_s = wall_elapsed_ns / 1e9
+        if self._sample_count > 0 and wall_elapsed_s > 0:
+            self._qps_list.append(int(self._sample_count / wall_elapsed_s))
+        else:
+            self._qps_list.append(0)
+
         self._cur += 1
 
     def measure(self, fn: Callable[[], None]) -> None:
@@ -857,6 +887,11 @@ class PerfWrapper:
         """Ratio of active CPU time to wall-clock time, normalized by CPU core count."""
         num_cores = os.cpu_count() or 1
         return self.cpu_utilization / num_cores
+
+    @property
+    def qps(self) -> torch.Tensor:
+        """Per-iteration QPS (excluding outliers)."""
+        return self._trim_outliers([float(q) for q in self._qps_list])
 
     @property
     def peak_rss_mbs(self) -> int:
@@ -926,6 +961,7 @@ class PerfWrapper:
             normalized_cpu_utilization=self.normalized_cpu_utilization,
             gpu_mem_stats=[self.gpu_mem_stats_p90],
             cpu_mem_stats=[CPUMemoryStats(rank, self.peak_rss_mbs)],
+            qps=self.qps,
             rank=rank,
         )
 
@@ -935,6 +971,7 @@ def _run_cuda_benchmark(
     num_benchmarks: int,
     rank: int,
     reset_accumulated_memory_stats: bool = True,
+    sample_count: int = 0,
 ) -> PerfWrapper:
     """Run benchmark iterations on CUDA, collecting GPU/CPU timing and memory stats.
 
@@ -942,7 +979,10 @@ def _run_cuda_benchmark(
     Call ``to_benchmark_result(name, rank, world_size)`` on the result to
     obtain a ``BenchmarkResult``.
     """
-    perf = PerfWrapper(num_benchmarks, rank, reset_accumulated_memory_stats)
+    perf = PerfWrapper(
+        num_benchmarks, rank, reset_accumulated_memory_stats, sample_count
+    )
+    logger.info(f"Running cuda benchmark {num_benchmarks} times on rank {rank}")
 
     for i in range(num_benchmarks):
         # Ensure that outstanding GPU work from the previous iteration has
@@ -952,6 +992,7 @@ def _run_cuda_benchmark(
             torch.cuda.synchronize(rank if rank >= 0 else 0)
 
         perf.measure(run_iter_fn)
+    logger.info(f"Cuda benchmark finished on rank {rank}")
 
     return perf
 
@@ -1060,6 +1101,7 @@ def _run_benchmark_core(
     reset_accumulated_memory_stats: bool = True,
     all_rank_traces: bool = False,
     memory_snapshot: bool = False,
+    sample_count: int = 0,
 ) -> BenchmarkResult:
     """Internal helper that contains the core benchmarking logic shared by
     ``benchmark`` and ``benchmark_func``.  All heavy–lifting (timing, memory
@@ -1087,6 +1129,7 @@ def _run_benchmark_core(
         all_rank_traces: Whether to export traces for all ranks or just rank 0.
         memory_snapshot: Whether to capture memory snapshot during the profiling
             usage: https://docs.pytorch.org/memory_viz
+        sample_count: Number of samples per iteration, used to calculate QPS.
     """
 
     # Preparation
@@ -1099,11 +1142,19 @@ def _run_benchmark_core(
             num_benchmarks,
             rank,
             reset_accumulated_memory_stats,
+            sample_count,
         )
         result = perf.to_benchmark_result(name, rank, world_size)
     else:  # CPU benchmarking
         times = _run_cpu_benchmark(run_iter_fn, num_benchmarks)
         cpu_elapsed_time = torch.tensor(times) * 1e3  # convert to ms
+        # Per-iteration QPS: sample_count / elapsed_seconds
+        times_t = torch.tensor(times, dtype=torch.float)
+        cpu_qps = (
+            torch.where(times_t > 0, sample_count / times_t, torch.zeros_like(times_t))
+            if sample_count > 0
+            else torch.zeros_like(cpu_elapsed_time)
+        )
         result = BenchmarkResult(
             short_name=name,
             gpu_elapsed_time=cpu_elapsed_time.clone(),
@@ -1112,6 +1163,7 @@ def _run_benchmark_core(
             normalized_cpu_utilization=torch.zeros_like(cpu_elapsed_time),
             gpu_mem_stats=[],
             cpu_mem_stats=[CPUMemoryStats.for_process(rank)],
+            qps=cpu_qps,
             rank=rank,
         )
 
@@ -1180,6 +1232,8 @@ def benchmark_model_with_warmup(
         pre_gpu_load=0,
         export_stacks=export_stacks,
         reset_accumulated_memory_stats=False,
+        # Ignore the sample count(qps) calculation for now
+        sample_count=0,
     )
 
 
@@ -1232,6 +1286,7 @@ def benchmark_func(
     export_stacks: bool = False,
     all_rank_traces: bool = False,
     memory_snapshot: bool = False,
+    sample_count: int = 0,
 ) -> BenchmarkResult:
     """
     Args:
@@ -1285,4 +1340,5 @@ def benchmark_func(
         reset_accumulated_memory_stats=True,
         all_rank_traces=all_rank_traces,
         memory_snapshot=memory_snapshot,
+        sample_count=sample_count,
     )
