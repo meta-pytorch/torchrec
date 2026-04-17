@@ -38,6 +38,7 @@ import torch
 import yaml
 from torch import multiprocessing as mp
 from torch.autograd.profiler import record_function
+from torchrec.distributed.benchmark.utils import dump_benchmark_result
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import get_free_port
 
@@ -1179,6 +1180,13 @@ def _run_benchmark_core(
             all_rank_traces=all_rank_traces,
             memory_snapshot=memory_snapshot,
         )
+
+    # Dump benchmark result to local storage
+    if output_dir:
+        try:
+            dump_benchmark_result(result, output_dir, world_size)
+        except OSError as e:
+            logger.warning(f"Failed to dump benchmark result: {e}")
 
     return result
 
