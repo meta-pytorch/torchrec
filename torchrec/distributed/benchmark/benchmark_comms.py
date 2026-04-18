@@ -771,6 +771,8 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
             },
             func_to_benchmark=func,
             rank=rank,
+            # Input is empty, actual traffic is determined by the benchmark function
+            sample_count=0,
             **arg.benchmark_func_kwargs(name=f"{arg.name}_{arg.backend}"),
         )
 
