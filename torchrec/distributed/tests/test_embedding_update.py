@@ -232,6 +232,53 @@ class TestEmbeddingUpdate(MultiProcessTestBase):
             expected_failure_msg="write_dist feature names",
         )
 
+    def test_embedding_update_variable_stride_kjt_disabled_in_oss_compatibility(
+        self,
+    ) -> None:
+        WORLD_SIZE = 2
+        self._gpu_check(WORLD_SIZE)
+        tables, inputs_per_rank = self._get_example_configs_and_input()
+        embedding_dim = 64
+        # Build write embeddings derived from the forward inputs so shapes
+        # match for verification, but provide stride_per_key_per_rank to
+        # exercise the variable stride code path through write_dist / dist_init.
+        embeddings_per_rank = []
+        for input in inputs_per_rank:
+            feat_0_vals = input["feature_0"].values()
+            feat_1_vals = input["feature_1"].values()
+            feat_2_vals = input["feature_2"].values()
+            feat_0_lengths = input["feature_0"].lengths()
+            feat_1_lengths = input["feature_1"].lengths()
+            feat_2_lengths = input["feature_2"].lengths()
+
+            all_values = torch.cat((feat_0_vals, feat_1_vals, feat_2_vals))
+            all_lengths = torch.cat((feat_0_lengths, feat_1_lengths, feat_2_lengths))
+            num_values = int(all_lengths.sum().item())
+
+            stride_per_key_per_rank = [
+                [int(feat_0_lengths.size(0))],
+                [int(feat_1_lengths.size(0))],
+                [int(feat_2_lengths.size(0))],
+            ]
+
+            kjt = KeyedJaggedTensor(
+                keys=["feature_0", "feature_1", "feature_2"],
+                values=all_values,
+                lengths=all_lengths,
+                weights=torch.rand(num_values, embedding_dim, dtype=torch.float32),
+                stride_per_key_per_rank=stride_per_key_per_rank,
+            )
+            embeddings_per_rank.append(kjt)
+
+        self._run_multi_process_test(
+            callable=sharded_embedding_update,
+            world_size=WORLD_SIZE,
+            tables=tables,
+            backend="nccl",
+            inputs_per_rank=inputs_per_rank,
+            embeddings_per_rank=embeddings_per_rank,
+        )
+
     def test_embedding_update_config_not_enabled_disabled_in_oss_compatibility(
         self,
     ) -> None:

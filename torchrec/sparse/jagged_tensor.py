@@ -439,14 +439,15 @@ def _permute_tensor_by_segments(
     index and sequence across multiple thread blocks.
 
     For permuting KJT with weights that are not of float type (i.e. storing
-    bucketization position tensor of longs in weights), `permute_1D_sparse_data` is used
-    instead of `keyed_jagged_index_select_dim1` which doesn't support non float weights.
+    bucketization position tensor of longs in weights) or with 2D weights (e.g.
+    embedding update), `permute_1D_sparse_data` is used instead of
+    `keyed_jagged_index_select_dim1` which doesn't support non-float or multi-dim weights.
 
     NOTE:
         `keyed_jagged_index_select_dim1` is only supported for CUDA.
     """
     if tensor.device.type == "cuda" and (
-        weights is None or weights.dtype == torch.float32
+        weights is None or (weights.dtype == torch.float32 and weights.dim() == 1)
     ):
         output = torch.ops.fbgemm.keyed_jagged_index_select_dim1(
             values=tensor,
