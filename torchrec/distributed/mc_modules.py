@@ -28,6 +28,7 @@ from typing import (
 
 import torch
 import torch.distributed as dist
+from pyre_extensions import none_throws
 from torch import nn
 from torch.distributed._shard.sharded_tensor import Shard, ShardMetadata
 from torchrec.distributed.embedding_sharding import (
@@ -951,7 +952,7 @@ class ShardedManagedCollisionCollection(
                     table_write_weights = None
                     if self._use_2d_weights:
                         n = kjt.values().numel()
-                        table_write_weights = weights_2d[
+                        table_write_weights = none_throws(weights_2d)[
                             weight_offset : weight_offset + n
                         ]
                         weight_offset += n
