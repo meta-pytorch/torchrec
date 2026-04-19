@@ -29,6 +29,7 @@ from typing import (
 
 import torch
 from torch.profiler import record_function
+from torch.utils._pytree import tree_flatten
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
     FusedKJTListSplitsAwaitable,
@@ -67,6 +68,21 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable, Pipelineable
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _batch_tensor_size(batch: Any) -> int:
+    """Compute total tensor storage size in bytes for a batch.
+
+    Uses pytree to flatten the batch into leaf tensors, then sums
+    element_size() * numel() for each. All operations are O(1) tensor
+    metadata reads — no data is accessed.
+    """
+    leaves, _ = tree_flatten(batch)
+    return sum(
+        leaf.element_size() * leaf.numel()
+        for leaf in leaves
+        if isinstance(leaf, torch.Tensor)
+    )
 
 
 def _to_device(
