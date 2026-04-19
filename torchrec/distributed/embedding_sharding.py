@@ -17,9 +17,12 @@ from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 import torch
 from torch import distributed as dist, nn
 from torchrec.distributed.dist_data import (
+    _FusedKJTDataA2AProxyAwaitable,
+    FusedKJTAllToAllTensorsAwaitable,
     KJTAllToAllTensorsAwaitable,
     SplitsAllToAllAwaitable,
 )
+from torchrec.pt2.checks import is_torchdynamo_compiling
 
 # This is required to support older torch package exports that do not contain
 # _check_int_overflow. During repackaging the
@@ -710,7 +713,10 @@ def _set_sharding_context_intra_a2a(
         tensors_awaitables,
         getattr(ctx, "sharding_contexts", []),
     ):
-        if isinstance(awaitable, KJTAllToAllTensorsAwaitable):
+        if isinstance(
+            awaitable,
+            (KJTAllToAllTensorsAwaitable, _FusedKJTDataA2AProxyAwaitable),
+        ):
             if hasattr(sharding_context, "input_splits"):
                 sharding_context.input_splits = awaitable._input_splits["values"]
             if hasattr(sharding_context, "output_splits"):
@@ -922,6 +928,17 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
             if splits_tensors and pg is not None
             else None
         )
+        self._pg = pg
+
+        # Gate fused data A2A in __init__ (eager mode) to avoid dynamo graph
+        # breaks. Stored as instance var so _wait_impl can use it.
+        self._fuse_data_a2a: bool = False
+        try:
+            self._fuse_data_a2a = torch._utils_internal.justknobs_check(
+                "pytorch/torchrec:enable_fused_kjt_data_a2a"
+            )
+        except Exception:
+            pass
 
     def _wait_impl(self) -> List[KJTListAwaitable]:
         if self._splits_awaitable:
@@ -929,7 +946,29 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
             splits_per_awaitable = _split(splits_list, self._lengths)
         else:
             splits_per_awaitable = [[] for _ in range(len(self._lengths))]
-        tensors_awaitables = []
+
+        if (
+            self._fuse_data_a2a
+            and self._pg is not None
+            and not is_torchdynamo_compiling()
+        ):
+            tensors_awaitables = self._fused_data_a2a_path(splits_per_awaitable)
+        else:
+            tensors_awaitables = self._unfused_data_a2a_path(splits_per_awaitable)
+
+        output = []
+        awaitables_per_output = _split(tensors_awaitables, self._output_lengths)
+        for awaitables, ctx in zip(awaitables_per_output, self._contexts):
+            _set_sharding_context_intra_a2a(awaitables, ctx)
+            output.append(KJTListAwaitable(awaitables, ctx))
+        return output
+
+    def _unfused_data_a2a_path(
+        self,
+        splits_per_awaitable: List[List[List[int]]],
+    ) -> List[Awaitable[KeyedJaggedTensor]]:
+        """Existing unfused code path — one KJTAllToAllTensorsAwaitable per entry."""
+        tensors_awaitables: List[Awaitable[KeyedJaggedTensor]] = []
         for splits, awaitable in zip(splits_per_awaitable, self._awaitables):
             if not splits:  # NoWait
                 assert isinstance(awaitable, Awaitable)
@@ -943,8 +982,6 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
                 output_splits = splits[:-1]
                 stride_per_rank = splits[-1]
 
-            # Log corrupted stride_per_rank at the point where splits
-            # are unpacked.
             if stride_per_rank is not None:
                 _check_int_overflow(
                     "ListOfKJTListSplitsAwaitable",
@@ -969,12 +1006,63 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
                     stride_per_rank=stride_per_rank,
                 )
             )
-        output = []
-        awaitables_per_output = _split(tensors_awaitables, self._output_lengths)
-        for awaitables, ctx in zip(awaitables_per_output, self._contexts):
-            _set_sharding_context_intra_a2a(awaitables, ctx)
-            output.append(KJTListAwaitable(awaitables, ctx))
-        return output
+        return tensors_awaitables
+
+    def _fused_data_a2a_path(
+        self,
+        splits_per_awaitable: List[List[List[int]]],
+    ) -> List[Awaitable[KeyedJaggedTensor]]:
+        """Fused code path — coalesces data A2A across all entries."""
+        # Resolve output_splits and stride_per_rank for each awaitable
+        resolved: List[
+            Optional[Tuple[KJTSplitsAllToAllMeta, List[List[int]], Optional[List[int]]]]
+        ] = []
+        nowait_results: List[Awaitable[KeyedJaggedTensor]] = []
+
+        for splits, awaitable in zip(splits_per_awaitable, self._awaitables):
+            if not splits:  # NoWait
+                assert isinstance(awaitable, Awaitable)
+                nowait_results.append(awaitable.wait())
+                resolved.append(None)
+            else:
+                assert isinstance(awaitable, KJTSplitsAllToAllMeta)
+                if awaitable._input.variable_stride_per_key():
+                    output_splits = splits
+                    stride_per_rank = None
+                else:
+                    output_splits = splits[:-1]
+                    stride_per_rank = splits[-1]
+                resolved.append((awaitable, output_splits, stride_per_rank))
+
+        # Collect fuseable entries (skip NoWait)
+        fuseable = [r for r in resolved if r is not None]
+
+        # Need at least 2 entries to benefit from fusion
+        if len(fuseable) < 2:
+            # Fall back to unfused path
+            return self._unfused_data_a2a_path(splits_per_awaitable)
+
+        assert self._pg is not None
+        fused = FusedKJTAllToAllTensorsAwaitable(
+            pg=self._pg,
+            entries=fuseable,
+        )
+
+        # Build tensors_awaitables list preserving original order
+        tensors_awaitables: List[Awaitable[KeyedJaggedTensor]] = []
+        fused_idx = 0
+        nowait_idx = 0
+        for entry in resolved:
+            if entry is None:
+                tensors_awaitables.append(nowait_results[nowait_idx])
+                nowait_idx += 1
+            else:
+                tensors_awaitables.append(
+                    _FusedKJTDataA2AProxyAwaitable(fused, fused_idx)
+                )
+                fused_idx += 1
+
+        return tensors_awaitables
 
 
 class ListOfKJTListAwaitable(Awaitable[ListOfKJTList]):

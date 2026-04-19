@@ -10,14 +10,16 @@
 import itertools
 import random
 import unittest
-from typing import Dict, Generator, Iterable, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, TypeVar, Union
 
 import hypothesis.strategies as st
 import torch
 import torch.distributed as dist
 from hypothesis import given, settings
 from torchrec.distributed.dist_data import (
+    _FusedKJTDataA2AProxyAwaitable,
     _get_recat,
+    FusedKJTAllToAllTensorsAwaitable,
     JaggedTensorAllToAll,
     KJTAllToAll,
     KJTAllToAllSplitsAwaitable,
@@ -27,6 +29,7 @@ from torchrec.distributed.dist_data import (
     SequenceEmbeddingsAllToAll,
     VariableBatchPooledEmbeddingsAllToAll,
 )
+from torchrec.distributed.embedding_sharding import KJTSplitsAllToAllMeta
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,
     get_qcomm_codecs,
@@ -1549,3 +1552,281 @@ class GetRecatOverflowTest(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.dtype, torch.int32)
+
+
+def _run_fused_kjt_a2a_test(
+    rank: int,
+    world_size: int,
+    backend: str,
+    num_entries: int,
+    is_weighted: bool,
+) -> None:
+    """Test function run in each process for FusedKJTAllToAllTensorsAwaitable."""
+    dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+    device = torch.device(f"cuda:{rank}") if backend == "nccl" else torch.device("cpu")
+    pg = dist.group.WORLD
+    assert pg is not None
+
+    B = 2  # batch size per rank
+    entries_data: List[
+        Tuple[KJTSplitsAllToAllMeta, List[List[int]], Optional[List[int]]]
+    ] = []
+    for entry_idx in range(num_entries):
+        # Use even feature counts so splits are uniform across ranks.
+        # This ensures output_splits == input_splits (symmetric A2A).
+        n_features = (2 + entry_idx) * world_size
+        keys = [f"E{entry_idx}_F{f}" for f in range(n_features)]
+        features_per_rank = n_features // world_size
+        splits = [features_per_rank] * world_size
+
+        # All ranks produce identical data for ALL features (B samples each).
+        # With uniform splits and identical data, output_splits == input_splits.
+        lengths = torch.ones(n_features * B, dtype=torch.int32, device=device)
+        total_vals = int(lengths.sum().item())
+        values = torch.arange(total_vals, dtype=torch.int64, device=device)
+        weights = torch.ones(total_vals, device=device) if is_weighted else None
+
+        kjt_kwargs: Dict[str, Any] = {
+            "keys": keys,
+            "values": values,
+            "lengths": lengths,
+        }
+        if weights is not None:
+            kjt_kwargs["weights"] = weights
+        kjt = KeyedJaggedTensor(**kjt_kwargs)
+
+        labels = ["lengths", "values"]
+        input_tensors_list: List[torch.Tensor] = [lengths, values]
+        if weights is not None:
+            labels.append("weights")
+            input_tensors_list.append(weights)
+
+        # With uniform splits: each rank sends features_per_rank * B elements
+        # to each other rank, and receives the same amount.
+        input_splits: List[List[int]] = []
+        for _label in labels:
+            per_rank = [features_per_rank * B] * world_size
+            input_splits.append(per_rank)
+
+        # Uniform splits => output_splits == input_splits
+        output_splits = input_splits
+        stride_per_rank = [B] * world_size
+
+        splits_tensors = [torch.tensor(s, device=device) for s in input_splits]
+        splits_tensors.append(torch.tensor(stride_per_rank, device=device))
+
+        # Output keys: features this rank will own after A2A.
+        # With uniform splits, rank r owns features [r*fpr, (r+1)*fpr).
+        output_keys = keys[rank * features_per_rank : (rank + 1) * features_per_rank]
+
+        meta = KJTSplitsAllToAllMeta(
+            pg=pg,
+            _input=kjt,
+            splits=splits,
+            splits_tensors=splits_tensors,
+            input_splits=input_splits,
+            input_tensors=input_tensors_list,
+            labels=labels,
+            keys=output_keys,
+            device=device,
+            stagger=1,
+        )
+        entries_data.append((meta, output_splits, stride_per_rank))
+
+    # Run FUSED path
+    fused = FusedKJTAllToAllTensorsAwaitable(pg=pg, entries=entries_data)
+    fused_kjts = fused._wait_impl()
+
+    # Verify fused output is well-formed and values are correct
+    assert (
+        len(fused_kjts) == num_entries
+    ), f"Expected {num_entries} KJTs, got {len(fused_kjts)}"
+    for i, kjt in enumerate(fused_kjts):
+        assert len(kjt.keys()) > 0, f"Entry {i} has no keys"
+        assert kjt.lengths().sum().item() == kjt.values().numel(), (
+            f"Entry {i} lengths sum ({kjt.lengths().sum().item()}) != "
+            f"values count ({kjt.values().numel()})"
+        )
+        if is_weighted:
+            assert (
+                kjt.weights_or_none() is not None
+            ), f"Entry {i} expected weights but got None"
+            assert kjt.weights().numel() == kjt.values().numel(), (
+                f"Entry {i} weights count ({kjt.weights().numel()}) != "
+                f"values count ({kjt.values().numel()})"
+            )
+
+        # Value-level check: with uniform splits and identical data on all
+        # ranks, the A2A output lengths should all be 1 (since input lengths
+        # are all 1) and values should be a contiguous range.
+        torch.testing.assert_close(
+            kjt.lengths().cpu(),
+            torch.ones(kjt.lengths().numel(), dtype=torch.int32),
+            msg=f"Entry {i} lengths values mismatch",
+        )
+        # Total values count should equal features_per_rank * B * world_size
+        n_features = (2 + i) * world_size
+        features_per_rank = n_features // world_size
+        expected_vals = features_per_rank * B * world_size
+        assert (
+            kjt.values().numel() == expected_vals
+        ), f"Entry {i} expected {expected_vals} values, got {kjt.values().numel()}"
+
+    dist.destroy_process_group()
+
+
+def _run_fused_proxy_attributes_test(
+    rank: int,
+    world_size: int,
+    backend: str,
+) -> None:
+    """Test that proxy awaitable attributes match expected values."""
+    dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+    device = torch.device(f"cuda:{rank}") if backend == "nccl" else torch.device("cpu")
+    pg = dist.group.WORLD
+    assert pg is not None
+
+    B = 2
+    entries_data: List[
+        Tuple[KJTSplitsAllToAllMeta, List[List[int]], Optional[List[int]]]
+    ] = []
+    for entry_idx in range(2):
+        # Uniform splits so output_splits == input_splits
+        n_features = (2 + entry_idx) * world_size
+        keys = [f"E{entry_idx}_F{f}" for f in range(n_features)]
+        features_per_rank = n_features // world_size
+        splits = [features_per_rank] * world_size
+
+        lengths = torch.ones(n_features * B, dtype=torch.int32, device=device)
+        total_vals = int(lengths.sum().item())
+        values = torch.arange(total_vals, dtype=torch.int64, device=device)
+
+        kjt = KeyedJaggedTensor(keys=keys, values=values, lengths=lengths)
+
+        labels = ["lengths", "values"]
+        input_tensors_list = [lengths, values]
+        input_splits = [
+            [features_per_rank * B] * world_size,
+            [features_per_rank * B] * world_size,
+        ]
+        output_splits = input_splits
+        stride_per_rank = [B] * world_size
+
+        splits_tensors = [torch.tensor(s, device=device) for s in input_splits]
+        splits_tensors.append(torch.tensor(stride_per_rank, device=device))
+
+        output_keys = keys[rank * features_per_rank : (rank + 1) * features_per_rank]
+
+        meta = KJTSplitsAllToAllMeta(
+            pg=pg,
+            _input=kjt,
+            splits=splits,
+            splits_tensors=splits_tensors,
+            input_splits=input_splits,
+            input_tensors=input_tensors_list,
+            labels=labels,
+            keys=output_keys,
+            device=device,
+            stagger=1,
+        )
+        entries_data.append((meta, output_splits, stride_per_rank))
+
+    # Build fused + proxies (no wait needed — just check attributes)
+    fused = FusedKJTAllToAllTensorsAwaitable(pg=pg, entries=entries_data)
+
+    for entry_idx, (meta, output_splits, stride_per_rank) in enumerate(entries_data):
+        proxy = _FusedKJTDataA2AProxyAwaitable(fused, entry_idx)
+
+        expected_input_splits = dict(zip(meta.labels, meta.input_splits))
+        expected_output_splits = dict(zip(meta.labels, output_splits))
+
+        assert (
+            proxy._input_splits == expected_input_splits
+        ), f"Entry {entry_idx} input_splits mismatch"
+        assert (
+            proxy._output_splits == expected_output_splits
+        ), f"Entry {entry_idx} output_splits mismatch"
+        assert (
+            proxy._stride_per_rank == stride_per_rank
+        ), f"Entry {entry_idx} stride_per_rank mismatch"
+        local_split = meta.splits[pg.rank()]
+        if local_split > 0:
+            assert proxy._recat is not None
+        else:
+            assert proxy._recat is None
+
+    # Wait to complete the A2A (required so NCCL doesn't hang on cleanup)
+    fused._wait_impl()
+
+    dist.destroy_process_group()
+
+
+class FusedKJTAllToAllTensorsTest(MultiProcessTestBase):
+    def test_fused_2_ebcs_same_labels_gloo(self) -> None:
+        self._run_multi_process_test(
+            callable=_run_fused_kjt_a2a_test,
+            world_size=2,
+            num_entries=2,
+            is_weighted=False,
+            backend="gloo",
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_fused_2_ebcs_same_labels(self) -> None:
+        self._run_multi_process_test(
+            callable=_run_fused_kjt_a2a_test,
+            world_size=2,
+            num_entries=2,
+            is_weighted=False,
+            backend="nccl",
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_fused_2_ebcs_weighted(self) -> None:
+        self._run_multi_process_test(
+            callable=_run_fused_kjt_a2a_test,
+            world_size=2,
+            num_entries=2,
+            is_weighted=True,
+            backend="nccl",
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_fused_4_ebcs(self) -> None:
+        self._run_multi_process_test(
+            callable=_run_fused_kjt_a2a_test,
+            world_size=2,
+            num_entries=4,
+            is_weighted=False,
+            backend="nccl",
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_fused_proxy_attributes_match_unfused(self) -> None:
+        self._run_multi_process_test(
+            callable=_run_fused_proxy_attributes_test,
+            world_size=2,
+            backend="nccl",
+        )
+
+    def test_fused_single_worker(self) -> None:
+        """Test that single-worker (world_size=1) short-circuits correctly."""
+        self._run_multi_process_test(
+            callable=_run_fused_kjt_a2a_test,
+            world_size=1,
+            num_entries=2,
+            is_weighted=False,
+            backend="gloo",
+        )
