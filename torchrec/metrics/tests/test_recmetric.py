@@ -16,7 +16,7 @@ from torchrec.metrics.metrics_config import BatchSizeStage, DefaultTaskInfo, Rec
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.mse import MSEMetric
 from torchrec.metrics.ne import NEMetric
-from torchrec.metrics.rec_metric import RecComputeMode, RecMetric
+from torchrec.metrics.rec_metric import RecComputeMode, RecMetric, RecMetricList
 from torchrec.metrics.test_utils import gen_test_batch, gen_test_tasks
 
 
@@ -449,3 +449,137 @@ class RecMetricTensorSizeLoggingTest(unittest.TestCase):
             weights=weights,
             required_inputs=required_inputs,
         )
+
+    @patch(
+        "torchrec.metrics.rec_metric.EventLoggingHandler.n_batch_log_event",
+    )
+    def test_update_deduplicates_across_unfused_metrics(
+        self, mock_log_event: Any
+    ) -> None:
+        """Verify logging fires once when multiple UNFUSED metrics process the same batch."""
+        ne = NEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=0,
+        )
+        mse = MSEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=0,
+        )
+        metric_list = RecMetricList([ne, mse])
+        model_output = gen_test_batch(128)
+        labels, predictions, weights, _ = parse_task_model_outputs(
+            [DefaultTaskInfo], model_output
+        )
+        metric_list.update(predictions=predictions, labels=labels, weights=weights)
+
+        mock_log_event.assert_called_once()
+
+    @patch(
+        "torchrec.metrics.rec_metric.EventLoggingHandler.n_batch_log_event",
+    )
+    def test_update_deduplicates_across_fused_metrics(
+        self, mock_log_event: Any
+    ) -> None:
+        """Verify logging fires once when multiple FUSED metrics process the same batch."""
+        ne = NEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=0,
+        )
+        mse = MSEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=0,
+        )
+        metric_list = RecMetricList([ne, mse])
+        model_output = gen_test_batch(128)
+        labels, predictions, weights, _ = parse_task_model_outputs(
+            [DefaultTaskInfo], model_output
+        )
+        metric_list.update(predictions=predictions, labels=labels, weights=weights)
+
+        mock_log_event.assert_called_once()
+
+    @patch(
+        "torchrec.metrics.rec_metric.EventLoggingHandler.n_batch_log_event",
+    )
+    def test_fused_update_logs_post_transformation_shapes(
+        self, mock_log_event: Any
+    ) -> None:
+        """Verify that in FUSED mode, logged shapes reflect the stacked
+        (n_tasks, batch_size) tensors, not the original dict."""
+        ne = NEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=0,
+        )
+        model_output = gen_test_batch(128)
+        labels, predictions, weights, _ = parse_task_model_outputs(
+            [DefaultTaskInfo], model_output
+        )
+        ne.update(predictions=predictions, labels=labels, weights=weights)
+
+        mock_log_event.assert_called_once()
+        metadata = mock_log_event.call_args[1]["metadata"]
+        # FUSED mode stacks per-task tensors into a single tensor,
+        # so the shape should be reported (not a dict of numels).
+        self.assertIn("predictions_shape", metadata)
+        self.assertIn("labels_shape", metadata)
+
+    @patch(
+        "torchrec.metrics.rec_metric.EventLoggingHandler.n_batch_log_event",
+    )
+    def test_fused_update_limit_deduplicates_logging(self, mock_log_event: Any) -> None:
+        """Verify that when fused_update_limit > 0, the buffered flush
+        still respects the _log_tensors flag from RecMetricList."""
+        ne = NEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=5,
+        )
+        mse = MSEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=64,
+            tasks=[DefaultTaskInfo],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=100,
+            fused_update_limit=5,
+        )
+        metric_list = RecMetricList([ne, mse])
+        model_output = gen_test_batch(128)
+        labels, predictions, weights, _ = parse_task_model_outputs(
+            [DefaultTaskInfo], model_output
+        )
+        # Send 5 batches to trigger the fused update flush.
+        for _ in range(5):
+            metric_list.update(predictions=predictions, labels=labels, weights=weights)
+
+        # Only the first metric (ne) should have logged, not both.
+        mock_log_event.assert_called_once()
