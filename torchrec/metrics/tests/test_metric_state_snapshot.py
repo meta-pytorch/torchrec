@@ -8,6 +8,7 @@
 # pyre-strict
 
 import unittest
+from typing import cast
 
 import torch
 from torchrec.metrics.auc import _state_reduction
@@ -338,6 +339,55 @@ class MetricStateSnapshotTest(unittest.TestCase):
             expected_states.update(task_states)
 
         assert_tensor_dict_equals(snapshot.metric_states, expected_states)
+
+    def test_from_metrics_with_list_state_no_reduction_fn(self) -> None:
+        original_tensor = torch.tensor([1.0, 2.0])
+        initial_states = {"buffer": [original_tensor]}
+        mock_metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=self.my_rank,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            initial_states=initial_states,
+            reduction_fn=_state_reduction,
+            is_tensor_list=True,
+        )
+        # TorchMetrics converts string reductions to callables, so patch directly.
+        for computation in mock_metric._metrics_computations:
+            cast(dict, computation._reductions)["buffer"] = None
+
+        rec_metrics = RecMetricList([mock_metric])
+        snapshot = MetricStateSnapshot.from_metrics(rec_metrics)
+
+        snapshot_list = snapshot.metric_states[
+            "test_task_MockRecMetricComputation_buffer"
+        ]
+        self.assertIsInstance(snapshot_list, list)
+        self.assertEqual(len(snapshot_list), 1)
+        self.assertIsNot(snapshot_list[0], original_tensor)
+        self.assertNotEqual(snapshot_list[0].data_ptr(), original_tensor.data_ptr())
+        torch.testing.assert_close(snapshot_list[0], original_tensor)
+
+    def test_from_metrics_with_non_tensor_non_list_state(self) -> None:
+        mock_metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=self.my_rank,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            initial_states={"cross_entropy_sum": torch.tensor(1.0)},
+            reduction_fn="sum",
+        )
+        for computation in mock_metric._metrics_computations:
+            cast(dict, computation._reductions)["scalar_attr"] = None
+            object.__setattr__(computation, "scalar_attr", 42)
+
+        rec_metrics = RecMetricList([mock_metric])
+        snapshot = MetricStateSnapshot.from_metrics(rec_metrics)
+
+        self.assertEqual(
+            snapshot.metric_states["test_task_MockRecMetricComputation_scalar_attr"],
+            42,
+        )
 
     def test_from_metrics_no_throughput_metric(self) -> None:
         """Test creating snapshot with None throughput metric."""
