@@ -770,6 +770,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             logger.info("fill_pipeline: failed to load batch i+1")
             return
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def _wait_for_batch(self) -> None:
         batch_id = self.contexts[0].index if len(self.contexts) > 0 else "?"
         with record_function(f"## wait_for_batch {batch_id} ##"):
@@ -1069,6 +1072,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             logger.info("_next_batch: dataloader exhausted")
         return batch
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def start_sparse_data_dist(
         self, batch: Optional[In], context: TrainPipelineContext
     ) -> None:
@@ -1086,6 +1092,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 with use_context_for_postprocs(self._pipelined_postprocs, context):
                     _start_data_dist(self._pipelined_modules, batch, context)
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def wait_sparse_data_dist(self, context: TrainPipelineContext) -> None:
         """
         Waits on the input dist splits requests to get the input dist tensors requests,
