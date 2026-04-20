@@ -7,8 +7,6 @@
 
 # pyre-strict
 
-#!/usr/bin/env python3
-
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
