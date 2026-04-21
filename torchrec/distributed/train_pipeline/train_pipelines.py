@@ -26,6 +26,7 @@ from typing import (
     Optional,
     Tuple,
     Type,
+    TYPE_CHECKING,
     Union,
 )
 
@@ -37,8 +38,60 @@ from torchrec.distributed.embedding import EmbeddingCollectionAwaitable  # noqa:
 from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionAwaitable,  # noqa: F401
 )
-from torchrec.distributed.logger import LazyStr, one_time_logger, one_time_rank0_logger
-from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+
+try:
+    from torchrec.distributed.logger import (
+        LazyStr,
+        one_time_logger,
+        one_time_rank0_logger,
+    )
+except Exception:
+    # Safety measure against torch package issues: old packages may not have
+    # these symbols in their archived torchrec.distributed.logger
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.train_pipelines.import_failure.logger"
+    )
+    one_time_logger = logging.getLogger(__name__)
+    one_time_rank0_logger = logging.getLogger(__name__)
+
+    class LazyStr:  # pyre-ignore[11]
+        def __init__(self, fn: Any) -> None:
+            self._fn = fn
+
+        def __str__(self) -> str:
+            return self._fn()
+
+
+try:
+    from torchrec.distributed.logging_handlers import (
+        EventLoggingHandler,
+        TorchrecComponent,
+    )
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.train_pipelines.import_failure.logging_handlers"
+    )
+
+    if TYPE_CHECKING:
+        from torchrec.distributed.logging_handlers import (
+            EventLoggingHandler,
+            TorchrecComponent,
+        )
+    else:
+        from enum import Enum as _Enum
+
+        class TorchrecComponent(_Enum):
+            TRAIN_PIPELINE = "train_pipeline"
+
+        class EventLoggingHandler:
+            @staticmethod
+            def event_logger(*args: object, **kwargs: object) -> Callable:
+                def decorator(func: Callable) -> Callable:
+                    return func
+
+                return decorator
+
+
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.backward_injection import (
     BackwardHookWork,
