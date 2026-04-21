@@ -42,7 +42,7 @@ from torchrec.distributed.types import (
     PipelineType,
     ShardingType,
 )
-from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
+from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS, DataType
 
 try:
     # This is a safety measure against torch package issues for when
@@ -203,10 +203,13 @@ class EmbeddingStorageEstimator(ShardEstimator):
             # input indices can be of int32, but in TBE they get converted to int64 anyway
             input_data_type_size = BIGINT_DTYPE
 
+            # When output_dtype is not explicitly set, default to FP32 (4 bytes)
+            # because the embedding kernel outputs FP32 by default
+            # (SparseType.FP32), regardless of the weight storage precision.
             output_data_type_size: float = (
                 DATA_TYPE_NUM_BITS[sharding_option.output_dtype] / 8
-                if sharding_option.output_dtype
-                else sharding_option.tensor.element_size()
+                if isinstance(sharding_option.output_dtype, DataType)
+                else 4.0  # FP32 default, matching embedding kernel output dtype
             )
 
             mpp_conf = (

@@ -1636,6 +1636,68 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
 
         self.assertEqual(hbms[0], hbms[1])
 
+    def test_output_data_type_size_uses_fp32_default(self) -> None:
+        """Output size estimation should use FP32 (4 bytes) when output_dtype is
+        not explicitly set, since the embedding kernel defaults to FP32 output
+        (SparseType.FP32) regardless of weight storage precision."""
+        topology = Topology(world_size=2, compute_device="cuda")
+        estimator = EmbeddingStorageEstimator(topology=topology)
+
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_bf16",
+                feature_names=["feature_0"],
+                data_type=DataType.BF16,
+            )
+        ]
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+        ebc_module = model.sparse.ebc
+        assert isinstance(ebc_module, torch.nn.Module)
+
+        bf16_tensor = torch.zeros(100, 10, dtype=torch.bfloat16, device="meta")
+        self.assertEqual(bf16_tensor.element_size(), 2)
+
+        sharding_option = ShardingOption(
+            name="table_bf16",
+            tensor=bf16_tensor,
+            module=("sparse.ebc", ebc_module),
+            input_lengths=[1.0],
+            batch_size=BATCH_SIZE,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            partition_by="host",
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=[Shard(size=[100, 10], offset=[0, 0])],
+        )
+
+        sharder_data_map = {
+            sharding_option.module_type_key: SharderData(
+                fused_params={},
+                qcomm_dtype_sizes={},
+                storage_usage_type=StorageUsageType.DEFAULT,
+            ),
+        }
+
+        estimator.estimate([sharding_option], sharder_data_map=sharder_data_map)
+
+        shard = sharding_option.shards[0]
+        self.assertIsNotNone(shard.storage)
+
+        # See batched_embedding_kernel.py:2865 for FP32 default:
+        #   output_dtype = fused_params.get("output_dtype", SparseType.FP32)
+        bf16_tensor_size = 100 * 10 * 2  # weight storage
+        input_size = math.ceil(1.0 * BATCH_SIZE * 2 * 8)  # BIGINT_DTYPE
+        expected_output_fp32 = BATCH_SIZE * 2 * 10 * 4  # FP32 output
+        expected_hbm = bf16_tensor_size + input_size + expected_output_fp32
+
+        self.assertEqual(
+            shard.storage.hbm,
+            expected_hbm,
+            f"Output sizing should use FP32 (4 bytes) not weight dtype "
+            f"(BF16 = 2 bytes). Expected HBM={expected_hbm}, got {shard.storage.hbm}.",
+        )
+
     def test_zero_dimension_tensor_raises_value_error(self) -> None:
         topology = Topology(world_size=2, compute_device="cuda")
         estimator = EmbeddingStorageEstimator(topology=topology)
