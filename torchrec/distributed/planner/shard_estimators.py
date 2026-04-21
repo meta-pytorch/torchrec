@@ -783,9 +783,8 @@ def _calculate_storage_specific_sizes(
         sharding_type,
     )
     optimizer_sizes = _calculate_optimizer_sizes(
-        tensor_sizes,
+        shard_sizes,
         optimizer_class,
-        shape,
     )
     cache_aux_state_sizes: List[int] = _calculate_cache_aux_state_sizes(
         shard_sizes,
@@ -839,24 +838,79 @@ def _calculate_cache_aux_state_sizes(
 
 
 def _calculate_optimizer_sizes(
-    tensor_sizes: List[int],
+    shard_sizes: List[List[int]],
     optimizer_class: Optional[Type[torch.optim.Optimizer]],
-    sharding_tensor_shape: torch.Size,
 ) -> List[int]:
-    optimizer_multiplier: float = _get_optimizer_multipler(
-        optimizer_class,
-        sharding_tensor_shape,
-    )
-    optimizer_sizes: List[int] = [
-        math.ceil(tensor_size * optimizer_multiplier) for tensor_size in tensor_sizes
-    ]
-    return optimizer_sizes
+    """Estimate FBGEMM-allocated optimizer state bytes per shard.
+
+    Memory decomposition:
+      - Optimizer class -> state schema (which buffers, full vs rowwise).
+      - Sharding        -> how the schema is partitioned per rank
+                           (this function operates on a single shard).
+      - FBGEMM          -> state dtype (float32, independent of weight
+                           dtype).
+
+    So bytes per shard = (count and shape from optimizer) * 4 (FBGEMM).
+
+    Source of truth for the float32 invariant: `momentum{1,2}_dtype` in
+    `fbgemm_gpu/split_table_batched_embeddings_ops_training.py`
+    (SplitTableBatchedEmbeddingBagsCodegen.__init__) defaults to
+    `torch.float32`; an `assert` gates `optimizer_state_dtypes` overrides
+    to PARTIAL_ROWWISE_ADAM / ENSEMBLE_ROWWISE_ADAGRAD only. Treating
+    state as float32 is exact for the gated optimizers and a conservative
+    upper bound for the two configurable ones — safe for memory planning.
+
+    Per-shard state structure (all buffers float32):
+
+        Optimizer              momentum1   momentum2
+        ---------              ---------   ---------
+        SGD / None             —           —
+        Adam / LAMB            full        full
+        RowWiseAdagrad         rowwise     —
+        PartialRowWiseAdam     full        rowwise
+        PartialRowWiseLAMB     full        rowwise
+        Adagrad / LarsSGD      full        —          (catch-all)
+
+    where  full    = prod(shard_size) elements,
+           rowwise = shard_size[0] elements (one per embedding row).
+    """
+    STATE_DTYPE_BYTES = 4  # float32; see docstring
+
+    if not optimizer_class or optimizer_class in [
+        torch.optim.SGD,
+        trec_optim.SGD,
+    ]:
+        return [0] * len(shard_sizes)
+
+    if optimizer_class in [
+        torch.optim.Adam,
+        trec_optim.Adam,
+        trec_optim.LAMB,
+    ]:
+        return [prod(size) * STATE_DTYPE_BYTES * 2 for size in shard_sizes]
+
+    if optimizer_class == trec_optim.RowWiseAdagrad:
+        return [size[0] * STATE_DTYPE_BYTES for size in shard_sizes]
+
+    if optimizer_class in [
+        trec_optim.PartialRowWiseAdam,
+        trec_optim.PartialRowWiseLAMB,
+    ]:
+        return [
+            prod(size) * STATE_DTYPE_BYTES + size[0] * STATE_DTYPE_BYTES
+            for size in shard_sizes
+        ]
+
+    return [prod(size) * STATE_DTYPE_BYTES for size in shard_sizes]
 
 
 def _get_optimizer_multipler(
     optimizer_class: Optional[Type[torch.optim.Optimizer]],
     shape: torch.Size,
 ) -> float:
+    """Deprecated: use _calculate_optimizer_sizes instead.
+
+    Kept for backward compatibility with external callers."""
     if not optimizer_class:
         return 0.0
     if optimizer_class in [torch.optim.SGD, trec_optim.SGD]:
