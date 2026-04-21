@@ -7,8 +7,6 @@
 
 # pyre-strict
 
-#!/usr/bin/env python3
-
 import copy
 import itertools
 from collections import defaultdict
