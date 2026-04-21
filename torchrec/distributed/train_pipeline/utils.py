@@ -38,7 +38,29 @@ from torchrec.distributed.embedding_sharding import (
     KJTSplitsAllToAllMeta,
 )
 from torchrec.distributed.embedding_types import KJTList
-from torchrec.distributed.logger import LazyStr, one_time_logger, one_time_rank0_logger
+
+try:
+    from torchrec.distributed.logger import (
+        LazyStr,
+        one_time_logger,
+        one_time_rank0_logger,
+    )
+except Exception:
+    # Safety measure against torch package issues: old packages may not have
+    # LazyStr/one_time_logger in their archived torchrec.distributed.logger
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.utils.import_failure.logger"
+    )
+
+    class LazyStr:  # pyre-ignore[11]: Annotation for no-op fallback
+        def __init__(self, fn: Any) -> None:
+            self._fn = fn
+
+        def __str__(self) -> str:
+            return self._fn()
+
+    one_time_logger = logging.getLogger(__name__)
+    one_time_rank0_logger = logging.getLogger(__name__)
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
