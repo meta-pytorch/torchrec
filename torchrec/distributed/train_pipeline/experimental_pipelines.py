@@ -210,6 +210,9 @@ class TrainEvalHybridPipelineBase(TrainPipelineSparseDist[In, Out]):
         # the input_dist of batches[0] has been invoked in previous iter. TODO: fact check
         self._wait_for_batch()
 
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
+
         # Start sparse data distribution for the next batch (overlapped with current forward)
         if len(self.batches) >= 2:
             # Invoke splits all_to_all comms (first part of input_dist)
@@ -310,6 +313,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
         multi_thread: bool = False,
         pipeline_depth: int = 2,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -321,6 +325,7 @@ class EvalPipelineCPUSparse(TrainPipelineSparseDist[In, Out]):
             pipeline_postproc=pipeline_postproc,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
         assert pipeline_depth in (1, 2), "pipeline_depth must be 1 or 2"
         self._pipeline_depth = pipeline_depth
@@ -703,6 +708,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -717,6 +723,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
             enqueue_batch_after_forward=False,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
         self._copy_executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=1)
         self.batches: Deque[Optional[In]] = cast(Deque[Optional[In]], FutureDeque())
@@ -814,6 +821,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -828,6 +836,7 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
         self._output_dist_site = InjectionSite(
             fqn=site_fqn,
@@ -880,6 +889,9 @@ class TrainPipelineSparseDistBwdOpt(TrainPipelineSparseDist[In, Out]):
         # wait for batches[0] being available on device, this should always be completed since
         # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
         self._wait_for_batch()
+
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
 
         if len(self.batches) >= 2:
             # invoke splits all_to_all comms (first part of input_dist)
@@ -954,6 +966,7 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -968,6 +981,7 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
         self._output_dist_site = InjectionSite(
             fqn=site_fqn,
@@ -1017,6 +1031,9 @@ class TrainPipelineSparseDistOptStash(TrainPipelineSparseDist[In, Out]):
                 self._optimizer.zero_grad()
 
         self._wait_for_batch()
+
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
 
         if len(self.batches) >= 2:
             self.start_sparse_data_dist(self.batches[1], self.contexts[1])
@@ -1108,6 +1125,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         free_features_storage_early: bool = False,
         delay_stash: bool = False,
         stash_site_fqn: Optional[str] = None,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1122,6 +1140,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
         if isinstance(site_fqn, str):
             self._injection_site = InjectionSite(
