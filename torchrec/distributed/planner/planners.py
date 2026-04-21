@@ -103,22 +103,26 @@ try:
         log_planner_config,
         log_planning_result,
         log_storage_reservation,
+        log_table_assignment,
     )
 except Exception:
     torch._C._log_api_usage_once(
         "torchrec.distributed.planner.planners.import_failure.logging_handlers"
     )
 
-    def log_offloading_summary(*args, **kwargs) -> None:
+    def log_offloading_summary(*args: object, **kwargs: object) -> None:
         pass
 
-    def log_planner_config(*args, **kwargs) -> None:
+    def log_planner_config(*args: object, **kwargs: object) -> None:
         pass
 
-    def log_planning_result(*args, **kwargs) -> None:
+    def log_planning_result(*args: object, **kwargs: object) -> None:
         pass
 
-    def log_storage_reservation(*args, **kwargs) -> None:
+    def log_storage_reservation(*args: object, **kwargs: object) -> None:
+        pass
+
+    def log_table_assignment(*args: object, **kwargs: object) -> None:
         pass
 
 
@@ -784,6 +788,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             )
 
             log_offloading_summary(best_plan, self.__class__.__name__)
+            log_table_assignment(best_plan, self.__class__.__name__)
 
             return sharding_plan
         else:
