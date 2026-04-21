@@ -68,6 +68,7 @@ from torchrec.distributed.train_pipeline.tracing import PipelinedPostproc
 from torchrec.distributed.train_pipeline.types import PipelineState
 from torchrec.distributed.train_pipeline.utils import (
     _batch_tensor_size,
+    _clear_input_dist_tensors,
     _override_input_dist_forwards,
     _pipeline_detach_model,
     _rewrite_model,
@@ -537,6 +538,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         enqueue_batch_after_forward: bool = False,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -548,6 +550,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._free_features_storage_early = free_features_storage_early
         self._batch_count = 0
         self._inplace_copy_batch_size_logged = False
+        self._clear_data_dist_inputs = clear_data_dist_inputs
 
         logger.info(
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
@@ -770,6 +773,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             logger.info("fill_pipeline: failed to load batch i+1")
             return
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def _wait_for_batch(self) -> None:
         batch_id = self.contexts[0].index if len(self.contexts) > 0 else "?"
         with record_function(f"## wait_for_batch {batch_id} ##"):
@@ -817,6 +823,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         # wait for batches[0] being available on device, this should always be completed since
         # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
         self._wait_for_batch()
+
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
 
         if len(self.batches) >= 2:
             # invoke splits all_to_all comms (first part of input_dist)
@@ -1069,6 +1078,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             logger.info("_next_batch: dataloader exhausted")
         return batch
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def start_sparse_data_dist(
         self, batch: Optional[In], context: TrainPipelineContext
     ) -> None:
@@ -1086,6 +1098,9 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 with use_context_for_postprocs(self._pipelined_postprocs, context):
                     _start_data_dist(self._pipelined_modules, batch, context)
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
+    )
     def wait_sparse_data_dist(self, context: TrainPipelineContext) -> None:
         """
         Waits on the input dist splits requests to get the input dist tensors requests,
@@ -1099,6 +1114,19 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                         context.input_dist_tensors_requests[name] = request
         context.input_dist_splits_requests.clear()
         context.fused_splits_awaitables.clear()
+
+    def clear_sparse_data_dist_inputs(self, context: TrainPipelineContext) -> None:
+        """
+        Clears the input dist tensors requests from the context.
+        """
+        # Free input tensor storage early, now that AllToAll collectives are in flight.
+        one_time_rank0_logger.info(
+            f"{self.__class__.__name__} clear_input_dist_tensors"
+        )
+        logger.info(f"{self.__class__.__name__} clear_input_dist_tensors")
+        # pyrefly: ignore [bad-argument-type]
+        with self._stream_context(self._data_dist_stream):
+            _clear_input_dist_tensors(context)
 
     def _copy_batch_to_gpu(self, dataloader_iter: Iterator[In]) -> Optional[In]:
         """
@@ -1245,6 +1273,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
         ] = None,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1259,6 +1288,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
             enqueue_batch_after_forward=False,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
 
         # SDD Lite only uses memcpy stream for H2D copy.
@@ -1407,6 +1437,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         enable_inplace_copy_batch: bool = False,
         enqueue_batch_after_forward: bool = False,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1420,6 +1451,7 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             enqueue_batch_after_forward=enqueue_batch_after_forward,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
         self._embedding_lookup_after_data_dist = embedding_lookup_after_data_dist
 
@@ -1513,6 +1545,9 @@ class TrainPipelineFusedSparseDist(TrainPipelineSparseDist[In, Out]):
         # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
         self._wait_for_batch()
 
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
+
         if len(self.batches) >= 2:
             # invoke splits all_to_all comms (first part of input_dist)
             self.start_sparse_data_dist(self.batches[1], self.contexts[1])
@@ -1601,6 +1636,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
         dmp_collection_sync_interval_batches: Optional[int] = 1,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1614,6 +1650,7 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             dmp_collection_sync_interval_batches=dmp_collection_sync_interval_batches,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
         self._start_batch = start_batch
         self._stash_gradients = stash_gradients
@@ -1700,6 +1737,9 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
                 f"training stopped at {self._batch_count} batches"
             )
             raise StopIteration
+
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
 
         if len(self.batches) >= 3:
             self.start_sparse_data_dist(
@@ -1983,6 +2023,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         ] = None,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1995,6 +2036,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             custom_model_fwd=custom_model_fwd,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
         self._prefetch_stream: Optional[torch.Stream] = (
             (torch.get_device_module(device).Stream())
@@ -2205,6 +2247,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         pipeline_postproc: bool = False,
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -2215,6 +2258,7 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             pipeline_postproc=pipeline_postproc,
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
         self._batch_loader: Optional[DataLoadingThread[In]] = None
 
@@ -2272,6 +2316,9 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         with record_function("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self.batches[0]), self._data_dist_stream)
 
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
+
         if len(self.batches) >= 2:
             self.start_sparse_data_dist(self.batches[1], self.contexts[1])
 
@@ -2328,6 +2375,9 @@ class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
         # wait for batches[0] being available on device, this should always be completed since
         # the input_dist of batches[0] has be invoked in previous iter. TODO: fact check
         self._wait_for_batch()
+
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
 
         if len(self.batches) >= 2:
             # invoke splits all_to_all comms (first part of input_dist)
@@ -2684,6 +2734,7 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
             Callable[[Optional[In]], Tuple[torch.Tensor, Out]]
         ] = None,
         free_features_storage_early: bool = False,
+        clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
             model,
@@ -2695,6 +2746,7 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
             pipeline_postproc,
             custom_model_fwd,
             free_features_storage_early=free_features_storage_early,
+            clear_data_dist_inputs=clear_data_dist_inputs,
         )
 
         torch._logging.set_logs(compiled_autograd_verbose=True)
@@ -2769,6 +2821,9 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
 
         with record_function("## wait_for_batch ##"):
             _wait_for_batch(cast(In, self.batches[0]), self._data_dist_stream)
+
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
 
         if len(self.batches) >= 2:
             self.start_sparse_data_dist(self.batches[1], self.contexts[1])

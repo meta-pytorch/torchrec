@@ -33,6 +33,7 @@ from torch.utils._pytree import tree_flatten
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
     FusedKJTListSplitsAwaitable,
+    KJTListAwaitable,
     KJTListSplitsAwaitable,
     KJTSplitsAllToAllMeta,
 )
@@ -197,6 +198,21 @@ def _clear_releasable_inputs(context: TrainPipelineContext) -> None:
             return msg
 
         one_time_logger.info(LazyStr(get_kjt_size))
+
+
+def _clear_input_dist_tensors(context: TrainPipelineContext) -> None:
+    """Free input tensor storage for all in-flight KJT AllToAll operations.
+
+    Iterates over input_dist_tensors_requests and calls clear_inputs() on each
+    KJTAllToAllTensorsAwaitable. This waits for the AllToAll collectives to
+    complete and frees the input tensor storage early, before _wait_impl() is
+    called during the model forward pass.
+    """
+    for request in context.input_dist_tensors_requests.values():
+        if isinstance(request, KJTListAwaitable):
+            for awaitable in request.awaitables:
+                if isinstance(awaitable, KJTAllToAllTensorsAwaitable):
+                    awaitable.clear_inputs()
 
 
 def _start_data_dist(

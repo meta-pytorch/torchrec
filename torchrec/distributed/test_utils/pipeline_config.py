@@ -61,6 +61,7 @@ class PipelineConfig:
     pipeline: str = "base"
     enable_inplace_copy_batch: bool = False
     free_features_storage_early: bool = False
+    clear_data_dist_inputs: bool = False
     pipeline_postproc: bool = False
     kwargs: Dict[str, Any] = field(default_factory=dict)
 
@@ -151,6 +152,7 @@ class PipelineConfig:
                     optimizer=opt,
                     device=device,
                     free_features_storage_early=self.free_features_storage_early,
+                    clear_data_dist_inputs=self.clear_data_dist_inputs,
                     **self.get_kwargs(start_batch=0),
                 )
             case "fused":
@@ -160,6 +162,7 @@ class PipelineConfig:
                     device=device,
                     enable_inplace_copy_batch=self.enable_inplace_copy_batch,
                     free_features_storage_early=self.free_features_storage_early,
+                    clear_data_dist_inputs=self.clear_data_dist_inputs,
                     **self.get_kwargs(emb_lookup_stream="data_dist"),
                 )
             case _:
@@ -171,5 +174,6 @@ class PipelineConfig:
                     device=device,
                     enable_inplace_copy_batch=self.enable_inplace_copy_batch,
                     free_features_storage_early=self.free_features_storage_early,
+                    clear_data_dist_inputs=self.clear_data_dist_inputs,
                     **self.get_kwargs(),
                 )

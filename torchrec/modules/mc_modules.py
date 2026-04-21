@@ -7,8 +7,6 @@
 
 # pyre-strict
 
-#!/usr/bin/env python3
-
 import abc
 from logging import getLogger, Logger
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
@@ -1299,7 +1297,7 @@ class MCHManagedCollisionModule(ManagedCollisionModule):
         ]
 
         # NOTE evicted ids for emb reset
-        # if evicted flag is already set, then existing evicted ids havent been
+        # if evicted flag is already set, then existing evicted ids haven't been
         # consumed by evict(). append new evicted ids to the list
         if self._evicted:
             self._evicted_emb_indices = torch.unique(

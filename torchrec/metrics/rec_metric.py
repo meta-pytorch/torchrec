@@ -7,8 +7,6 @@
 
 # pyre-strict
 
-#!/usr/bin/env python3
-
 import abc
 import inspect
 import itertools
@@ -396,6 +394,7 @@ class RecMetric(nn.Module, abc.ABC):
             self.LABELS: [],
             self.WEIGHTS: [],
         }
+        self._fused_update_log_tensors: List[bool] = []
         #  Dict[str, Any]]`.
         # pyrefly: ignore[bad-assignment]
         self.enable_pt2_compile: bool = kwargs.get("enable_pt2_compile", False)
@@ -566,10 +565,13 @@ class RecMetric(nn.Module, abc.ABC):
         ):
             return
         fused_arguments = self._fuse_update_buffers()
+        log_tensors = any(self._fused_update_log_tensors)
+        self._fused_update_log_tensors.clear()
         self._update(
             predictions=fused_arguments[self.PREDICTIONS],
             labels=fused_arguments[self.LABELS],
             weights=fused_arguments.get(self.WEIGHTS, None),
+            _log_tensors=log_tensors,
         )
 
     def _create_default_weights(self, predictions: torch.Tensor) -> torch.Tensor:
@@ -623,8 +625,30 @@ class RecMetric(nn.Module, abc.ABC):
                 f"{name}_numel": str({k: v.numel() for k, v in tensor.items()}),
             }
 
+    @torch.compiler.disable
+    def _log_tensor_sizes(
+        self,
+        predictions: RecModelOutput,
+        labels: RecModelOutput,
+        weights: Optional[RecModelOutput],
+    ) -> None:
+        """Log tensor size metadata for debugging."""
+        metadata: Dict[str, str] = {}
+        metadata.update(self._get_tensor_size_metadata("predictions", predictions))
+        metadata.update(self._get_tensor_size_metadata("labels", labels))
+        if weights is not None:
+            metadata.update(self._get_tensor_size_metadata("weights", weights))
+        # n_batch_log_event samples every 1000 calls to avoid logging to Scuba every batch.
+        EventLoggingHandler.n_batch_log_event(
+            component=TorchrecComponent.REC_METRICS.value,
+            event_name="update",
+            event_type=EventType.INFO,
+            metadata=metadata,
+        )
+
     def _update_fused(
         self,
+        log_tensors: bool,
         predictions: RecModelOutput,
         labels: RecModelOutput,
         weights: Optional[RecModelOutput],
@@ -680,6 +704,9 @@ class RecMetric(nn.Module, abc.ABC):
         else:
             assert isinstance(weights, torch.Tensor)
             weights = weights.view(len(self._tasks), -1)
+        # Log post-transformation tensor sizes for FUSED mode.
+        if log_tensors:
+            self._log_tensor_sizes(predictions, labels, weights)
         if self._should_validate_update:
             # has_valid_weights is a tensor of bool whose length equals to the number
             # of tasks. Each value in it is corresponding to whether the weights
@@ -710,6 +737,7 @@ class RecMetric(nn.Module, abc.ABC):
 
     def _update_unfused(
         self,
+        log_tensors: bool,
         predictions: RecModelOutput,
         labels: RecModelOutput,
         weights: Optional[RecModelOutput],
@@ -720,6 +748,9 @@ class RecMetric(nn.Module, abc.ABC):
         Iterates over tasks and updates each metric computation independently.
         """
         original_required_inputs = kwargs.get("required_inputs")
+        # Log pre-iteration tensor sizes for UNFUSED mode.
+        if log_tensors:
+            self._log_tensor_sizes(predictions, labels, weights)
         for task, metric_ in zip(self._tasks, self._metrics_computations):
             if task.name not in predictions:
                 continue
@@ -808,20 +839,10 @@ class RecMetric(nn.Module, abc.ABC):
         predictions: RecModelOutput,
         labels: RecModelOutput,
         weights: Optional[RecModelOutput],
+        _log_tensors: bool = True,
         **kwargs: Dict[str, Any],
     ) -> None:
-        metadata: Dict[str, str] = {}
-        metadata.update(self._get_tensor_size_metadata("predictions", predictions))
-        metadata.update(self._get_tensor_size_metadata("labels", labels))
-        if weights is not None:
-            metadata.update(self._get_tensor_size_metadata("weights", weights))
-        # n_batch_log_event samples every 1000 calls to avoid logging to Scuba every batch.
-        EventLoggingHandler.n_batch_log_event(
-            component=TorchrecComponent.REC_METRICS.value,
-            event_name="update",
-            event_type=EventType.INFO,
-            metadata=metadata,
-        )
+        log_tensors: bool = _log_tensors
         with torch.no_grad():
             if self._should_clone_update_inputs:
                 predictions, labels, weights, kwargs = self.clone_update_inputs(
@@ -832,9 +853,11 @@ class RecMetric(nn.Module, abc.ABC):
                 RecComputeMode.FUSED_TASKS_COMPUTATION,
                 RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION,
             ]:
-                self._update_fused(predictions, labels, weights, **kwargs)
+                self._update_fused(log_tensors, predictions, labels, weights, **kwargs)
             else:
-                self._update_unfused(predictions, labels, weights, **kwargs)
+                self._update_unfused(
+                    log_tensors, predictions, labels, weights, **kwargs
+                )
 
     @pt2_compile_callable
     def update(
@@ -846,15 +869,21 @@ class RecMetric(nn.Module, abc.ABC):
         **kwargs: Dict[str, Any],
     ) -> None:
         with record_function(f"## {self.__class__.__name__}:update ##"):
+            log_tensors = bool(kwargs.pop("_log_tensors", True))
             if self._fused_update_limit > 0:
                 self._update_buffers[self.PREDICTIONS].append(predictions)
                 self._update_buffers[self.LABELS].append(labels)
                 if weights is not None:
                     self._update_buffers[self.WEIGHTS].append(weights)
+                self._fused_update_log_tensors.append(log_tensors)
                 self._check_fused_update(force=False)
             else:
                 self._update(
-                    predictions=predictions, labels=labels, weights=weights, **kwargs
+                    predictions=predictions,
+                    labels=labels,
+                    weights=weights,
+                    _log_tensors=log_tensors,
+                    **kwargs,
                 )
 
     # The implementation of compute is very similar to local_compute, but compute overwrites
@@ -1001,13 +1030,17 @@ class RecMetricList(nn.Module):
         *,
         predictions: RecModelOutput,
         labels: RecModelOutput,
-        weights: RecModelOutput,
+        weights: Optional[RecModelOutput],
         **kwargs: Dict[str, Any],
     ) -> None:
-        for metric in self.rec_metrics:
+        for i, metric in enumerate(self.rec_metrics):
             # pyrefly: ignore[not-callable]
             metric.update(
-                predictions=predictions, labels=labels, weights=weights, **kwargs
+                predictions=predictions,
+                labels=labels,
+                weights=weights,
+                _log_tensors=(i == 0),
+                **kwargs,
             )
 
     def compute(self) -> Dict[str, torch.Tensor]:
