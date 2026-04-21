@@ -658,6 +658,8 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._model_fwd: Callable[[Optional[In]], Tuple[torch.Tensor, Out]] = (
             custom_model_fwd if custom_model_fwd else model
         )
+        if self._clear_data_dist_inputs:
+            PipelinedForward._use_main_stream_for_dist_init = True
 
         super().__init__()
 
