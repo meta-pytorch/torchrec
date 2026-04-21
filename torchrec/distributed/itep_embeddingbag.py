@@ -31,6 +31,7 @@ from torchrec.distributed.embeddingbag import (
     EmbeddingBagCollectionSharder,
     ShardedEmbeddingBagCollection,
 )
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.types import (
     Awaitable,
     LazyAwaitable,
@@ -300,6 +301,7 @@ class ITEPEmbeddingBagCollectionSharder(
             )
         )
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
         module: ITEPEmbeddingBagCollection,
@@ -558,6 +560,7 @@ class ITEPEmbeddingCollectionSharder(BaseEmbeddingSharder[ITEPEmbeddingCollectio
             )
         )
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
         module: ITEPEmbeddingCollection,

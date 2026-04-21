@@ -17,6 +17,7 @@ from torchrec.distributed.embedding_types import (
     BaseEmbeddingSharder,
     EmbeddingComputeKernel,
 )
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.sharding.dp_sharding import DpPooledEmbeddingSharding
 from torchrec.distributed.types import ParameterSharding, ShardingEnv, ShardingType
 from torchrec.distributed.utils import append_prefix
@@ -90,6 +91,7 @@ class ShardedFusedEmbeddingCollection(
 
 
 class FusedEmbeddingCollectionSharder(BaseEmbeddingSharder[FusedEmbeddingCollection]):
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
         module: FusedEmbeddingCollection,

@@ -29,6 +29,7 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingModule,
 )
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.types import (
     Awaitable,
     CommOp,
@@ -881,6 +882,7 @@ class ShardedEmbeddingTowerCollection(
 
 
 class EmbeddingTowerSharder(BaseEmbeddingSharder[EmbeddingTower]):
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
         module: EmbeddingTower,
@@ -982,6 +984,7 @@ class EmbeddingTowerCollectionSharder(BaseEmbeddingSharder[EmbeddingTowerCollect
             self.fused_params, qcomm_codecs_registry=qcomm_codecs_registry
         )
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
         module: EmbeddingTowerCollection,
