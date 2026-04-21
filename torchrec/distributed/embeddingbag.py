@@ -59,6 +59,8 @@ from torchrec.distributed.fused_params import (
     FUSED_PARAM_IS_SSD_TABLE,
     FUSED_PARAM_SSD_TABLE_LIST,
 )
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.sharding.cw_sharding import CwPooledEmbeddingSharding
 from torchrec.distributed.sharding.dp_sharding import DpPooledEmbeddingSharding
@@ -662,6 +664,16 @@ class ShardedEmbeddingBagCollection(
                 self._pooling_type_to_rs_features[config.pooling.value].extend(
                     config.feature_names
                 )
+
+        EventLoggingHandler.log_event(
+            component=TorchrecComponent.SHARDER.value,
+            event_name="ShardedEmbeddingBagCollection.table_names",
+            event_type=EventType.INFO,
+            metadata={
+                config.name: table_name_to_parameter_sharding[config.name].sharding_type
+                for config in self._embedding_bag_configs
+            },
+        )
 
         self.module_sharding_plan: EmbeddingModuleShardingPlan = cast(
             EmbeddingModuleShardingPlan,
@@ -2191,6 +2203,7 @@ class EmbeddingBagCollectionSharder(BaseEmbeddingSharder[EmbeddingBagCollection]
     This implementation uses non-fused `EmbeddingBagCollection`
     """
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
         module: EmbeddingBagCollection,
@@ -2491,6 +2504,7 @@ class EmbeddingBagSharder(BaseEmbeddingSharder[nn.EmbeddingBag]):
     This implementation uses non-fused `nn.EmbeddingBag`
     """
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
         module: nn.EmbeddingBag,

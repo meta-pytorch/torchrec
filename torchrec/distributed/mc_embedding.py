@@ -19,6 +19,7 @@ from torchrec.distributed.embedding import (
     ShardedEmbeddingCollection,
 )
 from torchrec.distributed.embedding_types import KJTList
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.mc_embedding_modules import (
     BaseManagedCollisionEmbeddingCollectionSharder,
     BaseShardedManagedCollisionEmbeddingCollection,
@@ -106,6 +107,7 @@ class ManagedCollisionEmbeddingCollectionSharder(
             qcomm_codecs_registry=qcomm_codecs_registry,
         )
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
         module: ManagedCollisionEmbeddingCollection,
