@@ -496,6 +496,7 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
 
         self._output_tensors: List[torch.Tensor] = []
         self._awaitables: List[dist.Work] = []
+        self._input_tensors = input_tensors
         self._world_size: int = self._pg.size()
         rank = dist.get_rank(self._pg)
 
@@ -558,6 +559,22 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
                 self._output_tensors.append(output_tensor)
                 self._awaitables.append(awaitable)
 
+    def clear_inputs(self) -> None:
+        """
+        Clears input KJT tensors after wait.
+        """
+        if self._workers == 1 or is_torchdynamo_compiling():
+            return
+
+        # Wait for all-to-all collectives to complete before freeing input storage.
+        for awaitable in self._awaitables:
+            awaitable.wait()
+
+        for tensor in self._input_tensors:
+            tensor.storage().resize_(0)
+
+        self._input_tensors.clear()
+
     def _wait_impl(self) -> KeyedJaggedTensor:
         """
         Overwrites wait function as we don't handle callbacks here.
@@ -571,6 +588,8 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
             return self._input
 
         if not is_torchdynamo_compiling():
+            # dist.Work.wait() is idempotent, so this is safe even if
+            # clear_inputs() already waited on these awaitables.
             for awaitable in self._awaitables:
                 awaitable.wait()
 
