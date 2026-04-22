@@ -706,6 +706,94 @@ def shared_memory_across_process(
             )
 
 
+def multi_async_comms(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Rank 0 and rank 1 issue two different collectives (a2a_single + all_reduce)
+    in different CPU-side order. The a2a uses ctx.pg and the all_reduce uses
+    a separate process group, so they have independent NCCL communicators.
+
+    Rank 0: a2a → compute → all_reduce
+    Rank 1: all_reduce → compute → a2a
+
+    The two collectives operate on different-sized tensors
+    (input_a: num_concat, input_b: num_concat*2).
+    """
+    with record_function("## setup ##"):
+        rank = ctx.rank
+        ar_pg = multi_async_comms._ar_pg  # pyrefly: ignore[missing-attribute]
+        # Warm up the NCCL communicator so subsequent ops are truly async;
+        # the first collective on a new pg blocks for ncclCommInitRank
+        dist.barrier(group=ar_pg)
+
+    with record_function("## pre-comms compute ##"):
+        input_a = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+        input_b = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat * 2, ctx=ctx)
+
+    def do_a2a(
+        input_tensor: torch.Tensor,
+        label: str,
+    ) -> tuple[torch.Tensor, dist.Work]:
+        out = torch.zeros_like(input_tensor)
+        with record_function(f"## rank {rank}: {label} ##"):
+            req = dist.all_to_all_single(
+                output=out,
+                input=input_tensor,
+                group=ctx.pg,
+                async_op=True,
+            )
+        return out, req
+
+    def do_all_reduce(
+        input_tensor: torch.Tensor,
+        label: str,
+    ) -> tuple[torch.Tensor, dist.Work]:
+        out = input_tensor.clone()
+        with record_function(f"## rank {rank}: {label} ##"):
+            req = dist.all_reduce(
+                out,
+                op=dist.ReduceOp.SUM,
+                group=ar_pg,
+                async_op=True,
+            )
+        return out, req
+
+    if rank == 0:
+        out_a, req_a = do_a2a(input_a, "a2a")
+        with record_function("## irrelevant compute ##"):
+            _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+        out_b, req_b = do_all_reduce(input_b, "all_reduce")
+    else:
+        out_b, req_b = do_all_reduce(input_b, "all_reduce")
+        with record_function("## irrelevant compute ##"):
+            _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+        out_a, req_a = do_a2a(input_a, "a2a")
+
+    with record_function("## irrelevant compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## wait and validate ##"):
+        req_a.wait()
+        req_b.wait()
+        checks_a = _validate(out_a, ctx)
+        # all_reduce(SUM) of values from rank 0 in (0,1) and rank 1 in (1,2)
+        # produces sums in (1,3), so int values >= 1
+        checks_b = torch.all(out_b.to(torch.int) >= 1)
+        checks = DeviceToHostTensorAwaitable(checks_a & checks_b)
+
+    with record_function("## post-comms compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=out_a[0])
+
+    with record_function("## assert ##"):
+        assert checks.item()
+
+
 # single-rank runner
 def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) -> None:
     if arg.backend == "nccl":
@@ -757,6 +845,12 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = single_thread_copy
             case "shared_memory_across_process":
                 func = shared_memory_across_process
+            case "multi_async_comms":
+                func = multi_async_comms
+                # pyrefly: ignore[missing-attribute]
+                multi_async_comms._ar_pg = dist.new_group(
+                    ranks=list(range(ctx.world_size))
+                )
             case _:
                 raise ValueError(f"Unknown benchmark name: {arg.name}")
 
