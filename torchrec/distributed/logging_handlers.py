@@ -259,6 +259,17 @@ def log_stats_match(
     pass
 
 
+def log_cacheability_resolved(
+    table_name: str = "",
+    table_height: int = 0,
+    cacheability: float = 0.0,
+    expected_lookups: int = 0,
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_clf_computed(
     table_name: str = "",
     table_height: int = 0,
