@@ -368,4 +368,17 @@ def log_itep_itp_info(
     pass
 
 
+def log_kernel_changed(
+    table_name: str = "",
+    action: str = "",
+    reason: str = "",
+    new_kernels: Optional[list] = None,  # type: ignore[type-arg]
+    table_height: Optional[int] = None,
+    cache_ratio: Optional[float] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
