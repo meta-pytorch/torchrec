@@ -12,9 +12,9 @@ RunOptions:
   profile_dir: "."
   loglevel: "INFO"
   memory_snapshot: True
-  name: "sparse_data_dist_eval"
+  name: "fused_sdd_uvm_eval"
 PipelineConfig:
-  pipeline: "eval-sdd"
+  pipeline: "eval-fused"
 ModelInputConfig:
   num_float_features: 1000
   feature_pooling_avg: 30
@@ -40,7 +40,7 @@ EmbeddingTablesConfig:
         data_type: FP16
 PlannerConfig:
   pooling_factors: [30.0]  # Must match ModelInputConfig.feature_pooling_avg
-  # compute_kernel: fused_uvm_caching
+  compute_kernel: fused_uvm
   additional_constraints:
     FP16_table:
       sharding_types: [row_wise]

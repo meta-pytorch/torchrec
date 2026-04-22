@@ -28,7 +28,14 @@ import torch
 from torch.profiler import record_function
 from torch.utils.hooks import RemovableHandle
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
-from torchrec.distributed.logger import one_time_rank0_logger
+
+try:
+    from torchrec.distributed.logger import one_time_rank0_logger
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.pipeline_stage.import_failure.logger"
+    )
+    one_time_rank0_logger = logging.getLogger(__name__)
 from torchrec.distributed.model_parallel import ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,

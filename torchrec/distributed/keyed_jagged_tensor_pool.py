@@ -12,6 +12,7 @@
 from typing import cast, Dict, List, Optional, Tuple, Type, Union
 
 import torch
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.object_pool import ShardedObjectPool
 from torchrec.distributed.sharding.rw_kjt_pool_sharding import (
     InferRwKeyedJaggedTensorPoolOutputDist,
@@ -679,6 +680,7 @@ class KeyedJaggedTensorPoolSharder(ModuleSharder[KeyedJaggedTensorPool]):
     def __init__(self) -> None:
         super().__init__()
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     # pyrefly: ignore[bad-param-name-override]
     def shard(
         self,

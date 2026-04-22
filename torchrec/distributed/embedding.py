@@ -55,6 +55,8 @@ from torchrec.distributed.fused_params import (
     FUSED_PARAM_IS_SSD_TABLE,
     FUSED_PARAM_SSD_TABLE_LIST,
 )
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.sharding.cw_sequence_sharding import (
     CwSequenceEmbeddingSharding,
@@ -445,6 +447,15 @@ class ShardedEmbeddingCollection(
                 table_name: parameter_sharding
                 for table_name, parameter_sharding in table_name_to_parameter_sharding.items()
                 if table_name in self._table_names
+            },
+        )
+        EventLoggingHandler.log_event(
+            component=TorchrecComponent.SHARDER.value,
+            event_name="ShardedEmbeddingCollection.table_names",
+            event_type=EventType.INFO,
+            metadata={
+                config.name: table_name_to_parameter_sharding[config.name].sharding_type
+                for config in self._embedding_configs
             },
         )
         self._env = env
@@ -1753,6 +1764,7 @@ class EmbeddingCollectionSharder(BaseEmbeddingSharder[EmbeddingCollection]):
         super().__init__(fused_params, qcomm_codecs_registry)
         self._use_index_dedup = use_index_dedup
 
+    @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
         module: EmbeddingCollection,
