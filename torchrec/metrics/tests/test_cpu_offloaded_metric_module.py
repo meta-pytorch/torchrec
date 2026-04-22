@@ -259,6 +259,59 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.assertFalse(self.cpu_module.update_thread.is_alive())
         self.assertFalse(self.cpu_module.compute_thread.is_alive())
 
+    def test_shutdown_is_idempotent(self) -> None:
+        self.cpu_module.shutdown()
+        self.assertTrue(self.cpu_module._shutdown_complete)
+
+        # Second call must be a no-op (no exception, no re-logging).
+        with patch.object(self.cpu_module, "_log_event") as mock_log_event:
+            self.cpu_module.shutdown()
+            mock_log_event.assert_not_called()
+
+    def test_shutdown_reraises_captured_exception(self) -> None:
+        """If a worker thread crashed before shutdown(), shutdown() must
+        re-raise the captured exception so the training job fails properly."""
+        with patch.object(
+            self.cpu_module,
+            "_process_metric_update_job",
+            side_effect=RuntimeError("worker died"),
+        ):
+            self.cpu_module.update(
+                {
+                    "task1-prediction": torch.tensor([0.5]),
+                    "task1-label": torch.tensor([0.5]),
+                    "task1-weight": torch.tensor([1.0]),
+                }
+            )
+            self.assertTrue(
+                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                "update thread did not capture exception",
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "worker died"):
+            self.cpu_module.shutdown()
+
+    def test_shutdown_processes_final_sync_marker_in_compute_thread(self) -> None:
+        """Two-phase shutdown: the SyncMarker enqueued during update-thread
+        flush must be processed by the compute thread before it stops."""
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.5]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+        for _ in range(3):
+            self.cpu_module.update(model_out)
+
+        computes_before = self.cpu_module._total_computes_processed
+        self.cpu_module.shutdown()
+
+        self.assertGreater(
+            self.cpu_module._total_computes_processed,
+            computes_before,
+            "compute thread did not process the final SyncMarker enqueued "
+            "during update-thread flush",
+        )
+
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
@@ -690,6 +743,28 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_no_dtoh_transfer_for_cpu_device(self) -> None:
         self._run_dtoh_transfer_test(use_cuda=False)
 
+    def test_compute_count_increments_once_per_async_compute(self) -> None:
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.7]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+
+        self.assertEqual(self.cpu_module.compute_count, 0)
+
+        for expected_count in range(1, 4):
+            for _ in range(3):
+                self.cpu_module.update(model_out)
+
+            deferrable = self.cpu_module.async_compute()
+            result_event = threading.Event()
+            deferrable.subscribe(callback=lambda _, e=result_event: e.set())
+            self.assertTrue(
+                result_event.wait(timeout=15.0),
+                f"async_compute #{expected_count} did not complete",
+            )
+            self.assertEqual(self.cpu_module.compute_count, expected_count)
+
     def test_generate_metric_module_creates_cpu_offloaded_module(self) -> None:
         module_kwargs = {
             "model_out_device": torch.device("cpu"),
@@ -804,6 +879,79 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
             self.cpu_module._captured_exception_event.wait(timeout=5.0)
             self.assertEqual(self.cpu_module._compute_errors, 1)
+
+    def test_queue_join_does_not_deadlock_after_processing_failure(self) -> None:
+        """Regression: if _do_work skips task_done() on processing failure,
+        queue.join() in sync()/wait_until_queue_is_empty() would deadlock.
+        The fix wraps processing in try/finally so task_done() always runs.
+        """
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.5]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+
+        with patch.object(
+            self.cpu_module,
+            "_process_metric_update_job",
+            side_effect=RuntimeError("processing failed"),
+        ):
+            self.cpu_module._update_rec_metrics(model_out)
+            # Wait for the update thread to die
+            self.assertTrue(
+                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                "update thread did not capture exception",
+            )
+
+        # queue.join() has no timeout — run in a thread and detect deadlock via Event
+        join_completed = threading.Event()
+
+        def join_queue() -> None:
+            self.cpu_module.update_queue.join()
+            join_completed.set()
+
+        threading.Thread(target=join_queue, daemon=True).start()
+        self.assertTrue(
+            join_completed.wait(timeout=5.0),
+            "queue.join() deadlocked — task_done() was not called after processing failure",
+        )
+
+    def test_compute_job_failure_propagates_to_future(self) -> None:
+        """Regression: _process_metric_compute_job failure must set the future's
+        exception so DeferrableMetrics.resolve() doesn't block forever."""
+        with patch.object(
+            self.cpu_module,
+            "_process_metric_compute_job",
+            side_effect=RuntimeError("compute failed"),
+        ):
+            deferrable = self.cpu_module.async_compute()
+
+            self.assertTrue(
+                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                "compute thread did not capture exception",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "compute failed"):
+                deferrable.resolve()
+
+    def test_sync_marker_failure_propagates_to_future(self) -> None:
+        """SynchronizationMarker.future is the same future returned via
+        DeferrableMetrics from async_compute(). A failure in
+        _process_synchronization_marker must surface through resolve()."""
+        with patch.object(
+            self.cpu_module,
+            "_process_synchronization_marker",
+            side_effect=RuntimeError("sync marker failed"),
+        ):
+            deferrable = self.cpu_module.async_compute()
+
+            self.assertTrue(
+                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                "update thread did not capture exception",
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "sync marker failed"):
+                deferrable.resolve()
 
     def test_enqueue_update_logs_failure_on_queue_full(self) -> None:
         """Verify FAILURE event is logged when update queue is full."""
