@@ -149,6 +149,14 @@ class EmbeddingQuantizationUtilsTest(unittest.TestCase):
                         # Verify the weights were converted
                         self.assertEqual(mock_convert_weights.call_count, 3)
 
+                        # Verify use_cpu_turnaround_optimization defaults to False
+                        for call in mock_convert_weights.call_args_list:
+                            self.assertFalse(
+                                call.kwargs.get(
+                                    "use_cpu_turnaround_optimization", False
+                                )
+                            )
+
                         # Verify weights_precision was updated
                         self.assertEqual(mock_emb.weights_precision, mock_sparse_type)
 
@@ -188,6 +196,14 @@ class EmbeddingQuantizationUtilsTest(unittest.TestCase):
 
                         # Verify weights were converted back
                         self.assertEqual(mock_convert_weights.call_count, 3)
+
+                        # Verify use_cpu_turnaround_optimization defaults to False
+                        for call in mock_convert_weights.call_args_list:
+                            self.assertFalse(
+                                call.kwargs.get(
+                                    "use_cpu_turnaround_optimization", False
+                                )
+                            )
 
                         # Verify _recalculate_torch_state was called
                         mock_recalc.assert_called_once_with(module)
@@ -241,6 +257,86 @@ class EmbeddingQuantizationUtilsTest(unittest.TestCase):
             skip_registering=True
         )
 
+    def test_quantize_embedding_modules_with_optimization(self) -> None:
+        """Test quantize_embedding_modules forwards use_cpu_turnaround_optimization=True."""
+        utils = EmbeddingQuantizationUtils()
+
+        mock_emb = Mock()
+        mock_emb.weights_dev = torch.tensor([1.0])
+        mock_emb.weights_host = torch.tensor([2.0])
+        mock_emb.weights_uvm = torch.tensor([3.0])
+        mock_emb.weights_precision = SparseType.FP32
+
+        module = torch.nn.Module()
+
+        with patch("torchrec.distributed.utils._group_sharded_modules") as mock_group:
+            mock_group.return_value = [mock_emb]
+
+            with patch(
+                "torchrec.distributed.utils.data_type_to_sparse_type"
+            ) as mock_convert:
+                mock_sparse_type = Mock()
+                mock_sparse_type.as_dtype.return_value = torch.float16
+                mock_convert.return_value = mock_sparse_type
+
+                with patch(
+                    "torchrec.distributed.utils._convert_weights"
+                ) as mock_convert_weights:
+                    mock_convert_weights.return_value = torch.tensor(
+                        [1.0], dtype=torch.float16
+                    )
+
+                    with patch(
+                        "torchrec.distributed.utils.weights_bytes_in_emb_kernel"
+                    ) as mock_bytes:
+                        mock_bytes.return_value = 100
+
+                        utils.quantize_embedding_modules(
+                            module,
+                            DataType.FP16,
+                            use_cpu_turnaround_optimization=True,
+                        )
+
+                        self.assertEqual(mock_convert_weights.call_count, 3)
+                        for call in mock_convert_weights.call_args_list:
+                            self.assertTrue(
+                                call.kwargs["use_cpu_turnaround_optimization"]
+                            )
+
+    def test_recreate_embedding_modules_with_optimization(self) -> None:
+        """Test recreate_embedding_modules forwards use_cpu_turnaround_optimization=True."""
+        utils = EmbeddingQuantizationUtils()
+
+        mock_emb = Mock()
+        mock_emb.weights_dev = torch.tensor([1.0])
+        mock_emb.weights_host = torch.tensor([2.0])
+        mock_emb.weights_uvm = torch.tensor([3.0])
+
+        original_sparse_type = SparseType.FP32
+        utils._emb_kernel_to_sparse_dtype[mock_emb] = original_sparse_type
+
+        module = torch.nn.Module()
+
+        with patch("torchrec.distributed.utils._group_sharded_modules") as mock_group:
+            mock_group.return_value = [mock_emb]
+
+            with patch(
+                "torchrec.distributed.utils._convert_weights"
+            ) as mock_convert_weights:
+                mock_convert_weights.return_value = torch.tensor([1.0])
+
+                with patch("torchrec.distributed.utils.weights_bytes_in_emb_kernel"):
+                    with patch.object(utils, "_recalculate_torch_state"):
+                        utils.recreate_embedding_modules(
+                            module, use_cpu_turnaround_optimization=True
+                        )
+
+                        self.assertEqual(mock_convert_weights.call_count, 3)
+                        for call in mock_convert_weights.call_args_list:
+                            self.assertTrue(
+                                call.kwargs["use_cpu_turnaround_optimization"]
+                            )
+
 
 class ConvertWeightsTest(unittest.TestCase):
     def test_convert_weights(self) -> None:
@@ -264,6 +360,123 @@ class ConvertWeightsTest(unittest.TestCase):
         # Verify the values are correct (approximately, due to precision change)
         expected_values = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float16)
         torch.testing.assert_close(new_weights, expected_values)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_convert_weights_cuda_peak_memory(self) -> None:
+        """Test that _convert_weights on CUDA doesn't exceed original tensor size in peak HBM."""
+        device = torch.device("cuda:0")
+        num_elements = 1024 * 1024  # 1M elements
+        weights = torch.randn(num_elements, dtype=torch.float32, device=device)
+        expected = weights.to(torch.float16)
+        converted_bytes = num_elements * 2  # fp16 = 2 bytes per element
+
+        mock_sparse_type = Mock()
+        mock_sparse_type.as_dtype.return_value = torch.float16
+
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        mem_before = torch.cuda.memory_allocated()
+
+        new_weights = _convert_weights(
+            weights, mock_sparse_type, use_cpu_turnaround_optimization=True
+        )
+
+        torch.cuda.synchronize()
+        peak_mem = torch.cuda.max_memory_allocated()
+
+        # With CPU-roundtrip: old storage is freed before new one is allocated,
+        # so peak should NOT grow by converted_bytes.
+        # Without optimization: peak would grow by converted_bytes (old + new coexist).
+        self.assertLess(peak_mem - mem_before, converted_bytes)
+
+        # Correctness
+        self.assertEqual(new_weights.dtype, torch.float16)
+        self.assertEqual(new_weights.device.type, "cuda")
+        self.assertEqual(weights.untyped_storage().size(), 0)
+        torch.testing.assert_close(new_weights, expected)
+
+    def test_convert_weights_fallback_cpu(self) -> None:
+        """Test _convert_weights fallback path when condition fails (CPU tensor)."""
+        weights = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        expected = weights.to(torch.float16)
+
+        mock_sparse_type = Mock()
+        mock_sparse_type.as_dtype.return_value = torch.float16
+
+        new_weights = _convert_weights(weights, mock_sparse_type)
+
+        self.assertEqual(new_weights.dtype, torch.float16)
+        self.assertEqual(weights.untyped_storage().size(), 0)
+        torch.testing.assert_close(new_weights, expected)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_convert_weights_fallback_empty_cuda(self) -> None:
+        """Test _convert_weights fallback path with empty CUDA tensor (numel == 0)."""
+        weights = torch.tensor([], dtype=torch.float32, device="cuda:0")
+
+        mock_sparse_type = Mock()
+        mock_sparse_type.as_dtype.return_value = torch.float16
+
+        new_weights = _convert_weights(weights, mock_sparse_type)
+
+        self.assertEqual(new_weights.dtype, torch.float16)
+        self.assertEqual(new_weights.numel(), 0)
+        self.assertEqual(new_weights.device.type, "cuda")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_convert_weights_cuda_no_optimization(self) -> None:
+        """Test _convert_weights on CUDA without optimization uses in-place fallback."""
+        weights = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device="cuda:0")
+        expected = weights.to(torch.float16)
+
+        mock_sparse_type = Mock()
+        mock_sparse_type.as_dtype.return_value = torch.float16
+
+        # use_cpu_turnaround_optimization=False (default) => in-place path
+        new_weights = _convert_weights(
+            weights, mock_sparse_type, use_cpu_turnaround_optimization=False
+        )
+
+        self.assertEqual(new_weights.dtype, torch.float16)
+        self.assertEqual(new_weights.device.type, "cuda")
+        self.assertEqual(weights.untyped_storage().size(), 0)
+        torch.testing.assert_close(new_weights, expected)
+
+    def test_convert_weights_cpu_with_optimization_flag(self) -> None:
+        """Test _convert_weights on CPU with optimization flag still uses fallback path."""
+        weights = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        expected = weights.to(torch.float16)
+
+        mock_sparse_type = Mock()
+        mock_sparse_type.as_dtype.return_value = torch.float16
+
+        # CPU tensors should use fallback path even with optimization=True
+        new_weights = _convert_weights(
+            weights, mock_sparse_type, use_cpu_turnaround_optimization=True
+        )
+
+        self.assertEqual(new_weights.dtype, torch.float16)
+        self.assertEqual(weights.untyped_storage().size(), 0)
+        torch.testing.assert_close(new_weights, expected)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+    def test_convert_weights_uvm_path(self) -> None:
+        """Test _convert_weights with UVM tensor: converts dtype, does not resize_(0)."""
+        weights = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32, device="cuda:0")
+        original_storage_size = weights.untyped_storage().size()
+        expected = weights.to(torch.float16)
+
+        mock_sparse_type = Mock()
+        mock_sparse_type.as_dtype.return_value = torch.float16
+
+        with patch("torch.ops.fbgemm.is_uvm_tensor", return_value=True):
+            new_weights = _convert_weights(weights, mock_sparse_type)
+
+        self.assertEqual(new_weights.dtype, torch.float16)
+        self.assertEqual(new_weights.device.type, "cuda")
+        # UVM path does NOT call resize_(0) — storage stays intact
+        self.assertEqual(weights.untyped_storage().size(), original_storage_size)
+        torch.testing.assert_close(new_weights, expected)
 
 
 class WeightsBytesTest(unittest.TestCase):
