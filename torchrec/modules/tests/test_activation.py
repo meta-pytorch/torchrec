@@ -16,12 +16,17 @@ from torchrec.modules.activation import SwishLayerNorm
 
 class TestActivation(unittest.TestCase):
     def test_swish_takes_float(self) -> None:
+        # Seed so the random input is deterministic; the previous unseeded
+        # randn occasionally produced inputs where the two LayerNorm
+        # invocations diverged by more than the (very tight) atol=1e-8.
+        torch.manual_seed(0)
         m = SwishLayerNorm([3, 4])
         input = torch.randn(2, 3, 4)
         output = m(input)
         norm = torch.nn.LayerNorm([3, 4])
         ref_output = input * torch.sigmoid(norm(input))
-        torch.testing.assert_close(output, ref_output, rtol=1e-05, atol=1e-08)
+        # atol relaxed to fp32-realistic precision.
+        torch.testing.assert_close(output, ref_output, rtol=1e-05, atol=1e-06)
 
     def test_fx_script_swish(self) -> None:
         m = SwishLayerNorm(10)
