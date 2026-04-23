@@ -1378,6 +1378,8 @@ class ParameterConstraints:
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE, either for
             SSD or PS.
         use_virtual_table (bool): is virtual table enabled for this table.
+        ue_group (Optional[str]): Unified Embedding group name for this table
+            (e.g. ``group_0``). ``None`` if the table is not part of a UE group.
     """
 
     sharding_types: Optional[List[str]] = None
@@ -1398,6 +1400,7 @@ class ParameterConstraints:
     device_group: Optional[str] = None
     key_value_params: Optional[KeyValueParams] = None
     use_virtual_table: bool = False
+    ue_group: Optional[str] = None
 
     def __hash__(self) -> int:
         hashable_list = [
@@ -1417,6 +1420,7 @@ class ParameterConstraints:
             self.device_group,
             self.key_value_params,
             self.use_virtual_table,
+            self.ue_group,
         ]
 
         return hash_sha256_to_int(hashable_list)
