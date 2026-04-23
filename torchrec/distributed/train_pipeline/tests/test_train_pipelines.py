@@ -8,6 +8,8 @@
 # pyre-strict
 
 import copy
+import os
+import signal
 import unittest
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
@@ -16,6 +18,7 @@ from typing import cast, Generator, List, Optional, Tuple, Type, TypeVar, Union
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch.distributed as dist
 from hypothesis import assume, given, settings, strategies as st, Verbosity
 from torch import nn, optim
 from torch._dynamo.testing import reduce_to_scalar_loss
@@ -2505,3 +2508,615 @@ class TrainPipelineSparseDistCompAutogradTest(TrainPipelineSparseDistTest):
         execute_all_batches: bool,
     ) -> None:
         super().test_equal_to_non_pipelined()
+
+
+class ExhaustionSyncResetTest(unittest.TestCase):
+    def test_exhaustion_synced_resets_on_new_iterator(self) -> None:
+        """Verify _exhaustion_synced resets when a new dataloader iterator is provided.
+
+        Without the reset, reusing the pipeline with a new dataloader (e.g., new
+        epoch) would cause _maybe_sync_dataloader_exhaustion to short-circuit
+        forever, silently disabling the sync feature.
+        """
+        pipeline = TrainPipelineSparseDist(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+        )
+
+        # Simulate first epoch: exhaust the iterator
+        epoch1_data = [torch.tensor([1]), torch.tensor([2])]
+        epoch1_iter = iter(epoch1_data)
+
+        batch = pipeline._next_batch(epoch1_iter)
+        self.assertEqual(batch, torch.tensor([1]))
+        batch = pipeline._next_batch(epoch1_iter)
+        self.assertEqual(batch, torch.tensor([2]))
+        batch = pipeline._next_batch(epoch1_iter)
+        self.assertIsNone(batch)
+        self.assertTrue(pipeline._dataloader_exhausted)
+
+        # Simulate the sync having fired
+        pipeline._exhaustion_synced = True
+
+        # Simulate second epoch: new iterator
+        epoch2_data = [torch.tensor([3])]
+        epoch2_iter = iter(epoch2_data)
+
+        batch = pipeline._next_batch(epoch2_iter)
+        self.assertEqual(batch, torch.tensor([3]))
+        # Both flags must be reset for the new iterator
+        self.assertFalse(pipeline._exhaustion_synced)
+        self.assertFalse(pipeline._dataloader_exhausted)
+
+    def test_exhaustion_synced_resets_on_reset(self) -> None:
+        """Verify _exhaustion_synced resets when reset() is called.
+
+        Without the reset, calling reset() then progress() with the same
+        iterator would leave _exhaustion_synced=True, causing
+        _maybe_sync_dataloader_exhaustion to short-circuit and silently
+        disable the sync feature.
+        """
+        pipeline = TrainPipelineSparseDist(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+        )
+
+        # Simulate exhaustion and sync having fired
+        pipeline._dataloader_exhausted = True
+        pipeline._exhaustion_synced = True
+
+        pipeline.reset()
+
+        self.assertFalse(pipeline._exhaustion_synced)
+        self.assertFalse(pipeline._dataloader_exhausted)
+
+
+class SyncDataloaderExhaustionTest(MultiProcessTestBase):
+    # Tests here drive the pipeline through internal methods (_next_batch,
+    # _maybe_sync_dataloader_exhaustion) to isolate the sync logic from the
+    # full pipeline machinery, plus the fill_pipeline code path. End-to-end
+    # progress() coverage with a real sharded model lives in
+    # SyncDataloaderExhaustionRealProgressTest below.
+
+    @classmethod
+    def _run_test_equal_batches_no_truncation(
+        cls,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        """Both ranks have 4 batches. No truncation should occur until exhaustion."""
+        dist.init_process_group(rank=rank, world_size=world_size, backend="gloo")
+
+        pipeline = TrainPipelineSparseDist(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            sync_dataloader_exhaustion=True,
+        )
+        pipeline._gloo_pg = dist.new_group(backend="gloo")
+
+        data = [torch.tensor([i]) for i in range(4)]
+        data_iter = iter(data)
+
+        # Load all batches
+        for _ in range(4):
+            batch = pipeline._next_batch(data_iter)
+            if batch is None:
+                raise AssertionError("expected a batch, got None")
+            pipeline.batches.append(batch)
+            pipeline._maybe_sync_dataloader_exhaustion()
+            # No rank is exhausted yet, sync should be a no-op
+            if pipeline._exhaustion_synced:
+                raise AssertionError("expected _exhaustion_synced to be False")
+
+        # Now exhaust
+        batch = pipeline._next_batch(data_iter)
+        if batch is not None:
+            raise AssertionError("expected None after exhaustion")
+        pipeline._maybe_sync_dataloader_exhaustion()
+
+        # Both ranks exhausted at the same time — no truncation needed
+        if len(pipeline.batches) != 4:
+            raise AssertionError(f"expected 4 batches, got {len(pipeline.batches)}")
+        if not pipeline._exhaustion_synced:
+            raise AssertionError("expected _exhaustion_synced to be True")
+        dist.destroy_process_group()
+
+    def test_equal_batches_no_truncation(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_equal_batches_no_truncation,
+            world_size=2,
+        )
+
+    @classmethod
+    def _run_test_immediate_exhaustion_truncates_to_zero(
+        cls,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        """Rank 0 has 0 batches, rank 1 has 3. Both should truncate to 0."""
+        dist.init_process_group(rank=rank, world_size=world_size, backend="gloo")
+        num_batches = 0 if rank == 0 else 3
+
+        pipeline = TrainPipelineSparseDist(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            sync_dataloader_exhaustion=True,
+        )
+        pipeline._gloo_pg = dist.new_group(backend="gloo")
+
+        data = [torch.tensor([i]) for i in range(num_batches)]
+        data_iter = iter(data)
+
+        # Load whatever is available
+        while True:
+            batch = pipeline._next_batch(data_iter)
+            if batch is not None:
+                pipeline.batches.append(batch)
+                pipeline.contexts.append(pipeline._create_context())
+            pipeline._maybe_sync_dataloader_exhaustion()
+            if pipeline._exhaustion_synced:
+                break
+
+        # Rank 0 had 0 batches, so MIN = 0 — all ranks truncate to 0
+        if len(pipeline.batches) != 0:
+            raise AssertionError(
+                f"rank {rank}: expected 0 batches, got {len(pipeline.batches)}"
+            )
+        if not pipeline._exhaustion_synced:
+            raise AssertionError("expected _exhaustion_synced to be True")
+        dist.destroy_process_group()
+
+    @classmethod
+    def _run_test_sync_is_noop_when_disabled(
+        cls,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        """When sync_dataloader_exhaustion=False, the method is a no-op."""
+        dist.init_process_group(rank=rank, world_size=world_size, backend="gloo")
+
+        pipeline = TrainPipelineSparseDist(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            sync_dataloader_exhaustion=False,
+        )
+
+        # Exhaust immediately
+        pipeline._dataloader_exhausted = True
+        pipeline.batches.append(torch.tensor([1]))
+
+        # Should be a complete no-op (no allreduce, no truncation)
+        pipeline._maybe_sync_dataloader_exhaustion()
+        if pipeline._exhaustion_synced:
+            raise AssertionError("expected _exhaustion_synced to be False")
+        if len(pipeline.batches) != 1:
+            raise AssertionError(f"expected 1 batch, got {len(pipeline.batches)}")
+        dist.destroy_process_group()
+
+    def test_immediate_exhaustion_truncates_to_zero(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_immediate_exhaustion_truncates_to_zero,
+            world_size=2,
+        )
+
+    def test_sync_is_noop_when_disabled(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_sync_is_noop_when_disabled,
+            world_size=2,
+        )
+
+    def test_sync_raises_when_pg_not_initialized(self) -> None:
+        """When sync is enabled but fill_pipeline hasn't been called,
+        _maybe_sync_dataloader_exhaustion should raise RuntimeError."""
+        pipeline = TrainPipelineSparseDist(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            sync_dataloader_exhaustion=True,
+        )
+        pipeline._dataloader_exhausted = True
+
+        with self.assertRaises(RuntimeError):
+            pipeline._maybe_sync_dataloader_exhaustion()
+
+    @classmethod
+    def _run_test_fill_pipeline_zero_batches_no_deadlock(
+        cls,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        """Rank 0 has 0 batches. fill_pipeline must still call the sync
+        collective so rank 1 doesn't deadlock in the allreduce.
+
+        Without the fix (sync on the first early-return path in fill_pipeline),
+        rank 0 would return without participating in the allreduce, and rank 1
+        would hang forever.
+        """
+        dist.init_process_group(rank=rank, world_size=world_size, backend="gloo")
+        num_batches = 0 if rank == 0 else 3
+
+        pipeline = TrainPipelineSparseDist(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            sync_dataloader_exhaustion=True,
+        )
+
+        data = [torch.tensor([i]) for i in range(num_batches)]
+        data_iter = iter(data)
+
+        # Drive through fill_pipeline — the actual code path that had the bug.
+        # This would deadlock without the fix because rank 0 returns early
+        # from fill_pipeline without calling _maybe_sync_dataloader_exhaustion.
+        pipeline.fill_pipeline(data_iter)
+
+        # Both ranks should have synced: rank 0 has 0 batches, so all truncate
+        if not pipeline._exhaustion_synced:
+            raise AssertionError("expected _exhaustion_synced to be True")
+        if len(pipeline.batches) != 0:
+            raise AssertionError(
+                f"rank {rank}: expected 0 batches, got {len(pipeline.batches)}"
+            )
+        dist.destroy_process_group()
+
+    def test_fill_pipeline_zero_batches_no_deadlock(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_fill_pipeline_zero_batches_no_deadlock,
+            world_size=2,
+        )
+
+    @classmethod
+    def _run_test_fill_pipeline_zero_batches_skips_init(
+        cls,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        """When rank 0 has 0 batches, sync should fire BEFORE
+        _init_pipelined_modules, truncating all ranks to 0.
+
+        Without the fix, rank 1 would enter _init_pipelined_modules
+        (NCCL collectives) while rank 0 is blocked on gloo — deadlock.
+        """
+        dist.init_process_group(rank=rank, world_size=world_size, backend="gloo")
+        num_batches = 0 if rank == 0 else 3
+
+        pipeline = TrainPipelineSparseDist(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            sync_dataloader_exhaustion=True,
+        )
+        data = [torch.tensor([i]) for i in range(num_batches)]
+
+        with patch.object(pipeline, "_init_pipelined_modules") as mock_init:
+            pipeline.fill_pipeline(iter(data))
+            mock_init.assert_not_called()
+
+        if not pipeline._exhaustion_synced:
+            raise AssertionError("expected _exhaustion_synced to be True")
+        if len(pipeline.batches) != 0:
+            raise AssertionError(
+                f"rank {rank}: expected 0 batches, got {len(pipeline.batches)}"
+            )
+        dist.destroy_process_group()
+
+    def test_fill_pipeline_zero_batches_skips_init(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_fill_pipeline_zero_batches_skips_init,
+            world_size=2,
+        )
+
+    @classmethod
+    def _run_test_multi_epoch_with_reset(
+        cls,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        """Two epochs with pipeline.reset() between them.
+
+        Verifies that sync works correctly after reset() and that
+        _gloo_pg is preserved across the reset.
+        """
+        dist.init_process_group(rank=rank, world_size=world_size, backend="gloo")
+
+        pipeline = TrainPipelineSparseDist(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            sync_dataloader_exhaustion=True,
+        )
+        pipeline._gloo_pg = dist.new_group(backend="gloo")
+        gloo_pg_id = id(pipeline._gloo_pg)
+
+        # Epoch 1: rank 0 has 4 batches, rank 1 has 2
+        epoch1_count = 4 if rank == 0 else 2
+        epoch1_iter = iter([torch.tensor([i]) for i in range(epoch1_count)])
+
+        while True:
+            batch = pipeline._next_batch(epoch1_iter)
+            if batch is not None:
+                pipeline.batches.append(batch)
+                pipeline.contexts.append(pipeline._create_context())
+            pipeline._maybe_sync_dataloader_exhaustion()
+            if pipeline._exhaustion_synced:
+                break
+
+        if len(pipeline.batches) != 2:
+            raise AssertionError(
+                f"rank {rank}: expected 2 batches in epoch 1, got {len(pipeline.batches)}"
+            )
+
+        # Reset between epochs
+        pipeline.reset()
+
+        # Verify _gloo_pg is preserved and flags are cleared
+        if id(pipeline._gloo_pg) != gloo_pg_id:
+            raise AssertionError("_gloo_pg should be preserved across reset")
+        if pipeline._exhaustion_synced:
+            raise AssertionError("_exhaustion_synced should be False after reset")
+        if pipeline._dataloader_exhausted:
+            raise AssertionError("_dataloader_exhausted should be False after reset")
+
+        # Epoch 2: rank 0 has 3 batches, rank 1 has 5
+        epoch2_count = 3 if rank == 0 else 5
+        epoch2_iter = iter([torch.tensor([i]) for i in range(epoch2_count)])
+
+        while True:
+            batch = pipeline._next_batch(epoch2_iter)
+            if batch is not None:
+                pipeline.batches.append(batch)
+                pipeline.contexts.append(pipeline._create_context())
+            pipeline._maybe_sync_dataloader_exhaustion()
+            if pipeline._exhaustion_synced:
+                break
+
+        if len(pipeline.batches) != 3:
+            raise AssertionError(
+                f"rank {rank}: expected 3 batches in epoch 2, got {len(pipeline.batches)}"
+            )
+        dist.destroy_process_group()
+
+    def test_multi_epoch_with_reset(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_multi_epoch_with_reset,
+            world_size=2,
+        )
+
+    @classmethod
+    def _run_test_execute_all_batches_false_no_deadlock(
+        cls,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        # Regression: with sync_dataloader_exhaustion=True AND
+        # execute_all_batches=False, copy_batch_to_gpu raises StopIteration
+        # when the dataloader is exhausted (rather than returning None).
+        # Without try/finally protection around the enqueue_batch calls,
+        # the raising rank skips _maybe_sync_dataloader_exhaustion entirely
+        # and never participates in the gloo allreduce, while non-raising
+        # ranks block on it forever — deadlock.
+        #
+        # With the fix (try/finally around all enqueue_batch sites in
+        # fill_pipeline and progress), both ranks complete the sync before
+        # StopIteration propagates, queues converge, and both exit cleanly.
+        # The watchdog is the failure signal: if a deadlock regresses, the
+        # non-raising rank hangs in dist.all_reduce until SIGALRM fires.
+        def _watchdog(_signum: int, _frame: object) -> None:
+            os._exit(124)
+
+        signal.signal(signal.SIGALRM, _watchdog)
+        signal.alarm(15)
+        try:
+            dist.init_process_group(rank=rank, world_size=world_size, backend="gloo")
+
+            pipeline = TrainPipelineSparseDist(
+                model=MagicMock(),
+                optimizer=MagicMock(),
+                device=torch.device("cpu"),
+                sync_dataloader_exhaustion=True,
+                execute_all_batches=False,  # the deadlock-prone combination
+            )
+
+            # Rank 0 starts already exhausted (0 batches), forcing
+            # copy_batch_to_gpu to raise StopIteration on the first
+            # enqueue_batch in fill_pipeline. Rank 1 has 1 batch, so its
+            # enqueue_batch succeeds and it proceeds to the sync — which is
+            # where it would block forever waiting for the (departed) rank 0.
+            num_batches = 0 if rank == 0 else 1
+            data = [torch.tensor([i]) for i in range(num_batches)]
+            data_iter = iter(data)
+
+            try:
+                pipeline.fill_pipeline(data_iter)
+            except StopIteration:
+                # Expected on the exhausting rank with execute_all_batches=False.
+                pass
+
+            # If we reach here, no deadlock. Verify the sync actually fired
+            # on both ranks (rank 0 via the try/finally, rank 1 via the
+            # normal post-enqueue call).
+            if not pipeline._exhaustion_synced:
+                raise AssertionError(
+                    f"rank {rank}: _exhaustion_synced is False — sync was "
+                    "skipped (the bug this test guards against)"
+                )
+            if len(pipeline.batches) != 0:
+                raise AssertionError(
+                    f"rank {rank}: expected truncation to 0 batches, "
+                    f"got {len(pipeline.batches)}"
+                )
+            dist.destroy_process_group()
+        finally:
+            signal.alarm(0)
+
+    def test_execute_all_batches_false_no_deadlock(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_execute_all_batches_false_no_deadlock,
+            world_size=2,
+        )
+
+
+def _run_test_progress_real_sparse_dist_uneven_data(
+    rank: int,
+    world_size: int,
+    tables: List[EmbeddingBagConfig],
+    weighted_tables: List[EmbeddingBagConfig],
+    data: List[Tuple[ModelInput, List[ModelInput]]],
+    enqueue_batch_after_forward: bool,
+    backend: str = "nccl",
+    local_size: Optional[int] = None,
+) -> None:
+    # Drives TrainPipelineSparseDist.progress() end-to-end with a real
+    # sharded model and uneven per-rank data ([2, 4, 6]). Validates the
+    # deadlock-prevention claim of sync_dataloader_exhaustion against the
+    # real sparse-dist + NCCL all-to-all path (no method mocks): all 3
+    # ranks terminate at min=2 iterations, the queue invariant holds, and
+    # forward+backward actually fired (proven by populated gradients).
+    def _watchdog(_signum: int, _frame: object) -> None:
+        # A regression that re-introduces the deadlock should fail fast,
+        # not burn the test-runner timeout. os._exit bypasses cleanup so
+        # the parent sees a 124 exit and surfaces a clear failure.
+        os._exit(124)
+
+    signal.signal(signal.SIGALRM, _watchdog)
+    signal.alarm(30)
+    try:
+        with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+            assert ctx.pg is not None
+
+            sharder = TestEBCSharder(
+                sharding_type=ShardingType.TABLE_WISE.value,
+                kernel_type=EmbeddingComputeKernel.FUSED.value,
+            )
+            model = TestSparseNN(
+                tables=tables,
+                weighted_tables=weighted_tables,
+                dense_device=ctx.device,
+                sparse_device=torch.device("meta"),
+            )
+            sharded_model = DistributedModelParallel(
+                module=copy.deepcopy(model),
+                env=ShardingEnv.from_process_group(ctx.pg),
+                init_data_parallel=False,
+                device=ctx.device,
+                sharders=[cast(ModuleSharder[nn.Module], sharder)],
+            )
+            optimizer = optim.SGD(sharded_model.parameters(), lr=0.1)
+
+            pipeline = TrainPipelineSparseDist(
+                model=sharded_model,
+                optimizer=optimizer,
+                device=ctx.device,
+                sync_dataloader_exhaustion=True,
+                enqueue_batch_after_forward=enqueue_batch_after_forward,
+            )
+
+            num_batches_per_rank = [2, 4, 6]
+            num_batches_for_this_rank = num_batches_per_rank[ctx.rank]
+            batches = [
+                d[1][ctx.rank].to(ctx.device) for d in data[:num_batches_for_this_rank]
+            ]
+            data_iter = iter(batches)
+
+            iterations = 0
+            try:
+                while True:
+                    pipeline.progress(data_iter)
+                    iterations += 1
+            except StopIteration:
+                pass
+
+            expected_iterations = min(num_batches_per_rank)
+            if iterations != expected_iterations:
+                raise AssertionError(
+                    f"rank {rank}: expected {expected_iterations} iterations "
+                    f"after sync truncation, got {iterations}"
+                )
+
+            if len(pipeline.batches) != len(pipeline.contexts):
+                raise AssertionError(
+                    f"rank {rank}: queue invariant violated — "
+                    f"batches={len(pipeline.batches)} "
+                    f"contexts={len(pipeline.contexts)}"
+                )
+
+            has_grad = any(
+                p.grad is not None
+                for p in sharded_model.parameters()
+                if p.requires_grad
+            )
+            if not has_grad:
+                raise AssertionError(
+                    f"rank {rank}: no parameter received a gradient — "
+                    "real sparse-dist forward/backward did not run"
+                )
+    finally:
+        signal.alarm(0)
+
+
+class SyncDataloaderExhaustionRealProgressTest(MultiProcessTestBase):
+    def setUp(self) -> None:
+        super().setUp()
+        num_features = 4
+        self.tables: List[EmbeddingBagConfig] = [
+            EmbeddingBagConfig(
+                num_embeddings=(i + 1) * 100,
+                embedding_dim=(i + 1) * 4,
+                name=f"table_{i}",
+                feature_names=[f"feature_{i}"],
+            )
+            for i in range(num_features)
+        ]
+        self.weighted_tables: List[EmbeddingBagConfig] = []
+
+    def _generate_data(
+        self, num_batches: int, world_size: int = 3, batch_size: int = 4
+    ) -> List[Tuple[ModelInput, List[ModelInput]]]:
+        return [
+            ModelInput.generate(
+                tables=self.tables,
+                weighted_tables=self.weighted_tables,
+                batch_size=batch_size,
+                world_size=world_size,
+                num_float_features=10,
+            )
+            for _ in range(num_batches)
+        ]
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 3,
+        "Need at least 3 GPUs for distributed test with world_size=3",
+    )
+    def test_progress_real_sparse_dist_uneven_data(self) -> None:
+        # Generate enough data for the largest rank (max=6).
+        data = self._generate_data(num_batches=6, world_size=3)
+        self._run_multi_process_test(
+            callable=_run_test_progress_real_sparse_dist_uneven_data,
+            world_size=3,
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            data=data,
+            enqueue_batch_after_forward=False,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 3,
+        "Need at least 3 GPUs for distributed test with world_size=3",
+    )
+    def test_progress_real_sparse_dist_uneven_data_enqueue_after_forward(
+        self,
+    ) -> None:
+        data = self._generate_data(num_batches=6, world_size=3)
+        self._run_multi_process_test(
+            callable=_run_test_progress_real_sparse_dist_uneven_data,
+            world_size=3,
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            data=data,
+            enqueue_batch_after_forward=True,
+        )

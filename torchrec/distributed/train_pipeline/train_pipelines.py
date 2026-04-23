@@ -31,6 +31,7 @@ from typing import (
 )
 
 import torch
+import torch.distributed as dist
 from torch.autograd.profiler import record_function
 from torchrec.distributed.comm_ops import Request  # noqa: F401
 from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
@@ -161,6 +162,8 @@ except Exception:
 
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_SENTINEL_NOT_EXHAUSTED: int = torch.iinfo(torch.int64).max
 
 # This is required to support older torch package export for older models
 try:
@@ -568,6 +571,16 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         free_features_storage_early (bool): if True, free the original batch KJT
             tensor storage right after permute in input_dist.  Safe because
             PipelinedForward ignores the KJT args during model forward.
+        sync_dataloader_exhaustion (bool): if True, synchronize dataloader
+            exhaustion across all ranks using a lightweight gloo allreduce
+            after each enqueue_batch call. When any rank's dataloader is
+            exhausted, all ranks truncate their batch queue to the minimum
+            count, ensuring every rank processes the same number of batches
+            and stops with matched collectives. All ranks must pass the same
+            value for this flag; mismatched values will deadlock on the
+            internal dist.new_group call. Requires a default process group
+            to be initialized. Cost: one CPU gloo allreduce of a 1-element
+            int64 tensor per progress() call. Default: False.
     """
 
     # The PipelinedForward class that is used in _rewrite_model
@@ -592,6 +605,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
         clear_data_dist_inputs: bool = False,
+        sync_dataloader_exhaustion: bool = False,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -653,6 +667,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self.batches: Deque[Optional[In]] = deque()
         self._dataloader_iter: Optional[Iterator[In]] = None
         self._dataloader_exhausted: bool = False
+        self._sync_dataloader_exhaustion_enabled = sync_dataloader_exhaustion
+        self._exhaustion_synced: bool = False
+        # Created in fill_pipeline on first call. Not destroyed on reset()
+        # to avoid the overhead of creating a new process group each epoch;
+        # the group is reused across epochs.
+        self._gloo_pg: Optional[dist.ProcessGroup] = None
         self._context_type: Type[TrainPipelineContext] = context_type
 
         self._model_fwd: Callable[[Optional[In]], Tuple[torch.Tensor, Out]] = (
@@ -798,6 +818,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             dataloader_iter stops, the last batch, do nothing
         """
 
+        # Create gloo PG for dataloader exhaustion sync. Done here because
+        # dist.new_group is a collective — all ranks must call it at the same
+        # point. fill_pipeline is called by all ranks at the start of progress().
+        if self._sync_dataloader_exhaustion_enabled and self._gloo_pg is None:
+            self._gloo_pg = dist.new_group(backend="gloo")
+
         # pipeline is already filled with max capacity (2)
         if len(self.batches) >= 2:
             return
@@ -808,9 +834,23 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         if self.batches and self._execute_all_batches:
             return
 
-        # batch i, data (batch) and context
-        if not self.enqueue_batch(dataloader_iter):
-            logger.info("fill_pipeline: failed to load batch i")
+        # batch i, data (batch) and context.
+        # try/finally because copy_batch_to_gpu raises StopIteration (rather
+        # than returning None) when execute_all_batches=False and the iterator
+        # is exhausted. Without finally, the raising rank would skip the sync
+        # below entirely, leaving non-raising ranks blocked forever in the
+        # gloo allreduce — a deadlock the validation feature is meant to
+        # prevent. The finally guarantees both ranks reach the sync.
+        try:
+            if not self.enqueue_batch(dataloader_iter):
+                logger.info("fill_pipeline: failed to load batch i")
+        finally:
+            # All ranks sync here, BEFORE _init_pipelined_modules (which
+            # issues NCCL collectives). If any rank exhausted, all truncate
+            # and return before entering NCCL territory — preventing a
+            # cross-backend deadlock.
+            self._maybe_sync_dataloader_exhaustion()
+        if not self.batches:
             return
 
         # modify the (sharded) sparse module forward, and invoke the first part of input_dist
@@ -823,10 +863,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         # doing the second part of input_dist, the first part is invoked in _init_pipelined_modules
         self.wait_sparse_data_dist(self.contexts[0])
 
-        # batch i+1
-        if not self.enqueue_batch(dataloader_iter):
-            logger.info("fill_pipeline: failed to load batch i+1")
-            return
+        # batch i+1 — same try/finally rationale as above.
+        try:
+            if not self.enqueue_batch(dataloader_iter):
+                logger.info("fill_pipeline: failed to load batch i+1")
+        finally:
+            self._maybe_sync_dataloader_exhaustion()
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -887,8 +929,19 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             self.start_sparse_data_dist(self.batches[1], self.contexts[1])
 
         if not self._enqueue_batch_after_forward:
-            # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
-            self.enqueue_batch(dataloader_iter)
+            # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here.
+            # try/finally because copy_batch_to_gpu raises StopIteration (not
+            # returns None) when execute_all_batches=False and the iterator is
+            # exhausted; without finally, the raising rank skips the sync and
+            # other ranks block in the allreduce forever.
+            try:
+                self.enqueue_batch(dataloader_iter)
+            finally:
+                # Sync after enqueue. Truncation is safe: start_sparse_data_dist
+                # was called on batches[1] (if len >= 2) before enqueue, so the
+                # exhausted rank has len >= 2 and min_batches >= 2 — only the
+                # just-enqueued batches[2] can be popped, never batches[1].
+                self._maybe_sync_dataloader_exhaustion()
 
         # forward
         with record_function(f"## forward {self.contexts[0].index} ##"):
@@ -899,7 +952,15 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here.
             # Start this step after the forward of batch i, so that the H2D copy doesn't compete
             # for pcie bandwidth with embedding lookup from UVM/UVM_CACHING.
-            self.enqueue_batch(dataloader_iter)
+            # Same try/finally rationale as the non-enqueue_batch_after_forward
+            # path above: copy_batch_to_gpu raises StopIteration on exhausted
+            # iter when execute_all_batches=False, and finally is required so
+            # the sync still runs and other ranks don't deadlock.
+            try:
+                self.enqueue_batch(dataloader_iter)
+            finally:
+                # Same invariant as the non-enqueue_batch_after_forward path above.
+                self._maybe_sync_dataloader_exhaustion()
 
         if len(self.batches) >= 2:
             # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
@@ -970,6 +1031,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self.contexts.clear()
         self.batches.clear()
         self._dataloader_exhausted = False
+        self._exhaustion_synced = False
         self._next_index = 0
         self._batch_i = None
         self._batch_ip2 = None
@@ -1120,6 +1182,8 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         if dataloader_iter is not self._dataloader_iter:
             self._dataloader_iter = dataloader_iter
             self._dataloader_exhausted = False
+            # Reset so sync works again for the new epoch/iterator
+            self._exhaustion_synced = False
 
         if self._dataloader_exhausted:
             batch = None
@@ -1132,6 +1196,61 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         if batch is None:
             logger.info("_next_batch: dataloader exhausted")
         return batch
+
+    def _maybe_sync_dataloader_exhaustion(self) -> None:
+        """Sync data exhaustion state across ranks via gloo allreduce.
+
+        When sync_dataloader_exhaustion is enabled, this ensures all ranks
+        stop at the same iteration by using a single allreduce(MIN): non-exhausted
+        ranks send INT_MAX, exhausted ranks send their batch count. If the result
+        is < INT_MAX, at least one rank exhausted and all truncate to the minimum.
+        """
+        if not self._sync_dataloader_exhaustion_enabled or self._exhaustion_synced:
+            return
+
+        if self._gloo_pg is None:
+            raise RuntimeError(
+                "_gloo_pg not initialized — fill_pipeline must be called "
+                "before _maybe_sync_dataloader_exhaustion when "
+                "sync_dataloader_exhaustion is enabled"
+            )
+
+        # Non-exhausted ranks send the sentinel; exhausted ranks send their
+        # batch count. A single MIN allreduce detects exhaustion and finds
+        # the minimum in one op.
+        batch_count = torch.tensor(
+            [
+                (
+                    len(self.batches)
+                    if self._dataloader_exhausted
+                    else _SENTINEL_NOT_EXHAUSTED
+                )
+            ],
+            dtype=torch.int64,
+        )
+        dist.all_reduce(batch_count, op=dist.ReduceOp.MIN, group=self._gloo_pg)
+        min_batches = batch_count.item()
+
+        if min_batches == _SENTINEL_NOT_EXHAUSTED:
+            return
+
+        # Truncation safety: in steady-state progress(), start_sparse_data_dist
+        # was called on batches[1] before enqueue_batch, so the exhausted rank
+        # still has at least batches[0] and batches[1] (len >= 2). Therefore
+        # min_batches >= 2 and we only ever pop the just-enqueued batches[2],
+        # never a batch with in-flight NCCL collectives.
+        #
+        # Pop from the right — discard the newest batches that the
+        # exhausted rank(s) don't have.
+        while len(self.batches) > min_batches:
+            self.batches.pop()
+            self.contexts.pop()
+
+        self._dataloader_exhausted = True
+        self._exhaustion_synced = True
+        logger.info(
+            "_maybe_sync_dataloader_exhaustion: synced to %d batches", min_batches
+        )
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
