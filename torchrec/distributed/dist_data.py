@@ -10,7 +10,7 @@
 import itertools
 import logging
 import os
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -60,6 +60,35 @@ _DTYPE_MAX: Dict[torch.dtype, int] = {
 }
 
 _TORCHREC_OVERFLOW_DEBUG: bool = os.environ.get("TORCHREC_OVERFLOW_DEBUG", "0") == "1"
+
+
+def _validate_collectives_enabled() -> bool:
+    # Read on each call so the env var can be flipped at runtime (e.g. by job
+    # config that loads after import) and so tests can patch with mock.patch
+    # instead of mutating module state.
+    return os.environ.get("TORCHREC_VALIDATE_COLLECTIVES", "0") == "1"
+
+
+def _collective_tag_from(*parts: object) -> int:
+    """Compute a deterministic collective tag from identifying parts.
+
+    Returns a non-negative value that fits in signed int32. Uses FNV-1a
+    (deterministic across processes, unlike hash()).
+
+    The current call sites use int64 splits tensors, so a wider hash is
+    available in principle. The int32 cap is intentional forward-compat:
+    it guarantees the tag fits in any reasonable signed-integer splits dtype
+    without wrapping negative. 31 bits (~2.1B buckets) leaves collision risk
+    negligible for the small number of distinct collective sites in flight
+    per process group.
+    """
+    h = 0x811C9DC5
+    for b in ",".join(str(p) for p in parts).encode():
+        h = ((h ^ b) * 0x01000193) & 0x7FFFFFFF
+    # Mask after the loop too: the FNV-1a seed (0x811C9DC5) exceeds
+    # signed-int32 max, so empty `parts` would skip the in-loop mask
+    # and return a value that violates the int32-fit contract.
+    return h & 0x7FFFFFFF
 
 
 def _check_int_overflow(
@@ -326,9 +355,37 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         self,
         input_tensors: List[torch.Tensor],
         pg: dist.ProcessGroup,
+        collective_tag: Optional[int] = None,
+        collective_tag_parts: Optional[Tuple[object, ...]] = None,
     ) -> None:
         super().__init__()
         self.num_workers: int = pg.size()
+        self._collective_tag = collective_tag
+        self._collective_tag_parts = collective_tag_parts
+        self._num_original_tensors = len(input_tensors)
+
+        # Append tag tensor for collective mismatch validation.
+        # Requires non-empty input_tensors to inherit device/dtype.
+        self._tag_appended: bool = False
+        if (
+            collective_tag is not None
+            and _validate_collectives_enabled()
+            and input_tensors
+        ):
+            dtype = input_tensors[0].dtype
+            if collective_tag > torch.iinfo(dtype).max:
+                raise ValueError(
+                    f"Collective tag {collective_tag} exceeds {dtype} range "
+                    f"(max={torch.iinfo(dtype).max}). "
+                    f"Splits tensors should be int32 or int64."
+                )
+            tag_tensor = torch.tensor(
+                [collective_tag] * self.num_workers,
+                device=input_tensors[0].device,
+                dtype=dtype,
+            )
+            input_tensors = input_tensors + [tag_tensor]
+            self._tag_appended = True
 
         if is_torchdynamo_compiling():
             # TODO(ivankobzarev) Remove this dynamo condition once dynamo functional collectives remapping does not emit copy_
@@ -381,9 +438,39 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
 
         ret = self._output_tensor.view(self.num_workers, -1).T.tolist()
 
+        # Validate collective tag if present
+        if self._tag_appended:
+            tag_row = ret[-1]
+            ret = ret[: self._num_original_tensors]
+            expected = self._collective_tag
+            if any(tag != expected for tag in tag_row):
+                label = (
+                    str(self._collective_tag_parts)
+                    if self._collective_tag_parts
+                    else "unknown"
+                )
+                raise RuntimeError(
+                    f"All2All collective mismatch detected (collective={label!r}): "
+                    f"expected tag {expected} but received tags {tag_row} from "
+                    f"peers. This indicates ranks are calling different "
+                    f"collectives on the same process group.\n"
+                    f"To debug: identify the rank whose tag differs from this "
+                    f"one, then compare its collective inputs (e.g. "
+                    f"input.keys(), splits, sharding plan) against this rank's. "
+                    f"Common causes: (1) divergent feature lists across ranks, "
+                    f"(2) a rank skipping the collective via early return or "
+                    f"data exhaustion, (3) sharding plan inconsistency. Do NOT "
+                    f"disable the check via TORCHREC_VALIDATE_COLLECTIVES — "
+                    f"the underlying mismatch will still cause silent data "
+                    f"corruption or an NCCL hang downstream."
+                )
+
         # Check for int32 overflow in AllToAll input. If the input is already
         # corrupted, the corruption happened before the collective.
         input_list = self._input_tensor.view(self.num_workers, -1).T.tolist()
+        # Strip tag row from input_list so overflow checks operate on real data
+        if self._tag_appended:
+            input_list = input_list[: self._num_original_tensors]
         if input_list:
             _check_int_overflow(
                 "SplitsAllToAllAwaitable",
@@ -688,9 +775,25 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
                 keys=keys,
             )
 
+        collective_tag: Optional[int] = None
+        tag_parts: Optional[Tuple[object, ...]] = None
+        if _validate_collectives_enabled():
+            # Identity components, all rank-invariant by contract:
+            # - input.keys(): pre-AllToAll feature list (NOT local `keys`,
+            #   which is the post-AllToAll subset and differs per rank).
+            # - tuple(self._splits): the sharding plan — feature-to-rank
+            #   assignment from the constructor, documented as "Same for
+            #   all ranks." Including this catches divergent sharding
+            #   plans that have the same key set; without it, a config
+            #   bug giving ranks different splits would compute the same
+            #   tag and silently corrupt the all2all.
+            tag_parts = ("KJTAllToAllSplits", input.keys(), tuple(self._splits))
+            collective_tag = _collective_tag_from(*tag_parts)
         self._splits_awaitable = SplitsAllToAllAwaitable(
             input_tensors,
             self._pg,
+            collective_tag=collective_tag,
+            collective_tag_parts=tag_parts,
         )
 
     def _wait_impl(self) -> KJTAllToAllTensorsAwaitable:

@@ -8,15 +8,29 @@
 # pyre-strict
 
 import itertools
+import os
 import random
 import unittest
-from typing import Dict, Generator, Iterable, List, Optional, Tuple, TypeVar, Union
+import unittest.mock
+from typing import (
+    cast,
+    Dict,
+    Generator,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+    Union,
+)
 
 import hypothesis.strategies as st
 import torch
 import torch.distributed as dist
 from hypothesis import given, settings
+from pyre_extensions import none_throws
 from torchrec.distributed.dist_data import (
+    _collective_tag_from,
     _get_recat,
     JaggedTensorAllToAll,
     KJTAllToAll,
@@ -25,7 +39,13 @@ from torchrec.distributed.dist_data import (
     PooledEmbeddingsAllToAll,
     PooledEmbeddingsReduceScatter,
     SequenceEmbeddingsAllToAll,
+    SplitsAllToAllAwaitable,
     VariableBatchPooledEmbeddingsAllToAll,
+)
+from torchrec.distributed.embedding_sharding import (
+    FusedKJTListSplitsAwaitable,
+    KJTListSplitsAwaitable,
+    KJTSplitsAllToAllMeta,
 )
 from torchrec.distributed.fbgemm_qcomm_codec import (
     CommType,
@@ -36,6 +56,7 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
+from torchrec.distributed.types import Awaitable, NullShardingContext
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
@@ -1549,3 +1570,611 @@ class GetRecatOverflowTest(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.dtype, torch.int32)
+
+
+class CollectiveTagFromTest(unittest.TestCase):
+    # Single-process unit tests for the _collective_tag_from helper.
+    _INT32_MAX = 0x7FFFFFFF
+
+    def test_empty_parts_fits_signed_int32(self) -> None:
+        # Regression: the FNV-1a seed (0x811C9DC5) exceeds signed-int32 max,
+        # so a previous implementation that only masked inside the loop body
+        # returned the raw seed when parts was empty, violating the docstring's
+        # int32-fit contract and risking overflow in callers that assign the
+        # tag to an int32 splits tensor.
+        tag = _collective_tag_from()
+        self.assertGreaterEqual(tag, 0)
+        self.assertLessEqual(tag, self._INT32_MAX)
+
+    def test_various_parts_all_fit_signed_int32(self) -> None:
+        # Sanity: a range of realistic call shapes all stay within int32.
+        # Mirrors the actual tag shapes used by the two production call sites
+        # (KJTAllToAllSplitsAwaitable, FusedKJTListSplitsAwaitable). If FNV-1a's
+        # mixing changes or one of the call sites grows a new identity field,
+        # this catches a regression across both.
+        cases = [
+            # KJTAllToAllSplits production shape: (name, keys, tuple(splits))
+            ("KJTAllToAllSplits", ["f0", "f1"], (1, 1)),
+            # FusedKJTListSplits production shape: (name, tuple of per-request
+            # entries — meta entries are (keys, splits, count); non-meta is None).
+            (
+                "FusedKJTListSplits",
+                (
+                    (("f0", "f1"), (1, 1), 2),
+                    None,
+                    (("f2",), (1,), 1),
+                ),
+            ),
+            # Boundary: empty keys / empty splits
+            ("KJTAllToAllSplits", [], ()),
+            # Boundary: empty fused awaitables list
+            ("FusedKJTListSplits", ()),
+            # Long single string — guards against FNV-1a length-related issues
+            ("x" * 1024,),
+        ]
+        for parts in cases:
+            with self.subTest(parts=parts):
+                tag = _collective_tag_from(*parts)
+                self.assertGreaterEqual(tag, 0)
+                self.assertLessEqual(tag, self._INT32_MAX)
+
+    def test_deterministic(self) -> None:
+        # Determinism is the main reason this exists instead of hash().
+        # If the implementation accidentally introduces nondeterminism
+        # (e.g., switching to hash() under PYTHONHASHSEED randomization),
+        # different ranks would compute different tags and the validation
+        # would false-positive.
+        self.assertEqual(
+            _collective_tag_from("KJTAllToAllSplits", ["f0", "f1"], 3),
+            _collective_tag_from("KJTAllToAllSplits", ["f0", "f1"], 3),
+        )
+
+
+class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
+    def setUp(self) -> None:
+        super().setUp()
+        os.environ["TORCHREC_VALIDATE_COLLECTIVES"] = "1"
+
+    def tearDown(self) -> None:
+        os.environ.pop("TORCHREC_VALIDATE_COLLECTIVES", None)
+        super().tearDown()
+
+    @classmethod
+    def _run_test_matching_tags(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        input_tensors = [
+            torch.tensor([rank] * world_size, dtype=torch.int64),
+            torch.tensor([rank + 1] * world_size, dtype=torch.int64),
+        ]
+        awaitable = SplitsAllToAllAwaitable(
+            input_tensors=input_tensors,
+            pg=none_throws(dist.group.WORLD),
+            collective_tag=42,
+            collective_tag_parts=("test_matching",),
+        )
+        result = awaitable.wait()
+        # Tag row should be stripped — only 2 original rows returned
+        assert len(result) == 2
+        # Row 0: each rank sent its rank number
+        assert result[0] == list(range(world_size))
+        # Row 1: each rank sent rank+1
+        assert result[1] == list(range(1, world_size + 1))
+        dist.destroy_process_group()
+
+    @classmethod
+    def _run_test_mismatched_tags(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        input_tensors = [
+            torch.tensor([1] * world_size, dtype=torch.int64),
+        ]
+        awaitable = SplitsAllToAllAwaitable(
+            input_tensors=input_tensors,
+            pg=none_throws(dist.group.WORLD),
+            collective_tag=rank,  # rank 0 -> tag 0, rank 1 -> tag 1
+            collective_tag_parts=("test_mismatched",),
+        )
+        try:
+            awaitable.wait()
+            raise AssertionError("Expected RuntimeError for mismatched tags")
+        except RuntimeError as e:
+            msg = str(e).lower()
+            assert "collective mismatch" in msg
+            assert "test_mismatched" in msg
+        dist.destroy_process_group()
+
+    @classmethod
+    def _run_test_no_tag(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        input_tensors = [
+            torch.tensor([rank] * world_size, dtype=torch.int64),
+        ]
+        awaitable = SplitsAllToAllAwaitable(
+            input_tensors=input_tensors,
+            pg=none_throws(dist.group.WORLD),
+            # No collective_tag — backward compatible
+        )
+        result = awaitable.wait()
+        assert len(result) == 1
+        assert result[0] == list(range(world_size))
+        dist.destroy_process_group()
+
+    def test_matching_tags_succeed(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_matching_tags,
+            world_size=2,
+            backend="gloo",
+        )
+
+    def test_mismatched_tags_raise(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_mismatched_tags,
+            world_size=2,
+            backend="gloo",
+        )
+
+    def test_no_tag_passthrough(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_no_tag,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_tag_does_not_corrupt_overflow_check(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        import torchrec.distributed.dist_data as dd
+
+        dd._TORCHREC_OVERFLOW_DEBUG = True
+
+        overflow_value = 2**31 + 1  # exceeds int32 max
+        input_tensors = [
+            torch.tensor([1] * world_size, dtype=torch.int64),
+            # Last row has overflow values — overflow check must catch this
+            torch.tensor([overflow_value] * world_size, dtype=torch.int64),
+        ]
+        awaitable = SplitsAllToAllAwaitable(
+            input_tensors=input_tensors,
+            pg=none_throws(dist.group.WORLD),
+            collective_tag=42,  # small tag — would NOT trigger overflow
+            collective_tag_parts=("test_overflow",),
+        )
+        try:
+            awaitable.wait()
+            raise AssertionError(
+                "Expected RuntimeError for int32 overflow in real data"
+            )
+        except RuntimeError as e:
+            # Should detect overflow in the real data, not skip it
+            # because the tag row (value=42) was checked instead
+            assert "corrupted" in str(e).lower()
+        dist.destroy_process_group()
+
+    def test_tag_does_not_corrupt_overflow_check(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_tag_does_not_corrupt_overflow_check,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_kjt_all_to_all_emits_tag(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        kjt = KeyedJaggedTensor(
+            keys=["f0", "f1"],
+            values=torch.tensor([1, 2, 3, 4], dtype=torch.int64),
+            lengths=torch.tensor([1, 1, 1, 1], dtype=torch.int64),
+        )
+        kjt_a2a = KJTAllToAll(
+            pg=none_throws(dist.group.WORLD),
+            splits=[1, 1],
+        )
+        splits_aw = kjt_a2a(kjt)
+        assert splits_aw._splits_awaitable._tag_appended is True
+        result = splits_aw.wait().wait()
+        assert isinstance(result, KeyedJaggedTensor)
+        dist.destroy_process_group()
+
+    def test_kjt_all_to_all_emits_tag(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_kjt_all_to_all_emits_tag,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_fused_kjt_list_splits_emits_tag(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        kjt = KeyedJaggedTensor(
+            keys=["f0"],
+            values=torch.tensor([1, 2], dtype=torch.int64),
+            lengths=torch.tensor([1, 1], dtype=torch.int64),
+        )
+        meta = KJTSplitsAllToAllMeta(
+            pg=none_throws(dist.group.WORLD),
+            _input=kjt,
+            splits=[1],
+            splits_tensors=[
+                torch.tensor([1] * world_size, dtype=torch.int64),
+            ],
+            input_splits=[[1] * world_size],
+            input_tensors=[kjt.lengths()],
+            labels=["lengths"],
+            keys=["f0"],
+            device=torch.device("cpu"),
+            stagger=1,
+        )
+        request = KJTListSplitsAwaitable(
+            awaitables=cast(List[Awaitable[Awaitable[KeyedJaggedTensor]]], [meta]),
+            ctx=NullShardingContext(),
+        )
+        fused = FusedKJTListSplitsAwaitable(
+            requests=[request],
+            contexts=[NullShardingContext()],
+            pg=none_throws(dist.group.WORLD),
+        )
+        assert fused._splits_awaitable is not None
+        assert fused._splits_awaitable._tag_appended is True
+        fused._splits_awaitable.wait()
+        dist.destroy_process_group()
+
+    def test_fused_kjt_list_splits_emits_tag(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_fused_kjt_list_splits_emits_tag,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_tag_not_appended_when_validation_disabled(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        input_tensors = [
+            torch.tensor([rank] * world_size, dtype=torch.int64),
+        ]
+        with unittest.mock.patch.dict(
+            os.environ, {"TORCHREC_VALIDATE_COLLECTIVES": "0"}
+        ):
+            awaitable = SplitsAllToAllAwaitable(
+                input_tensors=input_tensors,
+                pg=none_throws(dist.group.WORLD),
+                collective_tag=42,
+            )
+            assert awaitable._tag_appended is False
+            result = awaitable.wait()
+        assert len(result) == 1
+        assert result[0] == list(range(world_size))
+        dist.destroy_process_group()
+
+    def test_tag_not_appended_when_validation_disabled(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_tag_not_appended_when_validation_disabled,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_realistic_mismatched_tags(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        tag = (
+            _collective_tag_from("KJTAllToAllSplits", ["f0", "f1"], 3)
+            if rank == 0
+            else _collective_tag_from("FusedKJTListSplits", 2, [3, 3])
+        )
+        input_tensors = [
+            torch.tensor([1] * world_size, dtype=torch.int64),
+        ]
+        awaitable = SplitsAllToAllAwaitable(
+            input_tensors=input_tensors,
+            pg=none_throws(dist.group.WORLD),
+            collective_tag=tag,
+            collective_tag_parts=(f"rank{rank}_collective",),
+        )
+        try:
+            awaitable.wait()
+            raise AssertionError("Expected RuntimeError for mismatched tags")
+        except RuntimeError as e:
+            msg = str(e).lower()
+            assert "collective mismatch" in msg
+            assert f"rank{rank}_collective" in str(e)
+        dist.destroy_process_group()
+
+    def test_realistic_mismatched_tags_raise(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_realistic_mismatched_tags,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_feature_keys_divergence_raises(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        # Simulates the realistic bug class: both ranks reach the same call
+        # site (KJTAllToAllSplits) with the same len(input_splits), but their
+        # input.keys() diverge. The tag must distinguish on input.keys() so the
+        # mismatch is caught instead of corrupting the all2all silently.
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        keys = ["f0", "f1"] if rank == 0 else ["f0", "f2"]
+        input_splits_len = 3
+        tag = _collective_tag_from("KJTAllToAllSplits", keys, input_splits_len)
+        input_tensors = [
+            torch.tensor([1] * world_size, dtype=torch.int64),
+        ]
+        awaitable = SplitsAllToAllAwaitable(
+            input_tensors=input_tensors,
+            pg=none_throws(dist.group.WORLD),
+            collective_tag=tag,
+            collective_tag_parts=("KJTAllToAllSplits", keys, input_splits_len),
+        )
+        try:
+            awaitable.wait()
+            raise AssertionError(
+                "Expected RuntimeError for keys divergence at same call site"
+            )
+        except RuntimeError as e:
+            assert "collective mismatch" in str(e).lower()
+            assert "KJTAllToAllSplits" in str(e)
+        dist.destroy_process_group()
+
+    def test_feature_keys_divergence_raises(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_feature_keys_divergence_raises,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_splits_divergence_raises(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        # Companion to test_feature_keys_divergence_raises: same call site,
+        # same keys, but the per-feature sharding plan (`splits`) diverges
+        # across ranks. This is a config-bug class — the planner is supposed
+        # to produce the same plan on every rank — but it's exactly the
+        # silent-corruption mode the validation must catch. The tag must
+        # therefore include the splits identity, not just len(splits).
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        keys = ["f0", "f1"]  # rank-invariant
+        splits = (2, 0) if rank == 0 else (1, 1)  # divergent plan
+        tag = _collective_tag_from("KJTAllToAllSplits", keys, splits)
+        input_tensors = [
+            torch.tensor([1] * world_size, dtype=torch.int64),
+        ]
+        awaitable = SplitsAllToAllAwaitable(
+            input_tensors=input_tensors,
+            pg=none_throws(dist.group.WORLD),
+            collective_tag=tag,
+            collective_tag_parts=("KJTAllToAllSplits", keys, splits),
+        )
+        try:
+            awaitable.wait()
+            raise AssertionError(
+                "Expected RuntimeError for splits divergence at same call site"
+            )
+        except RuntimeError as e:
+            assert "collective mismatch" in str(e).lower()
+            assert "KJTAllToAllSplits" in str(e)
+        dist.destroy_process_group()
+
+    def test_splits_divergence_raises(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_splits_divergence_raises,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_fused_splits_divergence_raises(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        # FusedKJTListSplits-layer counterpart to test_splits_divergence_raises.
+        # Both ranks reach FusedKJTListSplitsAwaitable with the same structural
+        # arity (1 request, 1 splits tensor each) but their per-request
+        # sharding plan diverges. With the old structural-only tag
+        # ("FusedKJTListSplits", len(splits_tensors), self._lengths) these
+        # would collide; with the tightened per-request identity
+        # (keys, splits, len(splits_tensors)) the tag detects the divergence.
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        # Construct a KJTSplitsAllToAllMeta whose `splits` differs per rank.
+        # Everything else is rank-invariant: same keys, same shape.
+        kjt = KeyedJaggedTensor(
+            keys=["f0", "f1"],
+            values=torch.tensor([1, 2], dtype=torch.int64),
+            lengths=torch.tensor([1, 1], dtype=torch.int64),
+        )
+        splits = [2, 0] if rank == 0 else [1, 1]  # divergent sharding plan
+        meta = KJTSplitsAllToAllMeta(
+            pg=none_throws(dist.group.WORLD),
+            _input=kjt,
+            splits=splits,
+            splits_tensors=[
+                torch.tensor([1] * world_size, dtype=torch.int64),
+            ],
+            input_splits=[[1] * world_size],
+            input_tensors=[kjt.lengths()],
+            labels=["lengths"],
+            keys=["f0", "f1"],
+            device=torch.device("cpu"),
+            stagger=1,
+        )
+        request = KJTListSplitsAwaitable(
+            awaitables=cast(List[Awaitable[Awaitable[KeyedJaggedTensor]]], [meta]),
+            ctx=NullShardingContext(),
+        )
+        fused = FusedKJTListSplitsAwaitable(
+            requests=[request],
+            contexts=[NullShardingContext()],
+            pg=none_throws(dist.group.WORLD),
+        )
+        try:
+            none_throws(fused._splits_awaitable).wait()
+            raise AssertionError(
+                "Expected RuntimeError for fused splits divergence at same call site"
+            )
+        except RuntimeError as e:
+            assert "collective mismatch" in str(e).lower()
+            assert "FusedKJTListSplits" in str(e)
+        dist.destroy_process_group()
+
+    def test_fused_splits_divergence_raises(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_fused_splits_divergence_raises,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_fused_cross_type_divergence_raises(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        # Cross-type variant: both ranks reach FusedKJTListSplitsAwaitable with
+        # the same total number of splits tensors (1 — only the meta entry
+        # contributes; the non-meta entry contributes 0), so the underlying
+        # SplitsAllToAllAwaitable input shape matches and the all2all itself
+        # can run. But the per-position TYPE in `_awaitables` differs across
+        # ranks (meta vs non-meta swap). The position-preserving `None`
+        # placeholder in the tag must distinguish these so the divergence is
+        # caught — without it (e.g., if the production code filtered non-metas
+        # out before tagging), the two ranks would compute the same tag and
+        # silently corrupt the fused splits-all2all.
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        kjt = KeyedJaggedTensor(
+            keys=["f0"],
+            values=torch.tensor([1, 2], dtype=torch.int64),
+            lengths=torch.tensor([1, 1], dtype=torch.int64),
+        )
+        meta = KJTSplitsAllToAllMeta(
+            pg=none_throws(dist.group.WORLD),
+            _input=kjt,
+            splits=[1],
+            splits_tensors=[
+                torch.tensor([1] * world_size, dtype=torch.int64),
+            ],
+            input_splits=[[1] * world_size],
+            input_tensors=[kjt.lengths()],
+            labels=["lengths"],
+            keys=["f0"],
+            device=torch.device("cpu"),
+            stagger=1,
+        )
+        # Stub Awaitable that's intentionally NOT a KJTSplitsAllToAllMeta.
+        # spec=Awaitable makes isinstance(non_meta, Awaitable) succeed and
+        # isinstance(non_meta, KJTSplitsAllToAllMeta) fail — the only two
+        # checks production code performs on entries of `_awaitables` during
+        # tag construction. We never reach FusedKJTListSplitsAwaitable._wait_impl
+        # (which would call non_meta.wait()) because the test triggers only
+        # the splits stage via _splits_awaitable.wait().
+        non_meta = unittest.mock.MagicMock(spec=Awaitable)
+
+        # Rank 0 has [meta, non_meta]; rank 1 has [non_meta, meta]. Both
+        # contribute the same single splits tensor to the all2all (only the
+        # meta does), so the collective input shape matches across ranks.
+        if rank == 0:
+            mixed = [meta, non_meta]
+        else:
+            mixed = [non_meta, meta]
+
+        request = KJTListSplitsAwaitable(
+            awaitables=cast(List[Awaitable[Awaitable[KeyedJaggedTensor]]], mixed),
+            ctx=NullShardingContext(),
+        )
+        fused = FusedKJTListSplitsAwaitable(
+            requests=[request],
+            contexts=[NullShardingContext()],
+            pg=none_throws(dist.group.WORLD),
+        )
+        try:
+            none_throws(fused._splits_awaitable).wait()
+            raise AssertionError(
+                "Expected RuntimeError for cross-type _awaitables divergence"
+            )
+        except RuntimeError as e:
+            assert "collective mismatch" in str(e).lower()
+            assert "FusedKJTListSplits" in str(e)
+        dist.destroy_process_group()
+
+    def test_fused_cross_type_divergence_raises(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_fused_cross_type_divergence_raises,
+            world_size=2,
+            backend="gloo",
+        )
+
+    def test_tag_raises_on_small_dtype(self) -> None:
+        with unittest.mock.patch.dict(
+            os.environ, {"TORCHREC_VALIDATE_COLLECTIVES": "1"}
+        ):
+            mock_pg = unittest.mock.MagicMock()
+            mock_pg.size.return_value = 2
+
+            large_tag = 0x7FFF_FFFF  # max signed int32, exceeds int16 range
+            input_tensors = [torch.tensor([1, 1], dtype=torch.int16)]
+            with self.assertRaises(ValueError) as ctx:
+                SplitsAllToAllAwaitable(
+                    input_tensors=input_tensors,
+                    pg=mock_pg,
+                    collective_tag=large_tag,
+                )
+            self.assertIn("exceeds", str(ctx.exception).lower())
