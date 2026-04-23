@@ -99,7 +99,10 @@ def _maybe_compute_lengths(
 def _maybe_compute_offsets(
     lengths: Optional[torch.Tensor], offsets: Optional[torch.Tensor]
 ) -> torch.Tensor:
-    if offsets is None:
+    if not torch.jit.is_scripting() and torch.compiler.is_compiling():
+        assert lengths is not None
+        offsets = _to_offsets(lengths)
+    elif offsets is None:
         assert lengths is not None
         offsets = _to_offsets(lengths)
     return offsets
