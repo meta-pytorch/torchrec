@@ -787,7 +787,15 @@ class GroupedPooledEmbeddingsLookup(
         splits = []
         for config, features in zip(self.grouped_configs, features_by_group):
             embedding_dim_per_key = config.embedding_dims()
-            stride_per_rank_per_key = list(zip(*features.stride_per_key_per_rank()))
+            stride_per_key_per_rank = features.stride_per_key_per_rank()
+            stride_per_rank_per_key = list(zip(*stride_per_key_per_rank))
+            n_ranks = len(stride_per_rank_per_key)
+            if n_ranks != self._world_size and n_ranks > 0:
+                raise ValueError(
+                    f"stride_per_key_per_rank has {n_ranks} ranks but "
+                    f"world_size is {self._world_size}. "
+                    f"keys={features.keys()}"
+                )
             splits.append(
                 [
                     stride * dim
@@ -995,9 +1003,23 @@ class GroupedPooledEmbeddingsLookup(
 
         features_by_group = sparse_features.split(self._feature_splits)
 
-        # If VBE is enabled and mulitple TBEs are involved, we need to merge the
-        # output
+        # If VBE is enabled and multiple TBEs are involved, we need to merge
+        # the output. The pre-allocated merging path requires TBE modules that
+        # support vbe_output/vbe_output_offsets (SplitTable, SSD). Dense TBE
+        # modules create their own output, so use simple concatenation instead.
         if is_vbe_enabled and len(self._emb_modules) > 1:
+            n_dense = sum(
+                isinstance(m, BatchedDenseEmbeddingBag) for m in self._emb_modules
+            )
+            if n_dense == len(self._emb_modules):
+                embeddings = self._forward(features_by_group)
+                return torch.cat(embeddings, dim=0)
+            elif n_dense > 0:
+                raise ValueError(
+                    f"VBE merging does not support mixed Dense and Split/SSD "
+                    f"TBE modules. Got {n_dense} Dense out of "
+                    f"{len(self._emb_modules)} total modules."
+                )
             return self._forward_with_vbe_merging(
                 features_by_group, device=sparse_features.device()
             )
