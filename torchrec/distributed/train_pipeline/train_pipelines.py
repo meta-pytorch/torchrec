@@ -917,11 +917,14 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             )
 
             # update
-            with record_function(f"## optimizer {self.contexts[0].index} ##"):
-                self._optimizer.step()
+            self._optimizer_step()
 
         self.dequeue_batch()
         return output
+
+    def _optimizer_step(self) -> None:
+        with record_function(f"## optimizer {self.contexts[0].index} ##"):
+            self._optimizer.step()
 
     def _create_context(self) -> TrainPipelineContext:
         context = self._context_type(index=self._next_index, version=1)
