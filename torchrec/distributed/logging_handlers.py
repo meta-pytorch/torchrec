@@ -259,6 +259,17 @@ def log_stats_match(
     pass
 
 
+def log_cacheability_resolved(
+    table_name: str = "",
+    table_height: int = 0,
+    cacheability: float = 0.0,
+    expected_lookups: int = 0,
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_clf_computed(
     table_name: str = "",
     table_height: int = 0,
@@ -352,6 +363,19 @@ def log_itep_ien_pruning_decision(
 def log_itep_itp_info(
     metadata: Optional[Dict[str, str]] = None,
     technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_kernel_changed(
+    table_name: str = "",
+    action: str = "",
+    reason: str = "",
+    new_kernels: Optional[list] = None,  # type: ignore[type-arg]
+    table_height: Optional[int] = None,
+    cache_ratio: Optional[float] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
 ) -> None:
     """No-op OSS stub."""
     pass

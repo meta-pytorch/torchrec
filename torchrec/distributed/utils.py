@@ -716,8 +716,27 @@ def _group_sharded_modules(
 def _convert_weights(
     weights: torch.Tensor,
     converted_dtype: SparseType,
+    use_cpu_turnaround_optimization: bool = False,
 ) -> torch.Tensor:
     torch_dtype = converted_dtype.as_dtype()
+
+    # Only HBM tensors on GPUs benefit from CPU-roundtrip: we can
+    # free the HBM allocation before copying quantized data back.
+    # UVM tensors cannot be freed (resize_ fails).
+    if torch.ops.fbgemm.is_uvm_tensor(weights):
+        # free the reference for the UVM tensor
+        return weights.to(dtype=torch_dtype)
+    if (
+        use_cpu_turnaround_optimization
+        and weights.device.type == "cuda"
+        and weights.numel() > 0
+    ):
+        device = weights.device
+        cpu_weights = weights.cpu()
+        weights.untyped_storage().resize_(0)
+        new_weights = cpu_weights.to(dtype=torch_dtype).to(device)
+        return new_weights
+
     new_weights = weights.to(dtype=torch_dtype)
     weights.untyped_storage().resize_(0)
     return new_weights
@@ -742,7 +761,10 @@ class EmbeddingQuantizationUtils:
         ] = {}
 
     def quantize_embedding_modules(
-        self, module: nn.Module, converted_dtype: DataType
+        self,
+        module: nn.Module,
+        converted_dtype: DataType,
+        use_cpu_turnaround_optimization: bool = False,
     ) -> None:
         sharded_embs = _group_sharded_modules(module)
         sharded_embs.sort(key=weights_bytes_in_emb_kernel)
@@ -756,16 +778,19 @@ class EmbeddingQuantizationUtils:
                 # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_dev,
                 converted_sparse_dtype,
+                use_cpu_turnaround_optimization=use_cpu_turnaround_optimization,
             )
             emb_kernel.weights_host = _convert_weights(
                 # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_host,
                 converted_sparse_dtype,
+                use_cpu_turnaround_optimization=use_cpu_turnaround_optimization,
             )
             emb_kernel.weights_uvm = _convert_weights(
                 # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_uvm,
                 converted_sparse_dtype,
+                use_cpu_turnaround_optimization=use_cpu_turnaround_optimization,
             )
             # pyrefly: ignore[no-matching-overload]
             self._emb_kernel_to_sparse_dtype.setdefault(
@@ -778,6 +803,7 @@ class EmbeddingQuantizationUtils:
     def recreate_embedding_modules(
         self,
         module: nn.Module,
+        use_cpu_turnaround_optimization: bool = False,
     ) -> None:
         sharded_embs = _group_sharded_modules(module)
         sharded_embs.sort(key=weights_bytes_in_emb_kernel)
@@ -790,16 +816,19 @@ class EmbeddingQuantizationUtils:
                 # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_dev,
                 converted_sparse_dtype,
+                use_cpu_turnaround_optimization=use_cpu_turnaround_optimization,
             )
             emb_kernel.weights_host = _convert_weights(
                 # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_host,
                 converted_sparse_dtype,
+                use_cpu_turnaround_optimization=use_cpu_turnaround_optimization,
             )
             emb_kernel.weights_uvm = _convert_weights(
                 # pyrefly: ignore[bad-argument-type]
                 emb_kernel.weights_uvm,
                 converted_sparse_dtype,
+                use_cpu_turnaround_optimization=use_cpu_turnaround_optimization,
             )
         self._recalculate_torch_state(module)
 
