@@ -8,6 +8,7 @@
 # pyre-strict
 import contextlib
 import copy
+import dataclasses
 import logging
 from collections import defaultdict, deque
 from concurrent.futures import Future
@@ -94,18 +95,19 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 
 def _batch_tensor_size(batch: Any) -> int:
-    """Compute total tensor storage size in bytes for a batch.
-
-    Uses pytree to flatten the batch into leaf tensors, then sums
-    element_size() * numel() for each. All operations are O(1) tensor
-    metadata reads — no data is accessed.
-    """
+    """Compute total tensor storage size in bytes for a batch."""
+    if isinstance(batch, torch.Tensor):
+        return batch.element_size() * batch.numel()
     leaves, _ = tree_flatten(batch)
-    return sum(
-        leaf.element_size() * leaf.numel()
-        for leaf in leaves
-        if isinstance(leaf, torch.Tensor)
-    )
+    if len(leaves) == 1 and leaves[0] is batch:
+        # pytree didn't decompose it — try dataclass fields
+        if dataclasses.is_dataclass(batch) and not isinstance(batch, type):
+            return sum(
+                _batch_tensor_size(getattr(batch, f.name))
+                for f in dataclasses.fields(batch)
+            )
+        return 0
+    return sum(_batch_tensor_size(leaf) for leaf in leaves)
 
 
 def _to_device(
