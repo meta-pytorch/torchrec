@@ -104,6 +104,7 @@ try:
         log_planning_result,
         log_storage_reservation,
         log_table_assignment,
+        log_table_constraints,
     )
 except Exception:
     torch._C._log_api_usage_once(
@@ -123,6 +124,9 @@ except Exception:
         pass
 
     def log_table_assignment(*args, **kwargs) -> None:
+        pass
+
+    def log_table_constraints(*args, **kwargs) -> None:
         pass
 
 
@@ -637,6 +641,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 ),
             }
         )
+        if self._constraints:
+            log_table_constraints(self._constraints, self.__class__.__name__)
 
         search_space = self._enumerator.enumerate(
             module=module,
