@@ -12,3 +12,6 @@ from torchrec.distributed.test_utils.test_model_parallel import _ModelParallelBa
 
 class ModelParallelTestNccl(_ModelParallelBase):
     backend = "nccl"
+
+
+del _ModelParallelBase

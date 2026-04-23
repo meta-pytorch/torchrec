@@ -14,3 +14,6 @@ from torchrec.distributed.test_utils.test_model_parallel import _ModelParallelBa
 
 class ModelParallelTestGlooGPU(_ModelParallelBase):
     backend = "gloo"
+
+
+del _ModelParallelBase
