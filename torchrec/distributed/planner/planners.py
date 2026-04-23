@@ -99,9 +99,11 @@ try:
     # remove this once we are sure all model side packages have the required
     # dependencies
     from torchrec.distributed.logging_handlers import (
+        detect_technique,
         log_offloading_summary,
         log_planner_config,
         log_planning_result,
+        log_proposer_result,
         log_storage_reservation,
         log_table_assignment,
         log_table_constraints,
@@ -111,6 +113,9 @@ except Exception:
         "torchrec.distributed.planner.planners.import_failure.logging_handlers"
     )
 
+    def detect_technique(*args, **kwargs):
+        return None
+
     def log_offloading_summary(*args, **kwargs) -> None:
         pass
 
@@ -118,6 +123,9 @@ except Exception:
         pass
 
     def log_planning_result(*args, **kwargs) -> None:
+        pass
+
+    def log_proposer_result(*args, **kwargs) -> None:
         pass
 
     def log_storage_reservation(*args, **kwargs) -> None:
@@ -615,6 +623,10 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             global_hbm_available_gb=round(bytes_to_gb(global_storage_capacity.hbm), 3),
         )
 
+        _technique = detect_technique(
+            list(self._constraints.values()) if self._constraints else []
+        )
+
         dense_storage = getattr(self._storage_reservation, "_dense_storage", None)
         kjt_storage = getattr(self._storage_reservation, "_kjt_storage", None)
         log_storage_reservation(
@@ -625,6 +637,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             original_hbm_per_rank=self._topology.devices[0].storage.hbm,
             available_hbm_per_rank=storage_constraint.devices[0].storage.hbm,
             planner_type=self.__class__.__name__,
+            technique=_technique,
         )
 
         log_planner_config(
@@ -639,10 +652,13 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 "num_table_constraints": (
                     str(len(self._constraints)) if self._constraints else "0"
                 ),
-            }
+            },
+            technique=_technique,
         )
         if self._constraints:
-            log_table_constraints(self._constraints, self.__class__.__name__)
+            log_table_constraints(
+                self._constraints, self.__class__.__name__, technique=_technique
+            )
 
         search_space = self._enumerator.enumerate(
             module=module,
@@ -686,7 +702,10 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 proposer.load(search_space=search_space, enumerator=self._enumerator)
 
             start = time.time()
-            for proposer in self._proposers:
+            for proposer_idx, proposer in enumerate(self._proposers):
+                proposer_num_proposals = 0
+                proposer_num_plans = 0
+                proposer_best_perf: Optional[float] = None
                 proposal = proposer.propose()
 
                 while proposal:
@@ -711,6 +730,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                         continue
 
                     self._num_proposals += 1
+                    proposer_num_proposals += 1
                     try:
                         # plan is just proposal where shard.rank is populated
                         plan = self._partitioner.partition(
@@ -718,7 +738,13 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                             storage_constraint=storage_constraint,
                         )
                         self._num_plans += 1
+                        proposer_num_plans += 1
                         perf_rating = self._perf_model.rate(plan=plan)
+                        if (
+                            proposer_best_perf is None
+                            or perf_rating < proposer_best_perf
+                        ):
+                            proposer_best_perf = perf_rating
                         if perf_rating < best_perf_rating:
                             best_perf_rating = perf_rating
                             best_plan = copy.deepcopy(plan)
@@ -757,6 +783,17 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     reset_shard_rank(proposal)
                     proposal = proposer.propose()
 
+                log_proposer_result(
+                    planner_type=self.__class__.__name__,
+                    proposer_name=proposer.__class__.__name__,
+                    proposer_index=proposer_idx,
+                    num_proposals=proposer_num_proposals,
+                    num_plans=proposer_num_plans,
+                    best_perf_rating=proposer_best_perf,
+                    is_winning_proposer=False,
+                    technique=_technique,
+                )
+
         if best_plan:
             for callback in self._callbacks:
                 best_plan = callback(best_plan)
@@ -789,12 +826,17 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
 
             log_planning_result(
                 planner_type=self.__class__.__name__,
+                technique=_technique,
                 num_proposals=str(self._num_proposals),
                 num_plans=str(self._num_plans),
             )
 
-            log_offloading_summary(best_plan, self.__class__.__name__)
-            log_table_assignment(best_plan, self.__class__.__name__)
+            log_offloading_summary(
+                best_plan, self.__class__.__name__, technique=_technique
+            )
+            log_table_assignment(
+                best_plan, self.__class__.__name__, technique=_technique
+            )
 
             return sharding_plan
         else:
@@ -857,6 +899,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
 
             log_planning_result(
                 planner_type=self.__class__.__name__,
+                technique=_technique,
                 error_message=str(last_planner_error),
                 num_proposals=str(self._num_proposals),
                 num_plans=str(self._num_plans),
