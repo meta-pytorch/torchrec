@@ -17,6 +17,8 @@ from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 import torch
 from torch import distributed as dist, nn
 from torchrec.distributed.dist_data import (
+    _collective_tag_from,
+    _validate_collectives_enabled,
     KJTAllToAllTensorsAwaitable,
     SplitsAllToAllAwaitable,
 )
@@ -914,10 +916,45 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
                     dtype=t.dtype,
                 )
 
+        collective_tag: Optional[int] = None
+        tag_parts: Optional[Tuple[object, ...]] = None
+        if _validate_collectives_enabled():
+            # Per-request rank-invariant identity, mirroring the tightening
+            # applied to KJTAllToAllSplitsAwaitable. A structural-only tag
+            # (e.g., len(splits_tensors) + self._lengths) collapses on real
+            # models: any two EBCs with identical KJT shape and sharding
+            # type produce the same `_lengths` vector, so a code-path
+            # divergence that fuses different module sets across ranks
+            # would compute the same tag and silently corrupt the all2all.
+            #
+            # Use aw._input.keys() (PRE-AllToAll keys, rank-invariant) —
+            # NOT aw.keys, which is the post-AllToAll local subset. Use
+            # tuple(aw.splits) for the per-request sharding plan
+            # (rank-invariant by KJTAllToAll's documented contract).
+            # Position-preserving: a None placeholder for non-meta
+            # awaitables keeps reordering detectable.
+            tag_parts = (
+                "FusedKJTListSplits",
+                tuple(
+                    (
+                        (
+                            tuple(aw._input.keys()),
+                            tuple(aw.splits),
+                            len(aw.splits_tensors),
+                        )
+                        if isinstance(aw, KJTSplitsAllToAllMeta)
+                        else None
+                    )
+                    for aw in self._awaitables
+                ),
+            )
+            collective_tag = _collective_tag_from(*tag_parts)
         self._splits_awaitable: Optional[SplitsAllToAllAwaitable] = (
             SplitsAllToAllAwaitable(
                 input_tensors=splits_tensors,
                 pg=pg,
+                collective_tag=collective_tag,
+                collective_tag_parts=tag_parts,
             )
             if splits_tensors and pg is not None
             else None
