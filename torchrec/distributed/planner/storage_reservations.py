@@ -10,6 +10,7 @@
 import copy
 import logging
 import math
+import warnings
 from typing import Dict, List, Optional, Set, Tuple
 
 from torch import nn
@@ -235,6 +236,15 @@ class HeuristicalStorageReservation(StorageReservation):
         parameter_multiplier: float = 6.0,
         dense_tensor_estimate: Optional[int] = None,
     ) -> None:
+        warnings.warn(
+            "HeuristicalStorageReservation is known to cause issues, particularly "
+            "during dry run where it over-estimates dense tensor size. We recommend "
+            "passing a dense_tensor_estimate, or migrating to "
+            "FixedPercentageStorageReservation. This policy is over-tuned to specific "
+            "use cases.",
+            FutureWarning,
+            stacklevel=2,
+        )
         assert percentage >= 0 and percentage <= 1
         self._percentage: float = percentage
         self._parameter_multiplier = parameter_multiplier
