@@ -646,21 +646,27 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
                 self._output_tensors.append(output_tensor)
                 self._awaitables.append(awaitable)
 
-    def clear_inputs(self) -> None:
+    def clear_inputs(self) -> int:
         """
         Clears input KJT tensors after wait.
+
+        Returns:
+            Total bytes freed.
         """
         if self._workers == 1 or is_torchdynamo_compiling():
-            return
+            return 0
 
         # Wait for all-to-all collectives to complete before freeing input storage.
         for awaitable in self._awaitables:
             awaitable.wait()
 
+        size = 0
         for tensor in self._input_tensors:
+            size += tensor.element_size() * tensor.numel()
             tensor.storage().resize_(0)
 
         self._input_tensors.clear()
+        return size
 
     def _wait_impl(self) -> KeyedJaggedTensor:
         """

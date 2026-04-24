@@ -232,11 +232,22 @@ def _clear_input_dist_tensors(context: TrainPipelineContext) -> None:
     complete and frees the input tensor storage early, before _wait_impl() is
     called during the model forward pass.
     """
+    size = 0
     for request in context.input_dist_tensors_requests.values():
         if isinstance(request, KJTListAwaitable):
             for awaitable in request.awaitables:
                 if isinstance(awaitable, KJTAllToAllTensorsAwaitable):
-                    awaitable.clear_inputs()
+                    size += awaitable.clear_inputs()
+    if size > 0:
+
+        def get_size() -> str:
+            msg: str = (
+                f"clear_input_dist_tensors freed {size / 1024**3:.2f} GB ({size} bytes)"
+            )
+            logger.info(msg)
+            return msg
+
+        one_time_logger.info(LazyStr(get_size))
 
 
 def _start_data_dist(
