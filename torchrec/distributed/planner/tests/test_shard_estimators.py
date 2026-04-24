@@ -31,6 +31,7 @@ from torchrec.distributed.planner.constants import (
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
 from torchrec.distributed.planner.shard_estimators import (
+    _calculate_optimizer_sizes,
     _calculate_storage_specific_sizes,
     EmbeddingOffloadStats,
     EmbeddingStorageEstimator,
@@ -1056,6 +1057,11 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
 
 
 def calculate_storage_specific_size_data_provider():
+    # Test setup: shape=(10,5,3), shard_sizes=[[5,5,3],[5,5,3]], storage=100.
+    # weight_bytes per shard = 50 (non-DP) or 100 (DP, replicated).
+    # Optimizer state is float32 (4 bytes), computed from shard dimensions:
+    #   Adam:           prod([5,5,3]) * 4 * 2 = 600 per shard
+    #   RowWiseAdagrad: shard_rows(5)  * 4    =  20 per shard
     return (
         {
             "sharding_type": ShardingType.TABLE_ROW_WISE,
@@ -1067,8 +1073,8 @@ def calculate_storage_specific_size_data_provider():
             "sharding_type": ShardingType.COLUMN_WISE,
             "optimizer_class": torch.optim.Adam,
             "expected_storage": [
-                150 + math.ceil(5 * (4 + 0.5 * 16)),
-                150 + math.ceil(5 * (4 + 0.5 * 16)),
+                650 + math.ceil(5 * (4 + 0.5 * 16)),
+                650 + math.ceil(5 * (4 + 0.5 * 16)),
             ],
             "clf": 0.5,
         },
@@ -1085,8 +1091,8 @@ def calculate_storage_specific_size_data_provider():
             "sharding_type": ShardingType.DATA_PARALLEL,
             "optimizer_class": trec_optim.RowWiseAdagrad,
             "expected_storage": [
-                134 + math.ceil(5 * (4 + 1.0 * 16)),
-                134 + math.ceil(5 * (4 + 1.0 * 16)),
+                120 + math.ceil(5 * (4 + 1.0 * 16)),
+                120 + math.ceil(5 * (4 + 1.0 * 16)),
             ],
             "clf": 1.0,
         },
@@ -1635,6 +1641,95 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
             hbms.append(sharding_options[0].shards[0].storage.hbm)
 
         self.assertEqual(hbms[0], hbms[1])
+
+    def test_output_data_type_size_uses_fp32_default(self) -> None:
+        """Output size estimation should use FP32 (4 bytes) when output_dtype is
+        not explicitly set, since the embedding kernel defaults to FP32 output
+        (SparseType.FP32) regardless of weight storage precision."""
+        topology = Topology(world_size=2, compute_device="cuda")
+        estimator = EmbeddingStorageEstimator(topology=topology)
+
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_bf16",
+                feature_names=["feature_0"],
+                data_type=DataType.BF16,
+            )
+        ]
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+        ebc_module = model.sparse.ebc
+        assert isinstance(ebc_module, torch.nn.Module)
+
+        bf16_tensor = torch.zeros(100, 10, dtype=torch.bfloat16, device="meta")
+        self.assertEqual(bf16_tensor.element_size(), 2)
+
+        sharding_option = ShardingOption(
+            name="table_bf16",
+            tensor=bf16_tensor,
+            module=("sparse.ebc", ebc_module),
+            input_lengths=[1.0],
+            batch_size=BATCH_SIZE,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            partition_by="host",
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=[Shard(size=[100, 10], offset=[0, 0])],
+        )
+
+        sharder_data_map = {
+            sharding_option.module_type_key: SharderData(
+                fused_params={},
+                qcomm_dtype_sizes={},
+                storage_usage_type=StorageUsageType.DEFAULT,
+            ),
+        }
+
+        estimator.estimate([sharding_option], sharder_data_map=sharder_data_map)
+
+        shard = sharding_option.shards[0]
+        self.assertIsNotNone(shard.storage)
+
+        # See batched_embedding_kernel.py:2865 for FP32 default:
+        #   output_dtype = fused_params.get("output_dtype", SparseType.FP32)
+        bf16_tensor_size = 100 * 10 * 2  # weight storage
+        input_size = math.ceil(1.0 * BATCH_SIZE * 2 * 8)  # BIGINT_DTYPE
+        expected_output_fp32 = BATCH_SIZE * 2 * 10 * 4  # FP32 output
+        expected_hbm = bf16_tensor_size + input_size + expected_output_fp32
+
+        self.assertEqual(
+            shard.storage.hbm,
+            expected_hbm,
+            f"Output sizing should use FP32 (4 bytes) not weight dtype "
+            f"(BF16 = 2 bytes). Expected HBM={expected_hbm}, got {shard.storage.hbm}.",
+        )
+
+    def test_calculate_optimizer_sizes(self) -> None:
+        # FBGEMM optimizer states are always float32, regardless of weight
+        # dtype. See construct_split_state in
+        # split_table_batched_embeddings_ops_training.py.
+        shard_sizes = [[100, 10], [100, 10]]
+        full = 100 * 10 * 4  # full float32 state per shard
+        rowwise = 100 * 4  # rowwise float32 state per shard
+
+        cases = [
+            (None, [0, 0]),
+            (torch.optim.SGD, [0, 0]),
+            (trec_optim.SGD, [0, 0]),
+            (torch.optim.Adam, [full * 2, full * 2]),
+            (trec_optim.Adam, [full * 2, full * 2]),
+            (trec_optim.LAMB, [full * 2, full * 2]),
+            (trec_optim.RowWiseAdagrad, [rowwise, rowwise]),
+            (trec_optim.PartialRowWiseAdam, [full + rowwise, full + rowwise]),
+            (trec_optim.PartialRowWiseLAMB, [full + rowwise, full + rowwise]),
+            (trec_optim.Adagrad, [full, full]),  # catch-all: 1 full state
+        ]
+        for optimizer_class, expected in cases:
+            with self.subTest(optimizer_class=optimizer_class):
+                self.assertEqual(
+                    _calculate_optimizer_sizes(shard_sizes, optimizer_class),
+                    expected,
+                )
 
     def test_zero_dimension_tensor_raises_value_error(self) -> None:
         topology = Topology(world_size=2, compute_device="cuda")
