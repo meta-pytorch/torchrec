@@ -25,7 +25,6 @@ from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.model_parallel import HybridEvalDMP
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import POOLING_FACTOR
-from torchrec.distributed.planner.planners import HeteroEmbeddingShardingPlanner
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
@@ -216,7 +215,7 @@ class PlannerConfig:
             tables: List of unweighted embedding tables
 
         Returns:
-            A ShardingPlanner instance (EmbeddingShardingPlanner, LinearProgrammingPlanner, or HeteroEmbeddingShardingPlanner)
+            A ShardingPlanner instance (EmbeddingShardingPlanner or LinearProgrammingPlanner)
 
         Raises:
             RuntimeError: If an unknown planner type is specified
@@ -252,21 +251,13 @@ class PlannerConfig:
             if LinearProgrammingPlanner is None:
                 raise RuntimeError(
                     "LinearProgrammingPlanner is not available in OSS. "
-                    "Use planner_type='embedding' or 'hetero' instead."
+                    "Use planner_type='embedding' instead."
                 )
             return LinearProgrammingPlanner(
                 topology=topology,
                 batch_size=self.batch_size,
                 constraints=constraints if constraints else None,
                 storage_reservation=storage_reservation,
-            )
-        elif self.planner_type == "hetero":
-            topology_groups = {self.device_group: topology}
-            return HeteroEmbeddingShardingPlanner(
-                topology_groups=topology_groups,
-                batch_size=self.batch_size,
-                constraints=constraints if constraints else None,
-                storage_reservation=storage_reservation,  # pyrefly: ignore[unexpected-keyword]
             )
         else:
             raise RuntimeError(f"Unknown planner type: {self.planner_type}")

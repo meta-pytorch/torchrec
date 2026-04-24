@@ -20,9 +20,16 @@ class ModelParallelTestGloo(_ModelParallelBase):
     backend = "gloo"
 
 
+del _ModelParallelBase
+
+
 class ModelParallelStateDictTestGloo(ModelParallelStateDictBase):
     backend = "gloo"
 
 
 class ModelParallelSparseOnlyTestGloo(ModelParallelSparseOnlyBase):
     backend = "gloo"
+
+
+del ModelParallelSparseOnlyBase
+del ModelParallelStateDictBase
