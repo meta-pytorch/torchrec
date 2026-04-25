@@ -513,6 +513,15 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
                 # pyrefly: ignore [bad-assignment]
                 torch._dynamo.config.skip_torchrec = False
 
+                # On AMD (ROCm), disable shape padding benchmarking to prevent
+                # cross-PG deadlock: benchmark_gpu() calls cuda.synchronize()
+                # which blocks on pending NCCL collectives. The deadlock has
+                # only been observed on AMD MI350X (maz5); leave the default
+                # in place on NVIDIA so the perf optimization continues to
+                # apply where it's safe.
+                if torch.version.hip is not None:
+                    torch._inductor.config.shape_padding = False
+
                 # Importing only before compilation to not slow-done train_pipelines import
                 torch.ops.import_module("fbgemm_gpu.sparse_ops")
 
@@ -2836,6 +2845,14 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
             "raise_comms",
             "reorder_compute_for_overlap",
         ]
+        # On AMD (ROCm), disable shape padding benchmarking to prevent
+        # cross-PG deadlock: benchmark_gpu() calls cuda.synchronize() which
+        # blocks on pending NCCL collectives. The deadlock has only been
+        # observed on AMD MI350X (maz5); leave the default in place on
+        # NVIDIA so the perf optimization continues to apply where it's safe.
+        if torch.version.hip is not None:
+            # pyrefly: ignore [implicit-import]
+            torch._inductor.config.shape_padding = False
         self.initialized = False
 
     def get_compiled_autograd_ctx(
