@@ -178,6 +178,9 @@ class ThroughputMetric(nn.Module):
         )
         self._steps = 0
 
+    def set_batch_size(self, batch_size: int) -> None:
+        self._batch_size = batch_size
+
     def _get_batch_size(self) -> int:
         # No batch size stages, use the default batch size
         if not self._batch_size_stages:
