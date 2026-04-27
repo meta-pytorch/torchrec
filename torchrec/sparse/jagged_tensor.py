@@ -2970,22 +2970,32 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         return _jt_dict
 
     @torch.jit.unused
+    def _owned_tensors(self) -> List[torch.Tensor]:
+        """Returns tensors with independent storage owned by this KJT.
+
+        Used by clear_storage for byte accounting and storage freeing.
+        Excludes _jt_dict tensors because they are views sharing storage
+        with _values/_weights/_lengths. When adding a new tensor field
+        to KJT, add it here and all lifetime-management methods pick it
+        up automatically.
+        """
+        tensors = [self._values]
+        if self._weights is not None:
+            tensors.append(self._weights)
+        if self._lengths is not None:
+            tensors.append(self._lengths)
+        if self._offsets is not None:
+            tensors.append(self._offsets)
+        if self._inverse_indices is not None:
+            tensors.append(self._inverse_indices[1])
+        return tensors
+
+    @torch.jit.unused
     #  inconsistently.
     # pyrefly: ignore[bad-override]
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
-        self._values.record_stream(stream)
-        weights = self._weights
-        if weights is not None:
-            weights.record_stream(stream)
-        lengths = self._lengths
-        if lengths is not None:
-            lengths.record_stream(stream)
-        offsets = self._offsets
-        if offsets is not None:
-            offsets.record_stream(stream)
-        inverse_indices = self._inverse_indices
-        if inverse_indices is not None:
-            inverse_indices[1].record_stream(stream)
+        for tensor in self._owned_tensors():
+            tensor.record_stream(stream)
         jt_dict = self._jt_dict
         if jt_dict is not None:
             for jt in jt_dict.values():
@@ -3132,27 +3142,16 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
     @torch.jit.unused
     def clear_storage(self) -> int:
         """
-        Frees the underlying storage of all internal tensors (_values, _lengths,
-        _offsets, _weights) by resizing their untyped storage to zero.
+        Frees the underlying storage of all internal tensors by resizing
+        their untyped storage to zero.
 
         The Python KJT object remains alive but its tensor data is released,
         allowing GPU HBM to be reclaimed early.
         """
-        size = self._values.element_size() * self._values.numel()
-        self._values.untyped_storage().resize_(0)
-        if self._lengths is not None:
-            size += self._lengths.element_size() * self._lengths.numel()
-            self._lengths.untyped_storage().resize_(0)
-        if self._offsets is not None:
-            size += self._offsets.element_size() * self._offsets.numel()
-            self._offsets.untyped_storage().resize_(0)
-        if self._weights is not None:
-            size += self._weights.element_size() * self._weights.numel()
-            self._weights.untyped_storage().resize_(0)
-        if self._inverse_indices is not None:
-            inv_tensor = self._inverse_indices[1]
-            size += inv_tensor.element_size() * inv_tensor.numel()
-            inv_tensor.untyped_storage().resize_(0)
+        size = 0
+        for tensor in self._owned_tensors():
+            size += tensor.element_size() * tensor.numel()
+            tensor.untyped_storage().resize_(0)
         return size
 
     def dist_tensors(self) -> List[torch.Tensor]:
