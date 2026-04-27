@@ -951,7 +951,7 @@ class ModelInput(Pipelineable):
         self,
         device: torch.device,
         non_blocking: bool = False,
-        data_copy_stream: Optional[torch.cuda.streams.Stream] = None,
+        data_copy_stream: Optional[torch.Stream] = None,
     ) -> "ModelInput":
         """
         Move ModelInput to the specified device.
@@ -959,7 +959,7 @@ class ModelInput(Pipelineable):
         Args:
             device: Target device to move tensors to.
             non_blocking: Whether to perform asynchronous copies.
-            data_copy_stream: Optional CUDA stream for async data copies. When provided,
+            data_copy_stream: Optional device stream for async data copies. When provided,
                 tensors are pre-allocated on the target device and copied within this stream.
                 This enables pipelined data transfers with computation on other streams.
 
@@ -971,7 +971,7 @@ class ModelInput(Pipelineable):
             batch_gpu = batch_cpu.to(device="cuda")
 
             # Async transfer with dedicated stream
-            copy_stream = torch.cuda.Stream()
+            copy_stream = torch.Stream(device_type="cuda")
             batch_gpu = batch_cpu.to(device="cuda", non_blocking=True, data_copy_stream=copy_stream)
         """
         if data_copy_stream is None:
@@ -998,7 +998,8 @@ class ModelInput(Pipelineable):
             )
         else:
             # Async copy using dedicated stream
-            current_stream = torch.cuda.current_stream(device)
+            device_module = torch.get_device_module(device)
+            current_stream = device_module.current_stream(device)
 
             # Pre-allocate tensors on target device
             float_features = torch.empty_like(self.float_features, device=device)
@@ -1018,7 +1019,7 @@ class ModelInput(Pipelineable):
             )
 
             # Perform async copy in dedicated stream
-            with data_copy_stream:
+            with device_module.stream(data_copy_stream):
                 # Wait for current stream to finish memory allocation
                 data_copy_stream.wait_stream(current_stream)
 
