@@ -2975,14 +2975,21 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         self._values.record_stream(stream)
         weights = self._weights
-        lengths = self._lengths
-        offsets = self._offsets
         if weights is not None:
             weights.record_stream(stream)
+        lengths = self._lengths
         if lengths is not None:
             lengths.record_stream(stream)
+        offsets = self._offsets
         if offsets is not None:
             offsets.record_stream(stream)
+        inverse_indices = self._inverse_indices
+        if inverse_indices is not None:
+            inverse_indices[1].record_stream(stream)
+        jt_dict = self._jt_dict
+        if jt_dict is not None:
+            for jt in jt_dict.values():
+                jt.record_stream(stream)
 
     def to(
         self,
@@ -3142,6 +3149,10 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         if self._weights is not None:
             size += self._weights.element_size() * self._weights.numel()
             self._weights.untyped_storage().resize_(0)
+        if self._inverse_indices is not None:
+            inv_tensor = self._inverse_indices[1]
+            size += inv_tensor.element_size() * inv_tensor.numel()
+            inv_tensor.untyped_storage().resize_(0)
         return size
 
     def dist_tensors(self) -> List[torch.Tensor]:
