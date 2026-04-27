@@ -15,6 +15,7 @@ import torch.utils._pytree as pytree
 from torch.testing import FileCheck
 from torchrec.fx import symbolic_trace
 from torchrec.sparse.jagged_tensor import (
+    _safe_tolist,
     ComputeJTDictToKJT,
     JaggedTensor,
     jt_is_equal,
@@ -1384,3 +1385,35 @@ class TestJaggedTensorTracing(unittest.TestCase):
         # Assert: Verify tensors are on CUDA
         self.assertTrue(result_jt.values().is_cuda)
         self.assertTrue(result_jt.lengths().is_cuda)
+
+    def test_cuda_tolist_cpu_tensor(self) -> None:
+        tensor = torch.tensor([3, 5, 7, 2])
+        result = _safe_tolist(tensor)
+        self.assertEqual(result, [3, 5, 7, 2])
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_cuda_tolist_cuda_tensor(self) -> None:
+        tensor = torch.tensor([3, 5, 7, 2], device="cuda")
+        result = _safe_tolist(tensor)
+        self.assertEqual(result, [3, 5, 7, 2])
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_cuda_tolist_empty_tensor(self) -> None:
+        tensor = torch.tensor([], dtype=torch.int64, device="cuda")
+        result = _safe_tolist(tensor)
+        self.assertEqual(result, [])
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_cuda_tolist_single_element(self) -> None:
+        tensor = torch.tensor([42], device="cuda")
+        result = _safe_tolist(tensor)
+        self.assertEqual(result, [42])
