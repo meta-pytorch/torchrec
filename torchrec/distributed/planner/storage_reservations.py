@@ -125,6 +125,12 @@ def _reserve_storage_percentage(topology: Topology, percent: float) -> None:
         device.storage.hbm = int((1 - percent) * device.storage.hbm)
 
 
+def _reserve_storage_absolute(topology: Topology, hbm_gb: float) -> None:
+    hbm_bytes = int(hbm_gb * (1024**3))
+    for device in topology.devices:
+        device.storage.hbm -= hbm_bytes
+
+
 def _get_batch_inputs_and_shardable_parameters(
     module: nn.Module,
     sharders: List[ModuleSharder[nn.Module]],
@@ -212,6 +218,37 @@ class FixedPercentageStorageReservation(StorageReservation):
     def last_reserved_topology(self) -> Optional[Topology]:
         "Returns a copy of the cached value of the most recent output from the reserve() method."
         return copy.deepcopy(self._last_reserved_topology)
+
+
+class FixedAbsoluteStorageReservation(FixedPercentageStorageReservation):
+    """
+    Reserves a fixed absolute amount of HBM storage (in GB) on each device, rather
+    than a percentage of total HBM. Useful when the non-sharded memory footprint is
+    known in advance and does not scale with device capacity.
+
+    Args:
+        hbm_reserved_gb (float): the amount of HBM to reserve per device, in GB.
+    """
+
+    def __init__(self, hbm_reserved_gb: float) -> None:
+        assert hbm_reserved_gb >= 0
+        super().__init__(percentage=0.0)
+        self._hbm_reserved_gb: float = hbm_reserved_gb
+
+    def reserve(
+        self,
+        topology: Topology,
+        batch_size: int,
+        module: nn.Module,
+        sharders: List[ModuleSharder[nn.Module]],
+        constraints: Optional[Dict[str, ParameterConstraints]] = None,
+    ) -> Topology:
+        reserved_topology = super().reserve(
+            topology, batch_size, module, sharders, constraints
+        )
+        _reserve_storage_absolute(reserved_topology, self._hbm_reserved_gb)
+        self._last_reserved_topology = reserved_topology
+        return reserved_topology
 
 
 class HeuristicalStorageReservation(StorageReservation):
