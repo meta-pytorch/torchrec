@@ -38,7 +38,10 @@ import torch
 import yaml
 from torch import multiprocessing as mp
 from torch.autograd.profiler import record_function
-from torchrec.distributed.benchmark.utils import dump_benchmark_result
+from torchrec.distributed.benchmark.utils import (
+    create_trace_file_name,
+    dump_benchmark_result,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import get_free_port
 
@@ -752,11 +755,6 @@ class cmd_conf:
             print(
                 f"Invalid command. Please use select program from {', '.join(self.programs.keys())}."
             )
-
-
-def create_trace_file_name(profile_name: str, rank: int) -> str:
-    """Create a unique trace file name for the given rank and profile name."""
-    return f"trace-{profile_name}-rank{rank}.json.gz"
 
 
 def init_argparse_and_args() -> argparse.Namespace:
