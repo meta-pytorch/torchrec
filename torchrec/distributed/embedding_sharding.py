@@ -22,6 +22,7 @@ from torchrec.distributed.dist_data import (
     KJTAllToAllTensorsAwaitable,
     SplitsAllToAllAwaitable,
 )
+from torchrec.sparse.jagged_tensor import _safe_tolist
 
 # This is required to support older torch package exports that do not contain
 # _check_int_overflow. During repackaging the
@@ -905,7 +906,7 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
         # the bug is upstream of the collective.
         if splits_tensors and pg is not None:
             for idx, t in enumerate(splits_tensors):
-                t_list = t.tolist()
+                t_list = _safe_tolist(t)
                 _check_int_overflow(
                     "FusedKJTListSplitsAwaitable",
                     t_list,
