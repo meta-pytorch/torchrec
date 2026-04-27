@@ -297,6 +297,80 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
     )
+    def test_quant_pred_state_dict_cw_list_copy(self) -> None:
+        """Regression test: CW sharding with qsplitscalebias produces list-valued
+        qscale/qbias in state_dict. Copying between two identically-sharded models
+        must handle list-to-list copy (not just tensor-to-list)."""
+        device = torch.device("cuda:0")
+
+        model = TestSparseNN(
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+            num_float_features=10,
+            dense_device=device,
+            sparse_device=torch.device("meta"),
+        )
+        quant_model = quantize(
+            model,
+            inplace=True,
+            output_type=torch.half,
+            quant_state_dict_split_scale_bias=True,
+        )
+        model.training = False
+
+        sharder = cast(
+            ModuleSharder[torch.nn.Module],
+            TestQuantEBCSharder(
+                sharding_type=ShardingType.COLUMN_WISE.value,
+                kernel_type=EmbeddingComputeKernel.QUANT.value,
+            ),
+        )
+
+        dmp = DistributedModelParallel(
+            quant_model,
+            sharders=[sharder],
+            device=device,
+            env=ShardingEnv.from_local(world_size=2, rank=0),
+            init_data_parallel=False,
+        )
+
+        dmp_copy = DistributedModelParallel(
+            quant_model,
+            sharders=[
+                cast(
+                    ModuleSharder[torch.nn.Module],
+                    TestQuantEBCSharder(
+                        sharding_type=ShardingType.COLUMN_WISE.value,
+                        kernel_type=EmbeddingComputeKernel.QUANT.value,
+                    ),
+                )
+            ],
+            device=device,
+            env=ShardingEnv.from_local(world_size=2, rank=0),
+            init_data_parallel=False,
+        )
+
+        _, local_batch = ModelInput.generate(
+            batch_size=16,
+            world_size=1,
+            num_float_features=10,
+            tables=self.tables,
+            weighted_tables=self.weighted_tables,
+        )
+
+        # This triggers _load_from_state_dict where both src and dst
+        # qscale/qbias are List[Tensor] for CW sharding.
+        # pyrefly: ignore[bad-argument-type]
+        dmp_copy.load_state_dict(dmp.state_dict())
+        torch.testing.assert_close(
+            dmp(local_batch[0].to(device)).cpu(),
+            dmp_copy(local_batch[0].to(device)).cpu(),
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs available",
+    )
     @given(
         output_type=st.sampled_from(
             [

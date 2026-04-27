@@ -355,6 +355,16 @@ class ShardedQuantEmbeddingModuleState(
                 for t in dst_tensor:
                     assert isinstance(t, torch.Tensor)
                     t.copy_(src_tensor)
+            elif isinstance(dst_tensor, list) and isinstance(src_tensor, list):
+                # sharded CW to sharded CW qscale, qbias (many to many)
+                assert len(dst_tensor) == len(src_tensor), (
+                    f"Mismatched list lengths: dst has {len(dst_tensor)} elements, "
+                    f"src has {len(src_tensor)} elements"
+                )
+                for dst_t, src_t in zip(dst_tensor, src_tensor):
+                    assert isinstance(dst_t, torch.Tensor)
+                    assert isinstance(src_t, torch.Tensor)
+                    dst_t.copy_(src_t)
             else:
                 dst_tensor.copy_(src_tensor)
 
