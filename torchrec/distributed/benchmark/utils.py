@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
@@ -30,6 +31,150 @@ def get_gpu_type() -> str:
 def get_cpu_type() -> str:
     """Return the CPU model string."""
     return platform.processor() or platform.machine()
+
+
+def create_trace_file_name(profile_name: str, rank: int) -> str:
+    """Create a unique trace file name for the given rank and profile name."""
+    return f"trace-{profile_name}-rank{rank}.json.gz"
+
+
+def _load_trace_events(trace_path: str) -> list[dict[str, Any]]:
+    if trace_path.endswith(".gz"):
+        with gzip.open(trace_path, "rt") as f:
+            trace_data = json.load(f)
+    else:
+        with open(trace_path, "r") as f:
+            trace_data = json.load(f)
+
+    # pyre-ignore[6]: json.load returns Any
+    if isinstance(trace_data, list):
+        return trace_data
+    if isinstance(trace_data, dict):
+        return trace_data.get("traceEvents", [])
+    return []
+
+
+def _extract_stream_tracks(
+    events: list[dict[str, Any]],
+) -> dict[tuple[int, int], str]:
+    """Extract GPU stream track names from chrome trace metadata events.
+
+    In the Chrome Trace Format each event has a ``"ph"`` (phase) field:
+      - ``"M"``  — metadata event, used to set process/thread names
+      - ``"X"``  — complete duration event (has ``ts`` and ``dur``)
+      - ``"B"``/``"E"`` — begin/end pair for duration events
+
+    Metadata events with ``"name": "thread_name"`` assign a human-readable
+    name (stored in ``args.name``) to a ``(pid, tid)`` pair. This function
+    collects those whose name starts with ``"stream"`` (e.g. ``"stream 7"``),
+    which represent CUDA stream tracks in PyTorch profiler traces.
+    """
+    track_names: dict[tuple[int, int], str] = {}
+    for event in events:
+        if event.get("ph") != "M" or event.get("name") != "thread_name":
+            continue
+        pid = event.get("pid", 0)
+        tid = event.get("tid", 0)
+        args = event.get("args", {})
+        if not (
+            isinstance(args, dict) and isinstance(pid, int) and isinstance(tid, int)
+        ):
+            continue
+        name = args.get("name", "")
+        if isinstance(name, str) and name.startswith("stream"):
+            track_names[(pid, tid)] = name
+    return track_names
+
+
+def _merged_active_time(intervals: list[tuple[float, float]]) -> float:
+    """Merge overlapping time intervals and return total active duration.
+
+    Sorts intervals by start time, then merges any that overlap or are
+    adjacent. The result is the sum of all merged interval lengths, which
+    represents the total wall-clock time covered without double-counting.
+
+    Example::
+
+        >>> _merged_active_time([(0, 5), (3, 8), (10, 15)])
+        13.0  # merged to [(0, 8), (10, 15)] -> 8 + 5 = 13
+
+        >>> _merged_active_time([(0, 10), (2, 4), (6, 12)])
+        12.0  # fully overlapping -> [(0, 12)] -> 12
+    """
+    if not intervals:
+        return 0.0
+    intervals.sort()
+    merged: list[tuple[float, float]] = [intervals[0]]
+    for start, end in intervals[1:]:
+        _, prev_end = merged[-1]
+        if start <= prev_end:
+            merged[-1] = (merged[-1][0], max(prev_end, end))
+        else:
+            merged.append((start, end))
+    return sum(end - start for start, end in merged)
+
+
+def parse_chrome_trace_gpu_utilization(trace_path: str) -> dict[str, float]:
+    """Parse a perfetto/chrome trace and return per-stream GPU utilization.
+
+    GPU utilization for each stream is the fraction of the total trace duration
+    during which the stream has active events. Stream tracks are identified by
+    thread-name metadata events whose name starts with ``"stream"``.
+
+    Args:
+        trace_path: Path to a chrome trace file (``.json`` or ``.json.gz``).
+
+    Returns:
+        Mapping of stream name to utilization ratio (0.0 to 1.0).
+    """
+    events = _load_trace_events(trace_path)
+    stream_tracks = _extract_stream_tracks(events)
+    if not stream_tracks:
+        return {}
+
+    stream_intervals: dict[str, list[tuple[float, float]]] = {
+        name: [] for name in stream_tracks.values()
+    }
+    global_min_ts: float = float("inf")
+    global_max_ts: float = float("-inf")
+
+    for event in events:
+        ts = event.get("ts")
+        dur = event.get("dur")
+        if not isinstance(ts, (int, float)) or not isinstance(dur, (int, float)):
+            continue
+        if dur <= 0:
+            continue
+        pid = event.get("pid", 0)
+        tid = event.get("tid", 0)
+        if not isinstance(pid, int) or not isinstance(tid, int):
+            continue
+
+        end = float(ts) + float(dur)
+        key = (pid, tid)
+        if key in stream_tracks:
+            stream_intervals[stream_tracks[key]].append((float(ts), end))
+        global_min_ts = min(global_min_ts, float(ts))
+        global_max_ts = max(global_max_ts, end)
+
+    total_duration = global_max_ts - global_min_ts
+    if total_duration <= 0:
+        return {}
+
+    return {
+        name: _merged_active_time(stream_intervals[name]) / total_duration
+        for name in sorted(stream_intervals.keys())
+    }
+
+
+def _merge_gpu_utilization_metrics(
+    trace_path: str,
+    metrics: dict[str, object],
+) -> None:
+    gpu_utilization = parse_chrome_trace_gpu_utilization(trace_path)
+    for stream_name, util in gpu_utilization.items():
+        key = stream_name.replace(" ", "_") + "_utilization"
+        metrics[key] = util
 
 
 def dump_benchmark_result(
@@ -56,6 +201,17 @@ def dump_benchmark_result(
         "cpu_type": get_cpu_type(),
         "metrics": result.to_dict(),
     }
+
+    trace_path = os.path.join(
+        output_dir,
+        create_trace_file_name(result.short_name, result.rank),
+    )
+    metrics = data["metrics"]
+    if os.path.exists(trace_path) and isinstance(metrics, dict):
+        try:
+            _merge_gpu_utilization_metrics(trace_path, metrics)
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+            logger.warning(f"Failed to parse chrome trace for GPU utilization: {e}")
 
     path = os.path.join(
         output_dir,
