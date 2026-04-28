@@ -385,6 +385,6 @@ class InferenceStorageReservation(StorageReservation):
 
         return reserved_topology
 
-    # pyrefly: ignore[bad-override]
+    @property
     def last_reserved_topology(self) -> Optional[Topology]:
         return copy.deepcopy(self._last_reserved_topology)
