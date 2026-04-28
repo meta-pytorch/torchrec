@@ -40,6 +40,7 @@ from torchrec.distributed.embedding_types import (
     InputDistOutputs,
     ShardedEmbeddingTable,
 )
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.types import (
     Awaitable,
     CommOp,
@@ -294,6 +295,9 @@ class TwSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
             splits=features_per_rank,
         )
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.INPUT_DIST, n=1000, add_wait_counter=True
+    )
     def forward(
         self,
         sparse_features: KeyedJaggedTensor,
@@ -352,6 +356,9 @@ class TwPooledEmbeddingDist(
         self._dist: Optional[PooledEmbeddingsAllToAll] = None
         self._variable_dist: Optional[VariableBatchPooledEmbeddingsAllToAll] = None
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.OUTPUT_DIST, n=1000, add_wait_counter=True
+    )
     def forward(
         self,
         local_embs: torch.Tensor,
