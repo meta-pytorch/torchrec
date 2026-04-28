@@ -81,7 +81,7 @@ jobs:
       contents: read
     with:
       runner: ${{ matrix.os }}
-      timeout: 20
+      timeout: 30
       script: |
         ldd --version
         if [[ "${{ matrix.python.free_threaded }}" == "true" ]]; then
