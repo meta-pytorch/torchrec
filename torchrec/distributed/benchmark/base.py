@@ -39,6 +39,7 @@ import yaml
 from torch import multiprocessing as mp
 from torch.autograd.profiler import record_function
 from torchrec.distributed.benchmark.utils import (
+    create_snapshot_file_name,
     create_trace_file_name,
     dump_benchmark_result,
 )
@@ -1077,7 +1078,7 @@ def _run_cuda_profiling(
     if memory_snapshot and (all_rank_traces or rank == 0):
         try:
             torch.cuda.memory._dump_snapshot(
-                f"{output_dir}/memory-{name}-rank{rank}.pickle"
+                f"{output_dir}/{create_snapshot_file_name(name, rank)}"
             )
         except Exception as e:
             logger.error(f"Failed to capture memory snapshot {e}")
