@@ -42,6 +42,7 @@ from typing import List, Optional
 
 import torch
 from torch.autograd.profiler import record_function
+from torch.distributed.checkpoint import load as dcp_load, save as dcp_save
 from torchrec.distributed.benchmark.base import (
     BenchFuncConfig,
     benchmark_func,
@@ -104,6 +105,9 @@ class RunOptions(BenchFuncConfig):
     local_world_size: Optional[int] = None
     workflow: str = "model_init"
     run_forward: bool = True
+    checkpoint_id: str = "/tmp/benchmark_checkpoint"
+    save_checkpoint: bool = True
+    load_checkpoint: bool = True
 
 
 def _setup(
@@ -202,17 +206,25 @@ def model_init_runner(
                     )
                 )
 
+            with record_function("## checkpoint_save ##"):
+                state_dict = sharded_model.state_dict()
+                if run_option.save_checkpoint:
+                    dcp_save(state_dict, checkpoint_id=run_option.checkpoint_id)
+
+            with record_function("## checkpoint_load ##"):
+                if run_option.load_checkpoint:
+                    state_dict = sharded_model.state_dict()
+                    dcp_load(state_dict, checkpoint_id=run_option.checkpoint_id)
+                    # pyrefly: ignore[bad-argument-type]
+                    sharded_model.load_state_dict(dict(state_dict))
+                else:
+                    # pyrefly: ignore[bad-argument-type]
+                    sharded_model.load_state_dict(dict(state_dict))
+
             with record_function("## forward ##"):
                 if run_option.run_forward:
                     batch = bench_inputs[0]
                     sharded_model(batch.to(ctx.device))
-
-            with record_function("## checkpoint_save ##"):
-                state_dict = sharded_model.state_dict()
-
-            with record_function("## checkpoint_load ##"):
-                # pyrefly: ignore[bad-argument-type]
-                sharded_model.load_state_dict(dict(state_dict))
 
             torch.cuda.synchronize()
 
@@ -292,6 +304,21 @@ def quant_model_init1_runner(
                     )
                 )
 
+            with record_function("## checkpoint_save ##"):
+                state_dict = sharded_model.state_dict()
+                if run_option.save_checkpoint:
+                    dcp_save(state_dict, checkpoint_id=run_option.checkpoint_id)
+
+            with record_function("## checkpoint_load ##"):
+                if run_option.load_checkpoint:
+                    state_dict = sharded_model.state_dict()
+                    dcp_load(state_dict, checkpoint_id=run_option.checkpoint_id)
+                    # pyrefly: ignore[bad-argument-type]
+                    sharded_model.load_state_dict(dict(state_dict))
+                else:
+                    # pyrefly: ignore[bad-argument-type]
+                    sharded_model.load_state_dict(dict(state_dict))
+
             with record_function("## quantize ##"):
                 quant_utils = EmbeddingQuantizationUtils()
                 quant_utils.quantize_embedding_modules(
@@ -302,13 +329,6 @@ def quant_model_init1_runner(
                 if run_option.run_forward:
                     batch = bench_inputs[0]
                     sharded_model(batch.to(ctx.device))
-
-            # with record_function("## checkpoint_save ##"):
-            #     state_dict = sharded_model.state_dict()
-
-            # with record_function("## checkpoint_load ##"):
-            #     # pyrefly: ignore[bad-argument-type]
-            #     sharded_model.load_state_dict(dict(state_dict))
 
             torch.cuda.synchronize()
 
