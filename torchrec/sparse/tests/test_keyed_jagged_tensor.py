@@ -1632,6 +1632,35 @@ class TestKeyedJaggedTensor(unittest.TestCase):
             assert offsets is not None
             self.assertEqual(offsets.untyped_storage().nbytes(), 0)
 
+    def test_clear_storage_no_double_count_jt_dict(self) -> None:
+        # `_jt_dict`'s cached values/weights/lengths are views sharing storage
+        # with the parent KJT, so they must not be counted again. The cached
+        # offsets ARE freshly allocated by `to_dict()` and are counted exactly
+        # once — accounted for separately from `_owned_tensors()`.
+        kjt = KeyedJaggedTensor(
+            values=torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            keys=["index_0", "index_1"],
+            lengths=torch.IntTensor([1, 0, 2, 3]),
+            weights=torch.Tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6]),
+        )
+        assert kjt._lengths is not None
+        assert kjt._weights is not None
+        owned_size = (
+            kjt._values.element_size() * kjt._values.numel()
+            + kjt._lengths.element_size() * kjt._lengths.numel()
+            + kjt._weights.element_size() * kjt._weights.numel()
+        )
+        # Populate _jt_dict — values/lengths/weights are views; offsets are fresh
+        jt_dict = kjt.to_dict()
+        self.assertIsNotNone(kjt._jt_dict)
+        cached_offsets_size = sum(
+            jt._offsets.element_size() * jt._offsets.numel()
+            for jt in jt_dict.values()
+            if jt._offsets is not None
+        )
+        actual_size = kjt.clear_storage()
+        self.assertEqual(actual_size, owned_size + cached_offsets_size)
+
 
 class TestKeyedJaggedTensorScripting(unittest.TestCase):
     def test_scriptable_forward(self) -> None:
