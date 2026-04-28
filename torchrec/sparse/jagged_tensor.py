@@ -2152,7 +2152,10 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         self._offset_per_key = kjt._offset_per_key
         self._index_per_key = kjt._index_per_key
         self._stride_per_key = kjt._stride_per_key
-        self._jt_dict = kjt._jt_dict
+        # Drop any cached per-key JaggedTensors: they reference tensors owned by
+        # `kjt` (potentially on a different device), so reusing them on `self`
+        # would leak foreign storage into operations like `record_stream()`.
+        self._jt_dict = None
 
         # tensor in-place copy
         self._values.copy_(kjt._values, non_blocking=non_blocking)
@@ -2975,14 +2978,21 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
         self._values.record_stream(stream)
         weights = self._weights
-        lengths = self._lengths
-        offsets = self._offsets
         if weights is not None:
             weights.record_stream(stream)
+        lengths = self._lengths
         if lengths is not None:
             lengths.record_stream(stream)
+        offsets = self._offsets
         if offsets is not None:
             offsets.record_stream(stream)
+        inverse_indices = self._inverse_indices
+        if inverse_indices is not None:
+            inverse_indices[1].record_stream(stream)
+        jt_dict = self._jt_dict
+        if jt_dict is not None:
+            for jt in jt_dict.values():
+                jt.record_stream(stream)
 
     def to(
         self,
@@ -3012,7 +3022,6 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         offset_per_key = self._offset_per_key
         index_per_key = self._index_per_key
         stride_per_key = self._stride_per_key
-        jt_dict = self._jt_dict
         inverse_indices = self._inverse_indices
         if inverse_indices is not None:
             inverse_indices = (
@@ -3048,7 +3057,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             lengths_offset_per_key=lengths_offset_per_key,
             offset_per_key=offset_per_key,
             index_per_key=index_per_key,
-            jt_dict=jt_dict,
+            jt_dict=None,
             inverse_indices=inverse_indices,
         )
 
@@ -3142,6 +3151,20 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         if self._weights is not None:
             size += self._weights.element_size() * self._weights.numel()
             self._weights.untyped_storage().resize_(0)
+        if self._inverse_indices is not None:
+            inv_tensor = self._inverse_indices[1]
+            size += inv_tensor.element_size() * inv_tensor.numel()
+            inv_tensor.untyped_storage().resize_(0)
+        if self._jt_dict is not None:
+            # Cached JaggedTensors share `values`/`lengths`/`weights` storage
+            # with the parent KJT (already released above), but their `offsets`
+            # are freshly allocated by `to_dict()` and must be released here.
+            for jt in self._jt_dict.values():
+                jt_offsets = jt._offsets
+                if jt_offsets is not None:
+                    size += jt_offsets.element_size() * jt_offsets.numel()
+                    jt_offsets.untyped_storage().resize_(0)
+            self._jt_dict = None
         return size
 
     def dist_tensors(self) -> List[torch.Tensor]:
