@@ -13,6 +13,7 @@ import gzip
 import json
 import logging
 import os
+import pickle
 import platform
 from typing import Any
 
@@ -36,6 +37,11 @@ def get_cpu_type() -> str:
 def create_trace_file_name(profile_name: str, rank: int) -> str:
     """Create a unique trace file name for the given rank and profile name."""
     return f"trace-{profile_name}-rank{rank}.json.gz"
+
+
+def create_snapshot_file_name(profile_name: str, rank: int) -> str:
+    """Create a unique memory snapshot file name for the given rank and profile name."""
+    return f"memory-{profile_name}-rank{rank}.pickle"
 
 
 def _load_trace_events(trace_path: str) -> list[dict[str, Any]]:
@@ -177,6 +183,67 @@ def _merge_gpu_utilization_metrics(
         metrics[key] = util
 
 
+def parse_memory_snapshot_peak_per_stream(
+    snapshot_path: str,
+    device: int = 0,
+) -> dict[int, float]:
+    """Parse a PyTorch memory snapshot and return peak memory usage per stream.
+
+    Replays alloc/free events chronologically, tracking current memory per
+    CUDA stream and recording the high-water mark for each.
+
+    Args:
+        snapshot_path: Path to the ``.pickle`` memory snapshot file.
+        device: Device index in ``device_traces`` (default 0).
+
+    Returns:
+        Mapping of stream ID to peak memory in MB.
+    """
+    with open(snapshot_path, "rb") as f:
+        data = pickle.load(f)
+
+    device_traces = data.get("device_traces", [])
+    if not isinstance(device_traces, list) or device >= len(device_traces):
+        return {}
+
+    traces = device_traces[device]
+    if not isinstance(traces, list):
+        return {}
+
+    active_allocs: dict[int, tuple[int, int]] = {}
+    current_per_stream: dict[int, int] = {}
+    peak_per_stream: dict[int, int] = {}
+
+    for event in traces:
+        action = event.get("action", "")
+        addr = event.get("addr", 0)
+        if not isinstance(addr, int):
+            addr = int(addr)
+
+        if action == "alloc":
+            size = event.get("size", 0)
+            stream = event.get("stream", 0)
+            if not isinstance(size, int):
+                size = int(size)
+            if not isinstance(stream, int):
+                stream = int(stream)
+            active_allocs[addr] = (stream, size)
+            current = current_per_stream.get(stream, 0) + size
+            current_per_stream[stream] = current
+            if current > peak_per_stream.get(stream, 0):
+                peak_per_stream[stream] = current
+
+        elif action in ("free_requested", "free_completed"):
+            if addr in active_allocs:
+                stream, size = active_allocs.pop(addr)
+                current_per_stream[stream] = current_per_stream.get(stream, 0) - size
+
+    return {
+        stream: bytes_val / (1024 * 1024)
+        for stream, bytes_val in peak_per_stream.items()
+    }
+
+
 def dump_benchmark_result(
     result: Any,
     output_dir: str,
@@ -212,6 +279,21 @@ def dump_benchmark_result(
             _merge_gpu_utilization_metrics(trace_path, metrics)
         except (OSError, json.JSONDecodeError, KeyError, ValueError) as e:
             logger.warning(f"Failed to parse chrome trace for GPU utilization: {e}")
+
+    snapshot_path = os.path.join(
+        output_dir,
+        create_snapshot_file_name(result.short_name, result.rank),
+    )
+    if os.path.exists(snapshot_path):
+        try:
+            peak_mem = parse_memory_snapshot_peak_per_stream(snapshot_path)
+            metrics = data["metrics"]
+            assert isinstance(metrics, dict)
+            for stream_id, peak_mb in sorted(peak_mem.items()):
+                key = f"stream_{stream_id}_peak_memory_mb"
+                metrics[key] = round(peak_mb, 2)
+        except Exception as e:
+            logger.warning(f"Failed to parse memory snapshot: {e}")
 
     path = os.path.join(
         output_dir,
