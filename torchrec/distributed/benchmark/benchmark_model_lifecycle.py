@@ -35,7 +35,6 @@ OSS (external):
         --world_size=2 --batch_size=4096 --num_batches=5 --pipeline=sparse
 """
 
-import itertools
 import json
 import logging
 from dataclasses import dataclass
@@ -69,8 +68,9 @@ from torchrec.distributed.test_utils.table_config import (
     EmbeddingTablesConfig,
     TableExtendedConfigs,
 )
-from torchrec.metrics.metric_module import RecMetricModule
+from torchrec.distributed.utils import EmbeddingQuantizationUtils
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.types import DataType
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -103,6 +103,7 @@ class RunOptions(BenchFuncConfig):
     num_iters: Optional[int] = None
     local_world_size: Optional[int] = None
     workflow: str = "model_init"
+    run_forward: bool = True
 
 
 def _setup(
@@ -173,41 +174,142 @@ def model_init_runner(
         use_deterministic_algorithms=False,
     ) as ctx:
 
-        # --- The function to benchmark: full model lifecycle ---
         def _func_to_benchmark(
             bench_inputs: List[ModelInput],
         ) -> None:
-            # Phase 1: Model creation
-            unsharded_model = model_config.generate_model(
-                tables=tables,
-                weighted_tables=weighted_tables,
-                dense_device=ctx.device,
-                mc_configs=(
-                    table_related_configs.mc_configs if table_related_configs else None
-                ),
-            )
-            planner = planner_config.generate_planner(
-                tables=tables + weighted_tables,
-            )
-            sharded_model, optimizer = (
-                sharding_config.generate_sharded_model_and_optimizer(
-                    model=unsharded_model,
-                    # pyrefly: ignore[bad-argument-type]
-                    pg=ctx.pg,
-                    device=ctx.device,
-                    planner=planner,
+            with record_function("## model_creation ##"):
+                # unsharded_model is created on meta device (sparse) and CPU (dense)
+                unsharded_model = model_config.generate_model(
+                    tables=tables,
+                    weighted_tables=weighted_tables,
+                    dense_device=ctx.device,
+                    mc_configs=(
+                        table_related_configs.mc_configs
+                        if table_related_configs
+                        else None
+                    ),
                 )
-            )
+                planner = planner_config.generate_planner(
+                    tables=tables + weighted_tables,
+                )
+                sharded_model, optimizer = (
+                    sharding_config.generate_sharded_model_and_optimizer(
+                        model=unsharded_model,
+                        # pyrefly: ignore[bad-argument-type]
+                        pg=ctx.pg,
+                        device=ctx.device,
+                        planner=planner,
+                    )
+                )
 
-            batch = bench_inputs[0]
-            out = sharded_model(batch.to(ctx.device))
+            with record_function("## forward ##"):
+                if run_option.run_forward:
+                    batch = bench_inputs[0]
+                    sharded_model(batch.to(ctx.device))
 
-            # # Phase 2: Checkpoint save
-            # state_dict = sharded_model.state_dict()
+            with record_function("## checkpoint_save ##"):
+                state_dict = sharded_model.state_dict()
 
-            # # Phase 3: Checkpoint load
-            # # pyre-ignore[6]: Expected OrderedDict but got Dict
-            # sharded_model.load_state_dict(dict(state_dict))
+            with record_function("## checkpoint_load ##"):
+                # pyrefly: ignore[bad-argument-type]
+                sharded_model.load_state_dict(dict(state_dict))
+
+            torch.cuda.synchronize()
+
+        result = benchmark_func(
+            # pyrefly: ignore[bad-argument-type]
+            bench_inputs=bench_inputs,
+            # pyrefly: ignore[bad-argument-type]
+            prof_inputs=bench_inputs,
+            func_to_benchmark=_func_to_benchmark,
+            benchmark_func_kwargs={},
+            sample_count=0,
+            **run_option.benchmark_func_kwargs(rank=rank),
+        )
+
+        if rank == 0:
+            logger.setLevel(logging.INFO)
+            if run_option.output_json:
+                print(json.dumps(result.to_dict(), indent=2))
+            else:
+                logger.info(result.prettify())
+                logger.info("\nMarkdown format:\n%s", result)
+
+        return result
+
+
+def quant_model_init1_runner(
+    rank: int,
+    world_size: int,
+    tables: List[EmbeddingBagConfig],
+    weighted_tables: List[EmbeddingBagConfig],
+    run_option: RunOptions,
+    model_config: BaseModelConfig,
+    pipeline_config: PipelineConfig,
+    input_config: ModelInputConfig,
+    planner_config: PlannerConfig,
+    sharding_config: ShardingConfig,
+    metric_config: RecMetricConfig,
+    table_related_configs: Optional[TableExtendedConfigs] = None,
+) -> BenchmarkResult:
+    """Shard a float model first, then quantize TBE kernels in-place."""
+
+    bench_inputs = _setup(run_option, input_config, tables, weighted_tables, rank)
+
+    with MultiProcessContext(
+        rank=rank,
+        world_size=world_size,
+        backend="cpu:gloo,cuda:nccl",
+        use_deterministic_algorithms=False,
+    ) as ctx:
+
+        def _func_to_benchmark(
+            bench_inputs: List[ModelInput],
+        ) -> None:
+            with record_function("## model_creation ##"):
+                unsharded_model = model_config.generate_model(
+                    tables=tables,
+                    weighted_tables=weighted_tables,
+                    dense_device=ctx.device,
+                    mc_configs=(
+                        table_related_configs.mc_configs
+                        if table_related_configs
+                        else None
+                    ),
+                )
+
+            with record_function("## shard ##"):
+                planner = planner_config.generate_planner(
+                    tables=tables + weighted_tables,
+                )
+                sharded_model, optimizer = (
+                    sharding_config.generate_sharded_model_and_optimizer(
+                        model=unsharded_model,
+                        # pyrefly: ignore[bad-argument-type]
+                        pg=ctx.pg,
+                        device=ctx.device,
+                        planner=planner,
+                    )
+                )
+
+            with record_function("## quantize ##"):
+                quant_utils = EmbeddingQuantizationUtils()
+                quant_utils.quantize_embedding_modules(
+                    sharded_model, converted_dtype=DataType.NFP8
+                )
+
+            with record_function("## forward ##"):
+                if run_option.run_forward:
+                    batch = bench_inputs[0]
+                    sharded_model(batch.to(ctx.device))
+
+            # with record_function("## checkpoint_save ##"):
+            #     state_dict = sharded_model.state_dict()
+
+            # with record_function("## checkpoint_load ##"):
+            #     # pyrefly: ignore[bad-argument-type]
+            #     sharded_model.load_state_dict(dict(state_dict))
+
             torch.cuda.synchronize()
 
         result = benchmark_func(
@@ -257,6 +359,8 @@ def main(
     match run_option.workflow:
         case "model_init":
             runner = model_init_runner
+        case "quant_model_init1":
+            runner = quant_model_init1_runner
         case _:
             raise ValueError(f"Unknown workflow {run_option.workflow}")
 
