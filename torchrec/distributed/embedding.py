@@ -559,6 +559,17 @@ class ShardedEmbeddingCollection(
         self._inverse_indices_permute_per_sharding: Optional[List[torch.Tensor]] = None
         self._skip_missing_weight_key: List[str] = []
 
+        self.init_data_parallel()
+
+        self._initialize_torch_state()
+
+        if module.device != torch.device("meta"):
+            self.load_state_dict(module.state_dict())
+
+    def init_data_parallel(self) -> None:
+        """
+        Initialize data parallel for the embedding collection.
+        """
         for index, (sharding, lookup) in enumerate(
             zip(
                 self._sharding_type_to_sharding.values(),
@@ -574,15 +585,11 @@ class ShardedEmbeddingCollection(
                         if self._device is not None and self._device.type == "cuda"
                         else None
                     ),
-                    process_group=env.process_group,
+                    process_group=self._env.process_group,
                     gradient_as_bucket_view=True,
                     broadcast_buffers=True,
                     static_graph=True,
                 )
-        self._initialize_torch_state()
-
-        if module.device != torch.device("meta"):
-            self.load_state_dict(module.state_dict())
 
     @classmethod
     def create_grouped_sharding_infos(

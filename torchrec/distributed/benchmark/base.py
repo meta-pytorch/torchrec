@@ -38,7 +38,11 @@ import torch
 import yaml
 from torch import multiprocessing as mp
 from torch.autograd.profiler import record_function
-from torchrec.distributed.benchmark.utils import dump_benchmark_result
+from torchrec.distributed.benchmark.utils import (
+    create_snapshot_file_name,
+    create_trace_file_name,
+    dump_benchmark_result,
+)
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.test_utils import get_free_port
 
@@ -754,11 +758,6 @@ class cmd_conf:
             )
 
 
-def create_trace_file_name(profile_name: str, rank: int) -> str:
-    """Create a unique trace file name for the given rank and profile name."""
-    return f"trace-{profile_name}-rank{rank}.json.gz"
-
-
 def init_argparse_and_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
@@ -1079,7 +1078,7 @@ def _run_cuda_profiling(
     if memory_snapshot and (all_rank_traces or rank == 0):
         try:
             torch.cuda.memory._dump_snapshot(
-                f"{output_dir}/memory-{name}-rank{rank}.pickle"
+                f"{output_dir}/{create_snapshot_file_name(name, rank)}"
             )
         except Exception as e:
             logger.error(f"Failed to capture memory snapshot {e}")
