@@ -84,8 +84,6 @@ class RunOptions(BenchFuncConfig):
             Default is 1024 * 32.
         num_batches (int): Number of batches to process during the benchmark.
             Default is 10.
-        input_type (str): Type of input format to use for the model.
-            Default is "kjt" (KeyedJaggedTensor).
         num_benchmarks (int): Number of benchmark iterations.
             Default is 5.
         num_profiles (int): Number of profiling iterations.
@@ -121,7 +119,6 @@ class RunOptions(BenchFuncConfig):
     world_size: int = 2
     batch_size: int = 1024 * 32
     num_batches: int = 10
-    input_type: str = "kjt"
     num_benchmarks: int = 5
     num_profiles: int = 2
     export_stacks: bool = False
@@ -150,11 +147,10 @@ def runner(
     sharding_config: ShardingConfig,
     metric_config: RecMetricConfig,
     table_related_configs: Optional[TableExtendedConfigs] = None,
-    debug_mode: bool = False,
 ) -> BenchmarkResult:
     # Ensure GPUs are available and we have enough of them
     assert (
-        torch.cuda.is_available() and torch.cuda.device_count() >= world_size
+        torch.cuda.is_available() and torch.cuda.device_count() >= run_option.world_size
     ), "CUDA not available or insufficient GPUs for the requested world_size"
 
     # Set topology domain environment variable if specified
@@ -169,7 +165,7 @@ def runner(
         )
 
     # debug mode only works with vscode for now.
-    if debug_mode:
+    if run_option.debug_mode:
         # pyrefly: ignore[missing-module-attribute]
         from fbvscode import attach_debugger
 
@@ -178,7 +174,7 @@ def runner(
     run_option.set_log_level()
     with MultiProcessContext(
         rank=rank,
-        world_size=world_size,
+        world_size=run_option.world_size,
         backend="cpu:gloo,cuda:nccl",
         use_deterministic_algorithms=False,
     ) as ctx:
@@ -228,7 +224,7 @@ def runner(
 
         metric_module: Optional[RecMetricModule] = metric_config.generate_metric_module(
             batch_size=run_option.batch_size,
-            world_size=world_size,
+            world_size=run_option.world_size,
             rank=rank,
             device=ctx.device,
             process_group=ctx.pg,
@@ -304,12 +300,7 @@ def runner(
                 model=sharded_model,
                 config=ga_config,
             )
-        # Commented out due to potential conflict with pipeline.reset()
-        # pipeline.progress(iter(bench_inputs))  # warmup
 
-        run_option.name = (
-            type(pipeline).__name__ if run_option.name == "" else run_option.name
-        )
         result = benchmark_func(
             # pyrefly: ignore[bad-argument-type]
             bench_inputs=bench_inputs,
@@ -429,7 +420,6 @@ def main(
         sharding_config=sharding_config,
         metric_config=metric_config,
         table_related_configs=table_extended_config,
-        debug_mode=run_option.debug_mode,
     )
 
 
