@@ -2969,13 +2969,6 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         self._jt_dict = _jt_dict
         return _jt_dict
 
-    def set_jt_dict(
-        self, length_per_key: list[int], jt_dict: dict[str, JaggedTensor]
-    ) -> None:
-        """Directly sets the internal JaggedTensor dictionary cache."""
-        self._length_per_key = length_per_key
-        self._jt_dict = jt_dict
-
     @torch.jit.unused
     #  inconsistently.
     # pyrefly: ignore[bad-override]
