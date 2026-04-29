@@ -17,6 +17,7 @@ from torchrec.distributed.embedding_sharding import (
     BaseSparseFeaturesDist,
 )
 from torchrec.distributed.embedding_types import BaseGroupedFeatureProcessor
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.sharding.dp_sharding import (
     BaseDpEmbeddingSharding,
     DpSparseFeaturesDist,
@@ -36,6 +37,9 @@ class DpSequenceEmbeddingDist(
     def __init__(self) -> None:
         super().__init__()
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.OUTPUT_DIST, n=1000, add_wait_counter=True
+    )
     def forward(
         self,
         local_embs: torch.Tensor,

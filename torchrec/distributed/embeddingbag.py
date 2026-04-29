@@ -1816,6 +1816,18 @@ class ShardedEmbeddingBagCollection(
                 self._enabled_feature_score_auto_collection,
                 self._sharding_type_feature_score_mapping,
             )
+            EventLoggingHandler.n_batch_log_event(
+                component=TorchrecComponent.INPUT_DIST.value,
+                event_name="ShardedEmbeddingBagCollection.input_dist.features_by_shards",
+                event_type=EventType.INFO,
+                n=1000,
+                metadata={
+                    sharding_type: ",".join(features_by_shard.keys())
+                    for sharding_type, features_by_shard in zip(
+                        self._sharding_types, features_by_shards
+                    )
+                },
+            )
             awaitables = []
             for input_dist, features_by_shard, sharding_type in zip(
                 self._input_dists,

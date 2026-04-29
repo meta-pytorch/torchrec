@@ -1554,6 +1554,18 @@ class ShardedEmbeddingCollection(
             if self._use_index_dedup:
                 features_by_shards = self._dedup_indices(ctx, features_by_shards)
 
+            EventLoggingHandler.n_batch_log_event(
+                component=TorchrecComponent.INPUT_DIST.value,
+                event_name="ShardedEmbeddingCollection.input_dist.features_by_shards",
+                event_type=EventType.INFO,
+                n=1000,
+                metadata={
+                    sharding_type: ",".join(features_by_shard.keys())
+                    for sharding_type, features_by_shard in zip(
+                        self._sharding_type_to_sharding, features_by_shards
+                    )
+                },
+            )
             awaitables = []
             for input_dist, features, sharding_type in zip(
                 self._input_dists, features_by_shards, self._sharding_type_to_sharding
