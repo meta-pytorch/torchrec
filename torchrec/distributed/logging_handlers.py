@@ -391,6 +391,11 @@ def log_table_constraints(constraints: Optional[Dict] = None, planner_type: str 
     pass
 
 
+def log_search_space_summary(search_space: List, planner_type: str = "", technique: OptimizationTechnique = OptimizationTechnique.NONE) -> None:  # type: ignore[type-arg]
+    """No-op OSS stub."""
+    pass
+
+
 def log_proposer_result(
     planner_type: str = "",
     proposer_name: str = "",
