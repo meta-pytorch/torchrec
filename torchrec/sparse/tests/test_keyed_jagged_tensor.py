@@ -10,6 +10,7 @@
 
 import unittest
 from typing import List, Tuple
+from unittest import mock
 
 import torch
 import torch.utils._pytree as pytree
@@ -1060,6 +1061,45 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         ).to(torch.device("cuda"))
         j.record_stream(torch.cuda.current_stream())
 
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_record_stream_inverse_indices(self) -> None:
+        # record_stream is a CUDA allocator hint with no Python-observable state
+        # change. We verify it doesn't raise and tensors remain accessible.
+        inverse_indices_tensor = torch.tensor([0, 1, 0, 1], device="cuda")
+        kjt = KeyedJaggedTensor(
+            keys=["index_0", "index_1"],
+            values=torch.arange(6, device="cuda", dtype=torch.float),
+            lengths=torch.tensor([2, 1, 1, 2], device="cuda"),
+            inverse_indices=(["index_0", "index_1"], inverse_indices_tensor),
+        )
+        kjt.record_stream(torch.cuda.current_stream())
+        self.assertEqual(kjt.values().numel(), 6)
+        self.assertEqual(kjt.inverse_indices()[1].numel(), 4)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_record_stream_jt_dict(self) -> None:
+        # record_stream is a CUDA allocator hint with no Python-observable state
+        # change. We verify it doesn't raise and tensors remain accessible.
+        kjt = KeyedJaggedTensor.from_offsets_sync(
+            offsets=torch.tensor([0, 2, 2, 3, 4, 5, 8]),
+            values=torch.arange(8, dtype=torch.float),
+            keys=["index_0", "index_1"],
+        ).to(torch.device("cuda"))
+        jt_dict = kjt.to_dict()
+        self.assertIsNotNone(kjt._jt_dict)
+        kjt.record_stream(torch.cuda.current_stream())
+        self.assertEqual(kjt.values().numel(), 8)
+        self.assertIn("index_0", jt_dict)
+        self.assertIn("index_1", jt_dict)
+        self.assertEqual(jt_dict["index_0"].values().numel(), 3)
+        self.assertEqual(jt_dict["index_1"].values().numel(), 5)
+
     def test_equality(self) -> None:
         values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
         weights = torch.Tensor([1.0, 0.5, 1.5, 1.0, 0.5, 1.0, 1.0, 1.5])
@@ -1574,6 +1614,32 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertTrue(result_kjt.values().is_cuda)
         self.assertTrue(result_kjt.lengths().is_cuda)
 
+    def test_copy_invalidates_jt_dict(self) -> None:
+        # `copy_()` must drop any cached _jt_dict on the destination because the
+        # cached JaggedTensors reference the source KJT's tensors (potentially
+        # on a different device). Reusing them would leak foreign storage into
+        # operations like `record_stream()`.
+        keys = ["index_0", "index_1"]
+        source_kjt = KeyedJaggedTensor.from_offsets_sync(
+            offsets=torch.tensor([0, 2, 2, 3, 4, 5, 8]),
+            values=torch.arange(8, dtype=torch.float),
+            keys=keys,
+        )
+        source_kjt.to_dict()
+        self.assertIsNotNone(source_kjt._jt_dict)
+
+        dest_kjt = KeyedJaggedTensor(
+            values=torch.zeros(8, dtype=torch.float),
+            keys=keys,
+            lengths=torch.tensor([2, 0, 1, 1, 1, 3]),
+        )
+        dest_kjt.to_dict()
+        dest_jt_dict_before = dest_kjt._jt_dict
+        self.assertIsNotNone(dest_jt_dict_before)
+
+        dest_kjt.copy_(source_kjt)
+        self.assertIsNone(dest_kjt._jt_dict)
+
     def test_clear_storage(self) -> None:
         kjt = KeyedJaggedTensor(
             values=torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
@@ -1590,6 +1656,171 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         self.assertEqual(kjt._values.untyped_storage().nbytes(), 0)
         self.assertEqual(kjt._lengths.untyped_storage().nbytes(), 0)
         self.assertEqual(kjt._weights.untyped_storage().nbytes(), 0)
+
+    def test_clear_storage_inverse_indices(self) -> None:
+        inverse_indices_tensor = torch.tensor([0, 1, 0, 1])
+        kjt = KeyedJaggedTensor(
+            values=torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            keys=["index_0", "index_1"],
+            lengths=torch.IntTensor([1, 0, 2, 3]),
+            inverse_indices=(["index_0", "index_1"], inverse_indices_tensor),
+        )
+        self.assertGreater(kjt._values.untyped_storage().nbytes(), 0)
+        self.assertGreater(inverse_indices_tensor.untyped_storage().nbytes(), 0)
+        kjt.clear_storage()
+        self.assertEqual(kjt._values.untyped_storage().nbytes(), 0)
+        self.assertEqual(inverse_indices_tensor.untyped_storage().nbytes(), 0)
+
+    def test_clear_storage_jt_dict(self) -> None:
+        # `to_dict()` materializes per-key offset tensors that are NOT views
+        # into the parent KJT's storage. `clear_storage()` must release those
+        # cached offsets and drop the dict, otherwise HBM reclamation leaks.
+        kjt = KeyedJaggedTensor.from_offsets_sync(
+            offsets=torch.tensor([0, 2, 2, 3, 4, 5, 8]),
+            values=torch.arange(8, dtype=torch.float),
+            keys=["index_0", "index_1"],
+        )
+        jt_dict = kjt.to_dict()
+        cached_offsets = [jt._offsets for jt in jt_dict.values()]
+        for offsets in cached_offsets:
+            self.assertIsNotNone(offsets)
+            assert offsets is not None
+            self.assertGreater(offsets.untyped_storage().nbytes(), 0)
+
+        kjt.clear_storage()
+        self.assertIsNone(kjt._jt_dict)
+        for offsets in cached_offsets:
+            assert offsets is not None
+            self.assertEqual(offsets.untyped_storage().nbytes(), 0)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_record_stream_skips_cpu_inverse_indices_in_cuda_kjt(self) -> None:
+        # Stale `_inverse_indices` on a foreign device (e.g., FX-replay or
+        # direct ctor with mixed devices) must not be passed to record_stream.
+        # CPU tensors don't have streams; record_stream(cuda_stream) on a CPU
+        # tensor raises. The KJT must skip the foreign entry instead.
+        cpu_inverse_indices = torch.tensor([0, 1, 0, 1])
+        cuda_kjt = KeyedJaggedTensor(
+            keys=["index_0", "index_1"],
+            values=torch.arange(6, device="cuda", dtype=torch.float),
+            lengths=torch.tensor([2, 1, 1, 2], device="cuda"),
+        )
+        cuda_kjt._inverse_indices = (["index_0", "index_1"], cpu_inverse_indices)
+        cuda_kjt.record_stream(torch.cuda.current_stream())
+        self.assertGreater(cpu_inverse_indices.untyped_storage().nbytes(), 0)
+        self.assertEqual(cuda_kjt.values().numel(), 6)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_record_stream_skips_cpu_jt_dict_in_cuda_kjt(self) -> None:
+        # Stale `_jt_dict` whose entries live on a foreign device must not be
+        # passed to record_stream — `JaggedTensor.record_stream` would call
+        # `record_stream` on CPU tensors and raise. The KJT must skip them.
+        cpu_jt = JaggedTensor(
+            values=torch.arange(3, dtype=torch.float),
+            lengths=torch.tensor([2, 1]),
+        )
+        cuda_kjt = KeyedJaggedTensor(
+            keys=["index_0"],
+            values=torch.arange(3, device="cuda", dtype=torch.float),
+            lengths=torch.tensor([2, 1], device="cuda"),
+        )
+        cuda_kjt._jt_dict = {"index_0": cpu_jt}
+        cuda_kjt.record_stream(torch.cuda.current_stream())
+        self.assertGreater(cpu_jt._values.untyped_storage().nbytes(), 0)
+        self.assertEqual(cuda_kjt.values().numel(), 3)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_clear_storage_skips_foreign_device_inverse_indices(self) -> None:
+        # `clear_storage` must not `resize_(0)` the storage of an
+        # `_inverse_indices` tensor it doesn't own (i.e., one on a different
+        # device than `_values`); doing so corrupts the foreign owner.
+        cpu_inverse_indices = torch.tensor([0, 1, 0, 1])
+        cuda_kjt = KeyedJaggedTensor(
+            keys=["index_0", "index_1"],
+            values=torch.arange(6, device="cuda", dtype=torch.float),
+            lengths=torch.tensor([2, 1, 1, 2], device="cuda"),
+        )
+        cuda_kjt._inverse_indices = (["index_0", "index_1"], cpu_inverse_indices)
+        self.assertGreater(cuda_kjt._values.untyped_storage().nbytes(), 0)
+        self.assertGreater(cpu_inverse_indices.untyped_storage().nbytes(), 0)
+        cuda_kjt.clear_storage()
+        self.assertEqual(cuda_kjt._values.untyped_storage().nbytes(), 0)
+        self.assertGreater(cpu_inverse_indices.untyped_storage().nbytes(), 0)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_clear_storage_skips_foreign_device_jt_dict(self) -> None:
+        # `clear_storage` must not free the offset storage of a `_jt_dict`
+        # entry on a foreign device — that storage isn't ours to release.
+        cpu_offsets = torch.tensor([0, 2, 3])
+        cpu_jt = JaggedTensor(
+            values=torch.arange(3, dtype=torch.float),
+            lengths=torch.tensor([2, 1]),
+            offsets=cpu_offsets,
+        )
+        cuda_kjt = KeyedJaggedTensor(
+            keys=["index_0"],
+            values=torch.arange(3, device="cuda", dtype=torch.float),
+            lengths=torch.tensor([2, 1], device="cuda"),
+        )
+        cuda_kjt._jt_dict = {"index_0": cpu_jt}
+        self.assertGreater(cpu_offsets.untyped_storage().nbytes(), 0)
+        cuda_kjt.clear_storage()
+        self.assertGreater(cpu_offsets.untyped_storage().nbytes(), 0)
+        # `clear_storage` always drops the dict, even when entries are skipped.
+        self.assertIsNone(cuda_kjt._jt_dict)
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_cache_mismatch_warning_emitted_once(self) -> None:
+        # `_maybe_warn_cache_device_mismatch` is per-instance one-shot. A
+        # training loop with the same misbehaving KJT going through multiple
+        # record_stream / clear_storage calls must produce exactly one warning
+        # and one PyTorch API-usage event.
+        cuda_kjt = KeyedJaggedTensor(
+            keys=["index_0"],
+            values=torch.arange(3, device="cuda", dtype=torch.float),
+            lengths=torch.tensor([2, 1], device="cuda"),
+        )
+        cuda_kjt._inverse_indices = (
+            ["index_0"],
+            torch.tensor([0, 1, 0]),
+        )
+        cuda_kjt._jt_dict = {
+            "index_0": JaggedTensor(
+                values=torch.arange(3, dtype=torch.float),
+                lengths=torch.tensor([2, 1]),
+            )
+        }
+        with mock.patch("torch._C._log_api_usage_once") as mock_api_usage:
+            with self.assertLogs(level="WARNING") as captured_logs:
+                cuda_kjt.record_stream(torch.cuda.current_stream())
+                cuda_kjt.record_stream(torch.cuda.current_stream())
+                cuda_kjt.clear_storage()
+
+        warning_records = [
+            r for r in captured_logs.records if "KeyedJaggedTensor" in r.getMessage()
+        ]
+        self.assertEqual(len(warning_records), 1)
+        api_usage_calls = [
+            c
+            for c in mock_api_usage.call_args_list
+            if c.args and c.args[0] == "torchrec.sparse.kjt.cache_device_mismatch"
+        ]
+        self.assertEqual(len(api_usage_calls), 1)
 
 
 class TestKeyedJaggedTensorScripting(unittest.TestCase):
