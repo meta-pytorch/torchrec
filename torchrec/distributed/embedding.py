@@ -107,7 +107,12 @@ from torchrec.modules.embedding_modules import (
 from torchrec.modules.utils import construct_jagged_tensors, SequenceVBEContext
 from torchrec.optim.fused import EmptyFusedOptimizer, FusedOptimizerModule
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizer
-from torchrec.sparse.jagged_tensor import _to_offsets, JaggedTensor, KeyedJaggedTensor
+from torchrec.sparse.jagged_tensor import (
+    _safe_tolist,
+    _to_offsets,
+    JaggedTensor,
+    KeyedJaggedTensor,
+)
 from torchrec.sparse.tensor_dict import maybe_td_to_kjt
 
 try:
@@ -1494,7 +1499,7 @@ class ShardedEmbeddingCollection(
                 reindexed_values = None
 
             reindexed_lengths = reindexed_lengths.view(-1, stride)
-            reindexed_length_per_key = torch.sum(reindexed_lengths, dim=1).tolist()
+            reindexed_length_per_key = _safe_tolist(torch.sum(reindexed_lengths, dim=1))
 
             ctx.seq_vbe_ctx.append(
                 SequenceVBEContext(
