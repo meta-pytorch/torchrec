@@ -26,6 +26,7 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.types import Awaitable, NoWait, ShardingEnv, ShardMetadata
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
@@ -140,6 +141,9 @@ class DpSparseFeaturesDist(BaseSparseFeaturesDist[KeyedJaggedTensor]):
     def __init__(self) -> None:
         super().__init__()
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.INPUT_DIST, n=1000, add_wait_counter=True
+    )
     def forward(
         self,
         sparse_features: KeyedJaggedTensor,
@@ -167,6 +171,9 @@ class DpPooledEmbeddingDist(
     def __init__(self) -> None:
         super().__init__()
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.OUTPUT_DIST, n=1000, add_wait_counter=True
+    )
     def forward(
         self,
         local_embs: torch.Tensor,
