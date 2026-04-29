@@ -2142,7 +2142,9 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         if not self.enqueue_batch(dataloader_iter):
             return
 
-        self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+        self._fence_prefetch_and_start_sparse_data_dist(
+            self.batches[1], self.contexts[1]
+        )
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -2224,13 +2226,30 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
                 self._optimizer.step()
 
         # Start sparse data dist for batch i+2 at the end, so it overlaps
-        # with the next iteration's early phases.
+        # with the next iteration's early phases. Fences prefetch_stream first.
         if len(self.batches) >= 3:
-            self.start_sparse_data_dist(self.batches[2], self.contexts[2])
+            self._fence_prefetch_and_start_sparse_data_dist(
+                self.batches[2], self.contexts[2]
+            )
 
         self.dequeue_batch()
 
         return output
+
+    def _fence_prefetch_and_start_sparse_data_dist(
+        self, batch: Optional[In], context: TrainPipelineContext
+    ) -> None:
+        """Fence ``data_dist_stream`` on ``prefetch_stream`` then start input dist.
+
+        Without this fence, the caching allocator can hand the data-dist stream
+        blocks the prefetch stream still references, causing garbage embeddings
+        or illegal memory access on UVM-caching jobs (S627132). Both
+        ``fill_pipeline`` and ``progress`` route the post-prefetch input-dist
+        launch through this helper so the fence is never skipped.
+        """
+        if self._data_dist_stream is not None and self._prefetch_stream is not None:
+            self._data_dist_stream.wait_stream(self._prefetch_stream)
+        self.start_sparse_data_dist(batch, context)
 
     def _prefetch(self, context: PrefetchTrainPipelineContext) -> None:
         """

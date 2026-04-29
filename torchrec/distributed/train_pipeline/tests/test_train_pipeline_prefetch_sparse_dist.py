@@ -18,8 +18,9 @@ This module tests the prefetch pipeline API changes including:
 """
 
 import unittest
-from typing import Any, Dict, Iterator, List, Optional, Tuple
-from unittest.mock import MagicMock
+from collections import deque
+from typing import Any, cast, Dict, Iterator, List, Optional, Tuple
+from unittest.mock import call, MagicMock, patch
 
 import torch
 from hypothesis import given, settings, strategies as st
@@ -31,6 +32,9 @@ from torchrec.distributed.test_utils.test_sharding import copy_state_dict
 from torchrec.distributed.train_pipeline.pipeline_context import (
     PrefetchTrainPipelineContext,
 )
+from torchrec.distributed.train_pipeline.runtime_forwards import (
+    PrefetchPipelinedForward,
+)
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
     TrainPipelineSparseDistTestBase,
 )
@@ -38,8 +42,9 @@ from torchrec.distributed.train_pipeline.train_pipelines import (
     PrefetchTrainPipelineSparseDist,
 )
 from torchrec.distributed.train_pipeline.utils import prefetch_embeddings
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import Awaitable, ShardingType
 from torchrec.modules.embedding_configs import DataType
+from torchrec.streamable import Multistreamable
 
 
 class PrefetchEmbeddingsUtilTest(unittest.TestCase):
@@ -342,6 +347,396 @@ class PrefetchTrainPipelineTest(PrefetchTrainPipelineTestBase):
                 self.assertTrue(torch.equal(pred, pred_pipeline))
             else:
                 torch.testing.assert_close(pred, pred_pipeline)
+
+
+class PrefetchStreamSyncTest(PrefetchTrainPipelineTestBase):
+    """Tests for stream synchronization between prefetch and data_dist streams.
+
+    Validates the fix for the UVM cache cross-stream race (S627132): the
+    data_dist stream must wait for the prefetch stream before starting the
+    next batch's input distribution, and record_stream must cover
+    data_dist_stream for dist_input tensors.
+    """
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_streams_are_distinct(self) -> None:
+        """Verify the pipeline creates three distinct CUDA streams."""
+        pipeline, _, _, _ = self._create_pipeline()
+        self.assertIsNotNone(pipeline._prefetch_stream)
+        self.assertIsNotNone(pipeline._data_dist_stream)
+        self.assertIsNotNone(pipeline._default_stream)
+        self.assertIsNot(pipeline._prefetch_stream, pipeline._data_dist_stream)
+        self.assertIsNot(pipeline._prefetch_stream, pipeline._default_stream)
+        self.assertIsNot(pipeline._data_dist_stream, pipeline._default_stream)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_multiple_progress_with_uvm_caching_produces_finite_outputs(self) -> None:
+        """Run multiple iterations with FUSED_UVM_CACHING and verify all outputs
+        are finite. Garbage embeddings from a stream race would produce NaN/Inf."""
+        pipeline, dataloader, _, _ = self._create_pipeline(
+            num_batches=10,
+            batch_size=32,
+            kernel_type=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+        )
+        for i in range(7):
+            output = pipeline.progress(dataloader)
+            self.assertIsNotNone(output)
+            if isinstance(output, torch.Tensor):
+                self.assertTrue(
+                    torch.isfinite(output).all(),
+                    f"Non-finite output at iteration {i}",
+                )
+
+    def test_fence_helper_orders_wait_before_start_sparse_data_dist(self) -> None:
+        """Helper must issue ``data_dist_stream.wait_stream(prefetch_stream)``
+        before ``start_sparse_data_dist``. This is the contract that protects
+        the next batch's input dist from racing with the previous prefetch."""
+        # Bypass __init__ so we don't need a model/CUDA — the helper only
+        # touches stream attributes and ``start_sparse_data_dist``.
+        pipeline = PrefetchTrainPipelineSparseDist.__new__(
+            PrefetchTrainPipelineSparseDist
+        )
+        recorder = MagicMock()
+        pipeline._data_dist_stream = recorder.data_dist_stream
+        pipeline._prefetch_stream = recorder.prefetch_stream
+        pipeline.start_sparse_data_dist = recorder.start
+
+        batch = MagicMock(name="batch")
+        context = MagicMock(name="context")
+        pipeline._fence_prefetch_and_start_sparse_data_dist(batch, context)
+
+        self.assertEqual(
+            recorder.mock_calls,
+            [
+                call.data_dist_stream.wait_stream(recorder.prefetch_stream),
+                call.start(batch, context),
+            ],
+        )
+
+    def test_fence_helper_no_op_when_streams_are_none(self) -> None:
+        """On non-CUDA devices both streams are ``None``; helper must skip
+        the wait and still launch ``start_sparse_data_dist``."""
+        pipeline = PrefetchTrainPipelineSparseDist.__new__(
+            PrefetchTrainPipelineSparseDist
+        )
+        pipeline._data_dist_stream = None
+        pipeline._prefetch_stream = None
+        start_mock = MagicMock()
+        pipeline.start_sparse_data_dist = start_mock
+
+        batch = MagicMock()
+        context = MagicMock()
+        pipeline._fence_prefetch_and_start_sparse_data_dist(batch, context)
+
+        start_mock.assert_called_once_with(batch, context)
+
+    def test_fill_pipeline_routes_batch1_through_fence_helper(self) -> None:
+        """``fill_pipeline`` must launch batch 1's input dist via the fence
+        helper. Without this, the very first overlapped prefetch→data_dist
+        transition is unfenced and reintroduces the race the fix targets."""
+        pipeline = PrefetchTrainPipelineSparseDist.__new__(
+            PrefetchTrainPipelineSparseDist
+        )
+        pipeline.batches = deque()
+        pipeline.contexts = deque()
+        pipeline._execute_all_batches = False
+        pipeline._pipelined_forward_type = MagicMock()
+
+        # ``enqueue_batch`` populates the deques; emulate that with side effects.
+        def fake_enqueue(_iter: Any) -> bool:
+            pipeline.batches.append(MagicMock(name=f"batch_{len(pipeline.batches)}"))
+            pipeline.contexts.append(MagicMock(name=f"ctx_{len(pipeline.contexts)}"))
+            return True
+
+        pipeline.enqueue_batch = MagicMock(side_effect=fake_enqueue)
+        pipeline._init_pipelined_modules = MagicMock()
+        pipeline.wait_sparse_data_dist = MagicMock()
+        pipeline._prefetch = MagicMock()
+        pipeline._fence_prefetch_and_start_sparse_data_dist = MagicMock()
+
+        pipeline.fill_pipeline(MagicMock(name="dataloader_iter"))
+
+        pipeline._fence_prefetch_and_start_sparse_data_dist.assert_called_once_with(
+            pipeline.batches[1], pipeline.contexts[1]
+        )
+
+    def test_progress_routes_next_batch_through_fence_helper(self) -> None:
+        """``progress`` must launch the next batch's input dist via the fence
+        helper once the queue is full."""
+        pipeline = PrefetchTrainPipelineSparseDist.__new__(
+            PrefetchTrainPipelineSparseDist
+        )
+        # Pre-fill the queues with three sentinel batches/contexts so progress
+        # takes the ``len(batches) >= 3`` post-prefetch path.
+        pipeline.batches = deque(MagicMock(name=f"b{i}") for i in range(3))
+        pipeline.contexts = deque(MagicMock(name=f"c{i}") for i in range(3))
+        pipeline._execute_all_batches = True
+        pipeline._prefetch_stream = MagicMock()
+        pipeline._model = MagicMock(training=False)
+        pipeline._optimizer = MagicMock()
+        pipeline._model_fwd = MagicMock(return_value=(MagicMock(), MagicMock()))
+
+        pipeline.fill_pipeline = MagicMock()
+        pipeline.enqueue_batch = MagicMock(return_value=True)
+        pipeline._set_module_context = MagicMock()
+        pipeline.wait_sparse_data_dist = MagicMock()
+        pipeline._prefetch = MagicMock()
+        pipeline.dequeue_batch = MagicMock()
+        pipeline._fence_prefetch_and_start_sparse_data_dist = MagicMock()
+
+        # progress() reads contexts[0..2]; context[0] needs the cleared dicts.
+        cast(
+            PrefetchTrainPipelineContext, pipeline.contexts[0]
+        ).module_input_post_prefetch = MagicMock()
+        cast(
+            PrefetchTrainPipelineContext, pipeline.contexts[0]
+        ).module_contexts_post_prefetch = MagicMock()
+
+        with patch(
+            "torchrec.distributed.train_pipeline.train_pipelines._wait_for_batch"
+        ):
+            pipeline.progress(MagicMock(name="dataloader_iter"))
+
+        pipeline._fence_prefetch_and_start_sparse_data_dist.assert_called_once_with(
+            pipeline.batches[2], pipeline.contexts[2]
+        )
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_correctness_uvm_caching_matches_non_pipelined(self) -> None:
+        """Verify UVM-caching pipelined output matches non-pipelined baseline.
+        A stream race would cause divergence through garbage embeddings."""
+        self._set_table_weights_precision(DataType.FP32)
+        data = self._generate_data(num_batches=8, batch_size=32)
+        dataloader = iter(data)
+
+        fused_params = {
+            "cache_load_factor": 0.5,
+            "cache_precision": DataType.FP32,
+            "stochastic_rounding": False,
+        }
+        fused_params_pipelined = {**fused_params, "prefetch_pipeline": True}
+
+        model = self._setup_model()
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            fused_params,
+        )
+        sharded_model_pipelined, optim_pipelined = (
+            self._generate_sharded_model_and_optimizer(
+                model,
+                ShardingType.TABLE_WISE.value,
+                EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+                fused_params_pipelined,
+            )
+        )
+        copy_state_dict(
+            sharded_model.state_dict(), sharded_model_pipelined.state_dict()
+        )
+
+        pipeline = PrefetchTrainPipelineSparseDist(
+            model=sharded_model_pipelined,
+            optimizer=optim_pipelined,
+            device=self.device,
+            execute_all_batches=True,
+        )
+
+        for batch in data:
+            batch = batch.to(self.device)
+            optim.zero_grad(set_to_none=True)
+            loss, pred = sharded_model(batch)
+            loss.backward()
+            optim.step()
+
+            pred_pipeline = pipeline.progress(dataloader)
+            self.assertTrue(torch.equal(pred, pred_pipeline))
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_correctness_row_wise_uvm_caching(self) -> None:
+        """Same correctness check with ROW_WISE sharding — the sharding type
+        used in TWRW production jobs where the race was observed."""
+        self._set_table_weights_precision(DataType.FP32)
+        data = self._generate_data(num_batches=8, batch_size=32)
+        dataloader = iter(data)
+
+        fused_params = {
+            "cache_load_factor": 0.5,
+            "cache_precision": DataType.FP32,
+            "stochastic_rounding": False,
+        }
+        fused_params_pipelined = {**fused_params, "prefetch_pipeline": True}
+
+        model = self._setup_model()
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.ROW_WISE.value,
+            EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            fused_params,
+        )
+        sharded_model_pipelined, optim_pipelined = (
+            self._generate_sharded_model_and_optimizer(
+                model,
+                ShardingType.ROW_WISE.value,
+                EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+                fused_params_pipelined,
+            )
+        )
+        copy_state_dict(
+            sharded_model.state_dict(), sharded_model_pipelined.state_dict()
+        )
+
+        pipeline = PrefetchTrainPipelineSparseDist(
+            model=sharded_model_pipelined,
+            optimizer=optim_pipelined,
+            device=self.device,
+            execute_all_batches=True,
+        )
+
+        for batch in data:
+            batch = batch.to(self.device)
+            optim.zero_grad(set_to_none=True)
+            loss, pred = sharded_model(batch)
+            loss.backward()
+            optim.step()
+
+            pred_pipeline = pipeline.progress(dataloader)
+            self.assertTrue(torch.equal(pred, pred_pipeline))
+
+
+class _MockMultistreamable(Multistreamable):
+    """Concrete Multistreamable subclass that tracks record_stream calls."""
+
+    def __init__(self) -> None:
+        self._recorded_streams: List[Any] = []
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        self._recorded_streams.append(stream)
+
+
+class _MockAwaitable(Awaitable[_MockMultistreamable]):
+    """Concrete Awaitable that returns a pre-set value."""
+
+    def __init__(self, result: _MockMultistreamable) -> None:
+        super().__init__()
+        self._result = result
+
+    def _wait_impl(self) -> _MockMultistreamable:
+        return self._result
+
+
+class PrefetchEmbeddingsRecordStreamTest(unittest.TestCase):
+    """Tests for record_stream coverage in prefetch_embeddings.
+
+    Uses concrete Multistreamable subclasses (not MagicMock) so that the
+    isinstance checks inside prefetch_embeddings pass correctly.
+    """
+
+    def _make_context_and_module(self, name: str) -> Tuple[
+        PrefetchTrainPipelineContext,
+        MagicMock,
+        _MockMultistreamable,
+        _MockMultistreamable,
+    ]:
+        context = PrefetchTrainPipelineContext(index=0)
+        dist_input = _MockMultistreamable()
+        module_context = _MockMultistreamable()
+
+        mock_forward = MagicMock(spec=PrefetchPipelinedForward)
+        mock_forward._name = name
+
+        mock_module = MagicMock()
+        mock_module.forward = mock_forward
+
+        context.input_dist_tensors_requests[name] = _MockAwaitable(dist_input)
+        context.module_contexts[name] = module_context
+
+        return context, mock_module, dist_input, module_context
+
+    def test_prefetch_embeddings_records_data_dist_stream(self) -> None:
+        """Verify record_stream is called with data_dist_stream for both
+        dist_input and module_context."""
+        context, mock_module, dist_input, module_context = (
+            self._make_context_and_module("mod")
+        )
+
+        data_dist_stream = MagicMock()
+        forward_stream = MagicMock()
+        cur_stream = MagicMock()
+
+        stream_context = MagicMock()
+        stream_context.return_value.__enter__ = MagicMock(return_value=None)
+        stream_context.return_value.__exit__ = MagicMock(return_value=False)
+
+        with unittest.mock.patch(
+            "torchrec.distributed.train_pipeline.utils.torch.get_device_module"
+        ) as mock_device_module:
+            mock_device_module.return_value.current_stream.return_value = cur_stream
+
+            prefetch_embeddings(
+                context=context,
+                pipelined_modules=[mock_module],
+                device=torch.device("cpu"),
+                stream_context=stream_context,
+                data_dist_stream=data_dist_stream,
+                forward_stream=forward_stream,
+            )
+
+        self.assertIn(
+            data_dist_stream,
+            dist_input._recorded_streams,
+            "dist_input.record_stream must be called with data_dist_stream",
+        )
+        self.assertIn(
+            data_dist_stream,
+            module_context._recorded_streams,
+            "module_context.record_stream must be called with data_dist_stream",
+        )
+
+    def test_prefetch_embeddings_records_all_three_streams(self) -> None:
+        """Verify record_stream is called for cur_stream, data_dist_stream,
+        and forward_stream — all three consumers of the dist_input tensor."""
+        context, mock_module, dist_input, _ = self._make_context_and_module("mod")
+
+        data_dist_stream = MagicMock()
+        forward_stream = MagicMock()
+        cur_stream = MagicMock()
+
+        stream_context = MagicMock()
+        stream_context.return_value.__enter__ = MagicMock(return_value=None)
+        stream_context.return_value.__exit__ = MagicMock(return_value=False)
+
+        with unittest.mock.patch(
+            "torchrec.distributed.train_pipeline.utils.torch.get_device_module"
+        ) as mock_device_module:
+            mock_device_module.return_value.current_stream.return_value = cur_stream
+
+            prefetch_embeddings(
+                context=context,
+                pipelined_modules=[mock_module],
+                device=torch.device("cpu"),
+                stream_context=stream_context,
+                data_dist_stream=data_dist_stream,
+                forward_stream=forward_stream,
+            )
+
+        recorded = set(dist_input._recorded_streams)
+        self.assertIn(cur_stream, recorded)
+        self.assertIn(data_dist_stream, recorded)
+        self.assertIn(forward_stream, recorded)
+        self.assertEqual(len(recorded), 3, f"Expected 3 streams, got {recorded}")
 
 
 if __name__ == "__main__":
