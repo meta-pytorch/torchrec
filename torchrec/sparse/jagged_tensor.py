@@ -65,14 +65,14 @@ def _pin_and_move(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
 
 
 @torch.jit.unused
-def _cuda_tolist_impl(tensor: torch.Tensor) -> List[int]:
-    """Async D2H copy on the current stream, then .tolist() on CPU.
+def _cuda_to_cpu_safe(tensor: torch.Tensor) -> torch.Tensor:
+    """Stream-scoped D2H copy of a CUDA tensor to a CPU tensor.
 
-    Plain cuda_tensor.tolist() copies via copy_(non_blocking=False), which on
-    AMD/HIP routes through c10::cuda::memcpy_and_sync -> hipMemcpyWithStream.
-    hipMemcpyWithStream synchronizes ALL streams on the device, including peer
-    NCCL streams. When ranks are mutually waiting on cross-PG collectives, this
-    surfaces as a circular deadlock.
+    Plain cuda_tensor.tolist() / .cpu() copies via copy_(non_blocking=False),
+    which on AMD/HIP routes through c10::cuda::memcpy_and_sync ->
+    hipMemcpyWithStream. hipMemcpyWithStream synchronizes ALL streams on the
+    device, including peer NCCL streams. When ranks are mutually waiting on
+    cross-PG collectives, this surfaces as a circular deadlock.
 
     copy_(non_blocking=True) takes the other branch in copy_kernel_cuda
     (aten/src/ATen/native/cuda/Copy.cu) and issues cudaMemcpyAsync directly,
@@ -86,16 +86,15 @@ def _cuda_tolist_impl(tensor: torch.Tensor) -> List[int]:
     and allow overlap with compute, but is not required to remove the
     device-wide sync and is out of scope for this workaround.
 
-    NOTE: The return type must be List[int], not Any. KeyedJaggedTensor is
-    TorchScript-able, and _safe_tolist (which calls this) is reachable from
-    scripted KJT methods. An Any return type breaks TorchScript compilation
-    of downstream consumers (e.g. sample_inputs_utils_test).
+    Returns the CPU tensor; callers run .tolist() (or whatever shape-aware
+    conversion they need) on it. Marked @torch.jit.unused — TorchScript
+    callers must short-circuit before reaching this helper.
     """
     src = tensor.contiguous()
     cpu_buf = torch.empty(src.shape, dtype=src.dtype, device="cpu")
     cpu_buf.copy_(src, non_blocking=True)
     torch.cuda.current_stream(src.device).synchronize()
-    return cpu_buf.tolist()
+    return cpu_buf
 
 
 def _safe_tolist(tensor: torch.Tensor) -> List[int]:
@@ -131,7 +130,7 @@ def _safe_tolist(tensor: torch.Tensor) -> List[int]:
     ):
         return tensor.tolist()
 
-    return _cuda_tolist_impl(tensor)
+    return _cuda_to_cpu_safe(tensor).tolist()
 
 
 def _cumsum(o: List[int]) -> List[int]:
