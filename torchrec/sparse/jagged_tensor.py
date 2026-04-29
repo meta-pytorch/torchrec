@@ -64,6 +64,76 @@ def _pin_and_move(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
     )
 
 
+@torch.jit.unused
+def _cuda_tolist_impl(tensor: torch.Tensor) -> List[int]:
+    """Async D2H copy on the current stream, then .tolist() on CPU.
+
+    Plain cuda_tensor.tolist() copies via copy_(non_blocking=False), which on
+    AMD/HIP routes through c10::cuda::memcpy_and_sync -> hipMemcpyWithStream.
+    hipMemcpyWithStream synchronizes ALL streams on the device, including peer
+    NCCL streams. When ranks are mutually waiting on cross-PG collectives, this
+    surfaces as a circular deadlock.
+
+    copy_(non_blocking=True) takes the other branch in copy_kernel_cuda
+    (aten/src/ATen/native/cuda/Copy.cu) and issues cudaMemcpyAsync directly,
+    which on AMD is hipMemcpyAsync — stream-scoped, not device-wide. The host
+    still blocks inside the memcpy until upstream work on the current stream
+    completes (pageable D2H is implicitly host-synchronous), but other streams
+    on the device keep running, so the device-wide-sync amplification is gone.
+
+    Stays on the current stream by design. A dedicated D2H stream + pinned
+    destination would also detach from upstream waits on the current stream
+    and allow overlap with compute, but is not required to remove the
+    device-wide sync and is out of scope for this workaround.
+
+    NOTE: The return type must be List[int], not Any. KeyedJaggedTensor is
+    TorchScript-able, and _safe_tolist (which calls this) is reachable from
+    scripted KJT methods. An Any return type breaks TorchScript compilation
+    of downstream consumers (e.g. sample_inputs_utils_test).
+    """
+    src = tensor.contiguous()
+    cpu_buf = torch.empty(src.shape, dtype=src.dtype, device="cpu")
+    cpu_buf.copy_(src, non_blocking=True)
+    torch.cuda.current_stream(src.device).synchronize()
+    return cpu_buf.tolist()
+
+
+def _safe_tolist(tensor: torch.Tensor) -> List[int]:
+    """
+    Convert a GPU tensor to a Python list without triggering a device-wide sync.
+
+    Standard .tolist() on a CUDA tensor calls memcpy_and_sync(), which on
+    AMD/HIP synchronizes ALL streams — blocking on pending work including
+    NCCL collectives. This can expose cross-process-group hangs as visible
+    failures here even when the underlying root cause is elsewhere.
+
+    Instead, this function does an explicit D2H copy and syncs only the
+    current stream, then runs .tolist() on the resulting CPU tensor.
+
+    Known limitation: TorchScript callers fall back to plain .tolist().
+
+    Killswitch: pytorch/torchrec:killswitch_safe_tolist (default on). Set to
+    False to fall back to plain .tolist() if this path causes regressions.
+
+    NOTE: The return type must be List[int], not Any. This function is called
+    from TorchScript-able code paths (KeyedJaggedTensor). Using Any breaks
+    TorchScript compilation. For 2D tensors, use _safe_tolist_2d in
+    dist_data.py (added in D101269943).
+    """
+    if torch.jit.is_scripting() or not tensor.is_cuda:
+        return tensor.tolist()
+
+    if tensor.numel() == 0:
+        return []
+
+    if not torch._utils_internal.justknobs_check(
+        "pytorch/torchrec:killswitch_safe_tolist"
+    ):
+        return tensor.tolist()
+
+    return _cuda_tolist_impl(tensor)
+
+
 def _cumsum(o: List[int]) -> List[int]:
     """
     python-list version of converting lengths --> offsets
@@ -1255,9 +1325,9 @@ def _length_per_key_from_stride_per_key(
         )
         ret = torch.jit.annotate(
             List[int],
-            torch.ops.fbgemm.segment_sum_csr(
-                1, stride_per_key_offsets, lengths
-            ).tolist(),
+            _safe_tolist(
+                torch.ops.fbgemm.segment_sum_csr(1, stride_per_key_offsets, lengths)
+            ),
         )
     else:
         tensor_list: List[torch.Tensor] = [
@@ -1266,7 +1336,7 @@ def _length_per_key_from_stride_per_key(
         if len(tensor_list) == 0:
             return []
 
-        ret = torch.jit.annotate(List[int], torch.cat(tensor_list).tolist())
+        ret = torch.jit.annotate(List[int], _safe_tolist(torch.cat(tensor_list)))
 
     pt2_checks_all_is_size(ret)
     return ret
@@ -1301,9 +1371,11 @@ def _maybe_compute_length_per_key(
             _length_per_key_from_stride_per_key(lengths, stride_per_key)
             if variable_stride_per_key
             else (
-                torch.sum(
-                    pt2_check_size_nonzero(lengths.view(len(keys), stride)), dim=1
-                ).tolist()
+                _safe_tolist(
+                    torch.sum(
+                        pt2_check_size_nonzero(lengths.view(len(keys), stride)), dim=1
+                    )
+                )
                 if pt2_guard_size_oblivious(lengths.numel() != 0)
                 else [0] * len(keys)
             )
@@ -1312,7 +1384,7 @@ def _maybe_compute_length_per_key(
         _length: List[int] = (
             _length_per_key_from_stride_per_key(torch.diff(offsets), stride_per_key)
             if variable_stride_per_key
-            else torch.sum(torch.diff(offsets).view(-1, stride), dim=1).tolist()
+            else _safe_tolist(torch.sum(torch.diff(offsets).view(-1, stride), dim=1))
         )
     else:
         _length: List[int] = []
