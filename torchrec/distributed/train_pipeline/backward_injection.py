@@ -81,6 +81,7 @@ from torchrec.distributed.comm_ops import Request
 from torchrec.distributed.embedding import EmbeddingCollectionAwaitable
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionAwaitable
 from torchrec.distributed.types import NoWait, ShardingType
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 if TYPE_CHECKING:
@@ -136,7 +137,10 @@ class FirstGradTensorFinder:
     Finds the first tensor with ``requires_grad=True`` from a module's
     forward output (or input if ``use_input=True``).
 
-    Handles single tensors, tuples/lists, dicts, and nested combinations.
+    Handles single tensors, tuples/lists, dicts, nested combinations, and
+    ``(Keyed)JaggedTensor`` whose ``weights`` field carries the gradient
+    (e.g. ``PositionWeightedModuleCollection`` outputs a KJT whose weights
+    are the trainable position parameters).
     """
 
     use_input: bool = False
@@ -145,6 +149,12 @@ class FirstGradTensorFinder:
         if isinstance(data, torch.Tensor):
             if data.requires_grad:
                 return data
+        elif isinstance(data, (KeyedJaggedTensor, JaggedTensor)):
+            # KJT/JT carry their grad-tracking tensor in the optional
+            # `weights` field (e.g. PositionWeightedModuleCollection).
+            weights = data.weights_or_none()
+            if weights is not None and weights.requires_grad:
+                return weights
         elif isinstance(data, (tuple, list)):
             for item in data:
                 t = self._search(item)

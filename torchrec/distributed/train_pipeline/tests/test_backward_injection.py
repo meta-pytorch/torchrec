@@ -31,6 +31,7 @@ from torchrec.distributed.train_pipeline.backward_injection import (
 )
 from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 tc = unittest.TestCase()
 tc.maxDiff = None
@@ -66,6 +67,52 @@ class InjectionSiteTest(unittest.TestCase):
         grad = torch.tensor([1.0], requires_grad=True)
         self.assertIs(finder(grad, torch.tensor([0.0])), grad)
         self.assertIsNone(finder(torch.tensor([0.0]), grad))
+
+    def test_first_grad_tensor_finder_kjt_weights(self) -> None:
+        """KJT/JT carry the grad-tracking tensor in the optional weights field
+        (e.g. the output of PositionWeightedModuleCollection)."""
+        finder = FirstGradTensorFinder()
+
+        weights = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+        kjt = KeyedJaggedTensor(
+            keys=["f1"],
+            values=torch.tensor([1, 2, 3], dtype=torch.int64),
+            lengths=torch.tensor([2, 1], dtype=torch.int64),
+            weights=weights,
+        )
+        self.assertIs(finder(None, kjt), weights)
+
+        # Also matches when nested inside containers.
+        nested = (torch.tensor([0.0]), {"k": [kjt]})
+        self.assertIs(finder(None, nested), weights)
+
+        # JaggedTensor with grad-requiring weights also resolves.
+        jt_weights = torch.tensor([0.5, 0.6], requires_grad=True)
+        jt = JaggedTensor(
+            values=torch.tensor([1, 2], dtype=torch.int64),
+            lengths=torch.tensor([1, 1], dtype=torch.int64),
+            weights=jt_weights,
+        )
+        self.assertIs(finder(None, jt), jt_weights)
+
+    def test_first_grad_tensor_finder_kjt_no_weights(self) -> None:
+        """KJT/JT with no weights or non-grad weights yield no match."""
+        finder = FirstGradTensorFinder()
+
+        kjt_no_weights = KeyedJaggedTensor(
+            keys=["f1"],
+            values=torch.tensor([1, 2, 3], dtype=torch.int64),
+            lengths=torch.tensor([2, 1], dtype=torch.int64),
+        )
+        self.assertIsNone(finder(None, kjt_no_weights))
+
+        kjt_inert_weights = KeyedJaggedTensor(
+            keys=["f1"],
+            values=torch.tensor([1, 2, 3], dtype=torch.int64),
+            lengths=torch.tensor([2, 1], dtype=torch.int64),
+            weights=torch.tensor([1.0, 2.0, 3.0]),  # requires_grad=False
+        )
+        self.assertIsNone(finder(None, kjt_inert_weights))
 
     def test_register_hook_nonexistent_raises(self) -> None:
         site = InjectionSite(
