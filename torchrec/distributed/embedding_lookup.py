@@ -65,6 +65,7 @@ from torchrec.distributed.fused_params import (
     TBEToRegisterMixIn,
 )
 from torchrec.distributed.global_settings import get_propogate_device
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.quant_embedding_kernel import (
     QuantBatchedEmbedding,
     QuantBatchedEmbeddingBag,
@@ -357,6 +358,9 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                         forward_stream=forward_stream,
                     )
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.LOOKUP, n=1000, add_wait_counter=True
+    )
     def forward(
         self,
         sparse_features: KeyedJaggedTensor,
@@ -983,6 +987,9 @@ class GroupedPooledEmbeddingsLookup(
 
         return vbe_output
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.LOOKUP, n=1000, add_wait_counter=True
+    )
     def forward(
         self,
         sparse_features: KeyedJaggedTensor,
