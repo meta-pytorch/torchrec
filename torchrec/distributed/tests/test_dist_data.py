@@ -1629,6 +1629,17 @@ class CollectiveTagFromTest(unittest.TestCase):
             _collective_tag_from("KJTAllToAllSplits", ["f0", "f1"], 3),
         )
 
+    def test_separator_is_unambiguous(self) -> None:
+        # Regression: with a "," separator, _collective_tag_from("a", "b") and
+        # _collective_tag_from("a,b") both serialize to the bytes b"a,b" and
+        # collide, silently disabling validation for any future call site that
+        # passes raw strings containing commas. The NUL separator avoids the
+        # collision because collective identifier parts cannot contain \x00.
+        self.assertNotEqual(
+            _collective_tag_from("a", "b"),
+            _collective_tag_from("a,b"),
+        )
+
 
 class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
     def setUp(self) -> None:

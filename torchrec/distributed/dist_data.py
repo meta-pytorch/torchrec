@@ -83,16 +83,26 @@ def _collective_tag_from(*parts: object) -> int:
     The current call sites use int64 splits tensors, so a wider hash is
     available in principle. The int32 cap is intentional forward-compat:
     it guarantees the tag fits in any reasonable signed-integer splits dtype
-    without wrapping negative. 31 bits (~2.1B buckets) leaves collision risk
+    without wrapping negative. Mixing runs in full 32-bit FNV-1a state and is
+    narrowed to 31 bits only at return; ~2.1B buckets leaves collision risk
     negligible for the small number of distinct collective sites in flight
     per process group.
     """
+    # NUL separator (not ",") so str() of parts that themselves contain commas
+    # cannot collide with a different parts arity. Collective identifier parts
+    # (Python identifiers, sharding plan ints, container reprs) never contain
+    # \x00, so this separator is unambiguous in practice.
+    #
+    # In-loop mask is 0xFFFFFFFF (full 32-bit FNV-1a state); narrowing to
+    # signed int32 happens once at return. Masking to 31 bits inside the loop
+    # would discard bit 31 every iteration and weaken the avalanche relative
+    # to the reference algorithm without any benefit.
     h = 0x811C9DC5
-    for b in ",".join(str(p) for p in parts).encode():
-        h = ((h ^ b) * 0x01000193) & 0x7FFFFFFF
-    # Mask after the loop too: the FNV-1a seed (0x811C9DC5) exceeds
-    # signed-int32 max, so empty `parts` would skip the in-loop mask
-    # and return a value that violates the int32-fit contract.
+    for b in "\x00".join(str(p) for p in parts).encode():
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    # Post-loop mask still handles the empty-parts case: the FNV-1a seed
+    # (0x811C9DC5) exceeds signed-int32 max, so without this mask an empty
+    # call would violate the int32-fit contract.
     return h & 0x7FFFFFFF
 
 
