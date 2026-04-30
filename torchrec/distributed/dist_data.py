@@ -30,7 +30,12 @@ from torchrec.distributed.global_settings import get_propogate_device
 from torchrec.distributed.types import Awaitable, QuantizedCommCodecs, rank_device
 from torchrec.fx.utils import fx_marker
 from torchrec.pt2.checks import is_torchdynamo_compiling
-from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+from torchrec.sparse.jagged_tensor import (
+    _cuda_to_cpu_safe,
+    _safe_tolist,
+    JaggedTensor,
+    KeyedJaggedTensor,
+)
 
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
@@ -89,6 +94,28 @@ def _collective_tag_from(*parts: object) -> int:
     # signed-int32 max, so empty `parts` would skip the in-loop mask
     # and return a value that violates the int32-fit contract.
     return h & 0x7FFFFFFF
+
+
+def _safe_tolist_2d(tensor: torch.Tensor) -> List[List[int]]:
+    """2D analog of _safe_tolist. Avoids the device-wide sync from .tolist().
+
+    Delegates the actual stream-scoped D2H copy to _cuda_to_cpu_safe (defined
+    in jagged_tensor.py); this wrapper exists only so the return type can be
+    pinned to List[List[int]] for callers in this file. _safe_tolist returns
+    List[int] to preserve TorchScript compatibility on KeyedJaggedTensor;
+    dist_data.py is not scripted, so a concrete 2D return type is fine here.
+
+    Killswitch: pytorch/torchrec:killswitch_safe_tolist (default on). When off,
+    falls back to plain tensor.tolist() — the literal pre-fix call — so the
+    revert path is bit-exact, not just behaviorally equivalent.
+    """
+    if not tensor.is_cuda:
+        return tensor.tolist()
+    if not torch._utils_internal.justknobs_check(
+        "pytorch/torchrec:killswitch_safe_tolist"
+    ):
+        return tensor.tolist()
+    return _cuda_to_cpu_safe(tensor).tolist()
 
 
 def _check_int_overflow(
@@ -436,7 +463,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         if isinstance(self._splits_awaitable, dist.Work):
             self._splits_awaitable.wait()
 
-        ret = self._output_tensor.view(self.num_workers, -1).T.tolist()
+        ret = _safe_tolist_2d(self._output_tensor.view(self.num_workers, -1).T)
 
         # Validate collective tag if present
         if self._tag_appended:
@@ -467,7 +494,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
 
         # Check for int32 overflow in AllToAll input. If the input is already
         # corrupted, the corruption happened before the collective.
-        input_list = self._input_tensor.view(self.num_workers, -1).T.tolist()
+        input_list = _safe_tolist_2d(self._input_tensor.view(self.num_workers, -1).T)
         # Strip tag row from input_list so overflow checks operate on real data
         if self._tag_appended:
             input_list = input_list[: self._num_original_tensors]
@@ -1960,8 +1987,8 @@ class JaggedTensorAllToAll(Awaitable[JaggedTensor]):
         dist.all_to_all_single(
             self._dist_lengths,
             jt.lengths(),
-            output_split_sizes=num_items_to_receive.tolist(),
-            input_split_sizes=num_items_to_send.tolist(),
+            output_split_sizes=_safe_tolist(num_items_to_receive),
+            input_split_sizes=_safe_tolist(num_items_to_send),
             group=pg,
             async_op=False,
         )
@@ -1973,11 +2000,13 @@ class JaggedTensorAllToAll(Awaitable[JaggedTensor]):
         dist_id_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(
             num_items_to_receive
         )
-        value_output_splits = torch.ops.fbgemm.segment_sum_csr(
-            1,
-            dist_id_offsets,
-            self._dist_lengths,
-        ).tolist()
+        value_output_splits = _safe_tolist(
+            torch.ops.fbgemm.segment_sum_csr(
+                1,
+                dist_id_offsets,
+                self._dist_lengths,
+            )
+        )
 
         self._dist_values: torch.Tensor = torch.empty(
             sum(value_output_splits),
@@ -1987,11 +2016,13 @@ class JaggedTensorAllToAll(Awaitable[JaggedTensor]):
 
         #  same as above, calculate chunk sums
         id_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(num_items_to_send)
-        value_input_splits = torch.ops.fbgemm.segment_sum_csr(
-            1,
-            id_offsets,
-            jt.lengths(),
-        ).tolist()
+        value_input_splits = _safe_tolist(
+            torch.ops.fbgemm.segment_sum_csr(
+                1,
+                id_offsets,
+                jt.lengths(),
+            )
+        )
 
         self._dist_values_req: dist.Work = dist.all_to_all_single(
             self._dist_values,
@@ -2066,8 +2097,8 @@ class TensorAllToAllValuesAwaitable(Awaitable[torch.Tensor]):
             self._values_awaitable: dist.Work = dist.all_to_all_single(
                 output=self._dist_values,
                 input=input,
-                output_split_sizes=output_splits.tolist(),
-                input_split_sizes=input_splits.tolist(),
+                output_split_sizes=_safe_tolist(output_splits),
+                input_split_sizes=_safe_tolist(input_splits),
                 group=pg,
                 async_op=True,
             )

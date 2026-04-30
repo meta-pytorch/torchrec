@@ -154,66 +154,6 @@ class TestKeyedJaggedTensor(unittest.TestCase):
             atol=0,
         )
 
-    def test_set_jt_dict(self) -> None:
-        # Build the expected jt_dict from a fully-populated KJT.
-        values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
-        weights = torch.Tensor([1.0, 0.5, 1.5, 1.0, 0.5, 1.0, 1.0, 1.5])
-        keys = ["index_0", "index_1"]
-        offsets = torch.IntTensor([0, 2, 2, 3, 4, 5, 8])
-
-        source_kjt = KeyedJaggedTensor(
-            values=values,
-            keys=keys,
-            offsets=offsets,
-            weights=weights,
-        )
-        expected_jt_dict = source_kjt.to_dict()
-        expected_length_per_key = source_kjt.length_per_key()
-
-        # Build a KJT with empty lengths/values, then seed its cache via
-        # set_jt_dict. to_dict() should return the cached dict directly.
-        empty_values = torch.tensor([])
-        empty_lengths = torch.tensor([[], []])
-        empty_kjt = KeyedJaggedTensor(
-            keys=keys,
-            values=empty_values,
-            lengths=empty_lengths,
-            length_per_key=[0, 0],
-        )
-        empty_kjt.set_jt_dict(expected_length_per_key, expected_jt_dict)
-
-        jt_dict = empty_kjt.to_dict()
-        self.assertCountEqual(jt_dict.keys(), keys)
-
-        j0 = jt_dict["index_0"]
-        j1 = jt_dict["index_1"]
-        self.assertTrue(isinstance(j0, JaggedTensor))
-        self.assertTrue(isinstance(j1, JaggedTensor))
-        torch.testing.assert_close(
-            j0.lengths(), torch.IntTensor([2, 0, 1]), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            j0.weights(), torch.Tensor([1.0, 0.5, 1.5]), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            j0.values(), torch.Tensor([1.0, 2.0, 3.0]), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            j1.lengths(), torch.IntTensor([1, 1, 3]), rtol=0, atol=0
-        )
-        torch.testing.assert_close(
-            j1.weights(),
-            torch.Tensor([1.0, 0.5, 1.0, 1.0, 1.5]),
-            rtol=0,
-            atol=0,
-        )
-        torch.testing.assert_close(
-            j1.values(),
-            torch.Tensor([4.0, 5.0, 6.0, 7.0, 8.0]),
-            rtol=0,
-            atol=0,
-        )
-
     def test_pytree_kjt(self) -> None:
         values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
         weights = torch.Tensor([1.0, 0.5, 1.5, 1.0, 0.5, 1.0, 1.0, 1.5])

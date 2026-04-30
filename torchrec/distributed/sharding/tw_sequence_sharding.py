@@ -28,6 +28,7 @@ from torchrec.distributed.embedding_types import (
     BaseGroupedFeatureProcessor,
     InputDistOutputs,
 )
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.sharding.sequence_sharding import (
     InferSequenceShardingContext,
     SequenceShardingContext,
@@ -80,6 +81,9 @@ class TwSequenceEmbeddingDist(
             ),
         )
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.OUTPUT_DIST, n=1000, add_wait_counter=True
+    )
     def forward(
         self,
         local_embs: torch.Tensor,

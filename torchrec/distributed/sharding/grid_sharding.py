@@ -43,6 +43,7 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
+from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.sharding.twrw_sharding import TwRwSparseFeaturesDist
 from torchrec.distributed.types import (
     Awaitable,
@@ -390,6 +391,9 @@ class GridPooledEmbeddingDist(
         ] = None
         self._callbacks = callbacks
 
+    @EventLoggingHandler.event_logger(
+        TorchrecComponent.OUTPUT_DIST, n=1000, add_wait_counter=True
+    )
     def forward(
         self,
         local_embs: torch.Tensor,
