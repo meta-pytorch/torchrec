@@ -513,6 +513,15 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
                 # pyrefly: ignore [bad-assignment]
                 torch._dynamo.config.skip_torchrec = False
 
+                # On AMD (ROCm), disable shape padding benchmarking to prevent
+                # cross-PG deadlock: benchmark_gpu() calls cuda.synchronize()
+                # which blocks on pending NCCL collectives. The deadlock has
+                # only been observed on AMD MI350X (maz5); leave the default
+                # in place on NVIDIA so the perf optimization continues to
+                # apply where it's safe.
+                if torch.version.hip is not None:
+                    torch._inductor.config.shape_padding = False
+
                 # Importing only before compilation to not slow-done train_pipelines import
                 torch.ops.import_module("fbgemm_gpu.sparse_ops")
 
@@ -593,6 +602,18 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         free_features_storage_early: bool = False,
         clear_data_dist_inputs: bool = False,
     ) -> None:
+        # On AMD (ROCm), disable inductor shape padding to prevent cross-PG
+        # deadlock: should_pad_mm benchmarks GEMM kernels via benchmark_gpu(),
+        # which calls cuda.synchronize() and blocks on pending NCCL collectives
+        # from other process groups (e.g. mesh_shard + mesh_replicate).
+        # Observed on AMD MI350X. Set in the parent class so all subclasses
+        # (e.g. TrainPipelineSparseDistCompAutograd, APS subclasses) inherit
+        # the guard; pipelines that never compile are unaffected since this
+        # inductor config is only consulted during compilation.
+        if torch.version.hip is not None:
+            # pyrefly: ignore [implicit-import]
+            torch._inductor.config.shape_padding = False
+
         self._model = model
         self._optimizer = optimizer
         self._device = device
