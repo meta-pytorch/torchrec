@@ -107,12 +107,22 @@ from torchrec.modules.embedding_modules import (
 from torchrec.modules.utils import construct_jagged_tensors, SequenceVBEContext
 from torchrec.optim.fused import EmptyFusedOptimizer, FusedOptimizerModule
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizer
-from torchrec.sparse.jagged_tensor import (
-    _safe_tolist,
-    _to_offsets,
-    JaggedTensor,
-    KeyedJaggedTensor,
-)
+from torchrec.sparse.jagged_tensor import _to_offsets, JaggedTensor, KeyedJaggedTensor
+
+# _safe_tolist was added in D101235037.  Older torch package exports freeze
+# jagged_tensor.py from before that diff, so the symbol may not exist during
+# repackaging.  The fallback uses plain .tolist().
+try:
+    from torchrec.sparse.jagged_tensor import _safe_tolist
+except ImportError:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.embedding.import_failure._safe_tolist"
+    )
+
+    def _safe_tolist(tensor: torch.Tensor) -> list[int]:  # type: ignore[misc]
+        return tensor.tolist()
+
+
 from torchrec.sparse.tensor_dict import maybe_td_to_kjt
 
 try:

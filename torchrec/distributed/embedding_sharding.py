@@ -22,7 +22,20 @@ from torchrec.distributed.dist_data import (
     KJTAllToAllTensorsAwaitable,
     SplitsAllToAllAwaitable,
 )
-from torchrec.sparse.jagged_tensor import _safe_tolist
+
+# _safe_tolist was added in D101235037.  Older torch package exports freeze
+# jagged_tensor.py from before that diff, so the symbol may not exist during
+# repackaging.  The fallback uses plain .tolist().
+try:
+    from torchrec.sparse.jagged_tensor import _safe_tolist
+except ImportError:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.embedding_sharding.import_failure._safe_tolist"
+    )
+
+    def _safe_tolist(tensor: torch.Tensor) -> list[int]:  # type: ignore[misc]
+        return tensor.tolist()
+
 
 # This is required to support older torch package exports that do not contain
 # _check_int_overflow. During repackaging the

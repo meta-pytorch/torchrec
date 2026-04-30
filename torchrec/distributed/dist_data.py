@@ -30,12 +30,33 @@ from torchrec.distributed.global_settings import get_propogate_device
 from torchrec.distributed.types import Awaitable, QuantizedCommCodecs, rank_device
 from torchrec.fx.utils import fx_marker
 from torchrec.pt2.checks import is_torchdynamo_compiling
-from torchrec.sparse.jagged_tensor import (
-    _cuda_to_cpu_safe,
-    _safe_tolist,
-    JaggedTensor,
-    KeyedJaggedTensor,
-)
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+
+# _safe_tolist and _cuda_to_cpu_safe were added in D101235037 / D101269943.
+# Older torch package exports freeze jagged_tensor.py from before those diffs,
+# so the symbols may not exist during repackaging.  The fallbacks use plain
+# .tolist() / .cpu() — slightly slower on AMD/HIP but functionally correct.
+try:
+    from torchrec.sparse.jagged_tensor import _safe_tolist
+except ImportError:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.dist_data.import_failure._safe_tolist"
+    )
+
+    def _safe_tolist(tensor: torch.Tensor) -> List[int]:  # type: ignore[misc]
+        return tensor.tolist()
+
+
+try:
+    from torchrec.sparse.jagged_tensor import _cuda_to_cpu_safe
+except ImportError:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.dist_data.import_failure._cuda_to_cpu_safe"
+    )
+
+    def _cuda_to_cpu_safe(tensor: torch.Tensor) -> torch.Tensor:  # type: ignore[misc]
+        return tensor.cpu()
+
 
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
