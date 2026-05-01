@@ -142,7 +142,9 @@ def _safe_tolist_2d(tensor: torch.Tensor) -> List[List[int]]:
     """
     if not tensor.is_cuda:
         return tensor.tolist()
-    if not torch._utils_internal.justknobs_check(
+    # During torch.compile tracing, fall back to plain .tolist()
+    # (see _safe_tolist in jagged_tensor.py for details).
+    if is_torchdynamo_compiling() or not torch._utils_internal.justknobs_check(
         "pytorch/torchrec:killswitch_safe_tolist"
     ):
         return tensor.tolist()

@@ -125,7 +125,13 @@ def _safe_tolist(tensor: torch.Tensor) -> List[int]:
     if tensor.numel() == 0:
         return []
 
-    if not torch._utils_internal.justknobs_check(
+    # During torch.compile tracing, skip the JK check and _cuda_to_cpu_safe
+    # and fall back to plain .tolist(). justknobs_check calls pyjk.check()
+    # (a Cython function) which can raise SystemError in sandbox/RE
+    # environments. The resulting exception captures a reference to the pyjk
+    # module that cannot be pickled by the multiprocessing pool used in
+    # distributed tests, masking the real error behind MaybeEncodingError.
+    if is_torchdynamo_compiling() or not torch._utils_internal.justknobs_check(
         "pytorch/torchrec:killswitch_safe_tolist"
     ):
         return tensor.tolist()
