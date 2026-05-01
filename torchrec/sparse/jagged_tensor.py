@@ -2223,7 +2223,10 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         self._offset_per_key = kjt._offset_per_key
         self._index_per_key = kjt._index_per_key
         self._stride_per_key = kjt._stride_per_key
-        self._jt_dict = kjt._jt_dict
+        # Drop any cached per-key JaggedTensors: they reference tensors owned by
+        # `kjt` (potentially on a different device), so reusing them on `self`
+        # would leak foreign storage into operations like `record_stream()`.
+        self._jt_dict = None
 
         # tensor in-place copy
         self._values.copy_(kjt._values, non_blocking=non_blocking)
@@ -3041,19 +3044,36 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         return _jt_dict
 
     @torch.jit.unused
+    def _owned_tensors(self) -> List[torch.Tensor]:
+        """Returns tensors with independent storage owned by this KJT.
+
+        Used by clear_storage for byte accounting and storage freeing.
+        Excludes _jt_dict tensors because they are views sharing storage
+        with _values/_weights/_lengths. When adding a new tensor field
+        to KJT, add it here and all lifetime-management methods pick it
+        up automatically.
+        """
+        tensors = [self._values]
+        if self._weights is not None:
+            tensors.append(self._weights)
+        if self._lengths is not None:
+            tensors.append(self._lengths)
+        if self._offsets is not None:
+            tensors.append(self._offsets)
+        if self._inverse_indices is not None:
+            tensors.append(self._inverse_indices[1])
+        return tensors
+
+    @torch.jit.unused
     #  inconsistently.
     # pyrefly: ignore[bad-override]
     def record_stream(self, stream: torch.cuda.streams.Stream) -> None:
-        self._values.record_stream(stream)
-        weights = self._weights
-        lengths = self._lengths
-        offsets = self._offsets
-        if weights is not None:
-            weights.record_stream(stream)
-        if lengths is not None:
-            lengths.record_stream(stream)
-        if offsets is not None:
-            offsets.record_stream(stream)
+        for tensor in self._owned_tensors():
+            tensor.record_stream(stream)
+        jt_dict = self._jt_dict
+        if jt_dict is not None:
+            for jt in jt_dict.values():
+                jt.record_stream(stream)
 
     def to(
         self,
@@ -3083,7 +3103,6 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         offset_per_key = self._offset_per_key
         index_per_key = self._index_per_key
         stride_per_key = self._stride_per_key
-        jt_dict = self._jt_dict
         inverse_indices = self._inverse_indices
         if inverse_indices is not None:
             inverse_indices = (
@@ -3119,7 +3138,7 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             lengths_offset_per_key=lengths_offset_per_key,
             offset_per_key=offset_per_key,
             index_per_key=index_per_key,
-            jt_dict=jt_dict,
+            jt_dict=None,
             inverse_indices=inverse_indices,
         )
 
@@ -3196,23 +3215,26 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
     @torch.jit.unused
     def clear_storage(self) -> int:
         """
-        Frees the underlying storage of all internal tensors (_values, _lengths,
-        _offsets, _weights) by resizing their untyped storage to zero.
+        Frees the underlying storage of all internal tensors by resizing
+        their untyped storage to zero.
 
         The Python KJT object remains alive but its tensor data is released,
         allowing GPU HBM to be reclaimed early.
         """
-        size = self._values.element_size() * self._values.numel()
-        self._values.untyped_storage().resize_(0)
-        if self._lengths is not None:
-            size += self._lengths.element_size() * self._lengths.numel()
-            self._lengths.untyped_storage().resize_(0)
-        if self._offsets is not None:
-            size += self._offsets.element_size() * self._offsets.numel()
-            self._offsets.untyped_storage().resize_(0)
-        if self._weights is not None:
-            size += self._weights.element_size() * self._weights.numel()
-            self._weights.untyped_storage().resize_(0)
+        size = 0
+        for tensor in self._owned_tensors():
+            size += tensor.element_size() * tensor.numel()
+            tensor.untyped_storage().resize_(0)
+        if self._jt_dict is not None:
+            # Cached JaggedTensors share `values`/`lengths`/`weights` storage
+            # with the parent KJT (already released above), but their `offsets`
+            # are freshly allocated by `to_dict()` and must be released here.
+            for jt in self._jt_dict.values():
+                jt_offsets = jt._offsets
+                if jt_offsets is not None:
+                    size += jt_offsets.element_size() * jt_offsets.numel()
+                    jt_offsets.untyped_storage().resize_(0)
+            self._jt_dict = None
         return size
 
     def dist_tensors(self) -> List[torch.Tensor]:
