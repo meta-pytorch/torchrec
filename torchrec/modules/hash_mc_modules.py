@@ -253,7 +253,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         enable_per_feature_lookups: bool = False,
         no_bag: bool = False,
         write_runtime_meta_dim: int = 0,
-        delay_evict_dedup: bool = False,
     ) -> None:
         if output_segments is None:
             assert (
@@ -394,7 +393,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self._read_only_suffix: str = read_only_suffix
         self._enable_per_feature_lookups: bool = enable_per_feature_lookups
         self._no_bag = no_bag
-        self._delay_evict_dedup: bool = delay_evict_dedup
 
         logger.info(
             f"HashZchManagedCollisionModule: {self._name=}, {self.device=}, "
@@ -444,11 +442,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         num_reserved_slots: int,
         opt_in_rands: Optional[torch.Tensor],
         runtime_meta: Optional[torch.Tensor],
-        delay_evict_dedup: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # delay_evict_dedup is a FB-internal kernel optimization; the OSS
-        # FBGEMM kernel always compacts inline, so the flag is accepted for
-        # API parity with the FB subclass but not forwarded.
         return torch.ops.fbgemm.zero_collision_hash(
             input=input,
             identities=identities,
@@ -594,14 +588,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             return None
         out = torch.unique(torch.cat(self._evicted_indices))
         self._evicted_indices = []
-        # When delay_evict_dedup is enabled, the C++ kernel may return raw
-        # evict_slots with -1 sentinels instead of compacting them inline
-        # (which would force a costly cudaStreamSynchronize).
-        # torch.unique sorts ascending, so -1 is always the first element.
-        # Guard on actual -1 presence so this is safe regardless of whether
-        # the kernel compacted or not.
-        if self._delay_evict_dedup and out.numel() > 0 and out[0].item() == -1:
-            out = out[1:]
         return (
             out + self._output_global_offset_tensor
             if self._output_global_offset_tensor
@@ -720,7 +706,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                         if self._write_runtime_meta_dim > 0
                         else self._hash_zch_runtime_meta
                     ),
-                    delay_evict_dedup=self._delay_evict_dedup,
                 )
                 # Zero out runtime_meta at evicted slots so it follows
                 # the same eviction behavior as the identity tensor.
@@ -854,7 +839,6 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             enable_per_feature_lookups=self._enable_per_feature_lookups,
             no_bag=self._no_bag,
             write_runtime_meta_dim=self._write_runtime_meta_dim,
-            delay_evict_dedup=self._delay_evict_dedup,
         )
 
     def lookup_runtime_meta(
