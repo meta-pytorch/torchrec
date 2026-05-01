@@ -25,8 +25,19 @@ from torchrec.distributed.mc_embedding_modules import (
     BaseShardedManagedCollisionEmbeddingCollection,
 )
 from torchrec.distributed.mc_modules import (
+    _cat_jagged_values,
+    _fx_global_to_local_index,
+    _fx_jt_dict_add_offset,
+    _get_length_per_key,
+    create_mc_sharding,
+    EmbeddingCollectionContext,
+    input_dist_permute,
     ManagedCollisionCollectionContext,
+    ManagedCollisionCollectionSharder,
     ShardedManagedCollisionCollection,
+    ShardedMCCRemapper,
+    ShardedQuantManagedCollisionCollection,
+    update_jagged_tensor_dict,
 )
 from torchrec.distributed.model_parallel import DMPCollection
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
@@ -47,6 +58,7 @@ from torchrec.distributed.types import (
     ShardedTensor,
     ShardingEnv,
     ShardingPlan,
+    ShardingType,
 )
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.embedding_modules import EmbeddingCollection
@@ -1880,3 +1892,236 @@ class ShardedMCECWith2DSharding(MultiProcessTestBase):
             backend=backend,
             kjt_input_per_rank=kjt_input_per_rank,
         )
+
+
+class DummyMCModule(torch.nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+
+
+class TestInputDistPermute(unittest.TestCase):
+    def _create_kjt(self) -> KeyedJaggedTensor:
+        return KeyedJaggedTensor(
+            keys=["f0", "f1", "f2"],
+            values=torch.tensor([10, 20, 30, 40, 50, 60]),
+            lengths=torch.tensor([2, 1, 1, 1, 0, 1]),
+        )
+
+    def test_input_dist_permute_correctness(self) -> None:
+        kjt = self._create_kjt()
+        features_order = [2, 0, 1]
+        features_order_tensor = torch.tensor(features_order, dtype=torch.int32)
+
+        result = input_dist_permute(kjt, features_order, features_order_tensor)
+        expected = kjt.permute(features_order, features_order_tensor)
+
+        self.assertEqual(result.keys(), expected.keys())
+        torch.testing.assert_close(result.values(), expected.values())
+        torch.testing.assert_close(result.lengths(), expected.lengths())
+
+    def test_input_dist_permute_fx_node_type(self) -> None:
+        _features_order_tensor = torch.tensor([2, 0, 1], dtype=torch.int32)
+
+        class _Module(torch.nn.Module):
+            def forward(self, features: KeyedJaggedTensor) -> KeyedJaggedTensor:
+                return input_dist_permute(features, [2, 0, 1], _features_order_tensor)
+
+        tracer = torch.fx.Tracer(
+            autowrap_functions=(input_dist_permute,),
+            autowrap_modules=(torch.fx,),
+        )
+        graph = tracer.trace(_Module())
+
+        found = any(
+            node.op == "call_function"
+            and hasattr(node.target, "__name__")
+            and node.target.__name__ == "input_dist_permute"
+            for node in graph.nodes
+        )
+        self.assertTrue(found)
+
+    def test_input_dist_permute_identity_order(self) -> None:
+        kjt = self._create_kjt()
+        features_order = [0, 1, 2]
+        features_order_tensor = torch.tensor(features_order, dtype=torch.int32)
+
+        result = input_dist_permute(kjt, features_order, features_order_tensor)
+
+        self.assertEqual(result.keys(), kjt.keys())
+        torch.testing.assert_close(result.values(), kjt.values())
+
+    def test_input_dist_permute_subset(self) -> None:
+        kjt = self._create_kjt()
+        result = input_dist_permute(kjt, [1], torch.tensor([1], dtype=torch.int32))
+
+        self.assertEqual(result.keys(), ["f1"])
+
+
+class TestMCModuleUtilityFunctions(unittest.TestCase):
+    def test_fx_global_to_local_index(self) -> None:
+        feature_dict = {
+            "t_a": JaggedTensor(
+                values=torch.tensor([100, 200]), lengths=torch.tensor([2])
+            ),
+            "t_b": JaggedTensor(values=torch.tensor([500]), lengths=torch.tensor([1])),
+        }
+        result = _fx_global_to_local_index(feature_dict, {"t_a": 100, "t_b": 500})
+
+        torch.testing.assert_close(result["t_a"].values(), torch.tensor([0, 100]))
+        torch.testing.assert_close(result["t_b"].values(), torch.tensor([0]))
+
+    def test_fx_jt_dict_add_offset(self) -> None:
+        feature_dict = {
+            "t_a": JaggedTensor(
+                values=torch.tensor([0, 10]), lengths=torch.tensor([2])
+            ),
+        }
+        result = _fx_jt_dict_add_offset(feature_dict, {"t_a": 100})
+
+        torch.testing.assert_close(result["t_a"].values(), torch.tensor([100, 110]))
+
+    def test_get_length_per_key(self) -> None:
+        kjt = KeyedJaggedTensor(
+            keys=["f0", "f1", "f2"],
+            values=torch.tensor([1, 2, 3, 4, 5, 6]),
+            lengths=torch.tensor([2, 1, 1, 1, 0, 1]),
+        )
+        self.assertEqual(_get_length_per_key(kjt).tolist(), [3, 2, 1])
+
+    def test_cat_jagged_values(self) -> None:
+        jd = {
+            "a": JaggedTensor(values=torch.tensor([1, 2]), lengths=torch.tensor([2])),
+            "b": JaggedTensor(values=torch.tensor([3]), lengths=torch.tensor([1])),
+        }
+        torch.testing.assert_close(_cat_jagged_values(jd), torch.tensor([1, 2, 3]))
+
+    def test_update_jagged_tensor_dict(self) -> None:
+        jt_a = JaggedTensor(values=torch.tensor([1]), lengths=torch.tensor([1]))
+        jt_b = JaggedTensor(values=torch.tensor([2]), lengths=torch.tensor([1]))
+        result = update_jagged_tensor_dict({"a": jt_a}, {"b": jt_b})
+
+        self.assertIn("a", result)
+        self.assertIn("b", result)
+
+    def test_create_mc_sharding_unsupported(self) -> None:
+        from unittest.mock import MagicMock
+
+        with self.assertRaises(ValueError):
+            create_mc_sharding(
+                sharding_type=ShardingType.TABLE_WISE.value,
+                sharding_infos=[],
+                env=MagicMock(),
+            )
+
+
+class TestMCModuleContexts(unittest.TestCase):
+    def test_embedding_collection_context_defaults(self) -> None:
+        ctx = EmbeddingCollectionContext(sharding_contexts=[])
+
+        self.assertEqual(ctx.input_features, [])
+        self.assertIsNone(ctx.inverse_indices)
+        self.assertFalse(ctx.variable_batch_per_feature)
+
+    def test_mcc_context_is_subclass(self) -> None:
+        ctx = ManagedCollisionCollectionContext(sharding_contexts=[])
+
+        self.assertIsInstance(ctx, EmbeddingCollectionContext)
+
+
+class TestMCModuleSharder(unittest.TestCase):
+    def test_sharding_types(self) -> None:
+        sharder = ManagedCollisionCollectionSharder()
+
+        self.assertEqual(sharder.sharding_types("cuda"), [ShardingType.ROW_WISE.value])
+
+    def test_module_type(self) -> None:
+        sharder = ManagedCollisionCollectionSharder()
+
+        self.assertEqual(sharder.module_type, ManagedCollisionCollection)
+
+    def test_shardable_parameters_raises(self) -> None:
+        from unittest.mock import MagicMock
+
+        sharder = ManagedCollisionCollectionSharder()
+
+        with self.assertRaises(NotImplementedError):
+            sharder.shardable_parameters(MagicMock())
+
+
+class TestMCCRemapperUnit(unittest.TestCase):
+    def test_init_feature_to_offset(self) -> None:
+        mc_modules = torch.nn.ModuleDict({"table_a": DummyMCModule()})
+
+        remapper = ShardedMCCRemapper(
+            table_feature_splits=[2],
+            fns=["f0", "f1"],
+            managed_collision_modules=mc_modules,
+            shard_metadata={"table_a": [100, 50]},
+        )
+
+        self.assertEqual(remapper._feature_to_offset["f0"], 100)
+        self.assertEqual(remapper._feature_to_offset["f1"], 100)
+
+    def test_global_to_local_index(self) -> None:
+        mc_modules = torch.nn.ModuleDict({"table_a": DummyMCModule()})
+        remapper = ShardedMCCRemapper(
+            table_feature_splits=[1],
+            fns=["f0"],
+            managed_collision_modules=mc_modules,
+            shard_metadata={"table_a": [100, 50]},
+        )
+
+        jt = JaggedTensor(values=torch.tensor([150, 175]), lengths=torch.tensor([1, 1]))
+        result = remapper.global_to_local_index({"table_a": jt})
+
+        torch.testing.assert_close(result["table_a"].values(), torch.tensor([50, 75]))
+
+
+class TestShardedQuantMCCOutputDistUnit(unittest.TestCase):
+    def _make_sqmcc(
+        self, feature_names: list[str]
+    ) -> ShardedQuantManagedCollisionCollection:
+        # pyre-ignore[20]
+        obj = object.__new__(ShardedQuantManagedCollisionCollection)
+        obj._feature_names = feature_names
+        return obj
+
+    def test_output_dist_empty(self) -> None:
+        sqmcc = self._make_sqmcc(["f0"])
+        ctx = ManagedCollisionCollectionContext(sharding_contexts=[])
+
+        result = sqmcc.output_dist(ctx, KJTList([]))
+
+        self.assertEqual(result.keys(), [])
+
+    def test_output_dist_single(self) -> None:
+        sqmcc = self._make_sqmcc(["f0", "f1"])
+        ctx = ManagedCollisionCollectionContext(sharding_contexts=[])
+        kjt = KeyedJaggedTensor(
+            keys=["f0", "f1"],
+            values=torch.tensor([1, 2, 3]),
+            lengths=torch.tensor([2, 1]),
+        )
+
+        result = sqmcc.output_dist(ctx, KJTList([kjt]))
+
+        self.assertEqual(result.keys(), ["f0", "f1"])
+        torch.testing.assert_close(result.values(), torch.tensor([1, 2, 3]))
+
+    def test_compute_raises(self) -> None:
+        sqmcc = self._make_sqmcc(["f0"])
+        ctx = ManagedCollisionCollectionContext(sharding_contexts=[])
+
+        with self.assertRaises(NotImplementedError):
+            sqmcc.compute(ctx, 0, KJTList([]))
+
+    def test_create_context(self) -> None:
+        sqmcc = self._make_sqmcc(["f0"])
+        ctx = sqmcc.create_context()
+
+        self.assertIsInstance(ctx, ManagedCollisionCollectionContext)
+
+    def test_unsharded_module_type(self) -> None:
+        sqmcc = self._make_sqmcc(["f0"])
+
+        self.assertEqual(sqmcc.unsharded_module_type, ManagedCollisionCollection)
