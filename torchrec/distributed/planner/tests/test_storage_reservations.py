@@ -20,10 +20,12 @@ from torchrec.distributed.planner.storage_reservations import (
     _get_batch_inputs_and_shardable_parameters,
     _get_kjt_storage,
     _get_module_size,
+    FixedAbsoluteStorageReservation,
     FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.planner.types import PlannerError, PlannerErrorType, Topology
+from torchrec.distributed.planner.utils import gb_to_bytes
 from torchrec.distributed.test_utils.test_model import TestTowerInteraction
 from torchrec.distributed.types import ModuleSharder
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -474,3 +476,118 @@ class TestFixedPercentageStorageReservation(unittest.TestCase):
 
         expected_hbm = int((1 - 0.25) * topology.devices[0].storage.hbm)
         self.assertEqual(reserved_topology.devices[0].storage.hbm, expected_hbm)
+
+
+class TestFixedAbsoluteStorageReservation(unittest.TestCase):
+    def _create_model_and_sharders(
+        self,
+    ) -> tuple[TestModel, List[ModuleSharder[nn.Module]]]:
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+        return model, sharders
+
+    def test_reserves_absolute_bytes(self) -> None:
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 10 * 1024 * 1024 * 1024  # 10 GB
+        topology = Topology(world_size=2, compute_device="cuda", hbm_cap=hbm_cap)
+
+        reserved_bytes = gb_to_bytes(2.5)
+        reservation = FixedAbsoluteStorageReservation(hbm_reserved_bytes=reserved_bytes)
+
+        reserved_topology = reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        expected_hbm = hbm_cap - reserved_bytes
+        self.assertEqual(reserved_topology.devices[0].storage.hbm, expected_hbm)
+        self.assertEqual(reserved_topology.devices[1].storage.hbm, expected_hbm)
+
+    def test_from_gb(self) -> None:
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 10 * 1024 * 1024 * 1024
+        topology = Topology(world_size=1, compute_device="cuda", hbm_cap=hbm_cap)
+
+        reservation = FixedAbsoluteStorageReservation.from_gb(2.0)
+
+        reserved_topology = reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        expected_hbm = hbm_cap - gb_to_bytes(2.0)
+        self.assertEqual(reserved_topology.devices[0].storage.hbm, expected_hbm)
+
+    def test_zero_bytes_matches_no_reservation(self) -> None:
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 10 * 1024 * 1024 * 1024
+        topology = Topology(world_size=1, compute_device="cuda", hbm_cap=hbm_cap)
+
+        reservation = FixedAbsoluteStorageReservation(hbm_reserved_bytes=0)
+
+        reserved_topology = reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        self.assertEqual(reserved_topology.devices[0].storage.hbm, hbm_cap)
+
+    def test_kjt_storage_is_computed(self) -> None:
+        model, sharders = self._create_model_and_sharders()
+        topology = Topology(world_size=2, compute_device="cuda")
+
+        reservation = FixedAbsoluteStorageReservation.from_gb(1.0)
+
+        self.assertIsNone(reservation._kjt_storage)
+
+        reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        self.assertIsNotNone(reservation._kjt_storage)
+        self.assertGreater(reservation._kjt_storage.hbm, 0)
+
+    def test_last_reserved_topology_returns_copy(self) -> None:
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 10 * 1024 * 1024 * 1024
+        topology = Topology(world_size=1, compute_device="cuda", hbm_cap=hbm_cap)
+
+        reservation = FixedAbsoluteStorageReservation.from_gb(2.0)
+
+        self.assertIsNone(reservation.last_reserved_topology)
+
+        reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        cached = reservation.last_reserved_topology
+        self.assertIsNotNone(cached)
+        expected_hbm = hbm_cap - gb_to_bytes(2.0)
+        self.assertEqual(cached.devices[0].storage.hbm, expected_hbm)
+
+    def test_negative_bytes_raises(self) -> None:
+        with self.assertRaises(AssertionError):
+            FixedAbsoluteStorageReservation(hbm_reserved_bytes=-1)

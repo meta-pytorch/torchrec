@@ -35,6 +35,7 @@ from torchrec.distributed.planner.shard_estimators import (
     get_num_poolings,
 )
 from torchrec.distributed.planner.storage_reservations import (
+    FixedAbsoluteStorageReservation,
     FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
     InferenceStorageReservation,
@@ -207,7 +208,8 @@ class EmbeddingStats(Stats):
         compute_kernels_to_storage = defaultdict(lambda: Storage(0, 0, 0))
 
         reserved_hbm_percent, dense_storage, kjt_storage = _compute_storage(
-            storage_reservation=storage_reservation
+            storage_reservation=storage_reservation,
+            topology=topology,
         )
 
         for sharding_option in best_plan:
@@ -1026,19 +1028,27 @@ def _format_perf_breakdown(perf: Perf) -> str:
 
 def _compute_storage(
     storage_reservation: StorageReservation,
+    topology: Optional[Topology] = None,
 ) -> Tuple[float, Storage, Storage]:
-    reserved_hbm_percent = (
-        storage_reservation._percentage
-        if isinstance(
-            storage_reservation,
-            (
-                FixedPercentageStorageReservation,
-                HeuristicalStorageReservation,
-                InferenceStorageReservation,
-            ),
+    if (
+        isinstance(storage_reservation, FixedAbsoluteStorageReservation)
+        and topology is not None
+        and topology.devices[0].storage.hbm > 0
+    ):
+        reserved_hbm_percent = (
+            storage_reservation._hbm_reserved_bytes / topology.devices[0].storage.hbm
         )
-        else 0.0
-    )
+    elif isinstance(
+        storage_reservation,
+        (
+            FixedPercentageStorageReservation,
+            HeuristicalStorageReservation,
+            InferenceStorageReservation,
+        ),
+    ):
+        reserved_hbm_percent = storage_reservation._percentage
+    else:
+        reserved_hbm_percent = 0.0
 
     dense_storage = (
         storage_reservation._dense_storage

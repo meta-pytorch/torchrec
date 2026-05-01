@@ -23,7 +23,11 @@ from torchrec.distributed.planner.types import (
     StorageReservation,
     Topology,
 )
-from torchrec.distributed.planner.utils import sharder_name, storage_repr_in_gb
+from torchrec.distributed.planner.utils import (
+    gb_to_bytes,
+    sharder_name,
+    storage_repr_in_gb,
+)
 from torchrec.distributed.types import get_tensor_size_bytes, ModuleSharder
 
 
@@ -125,6 +129,11 @@ def _reserve_storage_percentage(topology: Topology, percent: float) -> None:
         device.storage.hbm = int((1 - percent) * device.storage.hbm)
 
 
+def _reserve_storage_absolute(topology: Topology, hbm_bytes: int) -> None:
+    for device in topology.devices:
+        device.storage.hbm = max(0, device.storage.hbm - hbm_bytes)
+
+
 def _get_batch_inputs_and_shardable_parameters(
     module: nn.Module,
     sharders: List[ModuleSharder[nn.Module]],
@@ -212,6 +221,41 @@ class FixedPercentageStorageReservation(StorageReservation):
     def last_reserved_topology(self) -> Optional[Topology]:
         "Returns a copy of the cached value of the most recent output from the reserve() method."
         return copy.deepcopy(self._last_reserved_topology)
+
+
+class FixedAbsoluteStorageReservation(FixedPercentageStorageReservation):
+    """
+    Reserves a fixed absolute amount of HBM storage on each device, rather
+    than a percentage of total HBM. Useful when the non-sharded memory footprint is
+    known in advance and does not scale with device capacity.
+
+    Args:
+        hbm_reserved_bytes (int): the amount of HBM to reserve per device, in bytes.
+    """
+
+    def __init__(self, hbm_reserved_bytes: int) -> None:
+        assert hbm_reserved_bytes >= 0
+        super().__init__(percentage=0.0)
+        self._hbm_reserved_bytes: int = hbm_reserved_bytes
+
+    @classmethod
+    def from_gb(cls, hbm_reserved_gb: float) -> "FixedAbsoluteStorageReservation":
+        return cls(hbm_reserved_bytes=gb_to_bytes(hbm_reserved_gb))
+
+    def reserve(
+        self,
+        topology: Topology,
+        batch_size: int,
+        module: nn.Module,
+        sharders: List[ModuleSharder[nn.Module]],
+        constraints: Optional[Dict[str, ParameterConstraints]] = None,
+    ) -> Topology:
+        reserved_topology = super().reserve(
+            topology, batch_size, module, sharders, constraints
+        )
+        _reserve_storage_absolute(reserved_topology, self._hbm_reserved_bytes)
+        self._last_reserved_topology = reserved_topology
+        return reserved_topology
 
 
 class HeuristicalStorageReservation(StorageReservation):
