@@ -1642,6 +1642,14 @@ class CollectiveTagFromTest(unittest.TestCase):
 
 
 class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
+    def __init__(self, methodName: str = "runTest") -> None:
+        # Force spawn: forkserver caches the env from when it was first
+        # started, so TORCHREC_VALIDATE_COLLECTIVES=1 set in setUp does not
+        # propagate to workers that fork from a forkserver booted by an
+        # earlier test in the file. Mirrors the py3.14 remediation in
+        # MultiProcessTestBase.__init__.
+        super().__init__(methodName, mp_init_mode="spawn")
+
     def setUp(self) -> None:
         super().setUp()
         os.environ["TORCHREC_VALIDATE_COLLECTIVES"] = "1"
