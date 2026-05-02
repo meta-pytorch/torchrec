@@ -51,6 +51,13 @@ def _slice_1d_tensor(tensor: torch.Tensor, start: int, end: int) -> torch.Tensor
     return tensor[start:end]
 
 
+@torch.fx.wrap
+def _slice_1d_tensor_by_lengths(
+    tensor: torch.Tensor, lengths: torch.Tensor
+) -> torch.Tensor:
+    return tensor[: int(lengths.sum().item())]
+
+
 def extract_module_or_tensor_callable(
     module_or_callable: Union[
         Callable[[], torch.nn.Module],
@@ -322,7 +329,7 @@ def construct_jagged_tensors_inference(
                 embeddings, 0, reverse_indices.to(torch.int32)
             )
         elif remove_padding:
-            embeddings = _slice_1d_tensor(embeddings, 0, int(lengths.sum().item()))
+            embeddings = _slice_1d_tensor_by_lengths(embeddings, lengths)
 
         ret: Dict[str, JaggedTensor] = {}
 
