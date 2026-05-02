@@ -77,6 +77,18 @@ from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
 
 
+@torch.fx.wrap
+def input_dist_permute(
+    features: KeyedJaggedTensor,
+    features_order: List[int],
+    features_order_tensor: torch.Tensor,
+) -> KeyedJaggedTensor:
+    return features.permute(
+        features_order,
+        features_order_tensor,
+    )
+
+
 @dataclass
 class EmbeddingCollectionContext(Multistreamable):
     sharding_contexts: List[
@@ -723,10 +735,9 @@ class ShardedManagedCollisionCollection(
             # skip_permute added since these were used earlier in `mc_embeddingbag`
             if not skip_permute and self._features_order:
                 original_features = features
-                features = features.permute(
-                    #  `Union[Module, Tensor]`.
+                features = input_dist_permute(
+                    features,
                     self._features_order,
-                    #  but got `Union[Module, Tensor]`.
                     # pyrefly: ignore[bad-argument-type]
                     self._features_order_tensor,
                 )
@@ -1502,7 +1513,8 @@ class ShardedQuantManagedCollisionCollection(
 
         with torch.no_grad():
             if self._features_order:
-                features = features.permute(
+                features = input_dist_permute(
+                    features,
                     self._features_order,
                     # pyrefly: ignore[bad-argument-type]
                     self._features_order_tensor,
