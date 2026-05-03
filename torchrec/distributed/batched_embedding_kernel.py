@@ -530,6 +530,9 @@ def _populate_zero_collision_tbe_params(
         )
     )
 
+    if embedding_cache_mode_:
+        tbe_params["optimizer"] = OptimType.EXACT_ROWWISE_ADAGRAD
+
     optimizer_type_for_st: Optional[str] = None
     optimizer_state_dtypes_for_st: Optional[FrozenSet[Tuple[str, int]]] = None
     load_ckpt_without_opt = False
