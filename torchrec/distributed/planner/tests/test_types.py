@@ -10,7 +10,7 @@
 import unittest
 from copy import deepcopy
 from typing import cast, Dict, Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from torch import multiprocessing
@@ -1376,6 +1376,44 @@ class TestKernelConfig(unittest.TestCase):
                 config.validate()
             self.assertIn("compute_device must be one of", str(context.exception))
             self.assertIn("invalid_device", str(context.exception))
+
+
+class TestTopologyCreatedByFactory(unittest.TestCase):
+    """Tests for the created_by_factory flag on Topology."""
+
+    @patch("torchrec.distributed.planner.types.logging")
+    def test_direct_construction_sets_flag_false(self, mock_logging: MagicMock) -> None:
+        topology = Topology(world_size=2, compute_device="cuda")
+        self.assertFalse(topology._created_by_factory)
+
+    @patch("torchrec.distributed.planner.types.logging")
+    def test_direct_construction_logs_warning(self, mock_logging: MagicMock) -> None:
+        mock_logger = MagicMock()
+        mock_logging.getLogger.return_value = mock_logger
+        Topology(world_size=2, compute_device="cuda")
+        mock_logger.warning.assert_called_once()
+        self.assertIn("TopologyFactory", mock_logger.warning.call_args[0][0])
+
+    def test_factory_creation_sets_flag_true(self) -> None:
+        trainer_config = TrainerConfig(world_size=2, local_world_size=2)
+        kernel_config = KernelConfig(compute_device="cuda")
+        topology = TopologyFactory.create_topology(
+            trainer_config=trainer_config,
+            kernel_config=kernel_config,
+        )
+        self.assertTrue(topology._created_by_factory)
+
+    @patch("torchrec.distributed.planner.types.logging")
+    def test_explicit_flag_true_suppresses_warning(
+        self, mock_logging: MagicMock
+    ) -> None:
+        mock_logger = MagicMock()
+        mock_logging.getLogger.return_value = mock_logger
+        topology = Topology(
+            world_size=2, compute_device="cuda", created_by_factory=True
+        )
+        self.assertTrue(topology._created_by_factory)
+        mock_logger.warning.assert_not_called()
 
 
 class TestTopologyFactory(unittest.TestCase):
