@@ -7,9 +7,10 @@
 
 # pyre-strict
 
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import torch
+from torchrec.fx.tracer import is_fx_tracing
 from torchrec.modules.embedding_configs import data_type_to_dtype
 from torchrec.sparse.jagged_tensor import (
     _desugar_keyed_tensors,
@@ -31,24 +32,6 @@ def _permuted_values(
     embedding_dicts = [kt.to_dict() for kt in kts]
     values = [embedding_dicts[idx][key] for (idx, key) in remap]
     return torch.cat(values, dim=dim)
-
-
-@torch.fx.wrap
-def module_init(module: "KTRegroupAsDict", keyed_tensors: List[KeyedTensor]) -> None:
-    assert len(keyed_tensors) > 0, "Empty list provided"
-    assert all(
-        kt.device() == keyed_tensors[0].device() for kt in keyed_tensors
-    ), "All inputs should be on the same device."
-    assert all(
-        kt.key_dim() == keyed_tensors[0].key_dim() for kt in keyed_tensors
-    ), "All inputs should have the same key_dim"
-    module._dim = keyed_tensors[0].key_dim()
-
-    if module._dim == 1:
-        module._init_fbgemm_regroup(keyed_tensors)
-    else:
-        module._init_regroup(keyed_tensors)
-    module._is_inited = True
 
 
 class PermuteMultiEmbedding(torch.nn.Module):
@@ -124,17 +107,31 @@ class PermuteMultiEmbedding(torch.nn.Module):
             in_shapes = in_shapes.to(device, non_blocking=True)
             out_shapes = out_shapes.to(device, non_blocking=True)
 
+        out_lengths = self._out_lengths
+        if out_lengths is None:
+            return values
         return torch.ops.fbgemm.permute_multi_embedding(
             values,
             permutes,
             in_shapes,
             out_shapes,
-            self._out_lengths,
+            out_lengths,
         )
 
 
+@torch.fx.wrap
 def _to_tensor_dict(
-    keys: List[str], values: Union[List[torch.Tensor], Tuple[torch.Tensor, ...]]
+    keys: List[str], values: List[torch.Tensor]
+) -> Dict[str, torch.Tensor]:
+    return {key: values[i] for i, key in enumerate(keys)}
+
+
+# Separate FX-wrapped function for the torch.split path. FX wrapping is
+# per-function identity in _wrapped_fns_to_patch, so the split call site
+# needs its own wrapper to be treated as opaque by the tracer.
+@torch.fx.wrap
+def _split_to_tensor_dict(
+    keys: List[str], values: List[torch.Tensor]
 ) -> Dict[str, torch.Tensor]:
     return {key: values[i] for i, key in enumerate(keys)}
 
@@ -164,6 +161,9 @@ class KTRegroupAsDict(torch.nn.Module, CacheMixin):
 
     """
 
+    _splits: List[int]
+    _idx_key_pairs: List[Tuple[int, str]]
+
     def __init__(
         self,
         groups: List[List[str]],
@@ -188,8 +188,10 @@ class KTRegroupAsDict(torch.nn.Module, CacheMixin):
         # cached values populated on first forward call
         self._dim: int = 1
         self._use_fbgemm_regroup: bool = False
-        self._splits: List[int] = []
-        self._idx_key_pairs: List[Tuple[int, str]] = []
+        self._splits: List[int] = torch.jit.annotate(List[int], [])
+        self._idx_key_pairs: List[Tuple[int, str]] = torch.jit.annotate(
+            List[Tuple[int, str]], []
+        )
         self._permute_pooled_embs_impl = PermuteMultiEmbedding(groups, multi_device)
         self._emb_dtype = emb_dtype
 
@@ -251,8 +253,10 @@ class KTRegroupAsDict(torch.nn.Module, CacheMixin):
         Returns:
             Dict[str, torch.Tensor]: dictionary of tensors keyed by the keys.
         """
-        if not self._is_inited:
-            module_init(self, keyed_tensors)
+        if not torch.jit.is_scripting():
+            if not is_fx_tracing():
+                if not self._is_inited:
+                    module_init(self, keyed_tensors)
 
         if self._use_fbgemm_regroup:
             values = _get_kts_values(keyed_tensors)
@@ -265,7 +269,31 @@ class KTRegroupAsDict(torch.nn.Module, CacheMixin):
             )
             permuted_values = self.embedding_cast([permuted_values])[0]
             splitted_values = torch.split(permuted_values, self._splits, dim=self._dim)
-            return _to_tensor_dict(self._keys, splitted_values)
+            # pyre-ignore[6]: torch.split returns Tuple but _split_to_tensor_dict accepts List
+            return _split_to_tensor_dict(self._keys, splitted_values)
 
     def clear_cache(self) -> None:
         self._is_inited = False
+
+
+# Defined after KTRegroupAsDict so the type annotation can use the unquoted
+# class name. TorchScript can't resolve string forward-references for
+# @torch.jit.ignore'd functions when scripting cross-compilation-unit FX graphs
+# (e.g. predictor's optimize_ebs_full_model traces a torch.package'd model).
+@torch.fx.wrap
+@torch.jit.ignore
+def module_init(module: KTRegroupAsDict, keyed_tensors: List[KeyedTensor]) -> None:
+    assert len(keyed_tensors) > 0, "Empty list provided"
+    assert all(
+        kt.device() == keyed_tensors[0].device() for kt in keyed_tensors
+    ), "All inputs should be on the same device."
+    assert all(
+        kt.key_dim() == keyed_tensors[0].key_dim() for kt in keyed_tensors
+    ), "All inputs should have the same key_dim"
+    module._dim = keyed_tensors[0].key_dim()
+
+    if module._dim == 1:
+        module._init_fbgemm_regroup(keyed_tensors)
+    else:
+        module._init_regroup(keyed_tensors)
+    module._is_inited = True
