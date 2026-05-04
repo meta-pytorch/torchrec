@@ -51,6 +51,7 @@ class EventScope(Enum):
     JOB = "job"
     TABLE = "table"
     TBE = "tbe"
+    MODULE = "module"
 
 
 class EventLoggingHandlerBase(abc.ABC):
