@@ -65,15 +65,7 @@ Example usage:
 import logging
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import (
-    Any,
-    Callable,
-    Optional,
-    Protocol,
-    runtime_checkable,
-    Sequence,
-    TYPE_CHECKING,
-)
+from typing import Any, Callable, Optional, Protocol, runtime_checkable, TYPE_CHECKING
 
 import torch
 from torch import nn
@@ -186,11 +178,16 @@ class InjectionSite:
         target_type: Selects the hooking mechanism.  Use ``PARAM_GRAD`` for
             compile-safe parameter-gradient hooks, ``ACTIVATION`` for
             forward-hook + ``tensor_finder`` hooks.
+        hook_position: Float in [0.0, 1.0] selecting which parameter to hook
+            within the target module (``PARAM_GRAD`` only).  0.0 picks the
+            first parameter (in ``module.parameters()`` order), 1.0 picks
+            the last.  Ignored for ``ACTIVATION``.
     """
 
     fqn: str
     tensor_finder: GradTensorFinder
     target_type: InjectionTargetType = InjectionTargetType.ACTIVATION
+    hook_position: float = 1.0
 
 
 def register_backward_hook(
@@ -250,34 +247,29 @@ def _register_param_grad_hook(
     target: nn.Module,
     hook_fn: Callable[[torch.Tensor], None],
 ) -> torch.utils.hooks.RemovableHandle:
-    """Compile-safe hook via ``register_multi_grad_hook`` on parameters."""
+    """Compile-safe hook on a single parameter selected by ``hook_position``."""
     params = [p for p in target.parameters() if p.requires_grad]
     if not params:
         raise ValueError(
             f"register_backward_hook: no trainable parameters in module '{site.fqn}'."
         )
 
-    def _multi_grad_callback(
-        grads: Sequence[torch.Tensor | None],
-    ) -> None:
-        """Invoke ``hook_fn`` with the first non-None gradient.
+    idx = _position_to_index(site.hook_position, len(params))
+    param = params[idx]
+    logger.info(
+        "register_backward_hook: hooking param %d/%d (position=%.2f) in '%s'",
+        idx,
+        len(params),
+        site.hook_position,
+        site.fqn,
+    )
+    return param.register_hook(hook_fn)
 
-        ``register_multi_grad_hook`` calls this once all tracked
-        parameters have accumulated their gradients.  We forward the
-        first available gradient tensor to the user-supplied
-        ``hook_fn``.
 
-        Raises:
-            RuntimeError: If every gradient in *grads* is ``None``.
-        """
-        grad = next((g for g in grads if g is not None), None)
-        if grad is None:
-            raise RuntimeError(
-                f"register_backward_hook: no non-None gradient found for module '{site.fqn}'."
-            )
-        hook_fn(grad)
-
-    return torch.autograd.graph.register_multi_grad_hook(params, _multi_grad_callback)
+def _position_to_index(position: float, length: int) -> int:
+    """Convert a [0.0, 1.0] position to an index in a list of ``length``."""
+    clamped = max(0.0, min(1.0, position))
+    return min(int(clamped * length), length - 1)
 
 
 def _register_activation_hook(
