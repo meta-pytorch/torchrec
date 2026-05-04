@@ -34,6 +34,23 @@ from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.types import CopyMixIn
 
 
+def _cuda_device_count() -> int:
+    """More robust CUDA device count that falls back to probing devices
+    when NVML fails to initialize."""
+    count = torch.cuda.device_count()
+    if count == 0:
+        for i in range(8):
+            try:
+                torch.zeros(1, device=f"cuda:{i}")
+                count = i + 1
+            except (RuntimeError, AssertionError):
+                break
+    return count
+
+
+CUDA_DEVICE_COUNT: int = _cuda_device_count()
+
+
 class CopyModule(nn.Module, CopyMixIn):
     def __init__(self) -> None:
         super().__init__()
@@ -139,7 +156,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
                 self._recursive_device_check(child, child_copy, device, device_copy)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     @given(
@@ -201,7 +218,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         self._recursive_device_check(dmp.module, dmp_1.module, device, device_1)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     @given(
@@ -294,7 +311,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     def test_quant_pred_state_dict_cw_list_copy(self) -> None:
@@ -368,7 +385,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     @given(
@@ -449,7 +466,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     def test_copy_mixin(self) -> None:
@@ -513,7 +530,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         ]
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 0,
+        CUDA_DEVICE_COUNT <= 0,
         "Not enough GPUs available",
     )
     @given(
@@ -620,7 +637,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 0,
+        CUDA_DEVICE_COUNT <= 0,
         "Not enough GPUs available",
     )
     @given(
@@ -706,7 +723,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 0,
+        CUDA_DEVICE_COUNT <= 0,
         "Not enough GPUs available",
     )
     @given(
@@ -796,7 +813,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 0,
+        CUDA_DEVICE_COUNT <= 0,
         "Not enough GPUs available",
     )
     @given(
