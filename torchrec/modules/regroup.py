@@ -34,24 +34,6 @@ def _permuted_values(
     return torch.cat(values, dim=dim)
 
 
-@torch.fx.wrap
-def module_init(module: "KTRegroupAsDict", keyed_tensors: List[KeyedTensor]) -> None:
-    assert len(keyed_tensors) > 0, "Empty list provided"
-    assert all(
-        kt.device() == keyed_tensors[0].device() for kt in keyed_tensors
-    ), "All inputs should be on the same device."
-    assert all(
-        kt.key_dim() == keyed_tensors[0].key_dim() for kt in keyed_tensors
-    ), "All inputs should have the same key_dim"
-    module._dim = keyed_tensors[0].key_dim()
-
-    if module._dim == 1:
-        module._init_fbgemm_regroup(keyed_tensors)
-    else:
-        module._init_regroup(keyed_tensors)
-    module._is_inited = True
-
-
 class PermuteMultiEmbedding(torch.nn.Module):
     """
     Module to handle cached tensors and running FBGEMM
@@ -292,3 +274,26 @@ class KTRegroupAsDict(torch.nn.Module, CacheMixin):
 
     def clear_cache(self) -> None:
         self._is_inited = False
+
+
+# Defined after KTRegroupAsDict so the type annotation can use the unquoted
+# class name. TorchScript can't resolve string forward-references for
+# @torch.jit.ignore'd functions when scripting cross-compilation-unit FX graphs
+# (e.g. predictor's optimize_ebs_full_model traces a torch.package'd model).
+@torch.fx.wrap
+@torch.jit.ignore
+def module_init(module: KTRegroupAsDict, keyed_tensors: List[KeyedTensor]) -> None:
+    assert len(keyed_tensors) > 0, "Empty list provided"
+    assert all(
+        kt.device() == keyed_tensors[0].device() for kt in keyed_tensors
+    ), "All inputs should be on the same device."
+    assert all(
+        kt.key_dim() == keyed_tensors[0].key_dim() for kt in keyed_tensors
+    ), "All inputs should have the same key_dim"
+    module._dim = keyed_tensors[0].key_dim()
+
+    if module._dim == 1:
+        module._init_fbgemm_regroup(keyed_tensors)
+    else:
+        module._init_regroup(keyed_tensors)
+    module._is_inited = True
