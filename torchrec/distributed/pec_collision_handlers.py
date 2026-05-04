@@ -173,6 +173,27 @@ class CollisionHandlerBase(abc.ABC):
         """Reset internal state (e.g. at epoch boundary)."""
         ...
 
+    @abc.abstractmethod
+    def compute_nonoverlapped_per_rank(
+        self,
+        nonoverlapped_features: KeyedJaggedTensor,
+        batch_size_per_rank: List[int],
+    ) -> torch.Tensor:
+        """Computes per-rank nonoverlapped value counts.
+
+        Used by collision_split_dist to compute per-rank split sizes for
+        the nonoverlapped partition. The overlapped splits are derived from
+        the total (output_splits - nonoverlapped).
+
+        Args:
+            nonoverlapped_features: nonoverlapped partition KJT
+            batch_size_per_rank: number of batch elements from each rank
+
+        Returns:
+            Tensor of shape [world_size] with per-rank nonoverlapped value counts
+        """
+        ...
+
 
 class RWCollisionHandler(CollisionHandlerBase):
     """Row-wise collision handler for PEC.
@@ -258,6 +279,33 @@ class RWCollisionHandler(CollisionHandlerBase):
 
     def reset(self) -> None:
         self._checker.reset_mask()
+
+    def compute_nonoverlapped_per_rank(
+        self,
+        nonoverlapped_features: KeyedJaggedTensor,
+        batch_size_per_rank: List[int],
+    ) -> torch.Tensor:
+        """Computes per-rank nonoverlapped value counts for RW sharding.
+
+        After RW input_dist, the KJT lengths are in feature-major order.
+        We transpose to batch-major, then use segment_sum_csr with
+        batch_size_per_rank as segment boundaries to sum lengths across
+        all features for each rank's batch elements.
+        """
+        batch_size_cumsum = torch.ops.fbgemm.asynchronous_complete_cumsum(
+            torch.tensor(
+                batch_size_per_rank,
+                device=self._device,
+                dtype=torch.int64,
+            )
+        )
+        num_features = len(nonoverlapped_features.keys())
+        lengths_batch_major = (
+            nonoverlapped_features.lengths().view(num_features, -1).t().flatten()
+        )
+        return torch.ops.fbgemm.segment_sum_csr(
+            num_features, batch_size_cumsum, lengths_batch_major
+        )
 
 
 def create_collision_handler(
