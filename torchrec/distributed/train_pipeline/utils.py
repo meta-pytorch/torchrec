@@ -41,6 +41,14 @@ from torchrec.distributed.embedding_sharding import (
 from torchrec.distributed.embedding_types import KJTList
 
 try:
+    from torchrec.distributed.logging_handlers import log_pipeline_module_info
+except Exception:
+
+    def log_pipeline_module_info(*args: Any, **kwargs: Any) -> None:
+        pass
+
+
+try:
     from torchrec.distributed.logger import (
         LazyStr,
         one_time_logger,
@@ -503,6 +511,7 @@ def _rewrite_model(  # noqa C901
     # i.e. don't have input transformations, i.e. rely only on 'builtins.getattr'.
     pipelined_forwards = []
     original_forwards = []
+    pipelined_sharded_modules = []
 
     non_pipelined_sharded_modules = []
 
@@ -542,6 +551,7 @@ def _rewrite_model(  # noqa C901
                 dist_stream,
             )
             pipelined_forwards.append(child)
+            pipelined_sharded_modules.append(node.target)
         else:
             logger.warning(
                 f"Module '{node.target}' will NOT be pipelined, due to input modifications"
@@ -564,6 +574,12 @@ def _rewrite_model(  # noqa C901
             + "This should be fixed for pipelining to work to the full extent.",
             ", ".join(non_pipelined_sharded_modules),
         )
+
+    log_pipeline_module_info(
+        pipelined_module_fqns=pipelined_sharded_modules,
+        non_pipelined_module_fqns=non_pipelined_sharded_modules,
+        pipeline_forward_type=pipelined_forward.__name__,
+    )
 
     return (
         pipelined_forwards,

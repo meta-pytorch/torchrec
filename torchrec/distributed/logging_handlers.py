@@ -381,6 +381,15 @@ def log_kernel_changed(
     pass
 
 
+def log_pipeline_module_info(
+    pipelined_module_fqns: List[str],
+    non_pipelined_module_fqns: List[str],
+    pipeline_forward_type: str = "",
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_table_assignment(best_plan: List, planner_type: str = "", technique: OptimizationTechnique = OptimizationTechnique.NONE) -> None:  # type: ignore[type-arg]
     """No-op OSS stub."""
     pass
