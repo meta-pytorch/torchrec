@@ -13,7 +13,12 @@ import torch
 import torch.fx
 from hypothesis import given, settings, strategies as st, Verbosity
 from torchrec.modules.embedding_configs import data_type_to_dtype
-from torchrec.modules.regroup import KTRegroupAsDict
+from torchrec.modules.regroup import (
+    _split_to_tensor_dict,
+    _to_tensor_dict,
+    KTRegroupAsDict,
+    PermuteMultiEmbedding,
+)
 from torchrec.sparse.jagged_tensor import _all_keys_used_once, KeyedTensor
 from torchrec.sparse.tests.utils import build_groups, build_kts
 from torchrec.types import DataType
@@ -215,3 +220,39 @@ class KTRegroupAsDictTest(unittest.TestCase):
         for key in eager_out.keys():
             self.assertEqual(cast_out[key].dtype, dtype)
             torch.allclose(cast_out[key], eager_out[key].to(dtype))
+
+    def test_permute_multi_embedding_none_out_lengths(self) -> None:
+        groups = [["f1", "f2"], ["f3"]]
+        permute = PermuteMultiEmbedding(groups)
+        values = [torch.randn(2, 4), torch.randn(2, 8)]
+        result = permute(values)
+        self.assertEqual(len(result), len(values))
+        for r, v in zip(result, values):
+            self.assertTrue(torch.equal(r, v))
+
+    def test_to_tensor_dict(self) -> None:
+        keys = ["a", "b", "c"]
+        values = [torch.tensor([1.0]), torch.tensor([2.0]), torch.tensor([3.0])]
+        result = _to_tensor_dict(keys, values)
+        self.assertEqual(list(result.keys()), keys)
+        for k, v in zip(keys, values):
+            self.assertTrue(torch.equal(result[k], v))
+
+    def test_split_to_tensor_dict(self) -> None:
+        keys = ["x", "y"]
+        values = [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
+        result = _split_to_tensor_dict(keys, values)
+        self.assertEqual(list(result.keys()), keys)
+        for k, v in zip(keys, values):
+            self.assertTrue(torch.equal(result[k], v))
+
+    def test_fx_trace_with_none_out_lengths(self) -> None:
+        groups = build_groups(
+            kts=self.kts, num_groups=self.num_groups, skips=False, duplicates=False
+        )
+        regroup_module = KTRegroupAsDict(groups=groups, keys=self.keys)
+        eager_out = regroup_module(self.kts)
+        gm = torch.fx.symbolic_trace(regroup_module)
+        fx_out = gm(self.kts)
+        for key in eager_out.keys():
+            self.assertTrue(torch.equal(eager_out[key], fx_out[key]))
