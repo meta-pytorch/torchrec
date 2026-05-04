@@ -9,10 +9,11 @@
 
 import copy
 import logging
+import time
 import warnings
 from collections import defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field
-from itertools import accumulate
+from itertools import accumulate, count
 from typing import (
     Any,
     cast,
@@ -418,6 +419,13 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         return jt_dict
 
 
+# Module-level monotonic counter used to derive a unique store key for the
+# pre-DDP barrier. All ranks construct ShardedEmbeddingCollection instances in
+# the same order in distributed training, so the counter values are consistent
+# across ranks for the same logical instance.
+_EC_BARRIER_INSTANCE_COUNTER = count()
+
+
 class ShardedEmbeddingCollection(
     ShardedEmbeddingModule[
         KJTList,
@@ -585,6 +593,41 @@ class ShardedEmbeddingCollection(
         """
         Initialize data parallel for the embedding collection.
         """
+        # Reserve a unique sequence id used to namespace the pre-DDP store
+        # barrier. All ranks construct instances in the same order, so the
+        # value is consistent across ranks for the same logical instance.
+        self._barrier_seq: int = next(_EC_BARRIER_INSTANCE_COUNTER)
+        _has_dp_sharding = any(
+            isinstance(s, DpSequenceEmbeddingSharding)
+            for s in self._sharding_type_to_sharding.values()
+        )
+        if _has_dp_sharding and self._env.process_group is not None:
+            _br = self._env.process_group.rank()
+            _ws = self._env.process_group.size()
+            _store = dist.distributed_c10d._get_default_store()
+            if _store is None:
+                logger.warning(
+                    f"[Rank {_br}] EC: no default c10d store available, "
+                    f"skipping pre-DDP barrier"
+                )
+            else:
+                _barrier_key = f"ec_pre_ddp_barrier_{self._module_fqn or 'default'}_{self._barrier_seq}"
+                logger.warning(
+                    f"[Rank {_br}] EC: entering store barrier before DDP wrapping"
+                )
+
+                _store.add(_barrier_key, 1)
+                _t0 = time.monotonic()
+                while _store.add(_barrier_key, 0) < _ws:
+                    if time.monotonic() - _t0 > 600:
+                        raise TimeoutError(
+                            f"[Rank {_br}] EC store barrier timed out after 600s"
+                        )
+                    time.sleep(0.5)
+                logger.warning(
+                    f"[Rank {_br}] EC: exited store barrier after "
+                    f"{time.monotonic() - _t0:.1f}s, proceeding to DDP wrapping"
+                )
         for index, (sharding, lookup) in enumerate(
             zip(
                 self._sharding_type_to_sharding.values(),
@@ -593,6 +636,39 @@ class ShardedEmbeddingCollection(
         ):
             # TODO: can move this into DpPooledEmbeddingSharding once all modules are composable
             if isinstance(sharding, DpSequenceEmbeddingSharding):
+                _ddp_rank = (
+                    self._env.process_group.rank()
+                    if self._env.process_group is not None
+                    else -1
+                )
+                _ddp_ws = (
+                    self._env.process_group.size()
+                    if self._env.process_group is not None
+                    else -1
+                )
+                _ddp_params = list(lookup.named_parameters())
+                _ddp_param_details = []
+                _ddp_int_max = 2**31 - 1
+                for _n, _p in _ddp_params:
+                    _ddp_param_details.append(
+                        f"{_n}: shape={list(_p.shape)}, "
+                        f"numel={_p.numel()}, "
+                        f"dtype={_p.dtype}"
+                    )
+                    if _p.numel() > _ddp_int_max:
+                        logger.error(
+                            f"[Rank {_ddp_rank}] OVERFLOW RISK in DDP wrap: "
+                            f"param '{_n}' numel={_p.numel()} > INT_MAX. "
+                            f"This WILL cause verify_params_across_processes "
+                            f"to fail."
+                        )
+                logger.warning(
+                    f"[Rank {_ddp_rank}] About to DDP-wrap lookup "
+                    f"index={index}: "
+                    f"num_params={len(_ddp_params)}, "
+                    f"world_size={_ddp_ws}, "
+                    f"params=[{'; '.join(_ddp_param_details)}]"
+                )
                 self._lookups[index] = DistributedDataParallel(
                     module=lookup,
                     device_ids=(
@@ -694,6 +770,21 @@ class ShardedEmbeddingCollection(
                     )
                 )
             )
+        for _st, _infos in sharding_type_to_sharding_infos.items():
+            _table_details = []
+            for _info in _infos:
+                _cfg = _info.embedding_config
+                _numel = _cfg.num_embeddings * _cfg.embedding_dim
+                _table_details.append(
+                    f"{_cfg.name}(num_emb={_cfg.num_embeddings}, "
+                    f"dim={_cfg.embedding_dim}, numel={_numel})"
+                )
+            logger.warning(
+                f"[EC] Sharding group '{_st}': "
+                f"num_tables={len(_infos)}, "
+                f"tables=[{', '.join(_table_details)}]"
+            )
+
         return sharding_type_to_sharding_infos
 
     @classmethod
@@ -1374,8 +1465,34 @@ class ShardedEmbeddingCollection(
             self._create_hash_size_info(feature_names, ctx)
 
     def _create_lookups(self) -> None:
-        for sharding in self._sharding_type_to_sharding.values():
+        for _st_key, sharding in zip(
+            self._sharding_type_to_sharding.keys(),
+            self._sharding_type_to_sharding.values(),
+        ):
             lookup = sharding.create_lookup()
+            _rank = (
+                self._env.process_group.rank()
+                if self._env.process_group is not None
+                else -1
+            )
+            _param_details = []
+            _int_max = 2**31 - 1
+            for _n, _p in lookup.named_parameters():
+                _param_details.append(
+                    f"{_n}: shape={list(_p.shape)}, numel={_p.numel()}"
+                )
+                if _p.numel() > _int_max:
+                    logger.error(
+                        f"[Rank {_rank}] OVERFLOW in lookup: "
+                        f"param '{_n}' numel={_p.numel()} > INT_MAX"
+                    )
+            logger.warning(
+                f"[Rank {_rank}] Created lookup for "
+                f"sharding_type={_st_key}: "
+                f"type={type(lookup).__name__}, "
+                f"num_params={len(_param_details)}, "
+                f"params=[{'; '.join(_param_details)}]"
+            )
             if self.enable_embedding_update and sharding.enable_embedding_update:
                 self._updates.append(sharding.create_update(lookup))
             self._lookups.append(lookup)
