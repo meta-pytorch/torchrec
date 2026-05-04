@@ -985,7 +985,11 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             # ]
         """
         if desired_length is None:
-            N = int(torch.max(self.lengths()).item())
+            _max = torch.max(self.lengths()).item()
+            if not torch.jit.is_scripting() and is_non_strict_exporting():
+                N = torch.sym_int(_max)
+            else:
+                N = int(_max)
         else:
             N = desired_length
         return torch.ops.fbgemm.jagged_to_padded_dense(
@@ -1039,7 +1043,11 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         if self.weights_or_none() is None:
             return None
         if desired_length is None:
-            N = int(torch.max(self.lengths()).item())
+            _max = torch.max(self.lengths()).item()
+            if not torch.jit.is_scripting() and is_non_strict_exporting():
+                N = torch.sym_int(_max)
+            else:
+                N = int(_max)
         else:
             N = desired_length
         return torch.ops.fbgemm.jagged_to_padded_dense(
