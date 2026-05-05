@@ -20,6 +20,7 @@ from torchrec.distributed.comm_ops import (
     all_gather_base_pooled,
     alltoall_pooled,
     alltoall_sequence,
+    pg_name,
     reduce_scatter_base_pooled,
     reduce_scatter_v_per_feature_pooled,
     reduce_scatter_v_pooled,
@@ -68,11 +69,21 @@ try:
 except OSError:
     pass
 
-# OSS
+# Event logging is optional: torch.package inference bundles strip
+# logging_handlers, and OSS users get the no-op stub. Catch broad Exception
+# (not just ImportError) to match the defensive idiom in
+# torchrec/distributed/train_pipeline/train_pipelines.py — a degraded
+# telemetry dependency must not break dist_data import.
 try:
-    pass
-except ImportError:
-    pass
+    from torchrec.distributed.logging_handlers import (
+        EventLoggingHandler,
+        TorchrecComponent,
+    )
+    from torchrec.distributed.logging_utils import EventType
+
+    _HAS_EVENT_LOGGER: bool = True
+except Exception:
+    _HAS_EVENT_LOGGER: bool = False
 
 
 logger: logging.Logger = logging.getLogger()
@@ -427,6 +438,15 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         # Append tag tensor for collective mismatch validation.
         # Requires non-empty input_tensors to inherit device/dtype.
         self._tag_appended: bool = False
+        # PG identity captured only when validation is enabled; surfaces in
+        # the Scuba event emitted on mismatch so SREs can attribute the
+        # failure to a specific PG without grepping rank logs.
+        self._pg_name: str = ""
+        self._pg_rank: int = -1
+        # Maps each PG-local index to the corresponding global rank, so the
+        # mismatch event can surface global ranks (actionable for triage)
+        # alongside PG-local indices. Empty when validation is disabled.
+        self._pg_global_ranks: List[int] = []
         if (
             collective_tag is not None
             and _validate_collectives_enabled()
@@ -446,6 +466,11 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
             )
             input_tensors = input_tensors + [tag_tensor]
             self._tag_appended = True
+            self._pg_name = pg_name(pg)
+            self._pg_rank = pg.rank()
+            self._pg_global_ranks = [
+                dist.get_global_rank(pg, i) for i in range(self.num_workers)
+            ]
 
         if is_torchdynamo_compiling():
             # TODO(ivankobzarev) Remove this dynamo condition once dynamo functional collectives remapping does not emit copy_
@@ -491,6 +516,58 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                     async_op=not is_torchdynamo_compiling(),
                 )
 
+    def _emit_mismatch_event(
+        self,
+        label: str,
+        expected: Optional[int],
+        tag_row: List[int],
+    ) -> None:
+        # Telemetry must never suppress the diagnostic RuntimeError raised by
+        # the caller — a Scuba-handler bug or metadata serialization failure
+        # would otherwise mask the actual mismatch.
+        if not _HAS_EVENT_LOGGER:
+            return
+        # PG-local indices are needed for the comparison itself; convert to
+        # global ranks for the event so SREs can identify the actual host
+        # without separately resolving the PG membership. Both are emitted
+        # because the PG-local view is still useful when reasoning about the
+        # collective's structure.
+        mismatched_pg_local = [i for i, t in enumerate(tag_row) if t != expected]
+        mismatched_global = [self._pg_global_ranks[i] for i in mismatched_pg_local]
+        global_rank = (
+            self._pg_global_ranks[self._pg_rank]
+            if 0 <= self._pg_rank < len(self._pg_global_ranks)
+            else -1
+        )
+        try:
+            EventLoggingHandler.log_event(
+                component=TorchrecComponent.INPUT_DIST.value,
+                event_name="SplitsAllToAllAwaitable.collective_tag_mismatch",
+                event_type=EventType.FAILURE,
+                metadata={
+                    "collective_label": label,
+                    "collective_kind": str(
+                        self._collective_tag_parts[0]
+                        if self._collective_tag_parts
+                        else "unknown"
+                    ),
+                    "expected_tag": str(expected),
+                    "received_tags": str(tag_row),
+                    "mismatched_peer_global_ranks": str(mismatched_global),
+                    "mismatched_peer_pg_ranks": str(mismatched_pg_local),
+                    "pg_name": self._pg_name,
+                    "pg_rank": str(self._pg_rank),
+                    "global_rank": str(global_rank),
+                    "world_size": str(self.num_workers),
+                },
+                error_message=f"All2All collective mismatch on {label}",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to emit collective_tag_mismatch event; "
+                "raising original mismatch error"
+            )
+
     def _wait_impl(self) -> List[List[int]]:
         # Can not use is_torchdynamo_compiling(), as every such condition should be independent for compilation with graph breaks.
         if isinstance(self._splits_awaitable, dist.Work):
@@ -509,6 +586,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                     if self._collective_tag_parts
                     else "unknown"
                 )
+                self._emit_mismatch_event(label, expected, tag_row)
                 raise RuntimeError(
                     f"All2All collective mismatch detected (collective={label!r}): "
                     f"expected tag {expected} but received tags {tag_row} from "
