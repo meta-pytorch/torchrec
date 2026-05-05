@@ -27,6 +27,7 @@ from torchrec.distributed.planner.estimator.estimator import (
 )
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
+    Perf,
     SharderData,
     SharderDataMap,
     ShardEstimator,
@@ -112,6 +113,14 @@ class EmbeddingPerfEstimator(ShardEstimator):
             sharding_options,
             sharder_data_map=sharder_data_map,
         )
+        for sharding_option in sharding_options:
+            for shard in sharding_option.shards:
+                if shard.perf is not None:
+                    _validate_perf(
+                        shard.perf,
+                        sharding_option.name,
+                        sharding_option.sharding_type,
+                    )
 
 
 class EmbeddingStorageEstimator(ShardEstimator):
@@ -512,6 +521,67 @@ def get_num_poolings(
     return [NUM_POOLINGS] * len(so.input_lengths)
 
 
+def _validate_io_sizes(
+    input_sizes: List[float],
+    output_sizes: List[float],
+    sharding_type: str,
+) -> None:
+    for i, size in enumerate(input_sizes):
+        if math.isnan(size):
+            logger.warning(
+                f"[TorchRec Planner] NaN detected in input_sizes[{i}] "
+                f"for sharding_type={sharding_type}. "
+                f"input_sizes={input_sizes}, output_sizes={output_sizes}"
+            )
+        elif size < 0:
+            logger.warning(
+                f"[TorchRec Planner] Negative value detected in input_sizes[{i}]={size} "
+                f"for sharding_type={sharding_type}. "
+                f"input_sizes={input_sizes}, output_sizes={output_sizes}"
+            )
+    for i, size in enumerate(output_sizes):
+        if math.isnan(size):
+            logger.warning(
+                f"[TorchRec Planner] NaN detected in output_sizes[{i}] "
+                f"for sharding_type={sharding_type}. "
+                f"input_sizes={input_sizes}, output_sizes={output_sizes}"
+            )
+        elif size < 0:
+            logger.warning(
+                f"[TorchRec Planner] Negative value detected in output_sizes[{i}]={size} "
+                f"for sharding_type={sharding_type}. "
+                f"input_sizes={input_sizes}, output_sizes={output_sizes}"
+            )
+
+
+def _validate_perf(
+    perf: Perf,
+    table_name: str,
+    sharding_type: str,
+) -> None:
+    for field_name in (
+        "fwd_compute",
+        "fwd_comms",
+        "bwd_compute",
+        "bwd_comms",
+        "input_dist_comms",
+        "prefetch_compute",
+    ):
+        value = getattr(perf, field_name)
+        if math.isnan(value):
+            logger.warning(
+                f"[TorchRec Planner] NaN detected in Perf.{field_name} "
+                f"for table={table_name}, sharding_type={sharding_type}. "
+                f"perf={perf}"
+            )
+        elif value < 0:
+            logger.warning(
+                f"[TorchRec Planner] Negative value detected in Perf.{field_name}={value} "
+                f"for table={table_name}, sharding_type={sharding_type}. "
+                f"perf={perf}"
+            )
+
+
 def _calculate_shard_io_sizes(
     sharding_type: str,
     batch_sizes: List[int],
@@ -526,7 +596,7 @@ def _calculate_shard_io_sizes(
     is_pooled: bool,
 ) -> Tuple[List[int], List[int]]:
     if sharding_type == ShardingType.DATA_PARALLEL.value:
-        return _calculate_dp_shard_io_sizes(
+        input_sizes, output_sizes = _calculate_dp_shard_io_sizes(
             batch_sizes=batch_sizes,
             input_lengths=input_lengths,
             emb_dim=emb_dim,
@@ -537,7 +607,7 @@ def _calculate_shard_io_sizes(
             is_pooled=is_pooled,
         )
     elif sharding_type == ShardingType.TABLE_WISE.value:
-        return _calculate_tw_shard_io_sizes(
+        input_sizes, output_sizes = _calculate_tw_shard_io_sizes(
             batch_sizes=batch_sizes,
             world_size=world_size,
             input_lengths=input_lengths,
@@ -551,7 +621,7 @@ def _calculate_shard_io_sizes(
         ShardingType.COLUMN_WISE.value,
         ShardingType.TABLE_COLUMN_WISE.value,
     }:
-        return _calculate_cw_shard_io_sizes(
+        input_sizes, output_sizes = _calculate_cw_shard_io_sizes(
             batch_sizes=batch_sizes,
             world_size=world_size,
             input_lengths=input_lengths,
@@ -562,7 +632,7 @@ def _calculate_shard_io_sizes(
             is_pooled=is_pooled,
         )
     elif sharding_type == ShardingType.ROW_WISE.value:
-        return _calculate_rw_shard_io_sizes(
+        input_sizes, output_sizes = _calculate_rw_shard_io_sizes(
             batch_sizes=batch_sizes,
             world_size=world_size,
             input_lengths=input_lengths,
@@ -576,7 +646,7 @@ def _calculate_shard_io_sizes(
         sharding_type == ShardingType.TABLE_ROW_WISE.value
         or sharding_type == ShardingType.GRID_SHARD.value  # same as table row wise
     ):
-        return _calculate_twrw_shard_io_sizes(
+        input_sizes, output_sizes = _calculate_twrw_shard_io_sizes(
             batch_sizes=batch_sizes,
             world_size=world_size,
             local_world_size=local_world_size,
@@ -591,6 +661,9 @@ def _calculate_shard_io_sizes(
         raise ValueError(
             f"Unrecognized or unsupported sharding type provided: {sharding_type}"
         )
+
+    _validate_io_sizes(input_sizes, output_sizes, sharding_type)
+    return input_sizes, output_sizes
 
 
 def _calculate_dp_shard_io_sizes(
