@@ -160,6 +160,52 @@ class KTRegroupAsDictTest(unittest.TestCase):
         for key in out.keys():
             torch.allclose(out[key], eager_out[key])
 
+    def test_fx_and_jit_regroup_captures_lazy_init(self) -> None:
+        """
+        Regression test: when KTRegroupAsDict is FX-traced as a submodule
+        of a parent module before its first forward call, the lazy-init
+        guard does not skip the module_init free function, so module_init
+        is captured into the resulting FX graph as a call_function node.
+        torch.jit.script must then succeed on that graph -- without
+        @torch.jit.ignore on module_init, TS would try to compile its
+        body and abort at script time with:
+
+          RuntimeError: 'KTRegroupAsDict' object has no attribute or
+          method '_init_fbgemm_regroup'. 'module_init' is being compiled
+          since it was called from 'GraphModule.forward'
+
+        This test only covers script-time success. Runtime dispatch of
+        the captured call requires the regroup module to be the original
+        Python instance (not a scripted submodule that strips its
+        non-TS methods); production achieves that via a cross-CU
+        torch.package setup that isn't reproducible in-process.
+        """
+        from torchrec.modules.regroup import module_init
+
+        class _Parent(torch.nn.Module):
+            def __init__(self, groups: list[list[str]], keys: list[str]) -> None:
+                super().__init__()
+                self.regroup = KTRegroupAsDict(groups=groups, keys=keys)
+
+            def forward(self, kts: list[KeyedTensor]) -> dict[str, torch.Tensor]:
+                return self.regroup(kts)
+
+        groups = build_groups(
+            kts=self.kts, num_groups=self.num_groups, skips=False, duplicates=False
+        )
+        parent = _Parent(groups=groups, keys=self.keys)
+        self.assertFalse(parent.regroup._is_inited)
+
+        # Trace BEFORE running forward, so module_init is captured into
+        # the resulting FX graph (rather than being skipped by the lazy-init guard).
+        gm = torch.fx.symbolic_trace(parent)
+        captured_targets = {n.target for n in gm.graph.nodes if n.op == "call_function"}
+        self.assertIn(module_init, captured_targets)
+
+        # Must not raise. Without @torch.jit.ignore on module_init this
+        # would fail with the RuntimeError above during compilation.
+        torch.jit.script(gm)
+
     def test_fx_and_jit_regroup_with_multi_device(self) -> None:
         groups = build_groups(
             kts=self.kts, num_groups=self.num_groups, skips=False, duplicates=False
