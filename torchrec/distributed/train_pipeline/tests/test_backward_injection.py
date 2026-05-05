@@ -23,6 +23,7 @@ from torchrec.distributed.test_utils.multi_process import (
 )
 from torchrec.distributed.test_utils.test_model import ModelInput, TestSparseNN
 from torchrec.distributed.train_pipeline.backward_injection import (
+    _position_to_index,
     FirstGradTensorFinder,
     InjectionSite,
     InjectionTargetType,
@@ -122,6 +123,66 @@ class InjectionSiteTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             register_backward_hook(site, SimpleModel(), lambda grad: None)
+
+    def test_position_to_index(self) -> None:
+        self.assertEqual(_position_to_index(0.0, 5), 0)
+        self.assertEqual(_position_to_index(1.0, 5), 4)
+        self.assertEqual(_position_to_index(0.5, 4), 2)
+        self.assertEqual(_position_to_index(0.0, 1), 0)
+        self.assertEqual(_position_to_index(1.0, 1), 0)
+        # out-of-range values are clamped
+        self.assertEqual(_position_to_index(-0.5, 5), 0)
+        self.assertEqual(_position_to_index(1.5, 5), 4)
+
+    def test_hook_position_selects_parameter(self) -> None:
+        """hook_position=0.0 hooks weight, hook_position=1.0 hooks bias."""
+        model = SimpleModel()
+        grad_shapes: List[torch.Size] = []
+
+        # layer_a is nn.Linear(4, 4): params are [weight(4,4), bias(4)]
+        site_first = InjectionSite(
+            fqn="layer_a",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+            hook_position=0.0,
+        )
+        handle = register_backward_hook(
+            site_first,
+            model,
+            lambda grad: grad_shapes.append(grad.shape),
+        )
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(grad_shapes[-1], torch.Size([4, 4]))
+        handle.remove()
+
+        site_last = InjectionSite(
+            fqn="layer_a",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+            hook_position=1.0,
+        )
+        handle = register_backward_hook(
+            site_last,
+            model,
+            lambda grad: grad_shapes.append(grad.shape),
+        )
+        model.zero_grad()
+        model(torch.randn(2, 4)).sum().backward()
+        self.assertEqual(grad_shapes[-1], torch.Size([4]))
+        handle.remove()
+
+    def test_hook_position_no_trainable_params_raises(self) -> None:
+        """PARAM_GRAD on a module with no trainable params raises ValueError."""
+        model = SimpleModel()
+        # layer_b contains ReLU at index 1 which has no parameters
+        site = InjectionSite(
+            fqn="layer_b.1",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+            hook_position=0.5,
+        )
+        with self.assertRaises(ValueError):
+            register_backward_hook(site, model, lambda grad: None)
 
     def test_register_hook_persists_and_removable(self) -> None:
         """Hook fires every iteration; removing it stops firing."""
