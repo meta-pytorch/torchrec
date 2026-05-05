@@ -34,6 +34,7 @@ from torchrec.distributed.planner.shard_estimators import (
     _calculate_shard_io_sizes,
     _calculate_storage_specific_sizes,
     _validate_io_sizes,
+    _validate_perf,
     EmbeddingOffloadStats,
     EmbeddingStorageEstimator,
 )
@@ -2018,3 +2019,99 @@ class TestCalculateShardIoSizesValidation(unittest.TestCase):
         self.assertEqual(output_sizes[0], 0)
         self.assertGreater(input_sizes[1], 0)
         self.assertGreater(output_sizes[1], 0)
+
+
+class TestValidatePerf(unittest.TestCase):
+    def test_valid_perf_no_warning(self) -> None:
+        perf = Perf(
+            fwd_compute=1.0,
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+        )
+        with self.assertLogs(level="WARNING") as cm:
+            import logging
+
+            logging.getLogger().warning("sentinel")
+            _validate_perf(perf, "table_0", "table_wise")
+        self.assertEqual(len(cm.output), 1)
+        self.assertIn("sentinel", cm.output[0])
+
+    def test_nan_fwd_compute_warns(self) -> None:
+        perf = Perf(
+            fwd_compute=float("nan"),
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+        )
+        with self.assertLogs(level="WARNING") as cm:
+            _validate_perf(perf, "table_0", "table_wise")
+        self.assertTrue(
+            any("NaN detected in Perf.fwd_compute" in msg for msg in cm.output)
+        )
+
+    def test_negative_bwd_comms_warns(self) -> None:
+        perf = Perf(
+            fwd_compute=1.0,
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=-3.0,
+        )
+        with self.assertLogs(level="WARNING") as cm:
+            _validate_perf(perf, "table_0", "row_wise")
+        self.assertTrue(
+            any(
+                "Negative value detected in Perf.bwd_comms=-3.0" in msg
+                for msg in cm.output
+            )
+        )
+
+    def test_nan_prefetch_compute_warns(self) -> None:
+        perf = Perf(
+            fwd_compute=1.0,
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+            prefetch_compute=float("nan"),
+        )
+        with self.assertLogs(level="WARNING") as cm:
+            _validate_perf(perf, "table_0", "table_wise")
+        self.assertTrue(
+            any("NaN detected in Perf.prefetch_compute" in msg for msg in cm.output)
+        )
+
+    def test_negative_input_dist_comms_warns(self) -> None:
+        perf = Perf(
+            fwd_compute=1.0,
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+            input_dist_comms=-0.5,
+        )
+        with self.assertLogs(level="WARNING") as cm:
+            _validate_perf(perf, "table_0", "column_wise")
+        self.assertTrue(
+            any(
+                "Negative value detected in Perf.input_dist_comms=-0.5" in msg
+                for msg in cm.output
+            )
+        )
+
+    def test_multiple_invalid_fields_warn(self) -> None:
+        perf = Perf(
+            fwd_compute=-1.0,
+            fwd_comms=float("nan"),
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+        )
+        with self.assertLogs(level="WARNING") as cm:
+            _validate_perf(perf, "table_0", "table_wise")
+        self.assertTrue(
+            any(
+                "Negative value detected in Perf.fwd_compute" in msg
+                for msg in cm.output
+            )
+        )
+        self.assertTrue(
+            any("NaN detected in Perf.fwd_comms" in msg for msg in cm.output)
+        )

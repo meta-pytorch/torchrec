@@ -27,6 +27,7 @@ from torchrec.distributed.planner.estimator.estimator import (
 )
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
+    Perf,
     SharderData,
     SharderDataMap,
     ShardEstimator,
@@ -112,6 +113,14 @@ class EmbeddingPerfEstimator(ShardEstimator):
             sharding_options,
             sharder_data_map=sharder_data_map,
         )
+        for sharding_option in sharding_options:
+            for shard in sharding_option.shards:
+                if shard.perf is not None:
+                    _validate_perf(
+                        shard.perf,
+                        sharding_option.name,
+                        sharding_option.sharding_type,
+                    )
 
 
 class EmbeddingStorageEstimator(ShardEstimator):
@@ -542,6 +551,34 @@ def _validate_io_sizes(
                 f"[TorchRec Planner] Negative value detected in output_sizes[{i}]={size} "
                 f"for sharding_type={sharding_type}. "
                 f"input_sizes={input_sizes}, output_sizes={output_sizes}"
+            )
+
+
+def _validate_perf(
+    perf: Perf,
+    table_name: str,
+    sharding_type: str,
+) -> None:
+    for field_name in (
+        "fwd_compute",
+        "fwd_comms",
+        "bwd_compute",
+        "bwd_comms",
+        "input_dist_comms",
+        "prefetch_compute",
+    ):
+        value = getattr(perf, field_name)
+        if math.isnan(value):
+            logger.warning(
+                f"[TorchRec Planner] NaN detected in Perf.{field_name} "
+                f"for table={table_name}, sharding_type={sharding_type}. "
+                f"perf={perf}"
+            )
+        elif value < 0:
+            logger.warning(
+                f"[TorchRec Planner] Negative value detected in Perf.{field_name}={value} "
+                f"for table={table_name}, sharding_type={sharding_type}. "
+                f"perf={perf}"
             )
 
 
