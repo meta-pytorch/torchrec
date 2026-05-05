@@ -42,6 +42,7 @@ class OptimizationTechnique(Enum):
     ITEP = "itep"
     ALBT = "albt"
     SSD_OFFLOADING = "ssd_offloading"
+    TWO_DIM_SPARSE_PARALLELISM = "two_dim_sparse_parallelism"
 
 
 @unique

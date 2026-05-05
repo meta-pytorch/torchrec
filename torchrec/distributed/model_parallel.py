@@ -32,6 +32,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.collective_utils import create_on_rank_and_share_result
 from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
+from torchrec.distributed.logging_handlers import log_two_dim_sparse_parallelism_config
 from torchrec.distributed.mc_embedding_modules import (
     BaseShardedManagedCollisionEmbeddingCollection,
 )
@@ -1197,6 +1198,21 @@ class DMPCollection(DistributedModelParallel):
         logger.info(
             "[TorchRec 2D Parallel] Consolidated sharding plan:\n%s", consolidated_plan
         )
+
+        # Log once per job; all ranks share the same config.
+        if self._global_rank == 0:
+            log_two_dim_sparse_parallelism_config(
+                {
+                    "is_2d_sharding_enabled": "True",
+                    "world_size": str(world_size),
+                    "sharding_group_size": str(sharding_group_size),
+                    "node_group_size": str(node_group_size),
+                    "sharding_strategy": sharding_strategy.name,
+                    "use_inter_host_allreduce": str(use_inter_host_allreduce),
+                    "has_submodule_configs": str(bool(submodule_configs)),
+                    "num_parallel_worlds": str(world_size // sharding_group_size),
+                }
+            )
 
         default_env = ShardingEnv2D(
             global_pg=self._pg,

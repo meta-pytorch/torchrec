@@ -368,6 +368,14 @@ def log_itep_itp_info(
     pass
 
 
+def log_two_dim_sparse_parallelism_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.TWO_DIM_SPARSE_PARALLELISM,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_kernel_changed(
     table_name: str = "",
     action: str = "",
