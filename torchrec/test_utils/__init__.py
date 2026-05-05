@@ -109,6 +109,18 @@ def skip_if_asan_class(cls: TReturn) -> Optional[TReturn]:
     return cls
 
 
+def cuda_device_count() -> int:
+    """More robust CUDA device count that falls back to CUDA_VISIBLE_DEVICES
+    when NVML fails to initialize."""
+    count = torch.cuda.device_count()
+    if count > 0:
+        return count
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible is not None and cuda_visible.strip():
+        return len(cuda_visible.split(","))
+    return 0
+
+
 def init_distributed_single_host(
     rank: int, world_size: int, backend: str, local_size: Optional[int] = None
 ) -> dist.ProcessGroup:
