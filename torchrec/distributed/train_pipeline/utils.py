@@ -761,6 +761,9 @@ def prefetch_embeddings(
 
         dist_input.record_stream(cur_stream)
         module_context.record_stream(cur_stream)
+        if data_dist_stream is not None:
+            dist_input.record_stream(data_dist_stream)
+            module_context.record_stream(data_dist_stream)
         if forward_stream is not None:
             dist_input.record_stream(forward_stream)
             module_context.record_stream(forward_stream)
