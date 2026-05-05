@@ -368,6 +368,14 @@ def log_itep_itp_info(
     pass
 
 
+def log_two_dim_sparse_parallelism_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.TWO_DIM_SPARSE_PARALLELISM,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_kernel_changed(
     table_name: str = "",
     action: str = "",
@@ -387,6 +395,11 @@ def log_table_assignment(best_plan: List, planner_type: str = "", technique: Opt
 
 
 def log_table_constraints(constraints: Optional[Dict] = None, planner_type: str = "", technique: OptimizationTechnique = OptimizationTechnique.NONE) -> None:  # type: ignore[type-arg]
+    """No-op OSS stub."""
+    pass
+
+
+def log_tbe_composition(grouped_configs: List, rank: int = 0, technique: OptimizationTechnique = OptimizationTechnique.NONE) -> None:  # type: ignore[type-arg]
     """No-op OSS stub."""
     pass
 
