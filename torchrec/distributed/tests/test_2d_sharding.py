@@ -45,7 +45,10 @@ from torchrec.modules.embedding_configs import (
     PoolingType,
 )
 from torchrec.modules.embedding_modules import EmbeddingCollection
-from torchrec.test_utils import skip_if_asan_class
+from torchrec.test_utils import cuda_device_count, skip_if_asan_class
+
+
+CUDA_DEVICE_COUNT: int = cuda_device_count()
 
 
 @skip_if_asan_class
@@ -61,7 +64,7 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         super().setUp(backend=backend)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     @given(
@@ -157,7 +160,7 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     @given(
@@ -254,7 +257,7 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     @given(
@@ -373,7 +376,7 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -466,7 +469,7 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     @given(
@@ -614,7 +617,7 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         }
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -681,7 +684,7 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -752,7 +755,7 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -904,7 +907,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         }
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -991,7 +994,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -1081,7 +1084,7 @@ class TestDynamic2DParallel(MultiProcessTestBase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -1224,7 +1227,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         super().setUp(backend=backend)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     @given(
@@ -1321,7 +1324,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     @given(
@@ -1418,7 +1421,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     @given(
@@ -1516,7 +1519,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
     @given(
@@ -1614,7 +1617,7 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 5,
+        CUDA_DEVICE_COUNT <= 5,
         "Not enough GPUs, this test requires at least six GPUs",
     )
     @given(
@@ -1757,7 +1760,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         }
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -1830,7 +1833,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -1903,7 +1906,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 7,
+        CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least eight GPUs",
     )
     @given(
@@ -1976,7 +1979,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 5,
+        CUDA_DEVICE_COUNT <= 5,
         "Not enough GPUs, this test requires at least six GPUs",
     )
     @given(

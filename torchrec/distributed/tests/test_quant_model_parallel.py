@@ -31,7 +31,10 @@ from torchrec.distributed.test_utils.test_model import (
 from torchrec.distributed.types import ShardedModule, ShardingEnv, ShardingType
 from torchrec.distributed.utils import copy_to_device
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.test_utils import cuda_device_count
 from torchrec.types import CopyMixIn
+
+CUDA_DEVICE_COUNT: int = cuda_device_count()
 
 
 class CopyModule(nn.Module, CopyMixIn):
@@ -139,7 +142,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
                 self._recursive_device_check(child, child_copy, device, device_copy)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     @given(
@@ -201,7 +204,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         self._recursive_device_check(dmp.module, dmp_1.module, device, device_1)
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     @given(
@@ -294,7 +297,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     def test_quant_pred_state_dict_cw_list_copy(self) -> None:
@@ -368,7 +371,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     @given(
@@ -449,7 +452,7 @@ class QuantModelParallelModelCopyTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
+        CUDA_DEVICE_COUNT <= 1,
         "Not enough GPUs available",
     )
     def test_copy_mixin(self) -> None:
@@ -513,7 +516,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         ]
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 0,
+        CUDA_DEVICE_COUNT <= 0,
         "Not enough GPUs available",
     )
     @given(
@@ -620,7 +623,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 0,
+        CUDA_DEVICE_COUNT <= 0,
         "Not enough GPUs available",
     )
     @given(
@@ -706,7 +709,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 0,
+        CUDA_DEVICE_COUNT <= 0,
         "Not enough GPUs available",
     )
     @given(
@@ -796,7 +799,7 @@ class QuantModelParallelModelSharderTest(unittest.TestCase):
         )
 
     @unittest.skipIf(
-        torch.cuda.device_count() <= 0,
+        CUDA_DEVICE_COUNT <= 0,
         "Not enough GPUs available",
     )
     @given(

@@ -9,6 +9,7 @@
 
 import abc
 import hashlib
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -662,6 +663,7 @@ class TopologyFactory:
             TopologyFactory._add_comms_params(topology_kwargs, hardware, kernel)
 
             one_time_rank0_logger.info("TopologyFactor.create_topology called.")
+            topology_kwargs["created_by_factory"] = True
             return Topology(**topology_kwargs)
         except Exception as e:
             one_time_logger.error(f"TopologyFactor.create_topology failed: {e}")
@@ -814,6 +816,7 @@ class Topology:
         weighted_feature_bwd_compute_multiplier: float = WEIGHTED_FEATURE_BWD_COMPUTE_MULTIPLIER,
         uneven_sharding_perf_multiplier: float = 1.0,
         generalized_comms_bandwidths: Optional[GeneralizedCommsBandwidth] = None,
+        created_by_factory: bool = False,
     ) -> None:
         """
         Representation of a network of devices in a cluster.
@@ -905,6 +908,14 @@ class Topology:
             weighted_feature_bwd_compute_multiplier
         )
         self._uneven_sharding_perf_multiplier = uneven_sharding_perf_multiplier
+        self._created_by_factory: bool = created_by_factory
+
+        if not self._created_by_factory:
+            logging.getLogger(__name__).warning(
+                "The topology was constructed directly rather than via TopologyFactory.create_topology(). "
+                "Please use TopologyFactory to ensure proper hardware configuration resolution and validation; "
+                "otherwise, the job will fail."
+            )
 
     @property
     def compute_device(self) -> str:

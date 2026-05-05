@@ -249,6 +249,13 @@ class MemoryStashingManager:
                             pin_memory=True,
                         )
                         cpu_buffer.copy_(tensor, non_blocking=True)
+                        # Tell the caching allocator this tensor is in use on
+                        # d2h_stream so the bytes are not reused by default-
+                        # stream allocations until the async D2H copy completes.
+                        # Without this, resize_(0) below would let the allocator
+                        # immediately reuse the HBM, corrupting the in-flight
+                        # copy and producing NaN after a few batches.
+                        tensor.record_stream(d2h_stream)
                         orig_storage_size = tensor.untyped_storage().size()
                         stash_data.append((tensor, cpu_buffer, orig_storage_size))
 
@@ -317,6 +324,11 @@ class MemoryStashingManager:
                     )
                     with torch.cuda.stream(h2d_stream):
                         tmp.copy_(cpu_buf, non_blocking=True)
+                    # Tell the caching allocator this storage is in use on
+                    # h2d_stream so the bytes cannot be reused by main-stream
+                    # allocations (e.g. a subsequent resize_(0) + realloc)
+                    # before the H2D copy completes.
+                    hbm_ref.record_stream(h2d_stream)
 
                 # only need to record the last event
                 restore_event = torch.cuda.Event()
