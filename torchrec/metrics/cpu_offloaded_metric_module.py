@@ -13,10 +13,11 @@ import queue
 import threading
 import time
 import traceback
-from typing import Any, Dict, Mapping, Optional, Union
+from contextlib import contextmanager, ExitStack
+from typing import Any, Dict, Iterator, Mapping, Optional, Union
 
 import torch
-from torch import distributed as dist
+from torch import distributed as dist, nn
 from torch.profiler import record_function
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.logging_utils import EventType
@@ -254,6 +255,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             if required_inputs:
                 metric_update_job.kwargs["required_inputs"] = required_inputs
 
+            _assert_buffers_on_cpu(self.rec_metrics, "rec_metrics")
             self.rec_metrics.update(
                 predictions=predictions,
                 labels=labels,
@@ -262,6 +264,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             )
 
             if self.throughput_metric:
+                _assert_buffers_on_cpu(self.throughput_metric, "throughput_metric")
                 self.throughput_metric.update()
 
             elapsed_ms = (time.time() - start_time) * 1000
@@ -459,6 +462,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         with record_function("## CPUOffloadedRecMetricModule:compute ##"):
             start_ms = time.time()
+            _assert_buffers_on_cpu(self.comms_module, "comms_module")
             self.comms_module.load_local_metric_state_snapshot(
                 metric_compute_job.metric_state_snapshot
             )
@@ -721,16 +725,66 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         Args are identical to torch.nn.Module.load_state_dict().
         """
-        # Temporarily remove comms_module from _modules. Otherwise, it will try to traverse
-        # the submodule tree and load the state dict into the comms module.
-        comms_module = self._modules.pop("comms_module", None)
-
-        try:
+        # Without this, super().load_state_dict() would traverse into comms_module
+        # and load the state dict into both rec_metrics and comms_module.
+        with self._detach_children("comms_module"):
             super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    @contextmanager
+    def _detach_children(self, *names: str) -> Iterator[None]:
+        """
+        Temporarily de-register named children from self._modules so that
+        nn.Module traversals (.to, _apply, load_state_dict, ...) skip them.
+        Restored on exit.
+        """
+        detached = {n: self._modules.pop(n) for n in names if n in self._modules}
+        try:
+            yield
         finally:
-            # Restore comms_module
-            if comms_module is not None:
-                self._modules["comms_module"] = comms_module
+            self._modules.update(detached)
+
+    @contextmanager
+    def pause_for_external_mutation(self) -> Iterator[None]:
+        """
+        De-register every CPU-pinned child and own buffer for the duration of
+        an external traversal that mutates module state -- for example, a
+        parent module's ``.to(cuda)`` propagated by cudagraph wrap or Pyper
+        init.
+
+        ZORM keeps all metric state on CPU; without this guard, a parent's
+        ``.to(cuda)`` would migrate ``rec_metrics`` / ``comms_module`` /
+        ``throughput_metric`` buffers to GPU and the next worker-thread
+        ``state += state_value`` would raise a device mismatch. The compute
+        worker also reads/writes the inherited ``_compute_interval_steps``
+        buffer via ``_adjust_compute_interval``; that buffer must stay on CPU
+        too.
+
+        Pre-condition: both the update queue and the compute queue must be
+        empty. The workers access children via ``self.<name>`` attribute
+        lookup; if a worker tries to look up a popped name during the detach
+        window, it gets ``AttributeError``. Keeping the queues empty ensures
+        no worker is mid-job during the detach.
+        """
+        # Use raise rather than assert: this guard prevents a worker
+        # AttributeError race; assertions are stripped under `python -O`.
+        if not (self.update_queue.empty() and self.compute_queue.empty()):
+            raise RuntimeError(
+                "pause_for_external_mutation requires both queues to be empty. "
+                "Call sync() first or only use this during init / before any "
+                "update() call."
+            )
+        detached_buffers = {
+            n: self._buffers.pop(n)
+            for n in ("_compute_interval_steps",)
+            if n in self._buffers
+        }
+        try:
+            with self._detach_children(
+                "rec_metrics", "comms_module", "throughput_metric"
+            ):
+                yield
+        finally:
+            self._buffers.update(detached_buffers)
 
     @override
     def unsync(self) -> None:
@@ -740,3 +794,51 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         and is essentially "discarded" after compute().
         """
         pass
+
+
+def _assert_buffers_on_cpu(module: nn.Module, label: str) -> None:
+    """
+    Verify every buffer under ``module`` is on CPU. Called from ZORM worker
+    threads before they touch metric state -- if a parent's ``.to(cuda)`` was
+    not wrapped in ``detach_zorm_for_device_traversal()``, this surfaces the
+    misuse with an actionable message instead of a cryptic ``state += value``
+    device-mismatch deep in TorchMetrics.
+    """
+    for name, buf in module.named_buffers():
+        if buf.device.type != "cpu":
+            raise RuntimeError(
+                f"ZORM metric state buffer {label}.{name} is on {buf.device}, "
+                "expected CPU. A caller migrated ZORM state off CPU. Wrap any "
+                "model.to(cuda)/.cuda() call with detach_zorm_for_device_traversal() "
+                "from torchrec.metrics.cpu_offloaded_metric_module."
+            )
+
+
+@contextmanager
+def detach_zorm_for_device_traversal(model: nn.Module) -> Iterator[None]:
+    """
+    Wrap any caller-driven traversal that mutates module state (typically
+    ``model.to(cuda)`` from cudagraph wrap or Pyper init) so that ZORM's
+    CPU-pinned children are temporarily de-registered and skipped.
+
+    Usage::
+
+        with detach_zorm_for_device_traversal(model):
+            model.to(torch.cuda.current_device())
+
+    Walks ``model.modules()`` once up-front to collect ZORM instances so the
+    iterator is not invalidated by the subsequent ``_modules`` mutation.
+    """
+    # Local import to avoid an import cycle: cpu_comms_metric_module imports
+    # from cpu_offloaded_metric_module via its parent package wiring.
+    from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
+
+    pinned_modules = [
+        m
+        for m in model.modules()
+        if isinstance(m, (CPUOffloadedRecMetricModule, CPUCommsRecMetricModule))
+    ]
+    with ExitStack() as stack:
+        for m in pinned_modules:
+            stack.enter_context(m.pause_for_external_mutation())
+        yield
