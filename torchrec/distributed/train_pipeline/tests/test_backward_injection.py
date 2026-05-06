@@ -60,14 +60,65 @@ class InjectionSiteTest(unittest.TestCase):
         finder = FirstGradTensorFinder()
         grad = torch.tensor([1.0], requires_grad=True)
         nested = (torch.tensor([0.0]), {"k": [torch.tensor([0.0]), grad]})
-        self.assertIs(finder(None, nested), grad)
-        self.assertIsNone(finder(None, torch.tensor([1.0])))
+        self.assertIs(finder(None, None, nested), grad)
+        self.assertIsNone(finder(None, None, torch.tensor([1.0])))
 
     def test_first_grad_tensor_finder_use_input(self) -> None:
         finder = FirstGradTensorFinder(use_input=True)
         grad = torch.tensor([1.0], requires_grad=True)
-        self.assertIs(finder(grad, torch.tensor([0.0])), grad)
-        self.assertIsNone(finder(torch.tensor([0.0]), grad))
+        self.assertIs(finder(grad, None, torch.tensor([0.0])), grad)
+        self.assertIsNone(finder(torch.tensor([0.0]), None, grad))
+
+    def test_first_grad_tensor_finder_use_input_kwargs(self) -> None:
+        """With use_input=True, kwargs_input is searched as a fallback when the
+        positional input contains no grad-requiring tensor (D103949397)."""
+        finder = FirstGradTensorFinder(use_input=True)
+        grad = torch.tensor([1.0], requires_grad=True)
+
+        # Grad lives only in kwargs_input — falls back to it.
+        self.assertIs(
+            finder(torch.tensor([0.0]), {"x": grad}, torch.tensor([0.0])), grad
+        )
+
+        # Positional input is empty/None — kwargs_input is still searched.
+        self.assertIs(finder(None, {"x": grad}, None), grad)
+        self.assertIs(finder((), {"x": grad}, None), grad)
+
+        # Grad nested inside kwargs containers (dict / list / tuple).
+        nested_kwargs = {"a": [torch.tensor([0.0]), {"b": grad}]}
+        self.assertIs(finder(None, nested_kwargs, None), grad)
+
+        # Positional input wins when both have grads — kwargs not consulted.
+        kw_grad = torch.tensor([2.0], requires_grad=True)
+        self.assertIs(finder(grad, {"x": kw_grad}, None), grad)
+
+        # No grad anywhere — returns None.
+        self.assertIsNone(finder(torch.tensor([0.0]), {"x": torch.tensor([0.0])}, None))
+
+    def test_first_grad_tensor_finder_use_input_kwargs_kjt(self) -> None:
+        """KJT weights inside kwargs_input are discoverable when use_input=True."""
+        finder = FirstGradTensorFinder(use_input=True)
+        weights = torch.tensor([1.0, 2.0, 3.0], requires_grad=True)
+        kjt = KeyedJaggedTensor(
+            keys=["f1"],
+            values=torch.tensor([1, 2, 3], dtype=torch.int64),
+            lengths=torch.tensor([2, 1], dtype=torch.int64),
+            weights=weights,
+        )
+        self.assertIs(finder(None, {"features": kjt}, None), weights)
+
+    def test_first_grad_tensor_finder_kwargs_ignored_when_use_input_false(
+        self,
+    ) -> None:
+        """With use_input=False (default), kwargs_input is never consulted —
+        only module_output is searched."""
+        finder = FirstGradTensorFinder()
+        grad = torch.tensor([1.0], requires_grad=True)
+
+        # Grad only in kwargs_input → not found, since output has no grad.
+        self.assertIsNone(finder(None, {"x": grad}, torch.tensor([0.0])))
+        # Output grad still wins regardless of kwargs.
+        self.assertIs(finder(None, {"x": grad}, grad), grad)
 
     def test_first_grad_tensor_finder_kjt_weights(self) -> None:
         """KJT/JT carry the grad-tracking tensor in the optional weights field
@@ -81,11 +132,11 @@ class InjectionSiteTest(unittest.TestCase):
             lengths=torch.tensor([2, 1], dtype=torch.int64),
             weights=weights,
         )
-        self.assertIs(finder(None, kjt), weights)
+        self.assertIs(finder(None, None, kjt), weights)
 
         # Also matches when nested inside containers.
         nested = (torch.tensor([0.0]), {"k": [kjt]})
-        self.assertIs(finder(None, nested), weights)
+        self.assertIs(finder(None, None, nested), weights)
 
         # JaggedTensor with grad-requiring weights also resolves.
         jt_weights = torch.tensor([0.5, 0.6], requires_grad=True)
@@ -94,7 +145,7 @@ class InjectionSiteTest(unittest.TestCase):
             lengths=torch.tensor([1, 1], dtype=torch.int64),
             weights=jt_weights,
         )
-        self.assertIs(finder(None, jt), jt_weights)
+        self.assertIs(finder(None, None, jt), jt_weights)
 
     def test_first_grad_tensor_finder_kjt_no_weights(self) -> None:
         """KJT/JT with no weights or non-grad weights yield no match."""
@@ -105,7 +156,7 @@ class InjectionSiteTest(unittest.TestCase):
             values=torch.tensor([1, 2, 3], dtype=torch.int64),
             lengths=torch.tensor([2, 1], dtype=torch.int64),
         )
-        self.assertIsNone(finder(None, kjt_no_weights))
+        self.assertIsNone(finder(None, None, kjt_no_weights))
 
         kjt_inert_weights = KeyedJaggedTensor(
             keys=["f1"],
@@ -113,7 +164,7 @@ class InjectionSiteTest(unittest.TestCase):
             lengths=torch.tensor([2, 1], dtype=torch.int64),
             weights=torch.tensor([1.0, 2.0, 3.0]),  # requires_grad=False
         )
-        self.assertIsNone(finder(None, kjt_inert_weights))
+        self.assertIsNone(finder(None, None, kjt_inert_weights))
 
     def test_register_hook_nonexistent_raises(self) -> None:
         site = InjectionSite(
