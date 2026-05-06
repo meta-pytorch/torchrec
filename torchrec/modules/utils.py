@@ -265,9 +265,7 @@ def construct_jagged_tensors(
                 )
                 embeddings = torch.gather(embeddings, 0, expanded_indices)
             else:
-                embeddings = torch.index_select(
-                    embeddings, 0, reverse_indices.to(torch.int32)
-                )
+                embeddings = torch.index_select(embeddings, 0, reverse_indices)
         ret: Dict[str, JaggedTensor] = {}
 
         if seq_vbe_ctx is not None:
