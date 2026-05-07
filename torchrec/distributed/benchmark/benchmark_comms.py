@@ -794,6 +794,93 @@ def multi_async_comms(
         assert checks.item()
 
 
+def data_copy_record_stream(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    use_record_stream: bool = True,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Reproduce the record_stream bug fixed by D102202725.
+
+    Without record_stream(), resize_(0) lets the caching allocator reuse
+    HBM while an async D2H copy on a side stream is still in flight,
+    corrupting the copied data (NaN / wrong values).
+    """
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        data_copy_stream = torch.cuda.Stream()
+
+        gpu_tensor = torch.full(
+            (num_concat * dim, dim),
+            fill_value=float(ctx.rank + 1),
+            device=ctx.device,
+        )
+        cpu_buffer = torch.empty_like(gpu_tensor, device="cpu").pin_memory()
+
+    with record_function("## async D2H copy on side stream ##"):
+        with torch.cuda.stream(data_copy_stream):
+            data_copy_stream.wait_stream(main_stream)
+            cpu_buffer.copy_(gpu_tensor, non_blocking=True)
+
+        if use_record_stream:
+            gpu_tensor.record_stream(data_copy_stream)
+
+    with record_function("## free source tensor ##"):
+        # untyped_storage().resize_(0) releases the underlying GPU memory
+        # back to the caching allocator. Without record_stream() above,
+        # the allocator may immediately reuse this memory for new
+        # allocations while the D2H copy is still reading from it.
+        gpu_tensor.untyped_storage().resize_(0)
+
+    with record_function("## new allocations that reuse freed HBM ##"):
+        _: list[torch.Tensor] = [
+            torch.full(
+                (num_concat * dim, dim),
+                fill_value=-1.0,
+                device=ctx.device,
+            )
+            for _ in range(num_mul)
+        ]
+
+    with record_function("## wait and validate ##"):
+        data_copy_stream.synchronize()
+        expected = float(ctx.rank + 1)
+        all_correct = bool(torch.all(cpu_buffer == expected).item())
+        has_nan = bool(torch.any(torch.isnan(cpu_buffer)).item())
+        logger.info(
+            f"[rank-{ctx.rank}] record_stream={use_record_stream}: "
+            f"correct={all_correct}, has_nan={has_nan}"
+        )
+
+    with record_function("## validation result ##"):
+        if has_nan:
+            logger.error(f"[rank-{ctx.rank}] NaN detected — missing record_stream()")
+        if not all_correct:
+            logger.error(f"[rank-{ctx.rank}] Data corruption — missing record_stream()")
+
+
+def data_copy_no_record_stream(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    return data_copy_record_stream(
+        _batch_inputs=_batch_inputs,
+        dim=dim,
+        num_mul=num_mul,
+        num_concat=num_concat,
+        ctx=ctx,
+        use_record_stream=False,
+    )
+
+
 # single-rank runner
 def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) -> None:
     if arg.backend == "nccl":
@@ -851,6 +938,10 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 multi_async_comms._ar_pg = dist.new_group(
                     ranks=list(range(ctx.world_size))
                 )
+            case "data_copy_record_stream":
+                func = data_copy_record_stream
+            case "data_copy_no_record_stream":
+                func = data_copy_no_record_stream
             case _:
                 raise ValueError(f"Unknown benchmark name: {arg.name}")
 
