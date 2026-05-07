@@ -113,13 +113,16 @@ class GradTensorFinder(Protocol):
     """
     Strategy for locating the tensor to attach a backward hook to.
 
-    Receives the module's forward input and output, and returns the tensor
-    on which to register the backward hook. Return ``None`` if no suitable
-    tensor is found.
+    Receives the module's forward positional input, keyword input, and output,
+    and returns the tensor on which to register the backward hook. Return
+    ``None`` if no suitable tensor is found.
     """
 
     def __call__(
-        self, module_input: Any, module_output: Any
+        self,
+        module_input: Any,
+        module_kwargs_input: Any,
+        module_output: Any,
     ) -> Optional[torch.Tensor]: ...
 
 
@@ -159,9 +162,14 @@ class FirstGradTensorFinder:
                     return t
         return None
 
-    def __call__(self, module_input: Any, module_output: Any) -> Optional[torch.Tensor]:
+    def __call__(
+        self, module_input: Any, module_kwargs_input: Any, module_output: Any
+    ) -> Optional[torch.Tensor]:
         data = module_input if self.use_input else module_output
-        return self._search(data)
+        tensor = self._search(data)
+        if tensor is None and self.use_input:
+            tensor = self._search(module_kwargs_input)
+        return tensor
 
 
 @dataclass(frozen=True)
@@ -282,9 +290,10 @@ def _register_activation_hook(
     def _fwd_hook(
         module: nn.Module,
         input: Any,
+        kwargs_input: Any,
         output: Any,
     ) -> None:
-        tensor = site.tensor_finder(input, output)
+        tensor = site.tensor_finder(input, kwargs_input, output)
         if tensor is None:
             raise RuntimeError(
                 f"register_backward_hook: no grad-requiring tensor in "
@@ -292,7 +301,7 @@ def _register_activation_hook(
             )
         tensor.register_hook(hook_fn)
 
-    return target.register_forward_hook(_fwd_hook)
+    return target.register_forward_hook(_fwd_hook, with_kwargs=True)
 
 
 @dataclass(frozen=True)
@@ -311,7 +320,12 @@ class OutputDistTensorFinder:
 
     sharding_type: ShardingType = ShardingType.TABLE_WISE
 
-    def __call__(self, module_input: Any, module_output: Any) -> Optional[torch.Tensor]:
+    def __call__(
+        self,
+        module_input: Any,
+        module_kwargs_input: Any,
+        module_output: Any,
+    ) -> Optional[torch.Tensor]:
         output = module_output
 
         # Handle MC EC/EBC tuple wrapping

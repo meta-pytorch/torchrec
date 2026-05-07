@@ -65,6 +65,7 @@ from torchrec.distributed.train_pipeline import (
     GradientAccumulationWrapper,
     TrainPipeline,
 )
+from torchrec.distributed.types import DeviceToHostTensorAwaitable
 from torchrec.metrics.metric_module import RecMetricModule
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
@@ -266,9 +267,19 @@ def runner(
                 )
             else:
                 dataloader = iter(bench_inputs)
+
+            not_nan_awaitable: Optional[DeviceToHostTensorAwaitable] = None
             while True:
                 try:
                     output = pipeline.progress(dataloader)
+                    if isinstance(output, torch.Tensor):
+                        not_nan_awaitable = DeviceToHostTensorAwaitable(
+                            ~torch.any(torch.isnan(output))
+                        )
+                    elif output is not None:
+                        logger.warning(
+                            f"Pipeline output is not a tensor: {type(output)}, skipping NaN check"
+                        )
 
                     if metric_module is not None and output is not None:
                         assert metric_model_out is not None
@@ -277,11 +288,18 @@ def runner(
                         if metric_module.should_compute():
                             with record_function("## metric_compute ##"):
                                 metric_module.compute()
+
                     if run_option.sync_fwd:
                         fwd_event.synchronize()
                     if run_option.sync_batch:
                         torch.cuda.synchronize()
+                    if (
+                        run_option.sync_fwd or run_option.sync_batch
+                    ) and not_nan_awaitable is not None:
+                        assert not_nan_awaitable.item(), "Pipeline output contains NaN"
                 except StopIteration:
+                    if not_nan_awaitable is not None:
+                        assert not_nan_awaitable.item(), "Pipeline output contains NaN"
                     break
 
         pipeline = pipeline_config.generate_pipeline(
