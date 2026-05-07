@@ -22,22 +22,27 @@ class MetricUpdateJob:
     to update each metric's state tensors.
     """
 
-    __slots__ = ["model_out", "kwargs"]
+    __slots__ = ["model_out", "kwargs", "merged_count"]
 
     def __init__(
         self,
         model_out: Dict[str, torch.Tensor],
         kwargs: Dict[str, Any],
+        merged_count: int = 1,
     ) -> None:
         """
         Args:
             model_out: intermediate model outputs (may be on GPU; DtoH
                 transfer is handled by the processing thread)
             kwargs: additional arguments from the trainer platform
+            merged_count: number of logical update() calls this job
+                represents (>1 when worker-side micro-batching merges
+                K calls into one job).
         """
 
         self.model_out: Dict[str, torch.Tensor] = model_out
         self.kwargs: Dict[str, Any] = kwargs
+        self.merged_count: int = merged_count
 
 
 class MetricComputeJob:

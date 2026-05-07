@@ -12,7 +12,7 @@ import queue
 import threading
 import time
 import unittest
-from typing import Callable, cast
+from typing import Callable, cast, Optional
 from unittest.mock import patch
 
 import torch
@@ -20,10 +20,12 @@ import torch.distributed as dist
 from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 from torchrec.metrics.cpu_offloaded_metric_module import (
+    _merge_update_jobs,
     CPUOffloadedRecMetricModule,
     MetricUpdateJob,
 )
 from torchrec.metrics.deferrable_metrics import transfer_tensors_to_cpu
+from torchrec.metrics.metric_job_types import SynchronizationMarker
 from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
 from torchrec.metrics.metrics_config import DefaultMetricsConfig
 from torchrec.metrics.rec_metric import RecMetricException, RecMetricList
@@ -74,18 +76,26 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.rec_metrics = RecMetricList([self.mock_metric])
 
         dist.init_process_group("gloo")
-        self.cpu_module: CPUOffloadedRecMetricModule = CPUOffloadedRecMetricModule(
-            model_out_device=torch.device("cpu"),
-            batch_size=self.batch_size,
-            world_size=self.world_size,
-            rec_tasks=self.tasks,
-            rec_metrics=self.rec_metrics,
+        self.cpu_module: CPUOffloadedRecMetricModule = self._make_module(
             throughput_metric=ThroughputMetric(
                 world_size=self.world_size,
                 batch_size=self.batch_size,
                 window_seconds=1,
             ),
         )
+
+    def _make_module(self, **overrides: object) -> CPUOffloadedRecMetricModule:
+        """K=1 isolates per-call semantics; batching paths use dedicated tests."""
+        defaults: dict[str, object] = {
+            "model_out_device": torch.device("cpu"),
+            "batch_size": self.batch_size,
+            "world_size": self.world_size,
+            "rec_tasks": self.tasks,
+            "rec_metrics": self.rec_metrics,
+            "update_batch_size": 1,
+        }
+        # pyrefly: ignore[bad-argument-type]
+        return CPUOffloadedRecMetricModule(**{**defaults, **overrides})
 
     def tearDown(self) -> None:
         if dist.is_initialized():
@@ -155,12 +165,8 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         "Not enough GPUs, this test requires at least one GPU",
     )
     def test_update_rec_metrics_queue_full(self) -> None:
-        cpu_module = CPUOffloadedRecMetricModule(
+        cpu_module = self._make_module(
             model_out_device=torch.device("cuda"),
-            batch_size=self.batch_size,
-            world_size=self.world_size,
-            rec_tasks=self.tasks,
-            rec_metrics=self.rec_metrics,
             update_queue_size=1,  # Small queue size
         )
 
@@ -435,11 +441,8 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "state_3": torch.tensor([3.0]),
             },
         )
-        offloaded_module = CPUOffloadedRecMetricModule(
+        offloaded_module = self._make_module(
             model_out_device=torch.device("cuda"),
-            batch_size=self.batch_size,
-            world_size=self.world_size,
-            rec_tasks=self.tasks,
             rec_metrics=RecMetricList([offloaded_metric]),
         )
 
@@ -500,11 +503,8 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "state_3": torch.tensor([1.0]),
             },
         )
-        offloaded_module = CPUOffloadedRecMetricModule(
+        offloaded_module = self._make_module(
             model_out_device=torch.device("cuda"),
-            batch_size=self.batch_size,
-            world_size=self.world_size,
-            rec_tasks=self.tasks,
             rec_metrics=RecMetricList([offloaded_metric]),
         )
 
@@ -544,12 +544,8 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         since torch.device("cuda:1") != torch.device("cuda").
         """
         # Create module with indexed cuda device (cuda:1)
-        cpu_module_indexed = CPUOffloadedRecMetricModule(
+        cpu_module_indexed = self._make_module(
             model_out_device=torch.device("cuda:1"),
-            batch_size=self.batch_size,
-            world_size=self.world_size,
-            rec_tasks=self.tasks,
-            rec_metrics=self.rec_metrics,
         )
 
         # Create tensors on cuda:1
@@ -665,11 +661,8 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         )
 
         device = torch.device("cuda") if use_cuda else torch.device("cpu")
-        offloaded_module = CPUOffloadedRecMetricModule(
+        offloaded_module = self._make_module(
             model_out_device=device,
-            batch_size=self.batch_size,
-            world_size=self.world_size,
-            rec_tasks=self.tasks,
             rec_metrics=RecMetricList([offloaded_metric]),
         )
 
@@ -817,13 +810,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_log_event_called_on_init(self) -> None:
         """Verify _log_event is called with INFO during __init__."""
         with patch.object(CPUOffloadedRecMetricModule, "_log_event") as mock_log_event:
-            module = CPUOffloadedRecMetricModule(
-                model_out_device=torch.device("cpu"),
-                batch_size=self.batch_size,
-                world_size=self.world_size,
-                rec_tasks=self.tasks,
-                rec_metrics=self.rec_metrics,
-            )
+            module = self._make_module()
 
             mock_log_event.assert_called_once_with(
                 "init",
@@ -955,14 +942,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
     def test_enqueue_update_logs_failure_on_queue_full(self) -> None:
         """Verify FAILURE event is logged when update queue is full."""
-        cpu_module = CPUOffloadedRecMetricModule(
-            model_out_device=torch.device("cpu"),
-            batch_size=self.batch_size,
-            world_size=self.world_size,
-            rec_tasks=self.tasks,
-            rec_metrics=self.rec_metrics,
-            update_queue_size=1,
-        )
+        cpu_module = self._make_module(update_queue_size=1)
 
         block_event = threading.Event()
 
@@ -993,14 +973,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
     def test_enqueue_compute_logs_failure_on_queue_full(self) -> None:
         """Verify FAILURE event is logged when update queue is full during async_compute."""
-        cpu_module = CPUOffloadedRecMetricModule(
-            model_out_device=torch.device("cpu"),
-            batch_size=self.batch_size,
-            world_size=self.world_size,
-            rec_tasks=self.tasks,
-            rec_metrics=self.rec_metrics,
-            update_queue_size=1,
-        )
+        cpu_module = self._make_module(update_queue_size=1)
 
         block_event = threading.Event()
 
@@ -1086,6 +1059,21 @@ class CPUOffloadedMetricModuleDistributedTest(MultiProcessTestBase):
             compare_sync=False,
         )
 
+    def test_cpu_offloaded_vs_standard_at_default_k_compute_only(self) -> None:
+        world_size = 2
+        batch_size = 8
+        num_batches = 20
+
+        self._run_multi_process_test(
+            callable=_compare_metric_results_worker,
+            world_size=world_size,
+            batch_size=batch_size,
+            num_batches=num_batches,
+            compare_sync=False,
+            update_batch_size=10,
+            compare_per_call=False,
+        )
+
 
 def _compare_metric_results_worker(
     rank: int,
@@ -1093,6 +1081,8 @@ def _compare_metric_results_worker(
     batch_size: int,
     num_batches: int,
     compare_sync: bool,
+    update_batch_size: int = 1,
+    compare_per_call: bool = True,
 ) -> None:
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
@@ -1137,6 +1127,7 @@ def _compare_metric_results_worker(
         world_size=world_size,
         rec_tasks=tasks,
         rec_metrics=RecMetricList([offloaded_metric]),
+        update_batch_size=update_batch_size,
     ).to(device)
 
     # Generate same training data for both modules
@@ -1178,33 +1169,35 @@ def _compare_metric_results_worker(
 
     # Wait for async compute to finish. Compare the input to each update()
     offloaded_results = future.resolve()
-    for (
-        offloaded_predictions,
-        offloaded_labels,
-        offloaded_weights,
-        standard_predictions,
-        standard_labels,
-        standard_weights,
-    ) in zip(
-        offloaded_metric.predictions_update_calls,
-        offloaded_metric.labels_update_calls,
-        offloaded_metric.weights_update_calls,
-        standard_metric.predictions_update_calls,
-        standard_metric.labels_update_calls,
-        standard_metric.weights_update_calls,
-    ):
-        assert_tensor_dict_equals(
-            actual_states=offloaded_predictions,
-            expected_states=standard_predictions,
-        )
-        assert_tensor_dict_equals(
-            actual_states=offloaded_labels,
-            expected_states=standard_labels,
-        )
-        assert_tensor_dict_equals(
-            actual_states=offloaded_weights,
-            expected_states=standard_weights,
-        )
+
+    if compare_per_call:
+        for (
+            offloaded_predictions,
+            offloaded_labels,
+            offloaded_weights,
+            standard_predictions,
+            standard_labels,
+            standard_weights,
+        ) in zip(
+            offloaded_metric.predictions_update_calls,
+            offloaded_metric.labels_update_calls,
+            offloaded_metric.weights_update_calls,
+            standard_metric.predictions_update_calls,
+            standard_metric.labels_update_calls,
+            standard_metric.weights_update_calls,
+        ):
+            assert_tensor_dict_equals(
+                actual_states=offloaded_predictions,
+                expected_states=standard_predictions,
+            )
+            assert_tensor_dict_equals(
+                actual_states=offloaded_labels,
+                expected_states=standard_labels,
+            )
+            assert_tensor_dict_equals(
+                actual_states=offloaded_weights,
+                expected_states=standard_weights,
+            )
 
     # Compare the computed metric results from both modules
     assert_tensor_dict_equals(
@@ -1214,6 +1207,319 @@ def _compare_metric_results_worker(
 
     cpu_offloaded_module.shutdown()
     dist.destroy_process_group()
+
+
+@skip_if_asan_class
+class WorkerSideBatchingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.world_size = 1
+        self.batch_size = 1
+        self.tasks = gen_test_tasks(["task1"])
+        self.initial_states = create_tensor_states(["cross_entropy_sum"])
+
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["LOCAL_WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = str("localhost")
+        os.environ["MASTER_PORT"] = str(get_free_port())
+        os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+
+        self.mock_metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=0,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            initial_states=self.initial_states,
+        )
+        self.rec_metrics = RecMetricList([self.mock_metric])
+
+        dist.init_process_group("gloo")
+
+    def tearDown(self) -> None:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        if hasattr(self, "cpu_module"):
+            try:
+                self.cpu_module.shutdown()
+            except Exception:
+                pass
+
+    def _make_module(self, update_batch_size: int) -> CPUOffloadedRecMetricModule:
+        self.cpu_module: CPUOffloadedRecMetricModule = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=self.rec_metrics,
+            update_batch_size=update_batch_size,
+        )
+        return self.cpu_module
+
+    def test_worker_drains_and_merges_into_one_call(self) -> None:
+        cpu_module = self._make_module(update_batch_size=4)
+
+        captured_jobs: list[MetricUpdateJob] = []
+        original_process = cpu_module._process_metric_update_job
+
+        def gated_process(job: MetricUpdateJob) -> None:
+            captured_jobs.append(job)
+            original_process(job)
+
+        with patch.object(
+            cpu_module,
+            "_process_metric_update_job",
+            side_effect=gated_process,
+        ):
+            for _ in range(4):
+                cpu_module._update_rec_metrics(
+                    {
+                        "task1-prediction": torch.tensor([0.5]),
+                        "task1-label": torch.tensor([0.5]),
+                        "task1-weight": torch.tensor([1.0]),
+                    }
+                )
+            wait_until_true(lambda: cpu_module._total_updates_processed == 4)
+
+        self.assertEqual(cpu_module._total_updates_processed, 4)
+        total_merged = sum(j.merged_count for j in captured_jobs)
+        self.assertEqual(total_merged, 4)
+        self.assertLessEqual(len(captured_jobs), 4)
+
+    def test_marker_mid_batch_flushes_pending_then_processes_marker(self) -> None:
+        cpu_module = self._make_module(update_batch_size=10)
+
+        gate = threading.Event()
+        original_get = cpu_module.update_queue.get
+
+        def blocked_get(block: bool = True, timeout: Optional[float] = None) -> object:
+            gate.wait()
+            return original_get(block, timeout)
+
+        process_order: list[str] = []
+        original_process_update = cpu_module._process_metric_update_job
+        original_process_marker = cpu_module._process_synchronization_marker
+
+        def tracking_update(job: MetricUpdateJob) -> None:
+            process_order.append(f"update(merged={job.merged_count})")
+            original_process_update(job)
+
+        def tracking_marker(marker: SynchronizationMarker) -> None:
+            process_order.append("marker")
+            original_process_marker(marker)
+
+        with patch.object(
+            cpu_module.update_queue, "get", side_effect=blocked_get
+        ), patch.object(
+            cpu_module,
+            "_process_metric_update_job",
+            side_effect=tracking_update,
+        ), patch.object(
+            cpu_module,
+            "_process_synchronization_marker",
+            side_effect=tracking_marker,
+        ):
+            for _ in range(3):
+                cpu_module._update_rec_metrics(
+                    {
+                        "task1-prediction": torch.tensor([0.5]),
+                        "task1-label": torch.tensor([0.5]),
+                        "task1-weight": torch.tensor([1.0]),
+                    }
+                )
+            cpu_module.async_compute()
+
+            gate.set()
+
+            wait_until_true(
+                lambda: cpu_module._total_updates_processed == 3
+                and cpu_module._total_computes_enqueued == 1
+            )
+
+        self.assertEqual(process_order[0], "update(merged=3)")
+        self.assertEqual(process_order[1], "marker")
+
+    def test_bare_marker_first_processed_alone(self) -> None:
+        cpu_module = self._make_module(update_batch_size=4)
+
+        future = cpu_module.async_compute()
+        future.resolve()
+
+        self.assertEqual(cpu_module._total_updates_processed, 0)
+        self.assertEqual(cpu_module._total_computes_enqueued, 1)
+
+    def test_batch_failure_fails_held_marker_future(self) -> None:
+        cpu_module = self._make_module(update_batch_size=10)
+
+        gate = threading.Event()
+        original_get = cpu_module.update_queue.get
+
+        def blocked_get(block: bool = True, timeout: Optional[float] = None) -> object:
+            gate.wait()
+            return original_get(block, timeout)
+
+        with patch.object(
+            cpu_module.update_queue, "get", side_effect=blocked_get
+        ), patch.object(
+            cpu_module,
+            "_process_metric_update_job",
+            side_effect=RuntimeError("merged batch failed"),
+        ):
+            cpu_module._update_rec_metrics(
+                {
+                    "task1-prediction": torch.tensor([0.5]),
+                    "task1-label": torch.tensor([0.5]),
+                    "task1-weight": torch.tensor([1.0]),
+                }
+            )
+            deferrable = cpu_module.async_compute()
+            gate.set()
+
+            with self.assertRaisesRegex(
+                RecMetricException,
+                "MetricUpdateJob batch failed before SynchronizationMarker",
+            ):
+                deferrable.resolve()
+
+    def test_sync_does_not_deadlock_with_partial_batch(self) -> None:
+        cpu_module = self._make_module(update_batch_size=10)
+
+        for _ in range(3):
+            cpu_module._update_rec_metrics(
+                {
+                    "task1-prediction": torch.tensor([0.5]),
+                    "task1-label": torch.tensor([0.5]),
+                    "task1-weight": torch.tensor([1.0]),
+                }
+            )
+
+        sync_completed = threading.Event()
+
+        def call_sync() -> None:
+            cpu_module.sync()
+            sync_completed.set()
+
+        threading.Thread(target=call_sync, daemon=True).start()
+        self.assertTrue(
+            sync_completed.wait(timeout=5.0),
+            "sync() deadlocked when called with a partial K-batch in flight",
+        )
+        self.assertEqual(cpu_module._total_updates_processed, 3)
+
+
+class MergeUpdateJobsTest(unittest.TestCase):
+    def test_single_job_returned_unchanged(self) -> None:
+        job = MetricUpdateJob(
+            model_out={"label": torch.tensor([[1.0, 2.0]])},
+            kwargs={},
+        )
+        merged = _merge_update_jobs([job])
+        self.assertIs(merged, job)
+
+    def test_concat_model_out_along_batch_dim(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={
+                    "label": torch.tensor([[1.0, 2.0]]),
+                    "prediction": torch.tensor([[0.1, 0.2]]),
+                },
+                kwargs={},
+            ),
+            MetricUpdateJob(
+                model_out={
+                    "label": torch.tensor([[3.0, 4.0]]),
+                    "prediction": torch.tensor([[0.3, 0.4]]),
+                },
+                kwargs={},
+            ),
+        ]
+        merged = _merge_update_jobs(jobs)
+        self.assertEqual(merged.model_out["label"].shape, (2, 2))
+        self.assertEqual(merged.model_out["prediction"].shape, (2, 2))
+        self.assertTrue(
+            torch.equal(
+                merged.model_out["label"],
+                torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                merged.model_out["prediction"],
+                torch.tensor([[0.1, 0.2], [0.3, 0.4]]),
+            )
+        )
+
+    def test_concat_required_inputs(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={"label": torch.tensor([1.0])},
+                kwargs={
+                    "required_inputs": {"target_tensor": torch.tensor([5.0])},
+                    "scalar_kwarg": "preserve_me",
+                },
+            ),
+            MetricUpdateJob(
+                model_out={"label": torch.tensor([2.0])},
+                kwargs={
+                    "required_inputs": {"target_tensor": torch.tensor([6.0])},
+                    "scalar_kwarg": "preserve_me",
+                },
+            ),
+        ]
+        merged = _merge_update_jobs(jobs)
+        self.assertEqual(merged.kwargs["scalar_kwarg"], "preserve_me")
+        self.assertTrue(
+            torch.equal(
+                merged.kwargs["required_inputs"]["target_tensor"],
+                torch.tensor([5.0, 6.0]),
+            )
+        )
+
+    def test_safe_merge_zero_dim_falls_back_to_stack(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={"label": torch.tensor(1.0)},
+                kwargs={},
+            ),
+            MetricUpdateJob(
+                model_out={"label": torch.tensor(2.0)},
+                kwargs={},
+            ),
+        ]
+        merged = _merge_update_jobs(jobs)
+        self.assertEqual(merged.model_out["label"].shape, (2,))
+        self.assertTrue(
+            torch.equal(merged.model_out["label"], torch.tensor([1.0, 2.0]))
+        )
+
+    def test_merged_count_sums_input_counts(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={"label": torch.tensor([1.0])},
+                kwargs={},
+                merged_count=3,
+            ),
+            MetricUpdateJob(
+                model_out={"label": torch.tensor([2.0])},
+                kwargs={},
+                merged_count=5,
+            ),
+        ]
+        merged = _merge_update_jobs(jobs)
+        self.assertEqual(merged.merged_count, 8)
+
+    def test_empty_required_inputs_passes_through(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={"label": torch.tensor([[1.0]])},
+                kwargs={"required_inputs": {}},
+            ),
+            MetricUpdateJob(
+                model_out={"label": torch.tensor([[2.0]])},
+                kwargs={"required_inputs": {}},
+            ),
+        ]
+        merged = _merge_update_jobs(jobs)
+        self.assertEqual(merged.kwargs.get("required_inputs"), {})
 
 
 if __name__ == "__main__":
