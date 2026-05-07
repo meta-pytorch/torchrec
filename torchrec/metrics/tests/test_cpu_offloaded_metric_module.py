@@ -21,6 +21,7 @@ from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 from torchrec.metrics.cpu_offloaded_metric_module import (
     CPUOffloadedRecMetricModule,
+    detach_zorm_for_device_traversal,
     MetricUpdateJob,
 )
 from torchrec.metrics.deferrable_metrics import transfer_tensors_to_cpu
@@ -530,6 +531,54 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "state_3": torch.tensor([1.0]),
             },
         )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_detach_zorm_for_device_traversal_keeps_state_on_cpu(self) -> None:
+        """
+        Regression for ZORM + cudagraph compatibility (sijiaw MAST job
+        f1075434594 on 2026-05-01).
+
+        When a parent module containing a CPUOffloadedRecMetricModule has
+        .to(cuda) called on it -- e.g., the post-make_graphed_callables sweep
+        at caffe2/torch/fb/module_factory/sync_sgd/cuda_graph_wrapper.py:157
+        -- nn.Module recursion drags ZORM's metric state buffers onto the
+        GPU. The worker thread then crashes on `state += state_value` (state
+        on cuda, state_value on cpu via transfer_tensors_to_cpu).
+
+        Fix: detach_zorm_for_device_traversal(model) is a context manager
+        that temporarily de-registers ZORM's CPU-pinned children from
+        self._modules so the parent's .to(cuda) recursion skips them.
+        """
+        parent = torch.nn.Module()
+        # pyre-ignore[16]: dynamic submodule attribute on bare nn.Module
+        parent.metric_module = self.cpu_module
+
+        # Sanity: every buffer starts on CPU before the traversal.
+        named_buffers_before = list(self.cpu_module.named_buffers())
+        self.assertGreater(
+            len(named_buffers_before),
+            0,
+            "expected ZORM module to have at least one state buffer to validate",
+        )
+        for name, buf in named_buffers_before:
+            self.assertEqual(
+                buf.device.type,
+                "cpu",
+                f"{name} expected on CPU before traversal, found {buf.device}",
+            )
+
+        with detach_zorm_for_device_traversal(parent):
+            parent.to("cuda:0")
+
+        for name, buf in self.cpu_module.named_buffers():
+            self.assertEqual(
+                buf.device.type,
+                "cpu",
+                f"{name} expected on CPU after wrapped .to(cuda), found {buf.device}",
+            )
 
     @unittest.skipIf(
         torch.cuda.device_count() < 2,
@@ -1137,7 +1186,10 @@ def _compare_metric_results_worker(
         world_size=world_size,
         rec_tasks=tasks,
         rec_metrics=RecMetricList([offloaded_metric]),
-    ).to(device)
+    )
+    # ZORM keeps all metric state on CPU; .to(device) here would migrate state
+    # buffers to GPU and break the worker thread. model_out_device tells ZORM
+    # where the inputs come from, which is all it needs.
 
     # Generate same training data for both modules
     torch.manual_seed(42 + rank)  # Ensure deterministic but rank-specific data

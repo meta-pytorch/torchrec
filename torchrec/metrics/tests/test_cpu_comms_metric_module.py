@@ -87,6 +87,36 @@ class CPUCommsRecMetricModuleTest(unittest.TestCase):
             # unwanted distributed syncs. All syncs will be called via cpu_comms_module.
             self.assertTrue(cloned_metric.verify_sync_disabled())
 
+    def test_pause_for_external_mutation_keeps_state_on_cpu(self) -> None:
+        """
+        Defensive: pause_for_external_mutation on the comms module pops
+        rec_metrics from _modules so a parent's .to(...) traversal does not
+        migrate the comms-side state buffers off CPU.
+        """
+        mock_metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=self.my_rank,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            initial_states={"state_1": torch.tensor([1.0])},
+        )
+        cpu_comms_module = CPUCommsRecMetricModule(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([mock_metric]),
+        )
+
+        # Inside the context, rec_metrics is not visible via _modules.
+        with cpu_comms_module.pause_for_external_mutation():
+            self.assertNotIn("rec_metrics", cpu_comms_module._modules)
+
+        # Restored on exit.
+        self.assertIn("rec_metrics", cpu_comms_module._modules)
+        self.assertIs(
+            cpu_comms_module._modules["rec_metrics"], cpu_comms_module.rec_metrics
+        )
+
     def test_load_metric_states(self) -> None:
         """
         Test loading metric states into a single metric computation.

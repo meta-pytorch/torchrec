@@ -7,7 +7,8 @@
 
 # pyre-strict
 import logging
-from typing import Any, cast, Dict
+from contextlib import contextmanager
+from typing import Any, cast, Dict, Iterator
 
 from torch import nn
 from torch.profiler import record_function
@@ -115,6 +116,30 @@ class CPUCommsRecMetricModule(RecMetricModule):
             if cache_key in metric_states:
                 cached_value = metric_states[cache_key]
                 setattr(computation, attr_name, cached_value)
+
+    @contextmanager
+    def _detach_children(self, *names: str) -> Iterator[None]:
+        """
+        Temporarily de-register named children from self._modules so that
+        nn.Module traversals (.to, _apply, ...) skip them. Restored on exit.
+        """
+        detached = {n: self._modules.pop(n) for n in names if n in self._modules}
+        try:
+            yield
+        finally:
+            self._modules.update(detached)
+
+    @contextmanager
+    def pause_for_external_mutation(self) -> Iterator[None]:
+        """
+        Defensive counterpart to ``CPUOffloadedRecMetricModule.pause_for_external_mutation``
+        in case this module is ever held outside the offloaded module's
+        ``_modules`` (so the offloaded module's pop would not protect it).
+        Pops ``rec_metrics`` and ``throughput_metric`` for the duration of an
+        external traversal that mutates module state.
+        """
+        with self._detach_children("rec_metrics", "throughput_metric"):
+            yield
 
     def _clone_rec_metrics(self) -> RecMetricList:
         """
