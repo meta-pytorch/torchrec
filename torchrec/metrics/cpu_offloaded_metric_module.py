@@ -8,6 +8,7 @@
 # pyre-strict
 import atexit
 import concurrent
+import contextlib
 import logging
 import queue
 import threading
@@ -43,6 +44,55 @@ metric_update_thread_name: str = "metric_update"
 metric_compute_thread_name: str = "metric_compute"
 
 
+def _safe_merge_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
+    """Concatenate tensors along the batch dim. Falls back to torch.stack
+    for 0-dim tensors since torch.cat cannot concatenate them."""
+    if tensors[0].dim() == 0:
+        return torch.stack(tensors, dim=0)
+    return torch.cat(tensors, dim=0)
+
+
+def _merge_update_jobs(jobs: list[MetricUpdateJob]) -> MetricUpdateJob:
+    """
+    Merge a list of MetricUpdateJobs into a single job by concatenating
+    per-key tensors in `model_out` and any tensor entries in
+    `kwargs['required_inputs']` along the batch dimension (dim=0).
+
+    Worker-side input batching: K mini-batches' worth of model outputs
+    are passed to rec_metrics.update as a single (concatenated) call,
+    cutting PyBind crossings on the worker thread by ~K× for sum-style
+    metrics. Semantically equivalent for sum-reduction metrics; for
+    raw-retention metrics (AUC family) the window-eviction math advances
+    by +1 instead of +K, which is negligible when window_size >> K.
+
+    All jobs must share the same model_out key set and required_inputs
+    key set; non-tensor kwargs are taken from the first job.
+    """
+    if len(jobs) == 1:
+        return jobs[0]
+
+    first = jobs[0]
+    merged_model_out: Dict[str, torch.Tensor] = {
+        key: _safe_merge_tensors([j.model_out[key] for j in jobs])
+        for key in first.model_out.keys()
+    }
+
+    merged_kwargs: Dict[str, Any] = dict(first.kwargs)
+    required_inputs_first = first.kwargs.get("required_inputs")
+    if isinstance(required_inputs_first, dict) and required_inputs_first:
+        merged_required: Dict[str, torch.Tensor] = {
+            key: _safe_merge_tensors([j.kwargs["required_inputs"][key] for j in jobs])
+            for key in required_inputs_first.keys()
+        }
+        merged_kwargs["required_inputs"] = merged_required
+
+    return MetricUpdateJob(
+        model_out=merged_model_out,
+        kwargs=merged_kwargs,
+        merged_count=sum(j.merged_count for j in jobs),
+    )
+
+
 class CPUOffloadedRecMetricModule(RecMetricModule):
     """
     RecMetricModule that offloads metric update() and compute() to CPU using background threads.
@@ -73,6 +123,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         model_out_device: torch.device,
         update_queue_size: int = 100,
         compute_queue_size: int = 100,
+        update_batch_size: int = 10,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -83,11 +134,19 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             model_out_device: the device where the model_out is located (used to determine whether to perform GPU to CPU transfers).
             update_queue_size: Maximum size of the update queue. Default is 100.
             compute_queue_size: Maximum size of the compute queue. Default is 100.
+            update_batch_size: Worker-side micro-batching K. The worker
+                drains up to K MetricUpdateJobs per cycle, merges their
+                tensors on GPU via torch.cat, and dispatches one
+                rec_metrics.update call — cutting PyBind crossings on the
+                worker by ~K× with no added trainer-thread work. Drain
+                stops at any SynchronizationMarker, which is processed
+                after the merged batch. Default is 10; set to 1 to disable.
             *args: Additional positional arguments passed to RecMetricModule.
             **kwargs: Additional keyword arguments passed to RecMetricModule.
         """
         super().__init__(*args, **kwargs)
         self._model_out_device = model_out_device
+        self._update_batch_size: int = max(1, update_batch_size)
         self._shutdown_event: threading.Event = threading.Event()
         self._compute_shutdown_event: threading.Event = threading.Event()
         self._shutdown_complete: bool = False
@@ -262,24 +321,20 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             )
 
             if self.throughput_metric:
-                self.throughput_metric.update()
+                for _ in range(metric_update_job.merged_count):
+                    self.throughput_metric.update()
 
             elapsed_ms = (time.time() - start_time) * 1000
             self.update_job_time_logger.add(elapsed_ms)
-            self._total_updates_processed += 1
+            self._total_updates_processed += metric_update_job.merged_count
 
     @override
     def shutdown(self) -> None:
-        """
-        Two-phase shutdown: stop the update thread first so its flush can
-        enqueue any final compute jobs, then stop the compute thread.
-        Idempotent — safe under explicit call + atexit.
-        """
+        """Two-phase shutdown: stop the update thread, then the compute thread.
+        Idempotent — safe under explicit call + atexit."""
 
         if self._shutdown_complete:
             return
-
-        shutdown_timeout = 300.0
 
         logger.info(
             f"Gracefully shutting down CPUOffloadedRecMetricModule... "
@@ -288,8 +343,15 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         )
 
         self._shutdown_event.set()
+        try:
+            # pyrefly: ignore[implicit-import]
+            self.update_queue.put_nowait(
+                SynchronizationMarker(concurrent.futures.Future())
+            )
+        except queue.Full:
+            pass
         if self.update_thread.is_alive():
-            self.update_thread.join(timeout=shutdown_timeout)
+            self.update_thread.join()
         logger.info(
             f"Update thread: alive={self.update_thread.is_alive()}, "
             f"update_queue_remaining={self.update_queue.qsize()}"
@@ -297,7 +359,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         self._compute_shutdown_event.set()
         if self.compute_thread.is_alive():
-            self.compute_thread.join(timeout=shutdown_timeout)
+            self.compute_thread.join()
         logger.info(
             f"Compute thread: alive={self.compute_thread.is_alive()}, "
             f"compute_queue_remaining={self.compute_queue.qsize()}"
@@ -431,6 +493,13 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             if not self.rec_metrics:
                 raise RecMetricException("No metrics to compute.")
 
+            if self._captured_exception_event.is_set():
+                synchronization_marker.future.set_exception(
+                    self._captured_exception
+                    or RecMetricException("compute thread is unavailable")
+                )
+                return
+
             metric_state_snapshot = MetricStateSnapshot.from_metrics(
                 self.rec_metrics,
                 self.throughput_metric,
@@ -498,7 +567,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         while not self._shutdown_event.is_set():
             try:
-                self._do_work(self.update_queue)
+                self._do_batched_update_work()
             except Exception as e:
                 self._update_errors += 1
                 logger.exception(f"Exception in update loop: {e}")
@@ -515,14 +584,6 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 self._captured_exception = e
                 self._captured_exception_event.set()
                 return
-
-        try:
-            # pyrefly: ignore[implicit-import]
-            self.update_queue.put_nowait(
-                SynchronizationMarker(concurrent.futures.Future())
-            )
-        except queue.Full:
-            logger.warning("Could not enqueue final SyncMarker: update queue full")
 
         remaining = self._flush_remaining_work(self.update_queue)
         logger.info(f"Flushed {remaining} remaining update items during shutdown.")
@@ -571,6 +632,67 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             if isinstance(job, MetricComputeJob) and not job.future.done():
                 job.future.set_exception(error)
             self.compute_queue.task_done()
+
+    def _drain_update_batch(
+        self, first: MetricUpdateJob
+    ) -> tuple[list[MetricUpdateJob], Optional[SynchronizationMarker], int]:
+        """Opportunistically drain up to update_batch_size jobs; stop at any
+        SynchronizationMarker."""
+        pending_jobs: list[MetricUpdateJob] = [first]
+        pending_marker: Optional[SynchronizationMarker] = None
+        items_pulled = 1
+        while len(pending_jobs) < self._update_batch_size:
+            try:
+                next_item = self.update_queue.get_nowait()
+            except queue.Empty:
+                break
+            items_pulled += 1
+            if isinstance(next_item, MetricUpdateJob):
+                pending_jobs.append(next_item)
+            else:
+                pending_marker = next_item
+                break
+        return pending_jobs, pending_marker, items_pulled
+
+    def _do_batched_update_work(self) -> None:
+        """Drain up to K MetricUpdateJobs, merge, and dispatch one
+        rec_metrics.update call. Held SynchronizationMarker (if any) is
+        processed after the merged batch."""
+        first = self.update_queue.get()
+        pending_jobs: list[MetricUpdateJob] = []
+        pending_marker: Optional[SynchronizationMarker] = None
+        items_pulled = 1
+
+        if isinstance(first, MetricUpdateJob):
+            pending_jobs, pending_marker, items_pulled = self._drain_update_batch(first)
+        elif isinstance(first, SynchronizationMarker):
+            pending_marker = first
+
+        try:
+            try:
+                if pending_jobs:
+                    self._process_metric_update_job(_merge_update_jobs(pending_jobs))
+            except Exception:
+                if pending_marker is not None and not pending_marker.future.done():
+                    # pyrefly: ignore[implicit-import]
+                    with contextlib.suppress(concurrent.futures.InvalidStateError):
+                        pending_marker.future.set_exception(
+                            RecMetricException(
+                                "MetricUpdateJob batch failed before SynchronizationMarker"
+                            )
+                        )
+                raise
+            if pending_marker is not None:
+                try:
+                    self._process_synchronization_marker(pending_marker)
+                except Exception as e:
+                    # pyrefly: ignore[implicit-import]
+                    with contextlib.suppress(concurrent.futures.InvalidStateError):
+                        pending_marker.future.set_exception(e)
+                    raise
+        finally:
+            for _ in range(items_pulled):
+                self.update_queue.task_done()
 
     def _do_work(
         self,
@@ -663,26 +785,10 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
     @override
     def sync(self) -> None:
-        """
-        Sync the metric states across ranks. This is required before checkpointing.
-        """
-
-        # Prepare for checkpointing by waiting for all queued work to complete.
-        # This ensures that the timing of the snapshot is consistent across all ranks.
-        self.wait_until_queue_is_empty(self.update_queue)
-        self.wait_until_queue_is_empty(self.compute_queue)
-        logger.info("Ready for checkpoint.")
-
-        snapshot = MetricStateSnapshot.from_metrics(
-            self.rec_metrics,
-            self.throughput_metric,
-        )
-        self.comms_module.load_local_metric_state_snapshot(snapshot)
-        aggregated_states = self.comms_module.get_pre_compute_states(
-            self.cpu_process_group
-        )
-        self.comms_module.load_pre_compute_states(aggregated_states)
-
+        """Sync the metric states across ranks. Required before checkpointing.
+        Reuses the compute path so the all-gather happens via the compute thread;
+        the metric values are not used here."""
+        self.async_compute().resolve()
         logger.info("CPUOffloadedRecMetricModule synced.")
 
     @override

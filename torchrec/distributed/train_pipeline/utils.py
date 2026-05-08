@@ -742,7 +742,9 @@ def prefetch_embeddings(
         request = context.input_dist_tensors_requests.pop(forward._name)
         assert isinstance(request, Awaitable)
 
-        with record_function(f"## _prefetch_embeddings {context.index} ##"):
+        with record_function(
+            f"## _prefetch_embeddings {forward._name}: {context.index} ##"
+        ):
             # Finish waiting on the dist_stream,
             # in case some delayed stream scheduling happens during the wait() call.
             with stream_context(data_dist_stream):
@@ -792,7 +794,9 @@ def _prefetch_embeddings(
         assert forward._name in context.input_dist_tensors_requests
         request = context.input_dist_tensors_requests.pop(forward._name)
         assert isinstance(request, Awaitable)
-        with record_function(f"## _prefetch_embeddings {context.index} ##"):
+        with record_function(
+            f"## _prefetch_embeddings {forward._name}: {context.index} ##"
+        ):
             # Finish waiting on the dist_stream,
             # in case some delayed stream scheduling happens during the wait() call.
             with stream_context(data_dist_stream):
