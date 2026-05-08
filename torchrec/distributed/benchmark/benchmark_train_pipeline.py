@@ -231,118 +231,130 @@ def runner(
             process_group=ctx.pg,
         )
 
-        # Pre-allocate synthetic model_out to avoid CUDA allocator noise
-        # in the timing loop. Values don't matter for benchmarking overhead.
-        metric_model_out = (
-            metric_config.generate_model_output(run_option.batch_size, ctx.device)
-            if metric_module is not None
-            else None
-        )
+        try:
+            # Pre-allocate synthetic model_out to avoid CUDA allocator noise
+            # in the timing loop. Values don't matter for benchmarking overhead.
+            metric_model_out = (
+                metric_config.generate_model_output(run_option.batch_size, ctx.device)
+                if metric_module is not None
+                else None
+            )
 
-        fwd_event = torch.cuda.Event(enable_timing=True)
-        if run_option.sync_fwd:
+            fwd_event = torch.cuda.Event(enable_timing=True)
+            if run_option.sync_fwd:
 
-            def sync_fwd_hook(
-                module: nn.Module,
-                inputs: Tuple[Any, ...],
-                outputs: Any,
+                def sync_fwd_hook(
+                    module: nn.Module,
+                    inputs: Tuple[Any, ...],
+                    outputs: Any,
+                ) -> None:
+                    fwd_event.record()
+
+                sharded_model.register_forward_hook(sync_fwd_hook)
+
+            def _func_to_benchmark(
+                bench_inputs: List[ModelInput],
+                model: nn.Module,
+                pipeline: TrainPipeline,
             ) -> None:
-                fwd_event.record()
+                pipeline.reset()
+                if metric_module is not None:
+                    metric_module.reset()
+                    metric_module.trained_batches = 0
 
-            sharded_model.register_forward_hook(sync_fwd_hook)
+                if run_option.num_iters is not None:
+                    dataloader = itertools.islice(
+                        itertools.cycle(bench_inputs), run_option.num_iters
+                    )
+                else:
+                    dataloader = iter(bench_inputs)
 
-        def _func_to_benchmark(
-            bench_inputs: List[ModelInput],
-            model: nn.Module,
-            pipeline: TrainPipeline,
-        ) -> None:
-            pipeline.reset()
-            if metric_module is not None:
-                metric_module.reset()
-                metric_module.trained_batches = 0
+                not_nan_awaitable: Optional[DeviceToHostTensorAwaitable] = None
+                while True:
+                    try:
+                        output = pipeline.progress(dataloader)
+                        if isinstance(output, torch.Tensor):
+                            not_nan_awaitable = DeviceToHostTensorAwaitable(
+                                ~torch.any(torch.isnan(output))
+                            )
+                        elif output is not None:
+                            logger.warning(
+                                f"Pipeline output is not a tensor: {type(output)}, skipping NaN check"
+                            )
 
-            if run_option.num_iters is not None:
-                dataloader = itertools.islice(
-                    itertools.cycle(bench_inputs), run_option.num_iters
-                )
-            else:
-                dataloader = iter(bench_inputs)
+                        if metric_module is not None and output is not None:
+                            assert metric_model_out is not None
+                            with record_function("## metric_update ##"):
+                                metric_module.update(metric_model_out)
+                            if metric_module.should_compute():
+                                with record_function("## metric_compute ##"):
+                                    if metric_config.enable_cpu_offload:
+                                        metric_module.async_compute()
+                                    else:
+                                        metric_module.compute()
 
-            not_nan_awaitable: Optional[DeviceToHostTensorAwaitable] = None
-            while True:
-                try:
-                    output = pipeline.progress(dataloader)
-                    if isinstance(output, torch.Tensor):
-                        not_nan_awaitable = DeviceToHostTensorAwaitable(
-                            ~torch.any(torch.isnan(output))
-                        )
-                    elif output is not None:
-                        logger.warning(
-                            f"Pipeline output is not a tensor: {type(output)}, skipping NaN check"
-                        )
+                        if run_option.sync_fwd:
+                            fwd_event.synchronize()
+                        if run_option.sync_batch:
+                            torch.cuda.synchronize()
+                        if (
+                            run_option.sync_fwd or run_option.sync_batch
+                        ) and not_nan_awaitable is not None:
+                            assert (
+                                not_nan_awaitable.item()
+                            ), "Pipeline output contains NaN"
+                    except StopIteration:
+                        if not_nan_awaitable is not None:
+                            assert (
+                                not_nan_awaitable.item()
+                            ), "Pipeline output contains NaN"
+                        break
 
-                    if metric_module is not None and output is not None:
-                        assert metric_model_out is not None
-                        with record_function("## metric_update ##"):
-                            metric_module.update(metric_model_out)
-                        if metric_module.should_compute():
-                            with record_function("## metric_compute ##"):
-                                metric_module.compute()
-
-                    if run_option.sync_fwd:
-                        fwd_event.synchronize()
-                    if run_option.sync_batch:
-                        torch.cuda.synchronize()
-                    if (
-                        run_option.sync_fwd or run_option.sync_batch
-                    ) and not_nan_awaitable is not None:
-                        assert not_nan_awaitable.item(), "Pipeline output contains NaN"
-                except StopIteration:
-                    if not_nan_awaitable is not None:
-                        assert not_nan_awaitable.item(), "Pipeline output contains NaN"
-                    break
-
-        pipeline = pipeline_config.generate_pipeline(
-            model=sharded_model,
-            opt=optimizer,
-            device=ctx.device,
-        )
-
-        if run_option.ga_num_steps > 1:
-            ga_config = GradientAccumulationConfig(
-                num_steps=run_option.ga_num_steps,
-            )
-            pipeline = GradientAccumulationWrapper(
-                pipeline=pipeline,
-                optimizer=optimizer,
+            pipeline = pipeline_config.generate_pipeline(
                 model=sharded_model,
-                config=ga_config,
+                opt=optimizer,
+                device=ctx.device,
             )
 
-        result = benchmark_func(
-            # pyrefly: ignore[bad-argument-type]
-            bench_inputs=bench_inputs,
-            # pyrefly: ignore[bad-argument-type]
-            prof_inputs=bench_inputs,
-            func_to_benchmark=_func_to_benchmark,
-            benchmark_func_kwargs={"model": sharded_model, "pipeline": pipeline},
-            sample_count=(
-                input_config.batch_size * run_option.num_iters
-                if run_option.num_iters is not None
-                else input_config.batch_size * run_option.num_batches
-            ),
-            **run_option.benchmark_func_kwargs(rank=rank),
-        )
+            if run_option.ga_num_steps > 1:
+                ga_config = GradientAccumulationConfig(
+                    num_steps=run_option.ga_num_steps,
+                )
+                pipeline = GradientAccumulationWrapper(
+                    pipeline=pipeline,
+                    optimizer=optimizer,
+                    model=sharded_model,
+                    config=ga_config,
+                )
 
-        if rank == 0:
-            logger.setLevel(logging.INFO)
-            if run_option.output_json:
-                print(json.dumps(result.to_dict(), indent=2))
-            else:
-                logger.info(result.prettify())
-                logger.info("\nMarkdown format:\n%s", result)
+            result = benchmark_func(
+                # pyrefly: ignore[bad-argument-type]
+                bench_inputs=bench_inputs,
+                # pyrefly: ignore[bad-argument-type]
+                prof_inputs=bench_inputs,
+                func_to_benchmark=_func_to_benchmark,
+                benchmark_func_kwargs={"model": sharded_model, "pipeline": pipeline},
+                sample_count=(
+                    input_config.batch_size * run_option.num_iters
+                    if run_option.num_iters is not None
+                    else input_config.batch_size * run_option.num_batches
+                ),
+                **run_option.benchmark_func_kwargs(rank=rank),
+            )
 
-        return result
+            if rank == 0:
+                logger.setLevel(logging.INFO)
+                if run_option.output_json:
+                    print(json.dumps(result.to_dict(), indent=2))
+                else:
+                    logger.info(result.prettify())
+                    logger.info("\nMarkdown format:\n%s", result)
+
+            return result
+        finally:
+            if metric_module is not None:
+                # Must drain background threads before MultiProcessContext exits.
+                metric_module.shutdown()
 
 
 # a standalone function to run the benchmark in multi-process mode
