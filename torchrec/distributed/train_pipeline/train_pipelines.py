@@ -2822,8 +2822,10 @@ class TrainPipelineSparseDistCompAutograd(TrainPipelineSparseDist[In, Out]):
             },
         )
         torch._dynamo.config.inline_inbuilt_nn_modules = True
-        # pyrefly: ignore [bad-assignment]
-        torch._dynamo.config.skip_fsdp_hooks = False
+        # pyrefly: ignore [missing-attribute]
+        if hasattr(torch._dynamo.config, "skip_fsdp_hooks"):
+            # pyrefly: ignore [missing-attribute]
+            torch._dynamo.config.skip_fsdp_hooks = False
         # pyrefly: ignore [bad-assignment, implicit-import]
         torch._functorch.config.recompute_views = True
         # pyrefly: ignore [bad-assignment, implicit-import]
