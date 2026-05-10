@@ -144,6 +144,7 @@ class ShardedPECEmbeddingCollection(
         )
         self._env: ShardingEnv = env
 
+        assert env.process_group is not None
         self._collision_handlers: List[CollisionHandlerBase] = []
         for (
             sharding_type,
@@ -155,6 +156,7 @@ class ShardedPECEmbeddingCollection(
                     device=device,
                     grouped_emb_configs=sharding._grouped_embedding_configs,  # pyre-ignore[16]
                     table_name_to_config=self._embedding_collection._table_name_to_config,
+                    process_group=env.process_group,
                     checker_type=module._checker_type,
                 )
             )
@@ -291,6 +293,41 @@ class ShardedPECEmbeddingCollection(
             splits_awaitable=splits_awaitable,
             total_input_splits=total_input_splits,
         )
+
+    def permute_dist(
+        self,
+        ctx: PECEmbeddingCollectionContext,
+        features_per_group: List[KeyedJaggedTensor],
+        forward_overlap_masks: List[torch.Tensor],
+    ) -> List[Awaitable[torch.Tensor]]:
+        """Distributes collision partition permutations via AllToAll.
+
+        Delegates to each handler's permute_dist. Each awaitable resolves
+        to a forward_permute tensor for reordering merged [ol, nol]
+        embeddings back to original order.
+
+        Args:
+            ctx: PEC context (sharding_contexts must be set from input_dist)
+            features_per_group: per-group features after input_dist (for lengths)
+            forward_overlap_masks: per-group bool masks for overlapped values
+
+        Returns:
+            List of Awaitable[torch.Tensor], one per sharding group, each
+            resolving to a forward_permute tensor.
+        """
+        return [
+            handler.permute_dist(
+                features,
+                mask,
+                sharding_ctx,
+            )
+            for handler, features, mask, sharding_ctx in zip(
+                self._collision_handlers,
+                features_per_group,
+                forward_overlap_masks,
+                ctx.sharding_contexts,
+            )
+        ]
 
 
 class PECEmbeddingCollectionSharder(BaseEmbeddingSharder[PECEmbeddingCollection]):
