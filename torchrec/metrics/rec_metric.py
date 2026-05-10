@@ -37,7 +37,26 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.profiler import record_function
 from torchmetrics import Metric
-from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+
+try:
+    from torchrec.distributed.logging_handlers import (
+        EventLoggingHandler,
+        TorchrecComponent,
+    )
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.metrics.rec_metric.import_failure.logging_handlers"
+    )
+
+    class TorchrecComponent(Enum):  # pyre-ignore[11]
+        REC_METRICS = "rec_metrics"
+
+    class EventLoggingHandler:  # pyre-ignore[11]
+        @staticmethod
+        def n_batch_log_event(*args: object, **kwargs: object) -> None:
+            pass
+
+
 from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.types import get_tensor_size_bytes
 from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
