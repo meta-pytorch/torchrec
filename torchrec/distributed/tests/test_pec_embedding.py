@@ -188,6 +188,13 @@ class ExpectedSplits:
     output_splits: List[List[int]]
 
 
+def _verify_forward_permute(
+    forward_permute: torch.Tensor,
+    expected: List[int],
+) -> None:
+    assert forward_permute.tolist() == expected
+
+
 def _verify_collision_result(
     result: CollisionResult,
     expected: ExpectedCollisionResult,
@@ -220,11 +227,13 @@ def _test_pec_forward_stages(
     backend: str,
     expected_collisions_per_rank: List[List[ExpectedCollisionResult]] | None = None,
     expected_splits_per_rank: List[List[ExpectedSplits]] | None = None,
+    expected_forward_permutes_per_rank: List[List[List[int]]] | None = None,
     local_size: Optional[int] = None,
 ) -> None:
     """Run PEC forward pipeline stages and verify against expected results.
 
-    Always runs: input_dist → detect_collisions → split → collision_split_dist.
+    Always runs: input_dist → detect_collisions → split →
+        collision_split_dist → permute_dist.
     Verification for each stage is enabled by providing its expected-output parameter.
     """
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
@@ -269,6 +278,22 @@ def _test_pec_forward_stages(
                 _verify_collision_splits(
                     all_splits,
                     expected_splits_per_rank[rank][batch_idx],
+                )
+
+            # Stage 3: permute_dist
+            features_list = list(dist_input)
+            masks = [r.forward_overlap_mask for r in results]
+            permute_awaitables = sharded_pec.permute_dist(
+                pec_ctx,
+                features_list,
+                masks,
+            )
+            forward_permutes = [aw.wait() for aw in permute_awaitables]
+
+            if expected_forward_permutes_per_rank is not None:
+                _verify_forward_permute(
+                    forward_permutes[0],
+                    expected_forward_permutes_per_rank[rank][batch_idx],
                 )
 
             prev_remapped = [r.remapped_feature_values for r in results]
@@ -428,6 +453,65 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
             tables=EMBEDDING_TABLES,
             kjt_input_per_rank=TWO_BATCH_KJT_INPUT_PER_RANK,
             expected_splits_per_rank=expected_splits_per_rank,
+            sharder=PECEmbeddingCollectionSharder(),
+            backend="nccl",
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_permute_dist(self) -> None:
+        """Verifies exact forward_permute values with cross-shard partial overlap."""
+        WORLD_SIZE = 2
+
+        # Cross-shard data: each rank has values in both shard 0 (0-7) and shard 1 (8-15)
+        kjt_input_per_rank = [
+            [
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=["feature_0", "feature_1"],
+                    values=torch.LongTensor([0, 8, 2, 10, 4, 12]),
+                    lengths=torch.LongTensor([2, 1, 1, 2]),
+                ),
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=["feature_0", "feature_1"],
+                    values=torch.LongTensor([0, 8, 3, 11, 4, 13]),
+                    lengths=torch.LongTensor([2, 1, 1, 2]),
+                ),
+            ],
+            [
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=["feature_0", "feature_1"],
+                    values=torch.LongTensor([1, 9, 5, 11, 6, 13]),
+                    lengths=torch.LongTensor([2, 1, 1, 2]),
+                ),
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=["feature_0", "feature_1"],
+                    values=torch.LongTensor([1, 9, 7, 14, 6, 15]),
+                    lengths=torch.LongTensor([2, 1, 1, 2]),
+                ),
+            ],
+        ]
+
+        # Batch 0: no overlap → forward_permute = upt = [0,3,1,4,2,5]
+        # Batch 1: partial overlap → forward_permute derived from received mask + upt
+        expected_forward_permutes_per_rank = [
+            [
+                [0, 3, 1, 4, 2, 5],
+                [0, 2, 5, 3, 1, 4],
+            ],
+            [
+                [0, 3, 1, 4, 2, 5],
+                [0, 2, 3, 4, 1, 5],
+            ],
+        ]
+
+        self._run_multi_process_test(
+            callable=_test_pec_forward_stages,
+            world_size=WORLD_SIZE,
+            tables=EMBEDDING_TABLES,
+            kjt_input_per_rank=kjt_input_per_rank,
+            expected_forward_permutes_per_rank=expected_forward_permutes_per_rank,
             sharder=PECEmbeddingCollectionSharder(),
             backend="nccl",
         )
