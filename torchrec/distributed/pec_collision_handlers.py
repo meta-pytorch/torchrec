@@ -14,7 +14,11 @@ from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
 import torch
+import torch.distributed as dist
+from torchrec.distributed.dist_data import TensorAllToAllValuesAwaitable
 from torchrec.distributed.embedding_types import GroupedEmbeddingConfig
+from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
+from torchrec.distributed.types import Awaitable
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.pec_embedding_modules import OverlappingCheckerType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -99,7 +103,7 @@ def split_features_by_values_mask(
     compute per-segment lengths for each partition efficiently.
 
     Args:
-        features: input KJT (after input dist, on sharder side)
+        features: input KJT (after input dist)
         overlap_mask: bool tensor of shape [num_values], True = overlapped
 
     Returns:
@@ -143,12 +147,49 @@ def split_features_by_values_mask(
     return overlapped_kjt, nonoverlapped_kjt
 
 
+class ForwardPermuteAwaitable(Awaitable[torch.Tensor]):
+    """RW-specific awaitable that computes forward_permute from a received mask.
+
+    On wait(), receives the mask via AllToAll, then builds forward_permute:
+    a tensor for reordering merged [ol_embs, nol_embs] back to original
+    order via index_select.
+
+    The received mask is in bucketized order (values sent to shard 0 first,
+    then shard 1, etc.). unbucketize_permute_tensor maps original position i
+    to bucket position upt[i]. We compose these to build forward_permute[i] =
+    position in merged [ol_embs, nol_embs] for original position i.
+    """
+
+    def __init__(
+        self,
+        values_awaitable: TensorAllToAllValuesAwaitable,
+        unbucketize_permute_tensor: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self._values_awaitable = values_awaitable
+        self._unbucketize_permute_tensor = unbucketize_permute_tensor
+
+    def _wait_impl(self) -> torch.Tensor:
+        received_mask = self._values_awaitable.wait()
+        bool_mask = received_mask.bool()
+        upt = self._unbucketize_permute_tensor
+        num_ol = bool_mask.sum()
+
+        # Example: bool_mask = [T, F, T, T, F, F]
+        #   ol_rank  = cumsum([1,0,1,1,0,0]) - 1 = [0, 0, 1, 2, 2, 2]
+        #   nol_rank = cumsum([0,1,0,0,1,1]) - 1 + 3 = [2, 3, 3, 3, 4, 5]
+        #   bucket_to_merged = where(mask, ol_rank, nol_rank) = [0, 3, 1, 2, 4, 5]
+        ol_rank = bool_mask.long().cumsum(0) - 1
+        nol_rank = (~bool_mask).long().cumsum(0) - 1 + num_ol
+        bucket_to_merged = torch.where(bool_mask, ol_rank, nol_rank)
+
+        return bucket_to_merged[upt]
+
+
 class CollisionHandlerBase(abc.ABC):
     """Interface for PEC collision detection handlers.
 
     Subclasses implement sharding-specific overlap detection logic.
-    The pipeline passes prev_remapped_feature_values as an argument to detect_collisions
-    rather than storing cross-batch state internally.
     """
 
     @abc.abstractmethod
@@ -171,6 +212,24 @@ class CollisionHandlerBase(abc.ABC):
     @abc.abstractmethod
     def reset(self) -> None:
         """Reset internal state (e.g. at epoch boundary)."""
+        ...
+
+    @abc.abstractmethod
+    def permute_dist(
+        self,
+        features: KeyedJaggedTensor,
+        forward_overlap_mask: torch.Tensor,
+        sharding_ctx: SequenceShardingContext,
+    ) -> Awaitable[torch.Tensor]:
+        """Distribute the collision partition permutation via AllToAll.
+
+        Sends overlap information from sharding ranks back to the original
+        rank and computes forward_permute — a tensor for reordering merged
+        [ol, nol] embeddings back to original order via index_select.
+
+        Returns:
+            Awaitable resolving to forward_permute tensor of shape [N].
+        """
         ...
 
     @abc.abstractmethod
@@ -208,12 +267,14 @@ class RWCollisionHandler(CollisionHandlerBase):
         device: torch.device,
         grouped_emb_configs: List[GroupedEmbeddingConfig],
         table_name_to_config: Dict[str, EmbeddingConfig],
+        process_group: dist.ProcessGroup,
         checker_type: OverlappingCheckerType = OverlappingCheckerType.BOOLEAN,
     ) -> None:
         assert (
             checker_type == OverlappingCheckerType.BOOLEAN
         ), f"Only BOOLEAN checker is supported, got {checker_type}"
         self._device = device
+        self._pg = process_group
         self._feature_to_table_offset: Dict[str, int] = {}
         self._input_features_offset: torch.Tensor = torch.empty(
             0,
@@ -307,12 +368,53 @@ class RWCollisionHandler(CollisionHandlerBase):
             num_features, batch_size_cumsum, lengths_batch_major
         )
 
+    def permute_dist(
+        self,
+        features: KeyedJaggedTensor,
+        forward_overlap_mask: torch.Tensor,
+        sharding_ctx: SequenceShardingContext,
+    ) -> ForwardPermuteAwaitable:
+        """Reorder mask to rank-major, AllToAll to original rank, compute forward_permute."""
+        assert sharding_ctx.sparse_features_recat is not None
+        assert sharding_ctx.unbucketize_permute_tensor is not None
+
+        recat = torch.ops.fbgemm.invert_permute(sharding_ctx.sparse_features_recat)
+        mask_int = forward_overlap_mask.to(torch.int32)
+
+        _, permuted_mask, _ = torch.ops.fbgemm.permute_2D_sparse_data(
+            recat,
+            features.lengths().view(recat.shape[0], -1),
+            mask_int,
+            None,
+            mask_int.numel(),
+        )
+
+        values_awaitable = TensorAllToAllValuesAwaitable(
+            self._pg,
+            permuted_mask,
+            input_splits=torch.tensor(
+                sharding_ctx.output_splits,
+                dtype=torch.int32,
+            ),
+            output_splits=torch.tensor(
+                sharding_ctx.input_splits,
+                dtype=torch.int32,
+            ),
+            device=permuted_mask.device,
+        )
+
+        return ForwardPermuteAwaitable(
+            values_awaitable=values_awaitable,
+            unbucketize_permute_tensor=sharding_ctx.unbucketize_permute_tensor,
+        )
+
 
 def create_collision_handler(
     sharding_type: str,
     device: torch.device,
     grouped_emb_configs: List[GroupedEmbeddingConfig],
     table_name_to_config: Dict[str, EmbeddingConfig],
+    process_group: dist.ProcessGroup,
     checker_type: OverlappingCheckerType,
 ) -> CollisionHandlerBase:
     """Factory function to create a collision handler for a given sharding type."""
@@ -321,6 +423,7 @@ def create_collision_handler(
             device=device,
             grouped_emb_configs=grouped_emb_configs,
             table_name_to_config=table_name_to_config,
+            process_group=process_group,
             checker_type=checker_type,
         )
     raise ValueError(

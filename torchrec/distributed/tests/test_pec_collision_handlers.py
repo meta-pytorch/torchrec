@@ -7,10 +7,12 @@
 
 # pyre-strict
 
+import os
 import unittest
 from typing import List
 
 import torch
+import torch.distributed as dist
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
@@ -27,6 +29,15 @@ from torchrec.distributed.pec_collision_handlers import (
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.pec_embedding_modules import OverlappingCheckerType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.test_utils import get_free_port
+
+
+def _get_single_rank_pg() -> dist.ProcessGroup:
+    if not dist.is_initialized():
+        os.environ.setdefault("MASTER_ADDR", "localhost")
+        os.environ.setdefault("MASTER_PORT", str(get_free_port()))
+        dist.init_process_group(backend="gloo", rank=0, world_size=1)
+    return dist.group.WORLD  # pyre-ignore[7]
 
 
 def _make_grouped_configs(
@@ -214,6 +225,7 @@ class RWCollisionHandlerTest(unittest.TestCase):
             device=torch.device("cpu"),
             grouped_emb_configs=_make_grouped_configs(tables, local_rows),
             table_name_to_config=_make_table_name_to_config(tables),
+            process_group=_get_single_rank_pg(),
             checker_type=OverlappingCheckerType.BOOLEAN,
         )
 
@@ -482,6 +494,7 @@ class CreateCollisionHandlerTest(unittest.TestCase):
             device=torch.device("cpu"),
             grouped_emb_configs=_make_grouped_configs(tables, local_rows=8),
             table_name_to_config=_make_table_name_to_config(tables),
+            process_group=_get_single_rank_pg(),
             checker_type=OverlappingCheckerType.BOOLEAN,
         )
 
@@ -503,5 +516,6 @@ class CreateCollisionHandlerTest(unittest.TestCase):
                 device=torch.device("cpu"),
                 grouped_emb_configs=_make_grouped_configs(tables, local_rows=8),
                 table_name_to_config=_make_table_name_to_config(tables),
+                process_group=_get_single_rank_pg(),
                 checker_type=OverlappingCheckerType.BOOLEAN,
             )

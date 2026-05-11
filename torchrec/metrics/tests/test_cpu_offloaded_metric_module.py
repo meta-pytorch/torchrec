@@ -976,8 +976,10 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         cpu_module = self._make_module(update_queue_size=1)
 
         block_event = threading.Event()
+        processing_started = threading.Event()
 
         def controlled_process_job(_: MetricUpdateJob) -> None:
+            processing_started.set()
             block_event.wait()
 
         model_out = {
@@ -991,6 +993,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         ), patch.object(cpu_module, "_log_event") as mock_log_event:
             # Fill the queue: 1 item being processed + 1 in queue = full
             cpu_module._update_rec_metrics(model_out)
+            # Wait for the update thread to pick up the first item before
+            # enqueueing the second, otherwise put_nowait races with get.
+            processing_started.wait(timeout=5.0)
             cpu_module._update_rec_metrics(model_out)
 
             with self.assertRaises(RecMetricException):
