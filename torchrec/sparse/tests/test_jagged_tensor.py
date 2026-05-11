@@ -49,7 +49,7 @@ def _count_current_stream_syncs() -> Iterator[list[int]]:
         def __getattr__(self, name: str) -> object:
             return getattr(self._stream, name)
 
-    def _patched(device: object = None) -> object:
+    def _patched(device: torch.device | int | str | None = None) -> object:
         return _Tracker(real_current_stream(device))
 
     with mock.patch("torch.cuda.current_stream", _patched):
@@ -1499,4 +1499,68 @@ class TestJaggedTensorTracing(unittest.TestCase):
             1,
             "_maybe_compute_length_per_key empty-lengths branch did not call "
             "current_stream.synchronize()",
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_maybe_compute_length_per_key_empty_offsets_cuda_syncs(self) -> None:
+        # When offsets is provided (no lengths) and len(offsets) == 1,
+        # torch.diff(offsets) is empty. The fix routes this through a
+        # short-circuit that syncs the current stream and returns
+        # [0] * len(keys), matching the lengths-path empty case.
+        keys = ["a", "b"]
+        offsets = torch.tensor([0], dtype=torch.int64, device="cuda")
+        with _count_current_stream_syncs() as sync_count:
+            result = _maybe_compute_length_per_key(
+                keys=keys,
+                stride=1,
+                stride_per_key=[1, 1],
+                variable_stride_per_key=False,
+                length_per_key=None,
+                lengths=None,
+                offsets=offsets,
+                values=None,
+            )
+
+        self.assertEqual(result, [0, 0])
+        self.assertGreaterEqual(
+            sync_count[0],
+            1,
+            "_maybe_compute_length_per_key empty-offsets branch did not call "
+            "current_stream.synchronize()",
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_maybe_compute_length_per_key_empty_offsets_vspk_cuda_syncs(
+        self,
+    ) -> None:
+        # Variable-stride-per-key analogue of the above. Same input shape
+        # (len(offsets) == 1) hits the same short-circuit before delegating
+        # to _length_per_key_from_stride_per_key, which would otherwise
+        # return [] without any sync.
+        keys = ["a", "b"]
+        offsets = torch.tensor([0], dtype=torch.int64, device="cuda")
+        with _count_current_stream_syncs() as sync_count:
+            result = _maybe_compute_length_per_key(
+                keys=keys,
+                stride=1,
+                stride_per_key=[1, 1],
+                variable_stride_per_key=True,
+                length_per_key=None,
+                lengths=None,
+                offsets=offsets,
+                values=None,
+            )
+
+        self.assertEqual(result, [0, 0])
+        self.assertGreaterEqual(
+            sync_count[0],
+            1,
+            "_maybe_compute_length_per_key empty-offsets VSPK branch did not "
+            "call current_stream.synchronize()",
         )

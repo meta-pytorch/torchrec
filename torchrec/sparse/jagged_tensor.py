@@ -1403,18 +1403,24 @@ def _maybe_compute_length_per_key(
             else _length_per_key_from_lengths(lengths, len(keys), stride)
         )
     elif len(keys) and offsets is not None and len(offsets) > 0:
-        # TODO: route this through _length_per_key_from_lengths once we
-        # confirm no caller depends on the empty-diff edge case returning [].
-        # Current behavior (returns [] when len(offsets) == 1) is inconsistent
-        # with the lengths-path empty case (returns [0] * len(keys)) and may
-        # have the same rank-divergence / cross-PG deadlock risk if it ever
-        # fires in collective code paths. Leaving as-is for now to scope this
-        # diff to the lengths-path only.
-        _length: List[int] = (
-            _length_per_key_from_stride_per_key(torch.diff(offsets), stride_per_key)
-            if variable_stride_per_key
-            else _safe_tolist(torch.sum(torch.diff(offsets).view(-1, stride), dim=1))
-        )
+        if variable_stride_per_key:
+            if len(offsets) == 1:
+                # Sync the current CUDA stream even if torch.diff(offsets) is empty.
+                # This keeps the rank in sync with peers that get a non-empty diff.
+                # Return [0] * len(keys) to match the lengths-path empty contract.
+                if not torch.jit.is_scripting() and offsets.is_cuda:
+                    torch.cuda.current_stream(offsets.device).synchronize()
+                _length: List[int] = [0] * len(keys)
+            else:
+                _length: List[int] = _length_per_key_from_stride_per_key(
+                    torch.diff(offsets), stride_per_key
+                )
+        else:
+            # Delegate to _length_per_key_from_lengths, which syncs the stream
+            # on empty diffs and handles non-empty diffs via _safe_tolist.
+            _length: List[int] = _length_per_key_from_lengths(
+                torch.diff(offsets), len(keys), stride
+            )
     else:
         _length: List[int] = []
 
