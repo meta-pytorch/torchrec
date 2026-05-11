@@ -2197,3 +2197,222 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
                     collective_tag=large_tag,
                 )
             self.assertIn("exceeds", str(ctx.exception).lower())
+
+    @classmethod
+    def _run_test_mismatch_emits_scuba_event(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        input_tensors = [
+            torch.tensor([1] * world_size, dtype=torch.int64),
+        ]
+        with unittest.mock.patch(
+            "torchrec.distributed.dist_data.EventLoggingHandler.log_event"
+        ) as mock_log_event:
+            awaitable = SplitsAllToAllAwaitable(
+                input_tensors=input_tensors,
+                pg=none_throws(dist.group.WORLD),
+                collective_tag=rank,  # divergent tag per rank → forces mismatch
+                collective_tag_parts=("scuba_test", "rank_specific"),
+            )
+            try:
+                awaitable.wait()
+                raise AssertionError("Expected RuntimeError for mismatched tags")
+            except RuntimeError:
+                pass
+            # log_event must fire exactly once on the failing rank.
+            assert (
+                mock_log_event.call_count == 1
+            ), f"expected 1 log_event call, got {mock_log_event.call_count}"
+            kwargs = mock_log_event.call_args.kwargs
+            assert kwargs["component"] == "input_dist"
+            assert (
+                kwargs["event_name"]
+                == "SplitsAllToAllAwaitable.collective_tag_mismatch"
+            )
+            # Only check the enum's string value to keep the test independent
+            # of how EventType is imported in the test module.
+            assert kwargs["event_type"].value == "FAILURE"
+            metadata = kwargs["metadata"]
+            assert metadata["expected_tag"] == str(rank)
+            assert metadata["pg_rank"] == str(rank)
+            assert metadata["world_size"] == str(world_size)
+            assert metadata["collective_kind"] == "scuba_test"
+            assert "scuba_test" in metadata["collective_label"]
+            # On WORLD, global rank and PG-local rank coincide.
+            assert metadata["global_rank"] == str(rank)
+            # Both lists are stringified; on a 2-rank job with divergent
+            # tags, every peer with a different tag appears.
+            assert metadata["mismatched_peer_global_ranks"].startswith("[")
+            assert metadata["mismatched_peer_pg_ranks"].startswith("[")
+        dist.destroy_process_group()
+
+    def test_mismatch_emits_scuba_event(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_mismatch_emits_scuba_event,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_mismatch_event_uses_global_ranks_on_subgroup(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        """Run on a 4-rank job; create a sub-PG of [1, 3]. On that sub-PG
+        the local ranks are 0 and 1 but global ranks are 1 and 3. Verify
+        that the Scuba event reports global ranks (actionable for triage),
+        not PG-local indices."""
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        # new_group is collective on WORLD, so every rank must call it,
+        # even ranks not in the resulting subgroup.
+        subgroup = dist.new_group(ranks=[1, 3], backend=backend)
+
+        if rank not in (1, 3):
+            # Non-members do not run the awaitable; just synchronize and exit.
+            dist.barrier()
+            dist.destroy_process_group()
+            return
+
+        # Ranks 1 and 3 run a collective on the subgroup with divergent
+        # tags so the mismatch path fires. PG-local ranks here are 0 and 1.
+        input_tensors = [torch.tensor([1, 1], dtype=torch.int64)]
+        with unittest.mock.patch(
+            "torchrec.distributed.dist_data.EventLoggingHandler.log_event"
+        ) as mock_log_event:
+            awaitable = SplitsAllToAllAwaitable(
+                input_tensors=input_tensors,
+                pg=subgroup,
+                collective_tag=rank,  # divergent tag per rank → mismatch
+                collective_tag_parts=("subgroup_test",),
+            )
+            try:
+                awaitable.wait()
+                raise AssertionError("Expected RuntimeError for mismatched tags")
+            except RuntimeError:
+                pass
+
+            assert (
+                mock_log_event.call_count == 1
+            ), f"expected 1 log_event call, got {mock_log_event.call_count}"
+            metadata = mock_log_event.call_args.kwargs["metadata"]
+
+            # PG-local rank for rank 1 is 0; for rank 3 is 1.
+            expected_pg_rank = 0 if rank == 1 else 1
+            assert metadata["pg_rank"] == str(expected_pg_rank), (
+                f"expected pg_rank={expected_pg_rank}, " f"got {metadata['pg_rank']}"
+            )
+            # Global rank should be the actual global rank, not the PG-local.
+            assert metadata["global_rank"] == str(
+                rank
+            ), f"expected global_rank={rank}, got {metadata['global_rank']}"
+            # The peer is the OTHER member of [1, 3].
+            other_global = 3 if rank == 1 else 1
+            other_pg_local = 1 if rank == 1 else 0
+            assert metadata["mismatched_peer_global_ranks"] == str([other_global]), (
+                f"expected mismatched_peer_global_ranks=[{other_global}], "
+                f"got {metadata['mismatched_peer_global_ranks']}"
+            )
+            assert metadata["mismatched_peer_pg_ranks"] == str([other_pg_local]), (
+                f"expected mismatched_peer_pg_ranks=[{other_pg_local}], "
+                f"got {metadata['mismatched_peer_pg_ranks']}"
+            )
+
+        dist.barrier()  # keep WORLD alive while non-member ranks finish.
+        dist.destroy_process_group()
+
+    def test_mismatch_event_uses_global_ranks_on_subgroup(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_mismatch_event_uses_global_ranks_on_subgroup,
+            world_size=4,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_mismatch_raises_when_logger_unavailable(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        input_tensors = [
+            torch.tensor([1] * world_size, dtype=torch.int64),
+        ]
+        # Simulate OSS / inference bundle where logging_handlers is absent.
+        # The off-path must still raise the same RuntimeError unchanged.
+        with unittest.mock.patch(
+            "torchrec.distributed.dist_data._HAS_EVENT_LOGGER", False
+        ):
+            awaitable = SplitsAllToAllAwaitable(
+                input_tensors=input_tensors,
+                pg=none_throws(dist.group.WORLD),
+                collective_tag=rank,
+                collective_tag_parts=("logger_off",),
+            )
+            try:
+                awaitable.wait()
+                raise AssertionError("Expected RuntimeError for mismatched tags")
+            except RuntimeError as e:
+                assert "collective mismatch" in str(e).lower()
+                assert "logger_off" in str(e)
+        dist.destroy_process_group()
+
+    def test_mismatch_raises_when_logger_unavailable(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_mismatch_raises_when_logger_unavailable,
+            world_size=2,
+            backend="gloo",
+        )
+
+    @classmethod
+    def _run_test_mismatch_raises_when_logger_throws(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+
+        input_tensors = [
+            torch.tensor([1] * world_size, dtype=torch.int64),
+        ]
+        # If log_event itself throws (e.g. Scuba handler bug, metadata
+        # serialization failure), the diagnostic RuntimeError must still
+        # fire — telemetry must never suppress the actual error.
+        with unittest.mock.patch(
+            "torchrec.distributed.dist_data.EventLoggingHandler.log_event",
+            side_effect=RuntimeError("simulated scuba handler failure"),
+        ):
+            awaitable = SplitsAllToAllAwaitable(
+                input_tensors=input_tensors,
+                pg=none_throws(dist.group.WORLD),
+                collective_tag=rank,
+                collective_tag_parts=("logger_throws",),
+            )
+            try:
+                awaitable.wait()
+                raise AssertionError("Expected RuntimeError for mismatched tags")
+            except RuntimeError as e:
+                # Must surface the mismatch diagnostic, not the scuba failure.
+                assert (
+                    "collective mismatch" in str(e).lower()
+                ), f"expected mismatch diagnostic, got: {e}"
+                assert "logger_throws" in str(e)
+                assert "simulated scuba handler failure" not in str(e)
+        dist.destroy_process_group()
+
+    def test_mismatch_raises_when_logger_throws(self) -> None:
+        self._run_multi_process_test(
+            callable=self._run_test_mismatch_raises_when_logger_throws,
+            world_size=2,
+            backend="gloo",
+        )
