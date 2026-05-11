@@ -19,7 +19,47 @@ from typing import Any, Dict, Mapping, Optional, Union
 import torch
 from torch import distributed as dist
 from torch.profiler import record_function
-from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+
+try:
+    # This is a safety measure against torch package issues for when
+    # Torchrec is included in the inference side model code. We should
+    # remove this once we are sure all model side packages have the required
+    # dependencies
+    from torchrec.distributed.logging_handlers import (
+        EventLoggingHandler,
+        TorchrecComponent,
+    )
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.metrics.cpu_offloaded_metric_module.import_failure.logging_handlers"
+    )
+
+    from enum import Enum as _Enum
+    from typing import Callable, TYPE_CHECKING
+
+    if TYPE_CHECKING:
+        from torchrec.distributed.logging_handlers import (
+            EventLoggingHandler,
+            TorchrecComponent,
+        )
+    else:
+
+        class TorchrecComponent(_Enum):
+            REC_METRICS = "rec_metrics"
+
+        class EventLoggingHandler:
+            @staticmethod
+            def event_logger(*args: object, **kwargs: object) -> Callable:
+                def decorator(func: Callable) -> Callable:
+                    return func
+
+                return decorator
+
+            @staticmethod
+            def log_event(*args: object, **kwargs: object) -> None:
+                pass
+
+
 from torchrec.distributed.logging_utils import EventType
 from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
 from torchrec.metrics.deferrable_metrics import (

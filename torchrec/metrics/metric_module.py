@@ -21,7 +21,47 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import DeviceMesh
 from torch.profiler import record_function
-from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+
+try:
+    # This is a safety measure against torch package issues for when
+    # Torchrec is included in the inference side model code. We should
+    # remove this once we are sure all model side packages have the required
+    # dependencies
+    from torchrec.distributed.logging_handlers import (
+        EventLoggingHandler,
+        TorchrecComponent,
+    )
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.metrics.metric_module.import_failure.logging_handlers"
+    )
+
+    from enum import Enum as _Enum
+    from typing import Callable, TYPE_CHECKING
+
+    if TYPE_CHECKING:
+        from torchrec.distributed.logging_handlers import (
+            EventLoggingHandler,
+            TorchrecComponent,
+        )
+    else:
+
+        class TorchrecComponent(_Enum):
+            REC_METRICS = "rec_metrics"
+
+        class EventLoggingHandler:
+            @staticmethod
+            def event_logger(*args: object, **kwargs: object) -> Callable:
+                def decorator(func: Callable) -> Callable:
+                    return func
+
+                return decorator
+
+            @staticmethod
+            def log_event(*args: object, **kwargs: object) -> None:
+                pass
+
+
 from torchrec.metrics.accuracy import AccuracyMetric
 from torchrec.metrics.auc import AUCMetric
 from torchrec.metrics.auprc import AUPRCMetric
