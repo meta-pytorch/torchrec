@@ -18,10 +18,10 @@ import torch.nn as nn
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.pec_collision_handlers import (
     CollisionResult,
+    CollisionSplits,
     split_features_by_values_mask,
 )
 from torchrec.distributed.pec_embedding import (
-    CollisionSplits,
     PECEmbeddingCollectionSharder,
     ShardedPECEmbeddingCollection,
 )
@@ -269,10 +269,11 @@ def _test_pec_forward_stages(
                 )
                 nol_features.append(nol)
 
-            all_splits = sharded_pec.collision_split_dist(
+            split_awaitables = sharded_pec.collision_split_dist(
                 pec_ctx,
                 nol_features,
-            ).wait()
+            )
+            all_splits = [aw.wait() for aw in split_awaitables]
 
             if expected_splits_per_rank is not None:
                 _verify_collision_splits(
