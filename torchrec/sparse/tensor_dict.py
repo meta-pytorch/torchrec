@@ -23,6 +23,7 @@ def maybe_td_to_kjt(
     if isinstance(features, TensorDict):
         if keys is None:
             # pyrefly: ignore[no-matching-overload]
+            # pyre-fixme[6]: Expected `Iterable` but got `_TensorDictKeysView`.
             keys = list(features.keys())
         values = torch.cat([features[key]._values for key in keys], dim=0)
         lengths = torch.cat(

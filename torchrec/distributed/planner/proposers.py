@@ -250,6 +250,7 @@ class GridSearchProposer(Proposer):
         ]
         #  `List[Tuple[int]]`.
         # pyrefly: ignore[no-matching-overload]
+        # pyre-fixme[6]: Expected `list[list[int]]` but got `list[tuple[int, ...]]`.
         self._proposals = list(itertools.product(*sharding_options_by_fqn_indices))
 
     def _reset(self) -> None:

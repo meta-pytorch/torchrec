@@ -73,6 +73,7 @@ class Tracer(torch.fx.Tracer):
                 if isinstance(root, torch.nn.Module):
                     for prefix, module in root.named_modules():
                         # TODO(T140754678): Remove this workaround to _fx_path
+                        # pyre-fixme[8]: Expected `Module | Tensor` but got `str | Unknown`.
                         module._fx_path = prefix
 
                 dmp = root

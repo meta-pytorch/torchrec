@@ -457,7 +457,7 @@ def quantize_inference_model(
             # handle the fp ebc separately
             _quantize_fp_module(
                 model,
-                m,
+                m,  # pyre-fixme[6]: Expected `FeatureProcessedEmbeddingBagCollection` but got `Module | Unknown`.
                 n,
                 weight_dtype=fp_weight_dtype,
                 # Pass in per_fp_table_weight_dtype if it is provided, perhaps

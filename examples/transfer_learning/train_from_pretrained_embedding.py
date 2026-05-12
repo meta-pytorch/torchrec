@@ -85,6 +85,7 @@ def share_tensor_via_shm(
         if dist.get_backend() == "gloo":
             gloo_pg = dist.group.WORLD
         else:
+            # pyre-fixme[9]: Expected `ProcessGroup | None` but got `ProcessGroup | int | None`.
             gloo_pg = dist.new_group(backend="gloo")
 
     torch.multiprocessing.set_sharing_strategy("file_system")

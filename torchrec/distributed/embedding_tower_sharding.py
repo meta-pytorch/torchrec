@@ -431,6 +431,7 @@ class ShardedEmbeddingTower(
         else:
             yield from ()
 
+    # pyre-fixme[14]: `named_modules` overrides method defined in `Module` inconsistently.
     def named_modules(
         self,
         memo: Optional[Set[nn.Module]] = None,
@@ -872,6 +873,7 @@ class ShardedEmbeddingTowerCollection(
                 )
             )
 
+    # pyre-fixme[14]: `named_modules` overrides method defined in `Module` inconsistently.
     def named_modules(
         self,
         memo: Optional[Set[nn.Module]] = None,

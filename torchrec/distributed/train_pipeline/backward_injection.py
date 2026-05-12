@@ -354,7 +354,7 @@ class OutputDistTensorFinder:
 
         # Find the awaitable matching our sharding type, skipping DP (NoWait)
         for w, st in zip(  # pyrefly: ignore[no-matching-overload]
-            awaitables, sharding_types
+            awaitables, sharding_types  # pyre-fixme[6]: Expected `Iterable[str]` but got `list[str] | Unknown | None`.
         ):
             if isinstance(w, NoWait):
                 continue

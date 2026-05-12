@@ -192,6 +192,7 @@ def create_virtual_table_local_metadata(
             else sum(weight_count_per_rank[:my_rank])
         )
     # pyrefly: ignore[no-matching-overload, missing-attribute]
+    # pyre-fixme[6]: Expected `Iterable[int]` but got `Size | int`.
     local_metadata.shard_sizes = list(param.size())
     # pyrefly: ignore[missing-attribute]
     local_metadata.shard_offsets = [

@@ -475,12 +475,12 @@ def sharded_tbes_weights_spec(
             ), "Cannot have any two of ShardedQuantEmbeddingBagCollection, ShardedQuantEmbeddingCollection, ShardedQuantManagedCollisionEmbeddingCollection, ShardedQuantFeatureProcessedEmbeddingBagCollection and ShardedQuantManagedCollisionEmbeddingBagCollection are true"
             tbes_configs: Dict[
                 IntNBitTableBatchedEmbeddingBagsCodegen, GroupedEmbeddingConfig
-            ] = module.tbes_configs()
+            ] = module.tbes_configs()  # pyre-fixme[29]: Expected a callable.
             table_shardings: Dict[str, str] = {}
 
             sharding_type_device_group_to_sharding_infos: Dict[
                 Tuple[str, str], List[EmbeddingShardingInfo]
-            ] = module.sharding_type_device_group_to_sharding_infos()
+            ] = module.sharding_type_device_group_to_sharding_infos()  # pyre-fixme[29]: Expected a callable.
 
             for (
                 (sharding_type, _),

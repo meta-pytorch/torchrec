@@ -207,6 +207,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             target=self._compute_loop, name=metric_compute_thread_name, daemon=True
         )
 
+        # pyre-fixme[8]: Expected `ProcessGroup` but got `ProcessGroup | int | None`.
         self.cpu_process_group: dist.ProcessGroup = dist.new_group(backend="gloo")
         self.comms_module: CPUCommsRecMetricModule = CPUCommsRecMetricModule(
             *args,
@@ -848,11 +849,14 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         Args are identical to torch.nn.Module.state_dict().
         """
         # pyrefly: ignore[no-matching-overload]
+        # pyre-fixme[7]: Expected `dict[str, Any]` but got `dict[str, Any] | None`.
+        # pyre-fixme[6]: Expected `dict[str, Any]` but got `dict[str, Any] | None`.
         return self.comms_module.state_dict(
             *args, destination=destination, prefix=prefix, keep_vars=keep_vars
         )
 
     @override
+    # pyre-fixme[14]: `load_state_dict` overrides method defined in `RecMetricModule` inconsistently.
     def load_state_dict(
         self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
     ) -> None:
