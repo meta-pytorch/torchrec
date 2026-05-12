@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Type
 
@@ -226,6 +227,66 @@ class ShardedPECEmbeddingCollection(
                 ctx.sharding_contexts,
             )
         ]
+
+    def compute_and_output_dist_in_partition(
+        self,
+        ctx: PECEmbeddingCollectionContext,
+        features: KeyedJaggedTensor,
+        collision_splits: CollisionSplits,
+        is_overlapped: bool,
+    ) -> List[Awaitable[torch.Tensor]]:
+        """Embedding lookup + output dist for one partition (overlapped or nonoverlapped).
+
+        Performs lookup on the partition's features using the inner EC's lookup
+        module, then AllToAll's the embeddings back to trainer using the
+        collision-specific splits. The embedding AllToAll goes in the reverse
+        direction of the features AllToAll, so collision output_splits become
+        embedding input_splits and vice versa.
+
+        Args:
+            ctx: PEC context (sharding_contexts must be set from input_dist)
+            features: partition features (ol or nol KJT from split_features)
+            collision_splits: splits from collision_split_dist().wait()
+            is_overlapped: True for overlapped partition, False for nonoverlapped
+
+        Returns:
+            List of Awaitable[torch.Tensor], one per sharding group.
+        """
+        partition_idx = 0 if is_overlapped else 1
+        awaitables: List[Awaitable[torch.Tensor]] = []
+
+        for lookup, odist, sharding_ctx, sharding_type in zip(
+            self._embedding_collection._lookups,
+            self._embedding_collection._output_dists,
+            ctx.sharding_contexts,
+            self._embedding_collection._sharding_type_to_sharding,
+        ):
+            # Shallow copy to avoid mutating the original sharding context
+            partition_ctx = copy(sharding_ctx)
+
+            # The original lengths_after_input_dist reflects the full batch.
+            # Replace with this partition's lengths so the embedding AllToAll
+            # knows the correct per-feature sequence lengths for recat.
+            partition_ctx.lengths_after_input_dist = features.lengths().view(
+                -1, features.stride()
+            )
+            # Embedding AllToAll reverses the direction of features AllToAll:
+            partition_ctx.input_splits = collision_splits.output_splits[partition_idx]
+            partition_ctx.output_splits = collision_splits.input_splits[partition_idx]
+
+            # upt maps positions in the full (pre-split) batch. Each partition
+            # only has a subset of values, so the full upt would have wrong size
+            # and wrong index mappings. PEC handles reordering after merging both
+            # partitions via forward_permute from permute_dist.
+            partition_ctx.unbucketize_permute_tensor = None
+
+            embedding_dim = self._embedding_collection._embedding_dim_for_sharding_type(
+                sharding_type
+            )
+            embs = lookup(features)
+            awaitables.append(odist(embs.view(-1, embedding_dim), partition_ctx))
+
+        return awaitables
 
 
 class PECEmbeddingCollectionSharder(BaseEmbeddingSharder[PECEmbeddingCollection]):
