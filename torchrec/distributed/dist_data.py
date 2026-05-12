@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.autograd.profiler import record_function
+from torch.distributed.distributed_c10d import ProcessGroupNCCL
 from torchrec.distributed.comm_ops import (
     all_gather_base_pooled,
     alltoall_pooled,
@@ -93,6 +94,27 @@ except Exception:
 
 
 logger: logging.Logger = logging.getLogger()
+
+
+def check_pg_for_nccl_error(pg: dist.ProcessGroup) -> None:
+    """Raise if the ProcessGroup has been flagged with an NCCL timeout or error."""
+    try:
+        backend = pg._get_backend(torch.device("cuda"))
+    except (RuntimeError, AttributeError):
+        return
+    if not isinstance(backend, ProcessGroupNCCL):
+        return
+    error = backend.get_error()
+    if error != torch._C._distributed_c10d.ErrorType.SUCCESS:
+        pg_name = pg.group_name if hasattr(pg, "group_name") else "unknown"
+        pg_desc = pg.group_desc if hasattr(pg, "group_desc") else ""
+        raise RuntimeError(
+            f"NCCL error detected on ProcessGroup "
+            f"(name={pg_name}, desc={pg_desc}, error={error}). "
+            f"Aborting to prevent silent data corruption "
+            f"from collective failure."
+        )
+
 
 _INT32_MAX: int = 2_147_483_647
 _INT64_MAX: int = 9_223_372_036_854_775_807
@@ -436,6 +458,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         collective_tag_parts: Optional[Tuple[object, ...]] = None,
     ) -> None:
         super().__init__()
+        self._pg: dist.ProcessGroup = pg
         self.num_workers: int = pg.size()
         self._collective_tag = collective_tag
         self._collective_tag_parts = collective_tag_parts
@@ -600,6 +623,12 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                     f"the underlying mismatch will still cause silent data "
                     f"corruption or an NCCL hang downstream."
                 )
+
+        # After .tolist() the CPU has blocked on the GPU.  If a prior
+        # collective timed out the watchdog will have flagged the PG by now.
+        # Check before the overflow validation below so we report "NCCL
+        # timeout" instead of a misleading "int32 overflow on garbage data".
+        check_pg_for_nccl_error(self._pg)
 
         # Check for int32 overflow in AllToAll input. If the input is already
         # corrupted, the corruption happened before the collective.

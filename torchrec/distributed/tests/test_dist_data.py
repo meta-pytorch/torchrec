@@ -29,9 +29,11 @@ import torch
 import torch.distributed as dist
 from hypothesis import given, settings
 from pyre_extensions import none_throws
+from torch.distributed.distributed_c10d import ProcessGroupNCCL
 from torchrec.distributed.dist_data import (
     _collective_tag_from,
     _get_recat,
+    check_pg_for_nccl_error,
     JaggedTensorAllToAll,
     KJTAllToAll,
     KJTAllToAllSplitsAwaitable,
@@ -2416,3 +2418,29 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
             world_size=2,
             backend="gloo",
         )
+
+
+class CheckPgForNcclErrorTest(unittest.TestCase):
+    """Unit tests for the check_pg_for_nccl_error helper."""
+
+    def test_returns_on_success(self) -> None:
+        """NCCL backend with SUCCESS error status should be a no-op."""
+        pg = unittest.mock.MagicMock(spec=dist.ProcessGroup)
+        backend = unittest.mock.MagicMock(spec=ProcessGroupNCCL)
+        backend.get_error.return_value = torch._C._distributed_c10d.ErrorType.SUCCESS
+        pg._get_backend.return_value = backend
+        self.assertIsNone(check_pg_for_nccl_error(pg))
+
+    def test_raises_on_nccl_error(self) -> None:
+        """NCCL backend with a non-SUCCESS error should raise RuntimeError."""
+        pg = unittest.mock.MagicMock(spec=dist.ProcessGroup)
+        pg.group_name = "test_pg"
+        pg.group_desc = "test_desc"
+        backend = unittest.mock.MagicMock(spec=ProcessGroupNCCL)
+        backend.get_error.return_value = torch._C._distributed_c10d.ErrorType.TIMEOUT
+        pg._get_backend.return_value = backend
+        with self.assertRaises(RuntimeError) as ctx:
+            check_pg_for_nccl_error(pg)
+        self.assertIn("NCCL error detected", str(ctx.exception))
+        self.assertIn("test_pg", str(ctx.exception))
+        self.assertIn("test_desc", str(ctx.exception))
