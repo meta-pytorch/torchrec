@@ -237,6 +237,44 @@ def _verify_partition_embeddings(
         torch.testing.assert_close(embs, expected_tensor)
 
 
+def _verify_merged_output(
+    jt_dict: Dict[str, JaggedTensor],
+    kjt_input: KeyedJaggedTensor,
+    original_values: torch.Tensor,
+    original_lengths: torch.Tensor,
+    tables: List[EmbeddingConfig],
+    ref_ec: EmbeddingCollection,
+    device: torch.device,
+) -> None:
+    feature_to_table = {}
+    for table in tables:
+        for fname in table.feature_names:
+            feature_to_table[fname] = table.name
+
+    assert set(jt_dict.keys()) == set(feature_to_table.keys())
+
+    stride = kjt_input.stride()
+    offset = 0
+    for feat_idx, fname in enumerate(kjt_input.keys()):
+        tname = feature_to_table[fname]
+        feat_lengths = original_lengths[feat_idx * stride : (feat_idx + 1) * stride]
+        num_values = feat_lengths.sum().item()
+        feat_ids = original_values[offset : offset + num_values]
+
+        actual_jt = jt_dict[fname]
+        torch.testing.assert_close(actual_jt.lengths().cpu(), feat_lengths)
+        if num_values > 0:
+            expected_embs = torch.stack(
+                [
+                    # pyre-ignore[16]: embeddings[tname] is nn.Embedding
+                    ref_ec.embeddings[tname].weight[vid.item()]
+                    for vid in feat_ids
+                ]
+            ).to(device)
+            torch.testing.assert_close(actual_jt.values(), expected_embs)
+        offset += num_values
+
+
 def _test_pec_forward_stages(
     tables: List[EmbeddingConfig],
     rank: int,
@@ -250,14 +288,17 @@ def _test_pec_forward_stages(
     ref_ec: EmbeddingCollection | None = None,
     expected_ol_per_rank: Dict[int, List[List[Tuple[str, int]]]] | None = None,
     expected_nol_per_rank: Dict[int, List[List[Tuple[str, int]]]] | None = None,
+    verify_merge: bool = False,
     local_size: Optional[int] = None,
 ) -> None:
     """Runs PEC forward pipeline stages and verifies against expected results.
 
     Always runs: input_dist → detect_collisions → split →
-        collision_split_dist → permute_dist.
-    Optionally runs: compute_and_output_dist_in_partition (when ref_ec is provided).
+        collision_split_dist → permute_dist →
+        compute_and_output_dist_in_partition (OL + NOL).
+    Optionally runs: merge_partitioned_embeddings (when verify_merge=True).
     Verification for each stage is enabled by providing its expected-output parameter.
+    Partition and merge verification require ref_ec for weight comparison.
     """
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         sharded_sparse_arch = _shard_pec(tables, ctx, sharder, local_size)
@@ -275,6 +316,8 @@ def _test_pec_forward_stages(
         prev_remapped = None
 
         for batch_idx, kjt_input in enumerate(batches):
+            original_values = kjt_input.values()
+            original_lengths = kjt_input.lengths()
             kjt_input = kjt_input.to(ctx.device)
 
             # Stage 1: input_dist → detect_collisions
@@ -336,7 +379,6 @@ def _test_pec_forward_stages(
                 is_overlapped=True,
             )
             assert len(ol_awaitables) == 1
-            ol_embs = ol_awaitables[0].wait()
 
             nol_awaitables = sharded_pec.compute_and_output_dist_in_partition(
                 pec_ctx,
@@ -345,23 +387,41 @@ def _test_pec_forward_stages(
                 is_overlapped=False,
             )
             assert len(nol_awaitables) == 1
-            nol_embs = nol_awaitables[0].wait()
 
-            if ref_ec is not None:
-                if expected_ol_per_rank is not None:
-                    _verify_partition_embeddings(
-                        ol_embs,
-                        expected_ol_per_rank[rank][batch_idx],
-                        ref_ec,
-                        ctx.device,
-                    )
-                if expected_nol_per_rank is not None:
-                    _verify_partition_embeddings(
-                        nol_embs,
-                        expected_nol_per_rank[rank][batch_idx],
-                        ref_ec,
-                        ctx.device,
-                    )
+            if ref_ec is not None and expected_ol_per_rank is not None:
+                _verify_partition_embeddings(
+                    ol_awaitables[0].wait(),
+                    expected_ol_per_rank[rank][batch_idx],
+                    ref_ec,
+                    ctx.device,
+                )
+            if ref_ec is not None and expected_nol_per_rank is not None:
+                _verify_partition_embeddings(
+                    nol_awaitables[0].wait(),
+                    expected_nol_per_rank[rank][batch_idx],
+                    ref_ec,
+                    ctx.device,
+                )
+
+            # Stage 5: merge_partitioned_embeddings
+            if verify_merge:
+                assert ref_ec is not None
+                lazy_result = sharded_pec.merge_partitioned_embeddings(
+                    pec_ctx,
+                    ol_awaitables,
+                    nol_awaitables,
+                    forward_permutes,
+                )
+                jt_dict = lazy_result.wait()
+                _verify_merged_output(
+                    jt_dict,
+                    kjt_input,
+                    original_values,
+                    original_lengths,
+                    tables,
+                    ref_ec,
+                    ctx.device,
+                )
 
             prev_remapped = [r.remapped_feature_values for r in results]
 
@@ -655,4 +715,28 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
             ref_ec=ref_ec,
             expected_ol_per_rank=expected_ol,
             expected_nol_per_rank=expected_nol,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_merge_partitioned_embeddings(self) -> None:
+        """Tests merged output matches expected embeddings from ref EC."""
+        WORLD_SIZE = 2
+
+        ref_ec = EmbeddingCollection(
+            tables=EMBEDDING_TABLES,
+            device=torch.device("cpu"),
+        )
+
+        self._run_multi_process_test(
+            callable=_test_pec_forward_stages,
+            world_size=WORLD_SIZE,
+            tables=EMBEDDING_TABLES,
+            kjt_input_per_rank=CROSS_SHARD_KJT_INPUT_PER_RANK,
+            sharder=PECEmbeddingCollectionSharder(),
+            backend="nccl",
+            ref_ec=ref_ec,
+            verify_merge=True,
         )
