@@ -175,7 +175,10 @@ def train(
     checkpoint_pg = dist.new_group(backend="gloo")
     # Copy sharded state_dict to CPU.
     cpu_state_dict = state_dict_to_device(
-        model.state_dict(), pg=checkpoint_pg, device=torch.device("cpu")
+        # pyrefly: ignore
+        model.state_dict(),
+        pg=checkpoint_pg,  # pyrefly: ignore
+        device=torch.device("cpu"),
     )
 
     ebc_cpu = EmbeddingBagCollection(
