@@ -10,12 +10,12 @@
 
 from __future__ import annotations
 
+from copy import copy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Type
 
 import torch
 import torch.nn as nn
-from torchrec.distributed.dist_data import SplitsAllToAllAwaitable
 from torchrec.distributed.embedding import (
     EmbeddingCollectionContext,
     EmbeddingCollectionSharder,
@@ -28,7 +28,9 @@ from torchrec.distributed.embedding_types import (
 )
 from torchrec.distributed.pec_collision_handlers import (
     CollisionHandlerBase,
+    CollisionPermutation,
     CollisionResult,
+    CollisionSplits,
     create_collision_handler,
 )
 from torchrec.distributed.types import (
@@ -40,6 +42,7 @@ from torchrec.distributed.types import (
     ShardingType,
 )
 from torchrec.modules.pec_embedding_modules import PECEmbeddingCollection
+from torchrec.modules.utils import construct_jagged_tensors
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
@@ -54,65 +57,66 @@ class PECEmbeddingCollectionContext(EmbeddingCollectionContext):
     prev_remapped_feature_values: List[torch.Tensor] | None = None
 
 
-@dataclass
-class CollisionSplits:
-    """Result of waiting on CollisionSplitsAwaitable.
+class PECEmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
+    """Merges overlapped and nonoverlapped embedding partitions.
 
-    input_splits: [ol_per_rank, nol_per_rank] — how many values this rank
-        sends to each other rank per partition.
-    output_splits: [ol_received, nol_received] — how many values this rank
-        receives from each other rank per partition.
-    """
-
-    input_splits: List[List[int]]
-    output_splits: List[List[int]]
-
-
-class CollisionSplitsAwaitable(Awaitable[List[CollisionSplits]]):
-    """Awaitable for PEC collision split sizes, one per sharding group.
-
-    Wraps a SplitsAllToAllAwaitable that exchanges nonoverlapped per-rank
-    counts. On wait(), derives overlapped received splits from
-    total - nol_received, then assembles per-group CollisionSplits.
-
-    Args:
-        ol_input_splits: per-group overlapped send counts, each [world_size].
-        nol_input_splits: per-group nonoverlapped send counts, each [world_size].
-        splits_awaitable: SplitsAllToAll that exchanges nol counts across ranks.
-        total_input_splits: per-group total receive counts from input_dist,
-            each [world_size]. Used to derive ol_received = total - nol_received.
+    On wait, concatenates [ol, nol] embeddings per sharding group and applies
+    the corresponding forward_permute to restore original order, then constructs
+    Dict[str, JaggedTensor] output via construct_jagged_tensors.
     """
 
     def __init__(
         self,
-        ol_input_splits: List[List[int]],
-        nol_input_splits: List[List[int]],
-        splits_awaitable: SplitsAllToAllAwaitable,
-        total_input_splits: List[List[int]],
+        overlapped_awaitables: List[Awaitable[torch.Tensor]],
+        nonoverlapped_awaitables: List[Awaitable[torch.Tensor]],
+        permutations: List[CollisionPermutation],
+        features_per_sharding: List[KeyedJaggedTensor],
+        embedding_names_per_sharding: List[List[str]],
+        need_indices: bool,
+        features_to_permute_indices: Dict[str, List[int]],
     ) -> None:
         super().__init__()
-        self._ol_input_splits = ol_input_splits
-        self._nol_input_splits = nol_input_splits
-        self._splits_awaitable = splits_awaitable
-        self._total_input_splits = total_input_splits
+        # PEC-specific: partition awaitables and permutation results (per group)
+        self._overlapped_awaitables = overlapped_awaitables
+        self._nonoverlapped_awaitables = nonoverlapped_awaitables
+        self._permutations = permutations
 
-    def _wait_impl(self) -> List[CollisionSplits]:
-        result = self._splits_awaitable.wait()
-        splits: List[CollisionSplits] = []
-        for nol_received, ol_input, nol_input, total in zip(
-            result,
-            self._ol_input_splits,
-            self._nol_input_splits,
-            self._total_input_splits,
+        # From EC: used by construct_jagged_tensors to build output
+        self._features_per_sharding = features_per_sharding
+        self._embedding_names_per_sharding = embedding_names_per_sharding
+        self._need_indices = need_indices
+
+        # CW-only: reorders column shards from rank-grouped to original order.
+        # Empty dict for RW sharding (PEC currently only supports RW).
+        self._features_to_permute_indices = features_to_permute_indices
+
+    def _wait_impl(self) -> Dict[str, JaggedTensor]:
+        jt_dict: Dict[str, JaggedTensor] = {}
+
+        for ol_aw, nol_aw, perm, features, embedding_names in zip(
+            self._overlapped_awaitables,
+            self._nonoverlapped_awaitables,
+            self._permutations,
+            self._features_per_sharding,
+            self._embedding_names_per_sharding,
         ):
-            ol_received = [total[r] - nol_received[r] for r in range(len(nol_received))]
-            splits.append(
-                CollisionSplits(
-                    input_splits=[ol_input, nol_input],
-                    output_splits=[ol_received, nol_received],
+            ol_embs = ol_aw.wait()
+            nol_embs = nol_aw.wait()
+
+            merged_embs = torch.cat([ol_embs, nol_embs], dim=0)
+            embeddings = torch.index_select(merged_embs, 0, perm.forward_permute)
+
+            jt_dict.update(
+                construct_jagged_tensors(
+                    embeddings=embeddings,
+                    features=features,
+                    embedding_names=embedding_names,
+                    need_indices=self._need_indices,
+                    features_to_permute_indices=self._features_to_permute_indices,
                 )
             )
-        return splits
+
+        return jt_dict
 
 
 class ShardedPECEmbeddingCollection(
@@ -197,7 +201,7 @@ class ShardedPECEmbeddingCollection(
         ctx: PECEmbeddingCollectionContext,
         dist_input: KJTList,
     ) -> List[CollisionResult]:
-        """Detect collisions for each sharding group's features.
+        """Detects collisions for each sharding group's features.
 
         Reads ctx.prev_remapped_feature_values (set by the pipeline from the
         previous batch's CollisionResult). Returns masks only — KJT splitting
@@ -225,109 +229,200 @@ class ShardedPECEmbeddingCollection(
         self,
         ctx: PECEmbeddingCollectionContext,
         nonoverlapped_features: List[KeyedJaggedTensor],
-    ) -> CollisionSplitsAwaitable:
-        """Starts AllToAll to exchange per-rank nonoverlapped/overlapped split
-        sizes.
+    ) -> List[Awaitable[CollisionSplits]]:
+        """Exchanges per-rank overlapped/nonoverlapped split sizes via AllToAll.
 
-        For each sharding group, computes how many nonoverlapped values this
-        rank sends to each other rank (nol_per_rank), derives the overlapped
-        counts (ol_per_rank = total - nol), and bundles all groups into a
-        single SplitsAllToAll. On wait, the received nol counts are used to
-        derive the received ol counts.
+        Delegates to each handler's split_dist. Each awaitable resolves
+        to CollisionSplits with per-rank send/receive counts for
+        overlapped and nonoverlapped partitions.
 
         Args:
             ctx: PEC context (sharding_contexts must be set from input_dist)
             nonoverlapped_features: one nonoverlapped KJT per
                 sharding group, from split_features_by_values_mask()
+                # TODO: test with multiple sharding groups
 
         Returns:
-            CollisionSplitsAwaitable that resolves to CollisionSplits.
-            # TODO: test with multiple sharding groups
+            List of Awaitable[CollisionSplits], one per sharding group.
         """
-        # Per-group value counts for the overlapped partition. Derived from
-        # output splits form input dist, and will be used in output dist.
-        ol_input_splits: List[List[int]] = []
-
-        # Per-group value counts for non-overlapped partition. Derived from
-        # output splits from input dist, and will be used in output dist.
-        nol_input_splits: List[List[int]] = []
-
-        # Per-group split tensors for the nonoverlapped partition. Exchanged
-        # via SplitsAllToAll.
-        nol_splits: List[torch.Tensor] = []
-
-        # Per-group total receive counts from input_dist, used by the
-        # awaitable to derive ol_received = total - nol_received.
-        total_input_splits: List[List[int]] = []
-
-        for handler, nol_features, sharding_ctx in zip(
-            self._collision_handlers,
-            nonoverlapped_features,
-            ctx.sharding_contexts,
-        ):
-            assert sharding_ctx.batch_size_per_rank is not None
-            nol = handler.compute_nonoverlapped_per_rank(
-                nol_features, sharding_ctx.batch_size_per_rank
+        return [
+            handler.split_dist(
+                nol_features,
+                sharding_ctx,
             )
-            ol = (
-                torch.tensor(
-                    sharding_ctx.output_splits,
-                    device=nol.device,
-                    dtype=nol.dtype,
-                )
-                - nol
+            for handler, nol_features, sharding_ctx in zip(
+                self._collision_handlers,
+                nonoverlapped_features,
+                ctx.sharding_contexts,
             )
-
-            nol_splits.append(nol)
-
-            ol_input_splits.append(ol.tolist())
-            nol_input_splits.append(nol.tolist())
-            total_input_splits.append(sharding_ctx.input_splits)
-
-        assert self._env.process_group is not None
-        splits_awaitable = SplitsAllToAllAwaitable(nol_splits, self._env.process_group)
-
-        return CollisionSplitsAwaitable(
-            ol_input_splits=ol_input_splits,
-            nol_input_splits=nol_input_splits,
-            splits_awaitable=splits_awaitable,
-            total_input_splits=total_input_splits,
-        )
+        ]
 
     def permute_dist(
         self,
         ctx: PECEmbeddingCollectionContext,
         features_per_group: List[KeyedJaggedTensor],
-        forward_overlap_masks: List[torch.Tensor],
-    ) -> List[Awaitable[torch.Tensor]]:
-        """Distributes collision partition permutations via AllToAll.
+        overlap_results: List[CollisionResult],
+        prev_ctx: PECEmbeddingCollectionContext | None = None,
+        prev_features_per_group: List[KeyedJaggedTensor] | None = None,
+    ) -> List[Awaitable[CollisionPermutation]]:
+        """Distributes forward and backward partition permutations via AllToAll.
 
-        Delegates to each handler's permute_dist. Each awaitable resolves
-        to a forward_permute tensor for reordering merged [ol, nol]
-        embeddings back to original order.
+        PEC partitions each batch into overlapped (ol) and nonoverlapped (nol)
+        values relative to the previous batch. The nol partition's lookup can
+        start early in batch i - 1 since those values don't conflict. The ol
+        partition must wait for batch i-1's gradient update before lookup.
+
+        Forward mask (batch i): produces forward_permute for merging [ol, nol]
+        embeddings back to original order after both lookups complete.
+
+        Backward mask (batch i-1): produces backward_permute for re-splitting
+        batch i-1's gradients into ol/nol. The ol gradient update of batch i - 1
+        must finish before batch i's ol lookup can proceed. The nol gradient
+        update of batch i - 1 can be deferred further into batch i since those
+        values don't conflict.
+
+        Both AllToAlls are fired together per handler for batching. The
+        backward mask lives on the previous batch's sharding ranks, so its
+        AllToAll needs prev_features (for lengths) and prev_ctx (for splits
+        and unbucketize_permute). The pipeline saves these across batches.
+
+        Args:
+            ctx: PEC context for current batch (sharding contexts as state)
+            features_per_group: current batch features after input_dist
+            overlap_results: from detect_collisions, contains both forward
+                and backward overlap masks
+            prev_ctx: previous batch's PEC context, needed for backward mask
+                AllToAll (None for first batch)
+            prev_features_per_group: previous batch's features after input_dist,
+                needed for backward mask AllToAll (None for first batch)
+
+        Returns:
+            List of Awaitable[CollisionPermutation], one per sharding group.
+        """
+        awaitables: List[Awaitable[CollisionPermutation]] = []
+
+        for i, (handler, features, result, sharding_ctx) in enumerate(
+            zip(
+                self._collision_handlers,
+                features_per_group,
+                overlap_results,
+                ctx.sharding_contexts,
+            )
+        ):
+            bwd_mask = result.backward_overlap_mask
+            prev_features = None
+            prev_sharding_ctx = None
+
+            if bwd_mask is not None:
+                assert prev_ctx is not None
+                assert prev_features_per_group is not None
+                prev_features = prev_features_per_group[i]
+                prev_sharding_ctx = prev_ctx.sharding_contexts[i]
+
+            awaitables.append(
+                handler.permute_dist(
+                    features,
+                    sharding_ctx,
+                    result.forward_overlap_mask,
+                    prev_features=prev_features,
+                    prev_sharding_ctx=prev_sharding_ctx,
+                    backward_overlap_mask=bwd_mask,
+                )
+            )
+
+        return awaitables
+
+    def compute_and_output_dist_in_partition(
+        self,
+        ctx: PECEmbeddingCollectionContext,
+        features: KeyedJaggedTensor,
+        collision_splits: CollisionSplits,
+        is_overlapped: bool,
+    ) -> List[Awaitable[torch.Tensor]]:
+        """Performs embedding lookup and output AllToAll for one partition.
+
+        Looks up embeddings for the partition's features using the inner EC's
+        lookup module, then AllToAll's the results back using partition-specific
+        splits. The embedding AllToAll reverses the direction of the features
+        AllToAll, so collision output_splits become embedding input_splits.
 
         Args:
             ctx: PEC context (sharding_contexts must be set from input_dist)
-            features_per_group: per-group features after input_dist (for lengths)
-            forward_overlap_masks: per-group bool masks for overlapped values
+            features: partition features (ol or nol KJT)
+            collision_splits: splits from split_dist
+            is_overlapped: True for overlapped partition, False for nonoverlapped
 
         Returns:
-            List of Awaitable[torch.Tensor], one per sharding group, each
-            resolving to a forward_permute tensor.
+            List of Awaitable[torch.Tensor], one per sharding group.
         """
-        return [
-            handler.permute_dist(
-                features,
-                mask,
-                sharding_ctx,
+        partition_idx = 0 if is_overlapped else 1
+        ec = self._embedding_collection
+        awaitables: List[Awaitable[torch.Tensor]] = []
+
+        for lookup, odist, sharding_ctx, sharding_type in zip(
+            ec._lookups,
+            ec._output_dists,
+            ctx.sharding_contexts,
+            ec._sharding_type_to_sharding,
+        ):
+            partition_ctx = copy(sharding_ctx)
+
+            # Replace full-batch lengths with this partition's lengths.
+            partition_ctx.lengths_after_input_dist = features.lengths().view(
+                -1, features.stride()
             )
-            for handler, features, mask, sharding_ctx in zip(
-                self._collision_handlers,
-                features_per_group,
-                forward_overlap_masks,
-                ctx.sharding_contexts,
-            )
+
+            # Reverse direction: collision output → embedding input.
+            partition_ctx.input_splits = collision_splits.output_splits[partition_idx]
+            partition_ctx.output_splits = collision_splits.input_splits[partition_idx]
+
+            # upt maps positions in the full (pre-split) batch — wrong size for
+            # a partition. Reordering is handled by forward_permute after merge.
+            partition_ctx.unbucketize_permute_tensor = None
+
+            embedding_dim = ec._embedding_dim_for_sharding_type(sharding_type)
+            embs = lookup(features)
+            awaitables.append(odist(embs.view(-1, embedding_dim), partition_ctx))
+
+        return awaitables
+
+    def merge_partitioned_embeddings(
+        self,
+        ctx: PECEmbeddingCollectionContext,
+        overlapped_awaitables: List[Awaitable[torch.Tensor]],
+        nonoverlapped_awaitables: List[Awaitable[torch.Tensor]],
+        permutations: List[CollisionPermutation],
+    ) -> LazyAwaitable[Dict[str, JaggedTensor]]:
+        """Creates a LazyAwaitable that merges ol/nol embeddings on wait.
+
+        On wait: waits on both partition awaitables, concatenates [ol, nol],
+        applies forward_permute to restore original order, and constructs
+        the final Dict[str, JaggedTensor].
+
+        Args:
+            ctx: PEC context (sharding_contexts must be set from input_dist)
+            overlapped_awaitables: from compute_and_output_dist_in_partition(is_overlapped=True)
+            nonoverlapped_awaitables: from compute_and_output_dist_in_partition(is_overlapped=False)
+            permutations: from permute_dist, one per sharding group
+
+        Returns:
+            LazyAwaitable resolving to Dict[str, JaggedTensor].
+        """
+        ec = self._embedding_collection
+        features_per_sharding = [
+            # pyre-ignore[6]
+            sharding_ctx.features_before_input_dist
+            for sharding_ctx in ctx.sharding_contexts
         ]
+        return PECEmbeddingCollectionAwaitable(
+            overlapped_awaitables=overlapped_awaitables,
+            nonoverlapped_awaitables=nonoverlapped_awaitables,
+            permutations=permutations,
+            features_per_sharding=features_per_sharding,
+            embedding_names_per_sharding=ec._embedding_names_per_sharding,
+            need_indices=ec._need_indices,
+            features_to_permute_indices=ec._features_to_permute_indices,
+        )
 
 
 class PECEmbeddingCollectionSharder(BaseEmbeddingSharder[PECEmbeddingCollection]):

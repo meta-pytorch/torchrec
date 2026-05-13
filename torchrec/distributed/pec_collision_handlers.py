@@ -15,7 +15,10 @@ from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
-from torchrec.distributed.dist_data import TensorAllToAllValuesAwaitable
+from torchrec.distributed.dist_data import (
+    SplitsAllToAllAwaitable,
+    TensorAllToAllValuesAwaitable,
+)
 from torchrec.distributed.embedding_types import GroupedEmbeddingConfig
 from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.types import Awaitable
@@ -81,7 +84,7 @@ class BooleanMaskChecker:
         self._seen_values.zero_()
 
     def update(self, remapped_feature_values: torch.Tensor) -> None:
-        """Mark values as seen. Resets first (only current batch matters)."""
+        """Marks values as seen. Resets first (only current batch matters)."""
         self.reset_mask()
         self._seen_values[remapped_feature_values] = True
 
@@ -89,7 +92,7 @@ class BooleanMaskChecker:
         self,
         remapped_feature_values: torch.Tensor,
     ) -> torch.Tensor:
-        """Return bool mask: True where values overlap with previously-seen values."""
+        """Returns bool mask: True where values overlap with previously-seen values."""
         return self._seen_values[remapped_feature_values]
 
 
@@ -97,7 +100,7 @@ def split_features_by_values_mask(
     features: KeyedJaggedTensor,
     overlap_mask: torch.Tensor,
 ) -> Tuple[KeyedJaggedTensor, KeyedJaggedTensor]:
-    """Split KJT into overlapped and nonoverlapped partitions by bool mask.
+    """Splits KJT into overlapped and nonoverlapped partitions by bool mask.
 
     Uses fbgemm.asynchronous_complete_cumsum + fbgemm.segment_sum_csr to
     compute per-segment lengths for each partition efficiently.
@@ -147,43 +150,145 @@ def split_features_by_values_mask(
     return overlapped_kjt, nonoverlapped_kjt
 
 
-class ForwardPermuteAwaitable(Awaitable[torch.Tensor]):
-    """RW-specific awaitable that computes forward_permute from a received mask.
+@dataclass
+class CollisionPermutation:
+    """Result of permute_dist for a single sharding group.
 
-    On wait(), receives the mask via AllToAll, then builds forward_permute:
-    a tensor for reordering merged [ol_embs, nol_embs] back to original
-    order via index_select.
+    Attributes:
+        forward_permute: For batch i — merges [ol, nol] embeddings back to
+            original order. Nonoverlapped values don't conflict with batch
+            i-1, so their lookup can start early (overlapped with i-1's
+            backward). Overlapped values must wait for i-1's gradient update.
+            Usage: index_select(cat([ol_embs, nol_embs]), 0, forward_permute)
 
-    The received mask is in bucketized order (values sent to shard 0 first,
-    then shard 1, etc.). unbucketize_permute_tensor maps original position i
-    to bucket position upt[i]. We compose these to build forward_permute[i] =
-    position in merged [ol_embs, nol_embs] for original position i.
+        backward_permute: For batch i-1 — reorders batch i-1's values to
+            [ol first, nol second] so gradients can be re-split. The ol
+            gradient update must complete before batch i's overlapped lookup.
+            None for the first batch.
+
+        backward_num_ol: Partition point in backward_permute.
+            backward_permute[:backward_num_ol] are overlapped indices.
+    """
+
+    forward_permute: torch.Tensor
+    backward_permute: torch.Tensor | None = None
+    backward_num_ol: int = 0
+
+
+def _compute_permute_from_mask(
+    bool_mask: torch.Tensor,
+    unbucketize_permute_tensor: torch.Tensor,
+) -> torch.Tensor:
+    """Computes a permute tensor from a received overlap mask and upt.
+
+    The mask is in bucketized order (shard 0 values first, then shard 1, etc.).
+    Builds a mapping from original position to position in merged [ol, nol],
+    composed with unbucketize_permute_tensor.
+
+    Example: bool_mask = [T, F, T, T, F, F]
+      ol_rank  = cumsum([1,0,1,1,0,0]) - 1 = [0, 0, 1, 2, 2, 2]
+      nol_rank = cumsum([0,1,0,0,1,1]) - 1 + 3 = [2, 3, 3, 3, 4, 5]
+      bucket_to_merged = where(mask, ol_rank, nol_rank) = [0, 3, 1, 2, 4, 5]
+    """
+    num_ol = bool_mask.sum()
+
+    ol_rank = bool_mask.long().cumsum(0) - 1
+    nol_rank = (~bool_mask).long().cumsum(0) - 1 + num_ol
+    bucket_to_merged = torch.where(bool_mask, ol_rank, nol_rank)
+
+    return bucket_to_merged[unbucketize_permute_tensor]
+
+
+class CollisionPermuteAwaitable(Awaitable[CollisionPermutation]):
+    """RW-specific awaitable that produces CollisionPermutation from received masks.
+
+    On wait(), receives forward (and optionally backward) masks via AllToAll,
+    then builds permute tensors by composing with unbucketize_permute_tensor.
     """
 
     def __init__(
         self,
-        values_awaitable: TensorAllToAllValuesAwaitable,
-        unbucketize_permute_tensor: torch.Tensor,
+        fwd_awaitable: TensorAllToAllValuesAwaitable,
+        fwd_unbucketize_permute: torch.Tensor,
+        bwd_awaitable: TensorAllToAllValuesAwaitable | None = None,
+        bwd_unbucketize_permute: torch.Tensor | None = None,
     ) -> None:
         super().__init__()
-        self._values_awaitable = values_awaitable
-        self._unbucketize_permute_tensor = unbucketize_permute_tensor
+        self._fwd_awaitable = fwd_awaitable
+        self._fwd_unbucketize_permute = fwd_unbucketize_permute
+        self._bwd_awaitable = bwd_awaitable
+        self._bwd_unbucketize_permute = bwd_unbucketize_permute
 
-    def _wait_impl(self) -> torch.Tensor:
-        received_mask = self._values_awaitable.wait()
-        bool_mask = received_mask.bool()
-        upt = self._unbucketize_permute_tensor
-        num_ol = bool_mask.sum()
+    def _wait_impl(self) -> CollisionPermutation:
+        fwd_mask = self._fwd_awaitable.wait().bool()
+        forward_permute = _compute_permute_from_mask(
+            fwd_mask, self._fwd_unbucketize_permute
+        )
 
-        # Example: bool_mask = [T, F, T, T, F, F]
-        #   ol_rank  = cumsum([1,0,1,1,0,0]) - 1 = [0, 0, 1, 2, 2, 2]
-        #   nol_rank = cumsum([0,1,0,0,1,1]) - 1 + 3 = [2, 3, 3, 3, 4, 5]
-        #   bucket_to_merged = where(mask, ol_rank, nol_rank) = [0, 3, 1, 2, 4, 5]
-        ol_rank = bool_mask.long().cumsum(0) - 1
-        nol_rank = (~bool_mask).long().cumsum(0) - 1 + num_ol
-        bucket_to_merged = torch.where(bool_mask, ol_rank, nol_rank)
+        backward_permute = None
+        backward_num_ol = 0
 
-        return bucket_to_merged[upt]
+        if self._bwd_awaitable is not None:
+            assert self._bwd_unbucketize_permute is not None
+            bwd_mask = self._bwd_awaitable.wait().bool()
+            backward_permute = _compute_permute_from_mask(
+                bwd_mask, self._bwd_unbucketize_permute
+            )
+            backward_num_ol = int(bwd_mask.sum().item())
+
+        return CollisionPermutation(
+            forward_permute=forward_permute,
+            backward_permute=backward_permute,
+            backward_num_ol=backward_num_ol,
+        )
+
+
+@dataclass
+class CollisionSplits:
+    """Per-rank split sizes for overlapped/nonoverlapped partitions.
+
+    input_splits: [ol_per_rank, nol_per_rank] — how many values this rank
+        sends to each other rank per partition.
+    output_splits: [ol_received, nol_received] — how many values this rank
+        receives from each other rank per partition.
+    """
+
+    input_splits: List[List[int]]
+    output_splits: List[List[int]]
+
+
+class CollisionSplitsAwaitable(Awaitable[CollisionSplits]):
+    """Resolves to CollisionSplits for a single sharding group.
+
+    Wraps a SplitsAllToAllAwaitable that exchanges nonoverlapped per-rank
+    counts. On wait(), derives overlapped received splits from
+    total - nol_received, then assembles CollisionSplits.
+    """
+
+    def __init__(
+        self,
+        ol_input_splits: List[int],
+        nol_input_splits: List[int],
+        splits_awaitable: SplitsAllToAllAwaitable,
+        total_input_splits: List[int],
+    ) -> None:
+        super().__init__()
+        self._ol_input_splits = ol_input_splits
+        self._nol_input_splits = nol_input_splits
+        self._splits_awaitable = splits_awaitable
+        self._total_input_splits = total_input_splits
+
+    def _wait_impl(self) -> CollisionSplits:
+        result = self._splits_awaitable.wait()
+        nol_received = result[0]
+        ol_received = [
+            self._total_input_splits[r] - nol_received[r]
+            for r in range(len(nol_received))
+        ]
+        return CollisionSplits(
+            input_splits=[self._ol_input_splits, self._nol_input_splits],
+            output_splits=[ol_received, nol_received],
+        )
 
 
 class CollisionHandlerBase(abc.ABC):
@@ -198,7 +303,7 @@ class CollisionHandlerBase(abc.ABC):
         features: KeyedJaggedTensor,
         prev_remapped_feature_values: torch.Tensor | None = None,
     ) -> CollisionResult:
-        """Detect overlapping IDs between current and previous batch.
+        """Detects overlapping IDs between current and previous batch.
 
         Args:
             features: current batch features (after input dist)
@@ -211,45 +316,59 @@ class CollisionHandlerBase(abc.ABC):
 
     @abc.abstractmethod
     def reset(self) -> None:
-        """Reset internal state (e.g. at epoch boundary)."""
+        """Resets internal state (e.g. at epoch boundary)."""
         ...
 
     @abc.abstractmethod
     def permute_dist(
         self,
+        # Forward: current batch
         features: KeyedJaggedTensor,
-        forward_overlap_mask: torch.Tensor,
         sharding_ctx: SequenceShardingContext,
-    ) -> Awaitable[torch.Tensor]:
-        """Distribute the collision partition permutation via AllToAll.
+        forward_overlap_mask: torch.Tensor,
+        # Backward: previous batch (all None for first batch)
+        prev_features: KeyedJaggedTensor | None = None,
+        prev_sharding_ctx: SequenceShardingContext | None = None,
+        backward_overlap_mask: torch.Tensor | None = None,
+    ) -> Awaitable[CollisionPermutation]:
+        """Distributes forward and backward partition permutations via AllToAll.
 
-        Sends overlap information from sharding ranks back to the original
-        rank and computes forward_permute — a tensor for reordering merged
-        [ol, nol] embeddings back to original order via index_select.
+        Sends forward overlap mask (current batch) and optionally backward
+        overlap mask (previous batch) from sharding ranks back to the original
+        rank. Both AllToAlls are fired together for batching.
+
+        Args:
+            features: current batch features after input_dist
+            sharding_ctx: current batch's sharding context
+            forward_overlap_mask: current batch's overlap mask
+            prev_features: previous batch's features (None for first batch)
+            prev_sharding_ctx: previous batch's sharding context
+            backward_overlap_mask: previous batch's backward mask
 
         Returns:
-            Awaitable resolving to forward_permute tensor of shape [N].
+            Awaitable resolving to CollisionPermutation.
         """
         ...
 
     @abc.abstractmethod
-    def compute_nonoverlapped_per_rank(
+    def split_dist(
         self,
         nonoverlapped_features: KeyedJaggedTensor,
-        batch_size_per_rank: List[int],
-    ) -> torch.Tensor:
-        """Computes per-rank nonoverlapped value counts.
+        sharding_ctx: SequenceShardingContext,
+    ) -> Awaitable[CollisionSplits]:
+        """Exchanges per-rank overlapped/nonoverlapped split sizes via AllToAll.
 
-        Used by collision_split_dist to compute per-rank split sizes for
-        the nonoverlapped partition. The overlapped splits are derived from
-        the total (output_splits - nonoverlapped).
+        Computes how many nonoverlapped values this rank sends to each peer
+        rank, derives the overlapped counts from the total, and starts a
+        SplitsAllToAll. Returns an awaitable that resolves to CollisionSplits.
 
         Args:
             nonoverlapped_features: nonoverlapped partition KJT
-            batch_size_per_rank: number of batch elements from each rank
+            sharding_ctx: sharding context from input_dist
 
         Returns:
-            Tensor of shape [world_size] with per-rank nonoverlapped value counts
+            Awaitable resolving to CollisionSplits with per-rank send/receive
+            counts for each partition.
         """
         ...
 
@@ -341,7 +460,7 @@ class RWCollisionHandler(CollisionHandlerBase):
     def reset(self) -> None:
         self._checker.reset_mask()
 
-    def compute_nonoverlapped_per_rank(
+    def _compute_nonoverlapped_per_rank(
         self,
         nonoverlapped_features: KeyedJaggedTensor,
         batch_size_per_rank: List[int],
@@ -368,18 +487,45 @@ class RWCollisionHandler(CollisionHandlerBase):
             num_features, batch_size_cumsum, lengths_batch_major
         )
 
-    def permute_dist(
+    def split_dist(
+        self,
+        nonoverlapped_features: KeyedJaggedTensor,
+        sharding_ctx: SequenceShardingContext,
+    ) -> CollisionSplitsAwaitable:
+        """Computes per-rank ol/nol split sizes and exchanges via AllToAll."""
+        assert sharding_ctx.batch_size_per_rank is not None
+        nol = self._compute_nonoverlapped_per_rank(
+            nonoverlapped_features, sharding_ctx.batch_size_per_rank
+        )
+        ol = (
+            torch.tensor(
+                sharding_ctx.output_splits,
+                device=nol.device,
+                dtype=nol.dtype,
+            )
+            - nol
+        )
+
+        splits_awaitable = SplitsAllToAllAwaitable([nol], self._pg)
+
+        return CollisionSplitsAwaitable(
+            ol_input_splits=ol.tolist(),
+            nol_input_splits=nol.tolist(),
+            splits_awaitable=splits_awaitable,
+            total_input_splits=sharding_ctx.input_splits,
+        )
+
+    def _mask_dist(
         self,
         features: KeyedJaggedTensor,
-        forward_overlap_mask: torch.Tensor,
         sharding_ctx: SequenceShardingContext,
-    ) -> ForwardPermuteAwaitable:
-        """Reorder mask to rank-major, AllToAll to original rank, compute forward_permute."""
+        overlap_mask: torch.Tensor,
+    ) -> TensorAllToAllValuesAwaitable:
+        """Permutes mask to rank-major order and starts reverse AllToAll."""
         assert sharding_ctx.sparse_features_recat is not None
-        assert sharding_ctx.unbucketize_permute_tensor is not None
 
         recat = torch.ops.fbgemm.invert_permute(sharding_ctx.sparse_features_recat)
-        mask_int = forward_overlap_mask.to(torch.int32)
+        mask_int = overlap_mask.to(torch.int32)
 
         _, permuted_mask, _ = torch.ops.fbgemm.permute_2D_sparse_data(
             recat,
@@ -389,7 +535,7 @@ class RWCollisionHandler(CollisionHandlerBase):
             mask_int.numel(),
         )
 
-        values_awaitable = TensorAllToAllValuesAwaitable(
+        return TensorAllToAllValuesAwaitable(
             self._pg,
             permuted_mask,
             input_splits=torch.tensor(
@@ -403,9 +549,44 @@ class RWCollisionHandler(CollisionHandlerBase):
             device=permuted_mask.device,
         )
 
-        return ForwardPermuteAwaitable(
-            values_awaitable=values_awaitable,
-            unbucketize_permute_tensor=sharding_ctx.unbucketize_permute_tensor,
+    def permute_dist(
+        self,
+        features: KeyedJaggedTensor,
+        sharding_ctx: SequenceShardingContext,
+        forward_overlap_mask: torch.Tensor,
+        prev_features: KeyedJaggedTensor | None = None,
+        prev_sharding_ctx: SequenceShardingContext | None = None,
+        backward_overlap_mask: torch.Tensor | None = None,
+    ) -> CollisionPermuteAwaitable:
+        """Fires forward (and optionally backward) mask AllToAlls together."""
+        assert sharding_ctx.unbucketize_permute_tensor is not None
+
+        fwd_awaitable = self._mask_dist(
+            features,
+            sharding_ctx,
+            forward_overlap_mask,
+        )
+
+        bwd_awaitable = None
+        bwd_unbucketize_permute = None
+
+        if backward_overlap_mask is not None:
+            assert prev_features is not None
+            assert prev_sharding_ctx is not None
+            assert prev_sharding_ctx.unbucketize_permute_tensor is not None
+
+            bwd_awaitable = self._mask_dist(
+                prev_features,
+                prev_sharding_ctx,
+                backward_overlap_mask,
+            )
+            bwd_unbucketize_permute = prev_sharding_ctx.unbucketize_permute_tensor
+
+        return CollisionPermuteAwaitable(
+            fwd_awaitable=fwd_awaitable,
+            fwd_unbucketize_permute=sharding_ctx.unbucketize_permute_tensor,
+            bwd_awaitable=bwd_awaitable,
+            bwd_unbucketize_permute=bwd_unbucketize_permute,
         )
 
 
@@ -417,7 +598,7 @@ def create_collision_handler(
     process_group: dist.ProcessGroup,
     checker_type: OverlappingCheckerType,
 ) -> CollisionHandlerBase:
-    """Factory function to create a collision handler for a given sharding type."""
+    """Creates a collision handler for the given sharding type."""
     if sharding_type == "row_wise":
         return RWCollisionHandler(
             device=device,

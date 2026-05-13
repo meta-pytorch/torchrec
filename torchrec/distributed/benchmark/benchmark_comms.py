@@ -794,6 +794,96 @@ def multi_async_comms(
         assert checks.item()
 
 
+def competing_comms(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    wait_for_comm1: bool = False,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Two collectives (a2a on pg1, all_reduce on pg2) on separate streams
+    with independent NCCL communicators. When wait_for_comm1=False (default),
+    both comms compete freely. When wait_for_comm1=True, stream_b waits
+    for comm1 to finish before issuing comm2.
+    """
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        stream_a = torch.cuda.Stream()
+        stream_b = torch.cuda.Stream()
+        # pyrefly: ignore[missing-attribute]
+        ar_pg = competing_comms._ar_pg
+        dist.barrier(group=ar_pg)
+
+    with record_function("## pre-comms compute ##"):
+        input_a = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+        input_b = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat * 2, ctx=ctx)
+
+    with record_function("## comm1: a2a on stream_a ##"):
+        out_a = torch.zeros_like(input_a)
+        out_a.record_stream(stream_a)
+        with torch.cuda.stream(stream_a):
+            stream_a.wait_stream(main_stream)
+            req_a = dist.all_to_all_single(
+                output=out_a,
+                input=input_a,
+                group=ctx.pg,
+                async_op=True,
+            )
+
+    with record_function("## comm2: all_reduce on stream_b ##"):
+        out_b = input_b.clone()
+        out_b.record_stream(stream_b)
+        with torch.cuda.stream(stream_b):
+            if wait_for_comm1:
+                req_a.wait()
+            stream_b.wait_stream(main_stream)
+            req_b = dist.all_reduce(
+                out_b,
+                op=dist.ReduceOp.SUM,
+                group=ar_pg,
+                async_op=True,
+            )
+
+    with record_function("## irrelevant compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## wait and validate ##"):
+        req_a.wait()
+        req_b.wait()
+        main_stream.wait_stream(stream_a)
+        main_stream.wait_stream(stream_b)
+        checks_a = _validate(out_a, ctx)
+        checks_b = torch.all(out_b.to(torch.int) >= 1)
+        checks = DeviceToHostTensorAwaitable(checks_a & checks_b)
+
+    with record_function("## post-comms compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=out_a[0])
+
+    with record_function("## assert ##"):
+        assert checks.item()
+
+
+def competing_comms_with_req_wait(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    return competing_comms(
+        _batch_inputs=_batch_inputs,
+        dim=dim,
+        num_mul=num_mul,
+        num_concat=num_concat,
+        ctx=ctx,
+        wait_for_comm1=True,
+    )
+
+
 def data_copy_record_stream(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
@@ -936,6 +1026,18 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = multi_async_comms
                 # pyrefly: ignore[missing-attribute]
                 multi_async_comms._ar_pg = dist.new_group(
+                    ranks=list(range(ctx.world_size))
+                )
+            case "competing_comms":
+                func = competing_comms
+                # pyrefly: ignore[missing-attribute]
+                competing_comms._ar_pg = dist.new_group(
+                    ranks=list(range(ctx.world_size))
+                )
+            case "competing_comms_with_req_wait":
+                func = competing_comms_with_req_wait
+                # pyrefly: ignore[missing-attribute]
+                competing_comms._ar_pg = dist.new_group(
                     ranks=list(range(ctx.world_size))
                 )
             case "data_copy_record_stream":
