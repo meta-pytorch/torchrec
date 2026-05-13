@@ -34,11 +34,6 @@ from typing import (
 import torch
 import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
-from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
-    BackendType,
-    EvictionPolicy,
-    KVZCHParams,
-)
 from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
     IntNBitTableBatchedEmbeddingBagsCodegen,
 )
@@ -51,7 +46,13 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SparseType,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-from fbgemm_gpu.tbe.ssd import ASSOC, SSDTableBatchedEmbeddingBags
+from fbgemm_gpu.tbe.ssd import (
+    ASSOC,
+    BackendType,
+    EvictionPolicy,
+    KVZCHParams,
+    SSDTableBatchedEmbeddingBags,
+)
 from fbgemm_gpu.tbe.ssd.utils.partially_materialized_tensor import (
     PartiallyMaterializedTensor,
 )
