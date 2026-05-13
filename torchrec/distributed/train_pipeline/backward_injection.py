@@ -65,7 +65,15 @@ Example usage:
 import logging
 from dataclasses import dataclass
 from enum import Enum, unique
-from typing import Any, Callable, Optional, Protocol, runtime_checkable, TYPE_CHECKING
+from typing import (
+    Any,
+    Callable,
+    Iterator,
+    Optional,
+    Protocol,
+    runtime_checkable,
+    TYPE_CHECKING,
+)
 
 import torch
 from torch import nn
@@ -250,28 +258,100 @@ def register_backward_hook(
             )
 
 
+def will_hook_fire(p: torch.Tensor) -> bool:
+    """``param.register_hook`` only fires via ``AccumulateGrad``; sharded
+    embedding params (ShardedTensor / DTensor) bypass it via FBGEMM TBE
+    fused backward, so a hook landing on one will silently never fire."""
+    return (
+        p.is_leaf
+        and p.requires_grad
+        and type(p).__name__ not in ("ShardedTensor", "DTensor")
+    )
+
+
+def _summarize_unhookable(
+    named_params: list[tuple[str, torch.Tensor]],
+) -> str:
+    """Bucket every ``will_hook_fire``-failing param by the *first* reason it
+    fails (priority: no_requires_grad → ShardedTensor → DTensor → non_leaf).
+    Used in the no-hookable-param assert message so callers can see why."""
+    no_grad = sharded = dtensor = non_leaf = 0
+    for _, p in named_params:
+        t = type(p).__name__
+        if not p.requires_grad:
+            no_grad += 1
+        elif t == "ShardedTensor":
+            sharded += 1
+        elif t == "DTensor":
+            dtensor += 1
+        elif not p.is_leaf:
+            non_leaf += 1
+    return (
+        f"total={len(named_params)}, no_requires_grad={no_grad}, "
+        f"ShardedTensor={sharded}, DTensor={dtensor}, non_leaf={non_leaf}"
+    )
+
+
 def _register_param_grad_hook(
     site: InjectionSite,
     target: nn.Module,
     hook_fn: Callable[[torch.Tensor], None],
 ) -> torch.utils.hooks.RemovableHandle:
-    """Compile-safe hook on a single parameter selected by ``hook_position``."""
-    params = [p for p in target.parameters() if p.requires_grad]
-    if not params:
-        raise ValueError(
-            f"register_backward_hook: no trainable parameters in module '{site.fqn}'."
-        )
+    """Compile-safe hook on a single parameter selected by ``hook_position``.
 
-    idx = _position_to_index(site.hook_position, len(params))
-    param = params[idx]
+    The position picks an index across *all* named parameters (so the
+    percentage is stable regardless of which params are hookable). If the
+    param at that index cannot fire a backward hook (sharded / non-leaf
+    / no grad), walk outward to the nearest hookable neighbor. Assert if
+    no parameter under ``site.fqn`` is hookable at all.
+    """
+    named_params = list(target.named_parameters())
+    n = len(named_params)
+
+    target_idx = _position_to_index(site.hook_position, n) if n else 0
+
+    chosen_idx = next(
+        (i for i in _walk_outward(target_idx, n) if will_hook_fire(named_params[i][1])),
+        None,
+    )
+
+    assert chosen_idx is not None, (
+        f"register_backward_hook: no hookable parameter in module "
+        f"'{site.fqn}' ({_summarize_unhookable(named_params)}); "
+        f"need is_leaf + requires_grad + not ShardedTensor/DTensor."
+    )
+
+    name, param = named_params[chosen_idx]
+    print(
+        f"[hook target] requested_idx={target_idx} chosen_idx={chosen_idx}/{n} "
+        f"fqn={site.fqn}.{name} type={type(param).__name__} "
+        f"is_leaf={param.is_leaf}"
+    )
     logger.info(
-        "register_backward_hook: hooking param %d/%d (position=%.2f) in '%s'",
-        idx,
-        len(params),
+        "register_backward_hook: hooking param %d/%d "
+        "(requested=%d, position=%.2f) in '%s'",
+        chosen_idx,
+        n,
+        target_idx,
         site.hook_position,
         site.fqn,
     )
     return param.register_hook(hook_fn)
+
+
+def _walk_outward(start: int, n: int) -> Iterator[int]:
+    """Yield indices in ``[0, n)`` ordered by distance from ``start``, forward
+    direction first on ties: ``start, start+1, start-1, start+2, start-2, …``.
+    Out-of-range indices are skipped, so callers see at most ``n`` values."""
+    if 0 <= start < n:
+        yield start
+    for offset in range(1, n):
+        forward = start + offset
+        if forward < n:
+            yield forward
+        backward = start - offset
+        if 0 <= backward:
+            yield backward
 
 
 def _position_to_index(position: float, length: int) -> int:
