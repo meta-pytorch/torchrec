@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.pec_collision_handlers import (
+    CollisionPermutation,
     CollisionResult,
     CollisionSplits,
     split_features_by_values_mask,
@@ -196,6 +197,19 @@ def _verify_forward_permute(
     assert forward_permute.tolist() == expected
 
 
+def _verify_backward_permute(
+    permutation: "CollisionPermutation",
+    expected_permute: List[int] | None,
+    expected_num_ol: int,
+) -> None:
+    if expected_permute is None:
+        assert permutation.backward_permute is None
+    else:
+        assert permutation.backward_permute is not None
+        assert permutation.backward_permute.tolist() == expected_permute
+    assert permutation.backward_num_ol == expected_num_ol
+
+
 def _verify_collision_result(
     result: CollisionResult,
     expected: ExpectedCollisionResult,
@@ -285,6 +299,8 @@ def _test_pec_forward_stages(
     expected_collisions_per_rank: List[List[ExpectedCollisionResult]] | None = None,
     expected_splits_per_rank: List[List[ExpectedSplits]] | None = None,
     expected_forward_permutes_per_rank: List[List[List[int]]] | None = None,
+    expected_backward_permutes_per_rank: List[List[List[int] | None]] | None = None,
+    expected_backward_num_ol_per_rank: List[List[int]] | None = None,
     ref_ec: EmbeddingCollection | None = None,
     expected_ol_per_rank: Dict[int, List[List[Tuple[str, int]]]] | None = None,
     expected_nol_per_rank: Dict[int, List[List[Tuple[str, int]]]] | None = None,
@@ -314,6 +330,8 @@ def _test_pec_forward_stages(
 
         batches = kjt_input_per_rank[rank]
         prev_remapped = None
+        prev_ctx = None
+        prev_features_list = None
 
         for batch_idx, kjt_input in enumerate(batches):
             original_values = kjt_input.values()
@@ -357,18 +375,30 @@ def _test_pec_forward_stages(
 
             # Stage 3: permute_dist
             features_list = list(dist_input)
-            masks = [r.forward_overlap_mask for r in results]
             permute_awaitables = sharded_pec.permute_dist(
                 pec_ctx,
                 features_list,
-                masks,
+                results,
+                prev_ctx=prev_ctx,
+                prev_features_per_group=prev_features_list,
             )
-            forward_permutes = [aw.wait() for aw in permute_awaitables]
+            permutations = [aw.wait() for aw in permute_awaitables]
 
             if expected_forward_permutes_per_rank is not None:
                 _verify_forward_permute(
-                    forward_permutes[0],
+                    permutations[0].forward_permute,
                     expected_forward_permutes_per_rank[rank][batch_idx],
+                )
+
+            if expected_backward_permutes_per_rank is not None:
+                _verify_backward_permute(
+                    permutations[0],
+                    expected_backward_permutes_per_rank[rank][batch_idx],
+                    (
+                        expected_backward_num_ol_per_rank[rank][batch_idx]
+                        if expected_backward_num_ol_per_rank is not None
+                        else 0
+                    ),
                 )
 
             # Stage 4: compute_and_output_dist_in_partition
@@ -410,7 +440,7 @@ def _test_pec_forward_stages(
                     pec_ctx,
                     ol_awaitables,
                     nol_awaitables,
-                    forward_permutes,
+                    permutations,
                 )
                 jt_dict = lazy_result.wait()
                 _verify_merged_output(
@@ -424,6 +454,8 @@ def _test_pec_forward_stages(
                 )
 
             prev_remapped = [r.remapped_feature_values for r in results]
+            prev_ctx = pec_ctx
+            prev_features_list = features_list
 
 
 # Cross-shard data: each rank has values in both shard 0 (0-7) and shard 1 (8-15)
@@ -647,8 +679,50 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
+    def test_backward_permute_dist(self) -> None:
+        """Verifies backward_permute and backward_num_ol with cross-shard overlap.
+
+        Batch 0: no backward (first batch) → backward_permute=None, num_ol=0.
+        Batch 1: backward mask from batch 0's values overlapping with batch 1.
+          Rank 0 received bwd mask: [T,F,T, T,F,F] → 3 ol, 3 nol
+          Rank 1 received bwd mask: [T,F,T, T,T,T] → 5 ol, 1 nol
+          backward_permute = _compute_permute_from_mask(bwd_mask, batch0_upt)
+        """
+        WORLD_SIZE = 2
+
+        # backward_permute = bucket_to_merged[upt]
+        # upt for batch 0 = [0,3,1,4,2,5] (no overlap, same as forward)
+        #
+        # Rank 0: mask=[T,F,T,T,F,F], bucket_to_merged=[0,3,1,2,4,5]
+        #   backward_permute = [0,2,3,4,1,5], num_ol=3
+        # Rank 1: mask=[T,F,T,T,T,T], bucket_to_merged=[0,5,1,2,3,4]
+        #   backward_permute = [0,2,5,3,1,4], num_ol=5
+        expected_backward_permutes_per_rank = [
+            [None, [0, 2, 3, 4, 1, 5]],
+            [None, [0, 2, 5, 3, 1, 4]],
+        ]
+        expected_backward_num_ol_per_rank = [
+            [0, 3],
+            [0, 5],
+        ]
+
+        self._run_multi_process_test(
+            callable=_test_pec_forward_stages,
+            world_size=WORLD_SIZE,
+            tables=EMBEDDING_TABLES,
+            kjt_input_per_rank=CROSS_SHARD_KJT_INPUT_PER_RANK,
+            expected_backward_permutes_per_rank=expected_backward_permutes_per_rank,
+            expected_backward_num_ol_per_rank=expected_backward_num_ol_per_rank,
+            sharder=PECEmbeddingCollectionSharder(),
+            backend="nccl",
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
     def test_compute_and_output_dist_in_partition(self) -> None:
-        """Test OL/NOL embeddings match expected weight rows.
+        """Tests OL/NOL embeddings match expected weight rows.
 
         Uses cross-shard partial overlap data. num_embeddings=16, world_size=2,
         block_size=8. Shard 0 stores original rows 0-7, shard 1 stores 8-15.
