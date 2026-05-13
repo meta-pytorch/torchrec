@@ -161,18 +161,19 @@ class CollisionPermutation:
             backward). Overlapped values must wait for i-1's gradient update.
             Usage: index_select(cat([ol_embs, nol_embs]), 0, forward_permute)
 
-        backward_permute: For batch i-1 — reorders batch i-1's values to
-            [ol first, nol second] so gradients can be re-split. The ol
-            gradient update must complete before batch i's overlapped lookup.
-            None for the first batch.
+        backward_ol_permute: Original-order indices of batch i-1's
+            overlapped values, in rank-major order. Used to extract OL
+            gradients via index_select. The OL gradient update must
+            complete before batch i's ol lookup. None for the first batch.
 
-        backward_num_ol: Partition point in backward_permute.
-            backward_permute[:backward_num_ol] are overlapped indices.
+        backward_nol_permute: Original-order indices of batch i-1's
+            nonoverlapped values, in rank-major order. NOL gradient update
+            can be deferred into batch i. None for the first batch.
     """
 
     forward_permute: torch.Tensor
-    backward_permute: torch.Tensor | None = None
-    backward_num_ol: int = 0
+    backward_ol_permute: torch.Tensor | None = None
+    backward_nol_permute: torch.Tensor | None = None
 
 
 def _compute_permute_from_mask(
@@ -225,21 +226,28 @@ class CollisionPermuteAwaitable(Awaitable[CollisionPermutation]):
             fwd_mask, self._fwd_unbucketize_permute
         )
 
-        backward_permute = None
-        backward_num_ol = 0
+        backward_ol_permute = None
+        backward_nol_permute = None
 
         if self._bwd_awaitable is not None:
             assert self._bwd_unbucketize_permute is not None
             bwd_mask = self._bwd_awaitable.wait().bool()
-            backward_permute = _compute_permute_from_mask(
-                bwd_mask, self._bwd_unbucketize_permute
-            )
-            backward_num_ol = int(bwd_mask.sum().item())
+
+            # Pre-compose recat into indices so backward can index_select
+            # directly from original-order gradient without a separate
+            # recat step. The indices are in ascending bucketized order
+            # (rank-major), which aligns with AllToAll splits.
+            recat = torch.ops.fbgemm.invert_permute(self._bwd_unbucketize_permute)
+            (ol_bucket_indices,) = torch.where(bwd_mask)
+            (nol_bucket_indices,) = torch.where(~bwd_mask)
+
+            backward_ol_permute = recat[ol_bucket_indices]
+            backward_nol_permute = recat[nol_bucket_indices]
 
         return CollisionPermutation(
             forward_permute=forward_permute,
-            backward_permute=backward_permute,
-            backward_num_ol=backward_num_ol,
+            backward_ol_permute=backward_ol_permute,
+            backward_nol_permute=backward_nol_permute,
         )
 
 

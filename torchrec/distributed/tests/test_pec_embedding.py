@@ -199,15 +199,18 @@ def _verify_forward_permute(
 
 def _verify_backward_permute(
     permutation: "CollisionPermutation",
-    expected_permute: List[int] | None,
-    expected_num_ol: int,
+    expected_ol_permute: List[int] | None,
+    expected_nol_permute: List[int] | None,
 ) -> None:
-    if expected_permute is None:
-        assert permutation.backward_permute is None
+    if expected_ol_permute is None:
+        assert permutation.backward_ol_permute is None
+        assert permutation.backward_nol_permute is None
     else:
-        assert permutation.backward_permute is not None
-        assert permutation.backward_permute.tolist() == expected_permute
-    assert permutation.backward_num_ol == expected_num_ol
+        assert permutation.backward_ol_permute is not None
+        assert permutation.backward_nol_permute is not None
+        assert permutation.backward_ol_permute.tolist() == expected_ol_permute
+        assert expected_nol_permute is not None
+        assert permutation.backward_nol_permute.tolist() == expected_nol_permute
 
 
 def _verify_collision_result(
@@ -299,8 +302,8 @@ def _test_pec_forward_stages(
     expected_collisions_per_rank: List[List[ExpectedCollisionResult]] | None = None,
     expected_splits_per_rank: List[List[ExpectedSplits]] | None = None,
     expected_forward_permutes_per_rank: List[List[List[int]]] | None = None,
-    expected_backward_permutes_per_rank: List[List[List[int] | None]] | None = None,
-    expected_backward_num_ol_per_rank: List[List[int]] | None = None,
+    expected_backward_ol_permutes_per_rank: List[List[List[int] | None]] | None = None,
+    expected_backward_nol_permutes_per_rank: List[List[List[int] | None]] | None = None,
     ref_ec: EmbeddingCollection | None = None,
     expected_ol_per_rank: Dict[int, List[List[Tuple[str, int]]]] | None = None,
     expected_nol_per_rank: Dict[int, List[List[Tuple[str, int]]]] | None = None,
@@ -390,15 +393,12 @@ def _test_pec_forward_stages(
                     expected_forward_permutes_per_rank[rank][batch_idx],
                 )
 
-            if expected_backward_permutes_per_rank is not None:
+            if expected_backward_ol_permutes_per_rank is not None:
+                assert expected_backward_nol_permutes_per_rank is not None
                 _verify_backward_permute(
                     permutations[0],
-                    expected_backward_permutes_per_rank[rank][batch_idx],
-                    (
-                        expected_backward_num_ol_per_rank[rank][batch_idx]
-                        if expected_backward_num_ol_per_rank is not None
-                        else 0
-                    ),
+                    expected_backward_ol_permutes_per_rank[rank][batch_idx],
+                    expected_backward_nol_permutes_per_rank[rank][batch_idx],
                 )
 
             # Stage 4: compute_and_output_dist_in_partition
@@ -684,26 +684,27 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
 
         Batch 0: no backward (first batch) → backward_permute=None, num_ol=0.
         Batch 1: backward mask from batch 0's values overlapping with batch 1.
-          Rank 0 received bwd mask: [T,F,T, T,F,F] → 3 ol, 3 nol
-          Rank 1 received bwd mask: [T,F,T, T,T,T] → 5 ol, 1 nol
-          backward_permute = _compute_permute_from_mask(bwd_mask, batch0_upt)
+
+        Received bwd mask (bucketized): rank0=[T,F,T,T,F,F], rank1=[T,F,T,T,T,T]
+        recat = invert_permute(batch0_upt) = invert_permute([0,3,1,4,2,5]) = [0,2,4,1,3,5]
+        backward_permute = cat([recat[where(mask)], recat[where(~mask)]])
+
+        Rank 0: where(mask)=[0,2,3], recat[[0,2,3]]=[0,4,1]
+                where(~mask)=[1,4,5], recat[[1,4,5]]=[2,3,5]
+                backward_permute=[0,4,1, 2,3,5], num_ol=3
+        Rank 1: where(mask)=[0,2,3,4,5], recat[[0,2,3,4,5]]=[0,4,1,3,5]
+                where(~mask)=[1], recat[[1]]=[2]
+                backward_permute=[0,4,1,3,5, 2], num_ol=5
         """
         WORLD_SIZE = 2
 
-        # backward_permute = bucket_to_merged[upt]
-        # upt for batch 0 = [0,3,1,4,2,5] (no overlap, same as forward)
-        #
-        # Rank 0: mask=[T,F,T,T,F,F], bucket_to_merged=[0,3,1,2,4,5]
-        #   backward_permute = [0,2,3,4,1,5], num_ol=3
-        # Rank 1: mask=[T,F,T,T,T,T], bucket_to_merged=[0,5,1,2,3,4]
-        #   backward_permute = [0,2,5,3,1,4], num_ol=5
-        expected_backward_permutes_per_rank = [
-            [None, [0, 2, 3, 4, 1, 5]],
-            [None, [0, 2, 5, 3, 1, 4]],
+        expected_backward_ol_permutes_per_rank = [
+            [None, [0, 4, 1]],
+            [None, [0, 4, 1, 3, 5]],
         ]
-        expected_backward_num_ol_per_rank = [
-            [0, 3],
-            [0, 5],
+        expected_backward_nol_permutes_per_rank = [
+            [None, [2, 3, 5]],
+            [None, [2]],
         ]
 
         self._run_multi_process_test(
@@ -711,8 +712,8 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
             world_size=WORLD_SIZE,
             tables=EMBEDDING_TABLES,
             kjt_input_per_rank=CROSS_SHARD_KJT_INPUT_PER_RANK,
-            expected_backward_permutes_per_rank=expected_backward_permutes_per_rank,
-            expected_backward_num_ol_per_rank=expected_backward_num_ol_per_rank,
+            expected_backward_ol_permutes_per_rank=expected_backward_ol_permutes_per_rank,
+            expected_backward_nol_permutes_per_rank=expected_backward_nol_permutes_per_rank,
             sharder=PECEmbeddingCollectionSharder(),
             backend="nccl",
         )
