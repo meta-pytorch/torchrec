@@ -145,7 +145,7 @@ class MultiLabelPrecisionMetricComputation(RecMetricComputation):
         labels = self._decode_integer_to_labels(labels.flatten(), self._num_labels)
         # Expand weights to match
         if weights is not None:
-            # pyrefly: ignore[no-matching-overload]
+            # pyrefly: ignore
             weights = weights.flatten().unsqueeze(-1).expand(-1, self._num_labels)
         else:
             weights = torch.ones_like(predictions, dtype=torch.float32)

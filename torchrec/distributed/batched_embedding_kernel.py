@@ -1408,7 +1408,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         table_config.local_rows == optimizer_state_value.size(0)
                         or optimizer_state_value.nelement() == 1  # single value state
                     )
-                # pyrefly: ignore [no-matching-overload]
+                # pyrefly: ignore
                 optimizer_states_keys_by_table[table_config.name] = list(
                     optimizer_states.keys()
                 )

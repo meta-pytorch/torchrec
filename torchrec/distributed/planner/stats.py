@@ -544,15 +544,19 @@ class EmbeddingStats(Stats):
             f"# {'Estimated Sharding Distribution' : <{self._width-2}}#"
         )
         self._stats_table.append(
+            # pyrefly: ignore
             f"# {'Sparse only Max HBM: '+_generate_rank_hbm_stats(sparse_hbm, max) : <{self._width-3}}#"
         )
         self._stats_table.append(
+            # pyrefly: ignore
             f"# {'Sparse only Min HBM: '+_generate_rank_hbm_stats(sparse_hbm, min) : <{self._width-3}}#"
         )
         self._stats_table.append(
+            # pyrefly: ignore
             f"# {'Max HBM: '+_generate_rank_hbm_stats(used_hbm, max) : <{self._width-3}}#"
         )
         self._stats_table.append(
+            # pyrefly: ignore
             f"# {'Min HBM: '+_generate_rank_hbm_stats(used_hbm, min) : <{self._width-3}}#"
         )
         self._stats_table.append(

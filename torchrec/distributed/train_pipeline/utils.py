@@ -400,6 +400,7 @@ def _pipeline_detach_model(
         for _, child_module in mod.named_modules():
             if not hasattr(child_module, "_input_dists"):
                 continue
+            # pyrefly: ignore
             for input_dist in child_module._input_dists:
                 if hasattr(input_dist, "_dist"):
                     kjt_dists.append(input_dist._dist)
@@ -592,6 +593,7 @@ def _override_input_dist_forwards(
             if not hasattr(child_module, "_input_dists"):
                 continue
 
+            # pyrefly: ignore
             for input_dist in child_module._input_dists:
                 if hasattr(input_dist, "_dist"):
                     assert isinstance(input_dist._dist, KJTAllToAll)
