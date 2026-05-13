@@ -41,6 +41,7 @@ from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingBagCo
 from torchrec.modules.mc_modules import (
     DistanceLFU_EvictionPolicy,
     ManagedCollisionCollection,
+    ManagedCollisionModule,
     MCHManagedCollisionModule,
 )
 from torchrec.modules.regroup import KTRegroupAsDict
@@ -338,7 +339,7 @@ class ModelInput(Pipelineable):
                 )
             }
             # pyrefly: ignore[bad-specialization]
-            global_idlist_input = TensorDict(source=dict_of_nt)
+            global_idlist_input = TensorDict(source=cast(Any, dict_of_nt))
 
             assert (
                 len(idscore_features) == 0
@@ -458,7 +459,7 @@ class ModelInput(Pipelineable):
                     )
                 }
                 # pyrefly: ignore[bad-specialization]
-                local_idlist_input = TensorDict(source=dict_of_nt)
+                local_idlist_input = TensorDict(source=cast(Any, dict_of_nt))
                 assert (
                     len(idscore_features) == 0
                 ), "TensorDict does not support weighted features"
@@ -2496,8 +2497,8 @@ class TestEBCSparseArchZCH(nn.Module):
         tables: List[EmbeddingBagConfig],
         device: torch.device,
         zch_kwargs: Dict[str, Any],
-    ):
-        mc_modules = {}
+    ) -> Dict[str, ManagedCollisionModule]:
+        mc_modules: Dict[str, ManagedCollisionModule] = {}
         for table in tables:
             mc_config = zch_kwargs[table.name]
             mc_type = mc_config.mc_type

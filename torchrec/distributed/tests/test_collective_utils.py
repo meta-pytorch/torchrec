@@ -77,6 +77,7 @@ class CollectiveUtilsTest(unittest.TestCase):
             ranks=[0, 1],
             backend=backend,
         )
+        assert isinstance(pg, dist.ProcessGroup)
         if pg.rank() == 0:
             assert is_leader(pg, 0) is True
             assert is_leader(pg, 1) is False
@@ -107,6 +108,7 @@ class CollectiveUtilsTest(unittest.TestCase):
             ranks=[0, 1],
             backend=backend,
         )
+        assert isinstance(pg, dist.ProcessGroup)
 
         func = mock.MagicMock()
         func.return_value = pg.rank()
@@ -152,19 +154,20 @@ class CollectiveUtilsTest(unittest.TestCase):
             ranks=[0, 1],
             backend=backend,
         )
+        assert isinstance(pg, dist.ProcessGroup)
 
         @run_on_leader(pg, 0)
         def _test_run_on_0(rank: int) -> int:
             return rank
 
-        res = _test_run_on_0(pg.rank())
+        res = _test_run_on_0(pg.rank())  # pyrefly: ignore
         assert res == 0
 
         @run_on_leader(pg, 1)
         def _test_run_on_1(rank: int) -> int:
             return rank
 
-        res = _test_run_on_1(pg.rank())
+        res = _test_run_on_1(pg.rank())  # pyrefly: ignore
         assert res == 1
         dist.destroy_process_group()
 
@@ -185,6 +188,7 @@ class CollectiveUtilsTest(unittest.TestCase):
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
         pg = dist.new_group(ranks=list(range(world_size)), backend=backend)
+        assert isinstance(pg, dist.ProcessGroup)
 
         shape = (64, 32)
         fill_value = 42.0
@@ -225,6 +229,7 @@ class CollectiveUtilsTest(unittest.TestCase):
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
         pg = dist.new_group(ranks=list(range(world_size)), backend=backend)
+        assert isinstance(pg, dist.ProcessGroup)
 
         def _creator() -> List[torch.Tensor]:
             return [
@@ -275,6 +280,7 @@ class CollectiveUtilsTest(unittest.TestCase):
         """Verifies the function is safe to call repeatedly (no stale state)."""
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
         pg = dist.new_group(ranks=list(range(world_size)), backend=backend)
+        assert isinstance(pg, dist.ProcessGroup)
 
         for i in range(3):
             fill_value = float(i + 1)
@@ -310,6 +316,7 @@ class CollectiveUtilsTest(unittest.TestCase):
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
         pg = dist.new_group(ranks=list(range(world_size)), backend=backend)
+        assert isinstance(pg, dist.ProcessGroup)
 
         result = create_on_rank_and_share_result(
             pg,

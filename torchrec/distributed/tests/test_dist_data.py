@@ -60,7 +60,7 @@ from torchrec.distributed.types import Awaitable, NullShardingContext
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
-T = TypeVar("T", int, float, List[int])
+T = TypeVar("T", int, float, List[int], List[float])
 
 
 # Lightly adapted from Stack Overflow #10823877
@@ -262,6 +262,7 @@ def _generate_pooled_embedding_batch(
     for i in range(world_size):
         in_keys = keys[offsets[i] : offsets[i + 1]]
         in_tensor.append(
+            # pyrefly: ignore
             _to_tensor(
                 [local_emb[key][b] for b in range(B_global) for key in in_keys],
                 torch.float,
@@ -270,6 +271,7 @@ def _generate_pooled_embedding_batch(
             else torch.empty(B_global, 0, dtype=torch.float)
         )
         out_tensor.append(
+            # pyrefly: ignore
             _to_tensor(
                 [
                     local_emb[key][b]
@@ -2274,6 +2276,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         # new_group is collective on WORLD, so every rank must call it,
         # even ranks not in the resulting subgroup.
         subgroup = dist.new_group(ranks=[1, 3], backend=backend)
+        assert isinstance(subgroup, dist.ProcessGroup)
 
         if rank not in (1, 3):
             # Non-members do not run the awaitable; just synchronize and exit.
@@ -2289,6 +2292,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         ) as mock_log_event:
             awaitable = SplitsAllToAllAwaitable(
                 input_tensors=input_tensors,
+                # pyrefly: ignore
                 pg=subgroup,
                 collective_tag=rank,  # divergent tag per rank → mismatch
                 collective_tag_parts=("subgroup_test",),

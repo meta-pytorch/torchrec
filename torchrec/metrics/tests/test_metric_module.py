@@ -169,6 +169,7 @@ class MetricModuleTest(unittest.TestCase):
                     my_rank=0,
                     state_metrics_mapping={StateMetricEnum.OPTIMIZERS: mock_optimizer},
                     device=torch.device("cpu"),
+                    # pyrefly: ignore
                     process_group=pg,
                 )
                 metric_module.rec_metrics.compute = MagicMock(
@@ -1064,6 +1065,7 @@ def metric_module_gather_state(
             my_rank=0,
             state_metrics_mapping={},
             device=torch.device(f"cuda:{rank}"),
+            # pyrefly: ignore
             process_group=dist.new_group(ranks=[rank], backend="nccl"),
         )
         new_metric_module.load_pre_compute_states(states)

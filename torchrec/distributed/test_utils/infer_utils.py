@@ -11,7 +11,7 @@
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, cast, Dict, Iterable, List, Optional, Tuple, Type, Union
 
 import torch
 import torchrec
@@ -901,7 +901,8 @@ def shard_qebc(
             assert len(sharding_spec.shards) == len(expected_shards[i])
             # pyrefly: ignore[no-matching-overload]
             for shard, ((offset_r, offset_c, size_r, size_c), placement) in zip(
-                sharding_spec.shards, expected_shards[i]
+                cast(Iterable, sharding_spec.shards),
+                expected_shards[i],
             ):
                 assert shard.shard_offsets == [offset_r, offset_c]
                 assert shard.shard_sizes == [size_r, size_c]
@@ -953,7 +954,8 @@ def shard_qec(
             assert len(sharding_spec.shards) == len(expected_shards[i])
             # pyrefly: ignore[no-matching-overload]
             for shard, ((offset_r, offset_c, size_r, size_c), placement) in zip(
-                sharding_spec.shards, expected_shards[i]
+                cast(Iterable, sharding_spec.shards),
+                expected_shards[i],
             ):
                 assert shard.shard_offsets == [offset_r, offset_c]
                 assert shard.shard_sizes == [size_r, size_c]

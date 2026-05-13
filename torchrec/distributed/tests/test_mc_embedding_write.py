@@ -10,7 +10,7 @@
 import copy
 import logging
 import unittest
-from typing import Dict, List, Optional, Tuple
+from typing import cast, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -931,10 +931,10 @@ def _test_dedup_indices_preserves_2d_weights(
         # block_bucketize_sparse_features_2d_weights splits columns across ranks.
         expected_float_vals = {10.0, 20.0, 30.0, 40.0}
         for _table_name, mc_module in mcc._managed_collision_modules.items():
-            # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
-            identities: torch.Tensor = torch.flatten(
-                mc_module._hash_zch_identities.data
+            _data: torch.Tensor = cast(
+                torch.Tensor, mc_module._hash_zch_identities.data
             )
+            identities: torch.Tensor = torch.flatten(_data)
             runtime_meta = mc_module._hash_zch_runtime_meta
             if runtime_meta is None:
                 continue
@@ -1148,10 +1148,10 @@ def _test_overwrite_ids_state_dict(
 
         # Step 5: Verify per-MC-module that overwritten slots have KJT2 values
         for _table_name, mc_module in mcc._managed_collision_modules.items():
-            # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
-            identities: torch.Tensor = torch.flatten(
-                mc_module._hash_zch_identities.data
+            _data: torch.Tensor = cast(
+                torch.Tensor, mc_module._hash_zch_identities.data
             )
+            identities: torch.Tensor = torch.flatten(_data)
             # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
             runtime_meta = mc_module._hash_zch_runtime_meta.data
             assert isinstance(runtime_meta, torch.Tensor)
@@ -1287,10 +1287,10 @@ def _test_partial_insertion_state_dict(
 
         # Verify per-MC-module consistency
         for _table_name, mc_module in mcc._managed_collision_modules.items():
-            # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
-            identities: torch.Tensor = torch.flatten(
-                mc_module._hash_zch_identities.data
+            _data: torch.Tensor = cast(
+                torch.Tensor, mc_module._hash_zch_identities.data
             )
+            identities: torch.Tensor = torch.flatten(_data)
             # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
             runtime_meta = mc_module._hash_zch_runtime_meta.data
             assert isinstance(runtime_meta, torch.Tensor)
@@ -1422,10 +1422,10 @@ def _test_eviction_clears_runtime_meta(
         # Snapshot which KJT1 IDs are on this rank before eviction
         kjt1_slots_before: Dict[int, int] = {}  # raw_id -> slot_idx
         for _table_name, mc_module in mcc._managed_collision_modules.items():
-            # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
-            identities: torch.Tensor = torch.flatten(
-                mc_module._hash_zch_identities.data
+            _data: torch.Tensor = cast(
+                torch.Tensor, mc_module._hash_zch_identities.data
             )
+            identities: torch.Tensor = torch.flatten(_data)
             mapped_kjt1, _, _ = mc_module.input_mapper(  # pyre-fixme[29]
                 values=kjt1_ids.to(ctx.device),
                 output_offset=mc_module._output_global_offset_tensor,
@@ -1472,10 +1472,10 @@ def _test_eviction_clears_runtime_meta(
 
         # Step 5: Verify per-MC-module
         for _table_name, mc_module in mcc._managed_collision_modules.items():
-            # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
-            identities: torch.Tensor = torch.flatten(
-                mc_module._hash_zch_identities.data
+            _data: torch.Tensor = cast(
+                torch.Tensor, mc_module._hash_zch_identities.data
             )
+            identities: torch.Tensor = torch.flatten(_data)
             # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
             runtime_meta = mc_module._hash_zch_runtime_meta.data
             assert isinstance(runtime_meta, torch.Tensor)
@@ -1622,10 +1622,10 @@ def _test_full_table_eviction_overwrites_runtime_meta(
             torch.sum(torch.stack([v.sum() for v in loss.values()])).backward()
         # Verify all slots are occupied on this rank
         for _table_name, mc_module in mcc._managed_collision_modules.items():
-            # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
-            identities: torch.Tensor = torch.flatten(
-                mc_module._hash_zch_identities.data
+            _data: torch.Tensor = cast(
+                torch.Tensor, mc_module._hash_zch_identities.data
             )
+            identities: torch.Tensor = torch.flatten(_data)
             occupied = (identities != -1).sum().item()
             assert (
                 occupied == identities.numel()
@@ -1656,10 +1656,10 @@ def _test_full_table_eviction_overwrites_runtime_meta(
             {}
         )  # raw_id -> (slot, expected_val)
         for _table_name, mc_module in mcc._managed_collision_modules.items():
-            # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
-            identities: torch.Tensor = torch.flatten(
-                mc_module._hash_zch_identities.data
+            _data: torch.Tensor = cast(
+                torch.Tensor, mc_module._hash_zch_identities.data
             )
+            identities: torch.Tensor = torch.flatten(_data)
             mapped_kjt1, _, _ = mc_module.input_mapper(  # pyre-fixme[29]
                 values=kjt1_ids.to(ctx.device),
                 output_offset=mc_module._output_global_offset_tensor,
@@ -1707,10 +1707,10 @@ def _test_full_table_eviction_overwrites_runtime_meta(
 
         # Step 5: Verify per-MC-module
         for _table_name, mc_module in mcc._managed_collision_modules.items():
-            # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
-            identities: torch.Tensor = torch.flatten(
-                mc_module._hash_zch_identities.data
+            _data: torch.Tensor = cast(
+                torch.Tensor, mc_module._hash_zch_identities.data
             )
+            identities: torch.Tensor = torch.flatten(_data)
             # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
             runtime_meta = mc_module._hash_zch_runtime_meta.data
             assert isinstance(runtime_meta, torch.Tensor)
@@ -2032,10 +2032,10 @@ def _test_collision_only_inserted_id_updates_runtime_meta(
 
         # Step 3: Verify runtime_meta consistency
         for _table_name, mc_module in mcc._managed_collision_modules.items():
-            # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
-            identities: torch.Tensor = torch.flatten(
-                mc_module._hash_zch_identities.data
+            _data: torch.Tensor = cast(
+                torch.Tensor, mc_module._hash_zch_identities.data
             )
+            identities: torch.Tensor = torch.flatten(_data)
             # pyre-ignore[16]: `Module | Tensor` is not assignable to `Tensor`
             runtime_meta = mc_module._hash_zch_runtime_meta.data
             assert isinstance(runtime_meta, torch.Tensor)
