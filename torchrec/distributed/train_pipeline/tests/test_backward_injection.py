@@ -223,7 +223,7 @@ class InjectionSiteTest(unittest.TestCase):
         handle.remove()
 
     def test_hook_position_no_trainable_params_raises(self) -> None:
-        """PARAM_GRAD on a module with no trainable params raises ValueError."""
+        """PARAM_GRAD on a module with no params asserts."""
         model = SimpleModel()
         # layer_b contains ReLU at index 1 which has no parameters
         site = InjectionSite(
@@ -232,8 +232,109 @@ class InjectionSiteTest(unittest.TestCase):
             target_type=InjectionTargetType.PARAM_GRAD,
             hook_position=0.5,
         )
-        with self.assertRaises(ValueError):
+        with self.assertRaises(AssertionError):
             register_backward_hook(site, model, lambda grad: None)
+
+    @staticmethod
+    def _has_backward_hook(p: torch.Tensor) -> bool:
+        """True iff ``p`` currently has at least one backward hook registered."""
+        hooks = getattr(p, "_backward_hooks", None)
+        return hooks is not None and len(hooks) > 0
+
+    @staticmethod
+    def _make_module_with_hookable_mask(
+        mask: List[bool],
+    ) -> Tuple[nn.Module, List[nn.Parameter]]:
+        """Build ``parent.child`` where ``child`` has ``len(mask)`` parameters;
+        ``mask[i]`` controls whether param ``i`` is hookable (requires_grad)."""
+        parent = nn.Module()
+        child = nn.Module()
+        parent.add_module("child", child)
+        params: List[nn.Parameter] = []
+        for i, hookable in enumerate(mask):
+            p = nn.Parameter(torch.randn(2), requires_grad=hookable)
+            child.register_parameter(f"p{i}", p)
+            params.append(p)
+        return parent, params
+
+    def test_fallback_walks_forward_to_nearest_hookable(self) -> None:
+        """target_idx points at an unhookable param; search walks forward."""
+        # 5 params; only indices 2 and 4 are hookable.
+        # hook_position=0.0 → target_idx=0 → walks 0,1,2 → picks 2.
+        parent, params = self._make_module_with_hookable_mask(
+            [False, False, True, False, True]
+        )
+        site = InjectionSite(
+            fqn="child",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+            hook_position=0.0,
+        )
+        handle = register_backward_hook(site, parent, lambda g: None)
+        self.assertTrue(self._has_backward_hook(params[2]))
+        for i in (0, 1, 3, 4):
+            self.assertFalse(self._has_backward_hook(params[i]))
+        handle.remove()
+
+    def test_fallback_walks_backward_to_nearest_hookable(self) -> None:
+        """target_idx at the end is unhookable; search walks backward."""
+        # 5 params; only index 1 is hookable.
+        # hook_position=1.0 → target_idx=4 → walks back through 3,2 → picks 1.
+        parent, params = self._make_module_with_hookable_mask(
+            [False, True, False, False, False]
+        )
+        site = InjectionSite(
+            fqn="child",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+            hook_position=1.0,
+        )
+        handle = register_backward_hook(site, parent, lambda g: None)
+        self.assertTrue(self._has_backward_hook(params[1]))
+        for i in (0, 2, 3, 4):
+            self.assertFalse(self._has_backward_hook(params[i]))
+        handle.remove()
+
+    def test_position_indexes_against_all_params(self) -> None:
+        """Percentage is computed over *all* params (not just hookable ones).
+
+        With 4 params where only indices 1 and 2 are hookable, hook_position=0.5
+        maps to target_idx = int(0.5*4) = 2 (hookable directly). If the index
+        were instead computed over the 2 hookable params, position 0.5 would
+        pick index 1 — this test guards against that regression.
+        """
+        parent, params = self._make_module_with_hookable_mask(
+            [False, True, True, False]
+        )
+        site = InjectionSite(
+            fqn="child",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+            hook_position=0.5,
+        )
+        handle = register_backward_hook(site, parent, lambda g: None)
+        self.assertTrue(self._has_backward_hook(params[2]))
+        self.assertFalse(self._has_backward_hook(params[1]))
+        handle.remove()
+
+    def test_no_hookable_param_asserts(self) -> None:
+        """If no param under the FQN is hookable, raise AssertionError with a
+        breakdown of how many params failed which check."""
+        parent, _ = self._make_module_with_hookable_mask([False, False, False])
+        site = InjectionSite(
+            fqn="child",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+            hook_position=0.5,
+        )
+        with self.assertRaises(AssertionError) as cm:
+            register_backward_hook(site, parent, lambda g: None)
+        msg = str(cm.exception)
+        self.assertIn("total=3", msg)
+        self.assertIn("no_requires_grad=3", msg)
+        self.assertIn("ShardedTensor=0", msg)
+        self.assertIn("DTensor=0", msg)
+        self.assertIn("non_leaf=0", msg)
 
     def test_register_hook_persists_and_removable(self) -> None:
         """Hook fires every iteration; removing it stops firing."""
