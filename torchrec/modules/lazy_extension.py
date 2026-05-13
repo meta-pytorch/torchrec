@@ -161,6 +161,8 @@ class LazyModuleExtensionMixin(LazyModuleMixin):
     # fmt: off
     #  `LazyModuleMixin` inconsistently.
     # pyrefly: ignore[bad-override]
+    # pyre-fixme[14]: `_infer_parameters` overrides method defined in
+    #  `LazyModuleMixin` inconsistently.
     def _infer_parameters(self: _LazyExtensionProtocol, module, args, kwargs) -> None:
         r"""Infers the size and initializes the parameters according to the provided input batch.
 

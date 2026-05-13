@@ -610,8 +610,10 @@ class RecMetricModule(nn.Module):
             for task, metric_computation in zip(
                 #  `Union[Module, Tensor]`.
                 #  `Union[Module, Tensor]`.
+                # pyre-fixme[6]: Expected `Iterable` but got `Module | Tensor`.
                 metric._tasks,
                 #  `Union[Module, Tensor]`.
+                # pyre-fixme[6]: Expected `Iterable` but got `Module | Tensor`.
                 metric._metrics_computations,
             ):
                 state = states[task.name]

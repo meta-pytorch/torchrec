@@ -507,7 +507,7 @@ class RecMetric(nn.Module, abc.ABC):
                 self._tasks,
                 metric_report.value,
                 (
-                    self._metrics_computations[0].has_valid_update
+                    self._metrics_computations[0].has_valid_update  # pyre-fixme[6]: Expected `Iterable` but got `Module | Tensor | repeat[int]`.
                     if self._should_validate_update
                     else itertools.repeat(1)
                 ),  # has_valid_update > 0 means the update is valid
@@ -978,9 +978,12 @@ class RecMetric(nn.Module, abc.ABC):
         # We need to flush the cached output to ensure checkpointing correctness.
         self._check_fused_update(force=True)
         # pyrefly: ignore[no-matching-overload]
+        # pyre-fixme[6]: Expected `dict[str, Any]` but got `dict[str, Tensor] | None`.
         destination = super().state_dict(
             destination=destination, prefix=prefix, keep_vars=keep_vars
         )
+        # pyre-fixme[7]: Expected `dict[str, Tensor]` but got `dict[str, Tensor] | None`.
+        # pyre-fixme[6]: Expected `dict[str, Any]` but got `dict[str, Tensor] | None`.
         return self._metrics_computations.state_dict(
             destination=destination,
             prefix=f"{prefix}_metrics_computations.",

@@ -780,6 +780,7 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
                     )
 
                 self._output_tensors.append(output_tensor)
+                # pyre-fixme[6]: Expected `Work` but got `Work | Unknown | None`.
                 self._awaitables.append(awaitable)
 
     def clear_inputs(self) -> int:
@@ -2133,6 +2134,7 @@ class JaggedTensorAllToAll(Awaitable[JaggedTensor]):
             )
         )
 
+        # pyre-fixme[8]: Expected `Work` but got `Work | Unknown | None`.
         self._dist_values_req: dist.Work = dist.all_to_all_single(
             self._dist_values,
             jt.values(),
@@ -2203,6 +2205,7 @@ class TensorAllToAllValuesAwaitable(Awaitable[torch.Tensor]):
                 )
 
         with record_function("## all2all_data:ids ##"):
+            # pyre-fixme[8]: Expected `Work` but got `Work | Unknown | None`.
             self._values_awaitable: dist.Work = dist.all_to_all_single(
                 output=self._dist_values,
                 input=input,
@@ -2245,6 +2248,7 @@ class TensorAllToAllSplitsAwaitable(Awaitable[TensorAllToAllValuesAwaitable]):
             )
 
         with record_function("## all2all_data:ids splits ##"):
+            # pyre-fixme[8]: Expected `Work` but got `Work | Unknown | None`.
             self._num_ids_awaitable: dist.Work = dist.all_to_all_single(
                 output=self._output_splits,
                 input=splits,

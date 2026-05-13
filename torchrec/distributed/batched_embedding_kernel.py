@@ -1409,6 +1409,7 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                         or optimizer_state_value.nelement() == 1  # single value state
                     )
                 # pyrefly: ignore [no-matching-overload]
+                # pyre-fixme[6]: Incompatible parameter type
                 optimizer_states_keys_by_table[table_config.name] = list(
                     optimizer_states.keys()
                 )

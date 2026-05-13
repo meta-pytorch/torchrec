@@ -544,16 +544,16 @@ class EmbeddingStats(Stats):
             f"# {'Estimated Sharding Distribution' : <{self._width-2}}#"
         )
         self._stats_table.append(
-            f"# {'Sparse only Max HBM: '+_generate_rank_hbm_stats(sparse_hbm, max) : <{self._width-3}}#"
+            f"# {'Sparse only Max HBM: '+_generate_rank_hbm_stats(sparse_hbm, max) : <{self._width-3}}#"  # pyre-fixme[6]
         )
         self._stats_table.append(
-            f"# {'Sparse only Min HBM: '+_generate_rank_hbm_stats(sparse_hbm, min) : <{self._width-3}}#"
+            f"# {'Sparse only Min HBM: '+_generate_rank_hbm_stats(sparse_hbm, min) : <{self._width-3}}#"  # pyre-fixme[6]
         )
         self._stats_table.append(
-            f"# {'Max HBM: '+_generate_rank_hbm_stats(used_hbm, max) : <{self._width-3}}#"
+            f"# {'Max HBM: '+_generate_rank_hbm_stats(used_hbm, max) : <{self._width-3}}#"  # pyre-fixme[6]
         )
         self._stats_table.append(
-            f"# {'Min HBM: '+_generate_rank_hbm_stats(used_hbm, min) : <{self._width-3}}#"
+            f"# {'Min HBM: '+_generate_rank_hbm_stats(used_hbm, min) : <{self._width-3}}#"  # pyre-fixme[6]
         )
         self._stats_table.append(
             f"# {'Mean HBM: '+_generate_rank_hbm_stats(used_hbm, statistics.mean) : <{self._width-3}}#"

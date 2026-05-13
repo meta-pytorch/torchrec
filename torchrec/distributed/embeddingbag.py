@@ -1752,6 +1752,7 @@ class ShardedEmbeddingBagCollection(
         """
         if isinstance(features, TensorDict):
             # pyrefly: ignore [no-matching-overload]
+            # pyre-fixme[6]: Expected `Iterable` but got `_TensorDictKeysView`.
             feature_keys = list(features.keys())
             if len(self._features_order) > 0:
                 feature_keys = [feature_keys[i] for i in self._features_order]
@@ -2358,6 +2359,7 @@ class ShardedEmbeddingBag(
 
         # Get all fused optimizers and combine them.
         optims = []
+        # pyre-fixme[6]: Expected `EmbeddingBag` but got `BaseEmbeddingLookup | Module | Unknown`.
         for _, module in self._lookup.named_modules():
             if isinstance(module, FusedOptimizerModule):
                 # modify param keys to match EmbeddingBag
@@ -2438,6 +2440,7 @@ class ShardedEmbeddingBag(
             destination[new_key] = item
         return destination
 
+    # pyre-fixme[14]: `named_modules` overrides method defined in `Module` inconsistently.
     def named_modules(
         self,
         memo: Optional[Set[nn.Module]] = None,
