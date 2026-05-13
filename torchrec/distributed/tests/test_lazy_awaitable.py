@@ -291,5 +291,6 @@ class TestLazyAwaitable(unittest.TestCase):
 
         # The use of a torch op should trigger exactly one wait on the parent object.
         # pyrefly: ignore[no-matching-overload]
+        # pyrefly: ignore
         result = torch.add(lazy_foo, lazy_bar)
         self.assertEqual(result, torch.tensor(1 * 3 + 2 * 3))

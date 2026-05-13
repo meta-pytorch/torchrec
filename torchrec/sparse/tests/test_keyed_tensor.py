@@ -804,6 +804,7 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             in_idx, out_idx, in_start, _, length, _ = permutes[i].tolist()
             refs[out_idx].append(ref_values[in_idx][in_start : (in_start + length), :])
         # pyrefly: ignore[no-matching-overload]
+        # pyrefly: ignore
         refs = [torch.cat(ref).t() for ref in refs]
         outputs = torch.ops.fbgemm.permute_multi_embedding(
             non_contiguous, permutes, in_shapes, out_shapes, out_lengths
