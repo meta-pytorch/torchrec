@@ -24,6 +24,17 @@ from torchrec.modules.mc_modules import ManagedCollisionModule
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 try:
+    from torchrec.distributed.logging_handlers import log_mpzch_config
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.modules.hash_mc_modules.import_failure.logging_handlers"
+    )
+
+    def log_mpzch_config(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+        pass
+
+
+try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:faster_hash_ops")
 except (OSError, RuntimeError):
     pass
@@ -405,6 +416,24 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, "
             f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
             f"{self._no_bag=}, {self._write_runtime_meta_dim=}"
+        )
+
+        log_mpzch_config(
+            metadata={
+                "table_name": self._name or "",
+                "zch_size": str(self._zch_size),
+                "total_num_buckets": str(self._buckets),
+                "max_probe": str(self._max_probe),
+                "input_hash_size": str(self._input_hash_size),
+                "eviction_policy_name": (
+                    self._eviction_policy_name.value
+                    if self._eviction_policy_name is not None
+                    else ""
+                ),
+                "disable_fallback": str(self._disable_fallback),
+                "opt_in_prob": str(self._opt_in_prob),
+                "percent_reserved_slots": str(self._percent_reserved_slots),
+            },
         )
 
     def _create_zch_buffer(
