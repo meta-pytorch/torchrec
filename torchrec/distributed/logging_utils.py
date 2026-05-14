@@ -45,6 +45,7 @@ class OptimizationTechnique(Enum):
     TWO_DIM_SHARDING = "two_dim_sharding"
     MPZCH = "mpzch"
     EMS = "ems"
+    ZORM = "zorm"
 
 
 @unique
