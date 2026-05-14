@@ -393,6 +393,14 @@ def log_mpzch_config(
     pass
 
 
+def log_ems_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.EMS,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_kernel_changed(
     table_name: str = "",
     action: str = "",
