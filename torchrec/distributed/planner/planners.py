@@ -19,7 +19,11 @@ import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
-from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+from torchrec.distributed.logging_handlers import (
+    EventLoggingHandler,
+    OptimizationTechnique,
+    TorchrecComponent,
+)
 from torchrec.distributed.planner.constants import BATCH_SIZE, MAX_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
@@ -102,6 +106,7 @@ try:
         log_planning_result,
         log_proposer_result,
         log_search_space_summary,
+        log_ssd_offloading_config,
         log_storage_reservation,
         log_table_assignment,
         log_table_constraints,
@@ -133,6 +138,9 @@ except Exception:
         pass
 
     def log_table_assignment(*args, **kwargs) -> None:
+        pass
+
+    def log_ssd_offloading_config(*args, **kwargs) -> None:
         pass
 
     def log_table_constraints(*args, **kwargs) -> None:
@@ -814,6 +822,11 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             )
             log_table_assignment(
                 best_plan, self.__class__.__name__, technique=_technique
+            )
+            # Log SSD offloading config only if any tables use SSD kernels
+            log_ssd_offloading_config(
+                best_plan,
+                technique=OptimizationTechnique.SSD_OFFLOADING,
             )
 
             return sharding_plan
