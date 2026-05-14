@@ -385,6 +385,14 @@ def log_ssd_offloading_config(
     pass
 
 
+def log_mpzch_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.MPZCH,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_kernel_changed(
     table_name: str = "",
     action: str = "",
