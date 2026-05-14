@@ -109,6 +109,17 @@ from torchrec.optim.fused import (
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+try:
+    from torchrec.distributed.logging_handlers import log_kvzch_config
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.batched_embedding_kernel.import_failure.logging_handlers"
+    )
+
+    def log_kvzch_config(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+        pass
+
+
 if TYPE_CHECKING:
     from deeplearning.fbgemm.fbgemm_gpu.fb.triton.triton_table_batched_embeddings import (
         TritonTableBatchedEmbeddingBags,
@@ -556,6 +567,40 @@ def _populate_zero_collision_tbe_params(
         optimizer_state_dtypes_for_st=optimizer_state_dtypes_for_st,
         enrichment_policy=enrichment_policy,
         feature_score_collection_enabled=fs_eviction_enabled,
+    )
+
+    table_names = ",".join(t.name for t in config.embedding_tables)
+    log_kvzch_config(
+        metadata={
+            "num_tables": str(len(config.embedding_tables)),
+            "table_names": table_names,
+            "eviction_trigger_mode": (
+                str(kvzch_tbe_config.kvzch_eviction_trigger_mode)
+                if kvzch_tbe_config
+                else ""
+            ),
+            "eviction_free_mem_threshold_gb": str(
+                kvzch_tbe_config.eviction_free_mem_threshold_gb
+                if kvzch_tbe_config
+                else 0.0
+            ),
+            "eviction_free_mem_check_interval_batch": str(
+                kvzch_tbe_config.eviction_free_mem_check_interval_batch
+                if kvzch_tbe_config
+                else 0
+            ),
+            "l2_cache_size": str(tbe_params.get("l2_cache_size", 0)),
+            "max_l1_cache_size": str(
+                config.fused_params.get("max_l1_cache_size", 0)
+                if config.fused_params
+                else 0
+            ),
+            "enrichment_policy": (
+                str(kvzch_tbe_config.enrichment_policy)
+                if kvzch_tbe_config and kvzch_tbe_config.enrichment_policy
+                else ""
+            ),
+        },
     )
 
 
