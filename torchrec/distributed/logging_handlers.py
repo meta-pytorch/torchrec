@@ -45,6 +45,7 @@ class TorchrecComponent(Enum):
     LOOKUP = "lookup"
     REC_METRICS = "rec_metrics"
     ITEP = "itep"
+    DISTRIBUTED_MODEL_PARALLEL = "distributed_model_parallel"
 
 
 class EventLoggingHandler(EventLoggingHandlerBase):
@@ -363,6 +364,46 @@ def log_itep_ien_pruning_decision(
 def log_itep_itp_info(
     metadata: Optional[Dict[str, str]] = None,
     technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_two_dim_sharding_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.TWO_DIM_SHARDING,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_ssd_offloading_config(
+    best_plan: Optional[List] = None,  # type: ignore[type-arg]
+    technique: OptimizationTechnique = OptimizationTechnique.SSD_OFFLOADING,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_mpzch_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.MPZCH,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_zorm_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ZORM,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_ems_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.EMS,
 ) -> None:
     """No-op OSS stub."""
     pass

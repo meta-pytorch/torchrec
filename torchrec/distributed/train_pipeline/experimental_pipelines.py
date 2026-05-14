@@ -58,6 +58,17 @@ from torchrec.distributed.train_pipeline.utils import (
 from torchrec.distributed.types import LazyNoWait, ShardingType
 from torchrec.sparse.jagged_tensor import KeyedTensor
 
+try:
+    from torchrec.distributed.logging_handlers import log_ems_config
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.experimental_pipelines.import_failure.logging_handlers"
+    )
+
+    def log_ems_config(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+        pass
+
+
 logger: logging.Logger = logging.getLogger(__name__)
 
 
@@ -1160,6 +1171,39 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         )
         if delay_stash:
             MemoryStashingManager.set_delay_stash(True)
+
+        self._log_ems_config()
+
+    def _log_ems_config(self) -> None:
+        """Emit an ems_config event with table-level stash info."""
+        try:
+            from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
+
+            stash_table_names: list[str] = []
+            total_stash_bytes: int = 0
+            base_model = self._model
+            if isinstance(base_model, DistributedModelParallel):
+                base_model = base_model.module
+            for module in base_model.modules():
+                embedding_configs = getattr(module, "embedding_configs", None)
+                if embedding_configs is not None:
+                    for ec in embedding_configs:
+                        if getattr(ec, "stash_weights", False):
+                            stash_table_names.append(ec.name)
+                            bits = DATA_TYPE_NUM_BITS.get(ec.data_type, 32)
+                            total_stash_bytes += (
+                                ec.num_embeddings * ec.embedding_dim * bits // 8
+                            )
+            log_ems_config(
+                metadata={
+                    "num_stash_tables": str(len(stash_table_names)),
+                    "stash_table_names": ",".join(stash_table_names),
+                    "total_stash_bytes": str(total_stash_bytes),
+                    "pipeline_type": type(self).__name__,
+                },
+            )
+        except Exception:
+            logger.debug("EMS config logging failed", exc_info=True)
 
     def _try_hook_stash(self) -> None:
         """Register a forward pre-hook on ``stash_site_fqn`` to execute
