@@ -45,6 +45,7 @@ class TorchrecComponent(Enum):
     LOOKUP = "lookup"
     REC_METRICS = "rec_metrics"
     ITEP = "itep"
+    DISTRIBUTED_MODEL_PARALLEL = "distributed_model_parallel"
 
 
 class EventLoggingHandler(EventLoggingHandlerBase):
@@ -363,6 +364,14 @@ def log_itep_ien_pruning_decision(
 def log_itep_itp_info(
     metadata: Optional[Dict[str, str]] = None,
     technique: OptimizationTechnique = OptimizationTechnique.ITEP,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_two_dim_sharding_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.TWO_DIM_SHARDING,
 ) -> None:
     """No-op OSS stub."""
     pass
