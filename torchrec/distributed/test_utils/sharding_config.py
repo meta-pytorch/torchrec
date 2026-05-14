@@ -14,7 +14,7 @@ from typing import Any, cast, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
-from fbgemm_gpu.split_table_batched_embeddings_ops_common import KVZCHTBEConfig
+from fbgemm_gpu.tbe.ssd import KVZCHTBEConfig
 from torch import nn, optim
 from torch.optim import Optimizer
 from torchrec.distributed import DistributedModelParallel
