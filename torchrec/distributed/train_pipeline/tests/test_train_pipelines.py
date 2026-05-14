@@ -218,6 +218,7 @@ class TrainPipelinePT2Test(unittest.TestCase):
             def forward(self, x: KeyedJaggedTensor) -> List[JaggedTensor]:
                 kt: KeyedTensor = self.model(x)
                 # pyrefly: ignore[no-matching-overload]
+                # pyre-fixme[7]: Expected `list[JaggedTensor]` but got `list[Tensor]`.
                 return list(kt.to_dict().values())
 
         return M_ebc(

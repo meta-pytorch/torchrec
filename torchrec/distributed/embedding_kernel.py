@@ -191,7 +191,7 @@ def create_virtual_table_local_metadata(
             if weight_count_per_rank is None
             else sum(weight_count_per_rank[:my_rank])
         )
-    # pyrefly: ignore[no-matching-overload, missing-attribute]
+    # pyrefly: ignore
     local_metadata.shard_sizes = list(param.size())
     # pyrefly: ignore[missing-attribute]
     local_metadata.shard_offsets = [

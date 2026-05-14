@@ -507,6 +507,7 @@ class RecMetric(nn.Module, abc.ABC):
                 self._tasks,
                 metric_report.value,
                 (
+                    # pyrefly: ignore
                     self._metrics_computations[0].has_valid_update
                     if self._should_validate_update
                     else itertools.repeat(1)
@@ -978,10 +979,10 @@ class RecMetric(nn.Module, abc.ABC):
         # We need to flush the cached output to ensure checkpointing correctness.
         self._check_fused_update(force=True)
         # pyrefly: ignore[no-matching-overload]
-        destination = super().state_dict(
+        destination = super().state_dict(  # pyrefly: ignore
             destination=destination, prefix=prefix, keep_vars=keep_vars
         )
-        return self._metrics_computations.state_dict(
+        return self._metrics_computations.state_dict(  # pyrefly: ignore
             destination=destination,
             prefix=f"{prefix}_metrics_computations.",
             keep_vars=keep_vars,

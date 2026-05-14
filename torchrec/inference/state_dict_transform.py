@@ -74,7 +74,7 @@ def state_dict_to_device(
         pg (ProcessGroup): Process Group used for comms
         device (torch.device): device to put state_dict on
     """
-    ret = {}
+    ret: Dict[str, Union[torch.Tensor, ShardedTensor]] = {}
     all_keys = state_dict_all_gather_keys(state_dict, pg)
     for key in all_keys:
         if key in state_dict:

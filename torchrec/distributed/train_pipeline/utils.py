@@ -41,6 +41,17 @@ from torchrec.distributed.embedding_sharding import (
 from torchrec.distributed.embedding_types import KJTList
 
 try:
+    from torchrec.distributed.logging_handlers import log_pipeline_module_info
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.utils.import_failure.logging_handlers"
+    )
+
+    def log_pipeline_module_info(*args: Any, **kwargs: Any) -> None:
+        pass
+
+
+try:
     from torchrec.distributed.logger import (
         LazyStr,
         one_time_logger,
@@ -400,6 +411,7 @@ def _pipeline_detach_model(
         for _, child_module in mod.named_modules():
             if not hasattr(child_module, "_input_dists"):
                 continue
+            # pyrefly: ignore
             for input_dist in child_module._input_dists:
                 if hasattr(input_dist, "_dist"):
                     kjt_dists.append(input_dist._dist)
@@ -503,6 +515,7 @@ def _rewrite_model(  # noqa C901
     # i.e. don't have input transformations, i.e. rely only on 'builtins.getattr'.
     pipelined_forwards = []
     original_forwards = []
+    pipelined_sharded_modules = []
 
     non_pipelined_sharded_modules = []
 
@@ -542,6 +555,7 @@ def _rewrite_model(  # noqa C901
                 dist_stream,
             )
             pipelined_forwards.append(child)
+            pipelined_sharded_modules.append(node.target)
         else:
             logger.warning(
                 f"Module '{node.target}' will NOT be pipelined, due to input modifications"
@@ -564,6 +578,12 @@ def _rewrite_model(  # noqa C901
             + "This should be fixed for pipelining to work to the full extent.",
             ", ".join(non_pipelined_sharded_modules),
         )
+
+    log_pipeline_module_info(
+        pipelined_module_fqns=pipelined_sharded_modules,
+        non_pipelined_module_fqns=non_pipelined_sharded_modules,
+        pipeline_forward_type=pipelined_forward.__name__,
+    )
 
     return (
         pipelined_forwards,
@@ -592,6 +612,7 @@ def _override_input_dist_forwards(
             if not hasattr(child_module, "_input_dists"):
                 continue
 
+            # pyrefly: ignore
             for input_dist in child_module._input_dists:
                 if hasattr(input_dist, "_dist"):
                     assert isinstance(input_dist._dist, KJTAllToAll)

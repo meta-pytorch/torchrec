@@ -431,6 +431,7 @@ class ShardedEmbeddingTower(
         else:
             yield from ()
 
+    # pyrefly: ignore
     def named_modules(
         self,
         memo: Optional[Set[nn.Module]] = None,
@@ -872,6 +873,7 @@ class ShardedEmbeddingTowerCollection(
                 )
             )
 
+    # pyrefly: ignore
     def named_modules(
         self,
         memo: Optional[Set[nn.Module]] = None,

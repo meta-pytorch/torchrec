@@ -457,6 +457,7 @@ def quantize_inference_model(
             # handle the fp ebc separately
             _quantize_fp_module(
                 model,
+                # pyrefly: ignore
                 m,
                 n,
                 weight_dtype=fp_weight_dtype,

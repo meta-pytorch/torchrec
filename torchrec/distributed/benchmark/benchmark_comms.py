@@ -172,6 +172,7 @@ def a2a_async_base(
         # assertion fails without wait(), this wait() makes the main cuda stream wait
         # for the comms to finish, so the post-comms compute will be blocked until
         # the comms is done
+        assert req is not None
         req.wait()
         checks = _validate(post_comms, ctx).to("cpu", non_blocking=True)
         ev_d2h.record()  # record the device-to-host data transfer
@@ -223,6 +224,7 @@ def a2a_async_twice(
         side_stream = torch.cuda.Stream()
         post_comms2.record_stream(side_stream)
         with torch.cuda.stream(side_stream):
+            assert req1 is not None
             req1.wait()  # let the side stream wait for comms1 to finish
             pre_comms = torch.sigmoid(post_comms1) + ctx.rank
             req2 = dist.all_to_all_single(
@@ -245,9 +247,11 @@ def a2a_async_twice(
 
     ev_d2h.synchronize()  # make sure the pre_checks is available from cpu side
     with record_function(f"## comms1 checks and pre-checks1 {pre_checks1} ##"):
+        assert req1 is not None
         req1.wait()  # let the main stream wait for comms1 to finish
         checks1 = _validate(post_comms1, ctx).to("cpu", non_blocking=True)
     with record_function(f"## comms2 checks and pre-checks2 {pre_checks2} ##"):
+        assert req2 is not None
         req2.wait()  # let the main stream wait for comms2 to finish
         checks2 = _validate(post_comms2, ctx).to("cpu", non_blocking=True)
         ev_d2h.record()  # record the device-to-host data transfer
@@ -292,6 +296,7 @@ def lazyawaitable(
         # assertion fails without wait(), this wait() makes the main cuda stream wait
         # for the comms to finish, so the post-comms compute will be blocked until
         # the comms is done
+        assert req is not None
         req.wait()
         check_awaitable = DeviceToHostTensorAwaitable(_validate(post_comms, ctx))
 
@@ -367,6 +372,7 @@ def multi_stream_memory(
         with record_function("## a2a comm validation ##"):
             # the comm validation is also done in this separate stream since
             # there's no data dependency afterwards
+            assert req is not None
             req.wait()
             checks = DeviceToHostTensorAwaitable(_validate(post_comms, ctx))
 
@@ -377,6 +383,7 @@ def multi_stream_memory(
         )
 
     with record_function("## post-comms compute ##"):
+        assert req is not None
         req.wait()
         post_comms = _compute(
             dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=post_comms[0]
@@ -468,6 +475,7 @@ def multi_stream_optimized(
 
     with record_function("## a2a comm validation ##"):
         # this req.wait() can be wrapped into a LazyAwaitable
+        assert req is not None
         req.wait()
         # still want the compute on the main stream if possible
         checks = DeviceToHostTensorAwaitable(_validate(post_comms, ctx))
@@ -748,6 +756,7 @@ def multi_async_comms(
                 group=ctx.pg,
                 async_op=True,
             )
+        assert req is not None
         return out, req
 
     def do_all_reduce(

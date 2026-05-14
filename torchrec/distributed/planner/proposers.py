@@ -249,7 +249,7 @@ class GridSearchProposer(Proposer):
             for sharding_options in self._sharding_options_by_fqn.values()
         ]
         #  `List[Tuple[int]]`.
-        # pyrefly: ignore[no-matching-overload]
+        # pyrefly: ignore
         self._proposals = list(itertools.product(*sharding_options_by_fqn_indices))
 
     def _reset(self) -> None:

@@ -207,6 +207,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             target=self._compute_loop, name=metric_compute_thread_name, daemon=True
         )
 
+        # pyrefly: ignore
         self.cpu_process_group: dist.ProcessGroup = dist.new_group(backend="gloo")
         self.comms_module: CPUCommsRecMetricModule = CPUCommsRecMetricModule(
             *args,
@@ -847,12 +848,13 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         Args are identical to torch.nn.Module.state_dict().
         """
-        # pyrefly: ignore[no-matching-overload]
-        return self.comms_module.state_dict(
+        # pyrefly: ignore
+        return self.comms_module.state_dict(  # pyrefly: ignore
             *args, destination=destination, prefix=prefix, keep_vars=keep_vars
         )
 
     @override
+    # pyrefly: ignore
     def load_state_dict(
         self, state_dict: Mapping[str, Any], strict: bool = True, assign: bool = False
     ) -> None:

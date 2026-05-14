@@ -183,6 +183,7 @@ class PipelinedPostproc(torch.nn.Module):
     def get_context(self) -> TrainPipelineContext:
         return self._context
 
+    # pyrefly: ignore
     def named_modules(
         self,
         memo: Optional[Set[torch.nn.Module]] = None,
