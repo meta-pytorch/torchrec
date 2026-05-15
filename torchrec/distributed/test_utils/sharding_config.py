@@ -14,7 +14,13 @@ from typing import Any, cast, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
-from fbgemm_gpu.tbe.ssd import KVZCHTBEConfig
+
+try:
+    from fbgemm_gpu.tbe.ssd import KVZCHTBEConfig
+except ImportError:
+    # Fallback for fbgemm_gpu < D103282820 (KVZCHTBEConfig moved from
+    # split_table_batched_embeddings_ops_common to tbe/ssd).
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import KVZCHTBEConfig
 from torch import nn, optim
 from torch.optim import Optimizer
 from torchrec.distributed import DistributedModelParallel
