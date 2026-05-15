@@ -524,6 +524,7 @@ def _prefetch_and_cached(
         EmbeddingComputeKernel.KEY_VALUE,
         EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,
         EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
+        EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE,
     }:
         return True
 

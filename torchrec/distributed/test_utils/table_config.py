@@ -44,6 +44,7 @@ def _process_virtual_table_config(config_dict: Dict[str, Any]) -> None:
         config_dict["use_virtual_table"] = config_dict["location"] in [
             "DRAM_VIRTUAL_TABLE",
             "SSD_VIRTUAL_TABLE",
+            "DRAM_SSD_VIRTUAL_TABLE",
         ]
 
         if config_dict["use_virtual_table"]:
