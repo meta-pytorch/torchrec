@@ -91,6 +91,9 @@ class EmbeddingComputeKernel(Enum):
     DRAM_VIRTUAL_TABLE = (
         "dram_virtual_table"  # dram as kv backend storage for virtual table
     )
+    DRAM_SSD_VIRTUAL_TABLE = (
+        "dram_ssd_virtual_table"  # dram + ssd composite kv backend for virtual table
+    )
     FUSED_TRITON = "fused_triton"
 
 
@@ -104,6 +107,7 @@ def compute_kernel_to_embedding_location(
         EmbeddingComputeKernel.KEY_VALUE,  # use hbm for cache
         EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,  # use hbm for cache
         EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,  # use hbm for cache
+        EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE,  # use hbm for cache
     ]:
         return EmbeddingLocation.DEVICE
     elif compute_kernel in [
@@ -568,6 +572,7 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
                     EmbeddingComputeKernel.KEY_VALUE.value,
                     EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
                     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+                    EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
                 ]
         else:
             # TODO re-enable model parallel and dense
