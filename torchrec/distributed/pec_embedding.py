@@ -33,6 +33,7 @@ from torchrec.distributed.pec_collision_handlers import (
     CollisionSplits,
     create_collision_handler,
 )
+from torchrec.distributed.pec_comm_ops import PECAll2AllSeqInfo, PECAll2AllSeqWait
 from torchrec.distributed.types import (
     Awaitable,
     LazyAwaitable,
@@ -56,30 +57,34 @@ class PECEmbeddingCollectionContext(EmbeddingCollectionContext):
 
     prev_remapped_feature_values: List[torch.Tensor] | None = None
 
+    # Set by merge_partitioned_embeddings, read by pipeline during backward.
+    # One per sharding group.
+    backward_ctxs: List[PECAll2AllSeqInfo] | None = None
+
 
 class PECEmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
     """Merges overlapped and nonoverlapped embedding partitions.
 
-    On wait, concatenates [ol, nol] embeddings per sharding group and applies
-    the corresponding forward_permute to restore original order, then constructs
-    Dict[str, JaggedTensor] output via construct_jagged_tensors.
+    On wait, passes OL/NOL embeddings through PECAll2AllSeqWait (which merges
+    via forward_permute and sets up the autograd graph for gradient re-split),
+    then constructs Dict[str, JaggedTensor] output via construct_jagged_tensors.
     """
 
     def __init__(
         self,
         overlapped_awaitables: List[Awaitable[torch.Tensor]],
         nonoverlapped_awaitables: List[Awaitable[torch.Tensor]],
-        permutations: List[CollisionPermutation],
+        backward_ctxs: List[PECAll2AllSeqInfo],
         features_per_sharding: List[KeyedJaggedTensor],
         embedding_names_per_sharding: List[List[str]],
         need_indices: bool,
         features_to_permute_indices: Dict[str, List[int]],
     ) -> None:
         super().__init__()
-        # PEC-specific: partition awaitables and permutation results (per group)
+        # PEC-specific: partition awaitables and gradient intercept (per group)
         self._overlapped_awaitables = overlapped_awaitables
         self._nonoverlapped_awaitables = nonoverlapped_awaitables
-        self._permutations = permutations
+        self._backward_ctxs = backward_ctxs
 
         # From EC: used by construct_jagged_tensors to build output
         self._features_per_sharding = features_per_sharding
@@ -93,18 +98,17 @@ class PECEmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
     def _wait_impl(self) -> Dict[str, JaggedTensor]:
         jt_dict: Dict[str, JaggedTensor] = {}
 
-        for ol_aw, nol_aw, perm, features, embedding_names in zip(
+        for ol_aw, nol_aw, bwd_ctx, features, embedding_names in zip(
             self._overlapped_awaitables,
             self._nonoverlapped_awaitables,
-            self._permutations,
+            self._backward_ctxs,
             self._features_per_sharding,
             self._embedding_names_per_sharding,
         ):
             ol_embs = ol_aw.wait()
             nol_embs = nol_aw.wait()
 
-            merged_embs = torch.cat([ol_embs, nol_embs], dim=0)
-            embeddings = torch.index_select(merged_embs, 0, perm.forward_permute)
+            embeddings = PECAll2AllSeqWait.apply(bwd_ctx, ol_embs, nol_embs)
 
             jt_dict.update(
                 construct_jagged_tensors(
@@ -395,9 +399,12 @@ class ShardedPECEmbeddingCollection(
     ) -> LazyAwaitable[Dict[str, JaggedTensor]]:
         """Creates a LazyAwaitable that merges ol/nol embeddings on wait.
 
-        On wait: waits on both partition awaitables, concatenates [ol, nol],
-        applies forward_permute to restore original order, and constructs
-        the final Dict[str, JaggedTensor].
+        On wait: passes OL/NOL through PECAll2AllSeqWait (which merges via
+        forward_permute and sets up autograd for gradient re-split), then
+        constructs the final Dict[str, JaggedTensor].
+
+        Also creates one PECAll2AllSeqInfo per sharding group and stores
+        them on ctx.backward_ctxs for the pipeline to set backward_splits.
 
         Args:
             ctx: PEC context (sharding_contexts must be set from input_dist)
@@ -409,6 +416,16 @@ class ShardedPECEmbeddingCollection(
             LazyAwaitable resolving to Dict[str, JaggedTensor].
         """
         ec = self._embedding_collection
+
+        backward_ctxs = [
+            PECAll2AllSeqInfo(
+                permutation=perm,
+                pg=self._env.process_group,
+            )
+            for perm in permutations
+        ]
+        ctx.backward_ctxs = backward_ctxs
+
         features_per_sharding = [
             # pyre-ignore[6]
             sharding_ctx.features_before_input_dist
@@ -417,7 +434,7 @@ class ShardedPECEmbeddingCollection(
         return PECEmbeddingCollectionAwaitable(
             overlapped_awaitables=overlapped_awaitables,
             nonoverlapped_awaitables=nonoverlapped_awaitables,
-            permutations=permutations,
+            backward_ctxs=backward_ctxs,
             features_per_sharding=features_per_sharding,
             embedding_names_per_sharding=ec._embedding_names_per_sharding,
             need_indices=ec._need_indices,

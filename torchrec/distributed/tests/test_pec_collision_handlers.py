@@ -40,6 +40,14 @@ def _get_single_rank_pg() -> dist.ProcessGroup:
     return dist.group.WORLD  # pyre-ignore[7]
 
 
+def tearDownModule() -> None:
+    # The PG initialized by _get_single_rank_pg lives for the duration of
+    # this file's tests; destroy it so later test modules in the same
+    # pytest process can call init_process_group themselves.
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
 def _make_grouped_configs(
     tables: List[EmbeddingConfig],
     local_rows: int,
