@@ -20,7 +20,13 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-from fbgemm_gpu.tbe.ssd import BackendType
+
+try:
+    from fbgemm_gpu.tbe.ssd import BackendType
+except ImportError:
+    # Fallback for fbgemm_gpu < D103282820 (BackendType moved from
+    # split_table_batched_embeddings_ops_common to tbe/ssd).
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import BackendType
 from fbgemm_gpu.tbe.ssd.training import SSDTableBatchedEmbeddingBags
 from fbgemm_gpu.tbe.ssd.utils.partially_materialized_tensor import (
     PartiallyMaterializedTensor,

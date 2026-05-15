@@ -15,7 +15,18 @@ from unittest.mock import MagicMock, patch
 
 import hypothesis.strategies as st
 import torch
-from fbgemm_gpu.tbe.ssd import BackendType, EnrichmentPolicy, EnrichmentType
+
+try:
+    from fbgemm_gpu.tbe.ssd import BackendType, EnrichmentPolicy, EnrichmentType
+except ImportError:
+    # Fallback for fbgemm_gpu < D103282820 (BackendType, EnrichmentPolicy,
+    # EnrichmentType moved from split_table_batched_embeddings_ops_common
+    # to tbe/ssd).
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
+        BackendType,
+        EnrichmentPolicy,
+        EnrichmentType,
+    )
 from hypothesis import given, settings
 from torchrec.distributed.batched_embedding_kernel import ZeroCollisionKeyValueEmbedding
 from torchrec.distributed.embedding import EmbeddingCollectionContext
@@ -683,6 +694,7 @@ class TestCreateEmbeddingKernelEnrichment(unittest.TestCase):
         """When enrichment_policy with truthy enrichment_type is set,
         should route to ZeroCollisionEmbeddingEnrichmentCache."""
         enrichment_policy = EnrichmentPolicy(
+            # pyrefly: ignore[bad-argument-type]
             enrichment_type=EnrichmentType.IGR_LASER_SID,
         )
         kvzch_tbe_config = MagicMock()
@@ -802,6 +814,7 @@ class TestCreateEmbeddingKernelEnrichment(unittest.TestCase):
             mock_zc_enrichment_cls.reset_mock()
 
             enrichment_policy = EnrichmentPolicy(
+                # pyrefly: ignore[bad-argument-type]
                 enrichment_type=enrichment_type,
             )
             kvzch_tbe_config = MagicMock()

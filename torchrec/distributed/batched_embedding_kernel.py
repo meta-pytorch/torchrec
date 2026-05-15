@@ -46,13 +46,19 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SparseType,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-from fbgemm_gpu.tbe.ssd import (
-    ASSOC,
-    BackendType,
-    EvictionPolicy,
-    KVZCHParams,
-    SSDTableBatchedEmbeddingBags,
-)
+from fbgemm_gpu.tbe.ssd import ASSOC, SSDTableBatchedEmbeddingBags
+
+try:
+    from fbgemm_gpu.tbe.ssd import BackendType, EvictionPolicy, KVZCHParams
+except ImportError:
+    # Fallback for fbgemm_gpu < D103282820 (BackendType, EvictionPolicy,
+    # KVZCHParams moved from split_table_batched_embeddings_ops_common
+    # to tbe/ssd).
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
+        BackendType,
+        EvictionPolicy,
+        KVZCHParams,
+    )
 from fbgemm_gpu.tbe.ssd.utils.partially_materialized_tensor import (
     PartiallyMaterializedTensor,
 )
@@ -549,6 +555,7 @@ def _populate_zero_collision_tbe_params(
         bucket_sizes=bucket_sizes,
         enable_optimizer_offloading=True,
         backend_return_whole_row=(backend_type == BackendType.DRAM),
+        # pyrefly: ignore[bad-argument-type]
         eviction_policy=eviction_policy,
         embedding_cache_mode=embedding_cache_mode_,
         load_ckpt_without_opt=load_ckpt_without_opt,
@@ -2168,6 +2175,7 @@ class ZeroCollisionKeyValueEmbedding(
             feature_table_map=self._feature_table_map,
             ssd_cache_location=embedding_location,
             pooling_mode=PoolingMode.NONE,
+            # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
             **ssd_tbe_params,
@@ -3365,6 +3373,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
             feature_table_map=self._feature_table_map,
             ssd_cache_location=embedding_location,
             pooling_mode=self._pooling,
+            # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
             **ssd_tbe_params,

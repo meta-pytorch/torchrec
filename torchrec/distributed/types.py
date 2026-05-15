@@ -35,7 +35,13 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     MultiPassPrefetchConfig,
 )
 from fbgemm_gpu.tbe.monitoring import TBEStatsReporterConfig
-from fbgemm_gpu.tbe.ssd import KVZCHTBEConfig
+
+try:
+    from fbgemm_gpu.tbe.ssd import KVZCHTBEConfig
+except ImportError:
+    # Fallback for fbgemm_gpu < D103282820 (KVZCHTBEConfig moved
+    # from split_table_batched_embeddings_ops_common to tbe/ssd).
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import KVZCHTBEConfig
 from torch.autograd.profiler import record_function
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.distributed_c10d import _get_object_coll_device
