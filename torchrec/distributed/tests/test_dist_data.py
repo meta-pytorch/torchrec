@@ -2276,13 +2276,14 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         # new_group is collective on WORLD, so every rank must call it,
         # even ranks not in the resulting subgroup.
         subgroup = dist.new_group(ranks=[1, 3], backend=backend)
-        assert isinstance(subgroup, dist.ProcessGroup)
 
         if rank not in (1, 3):
             # Non-members do not run the awaitable; just synchronize and exit.
             dist.barrier()
             dist.destroy_process_group()
             return
+
+        assert isinstance(subgroup, dist.ProcessGroup)
 
         # Ranks 1 and 3 run a collective on the subgroup with divergent
         # tags so the mismatch path fires. PG-local ranks here are 0 and 1.
