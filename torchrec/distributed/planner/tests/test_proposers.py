@@ -155,7 +155,7 @@ class TestProposers(unittest.TestCase):
         self.enumerator = EmbeddingEnumerator(topology=topology, batch_size=BATCH_SIZE)
         self.greedy_proposer = GreedyProposer()
         self.uniform_proposer = UniformProposer()
-        self.grid_search_proposer = GridSearchProposer()
+        self.grid_search_proposer = GridSearchProposer(max_proposals=int(1e5))
         self.dynamic_programming_proposer = DynamicProgrammingProposer()
         self._sharding_types = [x.value for x in ShardingType]
         self.maxDiff = None
@@ -412,21 +412,22 @@ class TestProposers(unittest.TestCase):
         )
 
         """
-        All sharding types but DP will have 3 possible compute kernels after pruning:
+        All sharding types but DP will have 4 possible compute kernels after pruning:
             - fused
             - fused_uvm_caching
             - fused_uvm
+            - key_value
         DP will have 1 possible compute kernel: dense
         So the total number of pruned options will be:
-            (num_sharding_types - 1) * 3 + 1 = 19
+            (num_sharding_types - 1) * 4 + 1 = 25
         """
-        num_pruned_options = (len(ShardingType) - 1) * 3 + 1
+        num_pruned_options = (len(ShardingType) - 1) * 4 + 1
         self.grid_search_proposer.load(search_space)
         for (
             sharding_options
         ) in self.grid_search_proposer._sharding_options_by_fqn.values():
-            # number of sharding types after pruning is number of sharding types * 3
-            # 3 compute kernels fused/dense, fused_uvm_caching, fused_uvm
+            # number of sharding types after pruning is number of sharding types * 4
+            # 4 compute kernels fused/dense, fused_uvm_caching, fused_uvm, key_value
             self.assertEqual(len(sharding_options), num_pruned_options)
 
         num_proposals = 0
