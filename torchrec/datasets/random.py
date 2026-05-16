@@ -212,7 +212,9 @@ class RandomRecDataset(IterableDataset[Batch]):
             num_generated_batches=num_generated_batches,
             min_ids_per_features=min_ids_per_features,
         )
-        self.num_batches: int = cast(int, num_batches if not None else sys.maxsize)
+        self.num_batches: int = cast(
+            int, num_batches if num_batches is not None else sys.maxsize
+        )
 
     def __iter__(self) -> Iterator[Batch]:
         return itertools.islice(iter(self.batch_generator), self.num_batches)
