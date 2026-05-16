@@ -8,13 +8,17 @@
 # pyre-strict
 
 
+import contextlib
 import unittest
+from typing import Iterator
+from unittest import mock
 
 import torch
 import torch.utils._pytree as pytree
 from torch.testing import FileCheck
 from torchrec.fx import symbolic_trace
 from torchrec.sparse.jagged_tensor import (
+    _maybe_compute_length_per_key,
     _safe_tolist,
     ComputeJTDictToKJT,
     JaggedTensor,
@@ -23,6 +27,33 @@ from torchrec.sparse.jagged_tensor import (
 )
 
 torch.fx.wrap("len")
+
+
+@contextlib.contextmanager
+def _count_current_stream_syncs() -> Iterator[list[int]]:
+    """Patch ``torch.cuda.current_stream`` so the returned stream's
+    ``synchronize()`` calls are counted. Yields a single-element list whose
+    ``[0]`` is the call count when the context exits.
+    """
+    sync_count: list[int] = [0]
+    real_current_stream = torch.cuda.current_stream
+
+    class _Tracker:
+        def __init__(self, stream: torch.cuda.Stream) -> None:
+            self._stream = stream
+
+        def synchronize(self) -> None:
+            sync_count[0] += 1
+            self._stream.synchronize()
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._stream, name)
+
+    def _patched(device: object = None) -> object:
+        return _Tracker(real_current_stream(device))
+
+    with mock.patch("torch.cuda.current_stream", _patched):
+        yield sync_count
 
 
 class TestJaggedTensor(unittest.TestCase):
@@ -1417,3 +1448,55 @@ class TestJaggedTensorTracing(unittest.TestCase):
         tensor = torch.tensor([42], device="cuda")
         result = _safe_tolist(tensor)
         self.assertEqual(result, [42])
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_safe_tolist_empty_cuda_tensor_syncs_current_stream(self) -> None:
+        # _safe_tolist on an empty CUDA tensor must sync the current stream
+        # so callers don't race ahead of peer ranks taking the non-empty
+        # .tolist() path. Verified by patching torch.cuda.current_stream and
+        # counting synchronize() calls.
+        empty = torch.tensor([], dtype=torch.int64, device="cuda")
+        with _count_current_stream_syncs() as sync_count:
+            result = _safe_tolist(empty)
+
+        self.assertEqual(result, [])
+        self.assertGreaterEqual(
+            sync_count[0],
+            1,
+            "_safe_tolist on empty CUDA tensor did not call "
+            "current_stream.synchronize()",
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 0,
+        "CUDA is not available",
+    )
+    def test_maybe_compute_length_per_key_empty_lengths_cuda_syncs(self) -> None:
+        # When lengths.numel() == 0, _maybe_compute_length_per_key takes the
+        # [0] * len(keys) short-circuit. After the fix that branch must sync
+        # the current stream so ranks with empty lengths don't race ahead of
+        # ranks taking the .tolist() path.
+        keys = ["a", "b"]
+        empty_lengths = torch.tensor([], dtype=torch.int64, device="cuda")
+        with _count_current_stream_syncs() as sync_count:
+            result = _maybe_compute_length_per_key(
+                keys=keys,
+                stride=1,
+                stride_per_key=[1, 1],
+                variable_stride_per_key=False,
+                length_per_key=None,
+                lengths=empty_lengths,
+                offsets=None,
+                values=None,
+            )
+
+        self.assertEqual(result, [0, 0])
+        self.assertGreaterEqual(
+            sync_count[0],
+            1,
+            "_maybe_compute_length_per_key empty-lengths branch did not call "
+            "current_stream.synchronize()",
+        )
