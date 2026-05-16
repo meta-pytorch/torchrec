@@ -122,9 +122,6 @@ def _safe_tolist(tensor: torch.Tensor) -> List[int]:
     if torch.jit.is_scripting() or not tensor.is_cuda:
         return tensor.tolist()
 
-    if tensor.numel() == 0:
-        return []
-
     # During torch.compile tracing, skip the JK check and _cuda_to_cpu_safe
     # and fall back to plain .tolist(). justknobs_check calls pyjk.check()
     # (a Cython function) which can raise SystemError in sandbox/RE
@@ -1326,6 +1323,26 @@ def _use_segment_sum_csr(stride_per_key: List[int]) -> bool:
     return len(stride_per_key) >= segment_threshold
 
 
+def _length_per_key_from_lengths(
+    lengths: torch.Tensor, len_keys: int, stride: int
+) -> List[int]:
+    """Compute per-key totals from a flat ``[len_keys * stride]`` lengths tensor.
+
+    Bundles the empty-lengths short-circuit with the GPU compute path so
+    callers don't have to. The empty branch syncs the current CUDA stream to
+    match the wait-set of the non-empty ``.tolist()`` path — without that,
+    ranks taking the empty short-circuit race ahead of ranks taking the
+    ``.tolist()`` path and deadlock the next collective.
+    """
+    if pt2_guard_size_oblivious(lengths.numel() == 0):
+        if not torch.jit.is_scripting() and lengths.is_cuda:
+            torch.cuda.current_stream(lengths.device).synchronize()
+        return [0] * len_keys
+    return _safe_tolist(
+        torch.sum(pt2_check_size_nonzero(lengths.view(len_keys, stride)), dim=1)
+    )
+
+
 def _length_per_key_from_stride_per_key(
     lengths: torch.Tensor, stride_per_key: List[int]
 ) -> List[int]:
@@ -1383,22 +1400,27 @@ def _maybe_compute_length_per_key(
         _length: List[int] = (
             _length_per_key_from_stride_per_key(lengths, stride_per_key)
             if variable_stride_per_key
-            else (
-                _safe_tolist(
-                    torch.sum(
-                        pt2_check_size_nonzero(lengths.view(len(keys), stride)), dim=1
-                    )
-                )
-                if pt2_guard_size_oblivious(lengths.numel() != 0)
-                else [0] * len(keys)
-            )
+            else _length_per_key_from_lengths(lengths, len(keys), stride)
         )
     elif len(keys) and offsets is not None and len(offsets) > 0:
-        _length: List[int] = (
-            _length_per_key_from_stride_per_key(torch.diff(offsets), stride_per_key)
-            if variable_stride_per_key
-            else _safe_tolist(torch.sum(torch.diff(offsets).view(-1, stride), dim=1))
-        )
+        if variable_stride_per_key:
+            if len(offsets) == 1:
+                # Sync the current CUDA stream even if torch.diff(offsets) is empty.
+                # This keeps the rank in sync with peers that get a non-empty diff.
+                # Return [0] * len(keys) to match the lengths-path empty contract.
+                if not torch.jit.is_scripting() and offsets.is_cuda:
+                    torch.cuda.current_stream(offsets.device).synchronize()
+                _length: List[int] = [0] * len(keys)
+            else:
+                _length: List[int] = _length_per_key_from_stride_per_key(
+                    torch.diff(offsets), stride_per_key
+                )
+        else:
+            # Delegate to _length_per_key_from_lengths, which syncs the stream
+            # on empty diffs and handles non-empty diffs via _safe_tolist.
+            _length: List[int] = _length_per_key_from_lengths(
+                torch.diff(offsets), len(keys), stride
+            )
     else:
         _length: List[int] = []
 
