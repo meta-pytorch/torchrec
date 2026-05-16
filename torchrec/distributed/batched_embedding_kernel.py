@@ -171,6 +171,54 @@ class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
         return self._shard_buf
 
 
+class AllGatherResizeAwaitable(LazyAwaitable[torch.Tensor]):
+    """
+    Awaitable that packages async all-gather work with a deferred resize operation.
+
+    The post-AG bookkeeping (rebinding the module's weights to the gathered
+    buffer and freeing the shard buffer storage) only runs when wait() is
+    called, so the AG kernel can overlap with whatever computation runs on
+    the main stream between kick-off and the first read of the gathered
+    weights.
+    """
+
+    def __init__(
+        self,
+        async_work: Optional[dist.Work],
+        async_event: Optional[torch.cuda.Event],
+        unsharded_param: torch.Tensor,
+        resize_callback: Callable[[], None],
+    ) -> None:
+        """
+        Args:
+            async_work: The async all-gather work handle
+            async_event: CUDA event recorded on the AG side stream
+            unsharded_param: The buffer containing the gathered (full) weights
+            resize_callback: Callback to perform post-AG resize/rebinding
+                (called on wait())
+        """
+        super().__init__()
+        self._async_work = async_work
+        self._async_event = async_event
+        self._unsharded_param = unsharded_param
+        self._resize_callback = resize_callback
+        self._completed = False
+
+    def _wait_impl(self) -> torch.Tensor:
+        if self._completed:
+            return self._unsharded_param
+
+        if self._async_event is not None:
+            torch.cuda.current_stream().wait_event(self._async_event)
+        if self._async_work is not None:
+            self._async_work.wait()
+
+        self._resize_callback()
+
+        self._completed = True
+        return self._unsharded_param
+
+
 def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParams]:
     # populate res_params, which is used for raw embedding streaming
     # here only populates the params available in fused_params and TBE configs
@@ -2688,25 +2736,44 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         self._async_work: Optional[dist.Work] = None
         self._async_event: Optional[torch.cuda.Event] = None
         self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
+        self._ag_async_work: Optional[dist.Work] = None
+        self._ag_async_event: Optional[torch.cuda.Event] = None
+        self._ag_awaitable: Optional[AllGatherResizeAwaitable] = None
 
-        self.register_full_backward_pre_hook(
-            # pyrefly: ignore [bad-argument-type]
-            self._hybird_sharded_backward_hook,
+        # Stored so callers (e.g., a training pipeline configured with a
+        # custom `_hybird_sharded_backward_hook` injection site) can remove
+        # the per-module pre-hook to avoid redundant work.
+        self._backward_pre_hook_handle: Optional[torch.utils.hooks.RemovableHandle] = (
+            self.register_full_backward_pre_hook(
+                # pyrefly: ignore [bad-argument-type]
+                self._hybird_sharded_backward_hook,
+            )
         )
 
     def _all_gather_table_weights(self) -> None:
         """
-        All-gather embedding weights from sharded state back to full weights.
+        Kick off async all-gather of embedding weights from sharded state
+        back to the full weights, and store an awaitable that performs the
+        post-AG bookkeeping when waited on.
 
         Collective Communication:
-            - all_gather_into_tensor on replica_pg (synchronous)
+            - all_gather_into_tensor on replica_pg (async)
 
-        This is called during the backward pass (via backward hook) to restore
-        full embedding weights before gradient computation.
+        Callers (the per-module backward pre-hook or a training pipeline
+        injection site) must subsequently call
+        `ensure_all_gather_complete()` (or wait on the awaitable returned by
+        `get_ag_awaitable()`) before any consumer reads
+        `self._emb_module.weights_dev`.
         """
         if not self.weights_sharded:
             return
         self.ensure_reduce_scatter_complete()
+
+        self._async_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._async_stream):
+            self._ag_awaitable = self._all_gather_weights_async()
+
+    def _all_gather_weights_async(self) -> AllGatherResizeAwaitable:
         # pyrefly: ignore [missing-attribute]
         shard_size = self._shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
@@ -2734,23 +2801,39 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
             )
 
         with record_function("## 2d_allgather_fully_sharded ##"):
-            dist.all_gather_into_tensor(
+            self._ag_async_work = dist.all_gather_into_tensor(
                 output_tensor=output_tensor,
                 input_tensor=self._shard_buf,
                 group=self._env.replica_pg,
-                async_op=False,
+                async_op=True,
             )
-        self._emb_module.weights_dev = self._unsharded_param[
-            : self._original_shape.numel()
-        ]
-        # pyrefly: ignore [missing-attribute]
-        self._shard_buf.untyped_storage().resize_(0)
-        self.weights_sharded = False
+
+        self._ag_async_event = torch.cuda.Event(enable_timing=False, blocking=False)
+        self._ag_async_event.record(self._async_stream)
+
+        def resize_callback() -> None:
+            self._emb_module.weights_dev = self._unsharded_param[
+                : self._original_shape.numel()
+            ]
+            # pyrefly: ignore [missing-attribute]
+            self._shard_buf.untyped_storage().resize_(0)
+            self.weights_sharded = False
+
+        return AllGatherResizeAwaitable(
+            async_work=self._ag_async_work,
+            async_event=self._ag_async_event,
+            unsharded_param=self._unsharded_param,
+            resize_callback=resize_callback,
+        )
 
     def _hybird_sharded_backward_hook(
         self, module: nn.Module, grad_input: List[torch.Tensor]
     ) -> None:
         self._all_gather_table_weights()
+        # No injection site is wired up for this module, so we cannot defer
+        # the wait — block here so weights are restored before backward
+        # consumes them.
+        self.ensure_all_gather_complete()
 
     def get_rs_awaitable(self) -> Optional[ReduceScatterResizeAwaitable]:
         """
@@ -2758,6 +2841,16 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         This can be used by higher-level modules to compose awaitables.
         """
         return self._rs_awaitable
+
+    def get_ag_awaitable(self) -> Optional[AllGatherResizeAwaitable]:
+        """
+        Get the current all-gather awaitable.
+
+        Returned to higher-level modules (e.g., a training pipeline that
+        defers the wait to a backward injection site) so they can decide
+        when to call `wait()`.
+        """
+        return self._ag_awaitable
 
     def ensure_reduce_scatter_complete(self) -> None:
         """
@@ -2772,6 +2865,15 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         if self._rs_awaitable is not None:
             self._rs_awaitable.wait()
             self._rs_awaitable = None
+
+    def ensure_all_gather_complete(self) -> None:
+        """
+        Wait on the in-flight async all-gather (and run its deferred resize
+        callback) if one is pending. No-op otherwise.
+        """
+        if self._ag_awaitable is not None:
+            self._ag_awaitable.wait()
+            self._ag_awaitable = None
 
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         embs = super().forward(features)
@@ -4464,26 +4566,44 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         self._async_work: Optional[dist.Work] = None
         self._async_event: Optional[torch.cuda.Event] = None
         self._rs_awaitable: Optional[ReduceScatterResizeAwaitable] = None
+        self._ag_async_work: Optional[dist.Work] = None
+        self._ag_async_event: Optional[torch.cuda.Event] = None
+        self._ag_awaitable: Optional[AllGatherResizeAwaitable] = None
 
-        self.register_full_backward_pre_hook(
-            # pyrefly: ignore [bad-argument-type]
-            self._hybird_sharded_backward_hook,
+        # Stored so callers (e.g., a training pipeline configured with a
+        # custom `_hybird_sharded_backward_hook` injection site) can remove
+        # the per-module pre-hook to avoid redundant work.
+        self._backward_pre_hook_handle: Optional[torch.utils.hooks.RemovableHandle] = (
+            self.register_full_backward_pre_hook(
+                # pyrefly: ignore [bad-argument-type]
+                self._hybird_sharded_backward_hook,
+            )
         )
 
     def _all_gather_table_weights(self) -> None:
         """
-        All-gather embedding weights from sharded state back to full weights.
+        Kick off async all-gather of embedding weights from sharded state
+        back to the full weights, and store an awaitable that performs the
+        post-AG bookkeeping when waited on.
 
         Collective Communication:
-            - all_gather_into_tensor on replica_pg (synchronous)
+            - all_gather_into_tensor on replica_pg (async)
 
-        This is called during the backward pass (via backward hook) to restore
-        full embedding weights before gradient computation.
+        Callers (the per-module backward pre-hook or a training pipeline
+        injection site) must subsequently call
+        `ensure_all_gather_complete()` (or wait on the awaitable returned by
+        `get_ag_awaitable()`) before any consumer reads
+        `self._emb_module.weights_dev`.
         """
         if not self.weights_sharded:
             return
         self.ensure_reduce_scatter_complete()
 
+        self._async_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(self._async_stream):
+            self._ag_awaitable = self._all_gather_weights_async()
+
+    def _all_gather_weights_async(self) -> AllGatherResizeAwaitable:
         # pyrefly: ignore [missing-attribute]
         shard_size = self._shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
@@ -4511,23 +4631,39 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             )
 
         with record_function("## 2d_allgather_fully_sharded ##"):
-            dist.all_gather_into_tensor(
+            self._ag_async_work = dist.all_gather_into_tensor(
                 output_tensor=output_tensor,
                 input_tensor=self._shard_buf,
                 group=self._env.replica_pg,
-                async_op=False,
+                async_op=True,
             )
-        self._emb_module.weights_dev = self._unsharded_param[
-            : self._original_shape.numel()
-        ]
-        # pyrefly: ignore [missing-attribute]
-        self._shard_buf.untyped_storage().resize_(0)
-        self.weights_sharded = False
+
+        self._ag_async_event = torch.cuda.Event(enable_timing=False, blocking=False)
+        self._ag_async_event.record(self._async_stream)
+
+        def resize_callback() -> None:
+            self._emb_module.weights_dev = self._unsharded_param[
+                : self._original_shape.numel()
+            ]
+            # pyrefly: ignore [missing-attribute]
+            self._shard_buf.untyped_storage().resize_(0)
+            self.weights_sharded = False
+
+        return AllGatherResizeAwaitable(
+            async_work=self._ag_async_work,
+            async_event=self._ag_async_event,
+            unsharded_param=self._unsharded_param,
+            resize_callback=resize_callback,
+        )
 
     def _hybird_sharded_backward_hook(
         self, module: nn.Module, grad_input: List[torch.Tensor]
     ) -> None:
         self._all_gather_table_weights()
+        # No injection site is wired up for this module, so we cannot defer
+        # the wait — block here so weights are restored before backward
+        # consumes them.
+        self.ensure_all_gather_complete()
 
     def get_rs_awaitable(self) -> Optional[ReduceScatterResizeAwaitable]:
         """
@@ -4535,6 +4671,16 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         This can be used by higher-level modules to compose awaitables.
         """
         return self._rs_awaitable
+
+    def get_ag_awaitable(self) -> Optional[AllGatherResizeAwaitable]:
+        """
+        Get the current all-gather awaitable.
+
+        Returned to higher-level modules (e.g., a training pipeline that
+        defers the wait to a backward injection site) so they can decide
+        when to call `wait()`.
+        """
+        return self._ag_awaitable
 
     def ensure_reduce_scatter_complete(self) -> None:
         """
@@ -4549,6 +4695,15 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         if self._rs_awaitable is not None:
             self._rs_awaitable.wait()
             self._rs_awaitable = None
+
+    def ensure_all_gather_complete(self) -> None:
+        """
+        Wait on the in-flight async all-gather (and run its deferred resize
+        callback) if one is pending. No-op otherwise.
+        """
+        if self._ag_awaitable is not None:
+            self._ag_awaitable.wait()
+            self._ag_awaitable = None
 
     # pyrefly: ignore [bad-override]
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
