@@ -394,9 +394,32 @@ def prune_pytree_flatten_unflatten(
     for fqn in in_fqns:
         submodule, node, submod_name = _get_graph_node(module, fqn)
 
-        # kt_regroup node will have either one arg or one kwarg
+        # kt_regroup node will have either one arg or one kwarg.
+        # Extra placeholder args may be prepended by unflatten when mutation
+        # intermediates with list arguments (e.g. aten.cat) are added as
+        # placeholder inputs. Strip them by finding the tree_unflatten arg.
         use_args = len(node.args) == 1
         use_kwargs = len(node.kwargs) == 1
+
+        if not (use_args or use_kwargs):
+            for arg in node.args:
+                if not isinstance(arg, Node):
+                    continue
+                if arg.op != "call_function" or arg.target != operator.getitem:
+                    continue
+                inner = arg.args[0]
+                if not isinstance(inner, Node):
+                    continue
+                if inner.op != "call_function" or inner.target != operator.getitem:
+                    continue
+                node.args = (arg,)
+                use_args = True
+                break
+            if not use_args:
+                # pyrefly: ignore[missing-attribute]
+                submodule.graph.eliminate_dead_code()
+                continue
+
         assert use_args or use_kwargs
 
         # Incase the kt_regroup module is partitioned to a submodule, we need
