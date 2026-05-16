@@ -26,7 +26,10 @@ from torchrec.distributed.model_parallel import HybridEvalDMP
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.storage_reservations import (
+    FixedAbsoluteStorageReservation,
+    FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
+    StorageReservationType,
 )
 from torchrec.distributed.planner.types import CacheParams, ParameterConstraints
 from torchrec.distributed.sharding_plan import get_default_sharders
@@ -76,6 +79,11 @@ class PlannerConfig:
     additional_constraints: Dict[str, Any] = field(default_factory=dict)
     # Storage reservation percentage (0.0 to 1.0) for planner memory estimation
     storage_reservation_percentage: float = 0.15
+    storage_reservation_type: StorageReservationType = (
+        StorageReservationType.FIXED_ABSOLUTE
+    )
+    # Absolute HBM to reserve per device in GB (used when storage_reservation_type="fixed_absolute")
+    storage_reservation_hbm_gb: float = 2.0
     # Hardware configuration for topology (dict with keys: hbm_cap, ddr_cap, etc.)
     hardware: Optional[Dict[str, Any]] = None
 
@@ -231,14 +239,25 @@ class PlannerConfig:
             )
             constraints[name] = cons
 
-        # Create storage reservation if percentage > 0
-        storage_reservation = (
-            HeuristicalStorageReservation(
+        # Create storage reservation based on type
+        storage_reservation = None
+        if self.storage_reservation_type == StorageReservationType.FIXED_ABSOLUTE:
+            if self.storage_reservation_hbm_gb is None:
+                raise ValueError(
+                    "storage_reservation_hbm_gb must be set when "
+                    "storage_reservation_type=FIXED_ABSOLUTE"
+                )
+            storage_reservation = FixedAbsoluteStorageReservation.from_gb(
+                self.storage_reservation_hbm_gb
+            )
+        elif self.storage_reservation_type == StorageReservationType.FIXED_PERCENTAGE:
+            storage_reservation = FixedPercentageStorageReservation(
                 percentage=self.storage_reservation_percentage
             )
-            if self.storage_reservation_percentage > 0
-            else None
-        )
+        elif self.storage_reservation_percentage > 0:
+            storage_reservation = HeuristicalStorageReservation(
+                percentage=self.storage_reservation_percentage
+            )
 
         if self.planner_type == "embedding":
             return EmbeddingShardingPlanner(
