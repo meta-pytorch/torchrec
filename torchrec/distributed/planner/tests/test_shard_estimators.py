@@ -31,7 +31,9 @@ from torchrec.distributed.planner.constants import (
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.estimator import EmbeddingPerfEstimatorFactory
 from torchrec.distributed.planner.shard_estimators import (
+    _calculate_shard_io_sizes,
     _calculate_storage_specific_sizes,
+    _validate_io_sizes,
     EmbeddingOffloadStats,
     EmbeddingStorageEstimator,
 )
@@ -1845,3 +1847,159 @@ class TestComputeStorageUsage(unittest.TestCase):
         )
         expected = get_tensor_size_bytes(tensor)
         self.assertEqual(result, {"hbm": expected})
+
+
+class TestValidateIoSizes(unittest.TestCase):
+    def test_valid_sizes_no_assertion(self) -> None:
+        result = _validate_io_sizes([100, 200], [300, 400], "table_wise")
+        self.assertIsNone(result)
+
+    def test_negative_input_size_asserts(self) -> None:
+        with self.assertRaises(AssertionError) as ctx:
+            _validate_io_sizes([-1, 100], [200, 300], "table_wise")
+        self.assertIn(
+            "Negative value detected in input_sizes[0]=-1", str(ctx.exception)
+        )
+
+    def test_negative_output_size_asserts(self) -> None:
+        with self.assertRaises(AssertionError) as ctx:
+            _validate_io_sizes([100, 200], [-5, 300], "row_wise")
+        self.assertIn(
+            "Negative value detected in output_sizes[0]=-5", str(ctx.exception)
+        )
+
+    def test_nan_input_size_asserts(self) -> None:
+        with self.assertRaises(AssertionError) as ctx:
+            _validate_io_sizes([float("nan"), 100], [200, 300], "column_wise")
+        self.assertIn("NaN detected in input_sizes[0]", str(ctx.exception))
+
+    def test_nan_output_size_asserts(self) -> None:
+        with self.assertRaises(AssertionError) as ctx:
+            _validate_io_sizes([100, 200], [300, float("nan")], "data_parallel")
+        self.assertIn("NaN detected in output_sizes[1]", str(ctx.exception))
+
+
+class TestCalculateShardIoSizesValidation(unittest.TestCase):
+    def test_valid_tw_sizes_are_non_negative(self) -> None:
+        input_sizes, output_sizes = _calculate_shard_io_sizes(
+            sharding_type="table_wise",
+            batch_sizes=[32],
+            world_size=2,
+            local_world_size=2,
+            input_lengths=[10.0],
+            emb_dim=64,
+            shard_sizes=[[100, 64]],
+            input_data_type_size=4.0,
+            output_data_type_size=4.0,
+            num_poolings=[1.0],
+            is_pooled=True,
+        )
+        for size in input_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+        for size in output_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+
+    def test_valid_rw_sizes_are_non_negative(self) -> None:
+        input_sizes, output_sizes = _calculate_shard_io_sizes(
+            sharding_type="row_wise",
+            batch_sizes=[32],
+            world_size=2,
+            local_world_size=2,
+            input_lengths=[10.0],
+            emb_dim=64,
+            shard_sizes=[[50, 64], [50, 64]],
+            input_data_type_size=4.0,
+            output_data_type_size=4.0,
+            num_poolings=[1.0],
+            is_pooled=True,
+        )
+        for size in input_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+        for size in output_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+
+    def test_valid_cw_sizes_are_non_negative(self) -> None:
+        input_sizes, output_sizes = _calculate_shard_io_sizes(
+            sharding_type="column_wise",
+            batch_sizes=[32],
+            world_size=2,
+            local_world_size=2,
+            input_lengths=[10.0],
+            emb_dim=64,
+            shard_sizes=[[100, 32], [100, 32]],
+            input_data_type_size=4.0,
+            output_data_type_size=4.0,
+            num_poolings=[1.0],
+            is_pooled=True,
+        )
+        for size in input_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+        for size in output_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+
+    def test_valid_dp_sizes_are_non_negative(self) -> None:
+        input_sizes, output_sizes = _calculate_shard_io_sizes(
+            sharding_type="data_parallel",
+            batch_sizes=[32],
+            world_size=2,
+            local_world_size=2,
+            input_lengths=[10.0],
+            emb_dim=64,
+            shard_sizes=[[100, 64], [100, 64]],
+            input_data_type_size=4.0,
+            output_data_type_size=4.0,
+            num_poolings=[1.0],
+            is_pooled=True,
+        )
+        for size in input_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+        for size in output_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+
+    def test_valid_twrw_sizes_are_non_negative(self) -> None:
+        input_sizes, output_sizes = _calculate_shard_io_sizes(
+            sharding_type="table_row_wise",
+            batch_sizes=[32],
+            world_size=4,
+            local_world_size=2,
+            input_lengths=[10.0],
+            emb_dim=64,
+            shard_sizes=[[50, 64], [50, 64]],
+            input_data_type_size=4.0,
+            output_data_type_size=4.0,
+            num_poolings=[1.0],
+            is_pooled=True,
+        )
+        for size in input_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+        for size in output_sizes:
+            self.assertGreaterEqual(size, 0)
+            self.assertFalse(math.isnan(size))
+
+    def test_zero_shard_sizes_produce_zero_io(self) -> None:
+        input_sizes, output_sizes = _calculate_shard_io_sizes(
+            sharding_type="row_wise",
+            batch_sizes=[32],
+            world_size=2,
+            local_world_size=2,
+            input_lengths=[10.0],
+            emb_dim=64,
+            shard_sizes=[[0, 0], [100, 64]],
+            input_data_type_size=4.0,
+            output_data_type_size=4.0,
+            num_poolings=[1.0],
+            is_pooled=True,
+        )
+        self.assertEqual(input_sizes[0], 0)
+        self.assertEqual(output_sizes[0], 0)
+        self.assertGreater(input_sizes[1], 0)
+        self.assertGreater(output_sizes[1], 0)
