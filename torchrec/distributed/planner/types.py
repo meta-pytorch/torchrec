@@ -1446,6 +1446,7 @@ class PlannerErrorType(Enum):
     PLAN_LOADING_FAILED = "plan_loading_failed"
     INVALID_RANK_ASSIGNMENT = "invalid_rank_assignment"
     INPUT_VALIDATION = "input_validation"
+    MISSING_MODULE_IN_PLAN = "missing_module_in_plan"
 
 
 class PlannerError(Exception):
