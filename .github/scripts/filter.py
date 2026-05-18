@@ -65,7 +65,7 @@ def main():
             # Re-enable once fbgemm-gpu releases cu132 nightly builds
             continue
         if entry["python_version"] in ("3.9"):
-            # stop python3.9 support, and skipp python3.14 due to incompatibility with torch.compile
+            # stop python3.9 support
             # for python version: https://devguide.python.org/versions/
             continue
         new_matrix_entries.append(entry)
