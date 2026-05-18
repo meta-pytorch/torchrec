@@ -34,6 +34,7 @@ from torchrec.distributed.planner.shard_estimators import (
     _calculate_shard_io_sizes,
     _calculate_storage_specific_sizes,
     _validate_io_sizes,
+    _validate_perf,
     EmbeddingOffloadStats,
     EmbeddingStorageEstimator,
 )
@@ -2003,3 +2004,75 @@ class TestCalculateShardIoSizesValidation(unittest.TestCase):
         self.assertEqual(output_sizes[0], 0)
         self.assertGreater(input_sizes[1], 0)
         self.assertGreater(output_sizes[1], 0)
+
+
+class TestValidatePerf(unittest.TestCase):
+    def test_valid_perf_no_assertion(self) -> None:
+        perf = Perf(
+            fwd_compute=1.0,
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+        )
+        _validate_perf(perf, "table_0", "table_wise")
+
+    def test_nan_fwd_compute_asserts(self) -> None:
+        perf = Perf(
+            fwd_compute=float("nan"),
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            _validate_perf(perf, "table_0", "table_wise")
+        self.assertIn("NaN detected in Perf.fwd_compute", str(ctx.exception))
+
+    def test_negative_bwd_comms_asserts(self) -> None:
+        perf = Perf(
+            fwd_compute=1.0,
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=-3.0,
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            _validate_perf(perf, "table_0", "row_wise")
+        self.assertIn(
+            "Negative value detected in Perf.bwd_comms=-3.0", str(ctx.exception)
+        )
+
+    def test_nan_prefetch_compute_asserts(self) -> None:
+        perf = Perf(
+            fwd_compute=1.0,
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+            prefetch_compute=float("nan"),
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            _validate_perf(perf, "table_0", "table_wise")
+        self.assertIn("NaN detected in Perf.prefetch_compute", str(ctx.exception))
+
+    def test_negative_input_dist_comms_asserts(self) -> None:
+        perf = Perf(
+            fwd_compute=1.0,
+            fwd_comms=2.0,
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+            input_dist_comms=-0.5,
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            _validate_perf(perf, "table_0", "column_wise")
+        self.assertIn(
+            "Negative value detected in Perf.input_dist_comms=-0.5", str(ctx.exception)
+        )
+
+    def test_multiple_invalid_fields_first_fails(self) -> None:
+        perf = Perf(
+            fwd_compute=-1.0,
+            fwd_comms=float("nan"),
+            bwd_compute=1.5,
+            bwd_comms=2.5,
+        )
+        with self.assertRaises(AssertionError) as ctx:
+            _validate_perf(perf, "table_0", "table_wise")
+        self.assertIn("Negative value detected in Perf.fwd_compute", str(ctx.exception))
