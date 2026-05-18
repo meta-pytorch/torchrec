@@ -48,6 +48,7 @@ from torchrec.distributed.model_tracker.types import (
     Trackers,
 )
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
+from torchrec.distributed.safety_net import install_torchrec_global_safety_net
 from torchrec.distributed.sharding_plan import get_default_sharders
 from torchrec.distributed.types import (
     DMPCollectionConfig,
@@ -292,6 +293,9 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         model_tracker_configs: Optional[ModelTrackerConfigs] = None,
     ) -> None:
         super().__init__()
+        # JK-gated, idempotent. Installs sys.excepthook / threading.excepthook
+        # wrappers that route uncaught exceptions to torchrec_event_logging.
+        install_torchrec_global_safety_net()
         torch._C._log_api_usage_once(f"torchrec.distributed.{self.__class__.__name__}")
 
         self.init_parameters = init_parameters
