@@ -22,6 +22,7 @@ from torchrec.distributed.planner.perf_models import NoopPerfModel
 from torchrec.distributed.planner.planners import (
     EmbeddingShardingPlanner,
     extract_plan,
+    validate_compute_kernels,
     validate_modules_inclusion_in_sharding_plan,
 )
 from torchrec.distributed.planner.proposers import EmbeddingOffloadScaleupProposer
@@ -37,6 +38,7 @@ from torchrec.distributed.planner.types import (
     PlannerErrorType,
     Shard,
     ShardingOption,
+    Storage,
     Topology,
 )
 from torchrec.distributed.sharding_plan import get_default_sharders
@@ -1860,3 +1862,254 @@ class TestValidateModulesInclusionInShardingPlan(unittest.TestCase):
         self.assertIn("sparse.ebc", sharding_plan.plan)
         # weighted_ebc should not be in the plan since it has no shardable params
         self.assertNotIn("sparse.weighted_ebc", sharding_plan.plan)
+
+    def test_validate_modules_inclusion_device_group_without_constraints(self) -> None:
+        """Test that validation raises ValueError when device_group is set but constraints is None."""
+        sharders: List[ModuleSharder[nn.Module]] = [
+            cast(ModuleSharder[nn.Module], TWvsRWSharder())
+        ]
+
+        # Should raise ValueError when device_group is set but constraints is None
+        empty_plan = ShardingPlan({})
+        with self.assertRaises(ValueError) as context:
+            validate_modules_inclusion_in_sharding_plan(
+                empty_plan,
+                self.model,
+                sharders,
+                constraints=None,
+                device_group="test_group",
+            )
+        self.assertIn(
+            "device_group is set but constraints is None", str(context.exception)
+        )
+
+
+class TestValidateComputeKernels(unittest.TestCase):
+
+    def _make_sharding_option(
+        self,
+        name: str = "table_0",
+        module_path: str = "sparse.ebc",
+        compute_kernel: str = EmbeddingComputeKernel.FUSED.value,
+        sharding_type: str = ShardingType.TABLE_WISE.value,
+        cache_params: Optional[CacheParams] = None,
+        key_value_params: Optional[KeyValueParams] = None,
+        storage: Optional[Storage] = None,
+    ) -> ShardingOption:
+        shard_storage = storage if storage is not None else Storage(hbm=1000, ddr=0)
+        ebc = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    num_embeddings=100,
+                    embedding_dim=64,
+                    name=name,
+                    feature_names=[f"feature_{name}"],
+                )
+            ],
+            device=torch.device("meta"),
+        )
+        return ShardingOption(
+            name=name,
+            tensor=torch.zeros(100, 64, device="meta"),
+            module=(module_path, ebc),
+            input_lengths=[1.0],
+            batch_size=128,
+            sharding_type=sharding_type,
+            partition_by="device",
+            compute_kernel=compute_kernel,
+            shards=[
+                Shard(
+                    size=[100, 64],
+                    offset=[0, 0],
+                    storage=shard_storage,
+                    rank=0,
+                ),
+            ],
+            cache_params=cache_params,
+            key_value_params=key_value_params,
+        )
+
+    def test_valid_fused_kernel(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            storage=Storage(hbm=1000, ddr=0),
+        )
+        # Should not raise
+        validate_compute_kernels([so])
+
+    def test_valid_dense_kernel(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.DENSE.value,
+            sharding_type=ShardingType.DATA_PARALLEL.value,
+            storage=Storage(hbm=1000, ddr=0),
+        )
+        # Should not raise
+        validate_compute_kernels([so])
+
+    def test_valid_fused_uvm_caching_kernel(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            cache_params=CacheParams(load_factor=0.5),
+            storage=Storage(hbm=500, ddr=1000),
+        )
+        # Should not raise
+        validate_compute_kernels([so])
+
+    def test_valid_quant_uvm_caching_kernel(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.QUANT_UVM_CACHING.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            cache_params=CacheParams(load_factor=0.2),
+            storage=Storage(hbm=200, ddr=1000),
+        )
+        # Should not raise
+        validate_compute_kernels([so])
+
+    def test_valid_key_value_kernel(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.KEY_VALUE.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            key_value_params=KeyValueParams(),
+            storage=Storage(hbm=500, ddr=0),
+        )
+        # Should not raise
+        validate_compute_kernels([so])
+
+    def test_unknown_compute_kernel(self) -> None:
+        so = self._make_sharding_option(compute_kernel="invalid_kernel")
+        with self.assertRaises(PlannerError) as ctx:
+            validate_compute_kernels([so])
+        self.assertEqual(
+            ctx.exception.error_type, PlannerErrorType.INVALID_COMPUTE_KERNEL
+        )
+        self.assertIn("unknown compute kernel", str(ctx.exception))
+
+    def test_dense_kernel_wrong_sharding_type(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.DENSE.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+        )
+        with self.assertRaises(PlannerError) as ctx:
+            validate_compute_kernels([so])
+        self.assertEqual(
+            ctx.exception.error_type, PlannerErrorType.INVALID_COMPUTE_KERNEL
+        )
+        self.assertIn("DENSE kernel requires DATA_PARALLEL", str(ctx.exception))
+
+    def test_fused_uvm_caching_missing_cache_load_factor(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            storage=Storage(hbm=500, ddr=1000),
+        )
+        # cache_load_factor=None is allowed because the OSS planner UVM path
+        # stores cache_load_factor in sharder.fused_params and computes the
+        # precise value post-planning via calc_cache_load_factor.
+        # Should not raise
+        validate_compute_kernels([so])
+
+    def test_fused_uvm_caching_invalid_cache_load_factor(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            cache_params=CacheParams(load_factor=1.0),
+            storage=Storage(hbm=500, ddr=1000),
+        )
+        with self.assertRaises(PlannerError) as ctx:
+            validate_compute_kernels([so])
+        self.assertIn("cache_load_factor", str(ctx.exception))
+
+    def test_key_value_kernel_without_params(self) -> None:
+        # key_value_params is optional - estimator creates defaults if needed
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.KEY_VALUE.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+        )
+        # Should not raise
+        validate_compute_kernels([so])
+
+    def test_fused_uvm_caching_negative_hbm(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            cache_params=CacheParams(load_factor=0.5),
+            storage=Storage(hbm=-100, ddr=1000),
+        )
+        with self.assertRaises(PlannerError) as ctx:
+            validate_compute_kernels([so])
+        self.assertIn("negative HBM", str(ctx.exception))
+
+    def test_fused_uvm_caching_negative_ddr(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            cache_params=CacheParams(load_factor=0.5),
+            storage=Storage(hbm=500, ddr=-100),
+        )
+        with self.assertRaises(PlannerError) as ctx:
+            validate_compute_kernels([so])
+        self.assertIn("negative DDR", str(ctx.exception))
+
+    def test_ssd_virtual_table_without_params(self) -> None:
+        # key_value_params is optional - estimator creates defaults if needed
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+        )
+        # Should not raise
+        validate_compute_kernels([so])
+
+    def test_multiple_violations(self) -> None:
+        so1 = self._make_sharding_option(
+            name="table_0",
+            compute_kernel=EmbeddingComputeKernel.DENSE.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+        )
+        so2 = self._make_sharding_option(
+            name="table_1",
+            compute_kernel="invalid_kernel",
+            sharding_type=ShardingType.TABLE_WISE.value,
+        )
+        with self.assertRaises(PlannerError) as ctx:
+            validate_compute_kernels([so1, so2])
+        self.assertIn("2 violation(s)", str(ctx.exception))
+
+    def test_empty_plan(self) -> None:
+        # Should not raise
+        validate_compute_kernels([])
+
+    def test_fused_uvm_caching_zero_cache_load_factor(self) -> None:
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            cache_params=CacheParams(load_factor=0.0),
+            storage=Storage(hbm=500, ddr=1000),
+        )
+        with self.assertRaises(PlannerError) as ctx:
+            validate_compute_kernels([so])
+        self.assertIn("cache_load_factor", str(ctx.exception))
+
+    def test_dram_virtual_table_without_params(self) -> None:
+        # key_value_params is optional - estimator creates defaults if needed
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+        )
+        # Should not raise
+        validate_compute_kernels([so])
+
+    def test_valid_with_negative_storage(self) -> None:
+        # Negative storage should fail validation for caching kernels
+        # Production data shows this never occurs (0 in 6.6M+ plans), so validation is safe
+        so = self._make_sharding_option(
+            compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            storage=Storage(hbm=-100, ddr=-200),
+        )
+        with self.assertRaises(PlannerError) as ctx:
+            validate_compute_kernels([so])
+        self.assertIn("negative HBM", str(ctx.exception))
+        self.assertIn("negative DDR", str(ctx.exception))
+        self.assertIn("2 violation(s)", str(ctx.exception))
