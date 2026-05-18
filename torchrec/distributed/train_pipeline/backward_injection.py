@@ -270,7 +270,7 @@ def will_hook_fire(p: torch.Tensor) -> bool:
 
 
 def _summarize_unhookable(
-    named_params: list[tuple[str, torch.Tensor]],
+    named_params: list[tuple[str, nn.Parameter]],
 ) -> str:
     """Bucket every ``will_hook_fire``-failing param by the *first* reason it
     fails (priority: no_requires_grad → ShardedTensor → DTensor → non_leaf).
