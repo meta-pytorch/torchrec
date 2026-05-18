@@ -1447,6 +1447,7 @@ class PlannerErrorType(Enum):
     INVALID_RANK_ASSIGNMENT = "invalid_rank_assignment"
     INPUT_VALIDATION = "input_validation"
     MISSING_MODULE_IN_PLAN = "missing_module_in_plan"
+    INVALID_COMPUTE_KERNEL = "invalid_compute_kernel"
 
 
 class PlannerError(Exception):

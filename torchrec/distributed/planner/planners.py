@@ -20,6 +20,7 @@ import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.planner.constants import BATCH_SIZE, MAX_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
@@ -343,6 +344,80 @@ def validate_rank_assignment(sharding_plan: ShardingPlan, topology: Topology) ->
             else:
                 msg = f"Sharding spec not found for {module_name}.{param_name}"
                 logging.warning(msg)
+
+
+_VALID_COMPUTE_KERNELS: set[str] = {k.value for k in EmbeddingComputeKernel}
+
+_CACHING_KERNELS: set[str] = {
+    EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+    EmbeddingComputeKernel.QUANT_UVM_CACHING.value,
+}
+
+
+def validate_compute_kernels(
+    best_plan: List[ShardingOption],
+) -> None:
+    """
+    Validates that compute kernel selections in the sharding plan are valid and
+    consistent with other sharding option attributes.
+
+    Args:
+        best_plan: The selected sharding options comprising the plan.
+
+    Raises:
+        PlannerError: If any sharding option has an invalid or inconsistent
+            compute kernel configuration.
+    """
+    violations: List[str] = []
+
+    for so in best_plan:
+        fqn = so.fqn
+        kernel = so.compute_kernel
+
+        if kernel not in _VALID_COMPUTE_KERNELS:
+            violations.append(f"{fqn}: unknown compute kernel '{kernel}'")
+            continue
+
+        if (
+            kernel == EmbeddingComputeKernel.DENSE.value
+            and so.sharding_type != ShardingType.DATA_PARALLEL.value
+        ):
+            violations.append(
+                f"{fqn}: DENSE kernel requires DATA_PARALLEL sharding, "
+                f"got '{so.sharding_type}'"
+            )
+
+        if kernel in _CACHING_KERNELS:
+            clf = so.cache_load_factor
+            if clf is not None and (clf <= 0 or clf >= 1):
+                violations.append(
+                    f"{fqn}: {kernel} requires cache_load_factor strictly "
+                    f"between 0 and 1, got {clf}"
+                )
+
+        # Validate storage for all kernels (negative storage is invalid for any kernel)
+        storage = so.total_storage
+        if storage.hbm < 0:
+            violations.append(
+                f"{fqn}: {kernel} has negative HBM storage ({storage.hbm})"
+            )
+        if storage.ddr < 0:
+            violations.append(
+                f"{fqn}: {kernel} has negative DDR storage ({storage.ddr})"
+            )
+
+    if violations:
+        for v in violations:
+            logging.warning(f"Compute kernel validation: {v}")
+        msg = (
+            "Compute kernel validation failed with "
+            f"{len(violations)} violation(s):\n"
+            + "\n".join(f"  - {v}" for v in violations)
+        )
+        raise PlannerError(
+            error_type=PlannerErrorType.INVALID_COMPUTE_KERNEL,
+            message=msg,
+        )
 
 
 def extract_plan(
@@ -920,6 +995,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
 
             validate_modules_inclusion_in_sharding_plan(sharding_plan, module, sharders)
             validate_rank_assignment(sharding_plan, self._topology)
+            validate_compute_kernels(best_plan)
 
             log_planning_result(
                 planner_type=self.__class__.__name__,
