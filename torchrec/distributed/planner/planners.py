@@ -10,6 +10,7 @@
 import copy
 import logging
 import time
+from collections import deque
 from functools import reduce
 from time import perf_counter
 from typing import Callable, cast, Dict, List, Optional, Tuple, Union
@@ -19,6 +20,7 @@ import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
 from torchrec.distributed.planner.constants import BATCH_SIZE, MAX_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
@@ -54,6 +56,7 @@ from torchrec.distributed.planner.types import (
 from torchrec.distributed.planner.utils import (
     bytes_to_gb,
     reset_shard_rank,
+    sharder_name,
     storage_repr_in_gb,
 )
 from torchrec.distributed.sharding_plan import get_default_sharders, placement
@@ -188,6 +191,122 @@ def to_sharding_plan(
     return ShardingPlan(plan)
 
 
+def _module_in_device_group(
+    shardable_params: Dict[str, nn.Parameter],
+    constraints: Dict[str, ParameterConstraints],
+    device_group: str,
+) -> bool:
+    # Check if any parameter that will actually be sharded belongs to the device group.
+    # We iterate over shardable_params (params that will be sharded) and check if
+    # they have constraints matching the target device_group.
+    for param_name in shardable_params:
+        if (
+            param_name in constraints
+            and constraints[param_name].device_group == device_group
+        ):
+            return True
+    return False
+
+
+def validate_modules_inclusion_in_sharding_plan(
+    sharding_plan: ShardingPlan,
+    module: nn.Module,
+    sharders: List[ModuleSharder[nn.Module]],
+    constraints: Optional[Dict[str, ParameterConstraints]] = None,
+    device_group: Optional[str] = None,
+) -> None:
+    """
+    Validates that all shardable modules in the model are included in the sharding plan.
+
+    This function traverses through the module hierarchy to identify all shardable
+    modules (modules that have a corresponding sharder AND have shardable parameters)
+    and validates that each one is present in the final sharding plan.
+
+    A module is only expected to be in the sharding plan if:
+    1. It has a corresponding sharder (by module type)
+    2. The sharder's shardable_parameters() returns at least one parameter for it
+    3. If device_group is specified, the module's constraint must match the device_group
+
+    This handles cases where a sharder is configured to only shard specific tables
+    (e.g., via shardable_params filter), leaving some modules with no parameters
+    to shard. It also supports group-based validation for HeteroEmbeddingShardingPlanner
+    where modules are partitioned across different device groups.
+
+    Args:
+        sharding_plan (ShardingPlan): The final sharding plan to validate.
+        module (nn.Module): The root module to traverse and validate.
+        sharders (List[ModuleSharder[nn.Module]]): The list of sharders used for
+            sharding. These define which module types are considered shardable.
+        constraints (Optional[Dict[str, ParameterConstraints]]): Per-table constraints
+            for sharding. Required when device_group is specified.
+        device_group (Optional[str]): If specified, only validate modules that belong
+            to this device group. This is used by HeteroEmbeddingShardingPlanner to
+            validate per-group sharding plans.
+
+    Raises:
+        PlannerError: If any shardable module with shardable parameters
+            is not found in the sharding plan.
+    """
+    if device_group is not None and constraints is None:
+        raise ValueError(
+            "device_group is set but constraints is None; "
+            "device_group filtering requires constraints to be provided"
+        )
+
+    sharder_map = {sharder_name(sharder.module_type): sharder for sharder in sharders}
+    expected_modules: set[str] = set()
+
+    named_modules_queue = deque([("", module)])
+    while named_modules_queue:
+        child_path, child_module = named_modules_queue.popleft()
+        sharder_key = sharder_name(type(child_module))
+        sharder = sharder_map.get(sharder_key, None)
+
+        if not sharder:
+            for n, m in child_module.named_children():
+                if child_path != "":
+                    named_modules_queue.append((child_path + "." + n, m))
+                else:
+                    named_modules_queue.append((n, m))
+            continue
+
+        shardable_params = sharder.shardable_parameters(child_module)
+        if shardable_params:
+            if device_group is not None and constraints is not None:
+                if _module_in_device_group(shardable_params, constraints, device_group):
+                    expected_modules.add(child_path)
+            else:
+                expected_modules.add(child_path)
+            # Skip traversing children of a module that will be sharded.
+            # The children are internal implementation details (e.g., _embedding_module
+            # inside ManagedCollisionEmbeddingCollection) and should not be separately
+            # validated or included in the sharding plan.
+            continue
+
+        # Continue traversing children only if this module doesn't have a sharder
+        # or has no shardable parameters
+        for n, m in child_module.named_children():
+            if child_path != "":
+                named_modules_queue.append((child_path + "." + n, m))
+            else:
+                named_modules_queue.append((n, m))
+
+    plan_modules = set(sharding_plan.plan.keys())
+    missing_modules = sorted(expected_modules - plan_modules)
+
+    if missing_modules:
+        group_info = f" for device group '{device_group}'" if device_group else ""
+        msg = (
+            f"The following shardable modules are not present in the "
+            f"sharding plan{group_info}: {missing_modules}."
+        )
+        logging.error(msg)
+        raise PlannerError(
+            error_type=PlannerErrorType.MISSING_MODULE_IN_PLAN,
+            message=msg,
+        )
+
+
 def validate_rank_assignment(sharding_plan: ShardingPlan, topology: Topology) -> None:
     """
     Validates that all shards in the given sharding plan have valid rank assignments.
@@ -225,6 +344,80 @@ def validate_rank_assignment(sharding_plan: ShardingPlan, topology: Topology) ->
             else:
                 msg = f"Sharding spec not found for {module_name}.{param_name}"
                 logging.warning(msg)
+
+
+_VALID_COMPUTE_KERNELS: set[str] = {k.value for k in EmbeddingComputeKernel}
+
+_CACHING_KERNELS: set[str] = {
+    EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
+    EmbeddingComputeKernel.QUANT_UVM_CACHING.value,
+}
+
+
+def validate_compute_kernels(
+    best_plan: List[ShardingOption],
+) -> None:
+    """
+    Validates that compute kernel selections in the sharding plan are valid and
+    consistent with other sharding option attributes.
+
+    Args:
+        best_plan: The selected sharding options comprising the plan.
+
+    Raises:
+        PlannerError: If any sharding option has an invalid or inconsistent
+            compute kernel configuration.
+    """
+    violations: List[str] = []
+
+    for so in best_plan:
+        fqn = so.fqn
+        kernel = so.compute_kernel
+
+        if kernel not in _VALID_COMPUTE_KERNELS:
+            violations.append(f"{fqn}: unknown compute kernel '{kernel}'")
+            continue
+
+        if (
+            kernel == EmbeddingComputeKernel.DENSE.value
+            and so.sharding_type != ShardingType.DATA_PARALLEL.value
+        ):
+            violations.append(
+                f"{fqn}: DENSE kernel requires DATA_PARALLEL sharding, "
+                f"got '{so.sharding_type}'"
+            )
+
+        if kernel in _CACHING_KERNELS:
+            clf = so.cache_load_factor
+            if clf is not None and (clf <= 0 or clf >= 1):
+                violations.append(
+                    f"{fqn}: {kernel} requires cache_load_factor strictly "
+                    f"between 0 and 1, got {clf}"
+                )
+
+        # Validate storage for all kernels (negative storage is invalid for any kernel)
+        storage = so.total_storage
+        if storage.hbm < 0:
+            violations.append(
+                f"{fqn}: {kernel} has negative HBM storage ({storage.hbm})"
+            )
+        if storage.ddr < 0:
+            violations.append(
+                f"{fqn}: {kernel} has negative DDR storage ({storage.ddr})"
+            )
+
+    if violations:
+        for v in violations:
+            logging.warning(f"Compute kernel validation: {v}")
+        msg = (
+            "Compute kernel validation failed with "
+            f"{len(violations)} violation(s):\n"
+            + "\n".join(f"  - {v}" for v in violations)
+        )
+        raise PlannerError(
+            error_type=PlannerErrorType.INVALID_COMPUTE_KERNEL,
+            message=msg,
+        )
 
 
 def extract_plan(
@@ -800,7 +993,9 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     ),
                 )
 
+            validate_modules_inclusion_in_sharding_plan(sharding_plan, module, sharders)
             validate_rank_assignment(sharding_plan, self._topology)
+            validate_compute_kernels(best_plan)
 
             log_planning_result(
                 planner_type=self.__class__.__name__,

@@ -14,6 +14,8 @@ from typing import cast, List, Optional, Tuple
 import torch
 from hypothesis import given, settings, strategies as st
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import fully_shard
 from torchrec.distributed import DistributedModelParallel
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.test_utils.emb_sharder import TestEBCSharder
@@ -237,8 +239,9 @@ class InjectionSiteTest(unittest.TestCase):
 
     @staticmethod
     def _has_backward_hook(p: torch.Tensor) -> bool:
-        """True iff ``p`` currently has at least one backward hook registered."""
-        hooks = getattr(p, "_backward_hooks", None)
+        """True iff ``p`` currently has at least one post-accumulate-grad hook
+        registered (the dict that ``_register_param_grad_hook`` populates)."""
+        hooks = getattr(p, "_post_accumulate_grad_hooks", None)
         return hooks is not None and len(hooks) > 0
 
     @staticmethod
@@ -333,7 +336,6 @@ class InjectionSiteTest(unittest.TestCase):
         self.assertIn("total=3", msg)
         self.assertIn("no_requires_grad=3", msg)
         self.assertIn("ShardedTensor=0", msg)
-        self.assertIn("DTensor=0", msg)
         self.assertIn("non_leaf=0", msg)
 
     def test_register_hook_persists_and_removable(self) -> None:
@@ -641,4 +643,81 @@ class OutputDistTensorFinderTest(MultiProcessTestBase):
             data=data,
             sharding_type=ShardingType.TABLE_WISE.value,
             mismatched_sharding_type=ShardingType.COLUMN_WISE.value,
+        )
+
+
+def _run_fsdp2_dtensor_param_grad_hook_test(
+    rank: int,
+    world_size: int,
+    backend: str = "nccl",
+    local_size: Optional[int] = None,
+) -> None:
+    """PARAM_GRAD hook fires on DTensor params under FSDP2 (``fully_shard``).
+
+    Pre-fix, ``_register_param_grad_hook`` called ``param.register_hook``, which
+    dispatches only from ``AccumulateGrad``. FSDP2 bypasses ``AccumulateGrad``
+    for DTensor params (it writes ``param.grad`` from its ``foreach_reduce``
+    callback against a temporary all-gathered tensor), so the hook silently
+    never fired and ``will_hook_fire`` gated DTensor off with a fail-fast
+    assert. The fix switches to ``register_post_accumulate_grad_hook``, which
+    ``foreach_reduce`` honors after the reduce-scatter write.
+    """
+    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+        parent = nn.Module()
+        child = nn.Sequential(
+            nn.Linear(8, 32, device=ctx.device),
+            nn.ReLU(),
+            nn.Linear(32, 8, device=ctx.device),
+        )
+        parent.add_module("child", child)
+
+        mesh = init_device_mesh(ctx.device.type, (world_size,))
+        fully_shard(child, mesh=mesh)
+
+        for _, p in child.named_parameters():
+            tc.assertEqual(
+                type(p).__name__,
+                "DTensor",
+                "fully_shard should convert child params to DTensor",
+            )
+
+        fire_count: List[int] = [0]
+        site = InjectionSite(
+            fqn="child",
+            tensor_finder=FirstGradTensorFinder(),
+            target_type=InjectionTargetType.PARAM_GRAD,
+        )
+        handle = register_backward_hook(
+            site,
+            parent,
+            lambda grad: fire_count.__setitem__(0, fire_count[0] + 1),
+        )
+
+        n_iters = 3
+        for _ in range(n_iters):
+            for p in child.parameters():
+                p.grad = None
+            child(torch.randn(2, 8, device=ctx.device)).sum().backward()
+
+        tc.assertEqual(
+            fire_count[0],
+            n_iters,
+            "PARAM_GRAD hook must fire once per backward on DTensor under FSDP2",
+        )
+        handle.remove()
+
+
+class FSDP2DTensorBackwardHookTest(MultiProcessTestBase):
+    """End-to-end test that the PARAM_GRAD hook fires on DTensor params under
+    FSDP2. Guards against regressing back to ``register_hook`` (which silently
+    no-ops on DTensor because FSDP2 bypasses ``AccumulateGrad``)."""
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2,
+        "Need at least 2 GPUs for FSDP2 test",
+    )
+    def test_param_grad_hook_fires_on_dtensor(self) -> None:
+        self._run_multi_process_test(
+            callable=_run_fsdp2_dtensor_param_grad_hook_test,
+            world_size=2,
         )

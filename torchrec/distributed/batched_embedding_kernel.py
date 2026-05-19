@@ -34,6 +34,7 @@ from typing import (
 import torch
 import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from fbgemm_gpu.split_table_batched_embeddings_ops_common import BackendType
 from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
     IntNBitTableBatchedEmbeddingBagsCodegen,
 )
@@ -48,7 +49,6 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
 )
 from fbgemm_gpu.tbe.ssd import (
     ASSOC,
-    BackendType,
     EvictionPolicy,
     KVZCHParams,
     SSDTableBatchedEmbeddingBags,

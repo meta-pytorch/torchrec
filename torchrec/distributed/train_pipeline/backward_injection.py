@@ -17,11 +17,12 @@ the backward all-to-all communication phase.
 
 Two hooking mechanisms are supported, selected via ``InjectionTargetType``:
 
-* **PARAM_GRAD** — uses ``torch.autograd.graph.register_multi_grad_hook`` on the
-  target module's trainable parameters.  This is **compile-safe**: unlike
-  forward hooks (which ``torch.compile`` can inline away), parameter
-  ``AccumulateGrad`` nodes survive compilation, so the hook fires reliably
-  under both eager and compiled (FMC) execution.
+* **PARAM_GRAD** — uses ``Tensor.register_post_accumulate_grad_hook`` on a
+  single trainable parameter under the target module. This works for both
+  plain leaf params (autograd's ``AccumulateGrad`` honors the hook dict) and
+  FSDP2 (``fully_shard``) DTensor params (FSDP2's ``foreach_reduce``
+  callback honors the same dict after writing the reduce-scattered grad).
+  Compile-safe: ``torch.compile`` does not strip these hooks.
 
 * **ACTIVATION** — uses a forward hook on the target module.  Each forward pass,
   the hook calls ``site.tensor_finder`` to locate an output tensor (e.g. the
@@ -76,6 +77,7 @@ from typing import (
 )
 
 import torch
+from pyre_extensions import none_throws
 from torch import nn
 from torchrec.distributed.comm_ops import Request
 from torchrec.distributed.embedding import EmbeddingCollectionAwaitable
@@ -102,9 +104,11 @@ class InjectionTargetType(Enum):
     """Selects the hooking mechanism used by ``register_backward_hook``.
 
     Attributes:
-        PARAM_GRAD: Compile-safe hook via ``register_multi_grad_hook`` on the
-            module's trainable parameters.  Suitable for dense sub-modules
-            whose parameters participate directly in the loss.
+        PARAM_GRAD: Hook via ``Tensor.register_post_accumulate_grad_hook`` on
+            a single trainable param under the target module. Works for plain
+            leaf params and FSDP2 DTensor params (both honor the
+            ``_post_accumulate_grad_hooks`` dict from their respective grad
+            writers — AccumulateGrad and FSDP2 ``foreach_reduce``). Compile-safe.
         ACTIVATION: Forward-hook + ``tensor_finder`` approach.  A forward hook
             calls ``site.tensor_finder`` each forward pass to locate the
             output tensor, then registers a per-tensor backward hook.
@@ -216,9 +220,11 @@ def register_backward_hook(
 
     The hooking mechanism is selected by ``site.target_type``:
 
-    * **PARAM_GRAD** — ``torch.autograd.graph.register_multi_grad_hook`` on the
-      module's trainable parameters.  Compile-safe (``AccumulateGrad``
-      nodes survive ``torch.compile``).  ``tensor_finder`` is ignored.
+    * **PARAM_GRAD** — ``Tensor.register_post_accumulate_grad_hook`` on a
+      single parameter under the target module. Works for both plain leaf
+      params and FSDP2 DTensor params (the dict is honored by AccumulateGrad
+      and FSDP2 ``foreach_reduce`` respectively). Compile-safe.
+      ``tensor_finder`` is ignored.
 
     * **ACTIVATION** — a forward hook that calls ``site.tensor_finder`` each
       forward pass, then registers ``hook_fn`` on the discovered tensor
@@ -259,36 +265,34 @@ def register_backward_hook(
 
 
 def will_hook_fire(p: torch.Tensor) -> bool:
-    """``param.register_hook`` only fires via ``AccumulateGrad``; sharded
-    embedding params (ShardedTensor / DTensor) bypass it via FBGEMM TBE
-    fused backward, so a hook landing on one will silently never fire."""
-    return (
-        p.is_leaf
-        and p.requires_grad
-        and type(p).__name__ not in ("ShardedTensor", "DTensor")
-    )
+    """A post-accumulate-grad hook fires only if the writer of ``param.grad``
+    iterates ``_post_accumulate_grad_hooks`` on the param. For plain leaves
+    that writer is autograd's ``AccumulateGrad``; for FSDP2 (``fully_shard``)
+    DTensor params it's FSDP2's ``foreach_reduce`` callback. ShardedTensor
+    params (sharded embeddings under FBGEMM TBE) are written from a fused
+    C++ backward that does not honor the dict, so a hook on them is silently
+    dropped — exclude them."""
+    return p.is_leaf and p.requires_grad and type(p).__name__ != "ShardedTensor"
 
 
 def _summarize_unhookable(
-    named_params: list[tuple[str, torch.Tensor]],
+    named_params: list[tuple[str, nn.Parameter]],
 ) -> str:
     """Bucket every ``will_hook_fire``-failing param by the *first* reason it
-    fails (priority: no_requires_grad → ShardedTensor → DTensor → non_leaf).
+    fails (priority: no_requires_grad → ShardedTensor → non_leaf).
     Used in the no-hookable-param assert message so callers can see why."""
-    no_grad = sharded = dtensor = non_leaf = 0
+    no_grad = sharded = non_leaf = 0
     for _, p in named_params:
         t = type(p).__name__
         if not p.requires_grad:
             no_grad += 1
         elif t == "ShardedTensor":
             sharded += 1
-        elif t == "DTensor":
-            dtensor += 1
         elif not p.is_leaf:
             non_leaf += 1
     return (
         f"total={len(named_params)}, no_requires_grad={no_grad}, "
-        f"ShardedTensor={sharded}, DTensor={dtensor}, non_leaf={non_leaf}"
+        f"ShardedTensor={sharded}, non_leaf={non_leaf}"
     )
 
 
@@ -297,13 +301,34 @@ def _register_param_grad_hook(
     target: nn.Module,
     hook_fn: Callable[[torch.Tensor], None],
 ) -> torch.utils.hooks.RemovableHandle:
-    """Compile-safe hook on a single parameter selected by ``hook_position``.
+    """Register a post-accumulate-grad hook on a single parameter selected by
+    ``hook_position``.
+
+    Uses ``Tensor.register_post_accumulate_grad_hook`` (not
+    ``Tensor.register_hook``) so the hook fires regardless of who writes
+    ``param.grad``:
+
+    * For plain leaf params, autograd's ``AccumulateGrad`` node iterates
+      ``_post_accumulate_grad_hooks`` after final accumulation.
+    * For FSDP2 (``fully_shard``) DTensor params, FSDP2's ``foreach_reduce``
+      callback iterates the same dict after writing the reduce-scattered
+      sharded grad via Python attribute assignment.
+
+    ``register_hook`` would only fire via ``AccumulateGrad``, which is
+    bypassed in the FSDP2 case (the DTensor param is never on the live
+    autograd graph; FSDP2 routes grad through a custom backward function
+    against a temporary all-gathered tensor) — so this used to silently
+    drop, gated off via ``will_hook_fire``.
 
     The position picks an index across *all* named parameters (so the
     percentage is stable regardless of which params are hookable). If the
-    param at that index cannot fire a backward hook (sharded / non-leaf
-    / no grad), walk outward to the nearest hookable neighbor. Assert if
+    param at that index cannot fire a hook (ShardedTensor / non-leaf /
+    no grad), walk outward to the nearest hookable neighbor. Assert if
     no parameter under ``site.fqn`` is hookable at all.
+
+    ``hook_fn`` keeps its ``(grad: Tensor) -> None`` contract: the adapter
+    reads ``param.grad`` (post-accumulate fires only after grad is fully
+    written, so it's guaranteed non-None) and forwards it.
     """
     named_params = list(target.named_parameters())
     n = len(named_params)
@@ -318,7 +343,7 @@ def _register_param_grad_hook(
     assert chosen_idx is not None, (
         f"register_backward_hook: no hookable parameter in module "
         f"'{site.fqn}' ({_summarize_unhookable(named_params)}); "
-        f"need is_leaf + requires_grad + not ShardedTensor/DTensor."
+        f"need is_leaf + requires_grad + not ShardedTensor."
     )
 
     name, param = named_params[chosen_idx]
@@ -336,7 +361,11 @@ def _register_param_grad_hook(
         site.hook_position,
         site.fqn,
     )
-    return param.register_hook(hook_fn)
+
+    def _grad_adapter(p: torch.Tensor) -> None:
+        hook_fn(none_throws(p.grad))
+
+    return param.register_post_accumulate_grad_hook(_grad_adapter)
 
 
 def _walk_outward(start: int, n: int) -> Iterator[int]:
