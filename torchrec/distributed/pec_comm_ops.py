@@ -14,10 +14,7 @@ from typing import List, Tuple
 
 import torch
 import torch.distributed as dist
-from torchrec.distributed.pec_collision_handlers import (
-    CollisionPermutation,
-    CollisionSplits,
-)
+from torchrec.distributed.pec_collision_handlers import OverlapSplits
 
 
 @dataclass
@@ -33,28 +30,25 @@ class PECAll2AllSeqInfo:
     will be added in a future diff.
 
     Attributes:
-        permutation: CollisionPermutation containing forward_permute (used in
-            forward merge) and backward_ol_permute/backward_nol_permute
-            (pre-composed original-order indices for splitting gradients
-            in rank-major order — no separate recat needed).
-        backward_splits: Previous batch's forward CollisionSplits, reused as
-            the gradient AllToAll split sizes. None until set by pipeline.
+        forward_permute: Permute tensor for merging [ol, nol] → original order.
+        backward_ol_permute: Original-order indices for OL gradient split.
+        backward_nol_permute: Original-order indices for NOL gradient split.
+        backward_splits: Per-rank OL/NOL split sizes for gradient AllToAll.
         pg: Process group for gradient AllToAll.
 
     Gradient outputs (set by PECAll2AllSeqWait.backward):
         ol_grad_work: Async work handle for OL gradient AllToAll.
-            Pipeline must wait before applying.
         ol_grad_local: Output buffer for OL gradient AllToAll.
-        nol_grad: NOL gradient tensor. Pipeline starts its own deferred
-            AllToAll using backward_splits.[input|output]_splits[1].
+        nol_grad: NOL gradient tensor for deferred AllToAll.
     """
 
-    permutation: CollisionPermutation
+    forward_permute: torch.Tensor
+    backward_ol_permute: torch.Tensor | None = None
+    backward_nol_permute: torch.Tensor | None = None
+    backward_splits: OverlapSplits | None = None
     pg: dist.ProcessGroup | None = None
-    backward_splits: CollisionSplits | None = None
 
-    # Gradient outputs — set by PECAll2AllSeqWait.backward, read by pipeline.
-    # Pipeline is responsible for wait + apply (future: gradient manager class).
+    # Gradient outputs — set by PECAll2AllSeqWait.backward
     ol_grad_work: dist.Work | None = None
     ol_grad_local: torch.Tensor | None = None
     nol_grad: torch.Tensor | None = None
@@ -128,9 +122,7 @@ class PECAll2AllSeqWait(torch.autograd.Function):
         ctx.backward_ctx = backward_ctx  # pyre-ignore[16]
 
         merged_embs = torch.cat([ol_embs, nol_embs], dim=0)
-        return torch.index_select(
-            merged_embs, 0, backward_ctx.permutation.forward_permute
-        )
+        return torch.index_select(merged_embs, 0, backward_ctx.forward_permute)
 
     @staticmethod
     # pyre-ignore[14]
@@ -139,11 +131,10 @@ class PECAll2AllSeqWait(torch.autograd.Function):
         grad_output: torch.Tensor,
     ) -> Tuple[None, None, None]:
         backward_ctx: PECAll2AllSeqInfo = ctx.backward_ctx  # pyre-ignore[16]
-        perm = backward_ctx.permutation
         splits = backward_ctx.backward_splits
 
-        assert perm.backward_ol_permute is not None
-        assert perm.backward_nol_permute is not None
+        assert backward_ctx.backward_ol_permute is not None
+        assert backward_ctx.backward_nol_permute is not None
         assert splits is not None
         assert backward_ctx.pg is not None
 
@@ -151,8 +142,8 @@ class PECAll2AllSeqWait(torch.autograd.Function):
 
         # Split gradient into ol/nol. Permute indices are pre-composed
         # with recat, so index_select produces rank-major order directly.
-        ol_grad = grad_output.index_select(0, perm.backward_ol_permute)
-        nol_grad = grad_output.index_select(0, perm.backward_nol_permute)
+        ol_grad = grad_output.index_select(0, backward_ctx.backward_ol_permute)
+        nol_grad = grad_output.index_select(0, backward_ctx.backward_nol_permute)
 
         # 3. Start async reverse AllToAll for OL grad
         ol_grad_work, ol_grad_local = _grad_dist(
