@@ -51,6 +51,9 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollection,
 )
 from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerCollection
+from torchrec.modules.mc_embedding_modules import (
+    BaseManagedCollisionEmbeddingCollection,
+)
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -311,12 +314,15 @@ class EmbeddingEnumerator(Enumerator):
         Returns:
             Optional[int]: Number of buckets for the table, or None if module is not EmbeddingBagCollection or table not found.
         """
-        # If module is not of type EmbeddingBagCollection, return None
         if isinstance(module, EmbeddingBagCollection):
             embedding_configs = module.embedding_bag_configs()
         elif isinstance(module, EmbeddingCollection):
             embedding_configs = module.embedding_configs()
+        elif isinstance(module, BaseManagedCollisionEmbeddingCollection):
+            all_buckets = module._managed_collision_collection.table_to_number_buckets()
+            return all_buckets[parameter] if parameter in all_buckets else None
         else:
+            # Module does not utilize buckets
             return None
 
         # Find the embedding config for the table with the same name as parameter input

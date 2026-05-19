@@ -346,7 +346,9 @@ def _create_hashzch_sharded_arch(
 
     module_sharding_plan = construct_module_sharding_plan(
         sparse_arch._mc_ec,
-        per_param_sharding={t.name: row_wise() for t in tables},
+        per_param_sharding={
+            t.name: row_wise(num_buckets=total_num_buckets) for t in tables
+        },
         local_size=ctx.local_size,
         world_size=WORLD_SIZE,
         device_type="cuda" if torch.cuda.is_available() else "cpu",
@@ -372,6 +374,7 @@ def _test_input_dist_2d_weights_mapping(
     sharder: ModuleSharder[nn.Module],
     backend: str,
     local_size: Optional[int] = None,
+    total_num_buckets: int = 4,
 ) -> None:
     """
     Test that input_dist() and compute() with 2D weights preserves the 1:1
@@ -384,7 +387,11 @@ def _test_input_dist_2d_weights_mapping(
     """
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         sharded_sparse_arch = _create_hashzch_sharded_arch(
-            tables, ctx, sharder, write_runtime_meta_dim=EMBEDDING_DIM // WORLD_SIZE
+            tables,
+            ctx,
+            sharder,
+            write_runtime_meta_dim=EMBEDDING_DIM // WORLD_SIZE,
+            total_num_buckets=total_num_buckets,
         )
         mc_ec = sharded_sparse_arch._mc_ec
         assert isinstance(mc_ec, ShardedManagedCollisionEmbeddingCollection)
@@ -691,15 +698,19 @@ class ShardedMCECInputDist2DWeightsTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    @given(backend=st.sampled_from(["nccl"]))
+    @given(backend=st.sampled_from(["nccl"]), uneven_buckets=st.booleans())
     @settings(deadline=None)
-    def test_input_dist_2d_weights_mapping(self, backend: str) -> None:
+    def test_input_dist_2d_weights_mapping(
+        self, backend: str, uneven_buckets: bool
+    ) -> None:
+        total_buckets = 3 if uneven_buckets else 4
+
         embedding_config = [
             EmbeddingConfig(
                 name="table_0",
                 feature_names=["feature_0"],
                 embedding_dim=EMBEDDING_DIM,
-                num_embeddings=32,
+                num_embeddings=36,
                 enable_embedding_update=True,
             ),
         ]
@@ -709,6 +720,7 @@ class ShardedMCECInputDist2DWeightsTest(MultiProcessTestBase):
             tables=embedding_config,
             sharder=ManagedCollisionEmbeddingCollectionSharder(),
             backend=backend,
+            total_num_buckets=total_buckets,
         )
 
     @unittest.skipIf(

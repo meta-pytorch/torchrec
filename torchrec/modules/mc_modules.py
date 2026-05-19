@@ -9,7 +9,17 @@
 
 import abc
 from logging import getLogger, Logger
-from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import (
+    Callable,
+    cast,
+    Dict,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 from torch import nn
@@ -393,6 +403,12 @@ class ManagedCollisionCollection(nn.Module):
 
     def embedding_configs(self) -> Sequence[BaseEmbeddingConfig]:
         return self._embedding_configs
+
+    def table_to_number_buckets(self) -> Dict[str, int]:
+        return {
+            table: cast(ManagedCollisionModule, mc_module).buckets()
+            for table, mc_module in self._managed_collision_modules.items()
+        }
 
     def forward(
         self,
