@@ -7,7 +7,6 @@ RunOptions:
   num_batches: 20
   num_benchmarks: 5
   num_profiles: 1
-  sharding_type: row_wise        # MP-ZCH only works with row-wise sharding
   profile_dir: "."
   name: "sparse_data_dist_mpzch"
   num_float_features: 1000
@@ -33,7 +32,6 @@ EmbeddingTablesConfig:
   mc_config:
     mc_type: "mp-zch"           # Either "mp-zch" or "sort-zch"
     total_num_buckets: 10       # zch_size must be a multiple of total_num_buckets,
-                                #     and total_num_buckets must be a multiple of world size
     max_probe: 128              # Controls amount of time kernel searches for lookup or insertion
     input_hash_size: 0          # Maximum input hash size.
     disable_fallback: False     # If ID lookup fails, then the IDS are removed entirely from output.
@@ -50,7 +48,7 @@ EmbeddingTablesConfig:
         data_type: FP16
         mc_config:
           mc_type: "mp-zch"
-          total_num_buckets: 10
+          total_num_buckets: 5
           max_probe: 128
           input_hash_size: 0
           eviction_policy_name: "SINGLE_TTL_EVICTION"
@@ -58,6 +56,7 @@ EmbeddingTablesConfig:
             single_ttl: 1
           disable_fallback: False
 PlannerConfig:
+  sharding_type: row_wise
   pooling_factors: [30.0]  # Must match ModelInputConfig.feature_pooling_avg
   # MP-ZCH only works with row-wise sharding
   additional_constraints:
