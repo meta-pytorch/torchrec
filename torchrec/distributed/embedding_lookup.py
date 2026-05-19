@@ -20,7 +20,19 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-from fbgemm_gpu.tbe.ssd import BackendType
+
+try:
+    from fbgemm_gpu.tbe.ssd import BackendType
+except ImportError:
+    # Track via _log_api_usage_once so we can quantify the callers still on
+    # a pre-D103282820 fbgemm_gpu and remove this fallback once those base
+    # layers roll forward.
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.embedding_lookup.import_failure.BackendType"
+    )
+    # Fallback for fbgemm_gpu < D103282820 (BackendType moved from
+    # split_table_batched_embeddings_ops_common to tbe/ssd).
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import BackendType
 from fbgemm_gpu.tbe.ssd.training import SSDTableBatchedEmbeddingBags
 from fbgemm_gpu.tbe.ssd.utils.partially_materialized_tensor import (
     PartiallyMaterializedTensor,

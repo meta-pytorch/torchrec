@@ -35,7 +35,24 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     MultiPassPrefetchConfig,
 )
 from fbgemm_gpu.tbe.monitoring import TBEStatsReporterConfig
-from fbgemm_gpu.tbe.ssd import KVZCHTBEConfig
+
+try:
+    from fbgemm_gpu.tbe.ssd import KVZCHTBEConfig
+except ImportError:
+    # `import torch` happens further down in this module; do a local import
+    # so the _log_api_usage_once call is self-contained. Subsequent
+    # `import torch` statements are no-ops thanks to module caching.
+    import torch
+
+    # Track via _log_api_usage_once so we can quantify the callers still on
+    # a pre-D103282820 fbgemm_gpu and remove this fallback once those base
+    # layers roll forward.
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.types.import_failure.KVZCHTBEConfig"
+    )
+    # Fallback for fbgemm_gpu < D103282820 (KVZCHTBEConfig moved
+    # from split_table_batched_embeddings_ops_common to tbe/ssd).
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import KVZCHTBEConfig
 from torch.autograd.profiler import record_function
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.distributed_c10d import _get_object_coll_device

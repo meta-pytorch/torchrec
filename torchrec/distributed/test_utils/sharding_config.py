@@ -14,7 +14,19 @@ from typing import Any, cast, Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
-from fbgemm_gpu.tbe.ssd import KVZCHTBEConfig
+
+try:
+    from fbgemm_gpu.tbe.ssd import KVZCHTBEConfig
+except ImportError:
+    # Track via _log_api_usage_once so we can quantify the callers still on
+    # a pre-D103282820 fbgemm_gpu and remove this fallback once those base
+    # layers roll forward.
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.test_utils.sharding_config.import_failure.KVZCHTBEConfig"
+    )
+    # Fallback for fbgemm_gpu < D103282820 (KVZCHTBEConfig moved from
+    # split_table_batched_embeddings_ops_common to tbe/ssd).
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import KVZCHTBEConfig
 from torch import nn, optim
 from torch.optim import Optimizer
 from torchrec.distributed import DistributedModelParallel
