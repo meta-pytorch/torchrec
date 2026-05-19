@@ -10,19 +10,14 @@
 
 import copy
 import unittest
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
-from torchrec.distributed.pec_collision_handlers import (
-    CollisionPermutation,
-    CollisionResult,
-    CollisionSplits,
-    split_features_by_values_mask,
-)
 from torchrec.distributed.pec_embedding import (
+    BackwardPartitionContext,
+    ForwardPartitionContext,
     PECEmbeddingCollectionSharder,
     ShardedPECEmbeddingCollection,
 )
@@ -56,7 +51,7 @@ EMBEDDING_TABLES: List[EmbeddingConfig] = [
         name="table_1",
         feature_names=["feature_1"],
         embedding_dim=8,
-        num_embeddings=16,
+        num_embeddings=8,
     ),
 ]
 
@@ -177,63 +172,35 @@ def _test_sharding(
             loss.backward()
 
 
-@dataclass
-class ExpectedCollisionResult:
-    remapped: List[int]
-    forward_mask: List[bool]
-    backward_mask: List[bool] | None
-
-
-@dataclass
-class ExpectedSplits:
-    input_splits: List[List[int]]
-    output_splits: List[List[int]]
-
-
 def _verify_forward_permute(
-    forward_permute: torch.Tensor,
+    forward_ctx: ForwardPartitionContext | None,
     expected: List[int],
 ) -> None:
-    assert forward_permute.tolist() == expected
+    assert forward_ctx is not None
+    assert forward_ctx.permute.tolist() == expected
 
 
-def _verify_backward_permute(
-    permutation: "CollisionPermutation",
+def _verify_backward_permutes(
+    backward_ctx: BackwardPartitionContext | None,
     expected_ol_permute: List[int] | None,
     expected_nol_permute: List[int] | None,
 ) -> None:
     if expected_ol_permute is None:
-        assert permutation.backward_ol_permute is None
-        assert permutation.backward_nol_permute is None
+        assert backward_ctx is None
     else:
-        assert permutation.backward_ol_permute is not None
-        assert permutation.backward_nol_permute is not None
-        assert permutation.backward_ol_permute.tolist() == expected_ol_permute
+        assert backward_ctx is not None
+        assert backward_ctx.ol_permute.tolist() == expected_ol_permute
         assert expected_nol_permute is not None
-        assert permutation.backward_nol_permute.tolist() == expected_nol_permute
+        assert backward_ctx.nol_permute.tolist() == expected_nol_permute
 
 
-def _verify_collision_result(
-    result: CollisionResult,
-    expected: ExpectedCollisionResult,
+def _verify_forward_splits(
+    forward_ctx: ForwardPartitionContext,
+    expected_input_splits: Tuple[List[int], List[int]],
+    expected_output_splits: Tuple[List[int], List[int]],
 ) -> None:
-    assert result.remapped_feature_values.tolist() == expected.remapped
-    assert result.forward_overlap_mask.tolist() == expected.forward_mask
-    if expected.backward_mask is None:
-        assert result.backward_overlap_mask is None
-    else:
-        assert result.backward_overlap_mask is not None
-        assert result.backward_overlap_mask.tolist() == expected.backward_mask
-
-
-def _verify_collision_splits(
-    all_splits: List[CollisionSplits],
-    expected: ExpectedSplits,
-) -> None:
-    assert len(all_splits) == 1
-    splits = all_splits[0]
-    assert splits.input_splits == expected.input_splits
-    assert splits.output_splits == expected.output_splits
+    assert forward_ctx.splits.input_splits == expected_input_splits
+    assert forward_ctx.splits.output_splits == expected_output_splits
 
 
 def _verify_partition_embeddings(
@@ -299,8 +266,6 @@ def _test_pec_forward_stages(
     kjt_input_per_rank: List[List[KeyedJaggedTensor]],
     sharder: ModuleSharder[nn.Module],
     backend: str,
-    expected_collisions_per_rank: List[List[ExpectedCollisionResult]] | None = None,
-    expected_splits_per_rank: List[List[ExpectedSplits]] | None = None,
     expected_forward_permutes_per_rank: List[List[List[int]]] | None = None,
     expected_backward_ol_permutes_per_rank: List[List[List[int] | None]] | None = None,
     expected_backward_nol_permutes_per_rank: List[List[List[int] | None]] | None = None,
@@ -310,20 +275,16 @@ def _test_pec_forward_stages(
     verify_merge: bool = False,
     local_size: Optional[int] = None,
 ) -> None:
-    """Runs PEC forward pipeline stages and verifies against expected results.
+    """Runs PEC forward pipeline using overlap_dist and verifies results.
 
-    Always runs: input_dist → detect_collisions → split →
-        collision_split_dist → permute_dist →
-        compute_and_output_dist_in_partition (OL + NOL).
-    Optionally runs: merge_partitioned_embeddings (when verify_merge=True).
-    Verification for each stage is enabled by providing its expected-output parameter.
-    Partition and merge verification require ref_ec for weight comparison.
+    Pipeline: input_dist → overlap_dist → compute_and_output_dist_in_partition
+    (OL + NOL) → optionally merge_partitioned_embeddings.
     """
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         sharded_sparse_arch = _shard_pec(tables, ctx, sharder, local_size)
         sharded_pec = sharded_sparse_arch._pec_ec
         assert isinstance(sharded_pec, ShardedPECEmbeddingCollection)
-        assert len(sharded_pec._collision_handlers) > 0
+        assert len(sharded_pec._overlap_handlers) > 0
 
         if ref_ec is not None:
             copy_state_dict(
@@ -332,7 +293,6 @@ def _test_pec_forward_stages(
             )
 
         batches = kjt_input_per_rank[rank]
-        prev_remapped = None
         prev_ctx = None
         prev_features_list = None
 
@@ -341,79 +301,47 @@ def _test_pec_forward_stages(
             original_lengths = kjt_input.lengths()
             kjt_input = kjt_input.to(ctx.device)
 
-            # Stage 1: input_dist → detect_collisions
+            # Stage 1: input_dist
             pec_ctx = sharded_pec.create_context()
-            pec_ctx.prev_remapped_feature_values = prev_remapped
             dist_input = sharded_pec.input_dist(pec_ctx, kjt_input).wait().wait()
-            results = sharded_pec.detect_collisions(pec_ctx, dist_input)
 
-            if expected_collisions_per_rank is not None:
-                _verify_collision_result(
-                    results[0],
-                    expected_collisions_per_rank[rank][batch_idx],
-                )
-
-            # Stage 2: split features → collision_split_dist
-            ol_features_list = []
-            nol_features_list = []
-            for result, features in zip(results, dist_input):
-                ol, nol = split_features_by_values_mask(
-                    features,
-                    result.forward_overlap_mask,
-                )
-                ol_features_list.append(ol)
-                nol_features_list.append(nol)
-
-            split_awaitables = sharded_pec.collision_split_dist(
-                pec_ctx,
-                nol_features_list,
-            )
-            all_splits = [aw.wait() for aw in split_awaitables]
-
-            if expected_splits_per_rank is not None:
-                _verify_collision_splits(
-                    all_splits,
-                    expected_splits_per_rank[rank][batch_idx],
-                )
-
-            # Stage 3: permute_dist
-            features_list = list(dist_input)
-            permute_awaitables = sharded_pec.permute_dist(
-                pec_ctx,
-                features_list,
-                results,
+            # Stage 2: overlap_dist (fused detect + split + mask dist + compute)
+            results = sharded_pec.overlap_dist(
+                ctx=pec_ctx,
+                dist_input=dist_input,
                 prev_ctx=prev_ctx,
-                prev_features_per_group=prev_features_list,
+                prev_dist_input=prev_features_list,
             )
-            permutations = [aw.wait() for aw in permute_awaitables]
+            forward_ctx, backward_ctx = results[0].wait()
 
             if expected_forward_permutes_per_rank is not None:
                 _verify_forward_permute(
-                    permutations[0].forward_permute,
+                    forward_ctx,
                     expected_forward_permutes_per_rank[rank][batch_idx],
                 )
 
             if expected_backward_ol_permutes_per_rank is not None:
                 assert expected_backward_nol_permutes_per_rank is not None
-                _verify_backward_permute(
-                    permutations[0],
+                _verify_backward_permutes(
+                    backward_ctx,
                     expected_backward_ol_permutes_per_rank[rank][batch_idx],
                     expected_backward_nol_permutes_per_rank[rank][batch_idx],
                 )
 
-            # Stage 4: compute_and_output_dist_in_partition
+            # Stage 3: compute_and_output_dist_in_partition
+            assert forward_ctx is not None
             ol_awaitables = sharded_pec.compute_and_output_dist_in_partition(
                 pec_ctx,
-                ol_features_list[0],
-                all_splits[0],
+                forward_ctx.ol_features,
+                forward_ctx.splits,
                 is_overlapped=True,
             )
             assert len(ol_awaitables) == 1
 
             nol_awaitables = sharded_pec.compute_and_output_dist_in_partition(
                 pec_ctx,
-                nol_features_list[0],
-                all_splits[0],
+                forward_ctx.nol_features,
+                forward_ctx.splits,
                 is_overlapped=False,
             )
             assert len(nol_awaitables) == 1
@@ -433,14 +361,14 @@ def _test_pec_forward_stages(
                     ctx.device,
                 )
 
-            # Stage 5: merge_partitioned_embeddings
+            # Stage 4: merge_partitioned_embeddings
             if verify_merge:
                 assert ref_ec is not None
                 lazy_result = sharded_pec.merge_partitioned_embeddings(
                     pec_ctx,
                     ol_awaitables,
                     nol_awaitables,
-                    permutations,
+                    [forward_ctx],
                 )
                 jt_dict = lazy_result.wait()
                 _verify_merged_output(
@@ -453,62 +381,50 @@ def _test_pec_forward_stages(
                     ctx.device,
                 )
 
-            prev_remapped = [r.remapped_feature_values for r in results]
             prev_ctx = pec_ctx
-            prev_features_list = features_list
+            prev_features_list = dist_input
 
 
-# Cross-shard data: each rank has values in both shard 0 (0-7) and shard 1 (8-15)
+# Cross-shard data for uneven tables (table_0: 16 rows, table_1: 8 rows).
+# With world_size=2 RW sharding:
+#   table_0: block_size=8, shard 0 rows 0-7, shard 1 rows 8-15
+#   table_1: block_size=4, shard 0 rows 0-3, shard 1 rows 4-7
+# stride=2 (batch_size=2 per rank), 2 batches per rank.
 CROSS_SHARD_KJT_INPUT_PER_RANK = [
     [
+        # Rank 0 batch 0
+        # f0: [0,8,2] → shard0:[0,2], shard1:[8]
+        # f1: [1,5,3] → shard0:[1,3], shard1:[5]
         KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_0", "feature_1"],
-            values=torch.LongTensor([0, 8, 2, 10, 4, 12]),
+            values=torch.LongTensor([0, 8, 2, 1, 5, 3]),
             lengths=torch.LongTensor([2, 1, 1, 2]),
         ),
+        # Rank 0 batch 1 (overlaps with batch 0: f0: 0, f1: 1)
+        # f0: [0,9,3] → shard0:[0,3], shard1:[9]
+        # f1: [1,6,2] → shard0:[1,2], shard1:[6]
         KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_0", "feature_1"],
-            values=torch.LongTensor([0, 8, 3, 11, 4, 13]),
-            lengths=torch.LongTensor([2, 1, 1, 2]),
-        ),
-    ],
-    [
-        KeyedJaggedTensor.from_lengths_sync(
-            keys=["feature_0", "feature_1"],
-            values=torch.LongTensor([1, 9, 5, 11, 6, 13]),
-            lengths=torch.LongTensor([2, 1, 1, 2]),
-        ),
-        KeyedJaggedTensor.from_lengths_sync(
-            keys=["feature_0", "feature_1"],
-            values=torch.LongTensor([1, 9, 7, 14, 6, 15]),
-            lengths=torch.LongTensor([2, 1, 1, 2]),
-        ),
-    ],
-]
-
-TWO_BATCH_KJT_INPUT_PER_RANK = [
-    [
-        KeyedJaggedTensor.from_lengths_sync(
-            keys=["feature_0", "feature_1"],
-            values=torch.LongTensor([0, 1, 2, 3, 4, 5]),
-            lengths=torch.LongTensor([2, 1, 1, 2]),
-        ),
-        KeyedJaggedTensor.from_lengths_sync(
-            keys=["feature_0", "feature_1"],
-            values=torch.LongTensor([1, 3, 5, 7, 4, 6]),
+            values=torch.LongTensor([0, 9, 3, 1, 6, 2]),
             lengths=torch.LongTensor([2, 1, 1, 2]),
         ),
     ],
     [
+        # Rank 1 batch 0
+        # f0: [1,10,5] → shard0:[1,5], shard1:[10]
+        # f1: [4,2,7] → shard0:[2], shard1:[4,7]
         KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_0", "feature_1"],
-            values=torch.LongTensor([6, 7, 8, 9, 10, 11]),
-            lengths=torch.LongTensor([1, 2, 2, 1]),
+            values=torch.LongTensor([1, 10, 5, 4, 2, 7]),
+            lengths=torch.LongTensor([2, 1, 1, 2]),
         ),
+        # Rank 1 batch 1 (overlaps with batch 0: f0: 1, f1: 4)
+        # f0: [1,11,7] → shard0:[1,7], shard1:[11]
+        # f1: [4,3,6] → shard0:[3], shard1:[4,6]
         KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_0", "feature_1"],
-            values=torch.LongTensor([8, 10, 9, 11, 13, 15]),
-            lengths=torch.LongTensor([1, 2, 2, 1]),
+            values=torch.LongTensor([1, 11, 7, 4, 3, 6]),
+            lengths=torch.LongTensor([2, 1, 1, 2]),
         ),
     ],
 ]
@@ -525,24 +441,13 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
     def test_sharding_rw(self) -> None:
         WORLD_SIZE = 2
 
-        kjt_input_per_rank = [
-            KeyedJaggedTensor.from_lengths_sync(
-                keys=["feature_0", "feature_1"],
-                values=torch.LongTensor([0, 1, 2, 3, 4, 5]),
-                lengths=torch.LongTensor([2, 1, 1, 2]),
-            ),
-            KeyedJaggedTensor.from_lengths_sync(
-                keys=["feature_0", "feature_1"],
-                values=torch.LongTensor([6, 7, 8, 9, 10, 11]),
-                lengths=torch.LongTensor([1, 2, 2, 1]),
-            ),
-        ]
-
         self._run_multi_process_test(
             callable=_test_sharding,
             world_size=WORLD_SIZE,
             tables=EMBEDDING_TABLES,
-            kjt_input_per_rank=kjt_input_per_rank,
+            kjt_input_per_rank=[
+                batches[0] for batches in CROSS_SHARD_KJT_INPUT_PER_RANK
+            ],
             sharder=PECEmbeddingCollectionSharder(),
             backend="nccl",
         )
@@ -551,117 +456,20 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    def test_detect_collisions(self) -> None:
-        """Verifies exact collision masks and remapped values."""
+    def test_overlap_dist_forward_permute(self) -> None:
+        """Verifies exact forward_permute values from overlap_dist."""
         WORLD_SIZE = 2
 
-        # RW sharding with block_size=8: rank 0 owns IDs 0-7, rank 1 owns 8-15.
-        # Remapped = local_value + table_offset (table_0 offset=0, table_1 offset=8).
-        expected_collisions_per_rank = [
-            [
-                ExpectedCollisionResult(
-                    remapped=[0, 1, 2, 6, 7, 11, 12, 13],
-                    forward_mask=[False] * 8,
-                    backward_mask=None,
-                ),
-                ExpectedCollisionResult(
-                    remapped=[1, 3, 5, 15, 12, 14],
-                    forward_mask=[True, False, False, False, True, False],
-                    backward_mask=[
-                        False,
-                        True,
-                        False,
-                        False,
-                        False,
-                        False,
-                        True,
-                        False,
-                    ],
-                ),
-            ],
-            [
-                ExpectedCollisionResult(
-                    remapped=[0, 9, 10, 11],
-                    forward_mask=[False] * 4,
-                    backward_mask=None,
-                ),
-                ExpectedCollisionResult(
-                    remapped=[0, 2, 1, 11, 13, 15],
-                    forward_mask=[True, False, False, True, False, False],
-                    backward_mask=[True, False, False, True],
-                ),
-            ],
-        ]
-
-        self._run_multi_process_test(
-            callable=_test_pec_forward_stages,
-            world_size=WORLD_SIZE,
-            tables=EMBEDDING_TABLES,
-            kjt_input_per_rank=TWO_BATCH_KJT_INPUT_PER_RANK,
-            expected_collisions_per_rank=expected_collisions_per_rank,
-            sharder=PECEmbeddingCollectionSharder(),
-            backend="nccl",
-        )
-
-    @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
-        "Not enough GPUs, this test requires at least two GPUs",
-    )
-    def test_collision_split_dist(self) -> None:
-        """Verifies exact collision split values per rank."""
-        WORLD_SIZE = 2
-
-        expected_splits_per_rank = [
-            [
-                ExpectedSplits(
-                    input_splits=[[0, 0], [6, 2]],
-                    output_splits=[[0, 0], [6, 0]],
-                ),
-                ExpectedSplits(
-                    input_splits=[[2, 0], [4, 0]],
-                    output_splits=[[2, 0], [4, 0]],
-                ),
-            ],
-            [
-                ExpectedSplits(
-                    input_splits=[[0, 0], [0, 4]],
-                    output_splits=[[0, 0], [2, 4]],
-                ),
-                ExpectedSplits(
-                    input_splits=[[0, 2], [0, 4]],
-                    output_splits=[[0, 2], [0, 4]],
-                ),
-            ],
-        ]
-
-        self._run_multi_process_test(
-            callable=_test_pec_forward_stages,
-            world_size=WORLD_SIZE,
-            tables=EMBEDDING_TABLES,
-            kjt_input_per_rank=TWO_BATCH_KJT_INPUT_PER_RANK,
-            expected_splits_per_rank=expected_splits_per_rank,
-            sharder=PECEmbeddingCollectionSharder(),
-            backend="nccl",
-        )
-
-    @unittest.skipIf(
-        torch.cuda.device_count() <= 1,
-        "Not enough GPUs, this test requires at least two GPUs",
-    )
-    def test_permute_dist(self) -> None:
-        """Verifies exact forward_permute values with cross-shard partial overlap."""
-        WORLD_SIZE = 2
-
-        # Batch 0: no overlap → forward_permute = upt = [0,3,1,4,2,5]
-        # Batch 1: partial overlap → forward_permute derived from received mask + upt
+        # Batch 0: no overlap → forward_permute = upt
+        # Batch 1: partial overlap → forward_permute derived from post-dist mask + upt
         expected_forward_permutes_per_rank = [
             [
-                [0, 3, 1, 4, 2, 5],
-                [0, 2, 5, 3, 1, 4],
+                [0, 4, 1, 2, 5, 3],
+                [0, 4, 3, 1, 5, 2],
             ],
             [
                 [0, 3, 1, 4, 2, 5],
-                [0, 2, 3, 4, 1, 5],
+                [0, 4, 3, 2, 1, 5],
             ],
         ]
 
@@ -679,32 +487,19 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    def test_backward_permute_dist(self) -> None:
-        """Verifies backward_permute and backward_num_ol with cross-shard overlap.
-
-        Batch 0: no backward (first batch) → backward_permute=None, num_ol=0.
-        Batch 1: backward mask from batch 0's values overlapping with batch 1.
-
-        Received bwd mask (bucketized): rank0=[T,F,T,T,F,F], rank1=[T,F,T,T,T,T]
-        recat = invert_permute(batch0_upt) = invert_permute([0,3,1,4,2,5]) = [0,2,4,1,3,5]
-        backward_permute = cat([recat[where(mask)], recat[where(~mask)]])
-
-        Rank 0: where(mask)=[0,2,3], recat[[0,2,3]]=[0,4,1]
-                where(~mask)=[1,4,5], recat[[1,4,5]]=[2,3,5]
-                backward_permute=[0,4,1, 2,3,5], num_ol=3
-        Rank 1: where(mask)=[0,2,3,4,5], recat[[0,2,3,4,5]]=[0,4,1,3,5]
-                where(~mask)=[1], recat[[1]]=[2]
-                backward_permute=[0,4,1,3,5, 2], num_ol=5
-        """
+    def test_overlap_dist_backward_permutes(self) -> None:
+        """Verifies backward ol/nol permutes from overlap_dist."""
         WORLD_SIZE = 2
 
+        # Batch 0: no prev batch → backward permutes are None
+        # Batch 1: backward permutes computed from backward mask
         expected_backward_ol_permutes_per_rank = [
-            [None, [0, 4, 1]],
-            [None, [0, 4, 1, 3, 5]],
+            [None, [0, 3, 5]],
+            [None, [0, 4, 3]],
         ]
         expected_backward_nol_permutes_per_rank = [
-            [None, [2, 3, 5]],
-            [None, [2]],
+            [None, [2, 1, 4]],
+            [None, [2, 1, 5]],
         ]
 
         self._run_multi_process_test(
@@ -725,16 +520,19 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
     def test_compute_and_output_dist_in_partition(self) -> None:
         """Tests OL/NOL embeddings match expected weight rows.
 
-        Uses cross-shard partial overlap data. num_embeddings=16, world_size=2,
-        block_size=8. Shard 0 stores original rows 0-7, shard 1 stores 8-15.
+        Uses uneven cross-shard data. table_0: 16 rows (block_size=8),
+        table_1: 8 rows (block_size=4). world_size=2.
 
-        Expected values manually traced through:
+        Expected values traced through:
         1. block_bucketize → which values go to which shard
         2. KJTAllToAll + recat [0,2,1,3] → feature-major on shard
-        3. collision mask (batch 1): shard0=[T,F,T,F,T,T], shard1=[T,T,T,T,F,F]
-        4. split → lookup on each shard's TBE
-        5. forward_recat to rank-major → embedding AllToAll → trainer
-        6. output = [from_shard0, from_shard1]
+        3. remap with per-table offsets (shard 0: t0 offset=0, t1 offset=8)
+        4. overlap mask (batch 1 vs batch 0 remapped values)
+        5. split → lookup → embedding AllToAll → rank receives
+        6. output order: [from_shard0, from_shard1]
+
+        Batch 0: all NOL (first batch, no overlap).
+        Batch 1 shard 0 mask=[T,F,T,F,T,T,T], shard 1 mask=[T,F,T,T,F].
         """
         WORLD_SIZE = 2
 
@@ -743,40 +541,26 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
             device=torch.device("cpu"),
         )
 
-        # Expected OL/NOL rows as (table_name, original_id).
-        # Output order: [from_shard0, from_shard1], rank-major within each.
-        #
-        # --- Batch 0: no overlap, all NOL ---
-        # Shard 0 recat rank-major:
-        #   trainer0 ← [t0[0],t0[2],t1[4]], trainer1 ← [t0[1],t0[5],t1[6]]
-        # Shard 1 recat rank-major:
-        #   trainer0 ← [t0[8],t1[10],t1[12]], trainer1 ← [t0[9],t1[11],t1[13]]
-        #
-        # --- Batch 1: shard0 mask=[T,F,T,F,T,T], shard1=[T,T,T,T,F,F] ---
-        # Shard 0 OL: trainer0 ← [t0[0],t1[4]], trainer1 ← [t0[1],t1[6]]
-        # Shard 0 NOL: trainer0 ← [t0[3]], trainer1 ← [t0[7]]
-        # Shard 1 OL: trainer0 ← [t0[8],t1[11],t1[13]], trainer1 ← [t0[9]]
-        # Shard 1 NOL: trainer0 ← [], trainer1 ← [t1[14],t1[15]]
         T0 = "table_0"
         T1 = "table_1"
         expected_ol: Dict[int, List[List[Tuple[str, int]]]] = {
             0: [
                 [],  # batch 0: no overlap
-                [(T0, 0), (T1, 4), (T0, 8), (T1, 11), (T1, 13)],
+                [(T0, 0), (T1, 1), (T1, 2)],
             ],
             1: [
                 [],
-                [(T0, 1), (T1, 6), (T0, 9)],
+                [(T0, 1), (T1, 3), (T1, 4)],
             ],
         }
         expected_nol: Dict[int, List[List[Tuple[str, int]]]] = {
             0: [
-                [(T0, 0), (T0, 2), (T1, 4), (T0, 8), (T1, 10), (T1, 12)],
-                [(T0, 3)],
+                [(T0, 0), (T0, 2), (T1, 1), (T1, 3), (T0, 8), (T1, 5)],
+                [(T0, 3), (T0, 9), (T1, 6)],
             ],
             1: [
-                [(T0, 1), (T0, 5), (T1, 6), (T0, 9), (T1, 11), (T1, 13)],
-                [(T0, 7), (T1, 14), (T1, 15)],
+                [(T0, 1), (T0, 5), (T1, 2), (T0, 10), (T1, 4), (T1, 7)],
+                [(T0, 7), (T0, 11), (T1, 6)],
             ],
         }
 
@@ -810,6 +594,62 @@ class ShardedPECEmbeddingCollectionTest(MultiProcessTestBase):
             world_size=WORLD_SIZE,
             tables=EMBEDDING_TABLES,
             kjt_input_per_rank=CROSS_SHARD_KJT_INPUT_PER_RANK,
+            sharder=PECEmbeddingCollectionSharder(),
+            backend="nccl",
+            ref_ec=ref_ec,
+            verify_merge=True,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    def test_single_shard_features(self) -> None:
+        """Tests overlap_dist when one shard receives no features.
+
+        All values in shard 1's range (table_0: 8-15, table_1: 4-7),
+        so shard 0 gets nothing after input_dist. Verifies mask_dist,
+        splits, permutes, and merge handle empty KJTs on the empty shard.
+        """
+        WORLD_SIZE = 2
+
+        ref_ec = EmbeddingCollection(
+            tables=EMBEDDING_TABLES,
+            device=torch.device("cpu"),
+        )
+
+        # table_0 shard1: [8,15], table_1 shard1: [4,7]
+        shard1_only_input = [
+            [
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=["feature_0", "feature_1"],
+                    values=torch.LongTensor([8, 9, 4, 5]),
+                    lengths=torch.LongTensor([2, 2]),
+                ),
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=["feature_0", "feature_1"],
+                    values=torch.LongTensor([8, 10, 5, 6]),
+                    lengths=torch.LongTensor([2, 2]),
+                ),
+            ],
+            [
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=["feature_0", "feature_1"],
+                    values=torch.LongTensor([12, 13, 6, 7]),
+                    lengths=torch.LongTensor([2, 2]),
+                ),
+                KeyedJaggedTensor.from_lengths_sync(
+                    keys=["feature_0", "feature_1"],
+                    values=torch.LongTensor([12, 14, 7, 4]),
+                    lengths=torch.LongTensor([2, 2]),
+                ),
+            ],
+        ]
+        self._run_multi_process_test(
+            callable=_test_pec_forward_stages,
+            world_size=WORLD_SIZE,
+            tables=EMBEDDING_TABLES,
+            kjt_input_per_rank=shard1_only_input,
             sharder=PECEmbeddingCollectionSharder(),
             backend="nccl",
             ref_ec=ref_ec,
