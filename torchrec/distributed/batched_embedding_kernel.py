@@ -47,12 +47,23 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SparseType,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
-from fbgemm_gpu.tbe.ssd import (
-    ASSOC,
-    EvictionPolicy,
-    KVZCHParams,
-    SSDTableBatchedEmbeddingBags,
-)
+from fbgemm_gpu.tbe.ssd import ASSOC, SSDTableBatchedEmbeddingBags
+
+try:
+    from fbgemm_gpu.tbe.ssd import EvictionPolicy, KVZCHParams
+except ImportError:
+    # Track via _log_api_usage_once so we can quantify the callers still on
+    # a pre-D103282820 fbgemm_gpu and remove this fallback once those base
+    # layers roll forward.
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.batched_embedding_kernel.import_failure.tbe_ssd_kvzch_types"
+    )
+    # Fallback for fbgemm_gpu < D103282820 (EvictionPolicy, KVZCHParams
+    # moved from split_table_batched_embeddings_ops_common to tbe/ssd).
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
+        EvictionPolicy,
+        KVZCHParams,
+    )
 from fbgemm_gpu.tbe.ssd.utils.partially_materialized_tensor import (
     PartiallyMaterializedTensor,
 )
@@ -549,6 +560,7 @@ def _populate_zero_collision_tbe_params(
         bucket_sizes=bucket_sizes,
         enable_optimizer_offloading=True,
         backend_return_whole_row=(backend_type == BackendType.DRAM),
+        # pyrefly: ignore[bad-argument-type]
         eviction_policy=eviction_policy,
         embedding_cache_mode=embedding_cache_mode_,
         load_ckpt_without_opt=load_ckpt_without_opt,
@@ -2168,6 +2180,7 @@ class ZeroCollisionKeyValueEmbedding(
             feature_table_map=self._feature_table_map,
             ssd_cache_location=embedding_location,
             pooling_mode=PoolingMode.NONE,
+            # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
             **ssd_tbe_params,
@@ -3365,6 +3378,7 @@ class ZeroCollisionKeyValueEmbeddingBag(
             feature_table_map=self._feature_table_map,
             ssd_cache_location=embedding_location,
             pooling_mode=self._pooling,
+            # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
             **ssd_tbe_params,

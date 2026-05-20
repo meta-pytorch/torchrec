@@ -19,12 +19,11 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingTable,
 )
 from torchrec.distributed.pec_collision_handlers import (
-    BooleanMaskChecker,
-    CollisionHandlerBase,
-    CollisionResult,
-    create_collision_handler,
-    RWCollisionHandler,
-    split_features_by_values_mask,
+    BooleanOverlapChecker,
+    create_overlap_handler,
+    OverlapMasks,
+    RWOverlapHandler,
+    split_kjt_by_values_mask,
 )
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.pec_embedding_modules import OverlappingCheckerType
@@ -41,9 +40,6 @@ def _get_single_rank_pg() -> dist.ProcessGroup:
 
 
 def tearDownModule() -> None:
-    # The PG initialized by _get_single_rank_pg lives for the duration of
-    # this file's tests; destroy it so later test modules in the same
-    # pytest process can call init_process_group themselves.
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -89,45 +85,53 @@ def _make_table_name_to_config(
     return {t.name: t for t in tables}
 
 
-class BooleanMaskCheckerTest(unittest.TestCase):
-    """Unit tests for BooleanMaskChecker."""
+class BooleanOverlapCheckerTest(unittest.TestCase):
+    """Unit tests for BooleanOverlapChecker."""
 
     def setUp(self) -> None:
-        self.checker = BooleanMaskChecker(torch.device("cpu"), mask_size=10)
+        self.checker = BooleanOverlapChecker(torch.device("cpu"), mask_size=10)
 
-    def test_empty_mask(self) -> None:
-        values = torch.tensor([0, 3, 5], dtype=torch.long)
+    def test_no_overlap(self) -> None:
+        prev = torch.tensor([0, 1, 2], dtype=torch.long)
+        current = torch.tensor([3, 4, 5], dtype=torch.long)
 
-        mask = self.checker.check_overlap(values)
+        fwd_mask, bwd_mask = self.checker.check(current, prev)
 
-        self.assertTrue(torch.equal(mask, torch.tensor([False, False, False])))
+        self.assertTrue(torch.equal(fwd_mask, torch.tensor([False, False, False])))
+        self.assertTrue(torch.equal(bwd_mask, torch.tensor([False, False, False])))
 
-    def test_update_and_check(self) -> None:
-        self.checker.update(torch.tensor([1, 3, 5], dtype=torch.long))
+    def test_full_overlap(self) -> None:
+        prev = torch.tensor([1, 3, 5], dtype=torch.long)
+        current = torch.tensor([1, 3, 5], dtype=torch.long)
 
-        mask = self.checker.check_overlap(torch.tensor([1, 3, 7], dtype=torch.long))
+        fwd_mask, bwd_mask = self.checker.check(current, prev)
 
-        self.assertTrue(torch.equal(mask, torch.tensor([True, True, False])))
+        self.assertTrue(torch.equal(fwd_mask, torch.tensor([True, True, True])))
+        self.assertTrue(torch.equal(bwd_mask, torch.tensor([True, True, True])))
 
-    def test_update_resets_previous(self) -> None:
-        self.checker.update(torch.tensor([1, 2], dtype=torch.long))
-        self.checker.update(torch.tensor([3, 4], dtype=torch.long))
+    def test_partial_overlap(self) -> None:
+        prev = torch.tensor([1, 3, 5], dtype=torch.long)
+        current = torch.tensor([1, 3, 7], dtype=torch.long)
 
-        mask = self.checker.check_overlap(torch.tensor([1, 2, 3, 4], dtype=torch.long))
+        fwd_mask, bwd_mask = self.checker.check(current, prev)
 
-        self.assertTrue(torch.equal(mask, torch.tensor([False, False, True, True])))
+        self.assertTrue(torch.equal(fwd_mask, torch.tensor([True, True, False])))
+        self.assertTrue(torch.equal(bwd_mask, torch.tensor([True, True, False])))
 
-    def test_reset_mask(self) -> None:
-        self.checker.update(torch.tensor([0, 1, 2], dtype=torch.long))
+    def test_asymmetric_overlap(self) -> None:
+        prev = torch.tensor([0, 1, 2, 3], dtype=torch.long)
+        current = torch.tensor([1, 4], dtype=torch.long)
 
-        self.checker.reset_mask()
-        mask = self.checker.check_overlap(torch.tensor([0, 1, 2], dtype=torch.long))
+        fwd_mask, bwd_mask = self.checker.check(current, prev)
 
-        self.assertTrue(torch.equal(mask, torch.tensor([False, False, False])))
+        self.assertTrue(torch.equal(fwd_mask, torch.tensor([True, False])))
+        self.assertTrue(
+            torch.equal(bwd_mask, torch.tensor([False, True, False, False]))
+        )
 
 
 class SplitFeaturesTest(unittest.TestCase):
-    """Unit tests for the standalone split_features_by_values_mask function."""
+    """Unit tests for the standalone split_kjt_by_values_mask function."""
 
     def test_all_nonoverlapped(self) -> None:
         kjt = KeyedJaggedTensor.from_lengths_sync(
@@ -137,9 +141,11 @@ class SplitFeaturesTest(unittest.TestCase):
         )
         mask = torch.tensor([False, False, False, False])
 
-        ol, nol = split_features_by_values_mask(kjt, mask)
+        ol, nol = split_kjt_by_values_mask(kjt, mask)
 
         self.assertEqual(ol.values().numel(), 0)
+        self.assertTrue(torch.equal(ol.lengths(), torch.tensor([0, 0, 0, 0])))
+        self.assertEqual(ol.keys(), ["f0", "f1"])
         self.assertTrue(torch.equal(nol.values(), torch.tensor([10, 20, 30, 40])))
         self.assertTrue(torch.equal(nol.lengths(), torch.tensor([2, 0, 1, 1])))
 
@@ -151,12 +157,13 @@ class SplitFeaturesTest(unittest.TestCase):
         )
         mask = torch.tensor([True, True, True, True])
 
-        ol, nol = split_features_by_values_mask(kjt, mask)
+        ol, nol = split_kjt_by_values_mask(kjt, mask)
 
         self.assertTrue(torch.equal(ol.values(), torch.tensor([10, 20, 30, 40])))
         self.assertTrue(torch.equal(ol.lengths(), torch.tensor([2, 0, 1, 1])))
         self.assertEqual(nol.values().numel(), 0)
         self.assertTrue(torch.equal(nol.lengths(), torch.tensor([0, 0, 0, 0])))
+        self.assertEqual(nol.keys(), ["f0", "f1"])
 
     def test_partial_overlap(self) -> None:
         kjt = KeyedJaggedTensor.from_lengths_sync(
@@ -166,7 +173,7 @@ class SplitFeaturesTest(unittest.TestCase):
         )
         mask = torch.tensor([False, True, False, False, True, False])
 
-        ol, nol = split_features_by_values_mask(kjt, mask)
+        ol, nol = split_kjt_by_values_mask(kjt, mask)
 
         self.assertTrue(torch.equal(ol.values(), torch.tensor([20, 50])))
         self.assertTrue(torch.equal(ol.lengths(), torch.tensor([1, 0, 0, 1])))
@@ -182,7 +189,7 @@ class SplitFeaturesTest(unittest.TestCase):
         )
         mask = torch.tensor([False, True, False])
 
-        ol, nol = split_features_by_values_mask(kjt, mask)
+        ol, nol = split_kjt_by_values_mask(kjt, mask)
 
         self.assertTrue(torch.equal(ol.values(), torch.tensor([2])))
         self.assertTrue(torch.allclose(ol.weights(), torch.tensor([0.2])))
@@ -197,14 +204,14 @@ class SplitFeaturesTest(unittest.TestCase):
         )
         mask = torch.tensor([True, False, False, True])
 
-        ol, nol = split_features_by_values_mask(kjt, mask)
+        ol, nol = split_kjt_by_values_mask(kjt, mask)
 
         self.assertEqual(ol.keys(), ["feature_a", "feature_b"])
         self.assertEqual(nol.keys(), ["feature_a", "feature_b"])
 
 
-class RWCollisionHandlerTest(unittest.TestCase):
-    """Unit tests for RWCollisionHandler."""
+class RWOverlapHandlerTest(unittest.TestCase):
+    """Unit tests for RWOverlapHandler."""
 
     def setUp(self) -> None:
         self.tables = [
@@ -227,8 +234,8 @@ class RWCollisionHandlerTest(unittest.TestCase):
         self,
         tables: List[EmbeddingConfig],
         local_rows: int = 8,
-    ) -> RWCollisionHandler:
-        return create_collision_handler(  # pyre-ignore[7]
+    ) -> RWOverlapHandler:
+        return create_overlap_handler(  # pyre-ignore[7]
             sharding_type="row_wise",
             device=torch.device("cpu"),
             grouped_emb_configs=_make_grouped_configs(tables, local_rows),
@@ -237,21 +244,14 @@ class RWCollisionHandlerTest(unittest.TestCase):
             checker_type=OverlappingCheckerType.BOOLEAN,
         )
 
-    def test_is_collision_handler_base(self) -> None:
-        self.assertIsInstance(self.handler, CollisionHandlerBase)
-
-    def test_feature_to_table_offset(self) -> None:
-        self.assertEqual(self.handler._feature_to_table_offset["feature_0"], 0)
-        self.assertEqual(self.handler._feature_to_table_offset["feature_1"], 8)
-
-    def test_remap_feature_values(self) -> None:
+    def test_remap_kjt_values(self) -> None:
         kjt = KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_0", "feature_1"],
             values=torch.tensor([0, 1, 2, 3]),
             lengths=torch.tensor([2, 2]),
         )
 
-        remapped = self.handler._remap_feature_values(kjt)
+        remapped = self.handler.remap_kjt_values(kjt)
 
         self.assertTrue(torch.equal(remapped, torch.tensor([0, 1, 10, 11])))
 
@@ -261,15 +261,29 @@ class RWCollisionHandlerTest(unittest.TestCase):
             values=torch.tensor([0, 1, 2, 3]),
             lengths=torch.tensor([2, 2]),
         )
+        remapped = self.handler.remap_kjt_values(kjt)
 
-        result = self.handler.detect_collisions(kjt)
+        result = self.handler.detect_overlap(remapped, prev_remapped=None)
 
-        self.assertIsInstance(result, CollisionResult)
+        self.assertIsInstance(result, OverlapMasks)
+        assert result.forward_overlap_mask is not None
         self.assertTrue(
             torch.equal(result.forward_overlap_mask, torch.zeros(4, dtype=torch.bool))
         )
         self.assertIsNone(result.backward_overlap_mask)
-        self.assertEqual(result.remapped_feature_values.numel(), 4)
+
+    def test_last_batch_all_ol(self) -> None:
+        """Last batch: current=None → no forward mask, all-True backward."""
+        prev_remapped = torch.tensor([0, 1, 10, 11], dtype=torch.long)
+
+        result = self.handler.detect_overlap(
+            current_remapped=None, prev_remapped=prev_remapped
+        )
+
+        self.assertIsNone(result.forward_overlap_mask)
+        assert result.backward_overlap_mask is not None
+        self.assertTrue(result.backward_overlap_mask.all())
+        self.assertEqual(result.backward_overlap_mask.numel(), 4)
 
     def test_second_batch_with_overlap(self) -> None:
         kjt1 = KeyedJaggedTensor.from_lengths_sync(
@@ -277,27 +291,28 @@ class RWCollisionHandlerTest(unittest.TestCase):
             values=torch.tensor([0, 1, 2, 3]),
             lengths=torch.tensor([2, 2]),
         )
-        result1 = self.handler.detect_collisions(kjt1)
+        remapped1 = self.handler.remap_kjt_values(kjt1)
+
         kjt2 = KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_0", "feature_1"],
             values=torch.tensor([1, 4, 3, 5]),
             lengths=torch.tensor([2, 2]),
         )
+        remapped2 = self.handler.remap_kjt_values(kjt2)
 
-        result2 = self.handler.detect_collisions(
-            kjt2, prev_remapped_feature_values=result1.remapped_feature_values
-        )
+        result = self.handler.detect_overlap(remapped2, prev_remapped=remapped1)
 
+        assert result.forward_overlap_mask is not None
         self.assertTrue(
             torch.equal(
-                result2.forward_overlap_mask,
+                result.forward_overlap_mask,
                 torch.tensor([True, False, True, False]),
             )
         )
-        assert result2.backward_overlap_mask is not None
+        assert result.backward_overlap_mask is not None
         self.assertTrue(
             torch.equal(
-                result2.backward_overlap_mask,
+                result.backward_overlap_mask,
                 torch.tensor([False, True, False, True]),
             )
         )
@@ -308,20 +323,21 @@ class RWCollisionHandlerTest(unittest.TestCase):
             values=torch.tensor([0, 1, 2, 3]),
             lengths=torch.tensor([2, 2]),
         )
-        result1 = self.handler.detect_collisions(kjt1)
+        remapped1 = self.handler.remap_kjt_values(kjt1)
+
         kjt2 = KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_0", "feature_1"],
             values=torch.tensor([4, 5, 6, 7]),
             lengths=torch.tensor([2, 2]),
         )
+        remapped2 = self.handler.remap_kjt_values(kjt2)
 
-        result2 = self.handler.detect_collisions(
-            kjt2, prev_remapped_feature_values=result1.remapped_feature_values
-        )
+        result = self.handler.detect_overlap(remapped2, prev_remapped=remapped1)
 
-        self.assertFalse(result2.forward_overlap_mask.any())
-        assert result2.backward_overlap_mask is not None
-        self.assertFalse(result2.backward_overlap_mask.any())
+        assert result.forward_overlap_mask is not None
+        self.assertFalse(result.forward_overlap_mask.any())
+        assert result.backward_overlap_mask is not None
+        self.assertFalse(result.backward_overlap_mask.any())
 
     def test_full_overlap_between_batches(self) -> None:
         kjt = KeyedJaggedTensor.from_lengths_sync(
@@ -329,60 +345,14 @@ class RWCollisionHandlerTest(unittest.TestCase):
             values=torch.tensor([0, 1, 2, 3]),
             lengths=torch.tensor([2, 2]),
         )
-        result1 = self.handler.detect_collisions(kjt)
+        remapped = self.handler.remap_kjt_values(kjt)
 
-        result2 = self.handler.detect_collisions(
-            kjt, prev_remapped_feature_values=result1.remapped_feature_values
-        )
+        result = self.handler.detect_overlap(remapped, prev_remapped=remapped)
 
-        self.assertTrue(result2.forward_overlap_mask.all())
-        assert result2.backward_overlap_mask is not None
-        self.assertTrue(result2.backward_overlap_mask.all())
-
-    def test_three_consecutive_batches(self) -> None:
-        """Only adjacent batches matter — checker resets on each update call."""
-        kjt1 = KeyedJaggedTensor.from_lengths_sync(
-            keys=["feature_0", "feature_1"],
-            values=torch.tensor([0, 1, 2, 3]),
-            lengths=torch.tensor([2, 2]),
-        )
-        result1 = self.handler.detect_collisions(kjt1)
-        kjt2 = KeyedJaggedTensor.from_lengths_sync(
-            keys=["feature_0", "feature_1"],
-            values=torch.tensor([4, 5, 6, 7]),
-            lengths=torch.tensor([2, 2]),
-        )
-        result2 = self.handler.detect_collisions(
-            kjt2, prev_remapped_feature_values=result1.remapped_feature_values
-        )
-        kjt3 = KeyedJaggedTensor.from_lengths_sync(
-            keys=["feature_0", "feature_1"],
-            values=torch.tensor([0, 1, 2, 3]),
-            lengths=torch.tensor([2, 2]),
-        )
-
-        result3 = self.handler.detect_collisions(
-            kjt3, prev_remapped_feature_values=result2.remapped_feature_values
-        )
-
-        self.assertFalse(result3.forward_overlap_mask.any())
-        assert result3.backward_overlap_mask is not None
-        self.assertFalse(result3.backward_overlap_mask.any())
-
-    def test_reset_clears_checker(self) -> None:
-        kjt = KeyedJaggedTensor.from_lengths_sync(
-            keys=["feature_0", "feature_1"],
-            values=torch.tensor([0, 1, 2, 3]),
-            lengths=torch.tensor([2, 2]),
-        )
-        self.handler.detect_collisions(kjt)
-
-        self.handler.reset()
-
-        mask = self.handler._checker.check_overlap(
-            torch.tensor([0, 1, 2, 3], dtype=torch.long)
-        )
-        self.assertFalse(mask.any())
+        assert result.forward_overlap_mask is not None
+        self.assertTrue(result.forward_overlap_mask.all())
+        assert result.backward_overlap_mask is not None
+        self.assertTrue(result.backward_overlap_mask.all())
 
     def test_variable_length_features(self) -> None:
         """Features with different lengths per batch element."""
@@ -392,23 +362,64 @@ class RWCollisionHandlerTest(unittest.TestCase):
             values=torch.tensor([0, 1, 2, 3, 4, 5, 6, 7]),
             lengths=torch.tensor([3, 1, 1, 3]),
         )
-        result1 = handler.detect_collisions(kjt1)
+        remapped1 = handler.remap_kjt_values(kjt1)
+
         kjt2 = KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_0", "feature_1"],
             values=torch.tensor([2, 8, 5, 9]),
             lengths=torch.tensor([2, 2]),
         )
+        remapped2 = handler.remap_kjt_values(kjt2)
 
-        result2 = handler.detect_collisions(
-            kjt2, prev_remapped_feature_values=result1.remapped_feature_values
-        )
+        result = handler.detect_overlap(remapped2, prev_remapped=remapped1)
 
+        assert result.forward_overlap_mask is not None
         self.assertTrue(
             torch.equal(
-                result2.forward_overlap_mask,
+                result.forward_overlap_mask,
                 torch.tensor([True, False, True, False]),
             )
         )
+        assert result.backward_overlap_mask is not None
+        # prev values [0,1,2,3,4,5,6,7] remapped to [0,1,2,3,20,21,22,23]
+        # current values [2,8,5,9] remapped to [2,8,21,25]
+        # backward: prev[i] in current? → [F,F,T,F, F,T,F,F]
+        self.assertTrue(
+            torch.equal(
+                result.backward_overlap_mask,
+                torch.tensor([False, False, True, False, False, True, False, False]),
+            )
+        )
+
+    def test_duplicate_values_in_batch(self) -> None:
+        """Duplicate values within a batch should still detect overlap correctly."""
+        kjt1 = KeyedJaggedTensor.from_lengths_sync(
+            keys=["feature_0", "feature_1"],
+            values=torch.tensor([0, 0, 2, 2]),
+            lengths=torch.tensor([2, 2]),
+        )
+        remapped1 = self.handler.remap_kjt_values(kjt1)
+
+        kjt2 = KeyedJaggedTensor.from_lengths_sync(
+            keys=["feature_0", "feature_1"],
+            values=torch.tensor([0, 1, 3, 2]),
+            lengths=torch.tensor([2, 2]),
+        )
+        remapped2 = self.handler.remap_kjt_values(kjt2)
+
+        result = self.handler.detect_overlap(remapped2, prev_remapped=remapped1)
+
+        assert result.forward_overlap_mask is not None
+        # current [0,1,3,2] remapped [0,1,11,10]: 0 in prev, 1 not, 11 not, 10 in prev
+        self.assertTrue(
+            torch.equal(
+                result.forward_overlap_mask,
+                torch.tensor([True, False, False, True]),
+            )
+        )
+        assert result.backward_overlap_mask is not None
+        # prev [0,0,2,2] remapped [0,0,10,10]: 0 in current, 0 in current, 10 in current, 10 in current
+        self.assertTrue(result.backward_overlap_mask.all())
 
     def test_empty_batch(self) -> None:
         """Empty KJT (all lengths=0) should produce empty masks."""
@@ -417,12 +428,13 @@ class RWCollisionHandlerTest(unittest.TestCase):
             values=torch.tensor([], dtype=torch.long),
             lengths=torch.tensor([0, 0]),
         )
+        remapped = self.handler.remap_kjt_values(kjt)
 
-        result = self.handler.detect_collisions(kjt)
+        result = self.handler.detect_overlap(remapped, prev_remapped=None)
 
+        assert result.forward_overlap_mask is not None
         self.assertEqual(result.forward_overlap_mask.numel(), 0)
         self.assertIsNone(result.backward_overlap_mask)
-        self.assertEqual(result.remapped_feature_values.numel(), 0)
 
     def test_single_table(self) -> None:
         """Single table — offset is always 0."""
@@ -432,22 +444,21 @@ class RWCollisionHandlerTest(unittest.TestCase):
             values=torch.tensor([0, 1, 2]),
             lengths=torch.tensor([3]),
         )
-        result1 = handler.detect_collisions(kjt1)
+        remapped1 = handler.remap_kjt_values(kjt1)
+
         kjt2 = KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_0"],
             values=torch.tensor([1, 3]),
             lengths=torch.tensor([2]),
         )
+        remapped2 = handler.remap_kjt_values(kjt2)
 
-        result2 = handler.detect_collisions(
-            kjt2, prev_remapped_feature_values=result1.remapped_feature_values
-        )
+        result = handler.detect_overlap(remapped2, prev_remapped=remapped1)
 
+        assert result.forward_overlap_mask is not None
+        self.assertTrue(torch.equal(remapped1, torch.tensor([0, 1, 2])))
         self.assertTrue(
-            torch.equal(result1.remapped_feature_values, torch.tensor([0, 1, 2]))
-        )
-        self.assertTrue(
-            torch.equal(result2.forward_overlap_mask, torch.tensor([True, False]))
+            torch.equal(result.forward_overlap_mask, torch.tensor([True, False]))
         )
 
     def test_multiple_features_per_table(self) -> None:
@@ -466,26 +477,27 @@ class RWCollisionHandlerTest(unittest.TestCase):
             values=torch.tensor([0, 1, 2, 3]),
             lengths=torch.tensor([2, 2]),
         )
-        result1 = handler.detect_collisions(kjt1)
+        remapped1 = handler.remap_kjt_values(kjt1)
+
         kjt2 = KeyedJaggedTensor.from_lengths_sync(
             keys=["feature_a", "feature_b"],
             values=torch.tensor([2, 5]),
             lengths=torch.tensor([1, 1]),
         )
+        remapped2 = handler.remap_kjt_values(kjt2)
 
-        result2 = handler.detect_collisions(
-            kjt2, prev_remapped_feature_values=result1.remapped_feature_values
-        )
+        result = handler.detect_overlap(remapped2, prev_remapped=remapped1)
 
+        assert result.forward_overlap_mask is not None
         self.assertEqual(handler._feature_to_table_offset["feature_a"], 0)
         self.assertEqual(handler._feature_to_table_offset["feature_b"], 0)
         self.assertTrue(
-            torch.equal(result2.forward_overlap_mask, torch.tensor([True, False]))
+            torch.equal(result.forward_overlap_mask, torch.tensor([True, False]))
         )
 
 
-class CreateCollisionHandlerTest(unittest.TestCase):
-    """Unit tests for the create_collision_handler factory function."""
+class CreateOverlapHandlerTest(unittest.TestCase):
+    """Unit tests for the create_overlap_handler factory function."""
 
     def test_row_wise_returns_rw_handler(self) -> None:
         tables = [
@@ -497,7 +509,7 @@ class CreateCollisionHandlerTest(unittest.TestCase):
             ),
         ]
 
-        handler = create_collision_handler(
+        handler = create_overlap_handler(
             sharding_type="row_wise",
             device=torch.device("cpu"),
             grouped_emb_configs=_make_grouped_configs(tables, local_rows=8),
@@ -506,7 +518,7 @@ class CreateCollisionHandlerTest(unittest.TestCase):
             checker_type=OverlappingCheckerType.BOOLEAN,
         )
 
-        self.assertIsInstance(handler, RWCollisionHandler)
+        self.assertIsInstance(handler, RWOverlapHandler)
 
     def test_unsupported_sharding_type_raises(self) -> None:
         tables = [
@@ -519,7 +531,7 @@ class CreateCollisionHandlerTest(unittest.TestCase):
         ]
 
         with self.assertRaises(ValueError):
-            create_collision_handler(
+            create_overlap_handler(
                 sharding_type="column_wise",
                 device=torch.device("cpu"),
                 grouped_emb_configs=_make_grouped_configs(tables, local_rows=8),
