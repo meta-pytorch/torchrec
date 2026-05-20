@@ -15,12 +15,21 @@ from unittest import mock
 
 import torch
 import torch.distributed as dist
+import torchrec.distributed.collective_utils as cu
+from hypothesis import given, settings, strategies as st
 from torch._utils_internal import TEST_MASTER_ADDR as MASTER_ADDR  # @manual
 from torchrec.distributed.collective_utils import (
+    _resolve_enablement_on_leader,
     create_on_rank_and_share_result,
+    init_collective_validation,
     invoke_on_rank_and_broadcast_result,
     is_leader,
     run_on_leader,
+    validate_collectives_enabled,
+)
+from torchrec.distributed.test_utils.multi_process import (
+    MultiProcessContext,
+    MultiProcessTestBase,
 )
 from torchrec.test_utils import get_free_port, seed_and_log
 
@@ -374,3 +383,80 @@ class CollectiveUtilsTest(unittest.TestCase):
             # pyrefly: ignore[bad-argument-type]
             callable=self._test_run_on_leader_decorator,
         )
+
+
+class TestEnableCollectiveValidation(MultiProcessTestBase):
+    def tearDown(self) -> None:
+        cu._USE_COLLECTIVE_VALIDATION = False
+        os.environ.pop("TORCHREC_VALIDATE_COLLECTIVES", None)
+        cu._INITIALIZED = False
+        super().tearDown()
+
+    @staticmethod
+    def _test_init_collective_validation(
+        rank: int, world_size: int, backend: str, jk_enabled: bool
+    ) -> None:
+        with MultiProcessContext(rank, world_size, backend) as ctx:
+            assert ctx.pg is not None
+
+            with mock.patch(
+                "torch._utils_internal.justknobs_check", return_value=jk_enabled
+            ) as mock_jk:
+                init_collective_validation(ctx.pg)
+
+            if ctx.rank == 0:
+                # Only rank 0 because of invoke_on_rank_and_broadcast_result
+                mock_jk.assert_called_once_with(
+                    "pytorch/torchrec:enable_collective_validation", default=False
+                )
+            assert cu._INITIALIZED is True
+
+            if jk_enabled:
+                assert cu._USE_COLLECTIVE_VALIDATION is True
+                assert validate_collectives_enabled() is True
+            else:
+                assert cu._USE_COLLECTIVE_VALIDATION is False
+                assert validate_collectives_enabled() is False
+
+    @given(jk_enabled=st.booleans())
+    @settings(deadline=None)
+    def test_init_collective_validation_jk(self, jk_enabled: bool) -> None:
+        world_size = 2
+        self._run_multi_process_test(
+            world_size=world_size,
+            backend="gloo",
+            jk_enabled=jk_enabled,
+            callable=TestEnableCollectiveValidation._test_init_collective_validation,
+        )
+
+    def test_set_env_var_overrides(self) -> None:
+        # Test setting env variable to false overrides jk
+        os.environ["TORCHREC_VALIDATE_COLLECTIVES"] = "0"
+        with mock.patch("torch._utils_internal.justknobs_check") as mock_jk:
+            self.assertFalse(_resolve_enablement_on_leader())
+            mock_jk.assert_not_called()
+
+    def test_set_env_var_without_jk(self) -> None:
+        # Test setting env variable to true enables without jk
+        os.environ["TORCHREC_VALIDATE_COLLECTIVES"] = "1"
+        with mock.patch("torch._utils_internal.justknobs_check") as mock_jk:
+            self.assertTrue(_resolve_enablement_on_leader())
+            mock_jk.assert_not_called()
+
+    def test_default_is_false(self) -> None:
+        os.environ.pop("TORCHREC_VALIDATE_COLLECTIVES", None)
+        with mock.patch(
+            "torch._utils_internal.justknobs_check", return_value=False
+        ) as mock_jk:
+            self.assertFalse(_resolve_enablement_on_leader())
+            mock_jk.assert_called_once_with(
+                "pytorch/torchrec:enable_collective_validation", default=False
+            )
+
+    def test_when_jk_fails(self) -> None:
+        os.environ.pop("TORCHREC_VALIDATE_COLLECTIVES", None)
+        with mock.patch(
+            "torch._utils_internal.justknobs_check",
+            side_effect=Exception("JustKnobs failed"),
+        ):
+            self.assertFalse(_resolve_enablement_on_leader())

@@ -8,7 +8,6 @@
 # pyre-strict
 
 import itertools
-import os
 import random
 import unittest
 import unittest.mock
@@ -27,6 +26,7 @@ from typing import (
 import hypothesis.strategies as st
 import torch
 import torch.distributed as dist
+import torchrec.distributed.collective_utils as cu
 from hypothesis import given, settings
 from pyre_extensions import none_throws
 from torchrec.distributed.dist_data import (
@@ -1652,14 +1652,6 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         # MultiProcessTestBase.__init__.
         super().__init__(methodName, mp_init_mode="spawn")
 
-    def setUp(self) -> None:
-        super().setUp()
-        os.environ["TORCHREC_VALIDATE_COLLECTIVES"] = "1"
-
-    def tearDown(self) -> None:
-        os.environ.pop("TORCHREC_VALIDATE_COLLECTIVES", None)
-        super().tearDown()
-
     @classmethod
     def _run_test_matching_tags(
         cls,
@@ -1668,6 +1660,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         input_tensors = [
             torch.tensor([rank] * world_size, dtype=torch.int64),
@@ -1696,6 +1689,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         input_tensors = [
             torch.tensor([1] * world_size, dtype=torch.int64),
@@ -1766,6 +1760,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
         import torchrec.distributed.dist_data as dd
 
         dd._TORCHREC_OVERFLOW_DEBUG = True
@@ -1808,6 +1803,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         kjt = KeyedJaggedTensor(
             keys=["f0", "f1"],
@@ -1839,6 +1835,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         kjt = KeyedJaggedTensor(
             keys=["f0"],
@@ -1888,20 +1885,18 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = False
 
         input_tensors = [
             torch.tensor([rank] * world_size, dtype=torch.int64),
         ]
-        with unittest.mock.patch.dict(
-            os.environ, {"TORCHREC_VALIDATE_COLLECTIVES": "0"}
-        ):
-            awaitable = SplitsAllToAllAwaitable(
-                input_tensors=input_tensors,
-                pg=none_throws(dist.group.WORLD),
-                collective_tag=42,
-            )
-            assert awaitable._tag_appended is False
-            result = awaitable.wait()
+        awaitable = SplitsAllToAllAwaitable(
+            input_tensors=input_tensors,
+            pg=none_throws(dist.group.WORLD),
+            collective_tag=42,
+        )
+        assert awaitable._tag_appended is False
+        result = awaitable.wait()
         assert len(result) == 1
         assert result[0] == list(range(world_size))
         dist.destroy_process_group()
@@ -1921,6 +1916,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         tag = (
             _collective_tag_from("KJTAllToAllSplits", ["f0", "f1"], 3)
@@ -1964,6 +1960,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         # input.keys() diverge. The tag must distinguish on input.keys() so the
         # mismatch is caught instead of corrupting the all2all silently.
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         keys = ["f0", "f1"] if rank == 0 else ["f0", "f2"]
         input_splits_len = 3
@@ -2008,6 +2005,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         # silent-corruption mode the validation must catch. The tag must
         # therefore include the splits identity, not just len(splits).
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         keys = ["f0", "f1"]  # rank-invariant
         splits = (2, 0) if rank == 0 else (1, 1)  # divergent plan
@@ -2053,6 +2051,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         # would collide; with the tightened per-request identity
         # (keys, splits, len(splits_tensors)) the tag detects the divergence.
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         # Construct a KJTSplitsAllToAllMeta whose `splits` differs per rank.
         # Everything else is rank-invariant: same keys, same shape.
@@ -2120,6 +2119,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         # out before tagging), the two ranks would compute the same tag and
         # silently corrupt the fused splits-all2all.
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         kjt = KeyedJaggedTensor(
             keys=["f0"],
@@ -2184,9 +2184,8 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         )
 
     def test_tag_raises_on_small_dtype(self) -> None:
-        with unittest.mock.patch.dict(
-            os.environ, {"TORCHREC_VALIDATE_COLLECTIVES": "1"}
-        ):
+        cu._USE_COLLECTIVE_VALIDATION = True
+        try:
             mock_pg = unittest.mock.MagicMock()
             mock_pg.size.return_value = 2
 
@@ -2199,6 +2198,8 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
                     collective_tag=large_tag,
                 )
             self.assertIn("exceeds", str(ctx.exception).lower())
+        finally:
+            cu._USE_COLLECTIVE_VALIDATION = False
 
     @classmethod
     def _run_test_mismatch_emits_scuba_event(
@@ -2208,6 +2209,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         input_tensors = [
             torch.tensor([1] * world_size, dtype=torch.int64),
@@ -2272,6 +2274,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         that the Scuba event reports global ranks (actionable for triage),
         not PG-local indices."""
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         # new_group is collective on WORLD, so every rank must call it,
         # even ranks not in the resulting subgroup.
@@ -2348,6 +2351,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         input_tensors = [
             torch.tensor([1] * world_size, dtype=torch.int64),
@@ -2386,6 +2390,7 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
         backend: str,
     ) -> None:
         dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        cu._USE_COLLECTIVE_VALIDATION = True
 
         input_tensors = [
             torch.tensor([1] * world_size, dtype=torch.int64),
