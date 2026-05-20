@@ -34,7 +34,11 @@ from torchrec.distributed.pec_collision_handlers import (
     OverlapSplits,
     split_kjt_by_values_mask,
 )
-from torchrec.distributed.pec_comm_ops import PECAll2AllSeqInfo, PECAll2AllSeqWait
+from torchrec.distributed.pec_comm_ops import (
+    PECAll2AllSeqInfo,
+    PECAll2AllSeqWait,
+    PECGradUpdateAwaitable,
+)
 from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.types import (
     Awaitable,
@@ -160,8 +164,9 @@ class BackwardPartitionContext:
 
     Produced by OverlapDistAwaitable on wait. Contains the previous
     batch's features re-split by overlap with the current batch, for
-    gradient re-routing during backward. The pipeline sets these on
-    PECAll2AllSeqInfo before calling loss.backward().
+    gradient re-routing during backward. Passed to
+    merge_partitioned_embeddings which sets the corresponding fields
+    on PECAll2AllSeqInfo.
 
     Attributes:
         splits: per-rank OL/NOL split sizes for gradient AllToAll.
@@ -283,14 +288,14 @@ class PECEmbeddingCollectionContext(EmbeddingCollectionContext):
         remapped_kjt_values: Cached remapped values per sharding group,
             set by overlap_dist. Used by the next batch's overlap_dist
             to detect overlap without re-remapping.
-        backward_ctx_per_group: PECAll2AllSeqInfo per sharding group,
-            set by merge_partitioned_embeddings. The pipeline sets
-            backward fields from the next batch's overlap_dist, then
-            read by PECAll2AllSeqWait during loss.backward().
+        autograd_ctx_per_sharding: PECAll2AllSeqInfo per sharding group,
+            set by merge_partitioned_embeddings. When backward_ctxs is
+            passed to merge, backward fields are populated automatically.
+            Read by PECAll2AllSeqWait during loss.backward().
     """
 
     remapped_kjt_values: List[torch.Tensor] | None = None
-    backward_ctx_per_group: List[PECAll2AllSeqInfo] | None = None
+    autograd_ctx_per_sharding: List[PECAll2AllSeqInfo] | None = None
 
 
 class PECEmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
@@ -305,7 +310,7 @@ class PECEmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         self,
         overlapped_awaitables: List[Awaitable[torch.Tensor]],
         nonoverlapped_awaitables: List[Awaitable[torch.Tensor]],
-        backward_ctxs: List[PECAll2AllSeqInfo],
+        autograd_ctxs: List[PECAll2AllSeqInfo],
         features_per_sharding: List[KeyedJaggedTensor],
         embedding_names_per_sharding: List[List[str]],
         need_indices: bool,
@@ -315,7 +320,7 @@ class PECEmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         # PEC-specific: partition awaitables and gradient intercept (per group)
         self._overlapped_awaitables = overlapped_awaitables
         self._nonoverlapped_awaitables = nonoverlapped_awaitables
-        self._backward_ctxs = backward_ctxs
+        self._autograd_ctxs = autograd_ctxs
 
         # From EC: used by construct_jagged_tensors to build output
         self._features_per_sharding = features_per_sharding
@@ -329,17 +334,29 @@ class PECEmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
     def _wait_impl(self) -> Dict[str, JaggedTensor]:
         jt_dict: Dict[str, JaggedTensor] = {}
 
-        for ol_aw, nol_aw, bwd_ctx, features, embedding_names in zip(
+        for ol_aw, nol_aw, autograd_ctx, features, embedding_names in zip(
             self._overlapped_awaitables,
             self._nonoverlapped_awaitables,
-            self._backward_ctxs,
+            self._autograd_ctxs,
             self._features_per_sharding,
             self._embedding_names_per_sharding,
         ):
             ol_embs = ol_aw.wait()
             nol_embs = nol_aw.wait()
 
-            embeddings = PECAll2AllSeqWait.apply(bwd_ctx, ol_embs, nol_embs)
+            # grad_anchor is a dummy tensor that ensures autograd tracks this
+            # node even though OL/NOL embeddings are computed under no_grad.
+            grad_anchor = torch.empty(
+                0,
+                device=ol_embs.device,
+                requires_grad=True,
+            )
+            embeddings = PECAll2AllSeqWait.apply(
+                autograd_ctx,
+                ol_embs,
+                nol_embs,
+                grad_anchor,
+            )
 
             jt_dict.update(
                 construct_jagged_tensors(
@@ -563,31 +580,34 @@ class ShardedPECEmbeddingCollection(
         ec = self._embedding_collection
         awaitables: List[Awaitable[torch.Tensor]] = []
 
-        for lookup, odist, sharding_ctx, sharding_type in zip(
-            ec._lookups,
-            ec._output_dists,
-            ctx.sharding_contexts,
-            ec._sharding_type_to_sharding,
-        ):
-            partition_ctx = copy(sharding_ctx)
+        with torch.no_grad():
+            for lookup, odist, sharding_ctx, sharding_type in zip(
+                ec._lookups,
+                ec._output_dists,
+                ctx.sharding_contexts,
+                ec._sharding_type_to_sharding,
+            ):
+                partition_ctx = copy(sharding_ctx)
 
-            # Replace full-batch lengths with this partition's lengths.
-            partition_ctx.lengths_after_input_dist = features.lengths().view(
-                -1, features.stride()
-            )
+                # Replace full-batch lengths with this partition's lengths.
+                partition_ctx.lengths_after_input_dist = features.lengths().view(
+                    -1, features.stride()
+                )
 
-            # Map overlap splits to embedding AllToAll context
-            partition_ctx.input_splits = overlap_splits.input_splits[partition_idx]
-            partition_ctx.output_splits = overlap_splits.output_splits[partition_idx]
+                # Map overlap splits to embedding AllToAll context
+                partition_ctx.input_splits = overlap_splits.input_splits[partition_idx]
+                partition_ctx.output_splits = overlap_splits.output_splits[
+                    partition_idx
+                ]
 
-            # In RW sharding, upt maps positions in the full (pre-split) batch —
-            # wrong size for a partition. Reordering is handled by RW handler
-            # if needed.
-            partition_ctx.unbucketize_permute_tensor = None
+                # In RW sharding, upt maps positions in the full (pre-split)
+                # batch — wrong size for a partition. Reordering is handled by
+                # RW handler if needed.
+                partition_ctx.unbucketize_permute_tensor = None
 
-            embedding_dim = ec._embedding_dim_for_sharding_type(sharding_type)
-            embs = lookup(features)
-            awaitables.append(odist(embs.view(-1, embedding_dim), partition_ctx))
+                embedding_dim = ec._embedding_dim_for_sharding_type(sharding_type)
+                embs = lookup(features)
+                awaitables.append(odist(embs.view(-1, embedding_dim), partition_ctx))
 
         return awaitables
 
@@ -597,6 +617,7 @@ class ShardedPECEmbeddingCollection(
         overlapped_awaitables: List[Awaitable[torch.Tensor]],
         nonoverlapped_awaitables: List[Awaitable[torch.Tensor]],
         forward_ctxs: List[ForwardPartitionContext],
+        backward_ctxs: List[BackwardPartitionContext] | None = None,
     ) -> LazyAwaitable[Dict[str, JaggedTensor]]:
         """Creates a LazyAwaitable that merges OL/NOL embeddings on wait.
 
@@ -605,11 +626,10 @@ class ShardedPECEmbeddingCollection(
         and sets up the autograd graph for gradient re-split in backward),
         then constructs the final Dict[str, JaggedTensor] output.
 
-        Also creates one PECAll2AllSeqInfo per sharding group (with only
-        forward_permute set) and stores them on PEC context. The
-        pipeline is responsible for setting backward fields (splits,
-        permutes) from the next batch's overlap_dist result before
-        calling loss.backward().
+        Creates one PECAll2AllSeqInfo per sharding group and stores them
+        on PEC context. If backward_ctxs is provided, populates the
+        backward fields (splits, permutes) so the caller does not need
+        to wire them manually before loss.backward().
 
         Args:
             ctx: PEC context (sharding_contexts must be set from
@@ -620,20 +640,30 @@ class ShardedPECEmbeddingCollection(
                 compute_and_output_dist_in_partition(is_overlapped=False).
             forward_ctxs: ForwardPartitionContexts from overlap_dist,
                 one per sharding group.
+            backward_ctxs: BackwardPartitionContexts from overlap_dist,
+                one per sharding group. If provided, backward fields are
+                set on PECAll2AllSeqInfo automatically.
 
         Returns:
             LazyAwaitable resolving to Dict[str, JaggedTensor].
         """
         ec = self._embedding_collection
 
-        backward_ctxs = [
+        autograd_ctx_per_sharding = [
             PECAll2AllSeqInfo(
                 forward_permute=fc.permute,
                 pg=self._env.process_group,
             )
             for fc in forward_ctxs
         ]
-        ctx.backward_ctx_per_group = backward_ctxs
+
+        if backward_ctxs is not None:
+            for info, bwd in zip(autograd_ctx_per_sharding, backward_ctxs):
+                info.backward_splits = bwd.splits
+                info.backward_ol_permute = bwd.ol_permute
+                info.backward_nol_permute = bwd.nol_permute
+
+        ctx.autograd_ctx_per_sharding = autograd_ctx_per_sharding
 
         features_per_sharding = [
             sharding_ctx.features_before_input_dist
@@ -642,12 +672,67 @@ class ShardedPECEmbeddingCollection(
         return PECEmbeddingCollectionAwaitable(
             overlapped_awaitables=overlapped_awaitables,
             nonoverlapped_awaitables=nonoverlapped_awaitables,
-            backward_ctxs=backward_ctxs,
+            autograd_ctxs=autograd_ctx_per_sharding,
             features_per_sharding=features_per_sharding,
             embedding_names_per_sharding=ec._embedding_names_per_sharding,
             need_indices=ec._need_indices,
             features_to_permute_indices=ec._features_to_permute_indices,
         )
+
+    def grad_dist(
+        self,
+        ctx: PECEmbeddingCollectionContext,
+        backward_features: KJTList,
+        is_overlapped: bool,
+    ) -> List[Awaitable[None]]:
+        """Kicks off gradient AllToAll for one partition and returns awaitables.
+
+        For OL: dist() was already started in PECAll2AllSeqWait.backward
+        (idempotent, so calling again is a no-op).
+        For NOL: dist() starts here.
+
+        When the returned awaitables are waited, they complete the AllToAll
+        and apply the gradient to TBE via re-lookup.
+
+        Args:
+            ctx: PEC context with autograd_ctx_per_sharding populated by
+                backward.
+            backward_features: previous batch's OL or NOL features for
+                gradient re-lookup (one per sharding group).
+            is_overlapped: True for OL partition, False for NOL.
+
+        Returns:
+            List of awaitables, one per sharding group.
+        """
+        assert ctx.autograd_ctx_per_sharding is not None
+        ec = self._embedding_collection
+
+        awaitables: List[Awaitable[None]] = []
+        for autograd_ctx, feature, lookup, sharding_type in zip(
+            ctx.autograd_ctx_per_sharding,
+            backward_features,
+            ec._lookups,
+            ec._sharding_type_to_sharding,
+        ):
+            embedding_dim = ec._embedding_dim_for_sharding_type(sharding_type)
+            grad_apply = (
+                autograd_ctx.ol_grad_apply
+                if is_overlapped
+                else autograd_ctx.nol_grad_apply
+            )
+            assert grad_apply is not None
+
+            grad_apply.dist()
+            awaitables.append(
+                PECGradUpdateAwaitable(
+                    grad_apply,
+                    feature,
+                    lookup,
+                    embedding_dim,
+                )
+            )
+
+        return awaitables
 
 
 class PECEmbeddingCollectionSharder(BaseEmbeddingSharder[PECEmbeddingCollection]):
