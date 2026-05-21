@@ -402,6 +402,7 @@ def calculate_shard_storages(
             EmbeddingComputeKernel.KEY_VALUE.value,
             EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
             EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+            EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
         }
         or use_virtual_table
     ):
@@ -487,6 +488,7 @@ def _is_table_cached(
         EmbeddingComputeKernel.KEY_VALUE.value,
         EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
         EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+        EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
     }:
         return True
     return False
