@@ -11,11 +11,18 @@
 This file contains utilities for constructing collective based control flows.
 """
 
+import logging
+import os
 from functools import wraps
 from typing import Any, Callable, cast, List, Optional, Tuple, TypeVar
 
 import torch
 import torch.distributed as dist
+
+_USE_COLLECTIVE_VALIDATION: bool = False
+_INITIALIZED: bool = False
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def is_leader(pg: Optional[dist.ProcessGroup], leader_rank: int = 0) -> bool:
@@ -201,3 +208,48 @@ def create_on_rank_and_share_result(
         shared_tensors.append(tensor)
 
     return constructor(shared_tensors)
+
+
+def _resolve_enablement_on_leader() -> bool:
+    """Determine if collective validation is enabled on rank 0.
+
+    Fail-closed on JK errors so a flaky JK service can't hang peers waiting in
+    broadcast_object_list.
+    """
+    enable_via_env = os.environ.get("TORCHREC_VALIDATE_COLLECTIVES", "")
+    if enable_via_env == "0":
+        return False
+    elif enable_via_env == "1":
+        return True
+    try:
+        return torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:enable_collective_validation", default=False
+        )
+    except Exception:
+        logger.exception(
+            "Failed to check JK for collective validation; defaulting to disabled"
+        )
+        return False
+
+
+def init_collective_validation(pg: dist.ProcessGroup) -> None:
+    """Broadcast collective validation flag from rank 0 to all ranks in pg.
+
+    Call once on the world PG during DistributedModelParallel.__init__
+    so all ranks participate. Uses both JK and env var to determine if validation
+    is enabled.
+    """
+    global _USE_COLLECTIVE_VALIDATION, _INITIALIZED
+    if _INITIALIZED:
+        return  # prevents double-DMP / JK initialization
+    _USE_COLLECTIVE_VALIDATION = invoke_on_rank_and_broadcast_result(
+        pg=pg,
+        func=_resolve_enablement_on_leader,
+        rank=0,
+    )
+    _INITIALIZED = True
+    logger.info(f"Collective validation initialized: {_USE_COLLECTIVE_VALIDATION}")
+
+
+def validate_collectives_enabled() -> bool:
+    return _USE_COLLECTIVE_VALIDATION

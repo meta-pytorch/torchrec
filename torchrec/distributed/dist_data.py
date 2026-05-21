@@ -16,6 +16,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.autograd.profiler import record_function
+from torchrec.distributed.collective_utils import validate_collectives_enabled
 from torchrec.distributed.comm_ops import (
     all_gather_base_pooled,
     alltoall_pooled,
@@ -103,13 +104,6 @@ _DTYPE_MAX: Dict[torch.dtype, int] = {
 }
 
 _TORCHREC_OVERFLOW_DEBUG: bool = os.environ.get("TORCHREC_OVERFLOW_DEBUG", "0") == "1"
-
-
-def _validate_collectives_enabled() -> bool:
-    # Read on each call so the env var can be flipped at runtime (e.g. by job
-    # config that loads after import) and so tests can patch with mock.patch
-    # instead of mutating module state.
-    return os.environ.get("TORCHREC_VALIDATE_COLLECTIVES", "0") == "1"
 
 
 def _collective_tag_from(*parts: object) -> int:
@@ -451,7 +445,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         self._pg_global_ranks: List[int] = []
         if (
             collective_tag is not None
-            and _validate_collectives_enabled()
+            and validate_collectives_enabled()
             and input_tensors
         ):
             dtype = input_tensors[0].dtype
@@ -920,7 +914,7 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
 
         collective_tag: Optional[int] = None
         tag_parts: Optional[Tuple[object, ...]] = None
-        if _validate_collectives_enabled():
+        if validate_collectives_enabled():
             # Identity components, all rank-invariant by contract:
             # - input.keys(): pre-AllToAll feature list (NOT local `keys`,
             #   which is the post-AllToAll subset and differs per rank).

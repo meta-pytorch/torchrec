@@ -16,9 +16,9 @@ from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import torch
 from torch import distributed as dist, nn
+from torchrec.distributed.collective_utils import validate_collectives_enabled
 from torchrec.distributed.dist_data import (
     _collective_tag_from,
-    _validate_collectives_enabled,
     KJTAllToAllTensorsAwaitable,
     SplitsAllToAllAwaitable,
 )
@@ -956,7 +956,7 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
 
         collective_tag: Optional[int] = None
         tag_parts: Optional[Tuple[object, ...]] = None
-        if _validate_collectives_enabled():
+        if validate_collectives_enabled():
             # Per-request rank-invariant identity, mirroring the tightening
             # applied to KJTAllToAllSplitsAwaitable. A structural-only tag
             # (e.g., len(splits_tensors) + self._lengths) collapses on real
