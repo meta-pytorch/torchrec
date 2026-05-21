@@ -29,7 +29,10 @@ from torch.distributed.remote_device import _remote_device
 from torch.distributed.tensor import DeviceMesh
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
-from torchrec.distributed.collective_utils import create_on_rank_and_share_result
+from torchrec.distributed.collective_utils import (
+    create_on_rank_and_share_result,
+    init_collective_validation,
+)
 from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.logging_handlers import log_two_dim_sharding_config
@@ -303,6 +306,15 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
             assert pg is not None, "Process group is not initialized"
             env = ShardingEnv.from_process_group(pg)
         self._env: ShardingEnv = env
+
+        if self._env.process_group is not None:
+            # Only validate on WORLD or groups that contain all ranks.
+            # Subgroups (e.g., sharding_pg/replica_pg in DMPCollection) must not
+            # issue constructor-time collectives as they can deadlock if DMP
+            # instances are created with different process groups or ordering.
+            pg = self._env.process_group
+            if pg is dist.GroupMember.WORLD or pg.size() == dist.get_world_size():
+                init_collective_validation(pg)
 
         if device is None:
             device = torch.device("cpu")
