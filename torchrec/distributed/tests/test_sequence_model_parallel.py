@@ -42,7 +42,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         sharding_type=st.just(ShardingType.ROW_WISE.value),
         kernel_type=st.sampled_from(
             [
-                EmbeddingComputeKernel.DENSE.value,
                 EmbeddingComputeKernel.FUSED.value,
             ]
         ),
@@ -133,7 +132,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         sharding_type=st.just(ShardingType.TABLE_WISE.value),
         kernel_type=st.sampled_from(
             [
-                EmbeddingComputeKernel.DENSE.value,
                 EmbeddingComputeKernel.FUSED.value,
             ]
         ),
@@ -193,7 +191,6 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         sharding_type=st.just(ShardingType.COLUMN_WISE.value),
         kernel_type=st.sampled_from(
             [
-                EmbeddingComputeKernel.DENSE.value,
                 EmbeddingComputeKernel.FUSED.value,
             ]
         ),
