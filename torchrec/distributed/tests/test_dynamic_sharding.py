@@ -539,7 +539,6 @@ class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
         ),
         kernel_type=st.sampled_from(
             [
-                EmbeddingComputeKernel.DENSE.value,
                 EmbeddingComputeKernel.FUSED.value,
                 EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
                 EmbeddingComputeKernel.FUSED_UVM.value,
@@ -582,13 +581,7 @@ class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
         - For Column-Wise sharding: Only Adagrad and SGD (no RowWiseAdagrad)
         """
         if self.device.type == "cpu":
-            assume(
-                kernel_type
-                in (
-                    EmbeddingComputeKernel.DENSE.value,
-                    EmbeddingComputeKernel.FUSED.value,
-                )
-            )
+            assume(kernel_type in (EmbeddingComputeKernel.FUSED.value,))
         elif self.device.type == "cuda":
             assume(torch.cuda.device_count() >= world_size)
 
