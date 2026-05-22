@@ -377,6 +377,14 @@ def log_two_dim_sharding_config(
     pass
 
 
+def log_ssd_offloading_config(
+    best_plan: Optional[List] = None,  # type: ignore[type-arg]
+    technique: OptimizationTechnique = OptimizationTechnique.SSD_OFFLOADING,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_kernel_changed(
     table_name: str = "",
     action: str = "",
