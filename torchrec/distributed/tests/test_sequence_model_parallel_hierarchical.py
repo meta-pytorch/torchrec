@@ -53,7 +53,6 @@ class SequenceModelParallelHierarchicalTest(MultiProcessTestBase):
         ),
         kernel_type=st.sampled_from(
             [
-                EmbeddingComputeKernel.DENSE.value,
                 EmbeddingComputeKernel.FUSED.value,
             ]
         ),

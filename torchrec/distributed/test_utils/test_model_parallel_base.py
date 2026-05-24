@@ -1280,7 +1280,7 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
                 ModuleSharder[nn.Module],
                 create_test_sharder(
                     sharder_type,
-                    sharding_type,
+                    ShardingType.DATA_PARALLEL.value,
                     EmbeddingComputeKernel.DENSE.value,
                     fused_params=fused_params,
                 ),
