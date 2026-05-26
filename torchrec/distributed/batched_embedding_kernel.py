@@ -34,7 +34,6 @@ from typing import (
 import torch
 import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
-from fbgemm_gpu.split_table_batched_embeddings_ops_common import BackendType
 from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
     IntNBitTableBatchedEmbeddingBagsCodegen,
 )
@@ -50,7 +49,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
 from fbgemm_gpu.tbe.ssd import ASSOC, SSDTableBatchedEmbeddingBags
 
 try:
-    from fbgemm_gpu.tbe.ssd import EvictionPolicy, KVZCHParams
+    from fbgemm_gpu.tbe.ssd import BackendType, EvictionPolicy, KVZCHParams
 except ImportError:
     # Track via _log_api_usage_once so we can quantify the callers still on
     # a pre-D103282820 fbgemm_gpu and remove this fallback once those base
@@ -58,9 +57,11 @@ except ImportError:
     torch._C._log_api_usage_once(
         "torchrec.distributed.batched_embedding_kernel.import_failure.tbe_ssd_kvzch_types"
     )
-    # Fallback for fbgemm_gpu < D103282820 (EvictionPolicy, KVZCHParams
-    # moved from split_table_batched_embeddings_ops_common to tbe/ssd).
+    # Fallback for fbgemm_gpu < D103282820 (BackendType, EvictionPolicy,
+    # KVZCHParams moved from split_table_batched_embeddings_ops_common
+    # to tbe/ssd).
     from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
+        BackendType,
         EvictionPolicy,
         KVZCHParams,
     )
