@@ -10,6 +10,7 @@ import contextlib
 import copy
 import dataclasses
 import logging
+import traceback
 from collections import defaultdict, deque
 from concurrent.futures import Future
 from contextlib import AbstractContextManager
@@ -39,6 +40,7 @@ from torchrec.distributed.embedding_sharding import (
     KJTSplitsAllToAllMeta,
 )
 from torchrec.distributed.embedding_types import KJTList
+from torchrec.distributed.logging_utils import EventType
 
 try:
     from torchrec.distributed.logging_handlers import log_pipeline_module_info
@@ -49,6 +51,36 @@ except Exception:
 
     def log_pipeline_module_info(*args: Any, **kwargs: Any) -> None:
         pass
+
+
+try:
+    # Defensive: torch-package / inference builds may strip the shim.
+    from torchrec.distributed.logging_handlers import (
+        EventLoggingHandler,
+        TorchrecComponent,
+    )
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.train_pipeline.utils.import_failure.event_logging_handler"
+    )
+
+    from enum import Enum as _Enum
+    from typing import TYPE_CHECKING
+
+    if TYPE_CHECKING:
+        from torchrec.distributed.logging_handlers import (
+            EventLoggingHandler,
+            TorchrecComponent,
+        )
+    else:
+
+        class TorchrecComponent(_Enum):
+            TRAIN_PIPELINE = "train_pipeline"
+
+        class EventLoggingHandler:
+            @staticmethod
+            def log_event(*args: object, **kwargs: object) -> None:
+                pass
 
 
 try:
@@ -658,6 +690,14 @@ class DataLoadingThread(Thread, Generic[In]):
         self._to_device_non_blocking = to_device_non_blocking
         self._buffered: Optional[In] = None
         self._buffer_empty_event.set()
+        # JK-gated capture of non-StopIteration exceptions. Off-path
+        # preserves the original silent-death behavior bit-exact.
+        self._capture_failures_enabled: bool = torch._utils_internal.justknobs_check(
+            "pytorch/torchrec:enable_data_loading_thread_failure_capture",
+            default=False,
+        )
+        self._captured_exception: Optional[BaseException] = None
+        self._captured_exception_event: Event = Event()
         one_time_rank0_logger.info(
             f"{self.__class__.__name__} created with device={device}, "
             f"to_device_non_blocking={to_device_non_blocking}, "
@@ -666,36 +706,92 @@ class DataLoadingThread(Thread, Generic[In]):
         )
 
     def run(self) -> None:
-        if self._device.type == "cuda" and torch.cuda.is_available():
-            # set the current device the same as the one used in the main thread
-            torch.cuda.set_device(self._device)
-        elif self._device.type == "mtia" and torch.mtia.is_available():
-            # set the current device the same as the one used in the main thread
-            torch.mtia.set_device(self._device)
-
+        self._set_thread_device()
         while not self._stop:
             self._buffer_empty_event.wait()
             # Set the filled event to unblock progress() and return.
             if self._stop:
                 self._buffer_filled_event.set()
                 return
+            fetch = (
+                self._fetch_with_capture
+                if self._capture_failures_enabled
+                else self._fetch_off_path
+            )
+            if not fetch():
+                return
+
+    def _set_thread_device(self) -> None:
+        if self._device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.set_device(self._device)
+        elif self._device.type == "mtia" and torch.mtia.is_available():
+            torch.mtia.set_device(self._device)
+
+    def _fetch_off_path(self) -> bool:
+        # Byte-exact preservation of the original behavior: non-StopIteration
+        # exceptions kill the daemon silently and the consumer hangs.
+        with record_function("## load_batch ##"):
+            try:
+                batch = next(self._dataloader_iter)
+            except StopIteration:
+                self._stop = True
+                self._buffer_filled_event.set()
+                return False
+        self._buffer_to_device(batch)
+        return True
+
+    def _fetch_with_capture(self) -> bool:
+        # JK-on safe path: capture non-StopIteration exceptions, emit a
+        # FAILURE event, and wake the consumer so get_next_batch re-raises
+        # instead of hanging.
+        stage = "next_iterator"
+        try:
             with record_function("## load_batch ##"):
                 try:
                     batch = next(self._dataloader_iter)
                 except StopIteration:
                     self._stop = True
                     self._buffer_filled_event.set()
-                    return
-            with record_function("## copy_batch_to_gpu ##"):
-                with torch.get_device_module(self._device).stream(self._memcpy_stream):
-                    self._buffered = cast(
-                        In,
-                        batch.to(
-                            self._device, non_blocking=self._to_device_non_blocking
-                        ),
-                    )
-                self._buffer_empty_event.clear()
-                self._buffer_filled_event.set()
+                    return False
+            stage = "copy_to_device"
+            self._buffer_to_device(batch)
+            return True
+        except Exception as e:
+            self._emit_fetch_failure(stage, e)
+            self._captured_exception = e
+            self._captured_exception_event.set()
+            self._buffer_filled_event.set()
+            return False
+
+    def _buffer_to_device(self, batch: In) -> None:
+        with record_function("## copy_batch_to_gpu ##"):
+            with torch.get_device_module(self._device).stream(self._memcpy_stream):
+                self._buffered = cast(
+                    In,
+                    batch.to(self._device, non_blocking=self._to_device_non_blocking),
+                )
+            self._buffer_empty_event.clear()
+            self._buffer_filled_event.set()
+
+    def _emit_fetch_failure(self, stage: str, e: Exception) -> None:
+        # Telemetry is wrapped so a logger/Scuba raise can never skip the
+        # consumer-wake in the caller.
+        try:
+            logger.exception(f"{self.__class__.__name__}: exception in {stage}: {e}")
+            EventLoggingHandler.log_event(
+                component=TorchrecComponent.TRAIN_PIPELINE.value,
+                event_name="DataLoadingThread.fetch_failure",
+                event_type=EventType.FAILURE,
+                metadata={
+                    "stage": stage,
+                    "exception_type": type(e).__name__,
+                    "device": str(self._device),
+                },
+                error_message=str(e),
+                stack_trace=traceback.format_exc(),
+            )
+        except BaseException:  # noqa: B036
+            pass
 
     def stop(self) -> None:
         logger.info(f"{self.__class__.__name__}: Stopping data loading thread...")
@@ -714,6 +810,16 @@ class DataLoadingThread(Thread, Generic[In]):
         the main thread in the training loop.
         """
         self._buffer_filled_event.wait()
+        if self._capture_failures_enabled and self._captured_exception_event.is_set():
+            # Terminal — pipeline.reset() rebuilds the thread to recover.
+            # Explicit None check (not assert) so python -O still raises
+            # the captured exception instead of TypeError.
+            captured = self._captured_exception
+            if captured is None:
+                raise RuntimeError(
+                    "DataLoadingThread: capture event set without captured exception"
+                )
+            raise captured
         batch = self._buffered
         if batch is None:
             if none_throws:

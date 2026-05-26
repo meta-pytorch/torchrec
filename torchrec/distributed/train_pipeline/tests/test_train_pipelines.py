@@ -8,6 +8,7 @@
 # pyre-strict
 
 import copy
+import threading
 import unittest
 from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ from torchrec.distributed.fp_embeddingbag import (
     FeatureProcessedEmbeddingBagCollectionSharder,
     ShardedFeatureProcessedEmbeddingBagCollection,
 )
+from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.model_parallel import DMPCollection
 from torchrec.distributed.sharding_plan import (
     construct_module_sharding_plan,
@@ -1843,6 +1845,19 @@ class TrainPipelineSparseDistLiteTest(TrainPipelineSparseDistTestBase):
             torch.testing.assert_close(pred, pred_pipeline)
 
 
+class _RaisingIter:
+    """Iterator whose __next__ always raises — simulates a failed dataloader."""
+
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    def __iter__(self) -> "_RaisingIter":
+        return self
+
+    def __next__(self) -> object:
+        raise self._exc
+
+
 class DataLoadingThreadTest(unittest.TestCase):
     def test_fetch_data(self) -> None:
         data = []
@@ -1861,6 +1876,273 @@ class DataLoadingThreadTest(unittest.TestCase):
         with self.assertRaises(StopIteration):
             data_loader.get_next_batch(True)
         data_loader.stop()
+
+    def test_fetch_failure_captured_on_iterator_exception_when_jk_on(self) -> None:
+        """JK on + iterator raises => get_next_batch re-raises promptly, no hang."""
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=True,
+        ):
+            # pyrefly: ignore[bad-specialization]
+            data_loader = DataLoadingThread(
+                torch.device("cpu"), _RaisingIter(RuntimeError("OOM")), True
+            )
+        data_loader.start()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "OOM"):
+                data_loader.get_next_batch()
+        finally:
+            data_loader.stop()
+
+    def test_fetch_failure_re_raised_on_subsequent_calls(self) -> None:
+        """Captured exception is terminal: every call re-raises until pipeline.reset()."""
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=True,
+        ):
+            # pyrefly: ignore[bad-specialization]
+            data_loader = DataLoadingThread(
+                torch.device("cpu"), _RaisingIter(RuntimeError("OOM")), True
+            )
+        data_loader.start()
+        try:
+            for _ in range(3):
+                with self.assertRaisesRegex(RuntimeError, "OOM"):
+                    data_loader.get_next_batch()
+        finally:
+            data_loader.stop()
+
+    def test_fetch_failure_captured_on_copy_exception_when_jk_on(self) -> None:
+        """JK on + batch.to(device) raises => get_next_batch surfaces it."""
+        bad_batch = MagicMock()
+        bad_batch.to.side_effect = RuntimeError("CUDA OOM in copy")
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=True,
+        ):
+            # pyrefly: ignore[bad-specialization]
+            data_loader = DataLoadingThread(
+                torch.device("cpu"), iter([bad_batch]), True
+            )
+        data_loader.start()
+        try:
+            with self.assertRaisesRegex(RuntimeError, "CUDA OOM in copy"):
+                data_loader.get_next_batch()
+        finally:
+            data_loader.stop()
+
+    def test_fetch_failure_silent_when_jk_off(self) -> None:
+        """Off-path byte-exact: BG dies silently, no event fires, no capture."""
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=False,
+        ):
+            # pyrefly: ignore[bad-specialization]
+            data_loader = DataLoadingThread(
+                torch.device("cpu"), _RaisingIter(RuntimeError("OOM")), True
+            )
+        data_loader.start()
+        try:
+            self.assertFalse(data_loader._buffer_filled_event.wait(timeout=0.5))
+            self.assertIsNone(data_loader._captured_exception)
+        finally:
+            # Force-stop the orphaned daemon (run() already returned).
+            data_loader._stop = True
+            data_loader._buffer_filled_event.set()
+            data_loader._buffer_empty_event.set()
+
+    def test_fetch_failure_emits_failure_telemetry(self) -> None:
+        """FAILURE Scuba sample has stage, exception_type, error_message, stack_trace."""
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=True,
+        ):
+            with patch(
+                "torchrec.distributed.train_pipeline.utils.EventLoggingHandler.log_event"
+            ) as mock_log_event:
+                # pyrefly: ignore[bad-specialization]
+                data_loader = DataLoadingThread(
+                    torch.device("cpu"), _RaisingIter(RuntimeError("OOM")), True
+                )
+                data_loader.start()
+                try:
+                    with self.assertRaises(RuntimeError):
+                        data_loader.get_next_batch()
+                finally:
+                    data_loader.stop()
+
+        self.assertEqual(mock_log_event.call_count, 1)
+        kwargs = mock_log_event.call_args.kwargs
+        self.assertEqual(kwargs["event_type"], EventType.FAILURE)
+        self.assertEqual(kwargs["event_name"], "DataLoadingThread.fetch_failure")
+        self.assertEqual(kwargs["metadata"]["stage"], "next_iterator")
+        self.assertEqual(kwargs["metadata"]["exception_type"], "RuntimeError")
+        self.assertEqual(kwargs["error_message"], "OOM")
+        self.assertTrue(kwargs["stack_trace"])
+
+    def test_fetch_failure_passes_jk_default_false_explicitly(self) -> None:
+        """Pins default=False; torch's justknobs_check defaults to True (fail-open)."""
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=False,
+        ) as mock_jk:
+            # pyrefly: ignore[bad-specialization]
+            DataLoadingThread(torch.device("cpu"), iter([]), True)
+
+        capture_calls = [
+            c
+            for c in mock_jk.call_args_list
+            if c.args
+            and c.args[0]
+            == "pytorch/torchrec:enable_data_loading_thread_failure_capture"
+        ]
+        self.assertEqual(len(capture_calls), 1)
+        self.assertEqual(capture_calls[0].kwargs.get("default"), False)
+
+    def test_stopiteration_not_logged_as_failure_when_jk_on(self) -> None:
+        """End-of-epoch must NOT emit FAILURE on the safe branch."""
+        data = [torch.tensor([i]) for i in range(3)]
+        data_iter = iter(data)
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=True,
+        ):
+            with patch(
+                "torchrec.distributed.train_pipeline.utils.EventLoggingHandler.log_event"
+            ) as mock_log_event:
+                # pyrefly: ignore[bad-specialization]
+                data_loader = DataLoadingThread(torch.device("cpu"), data_iter, True)
+                data_loader.start()
+                try:
+                    for i in range(3):
+                        item = data_loader.get_next_batch()
+                        # pyrefly: ignore[missing-attribute]
+                        self.assertEqual(item.item(), i)
+                    self.assertIsNone(data_loader.get_next_batch(False))
+                finally:
+                    data_loader.stop()
+
+        failure_calls = [
+            c
+            for c in mock_log_event.call_args_list
+            if c.kwargs.get("event_type") == EventType.FAILURE
+        ]
+        self.assertEqual(len(failure_calls), 0)
+
+    def test_consumer_woken_even_when_telemetry_raises(self) -> None:
+        """log_event raising must not skip the consumer wake (no regression to hang)."""
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=True,
+        ):
+            with patch(
+                "torchrec.distributed.train_pipeline.utils.EventLoggingHandler.log_event",
+                side_effect=RuntimeError("scuba down"),
+            ):
+                # pyrefly: ignore[bad-specialization]
+                data_loader = DataLoadingThread(
+                    torch.device("cpu"), _RaisingIter(RuntimeError("OOM")), True
+                )
+                data_loader.start()
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "OOM"):
+                        data_loader.get_next_batch()
+                finally:
+                    data_loader.stop()
+
+    def test_hang_reproduced_without_capture(self) -> None:
+        """Repros the off-path hang: JK off + iterator raises => consumer
+        blocks forever on `_buffer_filled_event.wait()`. In prod this is the
+        1500s DPP starvation kill misclassified as DPP_WORKER_STUCK_FULL_OUTPUT_QUEUE.
+        """
+        with patch(
+            "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+            return_value=False,
+        ):
+            # pyrefly: ignore[bad-specialization]
+            data_loader = DataLoadingThread(
+                torch.device("cpu"), _RaisingIter(RuntimeError("OOM")), True
+            )
+        data_loader.start()
+        try:
+            result: List[object] = []
+
+            def _consumer() -> None:
+                try:
+                    result.append(data_loader.get_next_batch())
+                except BaseException as e:  # noqa: B036
+                    result.append(e)
+
+            consumer = threading.Thread(target=_consumer, daemon=True)
+            consumer.start()
+            consumer.join(timeout=0.5)
+
+            self.assertTrue(
+                consumer.is_alive(),
+                "Expected get_next_batch() to hang with JK off, but it returned",
+            )
+            self.assertEqual(result, [])
+        finally:
+            # Release the still-blocked consumer and the orphaned daemon.
+            data_loader._stop = True
+            data_loader._buffer_filled_event.set()
+            data_loader._buffer_empty_event.set()
+            consumer.join(timeout=1.0)
+
+    def test_global_excepthook_does_not_wake_consumer(self) -> None:
+        """A process-global `threading.excepthook` observes the dying thread's
+        exception but cannot touch `_buffer_filled_event` — the consumer still
+        hangs. Proves that per-site capture is not redundant with any global
+        uncaught-exception safety net: the global net runs in the dying
+        thread's exit path and has no way to wake the consumer.
+        """
+        captured: List[BaseException] = []
+
+        def _recording_excepthook(args: threading.ExceptHookArgs) -> None:
+            if args.exc_value is not None:
+                captured.append(args.exc_value)
+
+        old_excepthook = threading.excepthook
+        threading.excepthook = _recording_excepthook
+        try:
+            with patch(
+                "torchrec.distributed.train_pipeline.utils.torch._utils_internal.justknobs_check",
+                return_value=False,
+            ):
+                # pyrefly: ignore[bad-specialization]
+                data_loader = DataLoadingThread(
+                    torch.device("cpu"), _RaisingIter(RuntimeError("OOM")), True
+                )
+            data_loader.start()
+            try:
+                result: List[object] = []
+
+                def _consumer() -> None:
+                    try:
+                        result.append(data_loader.get_next_batch())
+                    except BaseException as e:  # noqa: B036
+                        result.append(e)
+
+                consumer = threading.Thread(target=_consumer, daemon=True)
+                consumer.start()
+                consumer.join(timeout=0.5)
+
+                self.assertEqual(len(captured), 1)
+                self.assertIsInstance(captured[0], RuntimeError)
+                self.assertEqual(str(captured[0]), "OOM")
+
+                self.assertTrue(
+                    consumer.is_alive(),
+                    "Global threading.excepthook must not unblock the consumer",
+                )
+                self.assertEqual(result, [])
+            finally:
+                data_loader._stop = True
+                data_loader._buffer_filled_event.set()
+                data_loader._buffer_empty_event.set()
+                consumer.join(timeout=1.0)
+        finally:
+            threading.excepthook = old_excepthook
 
 
 class EvalPipelineSparseDistTest(unittest.TestCase):
