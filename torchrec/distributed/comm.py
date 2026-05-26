@@ -135,15 +135,21 @@ def get_topology_group_world_size(world_size: Optional[int] = None) -> int:
     This is the largest number of processes linked together by high-bandwidth communication.
     If it isn't specified, it falls back to LOCAL_WORLD_SIZE
     """
-    topology_domain_multiple = get_topology_domain_multiple()
     local_world_size = get_local_size(world_size)
 
-    if topology_domain_multiple is None:
+    # Check TORCHREC_RESOLVED_POD_SIZE — set by the planner
+    # When pod sizes are dynamically allocated,
+    # 'TORCHREC_RESOLVED_POD_SIZE' env variable can be set
+    # to the actual allocation while 'TOPOLOGY_DOMAIN_MULTIPLE'
+    # will give us the minimum configured pod size.
+    resolved = os.environ.get("TORCHREC_RESOLVED_POD_SIZE")
+    if resolved is None:
         logger.warning(
-            "Could not determine TOPOLOGY_DOMAIN_MULTIPLE from environment,"
-            " utilizing LOCAL_WORLD_SIZE instead."
+            "TORCHREC_RESOLVED_POD_SIZE not set," " utilizing LOCAL_WORLD_SIZE instead."
         )
         return local_world_size
+
+    topology_domain_multiple = int(resolved)
 
     # Total number of processes/gpu in domain = topology_domain_mult * number_gpu_per_domain
     numb_proc_per_pod = topology_domain_multiple * local_world_size
