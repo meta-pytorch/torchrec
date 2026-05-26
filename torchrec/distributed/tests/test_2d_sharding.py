@@ -2062,7 +2062,7 @@ class TestFullySharded2DECParallel(MultiProcessTestBase):
         ] = None,
         variable_batch_size: bool = False,
         variable_batch_per_feature: bool = False,
-        sharding_strategy: Optional[ShardingStrategy] = None,
+        sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
         rs_awaitable_hook_module: Optional[str] = None,
     ) -> None:
         self._run_multi_process_test(
