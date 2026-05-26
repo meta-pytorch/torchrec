@@ -159,38 +159,44 @@ class BenchmarkResult:
 
     def __str__(self) -> str:
         gpu_runtime = (
-            "GPU Runtime (P90)",
-            f"{self.runtime_percentile(90, device='gpu'):.2f} ms",
+            "GPU Runtime (P10/P50/P90)",
+            f"{self.runtime_percentile(10, device='gpu'):.2f} / {self.runtime_percentile(50, device='gpu'):.2f} / {self.runtime_percentile(90, device='gpu'):.2f} ms",
         )
         cpu_runtime = (
-            "CPU Runtime (P90)",
-            f"{self.runtime_percentile(90, device='cpu'):.2f} ms",
+            "CPU Runtime (P10/P50/P90)",
+            f"{self.runtime_percentile(10, device='cpu'):.2f} / {self.runtime_percentile(50, device='cpu'):.2f} / {self.runtime_percentile(90, device='cpu'):.2f} ms",
         )
         cpu_util = (
-            "CPU Utilization (P90)",
-            f"{self.cpu_utilization_percentile(90):.2%}",
+            "CPU Utilization (P10/P50/P90)",
+            f"{self.cpu_utilization_percentile(10):.2%} / {self.cpu_utilization_percentile(50):.2%} / {self.cpu_utilization_percentile(90):.2%}",
         )
         norm_cpu_util = (
-            "Normalized CPU Util (P90)",
-            f"{self.normalized_cpu_utilization_percentile(90):.2%}",
+            "Normalized CPU Util (P10/P50/P90)",
+            f"{self.normalized_cpu_utilization_percentile(10):.2%} / {self.normalized_cpu_utilization_percentile(50):.2%} / {self.normalized_cpu_utilization_percentile(90):.2%}",
         )
-        cpu_mem = "CPU Peak RSS (P90)", f"{self.cpu_mem_percentile(90)/1000:.2f} GB"
-        qps = ("QPS (P90)", f"{int(self.qps_percentile(90))}")
+        cpu_mem = (
+            "CPU Peak RSS (P10/P50/P90)",
+            f"{self.cpu_mem_percentile(10)/1000:.2f} / {self.cpu_mem_percentile(50)/1000:.2f} / {self.cpu_mem_percentile(90)/1000:.2f} GB",
+        )
+        qps = (
+            "QPS (P10/P50/P90)",
+            f"{int(self.qps_percentile(10))} / {int(self.qps_percentile(50))} / {int(self.qps_percentile(90))}",
+        )
 
         short_name_length = 35
 
         if len(self.gpu_mem_stats) > 0:
             mem_used = (
-                "GPU Mem used (P90)",
-                f"{self.device_mem_used(90)/1000:.2f} GB",
+                "GPU Mem used (P10/P50/P90)",
+                f"{self.device_mem_used(10)/1000:.2f} / {self.device_mem_used(50)/1000:.2f} / {self.device_mem_used(90)/1000:.2f} GB",
             )
             mem_alloc = (
-                "GPU Peak Mem alloc (P90)",
-                f"{self.max_mem_alloc_percentile(90)/1000:.2f} GB",
+                "GPU Peak Mem alloc (P10/P50/P90)",
+                f"{self.max_mem_alloc_percentile(10)/1000:.2f} / {self.max_mem_alloc_percentile(50)/1000:.2f} / {self.max_mem_alloc_percentile(90)/1000:.2f} GB",
             )
             mem_reserved = (
-                "GPU Peak Mem reserved (P90)",
-                f"{self.max_mem_reserved_percentile(90)/1000:.2f} GB",
+                "GPU Peak Mem reserved (P10/P50/P90)",
+                f"{self.max_mem_reserved_percentile(10)/1000:.2f} / {self.max_mem_reserved_percentile(50)/1000:.2f} / {self.max_mem_reserved_percentile(90)/1000:.2f} GB",
             )
             malloc_retries = (
                 "Malloc retries (P50/P90/P100)",
@@ -230,10 +236,10 @@ class BenchmarkResult:
             "=" * 60,
             "",
             "  Runtime:",
-            f"    GPU (P90):              {self.runtime_percentile(90, device='gpu'):.2f} ms",
-            f"    CPU (P90):              {self.runtime_percentile(90, device='cpu'):.2f} ms",
-            f"    CPU Utilization (P90):  {self.cpu_utilization_percentile(90):.2%}",
-            f"    Normalized CPU Util (P90):  {self.normalized_cpu_utilization_percentile(90):.2%}",
+            f"    GPU  (P10/P50/P90):     {self.runtime_percentile(10, device='gpu'):.2f} / {self.runtime_percentile(50, device='gpu'):.2f} / {self.runtime_percentile(90, device='gpu'):.2f} ms",
+            f"    CPU  (P10/P50/P90):     {self.runtime_percentile(10, device='cpu'):.2f} / {self.runtime_percentile(50, device='cpu'):.2f} / {self.runtime_percentile(90, device='cpu'):.2f} ms",
+            f"    CPU Utilization (P10/P50/P90):  {self.cpu_utilization_percentile(10):.2%} / {self.cpu_utilization_percentile(50):.2%} / {self.cpu_utilization_percentile(90):.2%}",
+            f"    Normalized CPU Util (P10/P50/P90):  {self.normalized_cpu_utilization_percentile(10):.2%} / {self.normalized_cpu_utilization_percentile(50):.2%} / {self.normalized_cpu_utilization_percentile(90):.2%}",
         ]
 
         if len(self.gpu_mem_stats) > 0:
@@ -241,9 +247,9 @@ class BenchmarkResult:
                 [
                     "",
                     "  GPU Memory:",
-                    f"    Peak Allocated (P90):   {self.max_mem_alloc_percentile(90)/1000:.2f} GB",
-                    f"    Peak Reserved (P90):    {self.max_mem_reserved_percentile(90)/1000:.2f} GB",
-                    f"    Used (P90):             {self.device_mem_used(90)/1000:.2f} GB",
+                    f"    Peak Allocated (P10/P50/P90):   {self.max_mem_alloc_percentile(10)/1000:.2f} / {self.max_mem_alloc_percentile(50)/1000:.2f} / {self.max_mem_alloc_percentile(90)/1000:.2f} GB",
+                    f"    Peak Reserved (P10/P50/P90):    {self.max_mem_reserved_percentile(10)/1000:.2f} / {self.max_mem_reserved_percentile(50)/1000:.2f} / {self.max_mem_reserved_percentile(90)/1000:.2f} GB",
+                    f"    Used (P10/P50/P90):             {self.device_mem_used(10)/1000:.2f} / {self.device_mem_used(50)/1000:.2f} / {self.device_mem_used(90)/1000:.2f} GB",
                     f"    Malloc Retries:         P50={self.mem_retries(50):.0f}  P90={self.mem_retries(90):.0f}  P100={self.mem_retries(100):.0f}",
                 ]
             )
@@ -252,9 +258,9 @@ class BenchmarkResult:
             [
                 "",
                 "  CPU Memory:",
-                f"    Peak RSS (P90):         {self.cpu_mem_percentile(90)/1000:.2f} GB",
+                f"    Peak RSS (P10/P50/P90): {self.cpu_mem_percentile(10)/1000:.2f} / {self.cpu_mem_percentile(50)/1000:.2f} / {self.cpu_mem_percentile(90)/1000:.2f} GB",
                 "",
-                f"  QPS (P90):                  {int(self.qps_percentile(90))}",
+                f"  QPS (P10/P50/P90):          {int(self.qps_percentile(10))} / {int(self.qps_percentile(50))} / {int(self.qps_percentile(90))}",
                 "",
                 "=" * 60,
             ]
@@ -263,23 +269,28 @@ class BenchmarkResult:
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, float | str]:
-        """Return a dict of key P90 metrics for structured (JSON) output."""
+        """Return a dict of key metrics at P10, P50, and P90 for structured (JSON) output."""
         d: dict[str, float | str] = {
             "short_name": self.short_name,
-            "gpu_runtime_p90_ms": float(self.runtime_percentile(90, device="gpu")),
-            "cpu_runtime_p90_ms": float(self.runtime_percentile(90, device="cpu")),
-            "cpu_utilization_p90": float(self.cpu_utilization_percentile(90)),
-            "normalized_cpu_utilization_p90": float(
-                self.normalized_cpu_utilization_percentile(90)
-            ),
-            "cpu_peak_rss_p90_mb": float(self.cpu_mem_percentile(90)),
         }
+        for p in (10, 50, 90):
+            d[f"gpu_runtime_p{p}_ms"] = float(self.runtime_percentile(p, device="gpu"))
+            d[f"cpu_runtime_p{p}_ms"] = float(self.runtime_percentile(p, device="cpu"))
+            d[f"cpu_utilization_p{p}"] = float(self.cpu_utilization_percentile(p))
+            d[f"normalized_cpu_utilization_p{p}"] = float(
+                self.normalized_cpu_utilization_percentile(p)
+            )
+            d[f"cpu_peak_rss_p{p}_mb"] = float(self.cpu_mem_percentile(p))
         if len(self.gpu_mem_stats) > 0:
-            d["gpu_peak_alloc_p90_mb"] = float(self.max_mem_alloc_percentile(90))
-            d["gpu_peak_reserved_p90_mb"] = float(self.max_mem_reserved_percentile(90))
-            d["gpu_mem_used_p90_mb"] = float(self.device_mem_used(90))
-            d["gpu_malloc_retries_p90"] = float(self.mem_retries(90))
-        d["qps_p90"] = int(self.qps_percentile(90))
+            for p in (10, 50, 90):
+                d[f"gpu_peak_alloc_p{p}_mb"] = float(self.max_mem_alloc_percentile(p))
+                d[f"gpu_peak_reserved_p{p}_mb"] = float(
+                    self.max_mem_reserved_percentile(p)
+                )
+                d[f"gpu_mem_used_p{p}_mb"] = float(self.device_mem_used(p))
+                d[f"gpu_malloc_retries_p{p}"] = float(self.mem_retries(p))
+        for p in (10, 50, 90):
+            d[f"qps_p{p}"] = int(self.qps_percentile(p))
         return d
 
     @classmethod
