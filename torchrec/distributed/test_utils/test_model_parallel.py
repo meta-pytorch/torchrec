@@ -161,7 +161,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
         indices_dtype: torch.dtype = torch.int64,
         offsets_dtype: torch.dtype = torch.int64,
         lengths_dtype: torch.dtype = torch.int64,
-        sharding_strategy: Optional[ShardingStrategy] = None,
+        sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
         atol: Optional[float] = None,
         rtol: Optional[float] = None,
         rs_awaitable_hook_module: Optional[str] = None,

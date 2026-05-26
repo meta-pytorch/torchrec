@@ -807,7 +807,7 @@ def sharding_single_rank_test_single_process(
     offsets_dtype: torch.dtype = torch.int64,
     lengths_dtype: torch.dtype = torch.int64,
     random_seed: Optional[int] = None,
-    sharding_strategy: Optional[ShardingStrategy] = None,
+    sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
     rs_awaitable_hook_module: Optional[str] = None,
     atol: Optional[float] = None,
     rtol: Optional[float] = None,
@@ -980,7 +980,6 @@ def sharding_single_rank_test_single_process(
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=all_reduce_func,
             submodule_configs=submodule_configs,
-            # pyrefly: ignore[bad-argument-type]
             sharding_strategy=sharding_strategy,
             rs_awaitable_hook_module=rs_awaitable_hook_module,
         )
@@ -1099,7 +1098,7 @@ def sharding_single_rank_test(
     offsets_dtype: torch.dtype = torch.int64,
     lengths_dtype: torch.dtype = torch.int64,
     random_seed: Optional[int] = None,
-    sharding_strategy: Optional[ShardingStrategy] = None,
+    sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
     rs_awaitable_hook_module: Optional[str] = None,
     atol: Optional[float] = None,
     rtol: Optional[float] = None,
