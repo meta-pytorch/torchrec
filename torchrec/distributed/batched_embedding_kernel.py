@@ -46,6 +46,10 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SparseType,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
+from fbgemm_gpu.tbe.config import (
+    EmbeddingLocation as SSDEmbeddingLocation,
+    PoolingMode as SSDPoolingMode,
+)
 from fbgemm_gpu.tbe.ssd import ASSOC, SSDTableBatchedEmbeddingBags
 
 try:
@@ -1951,8 +1955,8 @@ class KeyValueEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerModule
         self._emb_module: SSDTableBatchedEmbeddingBags = SSDTableBatchedEmbeddingBags(
             embedding_specs=list(zip(self._local_rows, self._local_cols)),
             feature_table_map=self._feature_table_map,
-            ssd_cache_location=embedding_location,
-            pooling_mode=PoolingMode.NONE,
+            ssd_cache_location=SSDEmbeddingLocation(embedding_location.value),
+            pooling_mode=SSDPoolingMode.NONE,
             pg=pg,
             **ssd_tbe_params,
         ).to(device)
@@ -2179,8 +2183,8 @@ class ZeroCollisionKeyValueEmbedding(
         self._emb_module: SSDTableBatchedEmbeddingBags = SSDTableBatchedEmbeddingBags(
             embedding_specs=list(zip(self._num_embeddings, self._local_cols)),
             feature_table_map=self._feature_table_map,
-            ssd_cache_location=embedding_location,
-            pooling_mode=PoolingMode.NONE,
+            ssd_cache_location=SSDEmbeddingLocation(embedding_location.value),
+            pooling_mode=SSDPoolingMode.NONE,
             # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
@@ -3160,8 +3164,8 @@ class KeyValueEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor], FusedOptimizer
         self._emb_module: SSDTableBatchedEmbeddingBags = SSDTableBatchedEmbeddingBags(
             embedding_specs=list(zip(self._local_rows, self._local_cols)),
             feature_table_map=self._feature_table_map,
-            ssd_cache_location=embedding_location,
-            pooling_mode=self._pooling,
+            ssd_cache_location=SSDEmbeddingLocation(embedding_location.value),
+            pooling_mode=SSDPoolingMode(self._pooling.value),
             pg=pg,
             **ssd_tbe_params,
         ).to(device)
@@ -3377,8 +3381,8 @@ class ZeroCollisionKeyValueEmbeddingBag(
         self._emb_module: SSDTableBatchedEmbeddingBags = SSDTableBatchedEmbeddingBags(
             embedding_specs=list(zip(self._num_embeddings, self._local_cols)),
             feature_table_map=self._feature_table_map,
-            ssd_cache_location=embedding_location,
-            pooling_mode=self._pooling,
+            ssd_cache_location=SSDEmbeddingLocation(embedding_location.value),
+            pooling_mode=SSDPoolingMode(self._pooling.value),
             # pyrefly: ignore[bad-argument-type]
             backend_type=backend_type,
             pg=pg,
