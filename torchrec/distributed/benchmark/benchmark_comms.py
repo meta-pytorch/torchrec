@@ -893,6 +893,74 @@ def competing_comms_with_req_wait(
     )
 
 
+def tolist_overlap_comms(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    num_comms_rounds: int = 5,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Test whether .tolist() on AMD waits for in-flight async comms to complete.
+
+    Two .tolist() calls for comparison:
+    1. On comms stream: comms launched (async_op) -> compute -> .tolist()
+       while comms are still in flight. On AMD this may block until comms
+       finish; on NVIDIA it should only wait for the compute D2H.
+    2. On main stream: after comms are waited -> compute -> .tolist()
+       This should be fast on both platforms since no comms are in flight.
+    """
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        comms_stream = torch.cuda.Stream()
+
+    with record_function("## pre-comms compute ##"):
+        pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## comms stream: async comms + tolist during comms ##"):
+        post_comms = torch.zeros_like(pre_comms)
+        post_comms.record_stream(comms_stream)
+        with torch.cuda.stream(comms_stream):
+            comms_stream.wait_stream(main_stream)
+            requests = [
+                dist.all_to_all_single(
+                    output=post_comms,
+                    input=pre_comms,
+                    group=ctx.pg,
+                    async_op=True,
+                )
+                for _ in range(num_comms_rounds)
+            ]
+            compute_result1 = _compute(
+                dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx
+            )
+            _ = compute_result1[0][0].tolist()
+
+            for req in requests:
+                req.wait()
+
+    with record_function("## tolist after comms (no in-flight comms) ##"):
+        compute_result2 = _compute(dim=dim, num_mul=1, num_concat=1, ctx=ctx)
+        _ = compute_result2[0][0].tolist()
+
+    with record_function("## irrelevant compute ##"):
+        _compute(dim=dim, num_mul=1, num_concat=1, ctx=ctx)
+
+    with record_function("## wait and validate ##"):
+        main_stream.wait_stream(comms_stream)
+        checks = DeviceToHostTensorAwaitable(_validate(post_comms, ctx))
+
+    with record_function("## post-comms compute ##"):
+        _compute(
+            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=post_comms[0]
+        )
+
+    with record_function("## assert ##"):
+        assert checks.item()
+
+
 def data_copy_record_stream(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
@@ -1049,6 +1117,8 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 competing_comms._ar_pg = dist.new_group(
                     ranks=list(range(ctx.world_size))
                 )
+            case s if s.startswith("tolist_overlap_comms"):
+                func = tolist_overlap_comms
             case "data_copy_record_stream":
                 func = data_copy_record_stream
             case "data_copy_no_record_stream":
