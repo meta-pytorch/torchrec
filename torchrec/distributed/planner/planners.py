@@ -104,6 +104,7 @@ try:
     # dependencies
     from torchrec.distributed.logging_handlers import (
         detect_technique,
+        log_mpzch_summary,
         log_offloading_summary,
         log_planner_config,
         log_planning_result,
@@ -144,6 +145,9 @@ except Exception:
         pass
 
     def log_ssd_offloading_config(*args, **kwargs) -> None:
+        pass
+
+    def log_mpzch_summary(*args, **kwargs) -> None:
         pass
 
     def log_table_constraints(*args, **kwargs) -> None:
@@ -1022,6 +1026,10 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             log_ssd_offloading_config(
                 best_plan,
                 technique=OptimizationTechnique.SSD_OFFLOADING,
+            )
+            log_mpzch_summary(
+                best_plan,
+                technique=OptimizationTechnique.MPZCH,
             )
 
             return sharding_plan

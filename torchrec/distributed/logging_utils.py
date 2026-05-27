@@ -43,6 +43,8 @@ class OptimizationTechnique(Enum):
     ALBT = "albt"
     SSD_OFFLOADING = "ssd_offloading"
     TWO_DIM_SHARDING = "two_dim_sharding"
+    EMS = "ems"
+    MPZCH = "mpzch"
 
 
 @unique

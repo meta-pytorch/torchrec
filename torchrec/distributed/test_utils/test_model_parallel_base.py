@@ -1297,9 +1297,15 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
             eps=1e-8,  # TBE has default eps 1e-8
         )
 
-        # load the baseline model's state_dict onto the new model
-        dense_model.load_state_dict(
-            cast("OrderedDict[str, torch.Tensor]", fused_model.state_dict())
+        # load the baseline model's state_dict onto the new model.
+        # Use copy_state_dict (not load_state_dict) because the two models have
+        # different topologies: fused_model produces ShardedTensor entries in its
+        # state_dict (table-wise + fused), while dense_model's params are
+        # TableBatchedEmbeddingSlice (data-parallel + dense). PyTorch's default
+        # load_state_dict cannot copy ShardedTensor into TableBatchedEmbeddingSlice.
+        copy_state_dict(
+            dense_model.state_dict(),
+            cast("OrderedDict[str, torch.Tensor]", fused_model.state_dict()),
         )
 
         for _ in range(4):
@@ -1311,4 +1317,25 @@ class ModelParallelStateDictBase(ModelParallelSingleRankBase):
             dense_opt.step()
 
         self._eval_models(fused_model, dense_model, batch, is_deterministic=False)
-        self._compare_models(fused_model, dense_model, is_deterministic=False)
+        # The two models use different sharding topologies (fused: table-wise
+        # produces ShardedTensor entries; dense: data-parallel produces plain
+        # tensors), so the symmetric _compare_models helper does not apply.
+        # Compare the underlying table weights directly instead.
+        fused_sd = fused_model.state_dict()
+        dense_sd = dense_model.state_dict()
+        for key, dense_val in dense_sd.items():
+            if not key.endswith(".weight") or "embedding_bags" not in key:
+                continue
+            fused_val = fused_sd[key]
+            fused_tensor = (
+                fused_val.local_shards()[0].tensor
+                if isinstance(fused_val, ShardedTensor)
+                else fused_val
+            )
+            dense_tensor = (
+                dense_val.local_shards()[0].tensor
+                if isinstance(dense_val, ShardedTensor)
+                else dense_val
+            )
+            rtol, atol = _get_default_rtol_and_atol(fused_tensor, dense_tensor)
+            torch.testing.assert_close(fused_tensor, dense_tensor, rtol=rtol, atol=atol)

@@ -385,6 +385,22 @@ def log_ssd_offloading_config(
     pass
 
 
+def log_ems_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.EMS,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_mpzch_summary(
+    best_plan: Optional[List] = None,  # type: ignore[type-arg]
+    technique: OptimizationTechnique = OptimizationTechnique.MPZCH,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_kernel_changed(
     table_name: str = "",
     action: str = "",
