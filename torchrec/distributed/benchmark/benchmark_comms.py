@@ -1048,6 +1048,101 @@ def data_copy_no_record_stream(
     )
 
 
+def a2a_d2h_contention(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    concurrent: bool = True,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Compare resource contention between all_to_all_single (NVLink/network)
+    and device-to-host copy (PCIe). When concurrent=True, both run on
+    separate streams simultaneously — contention on shared resources (PCIe,
+    memory bandwidth) will show up as increased latency in the trace.
+    When concurrent=False, D2H waits for all2all to complete first,
+    providing a contention-free baseline for comparison.
+    """
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        comms_stream = torch.cuda.Stream()
+        d2h_stream = torch.cuda.Stream()
+
+    with record_function("## pre-comms compute ##"):
+        pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## allocate d2h tensors ##"):
+        d2h_source = torch.full(
+            (num_concat * dim, dim),
+            fill_value=float(ctx.rank + 1),
+            device=ctx.device,
+        )
+        cpu_buffer = torch.empty_like(d2h_source, device="cpu").pin_memory()
+
+    with record_function("## barrier — align ranks ##"):
+        dist.barrier(group=ctx.pg)
+
+    with record_function("## d2h copy on d2h_stream ##"):
+        with torch.cuda.stream(d2h_stream):
+            d2h_stream.wait_stream(main_stream)
+            cpu_buffer.copy_(d2h_source, non_blocking=True)
+
+    with record_function("## all2all on comms_stream ##"):
+        post_comms = torch.zeros_like(pre_comms)
+        post_comms.record_stream(comms_stream)
+        with torch.cuda.stream(comms_stream):
+            comms_stream.wait_stream(main_stream)
+            if not concurrent:
+                d2h_stream.synchronize()
+            req = dist.all_to_all_single(
+                output=post_comms,
+                input=pre_comms,
+                group=ctx.pg,
+                async_op=True,
+            )
+
+    with record_function("## irrelevant compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## wait and validate ##"):
+        assert req is not None
+        req.wait()
+        main_stream.wait_stream(comms_stream)
+        d2h_stream.synchronize()
+        checks_a2a = DeviceToHostTensorAwaitable(_validate(post_comms, ctx))
+        expected = float(ctx.rank + 1)
+        d2h_correct = bool(torch.all(cpu_buffer == expected).item())
+
+    with record_function("## post-comms compute ##"):
+        _compute(
+            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=post_comms[0]
+        )
+
+    with record_function("## assert ##"):
+        assert checks_a2a.item()
+        assert d2h_correct, f"D2H copy validation failed on rank {ctx.rank}"
+
+
+def a2a_d2h_sequential(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    return a2a_d2h_contention(
+        _batch_inputs=_batch_inputs,
+        dim=dim,
+        num_mul=num_mul,
+        num_concat=num_concat,
+        ctx=ctx,
+        concurrent=False,
+    )
+
+
 # single-rank runner
 def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) -> None:
     if arg.backend == "nccl":
@@ -1123,6 +1218,10 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = data_copy_record_stream
             case "data_copy_no_record_stream":
                 func = data_copy_no_record_stream
+            case "a2a_d2h_contention":
+                func = a2a_d2h_contention
+            case "a2a_d2h_sequential":
+                func = a2a_d2h_sequential
             case _:
                 raise ValueError(f"Unknown benchmark name: {arg.name}")
 
