@@ -401,6 +401,14 @@ def log_mpzch_summary(
     pass
 
 
+def log_zorm_config(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ZORM,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_kernel_changed(
     table_name: str = "",
     action: str = "",
