@@ -430,6 +430,7 @@ class EmbeddingBagCollection(EmbeddingBagCollectionInterface, ModuleNoCopyMixin)
             emb_module = embedding_clazz(
                 # pyrefly: ignore[bad-argument-type]
                 embedding_specs=embedding_specs,
+                # pyrefly: ignore[bad-argument-type]
                 pooling_mode=pooling_type_to_pooling_mode(pooling),
                 weight_lists=weight_lists,
                 device=device,
