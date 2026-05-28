@@ -193,6 +193,7 @@ Use these utilities when generating tests:
 - NEVER add tests for private methods (starting with `_`) unless they contain complex logic that's critical to test.
 - ALWAYS match the import style of the source file (modern `list[str]` vs `List[str]`).
 - ALWAYS check if similar tests already exist before generating duplicates.
+- ALWAYS prefer real implementations over mocks. Use `MultiProcessContext` + real gloo PG for distributed tests, `ScopedConfigeratorFake` / JK overrides for config and feature flags, and in-memory fakes where they exist. Reach for `mock.patch` / `MagicMock` only when no real fake exists for the dependency, and call out *why* in a one-line comment.
 - Keep generated tests focused and minimal — don't test framework behavior or trivial getters/setters.
 
 ## Instructions from User
