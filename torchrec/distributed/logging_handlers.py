@@ -233,6 +233,7 @@ def log_storage_reservation(
     available_hbm_per_rank: int = 0,
     planner_type: str = "",
     technique: OptimizationTechnique = OptimizationTechnique.NONE,
+    hbm_reserved_bytes: Optional[int] = None,
 ) -> None:
     """No-op OSS stub."""
     pass

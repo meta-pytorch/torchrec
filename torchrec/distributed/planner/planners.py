@@ -823,6 +823,9 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             available_hbm_per_rank=storage_constraint.devices[0].storage.hbm,
             planner_type=self.__class__.__name__,
             technique=_technique,
+            hbm_reserved_bytes=getattr(
+                self._storage_reservation, "_hbm_reserved_bytes", None
+            ),
         )
 
         log_planner_config(
