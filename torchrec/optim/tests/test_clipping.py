@@ -220,6 +220,160 @@ class TestGradientClippingOptimizer(unittest.TestCase):
             param_2.grad, expected_grad_2, rtol=1e-05, atol=1e-08
         )
 
+    def test_last_total_grad_norm_none_before_step(self) -> None:
+        param_1 = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1}, {}, [{"params": [param_1]}]
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer, max_gradient=1.0, clipping=GradientClipping.NORM
+        )
+
+        self.assertIsNone(gradient_clipping_optimizer.last_total_grad_norm)
+
+    def test_last_total_grad_norm_stored_after_step(self) -> None:
+        param_1 = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1}, {}, [{"params": [param_1]}]
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer, max_gradient=10.0, clipping=GradientClipping.NORM
+        )
+
+        gradient_clipping_optimizer.zero_grad()
+        param_1.grad = torch.tensor([3.0, 4.0])
+        gradient_clipping_optimizer.step()
+
+        expected_norm = (3.0**2 + 4.0**2) ** 0.5
+        self.assertIsNotNone(gradient_clipping_optimizer.last_total_grad_norm)
+        torch.testing.assert_close(
+            gradient_clipping_optimizer.last_total_grad_norm,
+            torch.tensor(expected_norm),
+            rtol=1e-05,
+            atol=1e-08,
+        )
+
+    def test_last_total_grad_norm_updated_each_step(self) -> None:
+        param_1 = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1}, {}, [{"params": [param_1]}]
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer, max_gradient=10.0, clipping=GradientClipping.NORM
+        )
+
+        # Step 1
+        gradient_clipping_optimizer.zero_grad()
+        param_1.grad = torch.tensor([3.0, 4.0])
+        gradient_clipping_optimizer.step()
+        norm_1 = gradient_clipping_optimizer.last_total_grad_norm
+
+        # Step 2 with different gradients
+        gradient_clipping_optimizer.zero_grad()
+        param_1.grad = torch.tensor([6.0, 8.0])
+        gradient_clipping_optimizer.step()
+        norm_2 = gradient_clipping_optimizer.last_total_grad_norm
+
+        expected_norm_2 = (6.0**2 + 8.0**2) ** 0.5
+        self.assertIsNotNone(norm_2)
+        torch.testing.assert_close(
+            norm_2,
+            torch.tensor(expected_norm_2),
+            rtol=1e-05,
+            atol=1e-08,
+        )
+        # Verify it changed from step 1
+        assert norm_1 is not None
+        assert norm_2 is not None
+        self.assertNotEqual(norm_1.item(), norm_2.item())
+
+    def test_last_total_grad_norm_stored_for_value_clipping(self) -> None:
+        param_1 = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1}, {}, [{"params": [param_1]}]
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer,
+            max_gradient=1.0,
+            clipping=GradientClipping.VALUE,
+            track_grad_norm=True,
+        )
+
+        gradient_clipping_optimizer.zero_grad()
+        param_1.grad = torch.tensor([3.0, 4.0])
+        gradient_clipping_optimizer.step()
+
+        expected_norm = (3.0**2 + 4.0**2) ** 0.5
+        self.assertIsNotNone(gradient_clipping_optimizer.last_total_grad_norm)
+        torch.testing.assert_close(
+            gradient_clipping_optimizer.last_total_grad_norm,
+            torch.tensor(expected_norm),
+            rtol=1e-05,
+            atol=1e-08,
+        )
+
+    def test_last_total_grad_norm_stored_for_no_clipping(self) -> None:
+        param_1 = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1}, {}, [{"params": [param_1]}]
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer,
+            max_gradient=1.0,
+            clipping=GradientClipping.NONE,
+            track_grad_norm=True,
+        )
+
+        gradient_clipping_optimizer.zero_grad()
+        param_1.grad = torch.tensor([3.0, 4.0])
+        gradient_clipping_optimizer.step()
+
+        expected_norm = (3.0**2 + 4.0**2) ** 0.5
+        self.assertIsNotNone(gradient_clipping_optimizer.last_total_grad_norm)
+        torch.testing.assert_close(
+            gradient_clipping_optimizer.last_total_grad_norm,
+            torch.tensor(expected_norm),
+            rtol=1e-05,
+            atol=1e-08,
+        )
+
+    def test_last_total_grad_norm_multi_params(self) -> None:
+        param_1 = Variable(torch.tensor([3.0, 4.0]), requires_grad=True)
+        param_2 = Variable(torch.tensor([6.0, 8.0]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1, "param_2": param_2},
+            {},
+            [{"params": [param_1]}, {"params": [param_2]}],
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer, max_gradient=10.0, clipping=GradientClipping.NORM
+        )
+
+        gradient_clipping_optimizer.zero_grad()
+        param_1.grad = torch.tensor([3.0, 4.0])
+        param_2.grad = torch.tensor([6.0, 8.0])
+        gradient_clipping_optimizer.step()
+
+        expected_norm = (3.0**2 + 4.0**2 + 6.0**2 + 8.0**2) ** 0.5
+        torch.testing.assert_close(
+            gradient_clipping_optimizer.last_total_grad_norm,
+            torch.tensor(expected_norm),
+            rtol=1e-05,
+            atol=1e-08,
+        )
+
     @patch("torch.nn.utils.clip_grad_norm_")
     def test_clip_no_gradients_norm_meta_device(
         self, mock_clip_grad_norm: MagicMock
