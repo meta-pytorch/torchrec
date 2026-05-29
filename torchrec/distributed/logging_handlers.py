@@ -401,6 +401,14 @@ def log_mpzch_summary(
     pass
 
 
+def log_kvzch_summary(
+    best_plan: Optional[List] = None,  # type: ignore[type-arg]
+    technique: OptimizationTechnique = OptimizationTechnique.KVZCH,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_zorm_config(
     metadata: Optional[Dict[str, str]] = None,
     technique: OptimizationTechnique = OptimizationTechnique.ZORM,
