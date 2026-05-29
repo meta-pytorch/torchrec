@@ -778,6 +778,31 @@ class GroupedPooledEmbeddingsLookup(
                         ),
                     )
 
+    """
+    Merge the TBE output when VBE is enabled and multiple TBEs are involved for MTIA.
+    """
+
+    def _merge_variable_batch_embeddings(
+        self, embeddings: List[torch.Tensor], splits: List[List[int]]
+    ) -> torch.Tensor:
+        """Merges VBE embeddings from multiple TBEs via split-and-concat.
+
+        Used for devices that do not support pre-allocated VBE output (e.g.
+        MTIA). Each TBE's output is split by feature/rank boundaries and
+        reassembled in rank-major order (matching the pre-allocated layout)
+        with `torch.cat`.
+        """
+        assert len(embeddings) > 1 and len(splits) > 1
+
+        split_embs = [torch.split(emb, split) for emb, split in zip(embeddings, splits)]
+        combined_embs = [
+            emb
+            for rank in range(self._world_size)
+            for n, embs in zip(self._feature_splits, split_embs)
+            for emb in embs[n * rank : n * rank + n]
+        ]
+        return torch.cat(combined_embs)
+
     def _vbe_splits(
         self, features_by_group: List[KeyedJaggedTensor]
     ) -> List[List[int]]:
@@ -962,9 +987,15 @@ class GroupedPooledEmbeddingsLookup(
         involved.
 
         An 1D empty tensor will be preallocated for TBEs to handle the merging
-        logic.
+        logic. For MTIA devices, pre-allocated VBE output is not supported, so
+        fall back to the concat-based merge approach.
         """
         vbe_splits = self._vbe_splits(features_by_group)
+
+        if device.type == "mtia":
+            return self._merge_variable_batch_embeddings(
+                self._forward(features_by_group), vbe_splits
+            )
 
         vbe_output, vbe_offsets = self._create_vbe_output_and_offsets(
             vbe_splits, device

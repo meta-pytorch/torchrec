@@ -8,12 +8,14 @@
 # pyre-strict
 
 import unittest
-from typing import Any, cast, Dict, List, Optional, Tuple, Type
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from hypothesis import assume, given, settings, strategies as st, Verbosity
+from torchrec.distributed.embedding_lookup import GroupedPooledEmbeddingsLookup
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.fbgemm_qcomm_codec import CommType, QCommsConfig
@@ -30,6 +32,27 @@ from torchrec.distributed.types import ModuleSharder, ShardingStrategy, Sharding
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, PoolingType
 from torchrec.test_utils import skip_if_asan_class
 from torchrec.types import DataType
+
+
+# pyre-ignore[2,3]
+def sharding_single_rank_test_concat_vbe_merge(*args, **kwargs):
+    """Wrapper around sharding_single_rank_test that forces the concat-based
+    VBE merge path (instead of pre-allocated) to verify its correctness.
+    """
+
+    # pyre-ignore[2,3]
+    def _concat_forward_with_vbe_merging(self, features_by_group, device):
+        vbe_splits = self._vbe_splits(features_by_group)
+        return self._merge_variable_batch_embeddings(
+            self._forward(features_by_group), vbe_splits
+        )
+
+    with patch.object(
+        GroupedPooledEmbeddingsLookup,
+        "_forward_with_vbe_merging",
+        _concat_forward_with_vbe_merging,
+    ):
+        return sharding_single_rank_test(*args, **kwargs)
 
 
 class ModelParallelTestShared(MultiProcessTestBase):
@@ -165,11 +188,14 @@ class ModelParallelTestShared(MultiProcessTestBase):
         atol: Optional[float] = None,
         rtol: Optional[float] = None,
         rs_awaitable_hook_module: Optional[str] = None,
+        # pyre-ignore[24]
+        test_callable: Optional[Callable] = None,
     ) -> None:
         self._build_tables_and_groups(data_type=data_type)
+        callable_fn = test_callable or sharding_single_rank_test
         # directly run the test with single process
         if world_size == 1:
-            sharding_single_rank_test(
+            callable_fn(
                 rank=0,
                 world_size=world_size,
                 local_size=local_size,
@@ -204,7 +230,7 @@ class ModelParallelTestShared(MultiProcessTestBase):
             )
         else:
             self._run_multi_process_test(
-                callable=sharding_single_rank_test,
+                callable=callable_fn,
                 world_size=world_size,
                 local_size=local_size,
                 pod_size=pod_size,
@@ -862,6 +888,45 @@ class _ModelParallelBase(ModelParallelTestShared):
             variable_batch_per_feature=True,
             has_weighted_tables=False,
             data_type=data_type,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() < 2,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    @given(
+        sharding_type=st.just(ShardingType.COLUMN_WISE.value),
+        data_type=st.sampled_from([DataType.FP32, DataType.FP16]),
+    )
+    @settings(verbosity=Verbosity.verbose, max_examples=4, deadline=None)
+    def test_sharding_multiple_kernels_concat_merge(
+        self,
+        sharding_type: str,
+        data_type: DataType,
+    ) -> None:
+        fused_params = {"prefetch_pipeline": True}
+        constraints = {
+            table_name: ParameterConstraints(
+                min_partition=4,
+                compute_kernels=(
+                    [EmbeddingComputeKernel.FUSED.value]
+                    if i % 2 == 0
+                    else [EmbeddingComputeKernel.FUSED_UVM_CACHING.value]
+                ),
+                sharding_types=[sharding_type],
+            )
+            for i, table_name in enumerate(self.table_names)
+        }
+
+        self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[EmbeddingBagCollectionSharder(fused_params=fused_params)],
+            backend=self.backend,
+            constraints=constraints,
+            variable_batch_per_feature=True,
+            has_weighted_tables=False,
+            data_type=data_type,
+            test_callable=sharding_single_rank_test_concat_vbe_merge,
         )
 
     @unittest.skipIf(
