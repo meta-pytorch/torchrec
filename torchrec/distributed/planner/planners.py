@@ -8,9 +8,10 @@
 # pyre-strict
 
 import copy
+import json
 import logging
 import time
-from collections import deque
+from collections import Counter, deque
 from functools import reduce
 from time import perf_counter
 from typing import Callable, cast, Dict, List, Optional, Tuple, Union
@@ -855,6 +856,11 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
 
         log_search_space_summary(search_space, self.__class__.__name__)
 
+        num_shardable_tables = len({so.name for so in search_space})
+
+        proposals_per_proposer: Dict[str, Dict[str, object]] = {}
+        planner_time_seconds = 0.0
+
         loaded_sharding_options = None
         loaded_best_plan: List[ShardingOption] = []
 
@@ -892,6 +898,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             for proposer_idx, proposer in enumerate(self._proposers):
                 proposer_num_proposals = 0
                 proposer_num_plans = 0
+                proposer_cache_hits = 0
+                proposer_timed_out = False
                 proposer_best_perf: Optional[float] = None
                 proposal = proposer.propose()
 
@@ -903,9 +911,11 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                             logger.info(
                                 f"Exceeded time limit of {self._timeout_seconds}s. Took {elapsed}s"
                             )
+                            proposer_timed_out = True
                             break
                     proposal_key = tuple(sorted(map(hash, proposal)))
                     if proposal_key in proposal_cache:
+                        proposer_cache_hits += 1
                         partitionable, plan, perf_rating = proposal_cache[proposal_key]
                         proposer.feedback(
                             partitionable=partitionable,
@@ -980,6 +990,14 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     is_winning_proposer=False,
                     technique=_technique,
                 )
+                proposer_key = f"{proposer.__class__.__name__}_{proposer_idx}"
+                proposals_per_proposer[proposer_key] = {
+                    "proposals": proposer_num_proposals,
+                    "cache_hits": proposer_cache_hits,
+                    "timed_out": proposer_timed_out,
+                }
+
+            planner_time_seconds = time.time() - start
 
         if best_plan:
             for callback in self._callbacks:
@@ -1013,11 +1031,29 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             validate_rank_assignment(sharding_plan, self._topology)
             validate_compute_kernels(best_plan)
 
+            sharding_type_dist = dict(Counter(so.sharding_type for so in best_plan))
+            plan_source = "loaded" if loaded_best_plan else "solved"
+            extra_metadata: Dict[str, str] = {
+                "num_proposals": str(self._num_proposals),
+                "num_plans": str(self._num_plans),
+                "planner_time_seconds": str(round(planner_time_seconds, 3)),
+                "total_failed_proposals": str(self._num_proposals - self._num_plans),
+                "num_proposers": str(len(self._proposers)),
+                "proposer_classes": ",".join(
+                    p.__class__.__name__ for p in self._proposers
+                ),
+                "proposals_per_proposer": json.dumps(proposals_per_proposer),
+                "success": "True",
+                "num_shardable_tables": str(num_shardable_tables),
+                "sharding_type_distribution": json.dumps(sharding_type_dist),
+                "plan_source": plan_source,
+            }
+            if not loaded_best_plan:
+                extra_metadata["best_perf_rating"] = str(round(best_perf_rating, 6))
             log_planning_result(
                 planner_type=self.__class__.__name__,
                 technique=_technique,
-                num_proposals=str(self._num_proposals),
-                num_plans=str(self._num_plans),
+                **extra_metadata,
             )
 
             log_offloading_summary(
@@ -1099,15 +1135,57 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                     debug=self._debug,
                 )
 
+            is_storage_failure = not lowest_storage.fits_in(global_storage_constraints)
+            error_type = (
+                "INSUFFICIENT_STORAGE" if is_storage_failure else "STRICT_CONSTRAINTS"
+            )
+
+            failure_metadata: Dict[str, str] = {
+                "error_message": str(last_planner_error),
+                "num_proposals": str(self._num_proposals),
+                "num_plans": str(self._num_plans),
+                "planner_time_seconds": str(round(planner_time_seconds, 3)),
+                "total_failed_proposals": str(self._num_proposals - self._num_plans),
+                "num_proposers": str(len(self._proposers)),
+                "proposer_classes": ",".join(
+                    p.__class__.__name__ for p in self._proposers
+                ),
+                "proposals_per_proposer": json.dumps(proposals_per_proposer),
+                "success": "False",
+                "num_shardable_tables": str(num_shardable_tables),
+                "error_type": error_type,
+            }
+            if is_storage_failure:
+                storage_gap: Dict[str, Dict[str, float]] = {}
+                for tier in ("hbm", "ddr", "ssd"):
+                    capacity = round(
+                        bytes_to_gb(getattr(global_storage_capacity, tier)), 3
+                    )
+                    available = round(
+                        bytes_to_gb(getattr(global_storage_constraints, tier)), 3
+                    )
+                    required = round(bytes_to_gb(getattr(lowest_storage, tier)), 3)
+                    storage_gap[tier] = {
+                        "capacity_gb": capacity,
+                        "available_gb": available,
+                        "required_gb": required,
+                        "gap_gb": round(required - available, 3),
+                    }
+                failure_metadata["storage_gap"] = json.dumps(storage_gap)
+                exceeded_tiers = [
+                    tier
+                    for tier in ("hbm", "ddr", "ssd")
+                    if getattr(lowest_storage, tier)
+                    > getattr(global_storage_constraints, tier)
+                ]
+                failure_metadata["exceeded_storage_tiers"] = ",".join(exceeded_tiers)
             log_planning_result(
                 planner_type=self.__class__.__name__,
                 technique=_technique,
-                error_message=str(last_planner_error),
-                num_proposals=str(self._num_proposals),
-                num_plans=str(self._num_plans),
+                **failure_metadata,
             )
 
-            if not lowest_storage.fits_in(global_storage_constraints):
+            if is_storage_failure:
                 raise PlannerError(
                     error_type=PlannerErrorType.INSUFFICIENT_STORAGE,
                     message="Unable to find a plan for this model because of insufficient storage. \n"
