@@ -26,7 +26,11 @@ from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import 
     TrainPipelineSparseDistTestBase,
 )
 from torchrec.distributed.train_pipeline.tracing import CallArgs, PipelinedPostproc
-from torchrec.distributed.train_pipeline.utils import _rewrite_model
+from torchrec.distributed.train_pipeline.utils import (
+    _is_data_loading_retriable,
+    _rewrite_model,
+    DataLoadingThread,
+)
 from torchrec.distributed.types import ShardingType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -423,3 +427,45 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         missing_keys, unexpected_keys = sharded_model.load_state_dict(state_dict)
         self.assertEqual(missing_keys, [])
         self.assertEqual(unexpected_keys, [])
+
+
+class _RetryableDataError(Exception):
+    is_retryable: bool = True
+
+
+class _NonRetryableDataError(Exception):
+    is_retryable: bool = False
+
+
+class DataLoadingExceptionTest(unittest.TestCase):
+    def test_is_data_loading_retriable_direct(self) -> None:
+        self.assertTrue(
+            _is_data_loading_retriable(_RetryableDataError("transient network error"))
+        )
+        self.assertFalse(
+            _is_data_loading_retriable(_NonRetryableDataError("permission denied"))
+        )
+
+    def test_is_data_loading_retriable_via_cause(self) -> None:
+        cause = _RetryableDataError("transient network error")
+        wrapper = OSError("data loading failed")
+        wrapper.__cause__ = cause
+        self.assertTrue(_is_data_loading_retriable(wrapper))
+
+    def test_is_data_loading_retriable_no_attribute(self) -> None:
+        self.assertFalse(_is_data_loading_retriable(RuntimeError("plain")))
+
+    def test_data_loading_thread_non_retriable_exception(self) -> None:
+        error = _NonRetryableDataError("permission denied")
+        thread = DataLoadingThread(
+            device=torch.device("cpu"),
+            dataloader_iter=iter([]),
+            to_device_non_blocking=False,
+        )
+        thread._exception = error
+        thread._buffer_filled_event.set()
+
+        with self.assertRaises(_NonRetryableDataError) as ctx:
+            thread.get_next_batch(none_throws=True)
+        self.assertIs(ctx.exception, error)
+        self.assertIsNone(thread._exception)
