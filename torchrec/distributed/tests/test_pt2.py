@@ -992,7 +992,15 @@ class TestPt2(unittest.TestCase):
         original_weights = get_weights(m)
 
         indices = torch.Tensor([1, 2, 0, 1, 2]).to(dtype=torch.int64, device=device)
-        lengths = torch.Tensor([2, 3]).to(dtype=torch.int64, device=device)
+        # NOTE: lengths must have total_B entries (sum of batch_size_per_feature_per_rank),
+        # not num_features. Here total_B = 1 + 2 = 3, so lengths must have 3 entries.
+        # Previously this was [2, 3] which produced offsets=[0,2,5] (length 3); the VBE
+        # bounds-check kernel iterates b_t in [0, total_B) and reads offsets[b_t+1],
+        # so at b_t=2 it would read offsets[3] (OOB) and produce undefined indices_end.
+        # Under the old BoundsCheckMode::WARNING, adjust_offset_kernel silently rewrote
+        # offsets[] in place to mask this. Phase 2 of D101843208 removes that papering-
+        # over, turning the OOB into a fatal CUDA_KERNEL_ASSERT.
+        lengths = torch.Tensor([2, 1, 2]).to(dtype=torch.int64, device=device)
         offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
         batch_size_per_feature_per_rank = [[1], [2]]
         inp_f = torch.randn(1, requires_grad=True, device=device)
