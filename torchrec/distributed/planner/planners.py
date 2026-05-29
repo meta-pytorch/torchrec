@@ -104,6 +104,7 @@ try:
     # dependencies
     from torchrec.distributed.logging_handlers import (
         detect_technique,
+        log_kvzch_summary,
         log_mpzch_summary,
         log_offloading_summary,
         log_planner_config,
@@ -148,6 +149,9 @@ except Exception:
         pass
 
     def log_mpzch_summary(*args, **kwargs) -> None:
+        pass
+
+    def log_kvzch_summary(*args, **kwargs) -> None:
         pass
 
     def log_table_constraints(*args, **kwargs) -> None:
@@ -1030,6 +1034,10 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             log_mpzch_summary(
                 best_plan,
                 technique=OptimizationTechnique.MPZCH,
+            )
+            log_kvzch_summary(
+                best_plan,
+                technique=OptimizationTechnique.KVZCH,
             )
 
             return sharding_plan
