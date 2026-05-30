@@ -42,6 +42,9 @@ class GradientClippingOptimizer(OptimizerWrapper):
         param_to_pgs (Dict[torch.nn.Parameter, List[dist.ProcessGroup]], optional): Mapping of parameters
             to process groups. Used for global gradient clipping in n-D model parallelism case.
             Defaults to None, local gradient clipping is used.
+        track_grad_norm (bool): track_grad_norm (bool): If set to True, the optimizer will also track the
+            total gradient norm from the most recent step, which can be retrieved
+            using the `last_total_grad_norm` property.
     """
 
     def __init__(
@@ -54,6 +57,7 @@ class GradientClippingOptimizer(OptimizerWrapper):
         param_to_pgs: Optional[
             Dict[torch.nn.Parameter, List[dist.ProcessGroup]]
         ] = None,
+        track_grad_norm: bool = False,
     ) -> None:
         super().__init__(optimizer)
         self._clipping = clipping
@@ -62,6 +66,8 @@ class GradientClippingOptimizer(OptimizerWrapper):
         self._check_meta: bool = True
         self._enable_global_grad_clip = enable_global_grad_clip
         self._step_num = 0
+        self._track_grad_norm = track_grad_norm
+        self._last_total_grad_norm: Optional[torch.Tensor] = None
 
         # Group parameters by model parallelism process group if global clipping is enabled.
         # Otherwise, all parameters are treated as replicated and will be clipped locally.
@@ -102,6 +108,7 @@ class GradientClippingOptimizer(OptimizerWrapper):
         if self._check_meta:
             # skip gradient clipping and early return
             if any(t.device.type == "meta" for t in self._replicate_params):
+                self._last_total_grad_norm = None
                 super().step(closure)
                 return
             if any(
@@ -109,6 +116,7 @@ class GradientClippingOptimizer(OptimizerWrapper):
                 for params in self._sharded_params.values()
                 for t in params
             ):
+                self._last_total_grad_norm = None
                 super().step(closure)
                 return
             self._check_meta = False
@@ -129,48 +137,68 @@ class GradientClippingOptimizer(OptimizerWrapper):
                     if p.grad is not None and p.grad.numel() > 0
                 ]
                 if replicate_params:
-                    torch.nn.utils.clip_grad_norm_(
+                    self._last_total_grad_norm = torch.nn.utils.clip_grad_norm_(
                         parameters=replicate_params,
                         max_norm=self._max_gradient,
                         norm_type=self._norm_type,
                     )
+                else:
+                    self._last_total_grad_norm = None
             else:
-                self.clip_grad_norm_()
+                result = self.clip_grad_norm_()
+                self._last_total_grad_norm = (
+                    torch.tensor(result) if isinstance(result, float) else result
+                )
 
         elif self._clipping == GradientClipping.VALUE:
+            if self._track_grad_norm:
+                self._last_total_grad_norm, _ = self.compute_total_grad_norm()
             torch.nn.utils.clip_grad_value_(
                 parameters=self._replicate_params, clip_value=self._max_gradient
             )
 
+        elif self._clipping == GradientClipping.NONE:
+            if self._track_grad_norm:
+                self._last_total_grad_norm, _ = self.compute_total_grad_norm()
+
         super().step(closure)
         self._step_num += 1
 
-    def clip_grad_norm_(self) -> Optional[Union[float, torch.Tensor]]:
-        """Clip the gradient norm of all parameters."""
+    @property
+    def last_total_grad_norm(self) -> Optional[torch.Tensor]:
+        """Returns the total gradient norm from the most recent step, or None
+        if no step has run yet."""
+        return self._last_total_grad_norm
 
-        # converts self._norm_type to a float if it's a string. Used in the case where self._norm_type is 'inf'.
-        all_grads = []
-        sharded_params = self._sharded_params
-        replicate_params = self._replicate_params
+    def compute_total_grad_norm(
+        self,
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        """Computes the total gradient norm across all parameters without clipping.
 
-        # Process distributed parameters and gradients
+        Returns the total norm and the flat list of gradient tensors."""
         sharded_grads = {
-            pgs: _get_grads(dist_params) for pgs, dist_params in sharded_params.items()
+            pgs: _get_grads(dist_params)
+            for pgs, dist_params in self._sharded_params.items()
         }
+        replicate_grads = _get_grads(self._replicate_params)
 
+        all_grads = []
         for grads in sharded_grads.values():
             all_grads.extend(grads)
-
-        # Process replicated parameters and gradients
-        replicate_grads = _get_grads(replicate_params)
         all_grads.extend(replicate_grads)
 
-        total_grad_norm = _compute_total_norm(
+        total_norm = _compute_total_norm(
             replicate_grads=replicate_grads,
             sharded_grads=sharded_grads,
             norm_type=self._norm_type,
             max_grad_norm=self._max_gradient,
         )
+        return total_norm, all_grads
+
+    def clip_grad_norm_(self) -> Optional[Union[float, torch.Tensor]]:
+        """Clip the gradient norm of all parameters."""
+
+        total_grad_norm, all_grads = self.compute_total_grad_norm()
 
         # pyrefly: ignore[redundant-cast]
         clip_coef = cast(torch.Tensor, self._max_gradient / (total_grad_norm + 1e-6))

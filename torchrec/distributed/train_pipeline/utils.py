@@ -631,6 +631,14 @@ def get_h2d_func(batch: In, device: torch.device) -> Pipelineable:
     return batch.to(device, non_blocking=True)
 
 
+def _is_data_loading_retriable(exception: Exception) -> bool:
+    if hasattr(exception, "is_retryable"):
+        return bool(exception.is_retryable)
+    if hasattr(exception, "__cause__") and hasattr(exception.__cause__, "is_retryable"):
+        return bool(exception.__cause__.is_retryable)
+    return False
+
+
 class DataLoadingThread(Thread, Generic[In]):
     def __init__(
         self,
@@ -657,6 +665,7 @@ class DataLoadingThread(Thread, Generic[In]):
         self._device = device
         self._to_device_non_blocking = to_device_non_blocking
         self._buffered: Optional[In] = None
+        self._exception: Optional[Exception] = None
         self._buffer_empty_event.set()
         one_time_rank0_logger.info(
             f"{self.__class__.__name__} created with device={device}, "
@@ -683,6 +692,22 @@ class DataLoadingThread(Thread, Generic[In]):
                 try:
                     batch = next(self._dataloader_iter)
                 except StopIteration:
+                    self._stop = True
+                    self._buffer_filled_event.set()
+                    return
+                except Exception as e:
+                    if _is_data_loading_retriable(e):
+                        logger.warning(
+                            f"{self.__class__.__name__}: Retriable exception "
+                            f"in data loading (skipping batch): "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        continue
+                    logger.error(
+                        f"{self.__class__.__name__}: Non-retriable exception "
+                        f"in data loading: {type(e).__name__}: {e}"
+                    )
+                    self._exception = e
                     self._stop = True
                     self._buffer_filled_event.set()
                     return
@@ -714,6 +739,10 @@ class DataLoadingThread(Thread, Generic[In]):
         the main thread in the training loop.
         """
         self._buffer_filled_event.wait()
+        if self._exception is not None:
+            e = self._exception
+            self._exception = None
+            raise e
         batch = self._buffered
         if batch is None:
             if none_throws:
