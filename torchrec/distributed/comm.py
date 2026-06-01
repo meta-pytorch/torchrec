@@ -9,7 +9,7 @@
 
 import logging
 import os
-from typing import List, Optional, Tuple
+from typing import cast, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -214,7 +214,7 @@ def intra_and_cross_node_pg(
                 logger.warning(
                     "[Connection] intra_group: [%d] -> [%s]" % (my_rank, peers)
                 )
-                _INTRA_PG = curr_intra_group_pg
+                _INTRA_PG = cast(dist.ProcessGroup, curr_intra_group_pg)
         assert _INTRA_PG is not None
         dist.barrier()
 
@@ -226,7 +226,7 @@ def intra_and_cross_node_pg(
                 logger.warning(
                     "[Connection] cross_group: [%d] -> [%s]" % (my_rank, peers)
                 )
-                _CROSS_PG = curr_cross_group_pg
+                _CROSS_PG = cast(dist.ProcessGroup, curr_cross_group_pg)
         assert _CROSS_PG is not None
         dist.barrier()
 
@@ -313,7 +313,7 @@ def intra_and_cross_node_pg_2D(
                     logger.warning(
                         f"[Connection] 2D rank {my_rank} -> intra_pg_peers {intra_pg_peers}"
                     )
-                    _INTRA_PG_2D = curr_intra_pg
+                    _INTRA_PG_2D = cast(dist.ProcessGroup, curr_intra_pg)
         assert _INTRA_PG_2D is not None, "INTRA_PG_2D is not initialized!"
         dist.barrier()
 
@@ -334,7 +334,7 @@ def intra_and_cross_node_pg_2D(
                     logger.warning(
                         f"[Connection] 2D rank {my_rank} -> cross_pg_peers {cross_pg_peers}"
                     )
-                    _CROSS_PG_2D = curr_cross_pg
+                    _CROSS_PG_2D = cast(dist.ProcessGroup, curr_cross_pg)
         assert _CROSS_PG_2D is not None, "CROSS_PG_2D is not initialized!"
         dist.barrier()
 

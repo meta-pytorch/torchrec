@@ -748,7 +748,7 @@ class ShardPerfContext:
             )
 
         # Build contexts
-        contexts = []
+        contexts: List["ShardPerfContext"] = []
         for hash_size, emb_dim in shard_sizes:
             ctx = cls(
                 sharding_type=sharding_option.sharding_type,

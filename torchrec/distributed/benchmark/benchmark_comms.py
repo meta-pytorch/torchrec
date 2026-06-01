@@ -841,6 +841,7 @@ def competing_comms(
                 group=ctx.pg,
                 async_op=True,
             )
+            assert req_a is not None
 
     with record_function("## comm2: all_reduce on stream_b ##"):
         out_b = input_b.clone()
@@ -855,6 +856,7 @@ def competing_comms(
                 group=ar_pg,
                 async_op=True,
             )
+            assert req_b is not None
 
     with record_function("## irrelevant compute ##"):
         _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
@@ -939,6 +941,7 @@ def tolist_overlap_comms(
             _ = compute_result1[0][0].tolist()
 
             for req in requests:
+                assert req is not None
                 req.wait()
 
     with record_function("## tolist after comms (no in-flight comms) ##"):
@@ -950,6 +953,7 @@ def tolist_overlap_comms(
 
     with record_function("## wait and validate ##"):
         for req in requests:
+            assert req is not None
             req.wait()
         main_stream.wait_stream(comms_stream)
         checks = DeviceToHostTensorAwaitable(_validate(post_comms, ctx))
