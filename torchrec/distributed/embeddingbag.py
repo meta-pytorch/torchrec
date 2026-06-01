@@ -1370,20 +1370,25 @@ class ShardedEmbeddingBagCollection(
                         ),
                     )
 
-                    self._model_parallel_name_to_sharded_tensor[table_name] = (
-                        ShardedTensor._init_from_local_shards_and_global_metadata(
-                            local_shards=local_shards,
-                            sharded_tensor_metadata=sharding_spec.build_metadata(
-                                tensor_sizes=self._name_to_table_size[table_name],
-                                tensor_properties=tensor_properties,
-                            ),
-                            process_group=(
-                                self._env.sharding_pg
-                                if isinstance(self._env, ShardingEnv2D)
-                                else self._env.process_group
-                            ),
+                    try:
+                        self._model_parallel_name_to_sharded_tensor[table_name] = (
+                            ShardedTensor._init_from_local_shards_and_global_metadata(
+                                local_shards=local_shards,
+                                sharded_tensor_metadata=sharding_spec.build_metadata(
+                                    tensor_sizes=self._name_to_table_size[table_name],
+                                    tensor_properties=tensor_properties,
+                                ),
+                                process_group=(
+                                    self._env.sharding_pg
+                                    if isinstance(self._env, ShardingEnv2D)
+                                    else self._env.process_group
+                                ),
+                            )
                         )
-                    )
+                    except RuntimeError as e:
+                        raise RuntimeError(
+                            f"Failed to initialize sharded tensor for table '{table_name}': {e}"
+                        ) from e
 
         def extract_sharded_kvtensors(
             module: ShardedEmbeddingBagCollection,

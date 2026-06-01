@@ -9,6 +9,7 @@
 
 import os
 import unittest
+import unittest.mock
 from collections import defaultdict
 from typing import Any, Callable, cast, Dict, List, Optional, OrderedDict, Tuple, Union
 
@@ -282,6 +283,38 @@ class ModelParallelSparseOnlyBase(unittest.TestCase):
             filter(lambda s: "Validating input features..." in s, logs.output)
         )
         self.assertEqual(1, len(matched_logs))
+
+    def test_initialize_torch_state_error_includes_table_name(self) -> None:
+        with unittest.mock.patch.object(
+            ShardedEmbeddingBagCollection,
+            "_initialize_torch_state",
+            lambda self, **kwargs: None,
+        ):
+            model = self._create_sharded_model()
+
+        sharded_ebc = model.module
+        assert isinstance(sharded_ebc, ShardedEmbeddingBagCollection)
+
+        orig_fn = ShardedTensor._init_from_local_shards_and_global_metadata
+        call_count = 0
+
+        @classmethod  # type: ignore[misc]
+        def fail_on_second_call(cls: type, *args: object, **kwargs: object) -> object:
+            nonlocal call_count
+            call_count += 1
+            if call_count > 1:
+                raise RuntimeError("Number of local shards (0) does not match")
+            return orig_fn.__func__(cls, *args, **kwargs)
+
+        ShardedTensor._init_from_local_shards_and_global_metadata = fail_on_second_call  # type: ignore[assignment]
+        try:
+            sharded_ebc._initialize_torch_state()
+            self.fail("Expected RuntimeError")
+        except RuntimeError as e:
+            self.assertIn("large_table", str(e))
+            self.assertIn("Number of local shards (0) does not match", str(e))
+        finally:
+            ShardedTensor._init_from_local_shards_and_global_metadata = orig_fn  # type: ignore[assignment]
 
     def _create_sharded_model(
         self, embedding_dim: int = 128, num_embeddings: int = 256
