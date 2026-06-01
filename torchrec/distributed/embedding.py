@@ -1529,7 +1529,7 @@ class ShardedEmbeddingCollection(
     ) -> Awaitable[Awaitable[KJTList]]:
         need_permute: bool = True
         if isinstance(features, TensorDict):
-            # pyrefly: ignore[no-matching-overload]
+            # pyrefly: ignore[bad-argument-type]
             feature_keys = list(features.keys())
             if self._features_order:
                 feature_keys = [feature_keys[i] for i in self._features_order]
