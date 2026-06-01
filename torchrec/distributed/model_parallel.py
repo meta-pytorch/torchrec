@@ -639,7 +639,6 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
         state_dict = get_module(self).state_dict(
             destination=destination, prefix=prefix, keep_vars=keep_vars
         )
-        assert state_dict is not None
         torch.nn.modules.utils.consume_prefix_in_state_dict_if_present(
             state_dict, prefix + _DDP_STATE_DICT_PREFIX
         )
@@ -806,9 +805,8 @@ class DistributedModelParallel(nn.Module, FusedOptimizerModule):
     @staticmethod
     def _reset_parameters(module: nn.Module) -> None:
         for _, m in module.named_modules():
-            reset_parameters = getattr(m, "reset_parameters", None)
-            if callable(reset_parameters):
-                reset_parameters()
+            if hasattr(m, "reset_parameters"):
+                m.reset_parameters()
 
     def reshard(
         self,
