@@ -28,6 +28,24 @@ from torchrec.test_utils import (
 )
 
 
+def _picklable_exception_wrapper(
+    callable: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    # multiprocessing.Pool pickles worker exceptions (with their traceback)
+    # to send them back to the parent. If the exception value or any frame
+    # locals in the traceback reference unpicklable objects (e.g. modules
+    # held alive by torch._dynamo / torch.compile errors), pickling fails
+    # with MaybeEncodingError and the original error is lost. Convert any
+    # exception to a plain RuntimeError carrying a stringified traceback so
+    # the real failure always reaches the parent process.
+    try:
+        return callable(*args, **kwargs)
+    except Exception as e:
+        raise RuntimeError(
+            f"Worker raised {type(e).__name__}: {e}\n{traceback.format_exc()}"
+        ) from None
+
+
 class MultiProcessContext:
     def __init__(
         self,
@@ -162,7 +180,7 @@ class MultiProcessTestBase(unittest.TestCase):
             for i in range(world_size):
                 kwargs["rank"] = i
                 async_result = pool.apply_async(
-                    functools.partial(callable, **kwargs),
+                    functools.partial(_picklable_exception_wrapper, callable, **kwargs),
                     error_callback=lambda e: exceptions.append(e),
                 )
                 async_results.append(async_result)

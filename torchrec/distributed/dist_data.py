@@ -565,35 +565,42 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
 
         ret = _safe_tolist_2d(self._output_tensor.view(self.num_workers, -1).T)
 
-        # Validate collective tag if present
+        # Validate collective tag if present. The validation block itself is
+        # skipped under torch.compile: .tolist() returns unbacked symints, so
+        # `any(tag != expected for tag in tag_row)` produces data-dependent
+        # expressions that cannot be guarded with fullgraph=True. The tag is
+        # still stripped from `ret` so downstream consumers see the original
+        # tensors; cross-rank consistency is then enforced on every eager
+        # invocation.
         if self._tag_appended:
             tag_row = ret[-1]
             ret = ret[: self._num_original_tensors]
-            # _tag_appended=True implies _collective_tag was not None.
-            assert self._collective_tag is not None
-            expected: int = self._collective_tag
-            if any(tag != expected for tag in tag_row):
-                label = (
-                    str(self._collective_tag_parts)
-                    if self._collective_tag_parts
-                    else "unknown"
-                )
-                self._log_mismatch_event(label, expected, tag_row)
-                raise RuntimeError(
-                    f"All2All collective mismatch detected (collective={label!r}): "
-                    f"expected tag {expected} but received tags {tag_row} from "
-                    f"peers. This indicates ranks are calling different "
-                    f"collectives on the same process group.\n"
-                    f"To debug: identify the rank whose tag differs from this "
-                    f"one, then compare its collective inputs (e.g. "
-                    f"input.keys(), splits, sharding plan) against this rank's. "
-                    f"Common causes: (1) divergent feature lists across ranks, "
-                    f"(2) a rank skipping the collective via early return or "
-                    f"data exhaustion, (3) sharding plan inconsistency. Do NOT "
-                    f"disable the check via TORCHREC_VALIDATE_COLLECTIVES — "
-                    f"the underlying mismatch will still cause silent data "
-                    f"corruption or an NCCL hang downstream."
-                )
+            if not is_torchdynamo_compiling():
+                # _tag_appended=True implies _collective_tag was not None.
+                assert self._collective_tag is not None
+                expected: int = self._collective_tag
+                if any(tag != expected for tag in tag_row):
+                    label = (
+                        str(self._collective_tag_parts)
+                        if self._collective_tag_parts
+                        else "unknown"
+                    )
+                    self._log_mismatch_event(label, expected, tag_row)
+                    raise RuntimeError(
+                        f"All2All collective mismatch detected (collective={label!r}): "
+                        f"expected tag {expected} but received tags {tag_row} from "
+                        f"peers. This indicates ranks are calling different "
+                        f"collectives on the same process group.\n"
+                        f"To debug: identify the rank whose tag differs from this "
+                        f"one, then compare its collective inputs (e.g. "
+                        f"input.keys(), splits, sharding plan) against this rank's. "
+                        f"Common causes: (1) divergent feature lists across ranks, "
+                        f"(2) a rank skipping the collective via early return or "
+                        f"data exhaustion, (3) sharding plan inconsistency. Do NOT "
+                        f"disable the check via TORCHREC_VALIDATE_COLLECTIVES — "
+                        f"the underlying mismatch will still cause silent data "
+                        f"corruption or an NCCL hang downstream."
+                    )
 
         # Check for int32 overflow in AllToAll input. If the input is already
         # corrupted, the corruption happened before the collective.
