@@ -848,6 +848,7 @@ def competing_comms(
         out_b.record_stream(stream_b)
         with torch.cuda.stream(stream_b):
             if wait_for_comm1:
+                assert req_a is not None
                 req_a.wait()
             stream_b.wait_stream(main_stream)
             req_b = dist.all_reduce(
@@ -862,6 +863,8 @@ def competing_comms(
         _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
 
     with record_function("## wait and validate ##"):
+        assert req_a is not None
+        assert req_b is not None
         req_a.wait()
         req_b.wait()
         main_stream.wait_stream(stream_a)
@@ -1054,6 +1057,137 @@ def data_copy_no_record_stream(
     )
 
 
+def copy_engine_contention(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    low_priority: bool = True,
+    trunk_count: int = 3,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Test copy engine contention between two streams issuing PCIe transfers.
+
+    h2d_stream: 3 consecutive large H2D copies (saturates copy engine)
+    main stream: 1 small D2H copy + 2 small H2D copies (interleaved with
+                 small compute ops)
+
+    When low_priority=True, h2d_stream gets lower priority than main stream,
+    testing whether stream priority affects copy engine scheduling.
+    """
+    small_size = 1024
+
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        if low_priority:
+            h2d_stream = torch.cuda.Stream(priority=1)
+        else:
+            h2d_stream = torch.cuda.Stream()
+
+    with record_function("## allocate tensors ##"):
+        # 3 large H2D sources for h2d_stream (pinned CPU → GPU)
+        large_h2d_sources = [
+            torch.full(
+                (num_concat * dim // 5, dim),
+                fill_value=float(ctx.rank + i + 1),
+            ).pin_memory()
+            for i in range(trunk_count)
+        ]
+
+        # 1 small D2H source on GPU
+        d2h_source = torch.full(
+            (small_size,), fill_value=float(ctx.rank + 10), device=ctx.device
+        )
+        d2h_cpu_buffer = torch.empty_like(d2h_source, device="cpu").pin_memory()
+
+        # 2 small H2D sources (pinned CPU)
+        small_h2d_sources = [
+            torch.full(
+                (small_size,), fill_value=float(ctx.rank + 20 + i), dtype=torch.int32
+            ).pin_memory()
+            for i in range(2)
+        ]
+
+    with record_function("## pre-copy compute ##"):
+        _compute(dim=dim, num_mul=num_mul * 5, num_concat=num_concat, ctx=ctx)
+
+    # --- h2d_stream: 3 consecutive large H2D copies ---
+    with record_function("## 3x large h2d on h2d_stream ##"):
+        large_h2d_devices = []
+        with torch.cuda.stream(h2d_stream):
+            h2d_stream.wait_stream(main_stream)
+            for i, src in enumerate(large_h2d_sources):
+                with record_function(f"## large h2d {i} ##"):
+                    t = src.to(ctx.device, non_blocking=True)
+                    t.record_stream(main_stream)
+                    large_h2d_devices.append(t)
+
+    # --- main stream: compute, small d2h, compute, small h2d, compute, small h2d ---
+    with record_function("## small compute 0 ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=1, ctx=ctx)
+
+    with record_function("## small d2h on main stream ##"):
+        d2h_cpu_buffer.copy_(d2h_source, non_blocking=True)
+
+    with record_function("## small compute 1 ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=1, ctx=ctx)
+
+    with record_function("## small h2d 0 on main stream ##"):
+        small_h2d_device_0 = small_h2d_sources[0].to(ctx.device, non_blocking=True)
+
+    with record_function("## small compute 2 ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=1, ctx=ctx)
+
+    with record_function("## small h2d 1 on main stream ##"):
+        small_h2d_device_1 = small_h2d_sources[1].to(ctx.device, non_blocking=True)
+
+    with record_function("## irrelevant compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## wait and validate ##"):
+        h2d_stream.synchronize()
+        torch.cuda.synchronize()
+
+        # validate large H2D copies
+        large_correct = all(
+            bool(
+                torch.allclose(
+                    large_h2d_devices[i],
+                    torch.full_like(large_h2d_devices[i], float(ctx.rank + i + 1)),
+                )
+            )
+            for i in range(trunk_count)
+        )
+
+        # validate small D2H copy
+        d2h_correct = bool(torch.all(d2h_cpu_buffer == float(ctx.rank + 10)).item())
+
+        # validate small H2D copies
+        small_h2d_correct_0 = bool(
+            torch.all(small_h2d_device_0 == ctx.rank + 20).item()
+        )
+        small_h2d_correct_1 = bool(
+            torch.all(small_h2d_device_1 == ctx.rank + 21).item()
+        )
+
+        logger.info(
+            f"[rank-{ctx.rank}] low_priority={low_priority}: "
+            f"large_h2d={large_correct}, d2h={d2h_correct}, "
+            f"small_h2d_0={small_h2d_correct_0}, small_h2d_1={small_h2d_correct_1}"
+        )
+
+    with record_function("## post-copy compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## assert ##"):
+        assert large_correct, f"Large H2D validation failed on rank {ctx.rank}"
+        assert d2h_correct, f"D2H validation failed on rank {ctx.rank}"
+        assert small_h2d_correct_0, f"Small H2D 0 validation failed on rank {ctx.rank}"
+        assert small_h2d_correct_1, f"Small H2D 1 validation failed on rank {ctx.rank}"
+
+
 def a2a_d2h_contention(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
@@ -1224,6 +1358,8 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = data_copy_record_stream
             case "data_copy_no_record_stream":
                 func = data_copy_no_record_stream
+            case "copy_engine_contention":
+                func = copy_engine_contention
             case "a2a_d2h_contention":
                 func = a2a_d2h_contention
             case "a2a_d2h_sequential":
