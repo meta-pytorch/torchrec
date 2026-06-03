@@ -29,6 +29,7 @@ from torchrec.distributed.planner.proposers import EmbeddingOffloadScaleupPropos
 from torchrec.distributed.planner.shard_estimators import EmbeddingStorageEstimator
 from torchrec.distributed.planner.stats import EmbeddingStats
 from torchrec.distributed.planner.storage_reservations import (
+    FixedAbsoluteStorageReservation,
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.planner.types import (
@@ -2113,3 +2114,67 @@ class TestValidateComputeKernels(unittest.TestCase):
         self.assertIn("negative HBM", str(ctx.exception))
         self.assertIn("negative DDR", str(ctx.exception))
         self.assertIn("2 violation(s)", str(ctx.exception))
+
+
+class TestFixedAbsoluteStorageReservation(unittest.TestCase):
+    def test_planner_with_fixed_absolute_reservation(self) -> None:
+        """Verify FixedAbsoluteStorageReservation can be used in the planner
+        to produce a valid sharding plan."""
+        topology = Topology(
+            world_size=2,
+            hbm_cap=1024 * 1024 * 1024,  # 1 GB per device
+            compute_device="cuda",
+        )
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(4)
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        planner = EmbeddingShardingPlanner(
+            topology=topology,
+            storage_reservation=FixedAbsoluteStorageReservation.from_gb(0.1),
+        )
+        # pyrefly: ignore[bad-argument-type, missing-argument]
+        sharding_plan = planner.plan(module=model, sharders=[TWvsRWSharder()])
+        self.assertIsInstance(sharding_plan, ShardingPlan)
+        self.assertIn("sparse.ebc", sharding_plan.plan)
+
+    def test_error_message_with_fixed_absolute_reservation(self) -> None:
+        """Verify the no-plan error message formats correctly for
+        FixedAbsoluteStorageReservation, showing 'GB per device'
+        instead of percentage-based output."""
+        topology = Topology(
+            world_size=2,
+            hbm_cap=1024 * 1024 * 2,  # 2 MiB — tiny, will force failure
+            compute_device="cuda",
+        )
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=10000000,
+                embedding_dim=10000000,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(2)
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        planner = EmbeddingShardingPlanner(
+            topology=topology,
+            storage_reservation=FixedAbsoluteStorageReservation.from_gb(0.5),
+        )
+        with self.assertRaises(PlannerError) as context:
+            # pyrefly: ignore[bad-argument-type, missing-argument]
+            planner.plan(module=model, sharders=[TWvsRWSharder()])
+        self.assertEqual(
+            context.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
+        )
+        error_message = str(context.exception)
+        self.assertIn("GB per device", error_message)
+        self.assertIn("0.5", error_message)
+        # Should NOT contain percentage-based formatting
+        self.assertNotIn("Storage reservation percentage", error_message)

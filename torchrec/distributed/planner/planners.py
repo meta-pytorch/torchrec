@@ -38,6 +38,7 @@ from torchrec.distributed.planner.proposers import (
 )
 from torchrec.distributed.planner.stats import EmbeddingStats
 from torchrec.distributed.planner.storage_reservations import (
+    FixedAbsoluteStorageReservation,
     HeuristicalStorageReservation,
 )
 from torchrec.distributed.planner.types import (
@@ -1089,16 +1090,17 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 lambda x, y: x + y,
                 [device.storage for device in storage_constraint.devices],
             )
-            storage_reservation_solution = (
-                (
+            if isinstance(self._storage_reservation, HeuristicalStorageReservation):
+                storage_reservation_solution = (
                     f"\n\t  Storage reservation percentage: {self._storage_reservation._percentage}, "
                     f"\n\t  Per rank reservation for dense storage: {storage_repr_in_gb(self._storage_reservation._dense_storage)}, "
                     f"\n\t  Per rank reservation for kjt storage: {storage_repr_in_gb(self._storage_reservation._kjt_storage)}, "
                 )
-                if isinstance(self._storage_reservation, HeuristicalStorageReservation)
+            elif isinstance(self._storage_reservation, FixedAbsoluteStorageReservation):
+                storage_reservation_solution = f"\n\t  Storage reservation: {round(bytes_to_gb(self._storage_reservation._hbm_reserved_bytes), 3)} GB per device, "
+            else:
                 # pyrefly: ignore[missing-attribute]
-                else f"\n\t  Storage reservation percentage: {self._storage_reservation._percentage}, "
-            )
+                storage_reservation_solution = f"\n\t  Storage reservation percentage: {self._storage_reservation._percentage}, "
             no_plan_solution = (
                 f"Planner evaluated {self._num_proposals} proposals."
                 "\nPossible solutions:"
