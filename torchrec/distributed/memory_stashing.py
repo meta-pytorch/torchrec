@@ -208,6 +208,10 @@ class MemoryStashingManager:
         """
         # (hbm_tensor ref, cpu_buffer, original_storage_size)
         stash_data: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
+        # Original CUDA storages saved before .data= so restore can
+        # re-point tensors (and their views) back to the same storage.
+        _orig_storages: List[torch.UntypedStorage] = []
+        _orig_storage_offsets: List[Union[int, torch.SymInt]] = []
 
         # Restore events populated by ``restore`` and consumed by ``await_restore``
         restore_events: List[torch.cuda.Event] = []
@@ -259,6 +263,13 @@ class MemoryStashingManager:
                         orig_storage_size = tensor.untyped_storage().size()
                         stash_data.append((tensor, cpu_buffer, orig_storage_size))
 
+                    # Save original CUDA storage refs and offsets before
+                    # freeing, so restore can re-point tensors (and views
+                    # sharing the same storage) back to the original storage.
+                    for tensor, _, _ in stash_data:
+                        _orig_storages.append(tensor.untyped_storage())
+                        _orig_storage_offsets.append(tensor.storage_offset())
+
                     # Two-pass: free HBM storage only after all copies are
                     # enqueued.  Tensors may share the same underlying storage
                     # (e.g. views into an all-to-all output buffer), so freeing
@@ -271,6 +282,9 @@ class MemoryStashingManager:
                             seen_storage_ptrs.add(storage_ptr)
                             tensor.untyped_storage().resize_(0)
 
+                for tensor, cpu_buffer, _ in stash_data:
+                    tensor.data = cpu_buffer
+
         def restore(
             _grad: Optional[torch.Tensor] = None,
             sync_event: Optional[torch.cuda.Event] = None,
@@ -279,42 +293,45 @@ class MemoryStashingManager:
             restore_events.clear()
             h2d_stream = cls.h2d_stream()
 
-            size_text = _tensor_size_text([cpu_buf for _, cpu_buf, _ in stash_data])
+            size_text = _tensor_size_text([hbm_ref for hbm_ref, _, _ in stash_data])
             capped_logger.info(
                 f"restore {label}: {len(stash_data)} tensors, total {size_text}"
             )
             with record_function(f"restore {label} on device ({size_text})"):
-                for hbm_ref, _cpu_buf, orig_storage_size in stash_data:
-                    # Re-allocate HBM storage to the original size (which
-                    # may be larger than this tensor if storage is shared).
-                    # For shared storage, the first resize allocates the
-                    # full buffer; subsequent resizes for sibling views are
-                    # no-ops since the storage is already large enough.
-                    cur_size = hbm_ref.untyped_storage().size()
+                for (
+                    (hbm_ref, _cpu_buf, orig_storage_size),
+                    orig_stor,
+                    orig_offset,
+                ) in zip(stash_data, _orig_storages, _orig_storage_offsets):
+                    # Re-allocate the original CUDA storage to its full size
+                    # (which may be larger than this tensor if storage is
+                    # shared).  For shared storage, the first resize allocates
+                    # the full buffer; subsequent resizes for sibling views
+                    # are no-ops since the storage is already large enough.
+                    cur_size = orig_stor.size()
                     if cur_size < orig_storage_size:
-                        hbm_ref.untyped_storage().resize_(orig_storage_size)
+                        orig_stor.resize_(orig_storage_size)
+                    ref = torch.tensor(
+                        [], dtype=hbm_ref.dtype, device=torch.cuda.current_device()
+                    )
+                    ref.set_(orig_stor, orig_offset, hbm_ref.shape, hbm_ref.stride())
+                    hbm_ref.data = ref
 
             # Ensure h2d_stream waits for the caller's stream before any
-            # allocations.  When called from a background thread the default
+            # copies.  When called from a background thread the default
             # stream may differ from the main thread's, so all GPU work
-            # (including resize_ allocations) must happen on h2d_stream.
+            # must happen on h2d_stream.
             if sync_event is not None:
                 h2d_stream.wait_event(sync_event)
             else:
                 h2d_stream.wait_stream(torch.cuda.current_stream())
 
             with record_function(f"restore {label} from host ({size_text})"):
-                for hbm_ref, cpu_buf, _orig_storage_size in stash_data:
-
-                    # Copy data back using a temporary tensor to bypass
-                    # autograd.  copy_() on the original tensor would
+                for hbm_ref, cpu_buf, _ in stash_data:
+                    # Use a temporary tensor viewing the same storage to
+                    # bypass autograd.  copy_() on hbm_ref directly would
                     # increment its version counter, causing "modified by
-                    # inplace operation" errors during backward.  A fresh
-                    # tensor viewing the same storage has its own version
-                    # counter, avoiding the issue.
-                    #
-                    # Use hbm_ref.storage_offset() to place data at the
-                    # correct position within potentially shared storage.
+                    # inplace operation" errors during backward.
                     tmp = torch.tensor([], dtype=hbm_ref.dtype, device=hbm_ref.device)
                     tmp.set_(
                         hbm_ref.untyped_storage(),
@@ -326,11 +343,10 @@ class MemoryStashingManager:
                         tmp.copy_(cpu_buf, non_blocking=True)
                     # Tell the caching allocator this storage is in use on
                     # h2d_stream so the bytes cannot be reused by main-stream
-                    # allocations (e.g. a subsequent resize_(0) + realloc)
-                    # before the H2D copy completes.
+                    # allocations before the H2D copy completes.
                     hbm_ref.record_stream(h2d_stream)
 
-                # only need to record the last event
+                # Only need to record the last event — the stream is ordered.
                 restore_event = torch.cuda.Event()
                 restore_event.record(h2d_stream)
                 restore_events.append(restore_event)
