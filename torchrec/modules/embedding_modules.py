@@ -409,6 +409,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         device: Optional[torch.device] = None,
         need_indices: bool = False,
         use_gather_select: bool = False,
+        use_gather_select_per_sharding: Optional[Dict[str, bool]] = None,
     ) -> None:
         super().__init__()
         torch._C._log_api_usage_once(f"torchrec.modules.{self.__class__.__name__}")
@@ -417,6 +418,9 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         self._embedding_dim: int = -1
         self._need_indices: bool = need_indices
         self._use_gather_select: bool = use_gather_select
+        self._use_gather_select_per_sharding: Optional[Dict[str, bool]] = (
+            use_gather_select_per_sharding
+        )
         self._device: torch.device = (
             device if device is not None else torch.device("cpu")
         )
@@ -550,3 +554,12 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
             bool: Whether the EmbeddingCollection uses torch.gather to select embeddings.
         """
         return self._use_gather_select
+
+    def use_gather_select_per_sharding(self) -> Optional[Dict[str, bool]]:
+        """
+        Returns:
+            Optional[Dict[str, bool]]: Per-sharding-type override for whether to
+            use torch.gather to select embeddings. When a sharding type is present
+            in this dict, its value takes precedence over ``use_gather_select()``.
+        """
+        return self._use_gather_select_per_sharding
