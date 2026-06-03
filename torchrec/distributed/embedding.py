@@ -990,6 +990,7 @@ class ShardedEmbeddingCollection(
                     EmbeddingComputeKernel.KEY_VALUE.value,
                     EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
                     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+                    EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
                 }
                 if shards_wrapper_map["local_tensors"]:
                     self._model_parallel_name_to_dtensor[table_name] = (
@@ -1078,6 +1079,7 @@ class ShardedEmbeddingCollection(
                     EmbeddingComputeKernel.KEY_VALUE.value,
                     EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
                     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+                    EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
                 }:
                     ret[table_name] = sharded_t
             return ret
@@ -1224,6 +1226,7 @@ class ShardedEmbeddingCollection(
                 EmbeddingComputeKernel.KEY_VALUE.value,
                 EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
                 EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+                EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
             }:
                 continue
             assert table_config.init_fn is not None
