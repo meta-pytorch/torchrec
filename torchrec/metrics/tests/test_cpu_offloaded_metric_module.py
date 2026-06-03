@@ -1410,6 +1410,101 @@ class WorkerSideBatchingTest(unittest.TestCase):
         )
         self.assertEqual(cpu_module._total_updates_processed, 3)
 
+    def test_worker_waits_until_batch_size_or_sync_marker(self) -> None:
+        cpu_module = self._make_module(update_batch_size=4)
+
+        captured_jobs: list[MetricUpdateJob] = []
+        original_process = cpu_module._process_metric_update_job
+
+        def capture(job: MetricUpdateJob) -> None:
+            captured_jobs.append(job)
+            original_process(job)
+
+        with patch.object(
+            cpu_module,
+            "_process_metric_update_job",
+            side_effect=capture,
+        ):
+            for _ in range(2):
+                cpu_module._update_rec_metrics(
+                    {
+                        "task1-prediction": torch.tensor([0.5]),
+                        "task1-label": torch.tensor([0.5]),
+                        "task1-weight": torch.tensor([1.0]),
+                    }
+                )
+
+            time.sleep(0.5)
+            self.assertEqual(len(captured_jobs), 0)
+
+            for _ in range(2):
+                cpu_module._update_rec_metrics(
+                    {
+                        "task1-prediction": torch.tensor([0.5]),
+                        "task1-label": torch.tensor([0.5]),
+                        "task1-weight": torch.tensor([1.0]),
+                    }
+                )
+
+            wait_until_true(lambda: cpu_module._total_updates_processed == 4)
+
+            self.assertEqual(len(captured_jobs), 1)
+            self.assertEqual(captured_jobs[0].merged_count, 4)
+
+    def test_worker_processes_partial_batch_when_marker_arrives(self) -> None:
+        cpu_module = self._make_module(update_batch_size=10)
+
+        captured_jobs: list[MetricUpdateJob] = []
+        original_process = cpu_module._process_metric_update_job
+
+        def capture(job: MetricUpdateJob) -> None:
+            captured_jobs.append(job)
+            original_process(job)
+
+        with patch.object(
+            cpu_module,
+            "_process_metric_update_job",
+            side_effect=capture,
+        ):
+            for _ in range(3):
+                cpu_module._update_rec_metrics(
+                    {
+                        "task1-prediction": torch.tensor([0.5]),
+                        "task1-label": torch.tensor([0.5]),
+                        "task1-weight": torch.tensor([1.0]),
+                    }
+                )
+            time.sleep(0.5)
+            self.assertEqual(len(captured_jobs), 0)
+
+            cpu_module.async_compute()
+
+            wait_until_true(
+                lambda: cpu_module._total_updates_processed == 3
+                and cpu_module._total_computes_enqueued == 1
+            )
+
+            self.assertEqual(len(captured_jobs), 1)
+            self.assertEqual(captured_jobs[0].merged_count, 3)
+
+    def test_shutdown_unblocks_worker_waiting_for_batch(self) -> None:
+        cpu_module = self._make_module(update_batch_size=10)
+
+        cpu_module._update_rec_metrics(
+            {
+                "task1-prediction": torch.tensor([0.5]),
+                "task1-label": torch.tensor([0.5]),
+                "task1-weight": torch.tensor([1.0]),
+            }
+        )
+
+        time.sleep(0.2)
+        self.assertTrue(cpu_module.update_thread.is_alive())
+
+        cpu_module.shutdown()
+
+        self.assertFalse(cpu_module.update_thread.is_alive())
+
 
 class MergeUpdateJobsTest(unittest.TestCase):
     def test_single_job_returned_unchanged(self) -> None:

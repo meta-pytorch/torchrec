@@ -83,6 +83,8 @@ logger: logging.Logger = logging.getLogger(__name__)
 metric_update_thread_name: str = "metric_update"
 metric_compute_thread_name: str = "metric_compute"
 
+_DRAIN_WAIT_WARN_INTERVAL_SEC: float = 60.0
+
 
 def _safe_merge_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
     """Concatenate tensors along the batch dim. Falls back to torch.stack
@@ -677,16 +679,22 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
     def _drain_update_batch(
         self, first: MetricUpdateJob
     ) -> tuple[list[MetricUpdateJob], Optional[SynchronizationMarker], int]:
-        """Opportunistically drain up to update_batch_size jobs; stop at any
-        SynchronizationMarker."""
+        """Block until pending batch reaches update_batch_size or a
+        SynchronizationMarker arrives."""
         pending_jobs: list[MetricUpdateJob] = [first]
         pending_marker: Optional[SynchronizationMarker] = None
         items_pulled = 1
         while len(pending_jobs) < self._update_batch_size:
             try:
-                next_item = self.update_queue.get_nowait()
+                next_item = self.update_queue.get(timeout=_DRAIN_WAIT_WARN_INTERVAL_SEC)
             except queue.Empty:
-                break
+                logger.warning(
+                    f"metric_update worker blocked > {_DRAIN_WAIT_WARN_INTERVAL_SEC:.0f}s "
+                    f"waiting for batch (pending={len(pending_jobs)}/"
+                    f"{self._update_batch_size}, queue_size={self.update_queue.qsize()}). "
+                    f"Producer may be stalled or compute_interval_steps too large."
+                )
+                continue
             items_pulled += 1
             if isinstance(next_item, MetricUpdateJob):
                 pending_jobs.append(next_item)
