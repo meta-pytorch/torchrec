@@ -19,13 +19,61 @@ free-threaded Python 3.13t), a threading.Lock would be needed.
 """
 
 import logging
+import traceback
 from collections.abc import Iterator, Mapping
 from concurrent.futures import Future
 from typing import Any, Callable
 
 import torch
 
+try:
+    # Guarded: TorchRec is packaged into inference paths without the logging
+    # handler shim; an unconditional import would break those packages.
+    from torchrec.distributed.logging_handlers import (
+        EventLoggingHandler,
+        TorchrecComponent,
+    )
+    from torchrec.distributed.logging_utils import EventType
+except Exception:
+    torch._C._log_api_usage_once(
+        "torchrec.metrics.deferrable_metrics.import_failure.logging_handlers"
+    )
+
+    from enum import Enum as _Enum
+    from typing import TYPE_CHECKING
+
+    if TYPE_CHECKING:
+        from torchrec.distributed.logging_handlers import (
+            EventLoggingHandler,
+            TorchrecComponent,
+        )
+        from torchrec.distributed.logging_utils import EventType
+    else:
+
+        class TorchrecComponent(_Enum):
+            REC_METRICS = "rec_metrics"
+
+        class EventType(_Enum):
+            INFO = "INFO"
+
+        class EventLoggingHandler:
+            @staticmethod
+            def log_event(*args: object, **kwargs: object) -> None:
+                pass
+
+
 logger: logging.Logger = logging.getLogger(__name__)
+
+_EVENT_NAME: str = "DeferrableMetrics.deferred_failure"
+_ERROR_MESSAGE_MAX_LEN: int = 4096
+_STACK_TRACE_MAX_LEN: int = 8192
+_TRUNCATION_MARKER: str = "...[truncated]"
+
+
+def _truncate(s: str, n: int) -> str:
+    if len(s) <= n:
+        return s
+    return s[: max(0, n - len(_TRUNCATION_MARKER))] + _TRUNCATION_MARKER
 
 
 def device_supports_async(device: torch.device) -> bool:
@@ -79,6 +127,13 @@ class DeferrableMetrics(Mapping[str, Any]):
     Implements Mapping[str, Any] so it is a drop-in replacement for
     Dict[str, MetricValue] at both type and runtime level. Dict-style
     access (__getitem__, __iter__, __len__) calls resolve() internally.
+
+    Future-backed instances emit a `DeferrableMetrics.deferred_failure`
+    INFO event to `torchrec_event_logging` if the Future raises. Success
+    is already captured by the enclosing `RecMetricModule.compute` decorator,
+    so no SUCCESS counterpart is emitted here. The done-callback fires once
+    per Future regardless of whether resolve/subscribe is called, so
+    unobserved futures still surface their failures.
     """
 
     _warned: bool = False
@@ -95,6 +150,33 @@ class DeferrableMetrics(Mapping[str, Any]):
             self._future = None
             self._data = dict(inner)
             self._resolved = True
+
+        if self._future is not None:
+            self._future.add_done_callback(self._emit_failure_if_raised)
+
+    def _emit_failure_if_raised(self, f: Future[dict[str, Any]]) -> None:
+        # Runs on the Future's done-callback thread. Emit is synchronous to
+        # match the local @event_logger convention; telemetry must never
+        # raise into the caller.
+        try:
+            f.result()
+        except BaseException as e:  # noqa: B036
+            try:
+                EventLoggingHandler.log_event(
+                    component=TorchrecComponent.REC_METRICS.value,
+                    event_name=_EVENT_NAME,
+                    event_type=EventType.INFO,
+                    metadata={"exception_type": type(e).__name__},
+                    error_message=_truncate(str(e), _ERROR_MESSAGE_MAX_LEN),
+                    stack_trace=_truncate(
+                        "".join(
+                            traceback.format_exception(type(e), e, e.__traceback__)
+                        ),
+                        _STACK_TRACE_MAX_LEN,
+                    ),
+                )
+            except BaseException:  # noqa: B036
+                pass
 
     def _warn_sync_access(self) -> None:
         """Log a warning once per process when dict-style access
