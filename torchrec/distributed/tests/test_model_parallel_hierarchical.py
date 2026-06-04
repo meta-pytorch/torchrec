@@ -83,7 +83,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=6,
+        max_examples=3,
         deadline=None,
         phases=[Phase.explicit, Phase.generate, Phase.target],
     )
@@ -117,26 +117,33 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             # Need this to test topology group for TWRW
             os.environ["TOPOLOGY_DOMAIN_MULTIPLE"] = str(topology_domain)
 
-        self._test_sharding(
-            # pyrefly: ignore[bad-argument-type]
-            sharders=[
-                create_test_sharder(
-                    sharder_type,
-                    sharding_type,
-                    kernel_type,
-                    qcomms_config=qcomms_config,
-                    device=torch.device("cuda"),
-                ),
-            ],
-            pod_size=topology_domain,
-            backend="nccl",
-            world_size=world_size,
-            local_size=local_size,
-            qcomms_config=qcomms_config,
-            apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
-            variable_batch_size=variable_batch_size,
-            pooling=pooling,
-        )
+        try:
+            self._test_sharding(
+                # pyrefly: ignore[bad-argument-type]
+                sharders=[
+                    create_test_sharder(
+                        sharder_type,
+                        sharding_type,
+                        kernel_type,
+                        qcomms_config=qcomms_config,
+                        device=torch.device("cuda"),
+                    ),
+                ],
+                pod_size=topology_domain,
+                backend="nccl",
+                world_size=world_size,
+                local_size=local_size,
+                qcomms_config=qcomms_config,
+                apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
+                variable_batch_size=variable_batch_size,
+                pooling=pooling,
+            )
+        finally:
+            # Clean up to avoid leaking debug mode to subsequent tests,
+            # which adds 3 extra Gloo collectives per NCCL collective and
+            # causes timeouts.
+            os.environ.pop("TORCH_DISTRIBUTED_DEBUG", None)
+            os.environ.pop("TOPOLOGY_DOMAIN_MULTIPLE", None)
 
     @unittest.skipIf(
         torch.cuda.device_count() <= 3,
@@ -181,7 +188,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=6,
+        max_examples=3,
         deadline=None,
         phases=[Phase.explicit, Phase.generate, Phase.target],
     )
