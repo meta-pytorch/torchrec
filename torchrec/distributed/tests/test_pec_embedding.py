@@ -481,6 +481,8 @@ def _verify_weights_match(
     sharded_pec: ShardedPECEmbeddingCollection,
     ref_ec: EmbeddingCollection,
     device: torch.device,
+    atol: float = 1e-5,
+    rtol: float = 1.3e-6,
 ) -> None:
     """Forward all indices through both models and compare outputs."""
     verify_kjt = KeyedJaggedTensor.from_lengths_sync(
@@ -497,6 +499,8 @@ def _verify_weights_match(
         torch.testing.assert_close(
             pec_out[fname].values(),
             ref_out[fname].values().to(device),
+            atol=atol,
+            rtol=rtol,
         )
 
 
@@ -596,7 +600,14 @@ def _test_pec_grad_update(
             result = _pec_forward(state, i)
             _pec_backward(state, result)
 
-        _verify_weights_match(tables, state.sharded_pec, ref_ec, ctx.device)
+        # Relax tolerances: the sharded PEC uses a fused GPU optimizer kernel
+        # while ref_ec uses standard CPU SGD, causing expected numerical
+        # divergence in accumulated gradients. This matches the tolerance
+        # convention used by other torchrec sharded-vs-unsharded weight
+        # comparisons (e.g., test_embedding_update, test_pt2_multiprocess).
+        _verify_weights_match(
+            tables, state.sharded_pec, ref_ec, ctx.device, atol=1e-3, rtol=1e-3
+        )
 
 
 # =============================================================================
