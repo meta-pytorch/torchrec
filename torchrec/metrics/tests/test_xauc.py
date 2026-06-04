@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import torch
 from torchrec.metrics.metrics_config import DefaultTaskInfo
+from torchrec.metrics.rec_metric import WindowBuffer
 from torchrec.metrics.xauc import XAUCMetric
 
 
@@ -70,6 +71,15 @@ class XAUCMetricTest(unittest.TestCase):
         "see https://dev-discuss.pytorch.org/t/torch-compile-support-for-python-3-14-completed/3276",
     )
     def test_xauc_compile(self) -> None:
+        """
+        Covers three torch.compile-related aspects of windowed xauc:
+        1. Numerics match between compiled and eager xauc.
+        2. No graph breaks (fullgraph=True).
+        3. Guard against corruption as past seen with window buffer aliasing.
+        """
+        window_size = 40  # sized small enough to test eviction
+        n_iters = 15
+
         xauc = XAUCMetric(
             world_size=WORLD_SIZE,
             my_rank=0,
@@ -77,7 +87,7 @@ class XAUCMetricTest(unittest.TestCase):
             tasks=[DefaultTaskInfo],
             # pyrefly: ignore[bad-argument-type]
             enable_pt2_compile=False,
-            window_size=200,
+            window_size=window_size,
         )
 
         model_output = generate_model_output()
@@ -90,9 +100,9 @@ class XAUCMetricTest(unittest.TestCase):
                 tasks=[DefaultTaskInfo],
                 # pyrefly: ignore[bad-argument-type]
                 enable_pt2_compile=True,
-                window_size=200,
+                window_size=window_size,
             )
-            for _ in range(10):
+            for _ in range(n_iters):
                 xauc_compile.update(
                     predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
                     labels={DefaultTaskInfo.name: model_output["labels"][0]},
@@ -116,4 +126,37 @@ class XAUCMetricTest(unittest.TestCase):
                 check_dtype=False,
                 equal_nan=True,
                 msg=f"[{prefix}] Compiled: {compile_out[key]}, Eager: {eager_out[key]}",
+            )
+
+        # Guard against the inductor buffer-reuse corruption
+        # Now more implementation-agnostic: any defense that prevents
+        # production corruption -- in-op clone, slab+copy_, an inductor-side
+        # never_reuse annotation, storage handoff -- passes this check.
+        sentinel = -1.0e9
+        max_buffer_count = 4
+        buf = WindowBuffer(max_size=10**9, max_buffer_count=max_buffer_count)
+
+        @torch.compile(fullgraph=True)
+        def step(window_state: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+            curr_state = source + 1.0
+            buf.aggregate_state(window_state, curr_state, size=1)
+            return torch.full_like(curr_state, sentinel)
+
+        window_state = torch.zeros(3, dtype=torch.float64)
+        snapshots: list[torch.Tensor] = []
+        for i in range(max_buffer_count):
+            source = torch.tensor(
+                [i + 0.1 - 1.0, i + 0.2 - 1.0, i + 0.3 - 1.0], dtype=torch.float64
+            )
+            snapshots.append(source + 1.0)
+            step(window_state, source)
+        for idx, expected in enumerate(snapshots):
+            torch.testing.assert_close(
+                buf.buffers[idx],
+                expected,
+                atol=1e-6,
+                rtol=1e-6,
+                msg=(
+                    f"WindowBuffer entry #{idx} corrupted by Inductor " "buffer reuse."
+                ),
             )
