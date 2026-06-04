@@ -374,10 +374,12 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
     @override
     def shutdown(self) -> None:
         """Two-phase shutdown: stop the update thread, then the compute thread.
-        Idempotent — safe under explicit call + atexit."""
+        Idempotent — safe under explicit call + atexit, including the raise paths
+        below (thread-stuck and captured-exception)."""
 
         if self._shutdown_complete:
             return
+        self._shutdown_complete = True
 
         logger.info(
             f"Gracefully shutting down CPUOffloadedRecMetricModule... "
@@ -473,7 +475,6 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             f"updates={self._total_updates_processed}/{self._total_updates_enqueued}, "
             f"computes={self._total_computes_processed}/{self._total_computes_enqueued}"
         )
-        self._shutdown_complete = True
 
     @override
     def compute(self) -> DeferrableMetrics:
