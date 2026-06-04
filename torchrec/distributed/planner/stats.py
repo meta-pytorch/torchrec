@@ -32,6 +32,7 @@ from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.planner.constants import BIGINT_DTYPE
 from torchrec.distributed.planner.shard_estimators import (
     _calculate_shard_io_sizes,
+    _get_optimizer_multipler,
     get_num_poolings,
 )
 from torchrec.distributed.planner.storage_reservations import (
@@ -206,6 +207,8 @@ class EmbeddingStats(Stats):
         used_sharding_types = set()
         compute_kernels_to_count = defaultdict(int)
         compute_kernels_to_storage = defaultdict(lambda: Storage(0, 0, 0))
+        compute_kernels_to_weights = defaultdict(int)
+        compute_kernels_to_optimizer = defaultdict(int)
 
         reserved_hbm_percent, dense_storage, kjt_storage = _compute_storage(
             storage_reservation=storage_reservation,
@@ -219,6 +222,21 @@ class EmbeddingStats(Stats):
             compute_kernels_to_storage[
                 sharding_option.compute_kernel
             ] += sharding_option.total_storage
+            weight_bytes = (
+                sharding_option.tensor.shape[0]
+                * sharding_option.tensor.shape[1]
+                * sharding_option.tensor.element_size()
+            )
+            compute_kernels_to_weights[sharding_option.compute_kernel] += weight_bytes
+            optimizer_class = getattr(
+                sharding_option.tensor, "_optimizer_classes", [None]
+            )[0]
+            optimizer_multiplier = _get_optimizer_multipler(
+                optimizer_class, sharding_option.tensor.shape
+            )
+            compute_kernels_to_optimizer[sharding_option.compute_kernel] += math.ceil(
+                weight_bytes * optimizer_multiplier
+            )
 
             # for shard in sharding_option.shards:
             # compute_kernels_to_storage[sharding_option.compute_kernel] += shard.hbm
@@ -336,10 +354,24 @@ class EmbeddingStats(Stats):
         )
         self._log_compute_kernel_stats(
             {
+                k: f"{round(bytes_to_gb(v), 3)} GB"
+                for k, v in compute_kernels_to_weights.items()
+            },
+            description="Compute Kernels Embedding Weights",
+        )
+        self._log_compute_kernel_stats(
+            {
+                k: f"{round(bytes_to_gb(v), 3)} GB"
+                for k, v in compute_kernels_to_optimizer.items()
+            },
+            description="Compute Kernels Optimizer State",
+        )
+        self._log_compute_kernel_stats(
+            {
                 k: f"HBM: {round(bytes_to_gb(s.hbm),3)} GB, DDR: {round(bytes_to_gb(s.ddr),3)} GB, SSD: {round(bytes_to_gb(s.ssd),3)} GB"
                 for k, s in compute_kernels_to_storage.items()
             },
-            description="Compute Kernels Storage",
+            description="Compute Kernels Total Estimated Memory (weights + optimizer + IO + pipeline)",
         )
 
         self._log_hardcoded_compute_kernel_stats(best_plan, constraints)
