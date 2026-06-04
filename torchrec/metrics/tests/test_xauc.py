@@ -104,17 +104,16 @@ class XAUCMetricTest(unittest.TestCase):
                     labels={DefaultTaskInfo.name: model_output["labels"][0]},
                     weights={DefaultTaskInfo.name: model_output["weights"][0]},
                 )
-        metric_compile = xauc_compile.compute()[
-            f"xauc-{DefaultTaskInfo.name}|lifetime_xauc"
-        ]
-        metric = xauc.compute()[f"xauc-{DefaultTaskInfo.name}|lifetime_xauc"]
-
-        torch.testing.assert_close(
-            metric_compile,
-            metric,
-            atol=1e-4,
-            rtol=1e-4,
-            check_dtype=False,
-            equal_nan=True,
-            msg=f"Compiled: {metric_compile}, Expected: {metric}",
-        )
+        compile_out = xauc_compile.compute()
+        eager_out = xauc.compute()
+        for prefix in ("lifetime_xauc", "window_xauc"):
+            key = f"xauc-{DefaultTaskInfo.name}|{prefix}"
+            torch.testing.assert_close(
+                compile_out[key],
+                eager_out[key],
+                atol=1e-4,
+                rtol=1e-4,
+                check_dtype=False,
+                equal_nan=True,
+                msg=f"[{prefix}] Compiled: {compile_out[key]}, Eager: {eager_out[key]}",
+            )
