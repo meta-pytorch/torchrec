@@ -576,6 +576,14 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
             tag_row = ret[-1]
             ret = ret[: self._num_original_tensors]
             if not is_torchdynamo_compiling():
+                # Skip tag validation during Dynamo compilation: tag values
+                # are symbolic (unbacked SymInts) and the comparison against
+                # the concrete expected tag creates a data-dependent guard
+                # expression that Dynamo cannot handle (torch._dynamo.exc.
+                # UserError: 'Could not guard on data-dependent expression
+                # Ne(uNN, <tag>)').  The validation is a runtime safety
+                # check that only matters with real collective communication,
+                # not during graph tracing.
                 # _tag_appended=True implies _collective_tag was not None.
                 assert self._collective_tag is not None
                 expected: int = self._collective_tag
