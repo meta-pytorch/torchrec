@@ -352,6 +352,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         module_fqn: Optional[str] = None,
         sharding_types: Optional[List[str]] = None,
         use_gather_select: bool = False,
+        use_gather_select_per_sharding: Optional[Dict[str, bool]] = None,
         resize_awaitables: Optional[List[Awaitable[torch.Tensor]]] = None,
     ) -> None:
         super().__init__()
@@ -364,6 +365,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         self._module_fqn = module_fqn
         self._sharding_types = sharding_types
         self._use_gather_select = use_gather_select
+        self._use_gather_select_per_sharding = use_gather_select_per_sharding
         self._resize_awaitables = resize_awaitables
 
     def _wait_impl(self) -> Dict[str, JaggedTensor]:
@@ -396,6 +398,15 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
             ):
                 embeddings = w.wait()
 
+            sharding_type = self._sharding_types[i] if self._sharding_types else None
+            if (
+                self._use_gather_select_per_sharding is not None
+                and sharding_type is not None
+                and sharding_type in self._use_gather_select_per_sharding
+            ):
+                use_gather_select = self._use_gather_select_per_sharding[sharding_type]
+            else:
+                use_gather_select = self._use_gather_select
             jt_dict.update(
                 construct_jagged_tensors(
                     embeddings=embeddings,
@@ -406,7 +417,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                     original_features=original_features,
                     reverse_indices=reverse_indices,
                     seq_vbe_ctx=seq_vbe_ctx,
-                    use_gather_select=self._use_gather_select,
+                    use_gather_select=use_gather_select,
                 )
             )
 
@@ -571,6 +582,9 @@ class ShardedEmbeddingCollection(
             )
         self._need_indices: bool = module.need_indices()
         self._use_gather_select: bool = module.use_gather_select()
+        self._use_gather_select_per_sharding: Optional[Dict[str, bool]] = (
+            module.use_gather_select_per_sharding()
+        )
         self._inverse_indices_permute_per_sharding: Optional[List[torch.Tensor]] = None
         self._skip_missing_weight_key: List[str] = []
 
@@ -990,6 +1004,7 @@ class ShardedEmbeddingCollection(
                     EmbeddingComputeKernel.KEY_VALUE.value,
                     EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
                     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+                    EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
                 }
                 if shards_wrapper_map["local_tensors"]:
                     self._model_parallel_name_to_dtensor[table_name] = (
@@ -1078,6 +1093,7 @@ class ShardedEmbeddingCollection(
                     EmbeddingComputeKernel.KEY_VALUE.value,
                     EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
                     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+                    EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
                 }:
                     ret[table_name] = sharded_t
             return ret
@@ -1224,6 +1240,7 @@ class ShardedEmbeddingCollection(
                 EmbeddingComputeKernel.KEY_VALUE.value,
                 EmbeddingComputeKernel.SSD_VIRTUAL_TABLE.value,
                 EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
+                EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
             }:
                 continue
             assert table_config.init_fn is not None
@@ -1648,6 +1665,7 @@ class ShardedEmbeddingCollection(
             features_to_permute_indices=self._features_to_permute_indices,
             ctx=ctx,
             use_gather_select=self._use_gather_select,
+            use_gather_select_per_sharding=self._use_gather_select_per_sharding,
         )
 
     def compute_and_output_dist(
@@ -1708,6 +1726,7 @@ class ShardedEmbeddingCollection(
             module_fqn=self._module_fqn,
             sharding_types=list(self._sharding_type_to_sharding.keys()),
             use_gather_select=self._use_gather_select,
+            use_gather_select_per_sharding=self._use_gather_select_per_sharding,
             resize_awaitables=resize_awaitables,
         )
 

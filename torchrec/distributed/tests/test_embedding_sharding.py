@@ -35,7 +35,10 @@ except ImportError:
     )
 from hypothesis import given, settings
 from torchrec.distributed.batched_embedding_kernel import ZeroCollisionKeyValueEmbedding
-from torchrec.distributed.embedding import EmbeddingCollectionContext
+from torchrec.distributed.embedding import (
+    EmbeddingCollectionAwaitable,
+    EmbeddingCollectionContext,
+)
 from torchrec.distributed.embedding_lookup import (
     EmbeddingComputeKernel,
     GroupedEmbeddingsLookup,
@@ -865,3 +868,65 @@ class TestCreateEmbeddingKernelEnrichment(unittest.TestCase):
             backend_type=BackendType.DRAM,
         )
         mock_zc_enrichment_cls.assert_not_called()
+
+
+class EmbeddingCollectionAwaitableUseGatherSelectTest(unittest.TestCase):
+    """Tests per-sharding-type resolution of use_gather_select in _wait_impl."""
+
+    def _build_awaitable(
+        self,
+        sharding_types: List[str],
+        use_gather_select: bool,
+        use_gather_select_per_sharding: Optional[Dict[str, bool]],
+    ) -> EmbeddingCollectionAwaitable:
+        num_shardings = len(sharding_types)
+        awaitables = []
+        for _ in range(num_shardings):
+            w = MagicMock()
+            w.wait.return_value = torch.empty(0)
+            awaitables.append(w)
+        return EmbeddingCollectionAwaitable(
+            awaitables_per_sharding=awaitables,
+            features_per_sharding=[MagicMock() for _ in range(num_shardings)],
+            embedding_names_per_sharding=[[] for _ in range(num_shardings)],
+            ctx=EmbeddingCollectionContext(),
+            sharding_types=sharding_types,
+            use_gather_select=use_gather_select,
+            use_gather_select_per_sharding=use_gather_select_per_sharding,
+        )
+
+    @patch("torchrec.distributed.embedding.construct_jagged_tensors")
+    def test_per_sharding_override_and_fallback(
+        self, mock_construct: MagicMock
+    ) -> None:
+        mock_construct.return_value = {}
+        awaitable = self._build_awaitable(
+            sharding_types=["row_wise", "table_wise", "column_wise"],
+            use_gather_select=False,
+            # row_wise overridden to True, table_wise overridden to False,
+            # column_wise absent -> falls back to use_gather_select (False).
+            use_gather_select_per_sharding={"row_wise": True, "table_wise": False},
+        )
+
+        awaitable._wait_impl()
+
+        selected = [
+            call.kwargs["use_gather_select"] for call in mock_construct.call_args_list
+        ]
+        self.assertEqual(selected, [True, False, False])
+
+    @patch("torchrec.distributed.embedding.construct_jagged_tensors")
+    def test_no_per_sharding_uses_default(self, mock_construct: MagicMock) -> None:
+        mock_construct.return_value = {}
+        awaitable = self._build_awaitable(
+            sharding_types=["row_wise"],
+            use_gather_select=True,
+            use_gather_select_per_sharding=None,
+        )
+
+        awaitable._wait_impl()
+
+        selected = [
+            call.kwargs["use_gather_select"] for call in mock_construct.call_args_list
+        ]
+        self.assertEqual(selected, [True])

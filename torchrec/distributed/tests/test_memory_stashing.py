@@ -44,15 +44,15 @@ class TestStashTensors(unittest.TestCase):
             [tensor]
         )
 
-        # Verify HBM is freed
-        self.assertEqual(tensor.untyped_storage().size(), 0)
+        # Verify tensor is on CPU (HBM freed, data readable for checkpoint)
+        self.assertFalse(tensor.is_cuda)
 
         # Restore
         restore(None)
         await_restore(None)
 
-        # Verify values are correct
-        self.assertGreater(tensor.untyped_storage().size(), 0)
+        # Verify tensor is back on CUDA with correct values
+        self.assertTrue(tensor.is_cuda)
         torch.testing.assert_close(tensor, original, rtol=1e-05, atol=1e-08)
 
     def test_multiple_tensors(self) -> None:
@@ -65,9 +65,9 @@ class TestStashTensors(unittest.TestCase):
             [t1, t2]
         )
 
-        # All freed
-        self.assertEqual(t1.untyped_storage().size(), 0)
-        self.assertEqual(t2.untyped_storage().size(), 0)
+        # All on CPU (HBM freed)
+        self.assertFalse(t1.is_cuda)
+        self.assertFalse(t2.is_cuda)
 
         # Restore
         restore(None)
@@ -187,15 +187,15 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertIsNotNone(result)
         await_restore, _restore, _execute_stash = result
 
-        # Verify HBM is freed
-        self.assertEqual(original_weights.untyped_storage().size(), 0)
+        # Verify tensor is on CPU (HBM freed, data readable for checkpoint)
+        self.assertFalse(original_weights.is_cuda)
 
         # Restore weights
         MemoryStashingManager.restore_embedding_weights()
         await_restore(None)
 
-        # Verify HBM is restored and values are correct
-        self.assertGreater(original_weights.untyped_storage().size(), 0)
+        # Verify tensor is back on CUDA with correct values
+        self.assertTrue(original_weights.is_cuda)
         torch.testing.assert_close(
             original_weights, original_values, rtol=1e-05, atol=1e-08
         )
@@ -216,10 +216,10 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertIsNotNone(result)
         await_restore, _restore, _execute_stash = result
 
-        # Verify all are stashed
-        self.assertEqual(weights_1.untyped_storage().size(), 0)
-        self.assertEqual(weights_2.untyped_storage().size(), 0)
-        self.assertEqual(weights_3.untyped_storage().size(), 0)
+        # Verify all are on CPU (HBM freed)
+        self.assertFalse(weights_1.is_cuda)
+        self.assertFalse(weights_2.is_cuda)
+        self.assertFalse(weights_3.is_cuda)
 
         # Restore all
         MemoryStashingManager.restore_embedding_weights()
@@ -247,8 +247,8 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertIsNotNone(result)
         await_restore, _restore, _execute_stash = result
 
-        # Verify stash worked
-        self.assertEqual(original_weights.untyped_storage().size(), 0)
+        # Verify stash worked (tensor on CPU)
+        self.assertFalse(original_weights.is_cuda)
 
         # Restore
         MemoryStashingManager.restore_embedding_weights()
@@ -317,8 +317,8 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertIsNotNone(result)
         await_restore, _restore, _execute_stash = result
 
-        # Only CUDA weights should be stashed
-        self.assertEqual(cuda_weights.untyped_storage().size(), 0)
+        # Only CUDA weights should be stashed (moved to CPU)
+        self.assertFalse(cuda_weights.is_cuda)
         self.assertGreater(cpu_weights.untyped_storage().size(), 0)
 
         # Restore
@@ -355,8 +355,8 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertIsNotNone(result)
         await_restore, _restore, _execute_stash = result
 
-        # Valid weights should be stashed
-        self.assertEqual(valid_weights.untyped_storage().size(), 0)
+        # Valid weights should be stashed (moved to CPU)
+        self.assertFalse(valid_weights.is_cuda)
 
         # Restore
         MemoryStashingManager.restore_embedding_weights()
@@ -412,10 +412,10 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertIsNotNone(result)
         await_restore, _restore, _execute_stash = result
 
-        # Only the stash_weights=True group should be stashed
-        self.assertEqual(stash_weights.untyped_storage().size(), 0)
+        # Only the stash_weights=True group should be stashed (moved to CPU)
+        self.assertFalse(stash_weights.is_cuda)
         # The stash_weights=False group should NOT be stashed
-        self.assertGreater(no_stash_weights.untyped_storage().size(), 0)
+        self.assertTrue(no_stash_weights.is_cuda)
         self.assertTrue(torch.allclose(no_stash_weights, no_stash_original))
 
         # Restore
@@ -461,9 +461,9 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertIsNotNone(result)
         await_restore, _restore, _execute_stash = result
 
-        # Both should be stashed
-        self.assertEqual(weights_1.untyped_storage().size(), 0)
-        self.assertEqual(weights_2.untyped_storage().size(), 0)
+        # Both should be stashed (moved to CPU)
+        self.assertFalse(weights_1.is_cuda)
+        self.assertFalse(weights_2.is_cuda)
 
         # Restore
         MemoryStashingManager.restore_embedding_weights()
@@ -486,8 +486,8 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertIsNotNone(result)
 
         # Both should be stashed (no config = stash everything)
-        self.assertEqual(weights_1.untyped_storage().size(), 0)
-        self.assertEqual(weights_2.untyped_storage().size(), 0)
+        self.assertFalse(weights_1.is_cuda)
+        self.assertFalse(weights_2.is_cuda)
 
     def test_is_enabled(self) -> None:
         """Test is_enabled reflects stream initialization state."""
@@ -534,18 +534,16 @@ class TestStashOptimizerState(unittest.TestCase):
         # Stash optimizer state
         await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
 
-        # Verify state tensors are freed (storage size should be 0)
+        # Verify large state tensors are stashed to CPU
         for _param, state in optimizer.state.items():
             if isinstance(state, dict):
                 for key, value in state.items():
-                    if isinstance(value, torch.Tensor) and value.is_cuda:
-                        # Only large tensors (>= 1MB) should be stashed
+                    if isinstance(value, torch.Tensor):
                         tensor_size = value.numel() * value.element_size()
                         if tensor_size >= 1024 * 1024:
-                            self.assertEqual(
-                                value.untyped_storage().size(),
-                                0,
-                                f"Tensor {key} should be stashed",
+                            self.assertFalse(
+                                value.is_cuda,
+                                f"Tensor {key} should be stashed to CPU",
                             )
 
         # Restore
@@ -694,23 +692,21 @@ class TestStashOptimizerState(unittest.TestCase):
         # Stash
         await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
 
-        # Verify nested tensors are stashed
+        # Verify nested tensors are stashed to CPU
         for param, state in optimizer.state.items():
             if isinstance(state, dict) and "shampoo" in state:
                 shampoo_state = state["shampoo"]
                 for t in shampoo_state.factor_matrices:
                     if t.numel() * t.element_size() >= 1024 * 1024:
-                        self.assertEqual(
-                            t.untyped_storage().size(),
-                            0,
-                            "Factor matrix should be stashed",
+                        self.assertFalse(
+                            t.is_cuda,
+                            "Factor matrix should be stashed to CPU",
                         )
                 for t in shampoo_state.inv_factor_matrices:
                     if t.numel() * t.element_size() >= 1024 * 1024:
-                        self.assertEqual(
-                            t.untyped_storage().size(),
-                            0,
-                            "Inv factor matrix should be stashed",
+                        self.assertFalse(
+                            t.is_cuda,
+                            "Inv factor matrix should be stashed to CPU",
                         )
 
         # Restore
@@ -842,10 +838,10 @@ class TestEmsConfigWiring(unittest.TestCase):
         result = MemoryStashingManager.stash_embedding_weights(lookup)
         self.assertIsNotNone(result)
 
-        # Only the stash_weights=True TBE group should be stashed
-        self.assertEqual(stash_weights.untyped_storage().size(), 0)
+        # Only the stash_weights=True TBE group should be stashed (moved to CPU)
+        self.assertFalse(stash_weights.is_cuda)
         # The stash_weights=False TBE group should NOT be stashed
-        self.assertGreater(no_stash_weights.untyped_storage().size(), 0)
+        self.assertTrue(no_stash_weights.is_cuda)
         self.assertTrue(torch.allclose(no_stash_weights, no_stash_original))
 
         # Restore and verify

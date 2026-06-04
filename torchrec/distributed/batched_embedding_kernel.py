@@ -612,7 +612,9 @@ def _populate_zero_collision_tbe_params(
         bucket_offsets=bucket_offsets,
         bucket_sizes=bucket_sizes,
         enable_optimizer_offloading=True,
-        backend_return_whole_row=(backend_type == BackendType.DRAM),
+        backend_return_whole_row=(
+            backend_type in (BackendType.DRAM, BackendType.DRAM_SSD)
+        ),
         # pyrefly: ignore[bad-argument-type]
         eviction_policy=eviction_policy,
         embedding_cache_mode=embedding_cache_mode_,

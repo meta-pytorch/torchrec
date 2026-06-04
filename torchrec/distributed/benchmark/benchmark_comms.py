@@ -1063,7 +1063,7 @@ def copy_engine_contention(
     num_mul: int,
     num_concat: int,
     ctx: MultiProcessContext,
-    low_priority: bool = True,
+    dummy_compute: bool = False,
     trunk_count: int = 3,
     **_kwargs: Dict[str, Any],
 ) -> None:
@@ -1074,17 +1074,15 @@ def copy_engine_contention(
     main stream: 1 small D2H copy + 2 small H2D copies (interleaved with
                  small compute ops)
 
-    When low_priority=True, h2d_stream gets lower priority than main stream,
-    testing whether stream priority affects copy engine scheduling.
+    When dummy_compute=True, a tiny compute op (tensor.add_(1)) is inserted
+    between each large H2D copy on the h2d_stream, testing whether the copy
+    engine treats back-to-back copies differently from compute-separated ones.
     """
     small_size = 1024
 
     with record_function("## setup ##"):
         main_stream = torch.cuda.current_stream()
-        if low_priority:
-            h2d_stream = torch.cuda.Stream(priority=1)
-        else:
-            h2d_stream = torch.cuda.Stream()
+        h2d_stream = torch.cuda.Stream()
 
     with record_function("## allocate tensors ##"):
         # 3 large H2D sources for h2d_stream (pinned CPU → GPU)
@@ -1117,12 +1115,15 @@ def copy_engine_contention(
     with record_function("## 3x large h2d on h2d_stream ##"):
         large_h2d_devices = []
         with torch.cuda.stream(h2d_stream):
+            dummy_tensor = torch.empty(1, device=ctx.device)
             h2d_stream.wait_stream(main_stream)
             for i, src in enumerate(large_h2d_sources):
                 with record_function(f"## large h2d {i} ##"):
                     t = src.to(ctx.device, non_blocking=True)
                     t.record_stream(main_stream)
                     large_h2d_devices.append(t)
+                    if dummy_compute:
+                        dummy_tensor.add_(1)
 
     # --- main stream: compute, small d2h, compute, small h2d, compute, small h2d ---
     with record_function("## small compute 0 ##"):
@@ -1173,7 +1174,7 @@ def copy_engine_contention(
         )
 
         logger.info(
-            f"[rank-{ctx.rank}] low_priority={low_priority}: "
+            f"[rank-{ctx.rank}] dummy_compute={dummy_compute}: "
             f"large_h2d={large_correct}, d2h={d2h_correct}, "
             f"small_h2d_0={small_h2d_correct_0}, small_h2d_1={small_h2d_correct_1}"
         )
@@ -1186,6 +1187,156 @@ def copy_engine_contention(
         assert d2h_correct, f"D2H validation failed on rank {ctx.rank}"
         assert small_h2d_correct_0, f"Small H2D 0 validation failed on rank {ctx.rank}"
         assert small_h2d_correct_1, f"Small H2D 1 validation failed on rank {ctx.rank}"
+
+
+def copy_engine_contention_dummy_compute(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    return copy_engine_contention(
+        _batch_inputs=_batch_inputs,
+        dim=dim,
+        num_mul=num_mul,
+        num_concat=num_concat,
+        ctx=ctx,
+        dummy_compute=True,
+    )
+
+
+def h2d_execution_order(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Test the execution order of H2D copies across three streams.
+
+    Each stream issues a different amount of compute before its H2D copy,
+    so the copies are submitted to the copy engine at different times.
+    The CPU issues the long-compute stream first, but its copy reaches
+    the copy engine last:
+      stream_c: sync a2a       → H2D copy C (issued first, submitted last)
+      stream_b: medium compute → H2D copy B (issued second)
+      stream_a: short compute  → H2D copy A (issued last, submitted first)
+
+    Check the trace to observe the actual execution order of the H2D
+    copies on the copy engine. If the copy engine is FIFO by GPU-side
+    submission order (not CPU issue order), copy A should start first
+    despite being issued last from the CPU.
+    """
+    copy_size = num_concat * dim // 5
+
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        stream_a = torch.cuda.Stream()
+        stream_b = torch.cuda.Stream()
+        stream_c = torch.cuda.Stream()
+
+    small_size = 1024
+
+    with record_function("## allocate tensors ##"):
+        # bulk copies
+        src_a = torch.full((copy_size, dim), fill_value=1.0).pin_memory()
+        src_b = torch.full((copy_size, dim), fill_value=2.0).pin_memory()
+        src_c = torch.full((copy_size, dim), fill_value=3.0).pin_memory()
+
+        # small copies before/after each bulk copy (int32 ~ 4 KB each)
+        small_before = [
+            torch.full(
+                (small_size,), fill_value=float(100 + i), dtype=torch.int32
+            ).pin_memory()
+            for i in range(3)
+        ]
+        small_after = [
+            torch.full(
+                (small_size,), fill_value=float(200 + i), dtype=torch.int32
+            ).pin_memory()
+            for i in range(3)
+        ]
+
+    with record_function("## pre-compute ##"):
+        _compute(dim=dim, num_mul=num_mul * 3, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## stream_c: sync a2a + h2d (issued first) ##"):
+        a2a_input = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+        a2a_output = torch.zeros_like(a2a_input)
+        with torch.cuda.stream(stream_c):
+            stream_c.wait_stream(main_stream)
+            dist.all_to_all_single(
+                output=a2a_output,
+                input=a2a_input,
+                group=ctx.pg,
+                async_op=False,
+            )
+            small_dev_c_before = small_before[2].to(ctx.device, non_blocking=True)
+            small_dev_c_before += 1
+            dev_c = src_c.to(ctx.device, non_blocking=True)
+            small_dev_c_before -= 1
+            small_dev_c_after = small_after[2].to(ctx.device, non_blocking=True)
+            dev_c.record_stream(main_stream)
+            small_dev_c_before.record_stream(main_stream)
+            small_dev_c_after.record_stream(main_stream)
+
+    with record_function("## stream_b: medium compute + h2d (issued second) ##"):
+        with torch.cuda.stream(stream_b):
+            stream_b.wait_stream(main_stream)
+            _compute(dim=dim, num_mul=num_mul, num_concat=1, ctx=ctx)
+            small_dev_b_before = small_before[1].to(ctx.device, non_blocking=True)
+            small_dev_b_before += 1
+            dev_b = src_b.to(ctx.device, non_blocking=True)
+            small_dev_b_before -= 1
+            small_dev_b_after = small_after[1].to(ctx.device, non_blocking=True)
+            dev_b.record_stream(main_stream)
+            small_dev_b_before.record_stream(main_stream)
+            small_dev_b_after.record_stream(main_stream)
+
+    with record_function("## stream_a: short compute + h2d (issued last) ##"):
+        with torch.cuda.stream(stream_a):
+            stream_a.wait_stream(main_stream)
+            _compute(dim=dim, num_mul=1, num_concat=1, ctx=ctx)
+            small_dev_a_before = small_before[0].to(ctx.device, non_blocking=True)
+            small_dev_a_before += 1
+            dev_a = src_a.to(ctx.device, non_blocking=True)
+            small_dev_a_before -= 1
+            small_dev_a_after = small_after[0].to(ctx.device, non_blocking=True)
+            dev_a.record_stream(main_stream)
+            small_dev_a_before.record_stream(main_stream)
+            small_dev_a_after.record_stream(main_stream)
+
+    with record_function("## irrelevant compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## wait and validate ##"):
+        torch.cuda.synchronize()
+
+        a_correct = bool(torch.all(dev_a == 1.0).item())
+        b_correct = bool(torch.all(dev_b == 2.0).item())
+        c_correct = bool(torch.all(dev_c == 3.0).item())
+
+        small_correct = (
+            bool(torch.all(small_dev_a_before == 100).item())
+            and bool(torch.all(small_dev_a_after == 200).item())
+            and bool(torch.all(small_dev_b_before == 101).item())
+            and bool(torch.all(small_dev_b_after == 201).item())
+            and bool(torch.all(small_dev_c_before == 102).item())
+            and bool(torch.all(small_dev_c_after == 202).item())
+        )
+
+    with record_function("## post-copy compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## assert ##"):
+        assert a_correct, f"Copy A validation failed on rank {ctx.rank}"
+        assert b_correct, f"Copy B validation failed on rank {ctx.rank}"
+        assert c_correct, f"Copy C validation failed on rank {ctx.rank}"
+        assert small_correct, f"Small copy validation failed on rank {ctx.rank}"
 
 
 def a2a_d2h_contention(
@@ -1360,6 +1511,10 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = data_copy_no_record_stream
             case "copy_engine_contention":
                 func = copy_engine_contention
+            case "copy_engine_contention_dummy_compute":
+                func = copy_engine_contention_dummy_compute
+            case "h2d_execution_order":
+                func = h2d_execution_order
             case "a2a_d2h_contention":
                 func = a2a_d2h_contention
             case "a2a_d2h_sequential":
