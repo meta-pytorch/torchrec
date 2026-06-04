@@ -262,6 +262,7 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                 or table.compute_kernel == EmbeddingComputeKernel.KEY_VALUE
                 or table.compute_kernel == EmbeddingComputeKernel.SSD_VIRTUAL_TABLE
                 or table.compute_kernel == EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE
+                or table.compute_kernel == EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE
             ):
                 self._need_prefetch = True
         if config.compute_kernel == EmbeddingComputeKernel.DENSE:
@@ -330,6 +331,37 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                     device=device,
                     backend_type=BackendType.DRAM,
                 )
+        elif config.compute_kernel == EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE:
+            # for dram + ssd composite kv
+            if config.enable_embedding_update:
+                kv_zch_params = None
+                if (
+                    config.fused_params
+                    and "kvzch_tbe_config" in config.fused_params
+                    and config.is_using_virtual_table()
+                ):
+                    kv_zch_params = config.fused_params.get("kvzch_tbe_config")
+                if kv_zch_params and kv_zch_params.enrichment_policy is not None:
+                    return ZeroCollisionEmbeddingEnrichmentCache(
+                        config=config,
+                        pg=pg,
+                        device=device,
+                        backend_type=BackendType.DRAM_SSD,
+                    )
+                else:
+                    return ZeroCollisionEmbeddingCache(
+                        config=config,
+                        pg=pg,
+                        device=device,
+                        backend_type=BackendType.DRAM_SSD,
+                    )
+            else:
+                raise ValueError(
+                    "DRAM_SSD_VIRTUAL_TABLE compute kernel does not support a plain "
+                    "embedding table; it currently only supports the embedding cache "
+                    "(enable_embedding_update=True)."
+                )
+
         else:
             raise ValueError(f"Compute kernel not supported {config.compute_kernel}")
 
@@ -719,6 +751,14 @@ class GroupedPooledEmbeddingsLookup(
                 device=device,
                 sharding_type=sharding_type,
                 backend_type=BackendType.DRAM,
+            )
+        elif config.compute_kernel == EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE:
+            # DRAM_SSD only supports the embedding cache (EmbeddingCollection),
+            # not pooled EmbeddingBagCollection.
+            raise ValueError(
+                "DRAM_SSD_VIRTUAL_TABLE compute kernel is not supported for "
+                "EmbeddingBagCollection (pooled embeddings); it currently only "
+                "supports the embedding cache via EmbeddingCollection."
             )
         else:
             raise ValueError(f"Compute kernel not supported {config.compute_kernel}")

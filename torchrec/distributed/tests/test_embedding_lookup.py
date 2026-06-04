@@ -8,9 +8,13 @@
 # pyre-strict
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
-from torchrec.distributed.embedding_lookup import GroupedPooledEmbeddingsLookup
+from torchrec.distributed.embedding_lookup import (
+    BackendType,
+    GroupedEmbeddingsLookup,
+    GroupedPooledEmbeddingsLookup,
+)
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
@@ -148,3 +152,98 @@ class VbeSplitsTest(unittest.TestCase):
                 GroupedPooledEmbeddingsLookup._vbe_splits(lookup, [features])
             self.assertIn("1 ranks", str(ctx.exception))
             self.assertIn("world_size is 4", str(ctx.exception))
+
+
+def _make_virtual_table_config(
+    compute_kernel: EmbeddingComputeKernel,
+    enable_embedding_update: bool = True,
+    fused_params: dict | None = None,
+) -> GroupedEmbeddingConfig:
+    table = ShardedEmbeddingTable(
+        name="table_0",
+        data_type=DataType.FP32,
+        pooling=PoolingType.SUM,
+        is_weighted=False,
+        has_feature_processor=False,
+        compute_kernel=compute_kernel,
+        embedding_dim=16,
+        local_cols=16,
+        num_embeddings=100,
+        feature_names=["feature_0"],
+        use_virtual_table=True,
+    )
+    return GroupedEmbeddingConfig(
+        data_type=DataType.FP32,
+        pooling=PoolingType.SUM,
+        is_weighted=False,
+        has_feature_processor=False,
+        compute_kernel=compute_kernel,
+        embedding_tables=[table],
+        fused_params=fused_params,
+        enable_embedding_update=enable_embedding_update,
+    )
+
+
+class DramSsdVirtualTableKernelTest(unittest.TestCase):
+    @patch("torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingCache")
+    def test_dram_ssd_creates_embedding_cache(self, mock_cache: MagicMock) -> None:
+        config = _make_virtual_table_config(
+            EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE,
+            enable_embedding_update=True,
+        )
+        lookup = MagicMock(spec=GroupedEmbeddingsLookup)
+        result = GroupedEmbeddingsLookup._create_embedding_kernel(
+            lookup, config, None, None, None
+        )
+        mock_cache.assert_called_once()
+        self.assertEqual(
+            mock_cache.call_args.kwargs["backend_type"], BackendType.DRAM_SSD
+        )
+        self.assertIs(result, mock_cache.return_value)
+
+    @patch(
+        "torchrec.distributed.embedding_lookup.ZeroCollisionEmbeddingEnrichmentCache"
+    )
+    def test_dram_ssd_creates_enrichment_cache_with_policy(
+        self, mock_cache: MagicMock
+    ) -> None:
+        kvzch_config = MagicMock()
+        kvzch_config.enrichment_policy = MagicMock()
+        config = _make_virtual_table_config(
+            EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE,
+            enable_embedding_update=True,
+            fused_params={"kvzch_tbe_config": kvzch_config},
+        )
+        lookup = MagicMock(spec=GroupedEmbeddingsLookup)
+        result = GroupedEmbeddingsLookup._create_embedding_kernel(
+            lookup, config, None, None, None
+        )
+        mock_cache.assert_called_once()
+        self.assertEqual(
+            mock_cache.call_args.kwargs["backend_type"], BackendType.DRAM_SSD
+        )
+        self.assertIs(result, mock_cache.return_value)
+
+    def test_dram_ssd_without_embedding_update_raises(self) -> None:
+        config = _make_virtual_table_config(
+            EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE,
+            enable_embedding_update=False,
+        )
+        lookup = MagicMock(spec=GroupedEmbeddingsLookup)
+        with self.assertRaises(ValueError) as ctx:
+            GroupedEmbeddingsLookup._create_embedding_kernel(
+                lookup, config, None, None, None
+            )
+        self.assertIn("enable_embedding_update", str(ctx.exception))
+
+    def test_dram_ssd_pooled_embedding_bag_not_supported(self) -> None:
+        config = _make_virtual_table_config(
+            EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE,
+            enable_embedding_update=True,
+        )
+        lookup = MagicMock(spec=GroupedPooledEmbeddingsLookup)
+        with self.assertRaises(ValueError) as ctx:
+            GroupedPooledEmbeddingsLookup._create_embedding_kernel(
+                lookup, config, None, None, None, None
+            )
+        self.assertIn("EmbeddingBagCollection", str(ctx.exception))
