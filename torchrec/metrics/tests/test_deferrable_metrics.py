@@ -10,6 +10,7 @@
 import unittest
 from collections.abc import Mapping
 from concurrent.futures import Future
+from typing import Any
 from unittest.mock import patch
 
 import torch
@@ -271,6 +272,60 @@ class TestDeferrableMetrics(unittest.TestCase):
         self.assertEqual(len(received), 1)
         self.assertEqual(received[0]["original"], "data")
         self.assertEqual(received[0]["cpu_val"], "extra")
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_update_resolved_cuda_tensors_moved_to_cpu(self) -> None:
+        # Use fp32-exact values (powers of 2) to avoid precision-based assertion noise.
+        dm = DeferrableMetrics({"a": torch.tensor(1.0)})
+        dm.update({"loss": torch.tensor(0.5, device="cuda")})
+        resolved = dm.resolve()
+        self.assertEqual(resolved["loss"].device.type, "cpu")
+        self.assertEqual(resolved["loss"].item(), 0.5)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_update_future_backed_cuda_tensors_moved_to_cpu(self) -> None:
+        f: Future[dict[str, Any]] = Future()
+        dm = DeferrableMetrics(f)
+        dm.update({"loss": torch.tensor(0.25, device="cuda")})
+        f.set_result({"window_ne": torch.tensor(0.5)})
+        resolved = dm.resolve()
+        self.assertEqual(resolved["loss"].device.type, "cpu")
+        self.assertEqual(resolved["loss"].item(), 0.25)
+        self.assertEqual(resolved["window_ne"].item(), 0.5)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_update_bit_identical_to_per_tensor_cpu_extraction(self) -> None:
+        # Reference: per-tensor .cpu() (what publish would do today).
+        torch.manual_seed(0)
+        gpu_dict: dict[str, torch.Tensor] = {
+            f"task_{i}:loss": torch.rand((), device="cuda") for i in range(30)
+        }
+        expected = {k: v.cpu().item() for k, v in gpu_dict.items()}
+
+        f: Future[dict[str, Any]] = Future()
+        dm = DeferrableMetrics(f)
+        dm.update(gpu_dict)
+        f.set_result({})
+        actual = {k: v.item() for k, v in dm.resolve().items()}
+
+        for k in expected:
+            self.assertEqual(expected[k], actual[k])
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
+    def test_update_does_not_mutate_caller_dict(self) -> None:
+        caller_dict: dict[str, Any] = {"loss": torch.tensor(1.0, device="cuda")}
+        dm = DeferrableMetrics({"a": 1})
+        dm.update(caller_dict)
+        # Caller's dict still has the GPU tensor — we made a defensive copy.
+        self.assertEqual(caller_dict["loss"].device.type, "cuda")
+
+    def test_update_resolved_cpu_only_unchanged(self) -> None:
+        # No CUDA tensors → transfer_tensors_to_cpu short-circuits (no event).
+        dm = DeferrableMetrics({"a": torch.tensor(1.0)})
+        dm.update({"b": torch.tensor(2.0), "name": "task1"})
+        resolved = dm.resolve()
+        self.assertEqual(resolved["b"].item(), 2.0)
+        self.assertEqual(resolved["name"], "task1")
 
 
 class TransferTensorsToCpuTest(unittest.TestCase):

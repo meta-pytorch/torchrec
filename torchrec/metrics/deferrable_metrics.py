@@ -54,12 +54,15 @@ def transfer_tensors_to_cpu(
     if source_device is None:
         return tensors, None
 
-    cpu_tensors = {
-        k: v.to(device="cpu", non_blocking=True) if isinstance(v, torch.Tensor) else v
-        for k, v in tensors.items()
-    }
-
     with torch.cuda.device(source_device):
+        cpu_tensors: dict[str, Any] = {}
+        for k, v in tensors.items():
+            if isinstance(v, torch.Tensor):
+                dst = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=True)
+                dst.copy_(v, non_blocking=True)
+                cpu_tensors[k] = dst
+            else:
+                cpu_tensors[k] = v
         event = torch.cuda.Event()
         event.record()
 
@@ -159,6 +162,13 @@ class DeferrableMetrics(Mapping[str, Any]):
         If backed by Future, defers the merge until Future resolves.
         If other is a DeferrableMetrics, subscribes to it for deferred merge.
 
+        Any CUDA tensors in `other` are eagerly transferred to pinned CPU
+        memory on the calling thread (truly async via pinned destination —
+        caller is not blocked). The stored values are always CPU. This
+        prevents per-tensor `.detach().cpu()` from running on the resolve
+        thread (typically metric_compute), which would otherwise hold the
+        GIL and stall backward.
+
         Ordering constraint: when backed by a Future, update() replaces the
         internal Future with a new merged Future. Any subscribe() callbacks
         registered *before* update() are attached to the original Future and
@@ -183,18 +193,24 @@ class DeferrableMetrics(Mapping[str, Any]):
             return
 
         assert isinstance(other, dict)
-        dict_other: dict[str, Any] = other
+        # Eagerly stage CUDA tensors to pinned CPU. Returns the input dict
+        # unchanged with event=None when nothing is on CUDA.
+        cpu_other, transfer_event = transfer_tensors_to_cpu(other)
 
         if self._resolved:
-            self._data.update(dict_other)
+            if transfer_event is not None:
+                transfer_event.synchronize()
+            self._data.update(cpu_other)
         elif self._future is not None:
             original_future = self._future
             merged_future: Future[dict[str, Any]] = Future()
 
             def _on_complete(f: Future[dict[str, Any]]) -> None:
                 try:
+                    if transfer_event is not None:
+                        transfer_event.synchronize()
                     result = dict(f.result())
-                    result.update(dict_other)
+                    result.update(cpu_other)
                     merged_future.set_result(result)
                 except Exception as e:
                     merged_future.set_exception(e)
