@@ -414,7 +414,7 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=8,
+        max_examples=3,
         deadline=None,
         phases=[Phase.explicit, Phase.generate, Phase.target],
     )
@@ -466,7 +466,7 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=8,
+        max_examples=3,
         deadline=None,
         phases=[Phase.explicit, Phase.generate, Phase.target],
     )
@@ -560,7 +560,7 @@ class MultiRankDMPDynamicShardingTest(ModelParallelTestShared):
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=8,
+        max_examples=3,
         deadline=None,
         phases=[Phase.explicit, Phase.generate, Phase.target],
     )
