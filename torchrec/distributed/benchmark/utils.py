@@ -248,6 +248,7 @@ def dump_benchmark_result(
     result: Any,
     output_dir: str,
     world_size: int,
+    test_name: str = "",
 ) -> None:
     """Write benchmark result to a JSON file in *output_dir*.
 
@@ -259,6 +260,7 @@ def dump_benchmark_result(
             circular dependency with ``base``).
         output_dir: Directory where the JSON file is written.
         world_size: Number of ranks in the distributed run.
+        test_name: Test name to associate with the benchmark result.
     """
     data: dict[str, object] = {
         "short_name": result.short_name,
@@ -266,6 +268,7 @@ def dump_benchmark_result(
         "world_size": world_size,
         "gpu_type": get_gpu_type(),
         "cpu_type": get_cpu_type(),
+        "test_name": test_name,
         "metrics": result.to_dict(),
     }
 
