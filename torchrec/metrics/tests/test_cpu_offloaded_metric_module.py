@@ -297,6 +297,35 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "worker died"):
             self.cpu_module.shutdown()
 
+    def test_shutdown_idempotent_after_captured_exception(self) -> None:
+        """First shutdown() re-raises the captured worker exception; subsequent
+        calls (e.g. via atexit after tearDown swallowed the first) must be no-ops
+        rather than re-raising and re-running shutdown work."""
+        with patch.object(
+            self.cpu_module,
+            "_process_metric_update_job",
+            side_effect=RuntimeError("worker died"),
+        ):
+            self.cpu_module.update(
+                {
+                    "task1-prediction": torch.tensor([0.5]),
+                    "task1-label": torch.tensor([0.5]),
+                    "task1-weight": torch.tensor([1.0]),
+                }
+            )
+            self.assertTrue(
+                self.cpu_module._captured_exception_event.wait(timeout=5.0),
+                "update thread did not capture exception",
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "worker died"):
+            self.cpu_module.shutdown()
+
+        self.assertTrue(self.cpu_module._shutdown_complete)
+        with patch.object(self.cpu_module, "_log_event") as mock_log_event:
+            self.cpu_module.shutdown()
+            mock_log_event.assert_not_called()
+
     def test_shutdown_processes_final_sync_marker_in_compute_thread(self) -> None:
         """Two-phase shutdown: the SyncMarker enqueued during update-thread
         flush must be processed by the compute thread before it stops."""

@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import functools
 import sysconfig
 import unittest
 from typing import Dict
@@ -69,16 +70,6 @@ class XAUCMetricTest(unittest.TestCase):
         "see https://dev-discuss.pytorch.org/t/torch-compile-support-for-python-3-14-completed/3276",
     )
     def test_xauc_compile(self) -> None:
-        xauc_compile = XAUCMetric(
-            world_size=WORLD_SIZE,
-            my_rank=0,
-            batch_size=BATCH_SIZE,
-            tasks=[DefaultTaskInfo],
-            # pyrefly: ignore[bad-argument-type]
-            enable_pt2_compile=True,
-            window_size=200,
-        )
-
         xauc = XAUCMetric(
             world_size=WORLD_SIZE,
             my_rank=0,
@@ -90,29 +81,39 @@ class XAUCMetricTest(unittest.TestCase):
         )
 
         model_output = generate_model_output()
-        with patch.object(torch._dynamo.config, "fail_on_recompile_limit_hit", True):
+        fullgraph_compile = functools.partial(torch.compile, fullgraph=True)
+        with patch.object(torch, "compile", fullgraph_compile):
+            xauc_compile = XAUCMetric(
+                world_size=WORLD_SIZE,
+                my_rank=0,
+                batch_size=BATCH_SIZE,
+                tasks=[DefaultTaskInfo],
+                # pyrefly: ignore[bad-argument-type]
+                enable_pt2_compile=True,
+                window_size=200,
+            )
             for _ in range(10):
                 xauc_compile.update(
                     predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
                     labels={DefaultTaskInfo.name: model_output["labels"][0]},
                     weights={DefaultTaskInfo.name: model_output["weights"][0]},
+                    _log_tensors=False,  # required for fullgraph=True
                 )
                 xauc.update(
                     predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
                     labels={DefaultTaskInfo.name: model_output["labels"][0]},
                     weights={DefaultTaskInfo.name: model_output["weights"][0]},
                 )
-        metric_compile = xauc_compile.compute()[
-            f"xauc-{DefaultTaskInfo.name}|lifetime_xauc"
-        ]
-        metric = xauc.compute()[f"xauc-{DefaultTaskInfo.name}|lifetime_xauc"]
-
-        torch.testing.assert_close(
-            metric_compile,
-            metric,
-            atol=1e-4,
-            rtol=1e-4,
-            check_dtype=False,
-            equal_nan=True,
-            msg=f"Compiled: {metric_compile}, Expected: {metric}",
-        )
+        compile_out = xauc_compile.compute()
+        eager_out = xauc.compute()
+        for prefix in ("lifetime_xauc", "window_xauc"):
+            key = f"xauc-{DefaultTaskInfo.name}|{prefix}"
+            torch.testing.assert_close(
+                compile_out[key],
+                eager_out[key],
+                atol=1e-4,
+                rtol=1e-4,
+                check_dtype=False,
+                equal_nan=True,
+                msg=f"[{prefix}] Compiled: {compile_out[key]}, Eager: {eager_out[key]}",
+            )

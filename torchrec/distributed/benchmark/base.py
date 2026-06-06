@@ -1113,6 +1113,7 @@ def _run_benchmark_core(
     all_rank_traces: bool = False,
     memory_snapshot: bool = False,
     sample_count: int = 0,
+    test_name: str = "",
 ) -> BenchmarkResult:
     """Internal helper that contains the core benchmarking logic shared by
     ``benchmark`` and ``benchmark_func``.  All heavy–lifting (timing, memory
@@ -1194,7 +1195,7 @@ def _run_benchmark_core(
     # Dump benchmark result to local storage
     if output_dir:
         try:
-            dump_benchmark_result(result, output_dir, world_size)
+            dump_benchmark_result(result, output_dir, world_size, test_name=test_name)
         except OSError as e:
             logger.warning(f"Failed to dump benchmark result: {e}")
 
@@ -1217,6 +1218,7 @@ def benchmark_model_with_warmup(
     device_type: str = "cuda",
     benchmark_unsharded_module: bool = False,
     export_stacks: bool = False,
+    test_name: str = "",
 ) -> BenchmarkResult:
     if enable_logging:
         logger.info(f" BENCHMARK_MODEL[{name}]:\n{model}")
@@ -1252,6 +1254,7 @@ def benchmark_model_with_warmup(
         reset_accumulated_memory_stats=False,
         # Ignore the sample count(qps) calculation for now
         sample_count=0,
+        test_name=test_name,
     )
 
 
@@ -1268,6 +1271,7 @@ class BenchFuncConfig:
     all_rank_traces: bool = False
     memory_snapshot: bool = False
     loglevel: str = "WARNING"
+    test_name: str = ""
 
     def benchmark_func_kwargs(self, **kwargs_to_override) -> Dict[str, Any]:
         return {
@@ -1281,6 +1285,7 @@ class BenchFuncConfig:
             "export_stacks": self.export_stacks,
             "all_rank_traces": self.all_rank_traces,
             "memory_snapshot": self.memory_snapshot,
+            "test_name": self.test_name,
         } | kwargs_to_override
 
     def set_log_level(self) -> None:
@@ -1305,6 +1310,7 @@ def benchmark_func(
     all_rank_traces: bool = False,
     memory_snapshot: bool = False,
     sample_count: int = 0,
+    test_name: str = "",
 ) -> BenchmarkResult:
     """
     Args:
@@ -1359,4 +1365,5 @@ def benchmark_func(
         all_rank_traces=all_rank_traces,
         memory_snapshot=memory_snapshot,
         sample_count=sample_count,
+        test_name=test_name,
     )
