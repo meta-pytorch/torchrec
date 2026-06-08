@@ -41,37 +41,35 @@ from torchrec.distributed.embedding_sharding import (
 from torchrec.distributed.embedding_types import KJTList
 
 try:
-    from torchrec.distributed.logging_handlers import log_pipeline_module_info
+    from torchrec.distributed.logging_handlers import (
+        log_clear_input_dist_tensors,
+        log_free_features_storage_early,
+        log_pipeline_module_info,
+    )
 except Exception:
     torch._C._log_api_usage_once(
         "torchrec.distributed.train_pipeline.utils.import_failure.logging_handlers"
     )
+
+    def log_clear_input_dist_tensors(*args: Any, **kwargs: Any) -> None:
+        pass
+
+    def log_free_features_storage_early(*args: Any, **kwargs: Any) -> None:
+        pass
 
     def log_pipeline_module_info(*args: Any, **kwargs: Any) -> None:
         pass
 
 
 try:
-    from torchrec.distributed.logger import (
-        LazyStr,
-        one_time_logger,
-        one_time_rank0_logger,
-    )
+    from torchrec.distributed.logger import one_time_rank0_logger
 except Exception:
     # Safety measure against torch package issues: old packages may not have
-    # LazyStr/one_time_logger in their archived torchrec.distributed.logger
+    # one_time_rank0_logger in their archived torchrec.distributed.logger
     torch._C._log_api_usage_once(
         "torchrec.distributed.train_pipeline.utils.import_failure.logger"
     )
 
-    class LazyStr:  # pyre-ignore[11]: Annotation for no-op fallback
-        def __init__(self, fn: Any) -> None:
-            self._fn = fn
-
-        def __str__(self) -> str:
-            return self._fn()
-
-    one_time_logger = logging.getLogger(__name__)
     one_time_rank0_logger = logging.getLogger(__name__)
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
 from torchrec.distributed.train_pipeline.pipeline_context import (
@@ -226,13 +224,7 @@ def _clear_releasable_inputs(context: TrainPipelineContext) -> None:
             size += kjt.clear_storage()
         early_released.clear()
     if size > 0:
-
-        def get_kjt_size() -> str:
-            msg: str = f"clear_releasable_inputs {size / 1024**3:.2f} GB"
-            logger.info(msg)
-            return msg
-
-        one_time_logger.info(LazyStr(get_kjt_size))
+        log_free_features_storage_early(size)
 
 
 def _clear_input_dist_tensors(context: TrainPipelineContext) -> None:
@@ -250,15 +242,7 @@ def _clear_input_dist_tensors(context: TrainPipelineContext) -> None:
                 if isinstance(awaitable, KJTAllToAllTensorsAwaitable):
                     size += awaitable.clear_inputs()
     if size > 0:
-
-        def get_size() -> str:
-            msg: str = (
-                f"clear_input_dist_tensors freed {size / 1024**3:.2f} GB ({size} bytes)"
-            )
-            logger.info(msg)
-            return msg
-
-        one_time_logger.info(LazyStr(get_size))
+        log_clear_input_dist_tensors(size)
 
 
 def _start_data_dist(
