@@ -813,7 +813,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         except ValueError:
             raise RuntimeError(
                 f"Attempting to shard HashZchManagedCollisionModule, but rank {device} does not align with bucket boundaries;"
-                + f" please check kwarg total_num_buckets={self._buckets} is a multiple of world size."
+                + " please check if planner is aware of the bucket sizes per rank, and whether there is uneven buckets per rank. "
             )
         new_zch_size = output_id_range[1] - output_id_range[0]
 
