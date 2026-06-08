@@ -324,6 +324,7 @@ def _get_parameter_size_offsets(
     local_size: int,
     world_size: int,
     col_wise_shard_dim: Optional[int] = None,
+    num_buckets: Optional[int] = None,
 ) -> List[Tuple[List[int], List[int]]]:
     (
         shard_sizes,
@@ -334,6 +335,7 @@ def _get_parameter_size_offsets(
         local_world_size=local_size,
         sharding_type=sharding_type.value,
         col_wise_shard_dim=col_wise_shard_dim,
+        num_buckets=num_buckets,
     )
     return list(zip(shard_sizes, shard_offsets))
 
@@ -553,12 +555,15 @@ def table_wise(
 def row_wise(
     sizes_placement: Optional[Tuple[List[int], Union[str, List[str]]]] = None,
     compute_kernel: Optional[str] = None,
+    num_buckets: Optional[int] = None,
 ) -> ParameterShardingGenerator:
     """
     Returns a generator of ParameterShardingPlan for `ShardingType::ROW_WISE` for construct_module_sharding_plan.
 
     Args:
     sizes_placement (Optional[Tuple[List[int], str]]): Only use it in inference for uneven shardinglist of tuples of (sizes, placement); sizes is the row size list
+    compute_kernel (Optional[str]): embedding compute kernel to use for the table
+    num_buckets (Optional[int]): number of buckets to use for the table
 
     Example::
 
@@ -595,6 +600,7 @@ def row_wise(
                 ShardingType.ROW_WISE,
                 local_size,
                 world_size,
+                num_buckets=num_buckets,
             )
             assert len(size_and_offsets) <= world_size
             size_offset_ranks = []

@@ -134,7 +134,7 @@ class RwSequenceEmbeddingSharding(
     ) -> BaseSparseFeaturesDist[KeyedJaggedTensor]:
         num_features = self._get_num_features()
         feature_hash_sizes = self._get_feature_hash_sizes()
-        virtual_table_feature_num_buckets, has_uneven_virtual_tables = (
+        virtual_table_feature_num_buckets = (
             self._get_virtual_table_feature_num_buckets()
         )
         return RwSparseFeaturesDist(
@@ -148,7 +148,6 @@ class RwSequenceEmbeddingSharding(
             has_feature_processor=self._has_feature_processor,
             need_pos=False,
             virtual_table_feature_num_buckets=virtual_table_feature_num_buckets,
-            has_uneven_virtual_tables=has_uneven_virtual_tables,
         )
 
     def create_lookup(

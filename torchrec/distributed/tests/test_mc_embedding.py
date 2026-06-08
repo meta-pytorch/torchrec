@@ -87,21 +87,28 @@ class SparseArch(nn.Module):
         tables: List[EmbeddingConfig],
         device: torch.device,
         return_remapped: bool = False,
-        input_hash_size: int = 4000,
+        input_hash_size: List[int] | int = 4000,
         allow_in_place_embed_weight_update: bool = False,
         use_mpzch: bool = False,
     ) -> None:
         super().__init__()
         self._return_remapped = return_remapped
-
+        hash_sizes = [
+            input_hash_size if isinstance(input_hash_size, int) else input_hash_size[i]
+            for i in range(len(tables))
+        ]
         mc_modules: dict[str, ManagedCollisionModule] = {}
         if use_mpzch:
+            num_buckets: List[int] = [
+                int(t.total_num_buckets) if t.total_num_buckets is not None else 4
+                for t in tables
+            ]
             # Parameters hard-coded from test_quant_mc_embedding
             mc_modules["table_0"] = HashZchManagedCollisionModule(
                 zch_size=(tables[0].num_embeddings),
-                input_hash_size=input_hash_size,
+                input_hash_size=hash_sizes[0],
                 device=device,
-                total_num_buckets=4,
+                total_num_buckets=num_buckets[0],
                 eviction_policy_name=HashZchEvictionPolicyName.LRU_EVICTION,
                 eviction_config=HashZchEvictionConfig(
                     features=["feature_0"],
@@ -109,12 +116,11 @@ class SparseArch(nn.Module):
                 ),
                 max_probe=5,
             )
-
             mc_modules["table_1"] = HashZchManagedCollisionModule(
                 zch_size=(tables[1].num_embeddings),
                 device=device,
-                input_hash_size=input_hash_size,
-                total_num_buckets=4,
+                input_hash_size=hash_sizes[1],
+                total_num_buckets=num_buckets[1],
                 eviction_policy_name=HashZchEvictionPolicyName.LRU_EVICTION,
                 eviction_config=HashZchEvictionConfig(
                     features=["feature_1"],
@@ -125,7 +131,7 @@ class SparseArch(nn.Module):
         else:
             mc_modules["table_0"] = MCHManagedCollisionModule(
                 zch_size=(tables[0].num_embeddings),
-                input_hash_size=input_hash_size,
+                input_hash_size=hash_sizes[0],
                 device=device,
                 eviction_interval=2,
                 eviction_policy=DistanceLFU_EvictionPolicy(),
@@ -133,7 +139,7 @@ class SparseArch(nn.Module):
             mc_modules["table_1"] = MCHManagedCollisionModule(
                 zch_size=(tables[1].num_embeddings),
                 device=device,
-                input_hash_size=input_hash_size,
+                input_hash_size=hash_sizes[1],
                 eviction_interval=2,
                 eviction_policy=DistanceLFU_EvictionPolicy(),
             )
@@ -994,6 +1000,59 @@ def _test_2d_mc_syncing_preserves_top_indices(
             torch.testing.assert_close(preserved[nonempty], final_identities[nonempty])
 
 
+def _test_uneven_buckets_per_rank(
+    tables: List[EmbeddingConfig],
+    rank: int,
+    hash_sizes: List[int],
+    world_size: int,
+    sharder: ModuleSharder[nn.Module],
+    backend: str,
+    kjt_input_per_rank: List[KeyedJaggedTensor],
+    indices_to_rank: List[int],
+) -> None:
+    with MultiProcessContext(rank, world_size, backend) as ctx:
+        features = ["feature_0", "feature_1"]
+        sparse_arch = SparseArch(
+            tables,
+            torch.device("meta"),
+            use_mpzch=True,
+            input_hash_size=hash_sizes,
+        )
+        assert ctx.pg is not None
+        module_sharding_plan = construct_module_sharding_plan(
+            sparse_arch._mc_ec,
+            per_param_sharding={
+                "table_0": row_wise(num_buckets=tables[0].total_num_buckets),
+                "table_1": row_wise(num_buckets=tables[1].total_num_buckets),
+            },
+            local_size=None,
+            world_size=world_size,
+            device_type="cuda" if torch.cuda.is_available() else "cpu",
+            sharder=sharder,
+        )
+        sharded_sparse_arch = _shard_modules(
+            module=copy.deepcopy(sparse_arch),
+            plan=ShardingPlan({"_mc_ec": module_sharding_plan}),
+            #  `Optional[ProcessGroup]`.
+            # pyrefly: ignore[bad-argument-type]
+            env=ShardingEnv.from_process_group(ctx.pg),
+            sharders=[sharder],
+            device=ctx.device,
+        )
+
+        assert hasattr(sharded_sparse_arch._mc_ec, "_managed_collision_collection")
+        mc_module = sharded_sparse_arch._mc_ec._managed_collision_collection
+        assert isinstance(mc_module, ShardedManagedCollisionCollection)
+
+        kjt_rank = kjt_input_per_rank[rank].to(ctx.device)
+        mc_module._create_input_dists(features)
+        input_dists = mc_module._input_dists
+        assert len(input_dists) == 1
+        output = input_dists[0](kjt_rank).wait().wait()
+
+        torch.testing.assert_close(output.values().tolist(), indices_to_rank[rank])
+
+
 @skip_if_asan_class
 class ShardedMCEmbeddingCollectionParallelTest(MultiProcessTestBase):
     @unittest.skipIf(
@@ -1170,6 +1229,82 @@ class ShardedMCEmbeddingCollectionParallelTest(MultiProcessTestBase):
         )
 
     @unittest.skipIf(
+        torch.cuda.device_count() <= 2,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
+    @given(backend=st.sampled_from(["nccl"]))
+    @settings(deadline=None)
+    def test_sharding_zch_uneven_buckets_per_rank(self, backend: str) -> None:
+        WORLD_SIZE = 2
+        # Test on one feature having infinite input space, and other finite
+        HASH_SIZES = [0, 40]  # hash sizes per feature
+        BUCKETS = [3, 5]  # uneven buckets for worldsize=2
+        embedding_config = [
+            EmbeddingConfig(
+                name="table_0",
+                feature_names=["feature_0"],
+                embedding_dim=8,
+                num_embeddings=9,
+                total_num_buckets=BUCKETS[0],
+            ),
+            EmbeddingConfig(
+                name="table_1",
+                feature_names=["feature_1"],
+                embedding_dim=8,
+                num_embeddings=10,
+                total_num_buckets=BUCKETS[1],
+            ),
+        ]
+        # feature_0 does interleave mapping to rank
+        # feature_1 does block mapping to rank
+        kjt_input_per_rank = [  # noqa
+            KeyedJaggedTensor.from_lengths_sync(
+                keys=["feature_0", "feature_1"],
+                values=torch.LongTensor(
+                    [
+                        0,  # feature_0, rank 0
+                        1,  # feature_0, rank 0
+                        2,  # feature_0, rank 1
+                        3,  # feature_0, rank 0
+                        4,  # feature_0, rank 0
+                        5,  # feature_0, rank 1
+                        0,  # feature_1, rank 0,
+                        10,  # feature_1, rank 0
+                        23,  # feature_1, rank 0
+                        30,  # feature_1, rank 1
+                        32,  # feature_1, rank 1
+                        39,  # feature_1, rank 1
+                    ],
+                ),
+                lengths=torch.LongTensor([1] * 12),
+            ),
+            KeyedJaggedTensor.from_lengths_sync(
+                keys=["feature_0", "feature_1"],
+                values=torch.LongTensor(
+                    [
+                        0,  # feature_0, rank 0
+                        10,  # feature_1, rank 0
+                    ],
+                ),
+                lengths=torch.LongTensor([1, 1]),
+            ),
+        ]
+
+        # Final answer that maps rank to indices
+        rank_to_indices = [[0, 1, 3, 4, 0, 0, 10, 23, 10], [2, 5, 30, 32, 39]]
+
+        self._run_multi_process_test(
+            callable=_test_uneven_buckets_per_rank,
+            world_size=WORLD_SIZE,
+            hash_sizes=HASH_SIZES,
+            tables=embedding_config,
+            backend=backend,
+            sharder=ManagedCollisionEmbeddingCollectionSharder(),
+            kjt_input_per_rank=kjt_input_per_rank,
+            indices_to_rank=rank_to_indices,
+        )
+
+    @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
@@ -1329,11 +1464,13 @@ class ShardedMCEmbeddingCollectionParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
-    @given(backend=st.sampled_from(["nccl"]))
+    @given(backend=st.sampled_from(["nccl"]), uneven_buckets=st.booleans())
     @settings(deadline=None)
-    def test_sharding_zch_mc_ec_dedup(self, backend: str) -> None:
-
+    def test_sharding_zch_mc_ec_dedup(self, backend: str, uneven_buckets: bool) -> None:
         WORLD_SIZE = 2
+        total_num_buckets = [4, 4]
+        if uneven_buckets:
+            total_num_buckets = [3, 4]
 
         embedding_config = [
             EmbeddingConfig(
@@ -1341,12 +1478,14 @@ class ShardedMCEmbeddingCollectionParallelTest(MultiProcessTestBase):
                 feature_names=["feature_0", "feature_2"],
                 embedding_dim=8,
                 num_embeddings=16,
+                total_num_buckets=total_num_buckets[0],
             ),
             EmbeddingConfig(
                 name="table_1",
                 feature_names=["feature_1"],
                 embedding_dim=8,
                 num_embeddings=32,
+                total_num_buckets=total_num_buckets[1],
             ),
         ]
 
