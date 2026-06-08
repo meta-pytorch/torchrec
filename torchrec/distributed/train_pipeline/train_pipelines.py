@@ -40,31 +40,20 @@ from torchrec.distributed.embeddingbag import (
 )
 
 try:
-    from torchrec.distributed.logger import (
-        LazyStr,
-        one_time_logger,
-        one_time_rank0_logger,
-    )
+    from torchrec.distributed.logger import one_time_rank0_logger
 except Exception:
     # Safety measure against torch package issues: old packages may not have
     # these symbols in their archived torchrec.distributed.logger
     torch._C._log_api_usage_once(
         "torchrec.distributed.train_pipeline.train_pipelines.import_failure.logger"
     )
-    one_time_logger = logging.getLogger(__name__)
     one_time_rank0_logger = logging.getLogger(__name__)
-
-    class LazyStr:  # pyre-ignore[11]
-        def __init__(self, fn: Any) -> None:
-            self._fn = fn
-
-        def __str__(self) -> str:
-            return self._fn()
 
 
 try:
     from torchrec.distributed.logging_handlers import (
         EventLoggingHandler,
+        log_inplace_copy_batch,
         TorchrecComponent,
     )
 except Exception:
@@ -75,6 +64,7 @@ except Exception:
     if TYPE_CHECKING:
         from torchrec.distributed.logging_handlers import (
             EventLoggingHandler,
+            log_inplace_copy_batch,
             TorchrecComponent,
         )
     else:
@@ -90,6 +80,9 @@ except Exception:
                     return func
 
                 return decorator
+
+        def log_inplace_copy_batch(*args: object, **kwargs: object) -> None:
+            pass
 
 
 from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
@@ -355,9 +348,7 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                 self._inplace_copy_batch_size_logged = True
                 size = _batch_tensor_size(cur_batch)
 
-                one_time_logger.info(
-                    LazyStr(lambda: f"inplace_copy_batch size {size / 1024**3:.2f} GB")
-                )
+                log_inplace_copy_batch(size)
             with record_function("## inplace_copy_batch_to_gpu ##"):
                 self._cur_batch = _to_device(
                     cur_batch,
@@ -1093,11 +1084,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                     self._inplace_copy_batch_size_logged = True
                     size = _batch_tensor_size(batch)
 
-                    one_time_logger.info(
-                        LazyStr(
-                            lambda: f"inplace_copy_batch size {size / 1024**3:.2f} GB"
-                        )
-                    )
+                    log_inplace_copy_batch(size)
                 batch = _to_device(
                     batch,
                     self._device,
