@@ -508,6 +508,18 @@ class ShardedManagedCollisionCollection(
             self._sharding_features,
         ):
             assert isinstance(sharding, BaseRwEmbeddingSharding)
+
+            feature_to_sharded_table = {
+                feature: table
+                for group_config in sharding._grouped_embedding_configs_per_rank[0]
+                for table in group_config.embedding_tables
+                for feature in table.feature_names
+            }
+
+            embedding_table_sizes = [
+                feature_to_sharded_table[f].num_embeddings for f in sharding_features
+            ]
+
             feature_num_buckets: List[int] = [
                 # pyrefly: ignore[not-callable]
                 self._managed_collision_modules[self._feature_to_table[f]].buckets()
@@ -522,10 +534,7 @@ class ShardedManagedCollisionCollection(
 
             feature_hash_sizes: List[int] = []
             feature_total_num_buckets: List[int] = []
-            for input_size, num_buckets in zip(
-                input_sizes,
-                feature_num_buckets,
-            ):
+            for input_size, num_buckets in zip(input_sizes, feature_num_buckets):
                 feature_hash_sizes.append(input_size)
                 feature_total_num_buckets.append(num_buckets)
 
@@ -540,6 +549,7 @@ class ShardedManagedCollisionCollection(
                 has_feature_processor=sharding._has_feature_processor,
                 need_pos=False,
                 keep_original_indices=True,
+                zch_sizes=embedding_table_sizes,
             )
             self._input_dists.append(input_dist)
 
@@ -581,6 +591,18 @@ class ShardedManagedCollisionCollection(
             self._sharding_features,
         ):
             assert isinstance(sharding, BaseRwEmbeddingSharding)
+
+            feature_to_sharded_table = {
+                feature: table
+                for group_config in sharding._grouped_embedding_configs_per_rank[0]
+                for table in group_config.embedding_tables
+                for feature in table.feature_names
+            }
+
+            embedding_table_sizes = [
+                feature_to_sharded_table[f].num_embeddings for f in sharding_features
+            ]
+
             feature_num_buckets: List[int] = [
                 # pyrefly: ignore[not-callable]
                 self._managed_collision_modules[self._feature_to_table[f]].buckets()
@@ -608,6 +630,7 @@ class ShardedManagedCollisionCollection(
                 device=sharding._device,
                 is_sequence=True,
                 keep_original_indices=True,
+                zch_sizes=embedding_table_sizes,
             )
             self._write_input_dists.append(write_dist)
 

@@ -47,6 +47,9 @@ class OptimizationTechnique(Enum):
     MPZCH = "mpzch"
     KVZCH = "kvzch"
     ZORM = "zorm"
+    INPLACE_COPY_BATCH = "inplace_copy_batch"
+    CLEAR_INPUT_DIST = "clear_input_dist"
+    FREE_FEATURES_STORAGE_EARLY = "free_features_storage_early"
 
 
 @unique

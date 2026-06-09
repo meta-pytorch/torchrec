@@ -394,6 +394,48 @@ def log_ems_config(
     pass
 
 
+def log_inplace_copy_batch(
+    size_bytes: int = 0,
+    technique: OptimizationTechnique = OptimizationTechnique.INPLACE_COPY_BATCH,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_clear_input_dist_tensors(
+    size_bytes: int = 0,
+    technique: OptimizationTechnique = OptimizationTechnique.CLEAR_INPUT_DIST,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_free_features_storage_early(
+    size_bytes: int = 0,
+    technique: OptimizationTechnique = OptimizationTechnique.FREE_FEATURES_STORAGE_EARLY,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_ems_event(
+    event_name: str = "",
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.EMS,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_emo_event(
+    event_name: str = "",
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.EMO,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 def log_mpzch_summary(
     best_plan: Optional[List] = None,  # type: ignore[type-arg]
     technique: OptimizationTechnique = OptimizationTechnique.MPZCH,
