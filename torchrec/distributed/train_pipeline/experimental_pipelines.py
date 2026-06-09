@@ -25,7 +25,7 @@ from typing import (
 
 import torch
 from torch.autograd.profiler import record_function
-from torchrec.distributed.logger import LazyStr, one_time_logger, one_time_rank0_logger
+from torchrec.distributed.logger import one_time_rank0_logger
 from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.train_pipeline.backward_injection import (
@@ -59,7 +59,10 @@ from torchrec.distributed.types import LazyNoWait, ShardingType
 from torchrec.sparse.jagged_tensor import KeyedTensor
 
 try:
-    from torchrec.distributed.logging_handlers import log_ems_config
+    from torchrec.distributed.logging_handlers import (
+        log_ems_config,
+        log_inplace_copy_batch,
+    )
     from torchrec.modules.embedding_configs import DATA_TYPE_NUM_BITS
 except Exception:
     torch._C._log_api_usage_once(
@@ -69,6 +72,9 @@ except Exception:
     DATA_TYPE_NUM_BITS: dict = {}  # type: ignore[no-redef]
 
     def log_ems_config(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
+        pass
+
+    def log_inplace_copy_batch(*args: Any, **kwargs: Any) -> None:  # type: ignore[misc]
         pass
 
 
@@ -780,11 +786,7 @@ class TrainPipelineSparseDistT(TrainPipelineSparseDist[In, Out]):
                     self._inplace_copy_batch_size_logged = True
                     size = _batch_tensor_size(batch)
 
-                    one_time_logger.info(
-                        LazyStr(
-                            lambda: f"inplace_copy_batch size {size / 1024**3:.2f} GB"
-                        )
-                    )
+                    log_inplace_copy_batch(size)
                 future_batch = self._copy_executor.submit(
                     _to_device,
                     batch,
