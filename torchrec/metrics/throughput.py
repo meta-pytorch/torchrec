@@ -178,6 +178,14 @@ class ThroughputMetric(nn.Module):
         )
         self._steps = 0
 
+    def set_num_batch(self, num_batch: int) -> None:
+        # Seed the batch counter used to select the current batch_size_stage.
+        # Used after a checkpoint resume (e.g. ALBT preemption) to restore the
+        # number of batches already processed so the reported batch size matches
+        # the active stage. No-op when batch_size_stages is not in use.
+        if self._batch_size_stages is not None:
+            self._num_batch = num_batch
+
     def _get_batch_size(self) -> int:
         # No batch size stages, use the default batch size
         if not self._batch_size_stages:
