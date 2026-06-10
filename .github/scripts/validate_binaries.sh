@@ -73,6 +73,9 @@ elif [[ ${MATRIX_PYTHON_VERSION} = '3.13t' ]]; then
     # use conda-forge to install python3.13t
     conda create -y -n "${CONDA_ENV}" python="3.13" python-freethreading -c conda-forge
     conda run -n "${CONDA_ENV}" python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}')"
+elif [[ ${MATRIX_PYTHON_VERSION} = '3.14' ]]; then
+    # conda currently doesn't support 3.14 unless using the forge channel
+    conda create -y -n "${CONDA_ENV}" python="3.14" -c conda-forge
 else
     conda create -y -n "${CONDA_ENV}" python="${MATRIX_PYTHON_VERSION}"
 fi
