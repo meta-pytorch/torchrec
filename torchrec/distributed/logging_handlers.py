@@ -46,6 +46,7 @@ class TorchrecComponent(Enum):
     REC_METRICS = "rec_metrics"
     ITEP = "itep"
     DISTRIBUTED_MODEL_PARALLEL = "distributed_model_parallel"
+    ALBT = "albt"
 
 
 class EventLoggingHandler(EventLoggingHandlerBase):
