@@ -15,6 +15,14 @@ RunOptions:
   name: "fused_sdd_uvm_eval"
 PipelineConfig:
   pipeline: "eval-fused"
+  # Prefetch batch i+1's embedding lookup so it overlaps the dense forward of
+  # batch i. Combined with forward_uvm_block_limit above (which frees SMs for the
+  # concurrent dense forward), this is what produces the overlap. Override at the
+  # CLI with --enable_embedding_lookup_prefetch True|False.
+  enable_embedding_lookup_prefetch: True
+  # Dedicated lookup stream so the prefetched lookup is not serialized behind the
+  # next batch's input_dist a2a. Override with --emb_lookup_stream.
+  emb_lookup_stream: "new"
 ModelInputConfig:
   num_float_features: 1000
   feature_pooling_avg: 30
