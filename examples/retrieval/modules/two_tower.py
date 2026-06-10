@@ -221,7 +221,7 @@ class TwoTowerRetrieval(nn.Module):
             (batch_size, self.k), device=self.device, dtype=torch.int64
         )
         query_embedding = query_embedding.to(torch.float32)  # required by faiss
-        self.faiss_index.search(query_embedding, self.k, distances, candidates)
+        self.faiss_index.search(query_embedding, self.k, D=distances, I=candidates)
 
         # candidate lookup
         candidate_kjt = KeyedJaggedTensor(
