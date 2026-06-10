@@ -521,4 +521,62 @@ def log_proposer_result(
     pass
 
 
+def log_albt_enablement(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_schedule_conversion(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_warning(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_error(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+    error_message: Optional[str] = None,
+    stack_trace: Optional[str] = None,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_stage_transition(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_validation_success(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_schedule_stage(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
 _log_handlers: dict[str, logging.Handler] = defaultdict(logging.NullHandler)
