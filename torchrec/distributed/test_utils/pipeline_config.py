@@ -63,6 +63,13 @@ class PipelineConfig:
     free_features_storage_early: bool = False
     clear_data_dist_inputs: bool = False
     pipeline_postproc: bool = False
+    # Stream used for embedding lookups: "data_dist" (default), "new", or
+    # "current". Only used by the fused pipelines (e.g. "fused", "eval-fused").
+    emb_lookup_stream: str = "data_dist"
+    # eval-fused only: prefetch batch i+1's embedding lookup so it overlaps the
+    # dense forward of batch i (pair with the FBGEMM_FORWARD_UVM_BLOCK_LIMIT env
+    # var and emb_lookup_stream="new").
+    enable_embedding_lookup_prefetch: bool = False
     kwargs: Dict[str, Any] = field(default_factory=dict)
 
     def get_kwargs(self, **default_kwargs) -> Dict[str, Any]:
@@ -163,7 +170,19 @@ class PipelineConfig:
                     enable_inplace_copy_batch=self.enable_inplace_copy_batch,
                     free_features_storage_early=self.free_features_storage_early,
                     clear_data_dist_inputs=self.clear_data_dist_inputs,
-                    **self.get_kwargs(emb_lookup_stream="data_dist"),
+                    **self.get_kwargs(emb_lookup_stream=self.emb_lookup_stream),
+                )
+            case "eval-fused":
+                # pyrefly: ignore[unexpected-keyword]
+                return EvalPipelineFusedSparseDist(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    enable_inplace_copy_batch=self.enable_inplace_copy_batch,
+                    free_features_storage_early=self.free_features_storage_early,
+                    clear_data_dist_inputs=self.clear_data_dist_inputs,
+                    enable_embedding_lookup_prefetch=self.enable_embedding_lookup_prefetch,
+                    **self.get_kwargs(emb_lookup_stream=self.emb_lookup_stream),
                 )
             case _:
                 Pipeline = _pipeline_cls[self.pipeline]

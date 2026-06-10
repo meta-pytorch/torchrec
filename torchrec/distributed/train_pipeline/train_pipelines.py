@@ -2381,6 +2381,75 @@ class EvalPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
 
 
 class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
+    """
+    Eval variant of the fused SDD pipeline.
+
+    By default it preserves the original behavior: the current batch's embedding
+    lookup and dense forward run back-to-back (serially), since the forward
+    consumes the lookup output.
+
+    When ``enable_embedding_lookup_prefetch=True``, the pipeline instead keeps the
+    embedding lookup one batch ahead -- the lookup for batch i+1 is issued on the
+    ``emb_lookup_stream`` right after the dense forward of batch i, so the two
+    overlap on the GPU. The invariant is that on entry to ``progress()``,
+    ``batches[0]``'s lookup has already been primed (by ``fill_pipeline`` for the
+    first batch, or by the tail prefetch of the previous iteration).
+
+    NOTE: The overlap only pays off when the UVM forward (TBE) kernel does not
+    monopolize the SMs. Pair this with the ``FBGEMM_FORWARD_UVM_BLOCK_LIMIT`` env
+    var so the capped lookup kernel leaves SMs free for the concurrent dense
+    forward, and construct with ``emb_lookup_stream="new"`` for clean
+    compute/data_dist/emb_lookup stream separation.
+
+    NOTE: prefetch keeps two batches' embedding outputs alive at once, which
+    raises peak memory. This pipeline is experimental -- always run NE/output
+    parity tests before relying on it.
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        enable_embedding_lookup_prefetch: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._enable_embedding_lookup_prefetch = enable_embedding_lookup_prefetch
+
+    def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
+        if not self._enable_embedding_lookup_prefetch:
+            super().fill_pipeline(dataloader_iter)
+            return
+
+        # prefetch mode: same as the base fill, but additionally prime the first
+        # batch's embedding lookup so the first forward has a completed lookup to
+        # consume (the base fill_pipeline does not start any lookup).
+        # pipeline is already filled to capacity (2 batches in flight)
+        if len(self.batches) >= 2:
+            return
+        # last batch is draining; nothing to prime
+        if self.batches and self._execute_all_batches:
+            return
+
+        # batch i: load + copy to gpu, swap in pipelined forwards, complete input_dist
+        if not self.enqueue_batch(dataloader_iter):
+            logger.info("fill_pipeline: failed to load batch i")
+            return
+        self._init_pipelined_modules(
+            # pyrefly: ignore [bad-argument-type]
+            self.batches[0],
+            self.contexts[0],
+            # pyrefly: ignore [bad-argument-type]
+            self._pipelined_forward_type,
+        )
+        self.wait_sparse_data_dist(self.contexts[0])
+        # prime lookup(0) so the first forward has something to consume
+        # pyrefly: ignore [bad-argument-type]
+        self.start_embedding_lookup(self.batches[0], self.contexts[0])
+
+        # batch i+1: load + copy to gpu (input_dist deferred to progress())
+        if not self.enqueue_batch(dataloader_iter):
+            logger.info("fill_pipeline: failed to load batch i+1")
+            return
 
     @EventLoggingHandler.event_logger(
         TorchrecComponent.TRAIN_PIPELINE, n=1000, add_wait_counter=True
@@ -2388,10 +2457,12 @@ class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
         """
         For TrainPipelineSparseDist, we assume the max pipelined batches == 3 (capacity):
-            batches[0]: i+0 batch, fwd/bwd/opt (expecting output_dist)
+            batches[0]: i+0 batch, fwd (expecting output_dist)
             batches[1]: i+1 batch, for input_dist (expecting copied to device), and compute_and_output_dist
             batches[2]: i+2 batch, for copy_batch_to_gpu (expecting non-exhausted dataloader iter)
         """
+        if self._enable_embedding_lookup_prefetch:
+            return self._progress_prefetch(dataloader_iter)
 
         # attach the model just in case the user forgets to call it, especially when the user
         # pauses the pipeline.progress and detach the model for other purpose.
@@ -2408,7 +2479,6 @@ class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
         # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
         self._set_module_context(self.contexts[0])
 
-        # start embedding_lookup so it can overlap with previous optimizer
         if not self._embedding_lookup_after_data_dist:
             # pyrefly: ignore [bad-argument-type]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
@@ -2443,6 +2513,61 @@ class EvalPipelineFusedSparseDist(TrainPipelineFusedSparseDist[In, Out]):
         if len(self.batches) >= 2:
             # invoke data (values, lengths, etc.) all_to_all comms (second part of input_dist)
             self.wait_sparse_data_dist(self.contexts[1])
+
+        self.dequeue_batch()
+        return output
+
+    def _progress_prefetch(self, dataloader_iter: Iterator[In]) -> Out:
+        """
+        Overlap variant: forward(i) runs on the compute stream while lookup(i+1)
+        runs on the emb_lookup stream.
+
+        Invariant on entry: batches[0]'s input_dist is complete and its embedding
+        lookup has been primed (by fill_pipeline or the previous iteration's tail
+        prefetch).
+        """
+        # attach the model just in case the user forgets to call it, especially when the user
+        # pauses the pipeline.progress and detach the model for other purpose.
+        if not self._model_attached:
+            self.attach(self._model)
+
+        self.fill_pipeline(dataloader_iter)
+
+        if not self.batches:
+            raise StopIteration
+
+        # TODO: Remove once Bulk Eval migrated (needed for bwd compat, this class only)
+        self._set_module_context(self.contexts[0])
+
+        if self._model.training:
+            with record_function("## zero_grad ##"):
+                self._optimizer.zero_grad()
+
+        self._wait_for_batch()
+
+        if self._clear_data_dist_inputs:
+            self.clear_sparse_data_dist_inputs(self.contexts[0])
+
+        if len(self.batches) >= 2:
+            # invoke splits all_to_all comms (first part of input_dist for i+1)
+            self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+
+        # batch i+2: load data and copy to gpu, the dataload iter will first exhaust here
+        self.enqueue_batch(dataloader_iter)
+
+        # forward batch i FIRST, on the compute stream. It only depends on
+        # lookup(i), which was already primed, so issuing it before the prefetch
+        # keeps it off the input_dist critical path.
+        with record_function(f"## eval {self.contexts[0].index} ##"):
+            with torch.no_grad():
+                losses, output = self._model_fwd(self.batches[0])
+
+        if len(self.batches) >= 2:
+            # complete input_dist (second a2a) for i+1, then prefetch its embedding
+            # lookup on the emb_lookup stream so it overlaps forward(i) above.
+            self.wait_sparse_data_dist(self.contexts[1])
+            # pyrefly: ignore [bad-argument-type]
+            self.start_embedding_lookup(self.batches[1], self.contexts[1])
 
         self.dequeue_batch()
         return output
