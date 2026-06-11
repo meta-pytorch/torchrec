@@ -10,7 +10,7 @@
 from typing import List
 
 import torch
-from torch.fx.experimental.symbolic_shapes import guard_size_oblivious
+from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
 
 USE_TORCHDYNAMO_COMPILING_PATH: bool = False
 
@@ -66,9 +66,9 @@ def pt2_checks_tensor_slice(
     if torch.jit.is_scripting() or not is_pt2_compiling():
         return
 
-    torch._check_is_size(start_offset)
-    torch._check_is_size(end_offset)
-    torch._check_is_size(end_offset - start_offset)
+    torch._check(start_offset >= 0)
+    torch._check(end_offset >= 0)
+    torch._check(end_offset - start_offset >= 0)
     torch._check(start_offset <= tensor.size(dim))
     torch._check(end_offset <= tensor.size(dim))
     torch._check(end_offset >= start_offset)
@@ -79,7 +79,7 @@ def pt2_checks_all_is_size(x: List[int]) -> List[int]:
         return x
 
     for i in x:
-        torch._check_is_size(i)
+        torch._check(i >= 0)
     return x
 
 
@@ -92,8 +92,15 @@ def pt2_check_size_nonzero(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
-def pt2_guard_size_oblivious(x: bool) -> bool:
+def pt2_guard_or_false(x: bool) -> bool:
     if torch.jit.is_scripting() or not is_pt2_compiling():
         return x
 
-    return guard_size_oblivious(x)
+    return guard_or_false(x)
+
+
+def pt2_guard_or_true(x: bool) -> bool:
+    if torch.jit.is_scripting() or not is_pt2_compiling():
+        return x
+
+    return guard_or_true(x)
