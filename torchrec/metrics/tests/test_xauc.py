@@ -14,6 +14,7 @@ from typing import Dict
 from unittest.mock import patch
 
 import torch
+import torch._dynamo
 from torchrec.metrics.metrics_config import DefaultTaskInfo
 from torchrec.metrics.xauc import XAUCMetric
 
@@ -82,7 +83,17 @@ class XAUCMetricTest(unittest.TestCase):
 
         model_output = generate_model_output()
         fullgraph_compile = functools.partial(torch.compile, fullgraph=True)
-        with patch.object(torch, "compile", fullgraph_compile):
+        # torchmetrics.Metric.update() increments the integer ``_update_count``
+        # nn.Module attribute on every call. By default torch.compile specializes
+        # on integer module attributes, so each update sees a new value and
+        # triggers a recompile, exceeding ``recompile_limit`` after a few
+        # iterations (the test was failing with FailOnRecompileLimitHit under
+        # fullgraph=True). Treat integer module attributes as dynamic so the
+        # changing _update_count no longer forces recompiles, and assert that the
+        # recompile limit is never hit so this stays a regression guard.
+        with patch.object(torch, "compile", fullgraph_compile), patch.object(
+            torch._dynamo.config, "allow_unspec_int_on_nn_module", True
+        ), patch.object(torch._dynamo.config, "fail_on_recompile_limit_hit", True):
             xauc_compile = XAUCMetric(
                 world_size=WORLD_SIZE,
                 my_rank=0,
