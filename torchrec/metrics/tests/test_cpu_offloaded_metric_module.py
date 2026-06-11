@@ -20,6 +20,8 @@ import torch.distributed as dist
 from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 from torchrec.metrics.cpu_offloaded_metric_module import (
+    _foreach_clone_dict,
+    _foreach_clone_kwargs,
     _merge_update_jobs,
     CPUOffloadedRecMetricModule,
     MetricUpdateJob,
@@ -1649,6 +1651,56 @@ class MergeUpdateJobsTest(unittest.TestCase):
         ]
         merged = _merge_update_jobs(jobs)
         self.assertEqual(merged.kwargs.get("required_inputs"), {})
+
+
+class ForeachCloneTest(unittest.TestCase):
+    def test_int_tensors_clone_without_autograd_error(self) -> None:
+        d = {
+            "labels": torch.tensor([0, 1, 0], dtype=torch.int64),
+            "weights": torch.tensor([1.0, 1.0, 1.0], requires_grad=True),
+        }
+        out = _foreach_clone_dict(d)
+        self.assertEqual(out["labels"].dtype, torch.int64)
+        self.assertEqual(out["weights"].dtype, torch.float32)
+        torch.testing.assert_close(out["labels"], d["labels"])
+        torch.testing.assert_close(out["weights"], d["weights"])
+        self.assertFalse(out["weights"].requires_grad)
+
+    def test_kwargs_with_int_required_inputs(self) -> None:
+        kwargs = {
+            "required_inputs": {
+                "feature_id": torch.tensor([1, 2, 3], dtype=torch.int32),
+            },
+            "scale": torch.tensor([0.5], requires_grad=True),
+        }
+        out = _foreach_clone_kwargs(kwargs)
+        self.assertEqual(out["required_inputs"]["feature_id"].dtype, torch.int32)
+        torch.testing.assert_close(
+            out["required_inputs"]["feature_id"],
+            kwargs["required_inputs"]["feature_id"],
+        )
+        self.assertFalse(out["scale"].requires_grad)
+
+    def test_dict_clone_independent_of_caller_mutation(self) -> None:
+        """Reproduces the Pyper metric_update_reorder staleness bug at the helper
+        level: caller mutates the source tensor in place after we clone, and the
+        clone must still hold the pre-mutation value. Without _foreach_clone the
+        snapshot would be a reference and silently observe the new value."""
+        src = {
+            "predictions": torch.tensor([1.0, 2.0, 3.0]),
+            "labels": torch.tensor([0, 1, 0], dtype=torch.int64),
+        }
+        snapshot = _foreach_clone_dict(src)
+        # Caller overwrites the underlying storage (like Pyper's pre-allocated
+        # model_out buffer being reused for the next iteration).
+        src["predictions"].zero_()
+        src["labels"].fill_(7)
+        torch.testing.assert_close(
+            snapshot["predictions"], torch.tensor([1.0, 2.0, 3.0])
+        )
+        torch.testing.assert_close(
+            snapshot["labels"], torch.tensor([0, 1, 0], dtype=torch.int64)
+        )
 
 
 if __name__ == "__main__":
