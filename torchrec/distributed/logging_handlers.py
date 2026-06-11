@@ -46,6 +46,7 @@ class TorchrecComponent(Enum):
     REC_METRICS = "rec_metrics"
     ITEP = "itep"
     DISTRIBUTED_MODEL_PARALLEL = "distributed_model_parallel"
+    ALBT = "albt"
 
 
 class EventLoggingHandler(EventLoggingHandlerBase):
@@ -516,6 +517,64 @@ def log_proposer_result(
     best_perf_rating: Optional[float] = None,
     is_winning_proposer: bool = False,
     technique: OptimizationTechnique = OptimizationTechnique.NONE,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_enablement(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_schedule_conversion(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_warning(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_error(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+    error_message: Optional[str] = None,
+    stack_trace: Optional[str] = None,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_stage_transition(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_validation_success(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
+) -> None:
+    """No-op OSS stub."""
+    pass
+
+
+def log_albt_schedule_stage(
+    metadata: Optional[Dict[str, str]] = None,
+    technique: OptimizationTechnique = OptimizationTechnique.ALBT,
 ) -> None:
     """No-op OSS stub."""
     pass
