@@ -37,6 +37,7 @@ from torchrec.distributed.benchmark.base import (
     cmd_conf,
 )
 from torchrec.distributed.collective_utils import create_on_rank_and_share_result
+from torchrec.distributed.memory_stashing import chunked_copy_
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     run_multi_process_func,
@@ -1070,12 +1071,13 @@ def copy_engine_contention(
     """
     Test copy engine contention between two streams issuing PCIe transfers.
 
-    h2d_stream: 3 consecutive large H2D copies (saturates copy engine)
+    h2d_stream: one large H2D transfer split into ``trunk_count`` trunks via
+                ``chunked_copy_`` (saturates copy engine)
     main stream: 1 small D2H copy + 2 small H2D copies (interleaved with
                  small compute ops)
 
-    When dummy_compute=True, a tiny compute op (tensor.add_(1)) is inserted
-    between each large H2D copy on the h2d_stream, testing whether the copy
+    When dummy_compute=True, ``chunked_copy_`` inserts a tiny compute op
+    (tensor.add_(1)) between trunks on the h2d_stream, testing whether the copy
     engine treats back-to-back copies differently from compute-separated ones.
     """
     small_size = 1024
@@ -1085,14 +1087,16 @@ def copy_engine_contention(
         h2d_stream = torch.cuda.Stream()
 
     with record_function("## allocate tensors ##"):
-        # 3 large H2D sources for h2d_stream (pinned CPU → GPU)
-        large_h2d_sources = [
-            torch.full(
-                (num_concat * dim // 5, dim),
-                fill_value=float(ctx.rank + i + 1),
-            ).pin_memory()
-            for i in range(trunk_count)
-        ]
+        # One large H2D source (pinned CPU -> GPU), copied in trunks via
+        # chunked_copy_. The chunk size is one trunk, so the transfer is split
+        # into ``trunk_count`` back-to-back copies on the copy engine.
+        trunk_rows = num_concat * dim // 5
+        large_h2d_source = torch.full(
+            (trunk_count * trunk_rows, dim),
+            fill_value=float(ctx.rank + 1),
+        ).pin_memory()
+        large_h2d_device = torch.empty_like(large_h2d_source, device=ctx.device)
+        trunk_size_bytes = trunk_rows * dim * large_h2d_source.element_size()
 
         # 1 small D2H source on GPU
         d2h_source = torch.full(
@@ -1111,19 +1115,17 @@ def copy_engine_contention(
     with record_function("## pre-copy compute ##"):
         _compute(dim=dim, num_mul=num_mul * 5, num_concat=num_concat, ctx=ctx)
 
-    # --- h2d_stream: 3 consecutive large H2D copies ---
-    with record_function("## 3x large h2d on h2d_stream ##"):
-        large_h2d_devices = []
+    # --- h2d_stream: one large H2D copy, trunked via chunked_copy_ ---
+    with record_function("## large trunked h2d on h2d_stream ##"):
         with torch.cuda.stream(h2d_stream):
-            dummy_tensor = torch.empty(1, device=ctx.device)
             h2d_stream.wait_stream(main_stream)
-            for i, src in enumerate(large_h2d_sources):
-                with record_function(f"## large h2d {i} ##"):
-                    t = src.to(ctx.device, non_blocking=True)
-                    t.record_stream(main_stream)
-                    large_h2d_devices.append(t)
-                    if dummy_compute:
-                        dummy_tensor.add_(1)
+            chunked_copy_(
+                large_h2d_device,
+                large_h2d_source,
+                chunk_size_bytes=trunk_size_bytes,
+                dummy_compute=dummy_compute,
+            )
+            large_h2d_device.record_stream(main_stream)
 
     # --- main stream: compute, small d2h, compute, small h2d, compute, small h2d ---
     with record_function("## small compute 0 ##"):
@@ -1151,16 +1153,8 @@ def copy_engine_contention(
         h2d_stream.synchronize()
         torch.cuda.synchronize()
 
-        # validate large H2D copies
-        large_correct = all(
-            bool(
-                torch.allclose(
-                    large_h2d_devices[i],
-                    torch.full_like(large_h2d_devices[i], float(ctx.rank + i + 1)),
-                )
-            )
-            for i in range(trunk_count)
-        )
+        # validate large H2D copy
+        large_correct = bool(torch.all(large_h2d_device == float(ctx.rank + 1)).item())
 
         # validate small D2H copy
         d2h_correct = bool(torch.all(d2h_cpu_buffer == float(ctx.rank + 10)).item())
@@ -1204,6 +1198,28 @@ def copy_engine_contention_dummy_compute(
         num_concat=num_concat,
         ctx=ctx,
         dummy_compute=True,
+    )
+
+
+def copy_engine_contention_dummy_compute_10x_trunk(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    # Same as copy_engine_contention_dummy_compute but with 10x the trunk count
+    # (3 -> 30), so each trunk is smaller and the dummy compute op fires far
+    # more often between trunks on the copy engine.
+    return copy_engine_contention(
+        _batch_inputs=_batch_inputs,
+        dim=dim,
+        num_mul=num_mul,
+        num_concat=num_concat,
+        ctx=ctx,
+        dummy_compute=True,
+        trunk_count=30,
     )
 
 
@@ -1513,6 +1529,8 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = copy_engine_contention
             case "copy_engine_contention_dummy_compute":
                 func = copy_engine_contention_dummy_compute
+            case "copy_engine_contention_dummy_compute_10x_trunk":
+                func = copy_engine_contention_dummy_compute_10x_trunk
             case "h2d_execution_order":
                 func = h2d_execution_order
             case "a2a_d2h_contention":
