@@ -2097,6 +2097,29 @@ class JaggedTensorAllToAll(Awaitable[JaggedTensor]):
         super().__init__()
         self._workers: int = pg.size()
 
+        # Object-pool lengths AllToAll. The received lengths are written
+        # verbatim into ShardedKeyedJaggedTensorPool._key_lengths, so a
+        # corrupted / desynced AllToAll (e.g. int32-overflowed splits at small
+        # world sizes) silently poisons the pool and only crashes much later in
+        # lookup as a negative dimension in jagged_index_select. Mirror the
+        # int32-overflow guards already on the embedding AllToAll paths; these
+        # are a no-op unless TORCHREC_OVERFLOW_DEBUG=1. See T273509522 /
+        # T118141711.
+        lengths_input_splits = _safe_tolist(num_items_to_send)
+        lengths_output_splits = _safe_tolist(num_items_to_receive)
+        _check_int_overflow(
+            "JaggedTensorAllToAll",
+            lengths_input_splits,
+            "lengths input_splits (num_items_to_send, BEFORE AllToAll)",
+            workers=self._workers,
+        )
+        _check_int_overflow(
+            "JaggedTensorAllToAll",
+            lengths_output_splits,
+            "lengths output_splits (num_items_to_receive, BEFORE AllToAll)",
+            workers=self._workers,
+        )
+
         self._dist_lengths: torch.Tensor = torch.empty(
             sum(num_items_to_receive),
             device=jt.lengths().device,
@@ -2106,11 +2129,27 @@ class JaggedTensorAllToAll(Awaitable[JaggedTensor]):
         dist.all_to_all_single(
             self._dist_lengths,
             jt.lengths(),
-            output_split_sizes=_safe_tolist(num_items_to_receive),
-            input_split_sizes=_safe_tolist(num_items_to_send),
+            output_split_sizes=lengths_output_splits,
+            input_split_sizes=lengths_input_splits,
             group=pg,
             async_op=False,
         )
+
+        # The lengths AllToAll above is blocking, so self._dist_lengths is
+        # populated here. Surface out-of-range received lengths (negative or
+        # overflowed) at the source rather than as a downstream negative-dim
+        # crash. Gated on the debug env var so the min/max device sync only runs
+        # when explicitly debugging, keeping the default path sync-free.
+        if _TORCHREC_OVERFLOW_DEBUG and self._dist_lengths.numel() > 0:
+            _check_int_overflow(
+                "JaggedTensorAllToAll",
+                [
+                    int(self._dist_lengths.min()),
+                    int(self._dist_lengths.max()),
+                ],
+                "received lengths min/max (AFTER AllToAll)",
+                workers=self._workers,
+            )
 
         # below will calculate chunks sums e.g.
         # num_batches_to_receive = [2,2]
@@ -2125,6 +2164,12 @@ class JaggedTensorAllToAll(Awaitable[JaggedTensor]):
                 dist_id_offsets,
                 self._dist_lengths,
             )
+        )
+        _check_int_overflow(
+            "JaggedTensorAllToAll",
+            value_output_splits,
+            "value output_splits (BEFORE AllToAll)",
+            workers=self._workers,
         )
 
         self._dist_values: torch.Tensor = torch.empty(
@@ -2141,6 +2186,12 @@ class JaggedTensorAllToAll(Awaitable[JaggedTensor]):
                 id_offsets,
                 jt.lengths(),
             )
+        )
+        _check_int_overflow(
+            "JaggedTensorAllToAll",
+            value_input_splits,
+            "value input_splits (BEFORE AllToAll)",
+            workers=self._workers,
         )
 
         # pyrefly: ignore

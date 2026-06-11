@@ -25,6 +25,52 @@ from torchrec.sparse.jagged_tensor import JaggedTensor
 torch.fx.wrap("jagged_index_select_with_empty")
 
 
+def _assert_valid_key_lengths(
+    key_lengths: torch.Tensor,
+    feature_max_lengths: torch.Tensor,
+) -> None:
+    """Fail fast if KJT-pool key lengths are out of range before they are stored.
+
+    The row-wise ``ShardedKeyedJaggedTensorPool.update()`` path receives lengths
+    via an all-to-all (``torchrec.distributed.dist_data.JaggedTensorAllToAll``)
+    and writes them verbatim into ``_key_lengths``. A corrupted or desynced
+    all-to-all silently yields out-of-range lengths (e.g. +/-2**31 from an int32
+    overflow at small world sizes), which only blow up much later in ``lookup()``
+    as a negative dimension in ``jagged_index_select_2d_forward_v2``. Validating
+    here converts that silent corruption into an immediate, actionable error at
+    the write site.
+
+    This runs only in ``update()`` (training-time pool refresh), never in the
+    scripted inference ``lookup()`` path. See T273509522 (and the 2022 precedent
+    T118141711).
+
+    Args:
+        key_lengths (torch.Tensor): 2D ``(num_ids, num_features)`` tensor of
+            per-feature lengths about to be written into ``_key_lengths``.
+        feature_max_lengths (torch.Tensor): 1D ``(num_features,)`` tensor of the
+            configured maximum length for each feature.
+    """
+    if key_lengths.numel() == 0:
+        return
+    # Single device->host sync: lengths must be non-negative and within the
+    # configured per-feature maxima (an invariant already enforced on the input
+    # side by _update_preproc, so this never fires in a healthy run).
+    valid = torch.logical_and(
+        (key_lengths >= 0).all(),
+        (key_lengths <= feature_max_lengths).all(),
+    )
+    if not bool(valid):
+        raise RuntimeError(
+            "ShardedKeyedJaggedTensorPool.update received out-of-range key "
+            "lengths after the update all-to-all: "
+            f"min={int(key_lengths.min())}, "
+            f"per-feature max={key_lengths.max(dim=0).values.tolist()}, "
+            f"configured per-feature max={feature_max_lengths.tolist()}. This "
+            "indicates a corrupted or desynced update all-to-all (negative or "
+            "overflowed lengths), not a usage error. See T273509522."
+        )
+
+
 class KeyedJaggedTensorPoolLookup(abc.ABC, torch.nn.Module):
     """
     Abstract base class for KeyedJaggedTensor pool lookups
@@ -55,6 +101,7 @@ class KeyedJaggedTensorPoolLookup(abc.ABC, torch.nn.Module):
     _is_weighted: bool
     _total_lengths: int
     _total_lengths_t: torch.Tensor
+    _feature_max_lengths_t: torch.Tensor
     _key_lengths: torch.Tensor
     _jagged_lengths: torch.Tensor
     _jagged_offsets: torch.Tensor
@@ -74,6 +121,13 @@ class KeyedJaggedTensorPoolLookup(abc.ABC, torch.nn.Module):
         self._total_lengths = sum(self._feature_max_lengths.values())
         self._total_lengths_t = torch.tensor(
             [self._total_lengths], device=device, dtype=torch.int32
+        )
+        # Per-feature max lengths, used to validate post-all-to-all lengths in
+        # update() before they are written into _key_lengths (see T273509522).
+        self._feature_max_lengths_t = torch.tensor(
+            list(self._feature_max_lengths.values()),
+            device=device,
+            dtype=torch.int32,
         )
         self._is_weighted = is_weighted
 
@@ -254,11 +308,10 @@ class TensorJaggedIndexSelectLookup(KeyedJaggedTensorPoolLookup):
     def update(self, ids: torch.Tensor, values: JaggedTensor) -> None:
 
         with record_function("## TensorPool update ##"):
-            key_lengths = (
-                values.lengths().view(-1, len(self._feature_max_lengths))
-                # pyrefly: ignore[no-matching-overload]
-                .sum(axis=1)
-            )
+            key_lengths_2d = values.lengths().view(-1, len(self._feature_max_lengths))
+            _assert_valid_key_lengths(key_lengths_2d, self._feature_max_lengths_t)
+            # pyrefly: ignore[no-matching-overload]
+            key_lengths = key_lengths_2d.sum(axis=1)
             key_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(key_lengths)
 
             padded_values = torch.ops.fbgemm.jagged_to_padded_dense(
@@ -269,11 +322,7 @@ class TensorJaggedIndexSelectLookup(KeyedJaggedTensorPoolLookup):
             )
 
             self._values[ids] = padded_values.to(self._values.dtype)
-            self._key_lengths[ids] = (
-                values.lengths()
-                .view(-1, len(self._feature_max_lengths))
-                .to(self._key_lengths.dtype)
-            )
+            self._key_lengths[ids] = key_lengths_2d.to(self._key_lengths.dtype)
 
             if values.weights_or_none() is not None:
                 padded_weights = torch.ops.fbgemm.jagged_to_padded_dense(
@@ -403,11 +452,10 @@ class UVMCachingInt64Lookup(KeyedJaggedTensorPoolLookup):
 
     def update(self, ids: torch.Tensor, values: JaggedTensor) -> None:
         with record_function("## UVMCachingInt64Lookup update ##"):
-            key_lengths = (
-                values.lengths().view(-1, len(self._feature_max_lengths))
-                # pyrefly: ignore[no-matching-overload]
-                .sum(axis=1)
-            )
+            key_lengths_2d = values.lengths().view(-1, len(self._feature_max_lengths))
+            _assert_valid_key_lengths(key_lengths_2d, self._feature_max_lengths_t)
+            # pyrefly: ignore[no-matching-overload]
+            key_lengths = key_lengths_2d.sum(axis=1)
             key_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(key_lengths)
             padded_values: torch.Tensor = torch.ops.fbgemm.jagged_to_padded_dense(
                 values.values(),
@@ -425,11 +473,7 @@ class UVMCachingInt64Lookup(KeyedJaggedTensorPoolLookup):
 
             self._tbe_state[ids] = state
 
-            self._key_lengths[ids] = (
-                values.lengths()
-                .view(-1, len(self._feature_max_lengths))
-                .to(self._key_lengths.dtype)
-            )
+            self._key_lengths[ids] = key_lengths_2d.to(self._key_lengths.dtype)
 
     def states_to_register(self) -> Iterator[Tuple[str, torch.Tensor]]:
         yield "values_upper_and_lower_bits", self._tbe_state
@@ -542,11 +586,10 @@ class UVMCachingInt32Lookup(KeyedJaggedTensorPoolLookup):
 
     def update(self, ids: torch.Tensor, values: JaggedTensor) -> None:
         with record_function("## UVMCachingInt32Lookup update##"):
-            key_lengths = (
-                values.lengths().view(-1, len(self._feature_max_lengths))
-                # pyrefly: ignore[no-matching-overload]
-                .sum(axis=1)
-            )
+            key_lengths_2d = values.lengths().view(-1, len(self._feature_max_lengths))
+            _assert_valid_key_lengths(key_lengths_2d, self._feature_max_lengths_t)
+            # pyrefly: ignore[no-matching-overload]
+            key_lengths = key_lengths_2d.sum(axis=1)
             key_offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(key_lengths)
             state = torch.ops.fbgemm.jagged_to_padded_dense(
                 values.values(),
@@ -557,11 +600,7 @@ class UVMCachingInt32Lookup(KeyedJaggedTensorPoolLookup):
 
             self._tbe_state[ids] = state
 
-            self._key_lengths[ids] = (
-                values.lengths()
-                .view(-1, len(self._feature_max_lengths))
-                .to(self._key_lengths.dtype)
-            )
+            self._key_lengths[ids] = key_lengths_2d.to(self._key_lengths.dtype)
 
     def states_to_register(self) -> Iterator[Tuple[str, torch.Tensor]]:
         yield "values", self._tbe_state

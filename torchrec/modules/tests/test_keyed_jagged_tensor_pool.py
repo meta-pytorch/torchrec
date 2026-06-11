@@ -10,7 +10,11 @@ import unittest
 
 import torch
 from torchrec.modules.keyed_jagged_tensor_pool import KeyedJaggedTensorPool
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.modules.object_pool_lookups import (
+    _assert_valid_key_lengths,
+    TensorJaggedIndexSelectLookup,
+)
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 class KeyedJaggedTensorPoolTest(unittest.TestCase):
@@ -366,3 +370,94 @@ class KeyedJaggedTensorPoolTest(unittest.TestCase):
             kjt.lengths().cpu(),
             torch.tensor([], dtype=torch.int, device=torch.device("cpu")),
         )
+
+
+class KeyedJaggedTensorPoolLengthValidationTest(unittest.TestCase):
+    """Regression coverage for T273509522.
+
+    A corrupted / desynced row-wise update all-to-all delivers out-of-range key
+    lengths (negative or +/-2**31 overflow) that used to be written silently
+    into ``_key_lengths`` and only crash much later in ``lookup()`` as a
+    negative dimension in ``jagged_index_select``. ``update()`` must now reject
+    them at the write site.
+    """
+
+    def test_assert_valid_key_lengths_accepts_valid(self) -> None:
+        feature_max_lengths_t = torch.tensor([2, 4], dtype=torch.int32)
+        # In-range lengths (including 0 and the per-feature max) must pass.
+        _assert_valid_key_lengths(
+            torch.tensor([[1, 3], [2, 0], [0, 4]], dtype=torch.int32),
+            feature_max_lengths_t,
+        )
+        # An empty batch is a no-op (e.g. a rank that received nothing).
+        _assert_valid_key_lengths(
+            torch.zeros((0, 2), dtype=torch.int32), feature_max_lengths_t
+        )
+
+    def test_assert_valid_key_lengths_rejects_negative(self) -> None:
+        feature_max_lengths_t = torch.tensor([2, 4], dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "out-of-range key lengths"):
+            _assert_valid_key_lengths(
+                torch.tensor([[1, -7], [2, 0]], dtype=torch.int32),
+                feature_max_lengths_t,
+            )
+
+    def test_assert_valid_key_lengths_rejects_over_max(self) -> None:
+        feature_max_lengths_t = torch.tensor([2, 4], dtype=torch.int32)
+        # f1 length 5 exceeds its configured max of 2.
+        with self.assertRaisesRegex(RuntimeError, "out-of-range key lengths"):
+            _assert_valid_key_lengths(
+                torch.tensor([[5, 1]], dtype=torch.int32), feature_max_lengths_t
+            )
+
+    def test_assert_valid_key_lengths_rejects_overflow_magnitude(self) -> None:
+        # The actual bug signature: lengths at the +/-2**31 int32 boundary.
+        feature_max_lengths_t = torch.tensor([2, 4], dtype=torch.int32)
+        with self.assertRaisesRegex(RuntimeError, "out-of-range key lengths"):
+            _assert_valid_key_lengths(
+                torch.tensor([[2_115_462_454, -2_133_429_463]], dtype=torch.int32),
+                feature_max_lengths_t,
+            )
+
+    def test_update_rejects_corrupted_lengths(self) -> None:
+        device = (
+            torch.device("cpu")
+            if not torch.cuda.is_available()
+            else torch.device("cuda:0")
+        )
+        lookup = TensorJaggedIndexSelectLookup(
+            pool_size=4,
+            values_dtype=torch.int64,
+            feature_max_lengths={"f1": 2, "f2": 4},
+            is_weighted=False,
+            device=device,
+        )
+        # One id, two features: f1 length 5 exceeds its configured max of 2 -
+        # exactly the kind of out-of-range length a corrupted update all-to-all
+        # would deliver. update() must reject it instead of storing garbage.
+        corrupted = JaggedTensor(
+            values=torch.arange(6, dtype=torch.int64, device=device),
+            lengths=torch.tensor([5, 1], dtype=torch.int, device=device),
+        )
+        with self.assertRaisesRegex(RuntimeError, "out-of-range key lengths"):
+            lookup.update(torch.tensor([0], device=device), corrupted)
+
+    def test_update_accepts_valid_lengths(self) -> None:
+        device = (
+            torch.device("cpu")
+            if not torch.cuda.is_available()
+            else torch.device("cuda:0")
+        )
+        lookup = TensorJaggedIndexSelectLookup(
+            pool_size=4,
+            values_dtype=torch.int64,
+            feature_max_lengths={"f1": 2, "f2": 4},
+            is_weighted=False,
+            device=device,
+        )
+        # In-range update must not raise (guards against false positives).
+        valid = JaggedTensor(
+            values=torch.arange(3, dtype=torch.int64, device=device),
+            lengths=torch.tensor([2, 1], dtype=torch.int, device=device),
+        )
+        lookup.update(torch.tensor([0], device=device), valid)
