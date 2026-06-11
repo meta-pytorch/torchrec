@@ -137,12 +137,36 @@ conda env config vars set -n ${CONDA_ENV}  \
 #     export PYTORCH_CUDA_PKG="pytorch-cuda=${MATRIX_GPU_ARCH_VERSION}"
 # fi
 
-conda run -n "${CONDA_ENV}" pip install torch --index-url "$PYTORCH_URL"
-
-# install fbgemm
-conda run -n "${CONDA_ENV}" pip install fbgemm-gpu --index-url "$PYTORCH_URL"
+if [[ ${MATRIX_CHANNEL} = 'nightly' ]]; then
+    # Nightly: torch and fbgemm-gpu nightlies share a daily build cadence, so
+    # installing the latest of each keeps them ABI-compatible. Versions use
+    # dev/date formats that the X+5 mapping can't parse, so don't pin.
+    conda run -n "${CONDA_ENV}" pip install torch --index-url "$PYTORCH_URL"
+    conda run -n "${CONDA_ENV}" pip install fbgemm-gpu --index-url "$PYTORCH_URL"
+else
+    # Release/test: a published fbgemm_gpu release is ABI-locked to a specific
+    # torch (fbgemm 1.X is built against torch 2.(X+5)). The latest stable torch
+    # can be NEWER than the latest fbgemm release (e.g. torch 2.12 vs fbgemm 1.6),
+    # which crashes on import with:
+    #   fbgemm_gpu_config.so: undefined symbol: ..._ZNR5torch7Library4_defE...
+    # So install fbgemm-gpu FIRST, then pin torch to the version that matches the
+    # fbgemm that actually got installed (derive it, don't trust version.txt,
+    # which may name a release whose binaries aren't published yet).
+    conda run -n "${CONDA_ENV}" pip install fbgemm-gpu --index-url "$PYTORCH_URL"
+    INSTALLED_FBGEMM_VERSION=$(conda run -n "${CONDA_ENV}" pip show fbgemm_gpu | grep Version | cut -d' ' -f2)
+    COMPATIBLE_TORCH_VERSION=$(get_expected_torch_version "$INSTALLED_FBGEMM_VERSION")
+    if [[ $? -ne 0 ]]; then
+        echo "Failed to determine compatible torch version for fbgemm_gpu=$INSTALLED_FBGEMM_VERSION"
+        exit 1
+    fi
+    echo "Installed fbgemm_gpu=$INSTALLED_FBGEMM_VERSION -> pinning torch==${COMPATIBLE_TORCH_VERSION}.*"
+    conda run -n "${CONDA_ENV}" pip install "torch==${COMPATIBLE_TORCH_VERSION}.*" --index-url "$PYTORCH_URL"
+fi
 
 # install other requirements
+# NOTE: requirements.txt has a floating 'fbgemm-gpu>=1.4.0'; fbgemm_gpu is
+# already installed above and satisfies it, so pip will not re-resolve/upgrade
+# it here (no --upgrade), preserving the torch<->fbgemm pairing chosen above.
 conda run -n "${CONDA_ENV}" pip install -r requirements.txt
 
 # install torchrec
@@ -201,8 +225,18 @@ if [[ ${MATRIX_GPU_ARCH_VERSION} != '12.6' ]]; then
 fi
 
 echo "checking pypi release"
-conda run -n "${CONDA_ENV}" pip install torch
+# Same ABI rule as above, but for the PyPI index: install fbgemm_gpu first, then
+# pin torch to the version matching the installed fbgemm (fbgemm 1.X -> torch
+# 2.(X+5)) so the pair is never ABI-incompatible.
 conda run -n "${CONDA_ENV}" pip install fbgemm-gpu
+PYPI_FBGEMM_VERSION=$(conda run -n "${CONDA_ENV}" pip show fbgemm_gpu | grep Version | cut -d' ' -f2)
+PYPI_COMPATIBLE_TORCH_VERSION=$(get_expected_torch_version "$PYPI_FBGEMM_VERSION")
+if [[ $? -ne 0 ]]; then
+    echo "Failed to determine compatible torch version for fbgemm_gpu=$PYPI_FBGEMM_VERSION"
+    exit 1
+fi
+echo "PyPI fbgemm_gpu=$PYPI_FBGEMM_VERSION -> pinning torch==${PYPI_COMPATIBLE_TORCH_VERSION}.*"
+conda run -n "${CONDA_ENV}" pip install "torch==${PYPI_COMPATIBLE_TORCH_VERSION}.*"
 conda run -n "${CONDA_ENV}" pip install torchrec
 
 # Validate all package versions for PyPI release
