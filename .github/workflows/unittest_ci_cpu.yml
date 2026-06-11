@@ -102,15 +102,34 @@ jobs:
           index_url=https://download.pytorch.org/whl/${{ inputs.channel }}/cpu
         fi
         echo "index_url: $index_url"
-        conda run -n build_binary \
-          pip install torch --index-url $index_url
+        # For release/test channels, a published fbgemm_gpu release is ABI-locked
+        # to a specific torch (fbgemm 1.X is built against torch 2.(X+5)); the
+        # latest stable torch can be newer than the latest fbgemm release (e.g.
+        # torch 2.12 vs fbgemm 1.6) and crash on import with
+        # "fbgemm_gpu_config.so: undefined symbol: ..._ZNR5torch7Library4_defE...".
+        # So install fbgemm-gpu first and pin torch to the version matching the
+        # fbgemm that actually installed. Nightly stays floating (torch/fbgemm
+        # nightlies share a daily cadence; their dev/date versions can't be mapped).
+        if [[ "${{ inputs.channel }}" = "release" || "${{ inputs.channel }}" = "test" ]]; then
+          conda run -n build_binary \
+            pip install fbgemm-gpu --index-url $index_url
+          fbgemm_ver=$(conda run -n build_binary pip show fbgemm_gpu | grep Version | cut -d' ' -f2)
+          fbgemm_minor=$(echo "$fbgemm_ver" | cut -d'.' -f2)
+          compat_torch="2.$((fbgemm_minor + 5))"
+          echo "Installed fbgemm_gpu=$fbgemm_ver -> pinning torch==${compat_torch}.*"
+          conda run -n build_binary \
+            pip install "torch==${compat_torch}.*" --index-url $index_url
+        else
+          conda run -n build_binary \
+            pip install torch --index-url $index_url
+          conda run -n build_binary \
+            pip install fbgemm-gpu --index-url $index_url
+        fi
         conda run -n build_binary \
           python -c "import torch; print(torch.__version__)"
         echo "torch succeeded"
         conda run -n build_binary \
           python -c "import torch.distributed"
-        conda run -n build_binary \
-          pip install fbgemm-gpu --index-url $index_url
         conda run -n build_binary \
           python -c "import fbgemm_gpu; print(fbgemm_gpu.__version__)"
         echo "fbgemm_gpu succeeded"
