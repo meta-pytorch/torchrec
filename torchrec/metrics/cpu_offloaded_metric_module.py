@@ -847,7 +847,14 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                     computed_metrics = self._process_metric_compute_job(job)
                     job.future.set_result(computed_metrics)
             except Exception as e:
-                logger.warning(f"Ignoring error during shutdown flush: {e}")
+                if isinstance(job, MetricComputeJob):
+                    self._compute_errors += 1
+                else:
+                    self._update_errors += 1
+                if not self._captured_exception_event.is_set():
+                    self._captured_exception = e
+                    self._captured_exception_event.set()
+                logger.warning(f"Error during shutdown flush: {e}")
                 if (
                     isinstance(job, (SynchronizationMarker, MetricComputeJob))
                     and not job.future.done()

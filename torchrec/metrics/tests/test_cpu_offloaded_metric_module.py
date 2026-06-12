@@ -682,6 +682,38 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         self.assertEqual(items_processed, 2)
         self.assertTrue(test_queue.empty())
 
+    def test_flush_remaining_work_surfaces_exception(self) -> None:
+        """Flush-path exceptions must bump _update_errors and capture the first
+        exception. Otherwise shutdown logs `updates_match=False, update_errors=0`
+        with no traceback, hiding the real cause."""
+        test_queue = queue.Queue()
+        for _ in range(3):
+            test_queue.put(
+                MetricUpdateJob(
+                    model_out={
+                        "task1-prediction": torch.tensor([0.5]),
+                        "task1-label": torch.tensor([0.7]),
+                        "task1-weight": torch.tensor([1.0]),
+                    },
+                    kwargs={},
+                )
+            )
+
+        with patch.object(
+            self.cpu_module,
+            "_process_metric_update_job",
+            side_effect=RuntimeError("flush-time failure"),
+        ):
+            # pyrefly: ignore[bad-argument-type]
+            items_processed = self.cpu_module._flush_remaining_work(test_queue)
+
+        self.assertEqual(items_processed, 3)
+        self.assertEqual(self.cpu_module._update_errors, 3)
+        self.assertEqual(self.cpu_module._compute_errors, 0)
+        self.assertTrue(self.cpu_module._captured_exception_event.is_set())
+        self.assertIsInstance(self.cpu_module._captured_exception, RuntimeError)
+        self.assertEqual(str(self.cpu_module._captured_exception), "flush-time failure")
+
     def _run_dtoh_transfer_test(self, use_cuda: bool) -> None:
         offloaded_metric = MockRecMetric(
             world_size=self.world_size,
