@@ -135,6 +135,43 @@ def _merge_update_jobs(jobs: list[MetricUpdateJob]) -> MetricUpdateJob:
     )
 
 
+def _foreach_clone_dict(d: Mapping[str, Any]) -> Dict[str, Any]:
+    """Batched clone of tensor values; one PyBind crossing for N tensors."""
+    tensor_keys: list[str] = []
+    tensor_values: list[torch.Tensor] = []
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        if isinstance(v, torch.Tensor):
+            tensor_keys.append(k)
+            tensor_values.append(v)
+        else:
+            out[k] = v
+    if tensor_values:
+        # no_grad bypasses the autograd dispatch on _foreach_clone, which
+        # rejects integer dtypes (e.g., int labels/required_inputs).
+        with torch.no_grad():
+            cloned = torch._foreach_clone(tensor_values)
+        for k, t in zip(tensor_keys, cloned):
+            out[k] = t
+    return out
+
+
+def _foreach_clone_kwargs(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in kwargs.items():
+        if isinstance(v, dict):
+            out[k] = _foreach_clone_dict(v)
+        else:
+            out[k] = v
+    top_keys = [k for k, v in out.items() if isinstance(v, torch.Tensor)]
+    if top_keys:
+        with torch.no_grad():
+            cloned = torch._foreach_clone([out[k] for k in top_keys])
+        for k, t in zip(top_keys, cloned):
+            out[k] = t
+    return out
+
+
 class CPUOffloadedRecMetricModule(RecMetricModule):
     """
     RecMetricModule that offloads metric update() and compute() to CPU using background threads.
@@ -303,11 +340,14 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             assert self._captured_exception is not None
             raise self._captured_exception
 
+        snapshot_model_out = _foreach_clone_dict(model_out)
+        snapshot_kwargs = _foreach_clone_kwargs(kwargs)
+
         try:
             self.update_queue.put_nowait(
                 MetricUpdateJob(
-                    model_out=model_out,
-                    kwargs=kwargs,
+                    model_out=snapshot_model_out,
+                    kwargs=snapshot_kwargs,
                 )
             )
             self._total_updates_enqueued += 1
