@@ -35,6 +35,90 @@ def _tensor_size_text(tensor: Union[List[torch.Tensor], torch.Tensor]) -> str:
     return f"{size_mb / 1024:.2f} GB"
 
 
+def chunked_copy_(
+    dst: torch.Tensor,
+    src: torch.Tensor,
+    chunk_size_bytes: int = 512 * 1024**2,  # 512 MiB
+    non_blocking: bool = True,
+    dummy_compute: bool = True,
+) -> None:
+    """Copy ``src`` into ``dst`` in byte-bounded chunks to ease copy-engine contention.
+
+    A single bulk ``copy_`` (an H2D restore or a D2H stash) saturates the CUDA
+    copy engine until it finishes, serializing every same-direction copy from
+    other streams behind it (see the ``copy_engine_execution_order`` study).
+    Splitting the transfer into chunks of at most ``chunk_size_bytes`` bytes —
+    with a tiny dummy compute op enqueued between chunks — breaks the back-to-back
+    readiness of consecutive same-stream copies, so the copy engine yields
+    between chunks and lets other streams slip their (typically small) copies
+    into the gaps. This reduces, but does not eliminate, the contention latency.
+
+    The copy runs on the current CUDA stream; wrap the call in
+    ``with torch.cuda.stream(...)`` to target a specific stream.
+
+    Args:
+        dst: Destination tensor, written in place.
+        src: Source tensor with the same number of elements and dtype as ``dst``.
+        chunk_size_bytes: Maximum size of each chunk in bytes (default 512 MiB).
+            Values <= 0 disable chunking and fall back to a single un-chunked
+            ``copy_``.
+        non_blocking: Passed through to each per-chunk ``copy_`` for async DMA.
+        dummy_compute: If True, enqueue a tiny ``add_`` between chunks so the
+            copy engine yields to other streams. The study shows chunking alone
+            does not yield — under current-stream-first scheduling consecutive
+            same-stream copies run back-to-back as one uninterrupted block.
+
+    Note:
+        ``dst`` and ``src`` must be contiguous so that flat 1-D slicing aliases
+        their storage; non-contiguous tensors fall back to a single ``copy_``.
+    """
+    if dst.numel() != src.numel():
+        raise ValueError(
+            f"chunked_copy_ size mismatch: dst has {dst.numel()} elements, "
+            f"src has {src.numel()}"
+        )
+
+    numel = dst.numel()
+
+    # Fall back to a plain copy when chunking is disabled, the tensor is empty,
+    # or the layout cannot be safely flattened into an aliasing view.
+    if (
+        chunk_size_bytes <= 0
+        or numel == 0
+        or not dst.is_contiguous()
+        or not src.is_contiguous()
+    ):
+        dst.copy_(src, non_blocking=non_blocking)
+        return
+
+    chunk_elems = max(1, chunk_size_bytes // dst.element_size())
+    if chunk_elems >= numel:
+        dst.copy_(src, non_blocking=non_blocking)
+        return
+
+    dst_flat = dst.view(-1)
+    src_flat = src.view(-1)
+
+    # Reused single-element scratch tensor for the inter-chunk dummy op, so we
+    # do not allocate per chunk. Allocate it directly on the GPU side of the
+    # transfer (dst for H2D, src for D2H).
+    # Citrine C3: create the scratch tensor directly on device, not on CPU.
+    cuda_device = dst.device if dst.is_cuda else src.device if src.is_cuda else None
+    dummy = (
+        torch.ones(1, device=cuda_device)
+        if dummy_compute and cuda_device is not None
+        else None
+    )
+
+    for start in range(0, numel, chunk_elems):
+        end = min(start + chunk_elems, numel)
+        dst_flat[start:end].copy_(src_flat[start:end], non_blocking=non_blocking)
+        # Break same-stream copy readiness so the copy engine checks other
+        # streams before the next chunk runs (no dummy op after the last chunk).
+        if dummy is not None and end < numel:
+            dummy.add_(1)
+
+
 class MemoryStashingManager:
     """
     Class-level manager that holds shared resources (streams, threads, etc.)

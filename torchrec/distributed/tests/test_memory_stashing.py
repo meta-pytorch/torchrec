@@ -7,19 +7,22 @@
 
 # pyre-strict
 
+import math
 import unittest
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
+import hypothesis.strategies as st
 import torch
+from hypothesis import given, settings
 from torch import nn
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
-from torchrec.distributed.memory_stashing import MemoryStashingManager
+from torchrec.distributed.memory_stashing import chunked_copy_, MemoryStashingManager
 from torchrec.modules.embedding_configs import DataType, PoolingType
 
 
@@ -912,6 +915,180 @@ class TestEmsConfigWiring(unittest.TestCase):
                 eb_config.stash_weights,
                 f"{eb_config.name} should have stash_weights=False when EMS disabled",
             )
+
+
+def _expected_num_chunks(numel: int, element_size: int, chunk_size_bytes: int) -> int:
+    """Mirror chunked_copy_'s chunk arithmetic to predict the per-chunk op count."""
+    chunk_elems = max(1, chunk_size_bytes // element_size)
+    return math.ceil(numel / chunk_elems)
+
+
+def _filled(
+    shape: Tuple[int, ...], dtype: torch.dtype, device: torch.device
+) -> torch.Tensor:
+    """Create a deterministically-filled tensor of the given dtype/device."""
+    if dtype.is_floating_point:
+        return torch.randn(shape, device=device).to(dtype)
+    return torch.randint(-1000, 1000, shape, dtype=dtype, device=device)
+
+
+class ChunkedCopyTest(unittest.TestCase):
+    """Tests for chunked_copy_ exercising real cross-device (H2D / D2H) transfers.
+
+    ``chunked_copy_`` exists to chunk host<->device copies, so every test moves
+    data between CPU and CUDA (src and dst on different devices) rather than
+    CPU->CPU. Requires a GPU; skipped otherwise.
+    """
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = torch.device("cuda:0")
+
+    def _src_dst(
+        self, shape: Tuple[int, ...], dtype: torch.dtype, direction: str
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build (src, dst) on opposite devices for the given direction."""
+        host = _filled(shape, dtype, torch.device("cpu"))
+        if direction == "h2d":  # CPU src -> CUDA dst
+            return host.pin_memory(), torch.zeros(
+                shape, dtype=dtype, device=self.device
+            )
+        # d2h: CUDA src -> CPU dst
+        return host.to(self.device), torch.zeros(shape, dtype=dtype).pin_memory()
+
+    @given(
+        direction=st.sampled_from(["h2d", "d2h"]),
+        dtype=st.sampled_from(
+            [torch.float32, torch.float16, torch.float64, torch.int32]
+        ),
+        dims=st.lists(st.integers(min_value=1, max_value=64), min_size=1, max_size=3),
+        chunk_size_bytes=st.sampled_from([256, 1024, 65536, 1024**2]),
+    )
+    @settings(max_examples=100, deadline=None)
+    def test_numerical_correctness_h2d_and_d2h(
+        self,
+        direction: str,
+        dtype: torch.dtype,
+        dims: List[int],
+        chunk_size_bytes: int,
+    ) -> None:
+        """Chunked H2D/D2H copy reproduces the source bit-for-bit across shapes."""
+        src, dst = self._src_dst(tuple(dims), dtype, direction)
+        chunked_copy_(dst, src, chunk_size_bytes=chunk_size_bytes)
+        torch.cuda.synchronize()
+        # Exact match: copy_ between same dtype is lossless.
+        self.assertTrue(torch.equal(dst.cpu(), src.cpu()))
+
+    def test_default_chunk_size_copies_correctly(self) -> None:
+        """Calling without chunk_size_bytes uses the default and copies correctly."""
+        src, dst = self._src_dst((10000,), torch.float32, "h2d")
+        chunked_copy_(dst, src)  # no chunk_size_bytes -> use default
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(dst.cpu(), src.cpu()))
+
+    def test_h2d_in_place_and_location(self) -> None:
+        """H2D writes dst in place and keeps it on the GPU (no realloc)."""
+        src, dst = self._src_dst((50000,), torch.float32, "h2d")
+        ptr_before = dst.data_ptr()
+
+        # 64 KiB chunks -> many chunks, exercising the loop + dummy compute.
+        chunked_copy_(dst, src, chunk_size_bytes=64 * 1024, dummy_compute=True)
+        torch.cuda.synchronize()
+
+        self.assertTrue(dst.is_cuda)
+        self.assertEqual(dst.data_ptr(), ptr_before)
+        self.assertEqual(dst.shape, src.shape)
+        self.assertEqual(dst.dtype, src.dtype)
+        self.assertTrue(torch.equal(dst.cpu(), src.cpu()))
+
+    def test_d2h_in_place_and_location(self) -> None:
+        """D2H writes dst in place and keeps it on the host."""
+        src, dst = self._src_dst((50000,), torch.float32, "d2h")
+        ptr_before = dst.data_ptr()
+
+        chunked_copy_(dst, src, chunk_size_bytes=64 * 1024, dummy_compute=True)
+        torch.cuda.synchronize()
+
+        self.assertFalse(dst.is_cuda)
+        self.assertEqual(dst.data_ptr(), ptr_before)
+        self.assertTrue(torch.equal(dst, src.cpu()))
+
+    def test_source_is_not_mutated(self) -> None:
+        """Copying does not modify the source tensor (including with dummy_compute)."""
+        src, dst = self._src_dst((1000,), torch.float32, "h2d")
+        src_snapshot = src.clone()
+        chunked_copy_(dst, src, chunk_size_bytes=1024, dummy_compute=True)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(src, src_snapshot))
+
+    def test_size_mismatch_raises(self) -> None:
+        """Mismatched element counts raise ValueError."""
+        dst = torch.zeros(100, device=self.device)
+        src = torch.randn(99)
+        with self.assertRaises(ValueError):
+            chunked_copy_(dst, src, chunk_size_bytes=1024)
+
+    def test_zero_and_negative_chunk_size_copies_correctly(self) -> None:
+        """chunk_size_bytes <= 0 disables chunking but still copies correctly."""
+        for chunk_size_bytes in (0, -1):
+            with self.subTest(nbytes=chunk_size_bytes):
+                src, dst = self._src_dst((1000,), torch.float32, "h2d")
+                chunked_copy_(dst, src, chunk_size_bytes=chunk_size_bytes)
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(dst.cpu(), src.cpu()))
+
+    def test_empty_tensor_is_noop(self) -> None:
+        """Empty tensors copy without error and stay empty."""
+        src = torch.randn(0, device=self.device)
+        dst = torch.zeros(0)
+        chunked_copy_(dst, src, chunk_size_bytes=1024)
+        self.assertEqual(dst.numel(), 0)
+
+    def test_non_contiguous_stays_correct(self) -> None:
+        """Non-contiguous dst/src (fallback path) still copy correctly across devices."""
+        # Non-contiguous CPU source (transposed view) -> contiguous CUDA dst.
+        src = torch.randn(20, 10).t()
+        dst = torch.zeros(10, 20, device=self.device)
+        self.assertFalse(src.is_contiguous())
+        chunked_copy_(dst, src, chunk_size_bytes=256)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(dst.cpu(), src))
+
+        # Non-contiguous CUDA destination (transposed view) <- contiguous CPU src.
+        src2 = torch.randn(10, 20)
+        dst2 = torch.zeros(20, 10, device=self.device).t()
+        self.assertFalse(dst2.is_contiguous())
+        chunked_copy_(dst2, src2, chunk_size_bytes=256)
+        torch.cuda.synchronize()
+        self.assertTrue(torch.equal(dst2.cpu(), src2))
+
+    def test_dummy_compute_count_matches_chunks(self) -> None:
+        """With dummy_compute, exactly (num_chunks - 1) add_ ops are enqueued."""
+        numel = 50000
+        src, dst = self._src_dst((numel,), torch.float32, "h2d")
+        chunk_size_bytes = 64 * 1024
+        expected_chunks = _expected_num_chunks(
+            numel, dst.element_size(), chunk_size_bytes
+        )
+        self.assertGreater(expected_chunks, 1)
+
+        real_add = torch.Tensor.add_
+        add_calls: List[int] = []
+
+        def counting_add(self: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
+            add_calls.append(1)
+            return real_add(self, *args, **kwargs)
+
+        with patch.object(torch.Tensor, "add_", counting_add):
+            chunked_copy_(
+                dst, src, chunk_size_bytes=chunk_size_bytes, dummy_compute=True
+            )
+        torch.cuda.synchronize()
+
+        # A dummy op sits between consecutive chunks: one fewer than chunk count.
+        self.assertEqual(len(add_calls), expected_chunks - 1)
+        self.assertTrue(torch.equal(dst.cpu(), src.cpu()))
 
 
 if __name__ == "__main__":
