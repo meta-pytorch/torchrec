@@ -10,6 +10,7 @@ RunOptions:
   profile_dir: "."
   name: "sparse_data_dist_mpzch"
   num_float_features: 1000
+  loglevel: "info"
 PipelineConfig:
   pipeline: "sparse"
 ModelInputConfig:

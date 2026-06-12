@@ -1033,14 +1033,6 @@ def _run_cuda_profiling(
     """Run optional CUDA profiling with chrome trace export and memory snapshot."""
 
     def _trace_handler(prof: torch.profiler.profile) -> None:
-        try:
-            # pyrefly: ignore[missing-attribute]
-            total_avg = prof.profiler.total_average()
-            logger.info(f" TOTAL_AVERAGE:\n{name}\n{total_avg}")
-        except RecursionError:
-            logger.warning(
-                f"Skipping total_average for {name} due to deep profiler event tree"
-            )
         if not all_rank_traces and rank > 0:
             # only save trace for rank 0 when all_rank_traces is disabled
             return

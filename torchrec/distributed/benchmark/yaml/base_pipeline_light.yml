@@ -2,8 +2,8 @@
 # runs on 2 ranks, showing traces with reasonable workloads
 RunOptions:
   world_size: 2
-  num_batches: 10
-  num_benchmarks: 1
+  num_batches: 20
+  num_benchmarks: 5
   num_profiles: 1
   sharding_type: table_wise
   profile_dir: "."

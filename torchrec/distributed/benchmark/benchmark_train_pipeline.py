@@ -357,6 +357,9 @@ def run_pipeline(
     metric_config: RecMetricConfig,
 ) -> BenchmarkResult:
     tables, weighted_tables, *_ = table_config.generate_tables()
+    table_extended_config = TableExtendedConfigs(
+        mc_configs=table_config.mc_configs_per_table,
+    )
 
     benchmark_res_per_rank = run_multi_process_func(
         func=runner,
@@ -370,6 +373,7 @@ def run_pipeline(
         planner_config=planner_config,
         sharding_config=sharding_config,
         metric_config=metric_config,
+        table_related_configs=table_extended_config,
     )
 
     # Combine results from all ranks into a single BenchmarkResult
@@ -418,26 +422,18 @@ def main(
 
         attach_debugger()
 
-    tables, weighted_tables, *_ = table_config.generate_tables()
-    table_extended_config = TableExtendedConfigs(
-        mc_configs=table_config.mc_configs_per_table,
-    )
     model_config = model_selection.create_model_config()
 
     # launch trainers
-    run_multi_process_func(
-        func=runner,
-        world_size=run_option.world_size,
-        tables=tables,
-        weighted_tables=weighted_tables,
+    run_pipeline(
         run_option=run_option,
-        model_config=model_config,
+        table_config=table_config,
         pipeline_config=pipeline_config,
+        model_config=model_config,
         input_config=input_config,
         planner_config=planner_config,
         sharding_config=sharding_config,
         metric_config=metric_config,
-        table_related_configs=table_extended_config,
     )
 
 

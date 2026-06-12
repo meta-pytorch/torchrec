@@ -7,8 +7,8 @@
 #     --yaml_config=fbcode/torchrec/distributed/benchmark/yaml/metric_scaling_prod.yml
 RunOptions:
   world_size: 2
-  num_batches: 10
-  num_benchmarks: 3
+  num_batches: 20
+  num_benchmarks: 5
   num_profiles: 1
   num_iters: 100
   profile_dir: "."
