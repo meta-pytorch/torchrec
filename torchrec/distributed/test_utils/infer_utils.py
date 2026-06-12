@@ -158,13 +158,13 @@ class KJTInputExportDynamicShapeWrapper(torch.nn.Module):
         # Generate unbacked symints to represent sizes
         # for values and weights, constrain them reasonably
         values_size = values[0].item()
-        torch._check_is_size(values_size)
+        torch._check_is_size(cast(int, values_size))
         torch._check(values_size >= lengths.shape[0])
         # pyrefly: ignore[no-matching-overload]
         values = torch.ones(values_size).to(values.device)
         if weights is not None:
             weights_size = weights.int()[0].item()
-            torch._check_is_size(weights_size)
+            torch._check_is_size(cast(int, weights_size))
             torch._check(weights_size >= lengths.shape[0])
             # pyrefly: ignore[no-matching-overload]
             weights = torch.ones(weights_size).to(weights.device)
