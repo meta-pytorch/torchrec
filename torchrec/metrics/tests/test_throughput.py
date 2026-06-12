@@ -217,6 +217,70 @@ class ThroughputMetricTest(unittest.TestCase):
             },
         )
 
+    @patch(THROUGHPUT_PATH + ".time.monotonic")
+    def test_set_num_batch_selects_resumed_stage(self, time_mock: Mock) -> None:
+        # Seeding _num_batch (e.g. after an ALBT preemption resume) must select
+        # the batch_size_stage matching the resumed position instead of
+        # rewinding to the first stage.
+        time_mock.return_value = 1
+        batch_size_stages = [
+            BatchSizeStage(256, 10),
+            BatchSizeStage(512, 20),
+            BatchSizeStage(1024, None),
+        ]
+        throughput_metric = ThroughputMetric(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_seconds=100,
+            batch_size_stages=batch_size_stages,
+        )
+
+        # Resume in the middle stage (10 < num_batch <= 20).
+        throughput_metric.set_num_batch(15)
+        self.assertEqual(throughput_metric._num_batch, 15)
+
+        # The first update() of the resumed run pre-increments to 16, which is
+        # still within the second stage -> reports 512, not 256.
+        throughput_metric.update()
+        self.assertEqual(
+            throughput_metric.compute()["throughput-throughput|batch_size"],
+            512,
+        )
+
+    @patch(THROUGHPUT_PATH + ".time.monotonic")
+    def test_set_num_batch_resumes_into_final_stage(self, time_mock: Mock) -> None:
+        time_mock.return_value = 1
+        batch_size_stages = [BatchSizeStage(256, 1), BatchSizeStage(512, None)]
+        throughput_metric = ThroughputMetric(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_seconds=100,
+            batch_size_stages=batch_size_stages,
+        )
+
+        # Resume well past the first stage (max_iters=1).
+        throughput_metric.set_num_batch(5)
+        throughput_metric.update()
+        self.assertEqual(
+            throughput_metric.compute()["throughput-throughput|batch_size"],
+            512,
+        )
+
+    def test_set_num_batch_without_batch_size_stages_is_noop(self) -> None:
+        # Without batch_size_stages (non-ALBT job) set_num_batch must be a no-op:
+        # the metric never tracks _num_batch and keeps the default batch size.
+        throughput_metric = ThroughputMetric(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            window_seconds=100,
+            batch_size_stages=None,
+        )
+
+        throughput_metric.set_num_batch(100)
+
+        self.assertFalse(hasattr(throughput_metric, "_num_batch"))
+        self.assertEqual(throughput_metric._get_batch_size(), self.batch_size)
+
     def test_num_batch_without_batch_size_stages(self) -> None:
         # Create the module without the batch_size_stages
         throughput_metric = ThroughputMetric(
