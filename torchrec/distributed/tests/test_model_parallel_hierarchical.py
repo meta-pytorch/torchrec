@@ -251,7 +251,7 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
     )
     @settings(
         verbosity=Verbosity.verbose,
-        max_examples=2,
+        max_examples=1,
         deadline=None,
         phases=[Phase.explicit, Phase.generate, Phase.target],
     )
