@@ -95,6 +95,32 @@ except Exception:
 
 logger: logging.Logger = logging.getLogger()
 
+
+def _check_pg_for_nccl_error(pg: dist.ProcessGroup) -> None:
+    """Raise if the ProcessGroup has been flagged with an NCCL timeout or error."""
+    try:
+        backend = pg._get_backend(torch.device("cuda"))
+    except RuntimeError:
+        # RuntimeError: cannot get cuda device for cpu machines
+        # Exit gracefully
+        torch._C._log_api_usage_once(
+            "_check_pg_for_nccl_error: could not get cuda backend"
+        )
+        return
+    if not hasattr(backend, "get_error"):
+        return
+    error = backend.get_error()
+    if error != torch._C._distributed_c10d.ErrorType.SUCCESS:
+        pg_name = pg.group_name
+        pg_desc = pg.group_desc
+        raise RuntimeError(
+            f"NCCL error detected on ProcessGroup "
+            f"(name={pg_name}, desc={pg_desc}, error={error}). "
+            f"Aborting to prevent silent data corruption "
+            f"from collective failure."
+        )
+
+
 _INT32_MAX: int = 2_147_483_647
 _INT64_MAX: int = 9_223_372_036_854_775_807
 
@@ -430,6 +456,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         collective_tag_parts: Optional[Tuple[object, ...]] = None,
     ) -> None:
         super().__init__()
+        self._pg: dist.ProcessGroup = pg
         self.num_workers: int = pg.size()
         self._collective_tag = collective_tag
         self._collective_tag_parts = collective_tag_parts
@@ -564,6 +591,12 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
             self._splits_awaitable.wait()
 
         ret = _safe_tolist_2d(self._output_tensor.view(self.num_workers, -1).T)
+
+        # After .tolist() the CPU has blocked on the GPU.  If a prior
+        # collective timed out the watchdog will have flagged the PG by now.
+        # Check before the overflow validation below so we report "NCCL
+        # timeout" instead of a misleading "int32 overflow on garbage data".
+        _check_pg_for_nccl_error(self._pg)
 
         # Validate collective tag if present. The validation block itself is
         # skipped under torch.compile: .tolist() returns unbacked symints, so
