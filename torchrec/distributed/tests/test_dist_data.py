@@ -22,6 +22,7 @@ from typing import (
     TypeVar,
     Union,
 )
+from unittest.mock import MagicMock
 
 import hypothesis.strategies as st
 import torch
@@ -30,6 +31,7 @@ import torchrec.distributed.collective_utils as cu
 from hypothesis import given, settings
 from pyre_extensions import none_throws
 from torchrec.distributed.dist_data import (
+    _check_pg_for_nccl_error,
     _collective_tag_from,
     _get_recat,
     JaggedTensorAllToAll,
@@ -2426,3 +2428,84 @@ class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
             world_size=2,
             backend="gloo",
         )
+
+
+# Convenience alias for the c10d ErrorType enum used by the NCCL guard.
+_ErrorType = torch._C._distributed_c10d.ErrorType
+
+
+def _make_mock_pg(
+    backend: object,
+    *,
+    backend_raises: bool = False,
+    group_name: str = "splits_a2a_pg",
+    group_desc: str = "kjt_splits_collective",
+) -> MagicMock:
+    """Build a mock ProcessGroup for _check_pg_for_nccl_error.
+
+    No real ProcessGroup / NCCL / GPU is involved. ``pg._get_backend`` returns
+    ``backend`` (or raises RuntimeError when ``backend_raises`` is set, mimicking
+    a CPU-only host that cannot resolve a cuda backend).
+    """
+    pg = MagicMock(spec=dist.ProcessGroup)
+    pg.group_name = group_name
+    pg.group_desc = group_desc
+    if backend_raises:
+        pg._get_backend.side_effect = RuntimeError(
+            "cannot get cuda device for cpu machines"
+        )
+    else:
+        pg._get_backend.return_value = backend
+    return pg
+
+
+class CheckPgForNcclErrorTest(unittest.TestCase):
+    """Deterministic fault-injection tests for the ``_check_pg_for_nccl_error``
+    guard added to ``dist_data.py``. These run with mocks only -- no real
+    ProcessGroup, NCCL, GPU, or distributed init."""
+
+    def test_raises_on_non_success_error(self) -> None:
+        """backend.get_error() returns a non-SUCCESS ErrorType -> RuntimeError
+        is raised, and the message carries the pg name, desc, and error."""
+        backend = MagicMock()
+        backend.get_error.return_value = _ErrorType.TIMEOUT
+        pg = _make_mock_pg(backend, group_name="my_pg_name", group_desc="my_pg_desc")
+
+        with self.assertRaisesRegex(
+            RuntimeError, "NCCL error detected on ProcessGroup"
+        ) as cm:
+            _check_pg_for_nccl_error(pg)
+
+        message = str(cm.exception)
+        self.assertIn("my_pg_name", message)
+        self.assertIn("my_pg_desc", message)
+        self.assertIn("TIMEOUT", message)
+        self.assertIn("silent data corruption", message)
+        backend.get_error.assert_called_once()
+
+    def test_no_raise_on_success(self) -> None:
+        """backend.get_error() returns SUCCESS -> the guard does NOT raise."""
+        backend = MagicMock()
+        backend.get_error.return_value = _ErrorType.SUCCESS
+        pg = _make_mock_pg(backend)
+
+        # Should return None without raising.
+        self.assertIsNone(_check_pg_for_nccl_error(pg))
+        backend.get_error.assert_called_once()
+
+    def test_no_raise_when_backend_has_no_get_error(self) -> None:
+        """Backend lacks a get_error attribute (e.g. gloo) -> graceful no-op.
+
+        ``object()`` has no ``get_error`` attribute, so ``hasattr`` is False."""
+        backend = object()
+        pg = _make_mock_pg(backend)
+
+        self.assertIsNone(_check_pg_for_nccl_error(pg))
+
+    def test_no_raise_when_get_backend_raises(self) -> None:
+        """pg._get_backend raises RuntimeError (cpu / no-cuda host) -> the guard
+        swallows it and returns gracefully."""
+        pg = _make_mock_pg(backend=None, backend_raises=True)
+
+        self.assertIsNone(_check_pg_for_nccl_error(pg))
+        pg._get_backend.assert_called_once()
