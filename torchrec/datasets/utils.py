@@ -13,13 +13,25 @@ import random
 from dataclasses import dataclass
 from functools import partial
 from io import IOBase
-from typing import Any, Callable, Iterable, Iterator, List, Sequence, Tuple, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    List,
+    Sequence,
+    Tuple,
+    TYPE_CHECKING,
+    TypeVar,
+)
 
 import torch
-from iopath.common.file_io import PathManager, PathManagerFactory
 from torch.utils.data import functional_datapipe, get_worker_info, IterDataPipe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Pipelineable
+
+if TYPE_CHECKING:
+    from iopath.common.file_io import PathManager
 
 PATH_MANAGER_KEY = "torchrec"
 
@@ -241,7 +253,15 @@ class LoadFiles(IterDataPipe[Tuple[str, "IOBase"]]):
         #       `argument_validation` with this DataPipe may be potentially broken
         self.length: int = length
         self.open_kw = open_kw
-        self.path_manager: PathManager = PathManagerFactory().get(path_manager_key)
+        try:
+            from iopath.common.file_io import PathManagerFactory
+        except ImportError as e:
+            raise ImportError(
+                "iopath is required for dataset file loading. "
+                "Install with: pip install torchrec[datasets] or pip install iopath"
+            ) from e
+
+        self.path_manager: "PathManager" = PathManagerFactory().get(path_manager_key)
         self.path_manager.set_strict_kwargs_checking(False)
 
     # Remove annotation due to 'IOBase' is a general type and true type

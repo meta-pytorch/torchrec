@@ -10,12 +10,22 @@
 import os
 import shutil
 import time
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    TYPE_CHECKING,
+    Union,
+)
 
 import numpy as np
 import torch
 import torch.utils.data.datapipes as dp
-from iopath.common.file_io import PathManager, PathManagerFactory
 from pyre_extensions import none_throws
 from torch.utils.data import IterableDataset, IterDataPipe
 from torchrec.datasets.utils import (
@@ -26,6 +36,27 @@ from torchrec.datasets.utils import (
     safe_cast,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+if TYPE_CHECKING:
+    from iopath.common.file_io import PathManager
+
+
+def _get_path_manager(path_manager_key: str) -> "PathManager":
+    """Lazily import iopath and return a PathManager for the given key.
+
+    iopath is an optional dependency only needed for dataset file loading;
+    raise a helpful error if it is not installed.
+    """
+    try:
+        from iopath.common.file_io import PathManagerFactory
+    except ImportError as e:
+        raise ImportError(
+            "iopath is required for dataset file loading. "
+            "Install with: pip install torchrec[datasets] or pip install iopath"
+        ) from e
+
+    return PathManagerFactory().get(path_manager_key)
+
 
 FREQUENCY_THRESHOLD = 3
 INT_FEATURE_COUNT = 13
@@ -257,7 +288,7 @@ class BinaryCriteoUtils:
         # To be consistent with dense and sparse.
         labels_np = labels_np.reshape((-1, 1))
 
-        path_manager = PathManagerFactory().get(path_manager_key)
+        path_manager = _get_path_manager(path_manager_key)
         for fname, arr in [
             (out_dense_file, dense_np),
             (out_sparse_file, sparse_np),
@@ -281,7 +312,7 @@ class BinaryCriteoUtils:
         Returns:
             shape (Tuple[int, ...]): Shape tuple.
         """
-        path_manager = PathManagerFactory().get(path_manager_key)
+        path_manager = _get_path_manager(path_manager_key)
         with path_manager.open(path, "rb") as fin:
             # pyrefly: ignore[implicit-import]
             np.lib.format.read_magic(fin)
@@ -382,7 +413,7 @@ class BinaryCriteoUtils:
             output (np.ndarray): numpy array with the desired range of data from the
                 supplied npy file.
         """
-        path_manager = PathManagerFactory().get(path_manager_key)
+        path_manager = _get_path_manager(path_manager_key)
         with path_manager.open(fname, "rb") as fin:
             # pyrefly: ignore[implicit-import]
             np.lib.format.read_magic(fin)
@@ -514,7 +545,7 @@ class BinaryCriteoUtils:
                     # Re-map sparse value to contiguous in place.
                     file_to_features[f][col][i] = sparse_to_contiguous_int[sparse]
 
-        path_manager = PathManagerFactory().get(path_manager_key)
+        path_manager = _get_path_manager(path_manager_key)
         for f, features in file_to_features.items():
             output_file = os.path.join(output_dir, f + output_file_suffix)
             with path_manager.open(output_file, "wb") as fout:
@@ -605,7 +636,7 @@ class BinaryCriteoUtils:
 
             curr_first_row = curr_last_row
 
-        path_manager = PathManagerFactory().get(path_manager_key)
+        path_manager = _get_path_manager(path_manager_key)
 
         # Save the full dataset
         if output_dir_full_set is not None:
@@ -750,7 +781,7 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         self.mmap_mode = mmap_mode
         self.hashes: np.ndarray = np.array(hashes).reshape((1, CAT_FEATURE_COUNT))
         self.path_manager_key = path_manager_key
-        self.path_manager: PathManager = PathManagerFactory().get(path_manager_key)
+        self.path_manager: "PathManager" = _get_path_manager(path_manager_key)
 
         if shuffle_training_set and stage == "train":
             self._shuffle_and_load_data_for_rank()
