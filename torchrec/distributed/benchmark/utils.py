@@ -300,7 +300,7 @@ def dump_benchmark_result(
 
     path = os.path.join(
         output_dir,
-        f"torchrec_benchmark_{result.short_name}_{result.rank}.json",
+        f"torchrec_benchmark_{result.short_name}_{result.rank}_{test_name}.json",
     )
     os.makedirs(output_dir, exist_ok=True)
     with open(path, "w") as fh:
