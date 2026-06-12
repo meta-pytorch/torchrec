@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import logging
 import os
 import queue
 import threading
@@ -1701,6 +1702,86 @@ class ForeachCloneTest(unittest.TestCase):
         torch.testing.assert_close(
             snapshot["labels"], torch.tensor([0, 1, 0], dtype=torch.int64)
         )
+
+
+class LoadStateDictDevicePinTest(unittest.TestCase):
+    """`load_state_dict` post-hook re-pins metric state to CPU after restore."""
+
+    def setUp(self) -> None:
+        self.tasks = gen_test_tasks(["task1"])
+        self.initial_states = create_tensor_states(["cross_entropy_sum"])
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["LOCAL_WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(get_free_port())
+        os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+        self.mock_metric = MockRecMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=1,
+            tasks=self.tasks,
+            initial_states=self.initial_states,
+        )
+        self.rec_metrics = RecMetricList([self.mock_metric])
+        dist.init_process_group("gloo")
+
+    def tearDown(self) -> None:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        if hasattr(self, "cpu_module"):
+            try:
+                self.cpu_module.shutdown()
+            except RecMetricException as e:
+                # shutdown() raises RecMetricException on thread-stuck / captured-exception paths;
+                # tearDown must not propagate (would mask the real test failure), but log so it's visible.
+                logging.warning(
+                    "CPUOffloadedRecMetricModule.shutdown() failed in tearDown: %s", e
+                )
+
+    def _make_module(self) -> CPUOffloadedRecMetricModule:
+        self.cpu_module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=1,
+            world_size=1,
+            rec_tasks=self.tasks,
+            rec_metrics=self.rec_metrics,
+        )
+        return self.cpu_module
+
+    def _get_first_state(self, module: CPUOffloadedRecMetricModule) -> torch.Tensor:
+        # pyrefly: ignore[bad-index]
+        first_comp = module.rec_metrics.rec_metrics[0]._metrics_computations[
+            0
+        ]  # pyre-ignore[16]
+        for attr_name in first_comp._reductions:  # pyre-ignore[16]
+            state = getattr(first_comp, attr_name, None)
+            if isinstance(state, torch.Tensor):
+                return state
+        self.fail("No tensor state found")
+
+    @unittest.skipIf(torch.cuda.device_count() < 1, "needs GPU")
+    def test_post_hook_moves_cuda_state_in_reductions_to_cpu(self) -> None:
+        cpu_module = self._make_module()
+        # pyrefly: ignore[bad-index]
+        first_comp = cpu_module.rec_metrics.rec_metrics[0]._metrics_computations[
+            0
+        ]  # pyre-ignore[16]
+        attr_name = next(iter(first_comp._reductions))  # pyre-ignore[16]
+        with torch.no_grad():
+            # Citrine C7: prefer .to("cuda") over deprecated .cuda()
+            setattr(first_comp, attr_name, getattr(first_comp, attr_name).to("cuda"))
+        self.assertEqual(getattr(first_comp, attr_name).device.type, "cuda")
+        CPUOffloadedRecMetricModule._move_state_to_cpu_after_load(cpu_module, None)
+        self.assertEqual(getattr(first_comp, attr_name).device.type, "cpu")
+
+    def test_post_hook_no_op_when_already_cpu(self) -> None:
+        cpu_module = self._make_module()
+        before = self._get_first_state(cpu_module).clone()
+        CPUOffloadedRecMetricModule._move_state_to_cpu_after_load(cpu_module, None)
+        after = self._get_first_state(cpu_module)
+        self.assertEqual(after.device.type, "cpu")
+        torch.testing.assert_close(before, after)
 
 
 if __name__ == "__main__":

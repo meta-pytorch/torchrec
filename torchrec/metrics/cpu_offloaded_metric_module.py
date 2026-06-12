@@ -285,6 +285,10 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         atexit.register(self.shutdown)
 
+        self.register_load_state_dict_post_hook(
+            CPUOffloadedRecMetricModule._move_state_to_cpu_after_load
+        )
+
         logger.info(
             f"CPUOffloadedRecMetricModule initialization complete with {model_out_device.type=}, {update_queue_size=}, {compute_queue_size=}."
         )
@@ -325,8 +329,8 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         self, model_out: Dict[str, torch.Tensor], **kwargs: Any
     ) -> None:
         """
-        Called during RecMetricModule.update(). Start a non-blocking transfer of
-        the model outputs and append a MetricUpdateJob to the update queue.
+        Called during RecMetricModule.update(). Snapshot the model outputs
+        via a single batched clone, then enqueue a MetricUpdateJob.
 
         Args:
             model_out: intermediate model outputs to be used for metric updates
@@ -937,3 +941,47 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         and is essentially "discarded" after compute().
         """
         pass
+
+    @staticmethod
+    def _move_state_to_cpu_after_load(
+        module: torch.nn.Module, incompatible_keys: Any
+    ) -> None:
+        """`load_state_dict` post-hook: move any non-CPU metric state back to CPU.
+
+        torchmetrics `add_state` stores state via `setattr` (not `register_buffer`),
+        and `_load_from_state_dict` writes loaded tensors the same way — so checkpoint
+        restores can deposit cuda state on a CPU-only metric, crashing the next
+        `update()`. Walk `_reductions` on each `RecMetricComputation` and move via
+        getattr/setattr.
+        """
+        if not isinstance(module, CPUOffloadedRecMetricModule):
+            return
+        moved = 0
+        with torch.no_grad():
+            for metric in module.rec_metrics.rec_metrics:
+                for comp in metric._metrics_computations:  # pyre-ignore[16]
+                    for attr_name in comp._reductions:
+                        state = getattr(comp, attr_name, None)
+                        if isinstance(state, torch.Tensor):
+                            if state.device.type != "cpu":
+                                setattr(comp, attr_name, state.cpu())
+                                moved += 1
+                        elif isinstance(state, list):
+                            list_moved = False
+                            new_list = []
+                            for x in state:
+                                if (
+                                    isinstance(x, torch.Tensor)
+                                    and x.device.type != "cpu"
+                                ):
+                                    new_list.append(x.cpu())
+                                    list_moved = True
+                                else:
+                                    new_list.append(x)
+                            if list_moved:
+                                setattr(comp, attr_name, new_list)
+                                moved += 1
+        if moved:
+            logger.info(
+                f"CPUOffloadedRecMetricModule: moved {moved} state tensors to CPU after load_state_dict"
+            )
