@@ -314,7 +314,165 @@ def h2d_data_copy(arg: H2DCopyConfig) -> None:
     run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
 
 
-####################################### backups ########################################
+def benchmark_stream_memory(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    multi_stream: bool = True,
+    preallocated: bool = False,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Consolidates the three multi-stream memory-footprint benchmarks. It overlaps an
+    H2D copy and an all-to-all with compute, and the flags select the strategy:
+      - single_stream     (multi_stream=False): copy and a2a on the main stream
+      - multi_stream       (multi_stream=True): copy on a side stream, a2a on a
+                            dedicated dist stream
+      - optimized          (multi_stream=True, preallocated=True): pre-allocated
+                            in-place copy on a side stream, and a2a on the main
+                            stream relying on NCCL's own async stream -- keeps the
+                            overlap without the extra reserved-memory footprint
+    """
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        data_copy_stream = torch.cuda.Stream() if multi_stream else nullcontext()
+        # the optimized variant lets dist.all_to_all_single use its own async stream,
+        # so a dedicated dist stream is only needed for the plain multi-stream case
+        data_dist_stream = (
+            torch.cuda.Stream() if multi_stream and not preallocated else nullcontext()
+        )
+        irrelevant_data = torch.rand(dim, dim, device=ctx.device) - 0.5
+
+        # the host to device data transfer will block cuda execution without the `pin_memory()`
+        host_data = (torch.rand(dim, dim) - 0.5).pin_memory()
+        if preallocated:
+            # pre-allocate on the main stream so the freed memory can be reused by it
+            device_data = torch.empty_like(host_data, device=ctx.device)
+        else:
+            # the .to() copy below allocates the device tensor on the copy stream
+            device_data = torch.empty(0, device=ctx.device)
+
+    with record_function("## irrelevant compute before h2d ##"):
+        pre_comms = _compute(
+            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=irrelevant_data
+        )
+
+    with record_function("## copy data to device ##"):
+        # use a separate stream to copy data to device, this will not block the main stream
+        with data_copy_stream:
+            if preallocated:
+                # in-place copy into the main-stream allocation
+                device_data.copy_(host_data, non_blocking=True)
+            else:
+                device_data = host_data.to(ctx.device, non_blocking=True)
+                if multi_stream:
+                    # record to the main stream so it isn't freed early on the copy stream
+                    device_data.record_stream(main_stream)
+
+    with record_function("## irrelevant compute after h2d ##"):
+        irrelevant_data = torch.rand(dim, dim, device=ctx.device) - 0.5
+        pre_comms = _compute(
+            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=irrelevant_data
+        )
+
+    with record_function("## pre-comms compute ##"):
+        if isinstance(data_copy_stream, torch.cuda.Stream):
+            # make sure the data copy is done before the pre-comms compute
+            main_stream.wait_stream(data_copy_stream)
+        pre_comms = _compute(
+            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=device_data
+        )
+
+    # the optimized variant runs a2a on the main stream (NCCL async); the others run
+    # it on data_dist_stream (a side stream when multi_stream)
+    checks: Optional[DeviceToHostTensorAwaitable] = None
+    with data_dist_stream:
+        with record_function("## all_to_all_single ##"):
+            if isinstance(data_dist_stream, torch.cuda.Stream):
+                # make sure the pre-comms compute is done before the comms
+                data_dist_stream.wait_stream(main_stream)
+            post_comms = torch.zeros_like(pre_comms)
+            req = dist.all_to_all_single(
+                output=post_comms,
+                input=pre_comms,
+                group=ctx.pg,
+                async_op=True,
+            )
+            if isinstance(data_dist_stream, torch.cuda.Stream):
+                # record to the main stream so it isn't freed early on the dist stream
+                post_comms.record_stream(main_stream)
+        if not preallocated:
+            with record_function("## a2a comm validation ##"):
+                # validate in the dist stream since there's no data dependency after
+                assert req is not None
+                req.wait()
+                checks = DeviceToHostTensorAwaitable(_validate(post_comms, ctx))
+
+    with record_function("## irrelevant compute after a2a ##"):
+        irrelevant_data = torch.rand(dim, dim, device=ctx.device) - 0.5
+        pre_comms = _compute(
+            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=irrelevant_data
+        )
+
+    if preallocated:
+        with record_function("## a2a comm validation ##"):
+            # this req.wait() can be wrapped into a LazyAwaitable
+            assert req is not None
+            req.wait()
+            # still want the compute on the main stream if possible
+            checks = DeviceToHostTensorAwaitable(_validate(post_comms, ctx))
+
+    with record_function("## post-comms compute ##"):
+        assert req is not None
+        req.wait()
+        post_comms = _compute(
+            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=post_comms[0]
+        )
+
+    with record_function("## assert ##"):
+        assert checks is not None
+        assert checks.item()
+
+
+@dataclass
+class StreamMemoryConfig(DataCopyConfig):
+    """
+    run commands:
+    1. single stream: copy + a2a on the main stream
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
+        --name=single_stream_memory \
+        --multi_stream=False
+
+    2. multi stream: copy on a side stream, a2a on a dedicated dist stream
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
+        --name=multi_stream_memory
+
+    3. optimized: pre-allocated in-place copy on a side stream, a2a on the main stream
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
+        --name=multi_stream_optimized \
+        --preallocated=True
+
+    use case:
+        study the CUDA memory footprint when overlapping an H2D copy and an
+        all-to-all with compute across streams. A side-stream copy/comm overlaps
+        well but inflates that stream's reserved memory; pre-allocating on the main
+        stream + in-place copy, and letting all_to_all_single use NCCL's own async
+        stream, keeps the overlap while avoiding the extra footprint.
+        see https://github.com/meta-pytorch/torchrec/pull/3480 for more details
+    """
+
+    memory_snapshot: bool = True
+    multi_stream: bool = True
+    preallocated: bool = False
+    func: Callable[..., None] = benchmark_stream_memory
+
+
+# pyrefly: ignore[missing-attribute]
+@_cc.register
+def stream_memory(arg: StreamMemoryConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
 
 
 if __name__ == "__main__":
