@@ -22,7 +22,6 @@ see README.md for more details
 """
 
 import logging
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -265,91 +264,6 @@ def a2a_async_twice(
         # again, make sure the device-to-host data transfer is done before the assertion
         ev_d2h.synchronize()
         assert checks1 and checks2
-
-
-def threading_copy(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-    multithreading: bool = True,
-    **_kwargs: Dict[str, Any],
-) -> None:
-    num_tensors = 512
-    dummy_dim = 256
-
-    with record_function("## setup ##"):
-        main_stream = torch.cuda.current_stream()
-        data_copy_stream = torch.cuda.Stream()
-
-        # create a list of small tensors on cpu, pinned for async H2D copy
-        host_tensors = [
-            torch.rand(dummy_dim, dummy_dim).pin_memory() for _ in range(num_tensors)
-        ]
-        # pre-allocate gpu memory so the copy thread only does .copy_()
-        device_tensors = [torch.empty_like(t, device=ctx.device) for t in host_tensors]
-
-        # large tensor on gpu for main-stream compute
-        irrelevant_data = torch.rand(dim, dim, device=ctx.device) - 0.5
-
-    def _copy_worker() -> None:
-        torch.cuda.set_device(ctx.device)
-        with torch.cuda.stream(data_copy_stream):
-            for i in range(num_tensors):
-                device_tensors[i].copy_(host_tensors[i], non_blocking=True)
-
-    # launch the copy via ThreadPoolExecutor
-    executor: ThreadPoolExecutor | None = None
-    future: Future | None = None
-    with record_function("## submit copy to executor ##"):
-        if multithreading:
-            executor = ThreadPoolExecutor(max_workers=1)
-            future = executor.submit(_copy_worker)
-        else:
-            _copy_worker()
-
-    # run slow gpu operations on the main stream — these should overlap with the copies
-    with record_function("## main stream compute (should overlap with copy) ##"):
-        for _ in range(num_mul):
-            irrelevant_data = _compute(
-                dim=dim, num_mul=1, num_concat=1, ctx=ctx, x=irrelevant_data
-            )
-
-    with record_function("## wait for executor future ##"):
-        if multithreading:
-            assert future is not None
-            future.result()
-            assert executor is not None
-            executor.shutdown(wait=False)
-
-    with record_function("## wait for copy stream ##"):
-        main_stream.wait_stream(data_copy_stream)
-
-    # use the copied data to prove it arrived correctly
-    with record_function("## use copied data ##"):
-        _ = _compute(
-            dim=dummy_dim, num_mul=1, num_concat=1, ctx=ctx, x=device_tensors[0]
-        )
-
-
-def single_thread_copy(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-    multithreading: bool = True,
-    **_kwargs: Dict[str, Any],
-):
-    return threading_copy(
-        _batch_inputs=_batch_inputs,
-        dim=dim,
-        num_mul=num_mul,
-        num_concat=num_concat,
-        ctx=ctx,
-        multithreading=False,
-    )
 
 
 def shared_memory_across_process(
@@ -655,93 +569,6 @@ def tolist_overlap_comms(
 
     with record_function("## assert ##"):
         assert checks.item()
-
-
-def data_copy_record_stream(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-    use_record_stream: bool = True,
-    **_kwargs: Dict[str, Any],
-) -> None:
-    """
-    Reproduce the record_stream bug fixed by D102202725.
-
-    Without record_stream(), resize_(0) lets the caching allocator reuse
-    HBM while an async D2H copy on a side stream is still in flight,
-    corrupting the copied data (NaN / wrong values).
-    """
-    with record_function("## setup ##"):
-        main_stream = torch.cuda.current_stream()
-        data_copy_stream = torch.cuda.Stream()
-
-        gpu_tensor = torch.full(
-            (num_concat * dim, dim),
-            fill_value=float(ctx.rank + 1),
-            device=ctx.device,
-        )
-        cpu_buffer = torch.empty_like(gpu_tensor, device="cpu").pin_memory()
-
-    with record_function("## async D2H copy on side stream ##"):
-        with torch.cuda.stream(data_copy_stream):
-            data_copy_stream.wait_stream(main_stream)
-            cpu_buffer.copy_(gpu_tensor, non_blocking=True)
-
-        if use_record_stream:
-            gpu_tensor.record_stream(data_copy_stream)
-
-    with record_function("## free source tensor ##"):
-        # untyped_storage().resize_(0) releases the underlying GPU memory
-        # back to the caching allocator. Without record_stream() above,
-        # the allocator may immediately reuse this memory for new
-        # allocations while the D2H copy is still reading from it.
-        gpu_tensor.untyped_storage().resize_(0)
-
-    with record_function("## new allocations that reuse freed HBM ##"):
-        _: list[torch.Tensor] = [
-            torch.full(
-                (num_concat * dim, dim),
-                fill_value=-1.0,
-                device=ctx.device,
-            )
-            for _ in range(num_mul)
-        ]
-
-    with record_function("## wait and validate ##"):
-        data_copy_stream.synchronize()
-        expected = float(ctx.rank + 1)
-        all_correct = bool(torch.all(cpu_buffer == expected).item())
-        has_nan = bool(torch.any(torch.isnan(cpu_buffer)).item())
-        logger.info(
-            f"[rank-{ctx.rank}] record_stream={use_record_stream}: "
-            f"correct={all_correct}, has_nan={has_nan}"
-        )
-
-    with record_function("## validation result ##"):
-        if has_nan:
-            logger.error(f"[rank-{ctx.rank}] NaN detected — missing record_stream()")
-        if not all_correct:
-            logger.error(f"[rank-{ctx.rank}] Data corruption — missing record_stream()")
-
-
-def data_copy_no_record_stream(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-    **_kwargs: Dict[str, Any],
-) -> None:
-    return data_copy_record_stream(
-        _batch_inputs=_batch_inputs,
-        dim=dim,
-        num_mul=num_mul,
-        num_concat=num_concat,
-        ctx=ctx,
-        use_record_stream=False,
-    )
 
 
 def copy_engine_contention(
@@ -1167,10 +994,6 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = a2a_async_base
             case "a2a_async_twice":
                 func = a2a_async_twice
-            case "threading_copy":
-                func = threading_copy
-            case "single_thread_copy":
-                func = single_thread_copy
             case "shared_memory_across_process":
                 func = shared_memory_across_process
             case "multi_async_comms":
@@ -1193,10 +1016,6 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 )
             case s if s.startswith("tolist_overlap_comms"):
                 func = tolist_overlap_comms
-            case "data_copy_record_stream":
-                func = data_copy_record_stream
-            case "data_copy_no_record_stream":
-                func = data_copy_no_record_stream
             case "copy_engine_contention":
                 func = copy_engine_contention
             case "copy_engine_contention_dummy_compute":
