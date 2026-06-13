@@ -102,6 +102,11 @@ def main(argv: List[str]) -> None:
         ],
         python_requires=">=3.10",
         install_requires=install_requires,
+        extras_require={
+            # Optional dependencies for the example dataset loaders
+            # (torchrec.datasets, e.g. Criteo/MovieLens file loading).
+            "datasets": ["iopath"],
+        },
         packages=packages,
         zip_safe=False,
         # PyPI package information.
