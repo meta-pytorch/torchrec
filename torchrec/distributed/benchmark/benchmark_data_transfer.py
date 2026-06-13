@@ -22,6 +22,7 @@ see README.md for more details
 """
 
 import logging
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Dict, List, Optional
@@ -472,6 +473,207 @@ class StreamMemoryConfig(DataCopyConfig):
 # pyrefly: ignore[missing-attribute]
 @_cc.register
 def stream_memory(arg: StreamMemoryConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
+
+
+def benchmark_threading_copy(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    multithreading: bool = True,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    num_tensors = 512
+    dummy_dim = 256
+
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        data_copy_stream = torch.cuda.Stream()
+
+        # create a list of small tensors on cpu, pinned for async H2D copy
+        host_tensors = [
+            torch.rand(dummy_dim, dummy_dim).pin_memory() for _ in range(num_tensors)
+        ]
+        # pre-allocate gpu memory so the copy thread only does .copy_()
+        device_tensors: List[torch.Tensor] = [
+            torch.empty_like(t, device=ctx.device) for t in host_tensors
+        ]
+
+        # large tensor on gpu for main-stream compute
+        irrelevant_data = torch.rand(dim, dim, device=ctx.device) - 0.5
+
+    def _copy_worker() -> None:
+        torch.cuda.set_device(ctx.device)
+        with torch.cuda.stream(data_copy_stream):
+            for i in range(num_tensors):
+                device_tensors[i].copy_(host_tensors[i], non_blocking=True)
+
+    # launch the copy via ThreadPoolExecutor
+    executor: ThreadPoolExecutor | None = None
+    future: Future | None = None
+    with record_function("## submit copy to executor ##"):
+        if multithreading:
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(_copy_worker)
+        else:
+            _copy_worker()
+
+    # run slow gpu operations on the main stream — these should overlap with the copies
+    with record_function("## main stream compute (should overlap with copy) ##"):
+        for _ in range(num_mul):
+            irrelevant_data = _compute(
+                dim=dim, num_mul=1, num_concat=1, ctx=ctx, x=irrelevant_data
+            )
+
+    with record_function("## wait for executor future ##"):
+        if multithreading:
+            assert future is not None
+            future.result()
+            assert executor is not None
+            executor.shutdown(wait=False)
+
+    with record_function("## wait for copy stream ##"):
+        main_stream.wait_stream(data_copy_stream)
+
+    # use the copied data to prove it arrived correctly
+    with record_function("## use copied data ##"):
+        # result intentionally discarded: this only proves the copy arrived
+        _compute(dim=dummy_dim, num_mul=1, num_concat=1, ctx=ctx, x=device_tensors[0])
+
+
+@dataclass
+class ThreadingCopyConfig(DataCopyConfig):
+    """
+    run commands:
+    1. multi-threaded: issue the H2D copies from a worker thread
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer threading_copy \
+        --name=threading_copy
+
+    2. single-threaded: run the copies inline on the main thread
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer threading_copy \
+        --name=single_thread_copy \
+        --multithreading=False
+
+    use case:
+        in production models the input batch has 500+ tensors copied host-to-device
+        one by one; even though each copy is non-blocking, the per-call CPU overhead
+        (Python loop + CUDA driver dispatch) accumulates and blocks the main thread
+        from dispatching forward-pass kernels. This benchmark simulates that with many
+        small pinned tensors and checks whether issuing the copies from a separate
+        Python thread (via concurrent.futures.ThreadPoolExecutor, on a side CUDA
+        stream) frees the main thread and lets the copies overlap main-stream compute.
+        CUDA calls release the GIL so the background thread does not block the main
+        thread, though the Python copy loop itself still contends on the GIL.
+        see https://github.com/meta-pytorch/torchrec/pull/3774 for more details
+    """
+
+    memory_snapshot: bool = True
+    multithreading: bool = True
+    func: Callable[..., None] = benchmark_threading_copy
+
+
+# pyrefly: ignore[missing-attribute]
+@_cc.register
+def threading_copy(arg: ThreadingCopyConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
+
+
+def benchmark_data_copy_record_stream(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    use_record_stream: bool = True,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## setup ##"):
+        main_stream = torch.cuda.current_stream()
+        data_copy_stream = torch.cuda.Stream()
+
+        gpu_tensor = torch.full(
+            (num_concat * dim, dim),
+            fill_value=float(ctx.rank + 1),
+            device=ctx.device,
+        )
+        cpu_buffer = torch.empty_like(gpu_tensor, device="cpu").pin_memory()
+
+    with record_function("## async D2H copy on side stream ##"):
+        with torch.cuda.stream(data_copy_stream):
+            data_copy_stream.wait_stream(main_stream)
+            cpu_buffer.copy_(gpu_tensor, non_blocking=True)
+
+        if use_record_stream:
+            gpu_tensor.record_stream(data_copy_stream)
+
+    with record_function("## free source tensor ##"):
+        # untyped_storage().resize_(0) releases the underlying GPU memory
+        # back to the caching allocator. Without record_stream() above,
+        # the allocator may immediately reuse this memory for new
+        # allocations while the D2H copy is still reading from it.
+        gpu_tensor.untyped_storage().resize_(0)
+
+    with record_function("## new allocations that reuse freed HBM ##"):
+        _: list[torch.Tensor] = [
+            torch.full(
+                (num_concat * dim, dim),
+                fill_value=-1.0,
+                device=ctx.device,
+            )
+            for _ in range(num_mul)
+        ]
+
+    with record_function("## wait and validate ##"):
+        data_copy_stream.synchronize()
+        expected = float(ctx.rank + 1)
+        all_correct = bool(torch.all(cpu_buffer == expected).item())
+        has_nan = bool(torch.any(torch.isnan(cpu_buffer)).item())
+        logger.info(
+            f"[rank-{ctx.rank}] record_stream={use_record_stream}: "
+            f"correct={all_correct}, has_nan={has_nan}"
+        )
+
+    with record_function("## validation result ##"):
+        if has_nan:
+            logger.error(f"[rank-{ctx.rank}] NaN detected — missing record_stream()")
+        if not all_correct:
+            logger.error(f"[rank-{ctx.rank}] Data corruption — missing record_stream()")
+
+
+@dataclass
+class DataCopyRecordStreamConfig(DataCopyConfig):
+    """
+    run commands:
+    1. with record_stream (correct)
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer data_copy_record_stream \
+        --name=data_copy_record_stream
+
+    2. without record_stream (reproduces the bug)
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer data_copy_record_stream \
+        --name=data_copy_no_record_stream \
+        --use_record_stream=False
+
+    use case:
+        reproduce the NaN corruption bug fixed by D102202725 in EMS memory stashing.
+        record_stream() tells the CUDA caching allocator to defer reuse of a tensor's
+        memory until the recording stream catches up. Without it, freeing the source
+        via untyped_storage().resize_(0) on the main stream lets the allocator hand the
+        block to a new allocation while an async D2H copy on a side stream is still
+        reading it, corrupting the copied data (NaN / wrong values). With
+        use_record_stream the copy validates correctly; without it validation fails.
+        see https://github.com/meta-pytorch/torchrec/pull/4231 for more details
+    """
+
+    memory_snapshot: bool = True
+    use_record_stream: bool = True
+    func: Callable[..., None] = benchmark_data_copy_record_stream
+
+
+# pyrefly: ignore[missing-attribute]
+@_cc.register
+def data_copy_record_stream(arg: DataCopyRecordStreamConfig) -> None:
     run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
 
 
