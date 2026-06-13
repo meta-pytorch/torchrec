@@ -25,7 +25,7 @@ import logging
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 import torch
 import torch.distributed as dist
@@ -55,7 +55,7 @@ def _compute(
     num_mul: int,
     num_concat: int,
     ctx: MultiProcessContext,
-    x: Optional[torch.Tensor] = None,
+    x: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     a dummy compute function to simulate the GPU load for computing, all
@@ -126,6 +126,8 @@ def single_rank_runner(rank: int, world_size: int, arg: DataCopyConfig) -> None:
     }
     new_kwargs = {k: getattr(arg, k) for k in new_keys}
     func_name = getattr(arg.func, "__name__", arg.name)
+    if func_name.startswith("benchmark_"):
+        func_name = func_name[len("benchmark_") :]
     name: str = f"{func_name}_{arg.name}" if arg.name else func_name
 
     torch.autograd.set_detect_anomaly(True)
@@ -279,18 +281,17 @@ def benchmark_h2d_data_copy(
 class H2DCopyConfig(DataCopyConfig):
     """
     run commands:
-    1. default: non-blocking host-to-device data copy, w/o pre-allocated memory
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy \
-        --name=non_blocking_h2d_copy
+    1. non-blocking (default): host-to-device data copy, w/o pre-allocated memory
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy
 
     2. pre-allocated: non-blocking host-to-device data copy, w/ pre-allocated memory
     > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy \
-        --name=pre_allocated_h2d_copy \
+        --name=preallocated \
         --preallocated=True
 
     3. blocking: blocking host-to-device data copy
     > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy \
-        --name=blocking_h2d_copy \
+        --name=blocking \
         --use_data_copy_stream=False
 
     use case:
@@ -389,7 +390,7 @@ def benchmark_stream_memory(
 
     # the optimized variant runs a2a on the main stream (NCCL async); the others run
     # it on data_dist_stream (a side stream when multi_stream)
-    checks: Optional[DeviceToHostTensorAwaitable] = None
+    checks: DeviceToHostTensorAwaitable | None = None
     with data_dist_stream:
         with record_function("## all_to_all_single ##"):
             if isinstance(data_dist_stream, torch.cuda.Stream):
@@ -444,16 +445,15 @@ class StreamMemoryConfig(DataCopyConfig):
     run commands:
     1. single stream: copy + a2a on the main stream
     > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
-        --name=single_stream_memory \
+        --name=single \
         --multi_stream=False
 
-    2. multi stream: copy on a side stream, a2a on a dedicated dist stream
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
-        --name=multi_stream_memory
+    2. multi stream (default): copy on a side stream, a2a on a dedicated dist stream
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory
 
     3. optimized: pre-allocated in-place copy on a side stream, a2a on the main stream
     > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
-        --name=multi_stream_optimized \
+        --name=optimized \
         --preallocated=True
 
     use case:
@@ -548,13 +548,12 @@ def benchmark_threading_copy(
 class ThreadingCopyConfig(DataCopyConfig):
     """
     run commands:
-    1. multi-threaded: issue the H2D copies from a worker thread
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer threading_copy \
-        --name=threading_copy
+    1. multi-threaded (default): issue the H2D copies from a worker thread
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer threading_copy
 
     2. single-threaded: run the copies inline on the main thread
     > python -m torchrec.distributed.benchmark.benchmark_data_transfer threading_copy \
-        --name=single_thread_copy \
+        --name=single_thread \
         --multithreading=False
 
     use case:
@@ -647,13 +646,12 @@ def benchmark_data_copy_record_stream(
 class DataCopyRecordStreamConfig(DataCopyConfig):
     """
     run commands:
-    1. with record_stream (correct)
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer data_copy_record_stream \
-        --name=data_copy_record_stream
+    1. with record_stream (correct, default)
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer data_copy_record_stream
 
     2. without record_stream (reproduces the bug)
     > python -m torchrec.distributed.benchmark.benchmark_data_transfer data_copy_record_stream \
-        --name=data_copy_no_record_stream \
+        --name=no_record_stream \
         --use_record_stream=False
 
     use case:
@@ -808,17 +806,16 @@ class CopyEngineContentionConfig(DataCopyConfig):
     """
     run commands:
     1. default: back-to-back trunked H2D vs small copies on the main stream
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention \
-        --name=copy_engine_contention
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention
 
     2. dummy compute between trunks
     > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention \
-        --name=copy_engine_contention_dummy_compute \
+        --name=dummy_compute \
         --dummy_compute=True
 
     3. dummy compute + 10x trunks (smaller trunks, compute fires more often)
     > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention \
-        --name=copy_engine_contention_dummy_compute_10x_trunk \
+        --name=dummy_compute_10x_trunk \
         --dummy_compute=True \
         --trunk_count=30
 
@@ -986,8 +983,7 @@ def benchmark_h2d_execution_order(
 class H2DExecutionOrderConfig(DataCopyConfig):
     """
     run commands:
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_execution_order \
-        --name=h2d_execution_order
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_execution_order
 
     use case:
         observe the copy engine's execution order across three streams that reach their
@@ -1092,12 +1088,11 @@ class A2AD2HContentionConfig(DataCopyConfig):
     """
     run commands:
     1. concurrent (default): a2a and D2H run on separate streams simultaneously
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer a2a_d2h_contention \
-        --name=a2a_d2h_contention
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer a2a_d2h_contention
 
     2. sequential: D2H waits for the a2a to finish (contention-free baseline)
     > python -m torchrec.distributed.benchmark.benchmark_data_transfer a2a_d2h_contention \
-        --name=a2a_d2h_sequential \
+        --name=sequential \
         --concurrent=False
 
     use case:

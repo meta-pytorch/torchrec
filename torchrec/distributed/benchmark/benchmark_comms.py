@@ -12,18 +12,18 @@ Example usage:
 
 Buck2 (internal):
     buck2 run @fbcode//mode/opt fbcode//torchrec/distributed/benchmark:benchmark_comms -- \
-        a2a_single --name=a2a_sync_base-$(hg whereami | cut -c 1-10)
+        all_to_all_base --name=$(hg whereami | cut -c 1-10)
 
 OSS (external):
     python -m torchrec.distributed.benchmark.benchmark_comms \
-        a2a_single --name=a2a_sync_base-$(git rev-parse --short HEAD || echo $USER)
+        all_to_all_base --name=$(git rev-parse --short HEAD || echo $USER)
 
 see README.md for more details
 """
 
 import logging
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass, fields
+from typing import Any, Callable, Dict, List
 
 import torch
 import torch.distributed as dist
@@ -47,26 +47,13 @@ logger: logging.Logger = logging.getLogger(__name__)
 _cc = cmd_conf()
 
 
-@dataclass
-class AllToAllSingleRunConfig(BenchFuncConfig):
-    name: str = "all_to_all_single"
-    world_size: int = 2
-    dim: int = 2048
-    profile_dir: str = "."
-    num_benchmarks: int = 2
-    num_profiles: int = 2
-    num_mul: int = 5
-    num_concat: int = 100
-    debug_mode: bool = False
-    backend: str = "nccl"
-
-
+#################################### util functions ####################################
 def _compute(
     dim: int,
     num_mul: int,
     num_concat: int,
     ctx: MultiProcessContext,
-    x: Optional[torch.Tensor] = None,
+    x: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     a dummy compute function to simulate the GPU load for computing, all
@@ -92,73 +79,117 @@ def _validate(x: torch.Tensor, ctx: MultiProcessContext) -> torch.Tensor:
     return torch.all(checks)
 
 
-# all_to_all_single with sync and single stream
-def a2a_sync_base(
+################################# framework components #################################
+def _unset_benchmark(*_args: Any, **_kwargs: Any) -> None:
+    # placeholder default for CommsConfig.func; each benchmark config sets its own
+    raise NotImplementedError("CommsConfig.func must be set by a subclass")
+
+
+@dataclass
+class CommsConfig(BenchFuncConfig):
+    name: str = ""
+    world_size: int = 2
+    dim: int = 2048
+    profile_dir: str = "."
+    num_benchmarks: int = 2
+    num_profiles: int = 2
+    num_mul: int = 5
+    num_concat: int = 100
+    debug_mode: bool = False
+    backend: str = "nccl"
+    func: Callable[..., None] = _unset_benchmark
+
+
+# single-rank runner
+def single_rank_runner(rank: int, world_size: int, arg: CommsConfig) -> None:
+    if arg.backend == "nccl":
+        # Ensure GPUs are available and we have enough of them
+        assert (
+            torch.cuda.is_available() and torch.cuda.device_count() >= world_size
+        ), "CUDA not available or insufficient GPUs for the requested world_size"
+
+    arg.set_log_level()
+
+    # debug mode only works with vscode for now.
+    if arg.debug_mode:
+        # pyrefly: ignore[missing-module-attribute]
+        from fbvscode import attach_debugger
+
+        attach_debugger()
+
+    new_keys = {f.name for f in fields(type(arg))} - {
+        f.name for f in fields(CommsConfig)
+    }
+    new_kwargs = {k: getattr(arg, k) for k in new_keys}
+    func_name = getattr(arg.func, "__name__", arg.name)
+    if func_name.startswith("benchmark_"):
+        func_name = func_name[len("benchmark_") :]
+    name: str = f"{func_name}_{arg.name}" if arg.name else func_name
+
+    torch.autograd.set_detect_anomaly(True)
+    with MultiProcessContext(
+        rank=rank,
+        world_size=world_size,
+        backend=arg.backend,
+        use_deterministic_algorithms=False,
+    ) as ctx:
+        # benchmarks that issue a second collective need a dedicated all-reduce
+        # process group, created here inside the initialized MultiProcessContext
+        if new_kwargs.pop("needs_ar_pg", False):
+            new_kwargs["ar_pg"] = dist.new_group(ranks=list(range(ctx.world_size)))
+
+        result = benchmark_func(
+            bench_inputs=[],
+            prof_inputs=[],
+            benchmark_func_kwargs={
+                "ctx": ctx,
+                "dim": arg.dim,
+                "num_mul": arg.num_mul,
+                "num_concat": arg.num_concat,
+            }
+            | new_kwargs,
+            func_to_benchmark=arg.func,
+            rank=rank,
+            # Input is empty, actual traffic is determined by the benchmark function
+            sample_count=0,
+            **arg.benchmark_func_kwargs(name=name),
+        )
+
+        if rank == 0:
+            print(result)
+
+
+###################################### benchmarks ######################################
+# all_to_all_single on a single stream, sync or async
+def benchmark_all_to_all_base(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
     num_concat: int,
     ctx: MultiProcessContext,
+    async_op: bool = False,
     **_kwargs: Dict[str, Any],
 ) -> None:
     with record_function("## pre-comms compute ##"):
         pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
 
     with record_function("## all_to_all_single ##"):
-        post_comms = torch.empty_like(pre_comms)
-        req = dist.all_to_all_single(output=post_comms, input=pre_comms, group=ctx.pg)
-
-    with record_function("## comms validation ##"):
-        # this non-blocking copy to CPU will trigger a device-to-host data transfer
-        # however, since it's from the device side, CPU doesn't know if it's finished
-        # so we'll need a cuda event to mark if it's done from the device side
-        # the trace looks very interesting without cuda.event in this case
-        # all cpu-side operations are non-blocking, and finished before the comms
-        # and hence failed the validation assertion
-        checks = _validate(post_comms, ctx).to(torch.device("cpu"), non_blocking=True)
-        ev_d2h = torch.cuda.Event()
-        ev_d2h.record()
-
-    with record_function("## irrelevant compute ##"):
-        pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
-
-    with record_function("## post-comms compute ##"):
-        post_comms = _compute(
-            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=post_comms[0]
-        )
-
-    with record_function("## assert ##"):
-        # explained above, this event.synchroize() is needed to make sure the
-        # device-to-host data transfer is done before the assertion
-        ev_d2h.synchronize()
-        assert checks
-
-
-# all_to_all_single with sync and single stream
-def a2a_async_base(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-) -> None:
-    with record_function("## pre-comms compute ##"):
-        pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
-
-    with record_function("## all_to_all_single ##"):
-        # use zeros instead of empty to make sure no previous data used
+        # use zeros instead of empty to make sure no previous data is used
         post_comms = torch.zeros_like(pre_comms)
         req = dist.all_to_all_single(
             output=post_comms,
             input=pre_comms,
             group=ctx.pg,
-            async_op=True,
+            async_op=async_op,
         )
 
     with record_function("## comms pre-check ##"):
-        # pre-check is performed before comms' done
+        # in the async case this runs before the comms is done (a "pre-check");
+        # in the sync case the (blocking) comms has completed so it is the real check.
+        # this non-blocking copy to CPU triggers a device-to-host data transfer; since
+        # it's issued from the device side, the CPU doesn't know when it finishes, so we
+        # need a cuda event to mark completion before reading it on the host.
         pre_checks = _validate(post_comms, ctx).to("cpu", non_blocking=True)
-        # need this cuda.event to record the device-to-host data transfer
         ev_d2h = torch.cuda.Event()
         ev_d2h.record()
 
@@ -167,11 +198,11 @@ def a2a_async_base(
 
     ev_d2h.synchronize()  # make sure the pre_checks is available from cpu side
     with record_function(f"## comms check and pre-check: {pre_checks} ##"):
-        # assertion fails without wait(), this wait() makes the main cuda stream wait
-        # for the comms to finish, so the post-comms compute will be blocked until
-        # the comms is done
-        assert req is not None
-        req.wait()
+        if async_op:
+            # assertion fails without wait(): this wait() makes the main cuda stream
+            # wait for the comms to finish before the post-comms compute
+            assert req is not None
+            req.wait()
         checks = _validate(post_comms, ctx).to("cpu", non_blocking=True)
         ev_d2h.record()  # record the device-to-host data transfer
 
@@ -181,13 +212,48 @@ def a2a_async_base(
         )
 
     with record_function("## assert ##"):
-        # again, make sure the device-to-host data transfer is done before the assertion
+        # make sure the device-to-host data transfer is done before the assertion
         ev_d2h.synchronize()
         assert checks
 
 
+@dataclass
+class AllToAllBaseConfig(CommsConfig):
+    """
+    run commands:
+    1. sync (default): blocking all_to_all_single on a single stream
+    > python -m torchrec.distributed.benchmark.benchmark_comms all_to_all_base \
+        --name=sync
+
+    2. async: async_op=True, the main stream waits via req.wait() before post-comms
+    > python -m torchrec.distributed.benchmark.benchmark_comms all_to_all_base \
+        --name=async \
+        --async_op=True
+
+    use case:
+        benchmark all_to_all_single with and without async_op. With async_op the comms
+        runs on a separate (comms) stream, non-blocking for the following main-stream
+        ops, but the pre-allocated output is not valid until the comms is done (the
+        pre-check fails); when a later op depends on the output, the caller must
+        req.wait() so the main stream waits on the comms stream. Either way, the
+        device-side validation result is read on the host via a non-blocking D2H copy
+        gated by a CUDA event, so the host assertion only blocks until the value is
+        actually available -- not on the whole comms.
+        see https://github.com/meta-pytorch/torchrec/pull/3436 for more details
+    """
+
+    async_op: bool = False
+    func: Callable[..., None] = benchmark_all_to_all_base
+
+
+# pyrefly: ignore[missing-attribute]
+@_cc.register
+def all_to_all_base(arg: AllToAllBaseConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
+
+
 # all_to_all_single with sync and single stream
-def a2a_async_twice(
+def benchmark_a2a_async_twice(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -265,7 +331,33 @@ def a2a_async_twice(
         assert checks1 and checks2
 
 
-def shared_memory_across_process(
+@dataclass
+class A2AAsyncTwiceConfig(CommsConfig):
+    """
+    run commands:
+    > python -m torchrec.distributed.benchmark.benchmark_comms a2a_async_twice
+
+    use case:
+        model the data-dependent comms chain in TWRW output dist (intra-node
+        reduce_scatter -> decode/convert -> cross-node all_to_all). The second a2a and
+        the decode run on a side stream so the main stream's following compute
+        (rw-lookup / dense forward) overlaps instead of blocking on req.wait(). The
+        side stream's allocations inflate GPU reserved memory (the caching allocator
+        reserves per-stream pools) -- the compute-overlap vs memory-footprint tradeoff.
+        see https://github.com/meta-pytorch/torchrec/pull/3440 for more details
+    """
+
+    memory_snapshot: bool = True
+    func: Callable[..., None] = benchmark_a2a_async_twice
+
+
+# pyrefly: ignore[missing-attribute]
+@_cc.register
+def a2a_async_twice(arg: A2AAsyncTwiceConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
+
+
+def benchmark_shared_memory_across_process(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -301,7 +393,7 @@ def shared_memory_across_process(
         # Keep the tensor alive across benchmark iterations so the shared
         # memory file in /dev/shm is not cleaned up prematurely.
         # pyrefly: ignore[missing-attribute]
-        shared_memory_across_process._shm_tensor = shared_tensor
+        benchmark_shared_memory_across_process._shm_tensor = shared_tensor
 
     if ctx.rank != 0:
         with record_function(f"## rank-{ctx.rank}: validate shared data ##"):
@@ -314,12 +406,39 @@ def shared_memory_across_process(
             )
 
 
-def multi_async_comms(
+@dataclass
+class SharedMemoryAcrossProcessConfig(CommsConfig):
+    """
+    run commands:
+    > python -m torchrec.distributed.benchmark.benchmark_comms shared_memory_across_process
+
+    use case:
+        for read-only eval/inference, place the full embedding table in CPU shared
+        memory (/dev/shm) once and let all ranks on the host map the same physical
+        pages -- no sharding, no input/output dist, zero data copies (except one copy
+        on the creator rank). Host-level embedding footprint stays the size of the full
+        table regardless of rank count. Delegates to create_on_rank_and_share_result;
+        CPU-only, same-host (pass an intra-node process group).
+        see https://github.com/meta-pytorch/torchrec/pull/3810 for more details
+    """
+
+    memory_snapshot: bool = True
+    func: Callable[..., None] = benchmark_shared_memory_across_process
+
+
+# pyrefly: ignore[missing-attribute]
+@_cc.register
+def shared_memory_across_process(arg: SharedMemoryAcrossProcessConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
+
+
+def benchmark_multi_async_comms(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
     num_concat: int,
     ctx: MultiProcessContext,
+    ar_pg: dist.ProcessGroup | None = None,
     **_kwargs: Dict[str, Any],
 ) -> None:
     """
@@ -335,7 +454,7 @@ def multi_async_comms(
     """
     with record_function("## setup ##"):
         rank = ctx.rank
-        ar_pg = multi_async_comms._ar_pg  # pyrefly: ignore[missing-attribute]
+        assert ar_pg is not None
         # Warm up the NCCL communicator so subsequent ops are truly async;
         # the first collective on a new pg blocks for ncclCommInitRank
         dist.barrier(group=ar_pg)
@@ -403,27 +522,53 @@ def multi_async_comms(
         assert checks.item()
 
 
-def competing_comms(
+@dataclass
+class MultiAsyncCommsConfig(CommsConfig):
+    """
+    run commands:
+    > python -m torchrec.distributed.benchmark.benchmark_comms multi_async_comms
+
+    use case:
+        demonstrate two collectives (a2a + all_reduce) issued in different CPU-side
+        order across two ranks, over two independent process groups (ctx.pg + ar_pg):
+        rank 0 runs a2a then all_reduce, rank 1 runs them in the opposite order. Both
+        ranks still complete correctly since each collective matches on its own group.
+        see https://github.com/meta-pytorch/torchrec/pull/4149 for more details
+    """
+
+    # request a dedicated all-reduce process group (passed to func as ar_pg)
+    needs_ar_pg: bool = True
+    all_rank_traces: bool = True
+    func: Callable[..., None] = benchmark_multi_async_comms
+
+
+# pyrefly: ignore[missing-attribute]
+@_cc.register
+def multi_async_comms(arg: MultiAsyncCommsConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
+
+
+def benchmark_competing_comms(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
     num_concat: int,
     ctx: MultiProcessContext,
-    wait_for_comm1: bool = False,
+    serialized: bool = False,
+    ar_pg: dist.ProcessGroup | None = None,
     **_kwargs: Dict[str, Any],
 ) -> None:
     """
     Two collectives (a2a on pg1, all_reduce on pg2) on separate streams
-    with independent NCCL communicators. When wait_for_comm1=False (default),
-    both comms compete freely. When wait_for_comm1=True, stream_b waits
+    with independent NCCL communicators. When serialized=False (default),
+    both comms compete freely. When serialized=True, stream_b waits
     for comm1 to finish before issuing comm2.
     """
     with record_function("## setup ##"):
         main_stream = torch.cuda.current_stream()
         stream_a = torch.cuda.Stream()
         stream_b = torch.cuda.Stream()
-        # pyrefly: ignore[missing-attribute]
-        ar_pg = competing_comms._ar_pg
+        assert ar_pg is not None
         dist.barrier(group=ar_pg)
 
     with record_function("## pre-comms compute ##"):
@@ -447,7 +592,7 @@ def competing_comms(
         out_b = input_b.clone()
         out_b.record_stream(stream_b)
         with torch.cuda.stream(stream_b):
-            if wait_for_comm1:
+            if serialized:
                 assert req_a is not None
                 req_a.wait()
             stream_b.wait_stream(main_stream)
@@ -480,25 +625,44 @@ def competing_comms(
         assert checks.item()
 
 
-def competing_comms_with_req_wait(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-    **_kwargs: Dict[str, Any],
-) -> None:
-    return competing_comms(
-        _batch_inputs=_batch_inputs,
-        dim=dim,
-        num_mul=num_mul,
-        num_concat=num_concat,
-        ctx=ctx,
-        wait_for_comm1=True,
-    )
+@dataclass
+class CompetingCommsConfig(CommsConfig):
+    """
+    run commands:
+    1. default: a2a and all_reduce compete freely on separate streams
+    > python -m torchrec.distributed.benchmark.benchmark_comms competing_comms
+
+    2. wait for comm1: stream_b waits for the a2a before issuing the all_reduce
+    > python -m torchrec.distributed.benchmark.benchmark_comms competing_comms \
+        --name=serialized \
+        --serialized=True
+
+    use case:
+        collectives on different process groups have independent NCCL communicators, so
+        two of them issued concurrently genuinely compete for NVLink bandwidth (e.g.
+        sparse-dist a2a overlapping with dense-grad all_reduce). This runs a2a on
+        stream_a and all_reduce on stream_b (separate PGs). With serialized=True,
+        stream_b calls req_a.wait() before issuing the all_reduce, serializing the two
+        so each gets full bandwidth -- without blocking the CPU or main stream (only the
+        side stream waits). Compare against the default (free overlap) to see the
+        contention vs serialization tradeoff.
+        see https://github.com/meta-pytorch/torchrec/pull/4251 for more details
+    """
+
+    serialized: bool = False
+    all_rank_traces: bool = True
+    # request a dedicated all-reduce process group (passed to func as ar_pg)
+    needs_ar_pg: bool = True
+    func: Callable[..., None] = benchmark_competing_comms
 
 
-def tolist_overlap_comms(
+# pyrefly: ignore[missing-attribute]
+@_cc.register
+def competing_comms(arg: CompetingCommsConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
+
+
+def benchmark_tolist_overlap_comms(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -570,86 +734,32 @@ def tolist_overlap_comms(
         assert checks.item()
 
 
-# single-rank runner
-def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) -> None:
-    if arg.backend == "nccl":
-        # Ensure GPUs are available and we have enough of them
-        assert (
-            torch.cuda.is_available() and torch.cuda.device_count() >= world_size
-        ), "CUDA not available or insufficient GPUs for the requested world_size"
+@dataclass
+class TolistOverlapCommsConfig(CommsConfig):
+    """
+    run commands:
+    > python -m torchrec.distributed.benchmark.benchmark_comms tolist_overlap_comms
 
-    arg.set_log_level()
+    use case:
+        probe how .tolist() (a CPU-blocking D2H sync) interacts with in-flight async
+        comms across streams, used to investigate an AMD NCCL hang. .tolist() only
+        blocks the CPU thread; it should not stall comms already enqueued on other
+        streams -- which holds on NVIDIA, and on AMD too once the streams stay separate.
+        The real divergence is comm-stream allocation: on AMD a side stream can collapse
+        into the main stream, serializing comm+compute and making .tolist() appear to
+        wait on the comms (a device-wide sync that was never issued). So .tolist() is
+        not the root cause; the AMD side-stream collapse is.
+        see https://github.com/meta-pytorch/torchrec/pull/4299 for more details
+    """
 
-    # debug mode only works with vscode for now.
-    if arg.debug_mode:
-        # pyrefly: ignore[missing-module-attribute]
-        from fbvscode import attach_debugger
-
-        attach_debugger()
-
-    torch.autograd.set_detect_anomaly(True)
-    with MultiProcessContext(
-        rank=rank,
-        world_size=world_size,
-        backend=arg.backend,
-        use_deterministic_algorithms=False,
-    ) as ctx:
-        match arg.name.lower():
-            case "a2a_sync_base":
-                func = a2a_sync_base
-            case "a2a_async_base":
-                func = a2a_async_base
-            case "a2a_async_twice":
-                func = a2a_async_twice
-            case "shared_memory_across_process":
-                func = shared_memory_across_process
-            case "multi_async_comms":
-                func = multi_async_comms
-                # pyrefly: ignore[missing-attribute]
-                multi_async_comms._ar_pg = dist.new_group(
-                    ranks=list(range(ctx.world_size))
-                )
-            case "competing_comms":
-                func = competing_comms
-                # pyrefly: ignore[missing-attribute]
-                competing_comms._ar_pg = dist.new_group(
-                    ranks=list(range(ctx.world_size))
-                )
-            case "competing_comms_with_req_wait":
-                func = competing_comms_with_req_wait
-                # pyrefly: ignore[missing-attribute]
-                competing_comms._ar_pg = dist.new_group(
-                    ranks=list(range(ctx.world_size))
-                )
-            case s if s.startswith("tolist_overlap_comms"):
-                func = tolist_overlap_comms
-            case _:
-                raise ValueError(f"Unknown benchmark name: {arg.name}")
-
-        result = benchmark_func(
-            bench_inputs=[],
-            prof_inputs=[],
-            benchmark_func_kwargs={
-                "ctx": ctx,
-                "dim": arg.dim,
-                "num_mul": arg.num_mul,
-                "num_concat": arg.num_concat,
-            },
-            func_to_benchmark=func,
-            rank=rank,
-            # Input is empty, actual traffic is determined by the benchmark function
-            sample_count=0,
-            **arg.benchmark_func_kwargs(name=f"{arg.name}_{arg.backend}"),
-        )
-
-        if rank == 0:
-            print(result)
+    num_comms_rounds: int = 5
+    func: Callable[..., None] = benchmark_tolist_overlap_comms
 
 
 # pyrefly: ignore[missing-attribute]
 @_cc.register
-def a2a_single(arg: AllToAllSingleRunConfig) -> None:
-    run_multi_process_func(func=a2a_single_runner, world_size=arg.world_size, arg=arg)
+def tolist_overlap_comms(arg: TolistOverlapCommsConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
 
 
 if __name__ == "__main__":
