@@ -268,48 +268,6 @@ def a2a_async_twice(
         assert checks1 and checks2
 
 
-# LazyAwaitable
-def lazyawaitable(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-    **_kwargs: Dict[str, Any],
-) -> None:
-    with record_function("## pre-comms compute ##"):
-        pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
-
-    with record_function("## all_to_all_single ##"):
-        # use zeros instead of empty to make sure no previous data used
-        post_comms = torch.zeros_like(pre_comms)
-        req = dist.all_to_all_single(
-            output=post_comms,
-            input=pre_comms,
-            group=ctx.pg,
-            async_op=True,
-        )
-
-    with record_function("## irrelevant compute ##"):
-        pre_comms = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
-
-    with record_function("## comms check ##"):
-        # assertion fails without wait(), this wait() makes the main cuda stream wait
-        # for the comms to finish, so the post-comms compute will be blocked until
-        # the comms is done
-        assert req is not None
-        req.wait()
-        check_awaitable = DeviceToHostTensorAwaitable(_validate(post_comms, ctx))
-
-    with record_function("## post-comms compute ##"):
-        post_comms = _compute(
-            dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=post_comms[0]
-        )
-
-    with record_function("## assert ##"):
-        assert check_awaitable.item()
-
-
 # muti-stream memory footprint
 def multi_stream_memory(
     _batch_inputs: List[Dict[str, Any]],
@@ -488,97 +446,6 @@ def multi_stream_optimized(
 
     with record_function("## assert ##"):
         assert checks.item()
-
-
-# an optimized version of muti-stream memory footprint
-def non_blocking_copy(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-    preallocated: bool = False,
-    use_data_copy_stream: bool = True,
-    **_kwargs: Dict[str, Any],
-) -> None:
-    with record_function("## setup ##"):
-        main_stream = torch.cuda.current_stream()
-        data_copy_stream = (
-            torch.cuda.Stream() if use_data_copy_stream else nullcontext()
-        )
-        irrelevant_data = torch.rand(dim, dim, device=ctx.device) - 0.5
-
-        # the host to device data transfer will block cuda execution without the `pin_memory()`
-        host_data = (torch.rand(dim, dim) - 0.5).pin_memory()
-        if preallocated:
-            # pre-allocate memory on the device for the incoming data transfer from the host
-            device_data = torch.empty_like(host_data, device=ctx.device)
-        else:
-            device_data = torch.empty(0, device=ctx.device)
-
-    with record_function("## irrelevant compute before h2d ##"):
-        pre_comms = _compute(
-            dim=dim, num_mul=num_mul, num_concat=1, ctx=ctx, x=irrelevant_data
-        )
-
-    with record_function("## copy data to device ##"):
-        with data_copy_stream:
-            if preallocated:
-                # copy data to device, this will not block the main stream
-                device_data.copy_(host_data, non_blocking=True)
-            else:
-                device_data = host_data.to(ctx.device, non_blocking=True)
-
-    with record_function("## irrelevant compute after h2d ##"):
-        irrelevant_data = torch.rand(dim, dim, device=ctx.device) - 0.5
-        pre_comms = _compute(
-            dim=dim, num_mul=num_mul, num_concat=1, ctx=ctx, x=irrelevant_data
-        )
-
-    with record_function("## pre-comms compute ##"):
-        # make sure the data copy is done before the pre-comms compute
-        if use_data_copy_stream:
-            # pyrefly: ignore[bad-argument-type]
-            main_stream.wait_stream(data_copy_stream)
-        pre_comms = _compute(
-            dim=dim, num_mul=num_mul, num_concat=1, ctx=ctx, x=device_data
-        )
-
-
-def preallocated_non_blocking_copy(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-    **_kwargs: Dict[str, Any],
-) -> None:
-    return non_blocking_copy(
-        _batch_inputs=_batch_inputs,
-        dim=dim,
-        num_mul=num_mul,
-        num_concat=num_concat,
-        ctx=ctx,
-        preallocated=True,
-    )
-
-
-def blocking_copy(
-    _batch_inputs: List[Dict[str, Any]],
-    dim: int,
-    num_mul: int,
-    num_concat: int,
-    ctx: MultiProcessContext,
-    **_kwargs: Dict[str, Any],
-) -> None:
-    return non_blocking_copy(
-        _batch_inputs=_batch_inputs,
-        dim=dim,
-        num_mul=num_mul,
-        num_concat=num_concat,
-        ctx=ctx,
-        use_data_copy_stream=False,
-    )
 
 
 def threading_copy(
@@ -1481,20 +1348,12 @@ def a2a_single_runner(rank: int, world_size: int, arg: AllToAllSingleRunConfig) 
                 func = a2a_async_base
             case "a2a_async_twice":
                 func = a2a_async_twice
-            case "lazyawaitable":
-                func = lazyawaitable
             case "multi_stream_memory":
                 func = multi_stream_memory
             case "single_stream_memory":
                 func = single_stream_memory
             case "multi_stream_optimized":
                 func = multi_stream_optimized
-            case "non_blocking_copy":
-                func = non_blocking_copy
-            case "preallocated_non_blocking_copy":
-                func = preallocated_non_blocking_copy
-            case "blocking_copy":
-                func = blocking_copy
             case "threading_copy":
                 func = threading_copy
             case "single_thread_copy":
