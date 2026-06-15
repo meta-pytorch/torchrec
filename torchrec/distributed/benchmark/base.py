@@ -1029,6 +1029,7 @@ def _run_cuda_profiling(
     export_stacks: bool,
     all_rank_traces: bool,
     memory_snapshot: bool,
+    profile_all_threads: bool = False,
 ) -> None:
     """Run optional CUDA profiling with chrome trace export and memory snapshot."""
 
@@ -1057,6 +1058,16 @@ def _run_cuda_profiling(
         )
 
     # Optional allocator warm-up to create fragmentation similar to production
+
+    # profile_all_threads uses global RecordFunction callbacks so ops on threads
+    # other than the profiling thread (e.g. raw Python threads spawned by a
+    # benchmark) land in the same trace; the default thread-local callbacks miss
+    # them.
+    experimental_config = (
+        torch.profiler._ExperimentalConfig(profile_all_threads=True)
+        if profile_all_threads
+        else None
+    )
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
@@ -1068,6 +1079,7 @@ def _run_cuda_profiling(
         with_modules=True,
         with_stack=export_stacks,
         on_trace_ready=_trace_handler,
+        experimental_config=experimental_config,
     ) as prof:
         profile_iter_fn(prof)
 
@@ -1104,6 +1116,7 @@ def _run_benchmark_core(
     reset_accumulated_memory_stats: bool = True,
     all_rank_traces: bool = False,
     memory_snapshot: bool = False,
+    profile_all_threads: bool = False,
     sample_count: int = 0,
     test_name: str = "",
 ) -> BenchmarkResult:
@@ -1182,6 +1195,7 @@ def _run_benchmark_core(
             export_stacks=export_stacks,
             all_rank_traces=all_rank_traces,
             memory_snapshot=memory_snapshot,
+            profile_all_threads=profile_all_threads,
         )
 
     # Dump benchmark result to local storage
@@ -1262,6 +1276,7 @@ class BenchFuncConfig:
     export_stacks: bool = False
     all_rank_traces: bool = False
     memory_snapshot: bool = False
+    profile_all_threads: bool = False
     loglevel: str = "WARNING"
     test_name: str = ""
 
@@ -1277,6 +1292,7 @@ class BenchFuncConfig:
             "export_stacks": self.export_stacks,
             "all_rank_traces": self.all_rank_traces,
             "memory_snapshot": self.memory_snapshot,
+            "profile_all_threads": self.profile_all_threads,
             "test_name": self.test_name,
         } | kwargs_to_override
 
@@ -1301,6 +1317,7 @@ def benchmark_func(
     export_stacks: bool = False,
     all_rank_traces: bool = False,
     memory_snapshot: bool = False,
+    profile_all_threads: bool = False,
     sample_count: int = 0,
     test_name: str = "",
 ) -> BenchmarkResult:
@@ -1356,6 +1373,7 @@ def benchmark_func(
         reset_accumulated_memory_stats=True,
         all_rank_traces=all_rank_traces,
         memory_snapshot=memory_snapshot,
+        profile_all_threads=profile_all_threads,
         sample_count=sample_count,
         test_name=test_name,
     )

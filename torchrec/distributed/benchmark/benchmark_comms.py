@@ -22,6 +22,7 @@ see README.md for more details
 """
 
 import logging
+import threading
 from dataclasses import dataclass, fields
 from typing import Any, Callable, Dict, List
 
@@ -759,6 +760,150 @@ class TolistOverlapCommsConfig(CommsConfig):
 # pyrefly: ignore[missing-attribute]
 @_cc.register
 def tolist_overlap_comms(arg: TolistOverlapCommsConfig) -> None:
+    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
+
+
+def benchmark_cuda_event_wait(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    blocking: bool = True,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Measure how a blocking vs busy-waiting cuda Event.synchronize() affects a
+    concurrent CPU-side workload.
+
+    A long-running GPU kernel is launched on the main stream and an event is
+    recorded right after it. Just before the main thread waits on the event, a
+    side CPU thread starts running pure-CPU matmuls. The main thread then waits
+    on the event:
+
+      - blocking=True:  torch.cuda.Event(blocking=True) maps to
+                        cudaEventBlockingSync, so Event.synchronize() puts the
+                        calling thread to sleep on an OS primitive, leaving the
+                        CPU core free for the side thread.
+      - blocking=False: the default event busy-waits (spins) inside
+                        cudaEventSynchronize, burning a full CPU core that
+                        contends with the side thread.
+
+    The GIL is released both during synchronize() and during the matmuls, so
+    the contention being measured is purely for CPU cores. The side thread runs
+    a fixed number of matmuls wrapped in a single ## side-thread matmul ##
+    slice; under the spin variant (blocking=False) that slice is longer because
+    the spin steals a CPU core. Compare the slice of the blocking and spin runs
+    in the trace.
+
+    The side thread is a raw Python thread, which is invisible to the default
+    profiler (it installs RecordFunction callbacks thread-locally). The runner
+    sets ``profile_all_threads=True`` for this benchmark so the profiler uses
+    global callbacks and the side thread's slice appears in the chrome trace.
+
+    Tip: to amplify the effect, constrain the cores available to the process
+    (e.g. ``taskset -c 0-1``).
+    """
+    # cpu_mat_dim and n_side_matmuls set the side thread's total run time, which
+    # should outlast the event wait so the contention spans the whole wait.
+    cpu_mat_dim = 512
+    n_side_matmuls = 1000
+
+    with record_function("## setup ##"):
+        # single-threaded CPU matmul, so the side thread maps to ~1 core and the
+        # event-wait spin clearly steals cycles from it
+        prev_num_threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        a = torch.rand(cpu_mat_dim, cpu_mat_dim)
+        b = torch.rand(cpu_mat_dim, cpu_mat_dim)
+        start_gate = threading.Event()
+
+    def _side_compute() -> None:
+        c = a
+        start_gate.wait()
+        # The whole loop is one slice. It shows on the side thread's row only
+        # because the runner sets profile_all_threads=True (global callbacks);
+        # under the default thread-local profiler a raw Python thread fires no
+        # callbacks and is invisible.
+        with record_function("## side-thread matmul ##"):
+            for _ in range(n_side_matmuls):
+                c = a @ b  # recompute (no accumulation) so values stay bounded
+        _ = float(c.sum())  # touch the result so it isn't optimized away
+
+    with record_function("## launch long-running GPU kernel ##"):
+        # A few LARGE matmuls (one kernel launch each) keep the GPU busy for a
+        # long wall-clock time so the event wait is the long pole. Avoid many
+        # small kernels (e.g. a long F.normalize chain): the CPU enqueues them
+        # faster than the GPU drains, overflowing the launch queue ("Command
+        # Buffer Full"), which stalls the CPU on launch instead of on the event.
+        # Bump gpu_mat_dim / gpu_iters if the wait is too short to overlap with
+        # the side-thread compute.
+        gpu_mat_dim = 8192
+        gpu_iters = 50
+        g_a = torch.rand(gpu_mat_dim, gpu_mat_dim, device=ctx.device)
+        # small-magnitude operand keeps repeated matmul from overflowing to inf
+        g_b = (torch.rand(gpu_mat_dim, gpu_mat_dim, device=ctx.device) - 0.5) * 0.01
+        g_out = torch.empty_like(g_a)
+        for _ in range(gpu_iters):
+            torch.mm(g_a, g_b, out=g_out)
+            g_a, g_out = g_out, g_a
+
+    with record_function("## record event ##"):
+        ev = torch.cuda.Event(blocking=blocking)
+        ev.record()
+
+    with record_function("## start side thread ##"):
+        side_thread = threading.Thread(target=_side_compute, name="side_compute")
+        side_thread.start()
+        # release the side thread just before the main thread waits on the event
+        start_gate.set()
+
+    with record_function(f"## event.synchronize(blocking={blocking}) ##"):
+        ev.synchronize()
+
+    with record_function("## join side thread ##"):
+        side_thread.join()
+
+    with record_function("## report ##"):
+        torch.set_num_threads(prev_num_threads)
+        logger.info(
+            f"[rank-{ctx.rank}] blocking={blocking}: side thread ran "
+            f"{n_side_matmuls} matmuls ({cpu_mat_dim}x{cpu_mat_dim}); compare the "
+            f"## side-thread matmul ## slices against the spin variant in the trace"
+        )
+
+
+@dataclass
+class CudaEventWaitConfig(CommsConfig):
+    """
+    run commands:
+    1. blocking (default): Event.synchronize() sleeps the calling thread, leaving
+       the CPU core free for the side thread
+    > python -m torchrec.distributed.benchmark.benchmark_comms cuda_event_wait \
+        --name=blocking
+
+    2. spin: the default cuda Event busy-waits inside synchronize(), burning a
+       CPU core that contends with the side thread
+    > python -m torchrec.distributed.benchmark.benchmark_comms cuda_event_wait \
+        --name=spin \
+        --blocking=False
+
+    use case:
+        measure how a blocking vs busy-waiting cuda Event.synchronize() affects a
+        concurrent CPU-side workload. Compare the ## side-thread matmul ## slice
+        of the two runs in the chrome trace.
+    """
+
+    blocking: bool = True
+    num_profiles: int = 10
+    # capture the raw Python side thread in the chrome trace
+    profile_all_threads: bool = True
+    func: Callable[..., None] = benchmark_cuda_event_wait
+
+
+# pyrefly: ignore[missing-attribute]
+@_cc.register
+def cuda_event_wait(arg: CudaEventWaitConfig) -> None:
     run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
 
 
