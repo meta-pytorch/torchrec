@@ -9,7 +9,7 @@
 
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -18,8 +18,9 @@ from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
 )
-from torchrec.distributed.logger import capped_logger, one_time_rank0_logger
+from torchrec.distributed.logging_handlers import log_ems_event
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -139,6 +140,27 @@ class MemoryStashingManager:
     _stash_executor: Optional[ThreadPoolExecutor] = None
     _delay_stash: bool = False
     _pending_stash_callbacks: List[Callable[[Optional[torch.Tensor]], None]] = []
+    # Event names already emitted to the structured event logger. Used to emit
+    # each EMS telemetry event at most once per process. Required because
+    # TrainingOptimizationLogger.log() has no built-in dedup and several call
+    # sites run on every batch; without this guard they would flood the event
+    # logger. Intentionally NOT cleared in reset() to avoid re-flooding.
+    _logged_event_keys: set[str] = set()
+
+    @classmethod
+    def _log_ems_once(
+        cls, event_name: str, metadata: Optional[Dict[str, str]] = None
+    ) -> None:
+        """Emit an EMS event to the structured event logger at most once.
+
+        EMO ``lxu_cache`` stash/restore events are routed through here too —
+        they are memory-stashing operations, so they share the EMS technique
+        and stay distinguishable via their ``emo_`` event-name prefix.
+        """
+        if event_name in cls._logged_event_keys:
+            return
+        cls._logged_event_keys.add(event_name)
+        log_ems_event(event_name, metadata)
 
     @classmethod
     def thread_submit(cls, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
@@ -177,7 +199,7 @@ class MemoryStashingManager:
         else:
             cls._device_to_host_stream = device_to_host_stream
         logger.info("MemoryStashingManager: streams initialized")
-        one_time_rank0_logger.info("MemoryStashingManager: streams initialized")
+        cls._log_ems_once("ems_streams_initialized")
 
     @classmethod
     def set_delay_stash(cls, delay: bool) -> None:
@@ -225,8 +247,9 @@ class MemoryStashingManager:
         sync_event: Optional[torch.cuda.Event] = None,
     ) -> None:
         """Pop and call all embedding weight restore callbacks in reverse order."""
-        one_time_rank0_logger.info(
-            f"restore_embedding_weights: invoking {len(cls._embedding_weight_restore_callbacks)} callbacks"
+        cls._log_ems_once(
+            "ems_restore_embedding_weights_callbacks",
+            {"num_callbacks": str(len(cls._embedding_weight_restore_callbacks))},
         )
         while cls._embedding_weight_restore_callbacks:
             cls._embedding_weight_restore_callbacks.pop()(None, sync_event)
@@ -238,8 +261,9 @@ class MemoryStashingManager:
         sync_event: Optional[torch.cuda.Event] = None,
     ) -> None:
         """Pop and call all optimizer state restore callbacks in reverse order."""
-        one_time_rank0_logger.info(
-            f"restore_optimizer_state: invoking {len(cls._optimizer_state_restore_callbacks)} callbacks"
+        cls._log_ems_once(
+            "ems_restore_optimizer_state_callbacks",
+            {"num_callbacks": str(len(cls._optimizer_state_restore_callbacks))},
         )
         while cls._optimizer_state_restore_callbacks:
             cls._optimizer_state_restore_callbacks.pop()(None, sync_event)
@@ -321,8 +345,9 @@ class MemoryStashingManager:
                 d2h_stream.wait_stream(torch.cuda.current_stream())
 
             size_text = _tensor_size_text(tensors)
-            capped_logger.info(
-                f"stash {label}: {len(tensors)} tensors, total {size_text}"
+            cls._log_ems_once(
+                f"ems_stash_summary_{label.replace(' ', '_')}",
+                {"label": label, "num_tensors": str(len(tensors)), "size": size_text},
             )
 
             # Start async copy from HBM to CPU
@@ -378,8 +403,13 @@ class MemoryStashingManager:
             h2d_stream = cls.h2d_stream()
 
             size_text = _tensor_size_text([hbm_ref for hbm_ref, _, _ in stash_data])
-            capped_logger.info(
-                f"restore {label}: {len(stash_data)} tensors, total {size_text}"
+            cls._log_ems_once(
+                f"ems_restore_summary_{label.replace(' ', '_')}",
+                {
+                    "label": label,
+                    "num_tensors": str(len(stash_data)),
+                    "size": size_text,
+                },
             )
             with record_function(f"restore {label} on device ({size_text})"):
                 for (
@@ -503,9 +533,7 @@ class MemoryStashingManager:
 
         # Early return if module doesn't have embedding modules
         if not hasattr(module, "_emb_modules"):
-            capped_logger.info(
-                "stash_embedding_weights: no _emb_modules found, skipping"
-            )
+            cls._log_ems_once("ems_stash_embedding_weights_skipped")
             return None
 
         # Collect CUDA embedding weight tensors from TBE groups marked for stashing
@@ -533,10 +561,13 @@ class MemoryStashingManager:
                 continue
             tensors.append(weights_dev)
 
-        capped_logger.info(
-            f"stash_embedding_weights: lookup={type(lookup).__name__}, "
-            f"module={type(module).__name__}, "
-            f"collected {len(tensors)} weight tensors"
+        cls._log_ems_once(
+            "ems_stash_embedding_weights_collected",
+            {
+                "lookup": type(lookup).__name__,
+                "module": type(module).__name__,
+                "num_tensors": str(len(tensors)),
+            },
         )
 
         if not tensors:
@@ -569,8 +600,9 @@ class MemoryStashingManager:
         sync_event: Optional[torch.cuda.Event] = None,
     ) -> None:
         """Pop and call all EMO cache restore callbacks."""
-        one_time_rank0_logger.info(
-            f"restore_emo_cache: invoking {len(cls._emo_cache_restore_callbacks)} callbacks"
+        cls._log_ems_once(
+            "emo_restore_cache_callbacks",
+            {"num_callbacks": str(len(cls._emo_cache_restore_callbacks))},
         )
         while cls._emo_cache_restore_callbacks:
             cls._emo_cache_restore_callbacks.pop()(None, sync_event)
@@ -667,9 +699,12 @@ class MemoryStashingManager:
                 inner.lxu_cache_weights.untyped_storage().resize_(0)
 
         total_freed_mb = sum(orig_cache_sizes) / (1024**2)
-        capped_logger.info(
-            f"stash_emo_cache: freed {len(emo_stash_data)} EMO caches, "
-            f"total {total_freed_mb:.2f} MB"
+        cls._log_ems_once(
+            "emo_stash_cache",
+            {
+                "num_caches": str(len(emo_stash_data)),
+                "freed_mb": f"{total_freed_mb:.2f}",
+            },
         )
 
         def restore(
@@ -782,9 +817,12 @@ class MemoryStashingManager:
             for _state_key, state_value in state_dict.items():
                 tensors.extend(_collect_cuda_tensors_from_value(state_value))
 
-        one_time_rank0_logger.info(
-            f"stash_optimizer_state: optimizer={type(optimizer).__name__}, "
-            f"collected {len(tensors)} state tensors"
+        cls._log_ems_once(
+            "ems_stash_optimizer_state_collected",
+            {
+                "optimizer": type(optimizer).__name__,
+                "num_tensors": str(len(tensors)),
+            },
         )
 
         await_restore, restore, _execute_stash = cls._stash_tensors(
@@ -837,9 +875,7 @@ class MemoryStashingManager:
         ``await_restore`` on the main thread afterwards to make the default
         stream wait for the H2D copies to finish.
         """
-        one_time_rank0_logger.info(
-            "restore_optimizer_state_threaded: submitting to background thread"
-        )
+        cls._log_ems_once("ems_restore_optimizer_state_threaded")
         sync_event = torch.cuda.Event()
         sync_event.record(torch.cuda.current_stream())
         device = torch.cuda.current_device()
@@ -864,9 +900,7 @@ class MemoryStashingManager:
         ``await_restore`` on the main thread afterwards to make the default
         stream wait for the H2D copies to finish.
         """
-        one_time_rank0_logger.info(
-            "restore_embedding_weights_threaded: submitting to background thread"
-        )
+        cls._log_ems_once("ems_restore_embedding_weights_threaded")
         sync_event = torch.cuda.Event()
         sync_event.record(torch.cuda.current_stream())
         device = torch.cuda.current_device()
