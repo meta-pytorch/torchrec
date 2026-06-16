@@ -14,15 +14,29 @@ from typing import Dict, List
 import click
 import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType, SparseType
-from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
-    BoundsCheckMode,
-    EmbeddingLocation,
-    PoolingMode,
-)
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     ComputeDevice,
     SplitTableBatchedEmbeddingBagsCodegen,
 )
+
+try:
+    from fbgemm_gpu.tbe.config.embedding_config import (
+        BoundsCheckMode,
+        EmbeddingLocation,
+        PoolingMode,
+    )
+except ImportError:
+    # Fallback for a base-layer fbgemm_gpu that predates the tbe.config leaf module
+    # (created 2026-05-06). Tracked via _log_api_usage_once so this can be removed
+    # once base layers roll forward (cf. D105254047 for the SSD analogue).
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.benchmark.benchmark_split_table_batched_embeddings.import_failure.tbe_config_types"
+    )
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
+        BoundsCheckMode,
+        EmbeddingLocation,
+        PoolingMode,
+    )
 from torchrec.distributed.benchmark.base import benchmark_func
 from torchrec.distributed.test_utils.test_model import ModelInput
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
