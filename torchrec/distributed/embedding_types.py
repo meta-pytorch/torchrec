@@ -28,7 +28,17 @@ from typing import (
 )
 
 import torch
-from fbgemm_gpu.split_table_batched_embeddings_ops_common import EmbeddingLocation
+
+try:
+    from fbgemm_gpu.tbe.config.embedding_config import EmbeddingLocation
+except ImportError:
+    # Fallback for a base-layer fbgemm_gpu that predates the tbe.config leaf module
+    # (created 2026-05-06). Tracked via _log_api_usage_once so this can be removed
+    # once base layers roll forward (cf. D105254047 for the SSD analogue).
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.embedding_types.import_failure.tbe_config_types"
+    )
+    from fbgemm_gpu.split_table_batched_embeddings_ops_common import EmbeddingLocation
 from torch import fx, nn
 from torch.distributed._tensor import DeviceMesh
 from torch.distributed._tensor.placement_types import Placement
