@@ -82,13 +82,6 @@ def _validate(x: torch.Tensor, ctx: MultiProcessContext) -> torch.Tensor:
 
 
 ################################# framework components #################################
-
-
-def _unset_benchmark(*_args: Any, **_kwargs: Any) -> None:
-    # placeholder default for DataCopyConfig.func; each benchmark config sets its own
-    raise NotImplementedError("DataCopyConfig.func must be set by a subclass")
-
-
 @dataclass
 class DataCopyConfig(BenchFuncConfig):
     name: str = ""
@@ -101,11 +94,15 @@ class DataCopyConfig(BenchFuncConfig):
     num_concat: int = 100
     debug_mode: bool = False
     backend: str = "nccl"
-    func: Callable[..., None] = _unset_benchmark
 
 
 # single-rank runner
-def single_rank_runner(rank: int, world_size: int, arg: DataCopyConfig) -> None:
+def single_rank_runner(
+    rank: int,
+    world_size: int,
+    arg: DataCopyConfig,
+    bench_func: Callable[..., None],
+) -> None:
     if arg.backend == "nccl":
         # Ensure GPUs are available and we have enough of them
         assert (
@@ -125,9 +122,7 @@ def single_rank_runner(rank: int, world_size: int, arg: DataCopyConfig) -> None:
         f.name for f in fields(DataCopyConfig)
     }
     new_kwargs = {k: getattr(arg, k) for k in new_keys}
-    func_name = getattr(arg.func, "__name__", arg.name)
-    if func_name.startswith("benchmark_"):
-        func_name = func_name[len("benchmark_") :]
+    func_name = getattr(bench_func, "__name__", arg.name)
     name: str = f"{func_name}_{arg.name}" if arg.name else func_name
 
     torch.autograd.set_detect_anomaly(True)
@@ -147,7 +142,7 @@ def single_rank_runner(rank: int, world_size: int, arg: DataCopyConfig) -> None:
                 "num_concat": arg.num_concat,
             }
             | new_kwargs,
-            func_to_benchmark=arg.func,
+            func_to_benchmark=bench_func,
             rank=rank,
             # Input is empty, actual traffic is determined by the benchmark function
             sample_count=0,
@@ -158,8 +153,60 @@ def single_rank_runner(rank: int, world_size: int, arg: DataCopyConfig) -> None:
             print(result)
 
 
+def register_benchmark(
+    config: type[DataCopyConfig],
+) -> Callable[[Callable[..., None]], Callable[..., None]]:
+    """
+    Decorator factory: register a benchmark function with the CLI, bound to the
+    given config class. The decorated function is the per-iteration benchmark and
+    its name is the CLI subcommand. Define the config class first, then:
+
+    @register_benchmark(LazyAwaitableConfig)
+    def lazyawaitable(_batch_inputs, ..., ctx, **_kwargs): ...
+    """
+
+    def decorator(func: Callable[..., None]) -> Callable[..., None]:
+        def dispatch(arg: DataCopyConfig) -> None:
+            run_multi_process_func(
+                func=single_rank_runner,
+                world_size=arg.world_size,
+                arg=arg,
+                bench_func=func,
+            )
+
+        # CLI subcommand key = benchmark function name; the annotation must be the
+        # concrete config subclass so cmd_conf builds its argparse from its fields
+        dispatch.__name__ = func.__name__
+        dispatch.__annotations__ = {"arg": config, "return": None}
+        # pyrefly: ignore[missing-attribute]
+        _cc.register(dispatch)
+        return func
+
+    return decorator
+
+
 ###################################### benchmarks ######################################
-def benchmark_lazyawaitable(
+@dataclass
+class LazyAwaitableConfig(DataCopyConfig):
+    """
+    run commands:
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer lazyawaitable
+
+    use case:
+        demonstrate the use of the device-to-host lazy awaitable. The
+        DeviceToHostTensorAwaitable wraps a non-blocking device-to-host transfer
+        together with a CUDA event and defers the cudaEventSync until the value is
+        actually read on the host. This removes a CPU-blocking sync point, so the
+        post-comms compute can be scheduled ahead of the host-side assertion --
+        useful for sync-point removal in training optimization.
+        see https://github.com/meta-pytorch/torchrec/pull/3477 for more details
+    """
+
+    name: str = "lazyawaitable"
+
+
+@register_benchmark(LazyAwaitableConfig)
+def lazyawaitable(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -201,32 +248,40 @@ def benchmark_lazyawaitable(
 
 
 @dataclass
-class LazyAwaitableConfig(DataCopyConfig):
+class H2DCopyConfig(DataCopyConfig):
     """
     run commands:
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer lazyawaitable
+    1. non-blocking (default): host-to-device data copy, w/o pre-allocated memory
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy
+
+    2. pre-allocated: non-blocking host-to-device data copy, w/ pre-allocated memory
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy \
+        --name=preallocated \
+        --preallocated=True
+
+    3. blocking: blocking host-to-device data copy
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy \
+        --name=blocking \
+        --use_data_copy_stream=False
 
     use case:
-        demonstrate the use of the device-to-host lazy awaitable. The
-        DeviceToHostTensorAwaitable wraps a non-blocking device-to-host transfer
-        together with a CUDA event and defers the cudaEventSync until the value is
-        actually read on the host. This removes a CPU-blocking sync point, so the
-        post-comms compute can be scheduled ahead of the host-side assertion --
-        useful for sync-point removal in training optimization.
-        see https://github.com/meta-pytorch/torchrec/pull/3477 for more details
+        study the CUDA cached-memory footprint of host-to-device copies. A
+        non-blocking copy on a side stream inflates that stream's reserved
+        memory: the copied tensor is allocated on the side stream and is not
+        shared back with the main stream by the caching allocator.
+        Pre-allocating on the main stream and doing an in-place copy on the side
+        stream keeps the footprint as low as a blocking copy.
+        see https://github.com/meta-pytorch/torchrec/pull/3485 and
+        https://github.com/meta-pytorch/torchrec/pull/3510 for more details
     """
 
-    name: str = "lazyawaitable"
-    func: Callable[..., None] = benchmark_lazyawaitable
+    memory_snapshot: bool = True
+    preallocated: bool = False
+    use_data_copy_stream: bool = True
 
 
-# pyrefly: ignore[missing-attribute]
-@_cc.register
-def lazyawaitable(arg: LazyAwaitableConfig) -> None:
-    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
-
-
-def benchmark_h2d_data_copy(
+@register_benchmark(H2DCopyConfig)
+def h2d_data_copy(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -278,46 +333,38 @@ def benchmark_h2d_data_copy(
 
 
 @dataclass
-class H2DCopyConfig(DataCopyConfig):
+class StreamMemoryConfig(DataCopyConfig):
     """
     run commands:
-    1. non-blocking (default): host-to-device data copy, w/o pre-allocated memory
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy
+    1. single stream: copy + a2a on the main stream
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
+        --name=single \
+        --multi_stream=False
 
-    2. pre-allocated: non-blocking host-to-device data copy, w/ pre-allocated memory
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy \
-        --name=preallocated \
+    2. multi stream (default): copy on a side stream, a2a on a dedicated dist stream
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory
+
+    3. optimized: pre-allocated in-place copy on a side stream, a2a on the main stream
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
+        --name=optimized \
         --preallocated=True
 
-    3. blocking: blocking host-to-device data copy
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_data_copy \
-        --name=blocking \
-        --use_data_copy_stream=False
-
     use case:
-        study the CUDA cached-memory footprint of host-to-device copies. A
-        non-blocking copy on a side stream inflates that stream's reserved
-        memory: the copied tensor is allocated on the side stream and is not
-        shared back with the main stream by the caching allocator.
-        Pre-allocating on the main stream and doing an in-place copy on the side
-        stream keeps the footprint as low as a blocking copy.
-        see https://github.com/meta-pytorch/torchrec/pull/3485 and
-        https://github.com/meta-pytorch/torchrec/pull/3510 for more details
+        study the CUDA memory footprint when overlapping an H2D copy and an
+        all-to-all with compute across streams. A side-stream copy/comm overlaps
+        well but inflates that stream's reserved memory; pre-allocating on the main
+        stream + in-place copy, and letting all_to_all_single use NCCL's own async
+        stream, keeps the overlap while avoiding the extra footprint.
+        see https://github.com/meta-pytorch/torchrec/pull/3480 for more details
     """
 
     memory_snapshot: bool = True
+    multi_stream: bool = True
     preallocated: bool = False
-    use_data_copy_stream: bool = True
-    func: Callable[..., None] = benchmark_h2d_data_copy
 
 
-# pyrefly: ignore[missing-attribute]
-@_cc.register
-def h2d_data_copy(arg: H2DCopyConfig) -> None:
-    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
-
-
-def benchmark_stream_memory(
+@register_benchmark(StreamMemoryConfig)
+def stream_memory(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -440,44 +487,36 @@ def benchmark_stream_memory(
 
 
 @dataclass
-class StreamMemoryConfig(DataCopyConfig):
+class ThreadingCopyConfig(DataCopyConfig):
     """
     run commands:
-    1. single stream: copy + a2a on the main stream
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
-        --name=single \
-        --multi_stream=False
+    1. multi-threaded (default): issue the H2D copies from a worker thread
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer threading_copy
 
-    2. multi stream (default): copy on a side stream, a2a on a dedicated dist stream
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory
-
-    3. optimized: pre-allocated in-place copy on a side stream, a2a on the main stream
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer stream_memory \
-        --name=optimized \
-        --preallocated=True
+    2. single-threaded: run the copies inline on the main thread
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer threading_copy \
+        --name=single_thread \
+        --multithreading=False
 
     use case:
-        study the CUDA memory footprint when overlapping an H2D copy and an
-        all-to-all with compute across streams. A side-stream copy/comm overlaps
-        well but inflates that stream's reserved memory; pre-allocating on the main
-        stream + in-place copy, and letting all_to_all_single use NCCL's own async
-        stream, keeps the overlap while avoiding the extra footprint.
-        see https://github.com/meta-pytorch/torchrec/pull/3480 for more details
+        in production models the input batch has 500+ tensors copied host-to-device
+        one by one; even though each copy is non-blocking, the per-call CPU overhead
+        (Python loop + CUDA driver dispatch) accumulates and blocks the main thread
+        from dispatching forward-pass kernels. This benchmark simulates that with many
+        small pinned tensors and checks whether issuing the copies from a separate
+        Python thread (via concurrent.futures.ThreadPoolExecutor, on a side CUDA
+        stream) frees the main thread and lets the copies overlap main-stream compute.
+        CUDA calls release the GIL so the background thread does not block the main
+        thread, though the Python copy loop itself still contends on the GIL.
+        see https://github.com/meta-pytorch/torchrec/pull/3774 for more details
     """
 
     memory_snapshot: bool = True
-    multi_stream: bool = True
-    preallocated: bool = False
-    func: Callable[..., None] = benchmark_stream_memory
+    multithreading: bool = True
 
 
-# pyrefly: ignore[missing-attribute]
-@_cc.register
-def stream_memory(arg: StreamMemoryConfig) -> None:
-    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
-
-
-def benchmark_threading_copy(
+@register_benchmark(ThreadingCopyConfig)
+def threading_copy(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -545,42 +584,34 @@ def benchmark_threading_copy(
 
 
 @dataclass
-class ThreadingCopyConfig(DataCopyConfig):
+class DataCopyRecordStreamConfig(DataCopyConfig):
     """
     run commands:
-    1. multi-threaded (default): issue the H2D copies from a worker thread
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer threading_copy
+    1. with record_stream (correct, default)
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer data_copy_record_stream
 
-    2. single-threaded: run the copies inline on the main thread
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer threading_copy \
-        --name=single_thread \
-        --multithreading=False
+    2. without record_stream (reproduces the bug)
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer data_copy_record_stream \
+        --name=no_record_stream \
+        --use_record_stream=False
 
     use case:
-        in production models the input batch has 500+ tensors copied host-to-device
-        one by one; even though each copy is non-blocking, the per-call CPU overhead
-        (Python loop + CUDA driver dispatch) accumulates and blocks the main thread
-        from dispatching forward-pass kernels. This benchmark simulates that with many
-        small pinned tensors and checks whether issuing the copies from a separate
-        Python thread (via concurrent.futures.ThreadPoolExecutor, on a side CUDA
-        stream) frees the main thread and lets the copies overlap main-stream compute.
-        CUDA calls release the GIL so the background thread does not block the main
-        thread, though the Python copy loop itself still contends on the GIL.
-        see https://github.com/meta-pytorch/torchrec/pull/3774 for more details
+        reproduce the NaN corruption bug fixed by D102202725 in EMS memory stashing.
+        record_stream() tells the CUDA caching allocator to defer reuse of a tensor's
+        memory until the recording stream catches up. Without it, freeing the source
+        via untyped_storage().resize_(0) on the main stream lets the allocator hand the
+        block to a new allocation while an async D2H copy on a side stream is still
+        reading it, corrupting the copied data (NaN / wrong values). With
+        use_record_stream the copy validates correctly; without it validation fails.
+        see https://github.com/meta-pytorch/torchrec/pull/4231 for more details
     """
 
     memory_snapshot: bool = True
-    multithreading: bool = True
-    func: Callable[..., None] = benchmark_threading_copy
+    use_record_stream: bool = True
 
 
-# pyrefly: ignore[missing-attribute]
-@_cc.register
-def threading_copy(arg: ThreadingCopyConfig) -> None:
-    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
-
-
-def benchmark_data_copy_record_stream(
+@register_benchmark(DataCopyRecordStreamConfig)
+def data_copy_record_stream(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -643,40 +674,46 @@ def benchmark_data_copy_record_stream(
 
 
 @dataclass
-class DataCopyRecordStreamConfig(DataCopyConfig):
+class CopyEngineContentionConfig(DataCopyConfig):
     """
     run commands:
-    1. with record_stream (correct, default)
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer data_copy_record_stream
+    1. default: back-to-back trunked H2D vs small copies on the main stream
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention
 
-    2. without record_stream (reproduces the bug)
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer data_copy_record_stream \
-        --name=no_record_stream \
-        --use_record_stream=False
+    2. dummy compute between trunks
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention \
+        --name=dummy_compute \
+        --dummy_compute=True
+
+    3. dummy compute + 10x trunks (smaller trunks, compute fires more often)
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention \
+        --name=dummy_compute_10x_trunk \
+        --dummy_compute=True \
+        --trunk_count=30
 
     use case:
-        reproduce the NaN corruption bug fixed by D102202725 in EMS memory stashing.
-        record_stream() tells the CUDA caching allocator to defer reuse of a tensor's
-        memory until the recording stream catches up. Without it, freeing the source
-        via untyped_storage().resize_(0) on the main stream lets the allocator hand the
-        block to a new allocation while an async D2H copy on a side stream is still
-        reading it, corrupting the copied data (NaN / wrong values). With
-        use_record_stream the copy validates correctly; without it validation fails.
-        see https://github.com/meta-pytorch/torchrec/pull/4231 for more details
+        reproduce and mitigate CUDA copy-engine contention. A bulk H2D copy (e.g. EMS
+        embedding restore) saturates the GPU's single same-direction DMA copy engine,
+        blocking small H2D copies -- and the dependent compute -- on other streams. The
+        copy engine is priority-blind and current-stream-first, so consecutive
+        same-stream trunks run back-to-back and chunking alone never yields. Here the
+        h2d_stream runs one bulk H2D split into trunk_count trunks via chunked_copy_,
+        while the main stream interleaves a small D2H and two small H2D copies with
+        compute. With dummy_compute a tiny op is inserted between trunks, forcing the
+        engine to yield so the main stream's small H2D copies slip into the gaps (the
+        D2H is unaffected -- it uses a separate copy engine). Smaller trunks (larger
+        trunk_count) tighten the contention latency at a small bandwidth cost.
+        see https://github.com/meta-pytorch/torchrec/pull/4303 and
+        https://github.com/meta-pytorch/torchrec/pull/4339 for more details
     """
 
     memory_snapshot: bool = True
-    use_record_stream: bool = True
-    func: Callable[..., None] = benchmark_data_copy_record_stream
+    dummy_compute: bool = False
+    trunk_count: int = 3
 
 
-# pyrefly: ignore[missing-attribute]
-@_cc.register
-def data_copy_record_stream(arg: DataCopyRecordStreamConfig) -> None:
-    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
-
-
-def benchmark_copy_engine_contention(
+@register_benchmark(CopyEngineContentionConfig)
+def copy_engine_contention(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -802,52 +839,27 @@ def benchmark_copy_engine_contention(
 
 
 @dataclass
-class CopyEngineContentionConfig(DataCopyConfig):
+class H2DExecutionOrderConfig(DataCopyConfig):
     """
     run commands:
-    1. default: back-to-back trunked H2D vs small copies on the main stream
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention
-
-    2. dummy compute between trunks
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention \
-        --name=dummy_compute \
-        --dummy_compute=True
-
-    3. dummy compute + 10x trunks (smaller trunks, compute fires more often)
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer copy_engine_contention \
-        --name=dummy_compute_10x_trunk \
-        --dummy_compute=True \
-        --trunk_count=30
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_execution_order
 
     use case:
-        reproduce and mitigate CUDA copy-engine contention. A bulk H2D copy (e.g. EMS
-        embedding restore) saturates the GPU's single same-direction DMA copy engine,
-        blocking small H2D copies -- and the dependent compute -- on other streams. The
-        copy engine is priority-blind and current-stream-first, so consecutive
-        same-stream trunks run back-to-back and chunking alone never yields. Here the
-        h2d_stream runs one bulk H2D split into trunk_count trunks via chunked_copy_,
-        while the main stream interleaves a small D2H and two small H2D copies with
-        compute. With dummy_compute a tiny op is inserted between trunks, forcing the
-        engine to yield so the main stream's small H2D copies slip into the gaps (the
-        D2H is unaffected -- it uses a separate copy engine). Smaller trunks (larger
-        trunk_count) tighten the contention latency at a small bandwidth cost.
-        see https://github.com/meta-pytorch/torchrec/pull/4303 and
-        https://github.com/meta-pytorch/torchrec/pull/4339 for more details
+        observe the copy engine's execution order across three streams that reach their
+        H2D copies at different times (controlled by different pre-copy compute).
+        Reverse-engineered model: the engine uses readiness-based dispatch (it runs
+        whichever copy becomes ready next, regardless of CPU issue order) with
+        current-stream-first scheduling (consecutive same-stream copies run back-to-back
+        unless a dummy op breaks their readiness). The CPU issues the long-compute
+        stream first but its copy reaches the engine last -- check the trace to confirm.
+        see https://github.com/meta-pytorch/torchrec/pull/4315 for more details
     """
 
     memory_snapshot: bool = True
-    dummy_compute: bool = False
-    trunk_count: int = 3
-    func: Callable[..., None] = benchmark_copy_engine_contention
 
 
-# pyrefly: ignore[missing-attribute]
-@_cc.register
-def copy_engine_contention(arg: CopyEngineContentionConfig) -> None:
-    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
-
-
-def benchmark_h2d_execution_order(
+@register_benchmark(H2DExecutionOrderConfig)
+def h2d_execution_order(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -980,33 +992,33 @@ def benchmark_h2d_execution_order(
 
 
 @dataclass
-class H2DExecutionOrderConfig(DataCopyConfig):
+class A2AD2HContentionConfig(DataCopyConfig):
     """
     run commands:
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer h2d_execution_order
+    1. concurrent (default): a2a and D2H run on separate streams simultaneously
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer a2a_d2h_contention
+
+    2. sequential: D2H waits for the a2a to finish (contention-free baseline)
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer a2a_d2h_contention \
+        --name=sequential \
+        --concurrent=False
 
     use case:
-        observe the copy engine's execution order across three streams that reach their
-        H2D copies at different times (controlled by different pre-copy compute).
-        Reverse-engineered model: the engine uses readiness-based dispatch (it runs
-        whichever copy becomes ready next, regardless of CPU issue order) with
-        current-stream-first scheduling (consecutive same-stream copies run back-to-back
-        unless a dummy op breaks their readiness). The CPU issues the long-compute
-        stream first but its copy reaches the engine last -- check the trace to confirm.
-        see https://github.com/meta-pytorch/torchrec/pull/4315 for more details
+        measure whether a device-to-host copy (PCIe copy engine) contends with
+        all_to_all_single (NVLink/NVSwitch) when overlapped. Running both concurrently
+        vs sequentially (the contention-free baseline) shows comparable a2a latency:
+        D2H and NCCL collectives use largely independent data paths, so they are safe to
+        overlap. The concurrent variant surfaces any shared-resource contention (copy
+        engine, memory controller, L2 bandwidth) as increased latency in the trace.
+        see https://github.com/meta-pytorch/torchrec/pull/4292 for more details
     """
 
     memory_snapshot: bool = True
-    func: Callable[..., None] = benchmark_h2d_execution_order
+    concurrent: bool = True
 
 
-# pyrefly: ignore[missing-attribute]
-@_cc.register
-def h2d_execution_order(arg: H2DExecutionOrderConfig) -> None:
-    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
-
-
-def benchmark_a2a_d2h_contention(
+@register_benchmark(A2AD2HContentionConfig)
+def a2a_d2h_contention(
     _batch_inputs: List[Dict[str, Any]],
     dim: int,
     num_mul: int,
@@ -1081,39 +1093,6 @@ def benchmark_a2a_d2h_contention(
     with record_function("## assert ##"):
         assert checks_a2a.item()
         assert d2h_correct, f"D2H copy validation failed on rank {ctx.rank}"
-
-
-@dataclass
-class A2AD2HContentionConfig(DataCopyConfig):
-    """
-    run commands:
-    1. concurrent (default): a2a and D2H run on separate streams simultaneously
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer a2a_d2h_contention
-
-    2. sequential: D2H waits for the a2a to finish (contention-free baseline)
-    > python -m torchrec.distributed.benchmark.benchmark_data_transfer a2a_d2h_contention \
-        --name=sequential \
-        --concurrent=False
-
-    use case:
-        measure whether a device-to-host copy (PCIe copy engine) contends with
-        all_to_all_single (NVLink/NVSwitch) when overlapped. Running both concurrently
-        vs sequentially (the contention-free baseline) shows comparable a2a latency:
-        D2H and NCCL collectives use largely independent data paths, so they are safe to
-        overlap. The concurrent variant surfaces any shared-resource contention (copy
-        engine, memory controller, L2 bandwidth) as increased latency in the trace.
-        see https://github.com/meta-pytorch/torchrec/pull/4292 for more details
-    """
-
-    memory_snapshot: bool = True
-    concurrent: bool = True
-    func: Callable[..., None] = benchmark_a2a_d2h_contention
-
-
-# pyrefly: ignore[missing-attribute]
-@_cc.register
-def a2a_d2h_contention(arg: A2AD2HContentionConfig) -> None:
-    run_multi_process_func(func=single_rank_runner, world_size=arg.world_size, arg=arg)
 
 
 if __name__ == "__main__":
