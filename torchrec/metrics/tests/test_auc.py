@@ -9,6 +9,7 @@
 
 import unittest
 from typing import Dict, Iterable, List, Optional, Type, Union
+from unittest.mock import patch
 
 import torch
 from torch import no_grad
@@ -87,6 +88,79 @@ class TestAUCMetric(TestMetric):
 
 
 WORLD_SIZE = 4
+BATCH_SIZE = 10
+
+
+def generate_compile_model_output() -> Dict[str, torch.Tensor]:
+    return {
+        "predictions": torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5]]),
+        "labels": torch.tensor([[1.0, 0.0, 1.0, 0.0, 1.0]]),
+        "weights": torch.tensor([[1.0, 1.0, 1.0, 1.0, 1.0]]),
+    }
+
+
+class AUCMetricCompileTest(unittest.TestCase):
+    def test_auc_compile(self) -> None:
+        # AUCMetricComputation.update windows the raw inputs as a growing list of
+        # tensors. When that update is traced by torch.compile it guards on the
+        # Python list length (len(labels) == 1, 2, 3, ...) and on dynamic tensor
+        # sizes on every warm-up step, which exceeds the recompile limit. The
+        # @torch.compiler.disable on AUCMetricComputation.update keeps that code
+        # out of the compiled graph. This test is a regression guard: it asserts
+        # the recompile limit is never hit and that the compiled path matches
+        # eager. Reverting the @torch.compiler.disable makes it fail with
+        # FailOnRecompileLimitHit.
+        auc_compiled = AUCMetric(
+            world_size=WORLD_SIZE,
+            my_rank=0,
+            batch_size=BATCH_SIZE,
+            tasks=[DefaultTaskInfo],
+            window_size=200,
+        )
+        auc_eager = AUCMetric(
+            world_size=WORLD_SIZE,
+            my_rank=0,
+            batch_size=BATCH_SIZE,
+            tasks=[DefaultTaskInfo],
+            window_size=200,
+        )
+
+        model_output = generate_compile_model_output()
+        compiled_update = torch.compile(auc_compiled.update)
+        # torchmetrics increments the integer ``_update_count`` nn.Module attribute
+        # on every update. By default torch.compile specializes on integer module
+        # attributes, so that alone would force a recompile each step; treat int
+        # module attributes as dynamic to isolate the AUC list-length recompiles,
+        # then assert the recompile limit is never hit so this stays a regression
+        # guard.
+        with patch.object(
+            torch._dynamo.config, "allow_unspec_int_on_nn_module", True
+        ), patch.object(torch._dynamo.config, "fail_on_recompile_limit_hit", True):
+            for _ in range(10):
+                compiled_update(
+                    predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
+                    labels={DefaultTaskInfo.name: model_output["labels"][0]},
+                    weights={DefaultTaskInfo.name: model_output["weights"][0]},
+                    _log_tensors=False,  # avoid logging-induced graph breaks
+                )
+                auc_eager.update(
+                    predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
+                    labels={DefaultTaskInfo.name: model_output["labels"][0]},
+                    weights={DefaultTaskInfo.name: model_output["weights"][0]},
+                )
+
+        key = f"auc-{DefaultTaskInfo.name}|window_auc"
+        compiled_out = auc_compiled.compute()
+        eager_out = auc_eager.compute()
+        torch.testing.assert_close(
+            compiled_out[key],
+            eager_out[key],
+            atol=1e-4,
+            rtol=1e-4,
+            check_dtype=False,
+            equal_nan=True,
+            msg=f"Compiled: {compiled_out[key]}, Eager: {eager_out[key]}",
+        )
 
 
 class AUCMetricTest(unittest.TestCase):
