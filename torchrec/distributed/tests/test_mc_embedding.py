@@ -2264,3 +2264,144 @@ class TestShardedQuantMCCOutputDistUnit(unittest.TestCase):
         sqmcc = self._make_sqmcc(["f0"])
 
         self.assertEqual(sqmcc.unsharded_module_type, ManagedCollisionCollection)
+
+
+class _IdentityDistModule(torch.nn.Module):
+    def forward(self, x: KeyedJaggedTensor) -> KeyedJaggedTensor:
+        return x
+
+
+class _SplitWithIndexAccessModule(torch.nn.Module):
+    """Mimics the fixed ShardedQuantManagedCollisionCollection.input_dist() pattern."""
+
+    def __init__(self, num_splits: int) -> None:
+        super().__init__()
+        self._dists = torch.nn.ModuleList(
+            [_IdentityDistModule() for _ in range(num_splits)]
+        )
+        self._splits = [1] * num_splits
+
+    def forward(self, features: KeyedJaggedTensor) -> List[KeyedJaggedTensor]:
+        feature_splits = features.split(self._splits)
+        results: List[KeyedJaggedTensor] = []
+        for i in range(len(self._dists)):
+            results.append(self._dists[i](feature_splits[i]))
+        return results
+
+
+class _SplitWithZipModule(torch.nn.Module):
+    """Mimics the old broken ShardedQuantManagedCollisionCollection.input_dist() pattern."""
+
+    def __init__(self, num_splits: int) -> None:
+        super().__init__()
+        self._dists = torch.nn.ModuleList(
+            [_IdentityDistModule() for _ in range(num_splits)]
+        )
+        self._splits = [1] * num_splits
+
+    def forward(self, features: KeyedJaggedTensor) -> List[KeyedJaggedTensor]:
+        feature_splits = features.split(self._splits)
+        results: List[KeyedJaggedTensor] = []
+        for feature_split, dist_mod in zip(feature_splits, self._dists):
+            results.append(dist_mod(feature_split))
+        return results
+
+
+class TestMccInputDistFxTracing(unittest.TestCase):
+    """Tests that ShardedQuantManagedCollisionCollection.input_dist() iteration
+    pattern is FX-traceable.
+
+    The fix changed zip(feature_splits, self._input_dists) to index-based
+    range(len(...)) + feature_splits[i], because FX Proxies support
+    __getitem__ but not __iter__.
+    """
+
+    def _create_kjt(self, num_features: int = 3) -> KeyedJaggedTensor:
+        keys = [f"f{i}" for i in range(num_features)]
+        values = torch.arange(num_features * 2, dtype=torch.int64)
+        lengths = torch.ones(num_features, dtype=torch.int64) * 2
+        return KeyedJaggedTensor(keys=keys, values=values, lengths=lengths)
+
+    def test_index_access_traces_without_error(self) -> None:
+        module = _SplitWithIndexAccessModule(num_splits=3)
+        tracer = torch.fx.Tracer()
+        graph = tracer.trace(module)
+
+        split_nodes = [
+            n for n in graph.nodes if n.op == "call_method" and n.target == "split"
+        ]
+        self.assertGreaterEqual(len(split_nodes), 1)
+
+        getitem_nodes = [
+            n
+            for n in graph.nodes
+            if n.op == "call_function" and "getitem" in str(n.target)
+        ]
+        self.assertEqual(len(getitem_nodes), 3)
+
+    def test_zip_iteration_raises_trace_error(self) -> None:
+        module = _SplitWithZipModule(num_splits=3)
+        tracer = torch.fx.Tracer()
+        with self.assertRaises(torch.fx.proxy.TraceError):
+            tracer.trace(module)
+
+    def test_index_access_correctness(self) -> None:
+        kjt = self._create_kjt(num_features=3)
+        module = _SplitWithIndexAccessModule(num_splits=3)
+
+        results = module(kjt)
+
+        self.assertEqual(len(results), 3)
+        for i, result in enumerate(results):
+            self.assertEqual(result.keys(), [f"f{i}"])
+            self.assertEqual(len(result.values()), 2)
+
+    def test_index_access_matches_zip_access(self) -> None:
+        kjt = self._create_kjt(num_features=3)
+        index_module = _SplitWithIndexAccessModule(num_splits=3)
+        zip_module = _SplitWithZipModule(num_splits=3)
+
+        index_results = index_module(kjt)
+        zip_results = zip_module(kjt)
+
+        self.assertEqual(len(index_results), len(zip_results))
+        for idx_r, zip_r in zip(index_results, zip_results):
+            self.assertEqual(idx_r.keys(), zip_r.keys())
+            torch.testing.assert_close(idx_r.values(), zip_r.values())
+            torch.testing.assert_close(idx_r.lengths(), zip_r.lengths())
+
+    def test_traced_module_executes_correctly(self) -> None:
+        module = _SplitWithIndexAccessModule(num_splits=2)
+        tracer = torch.fx.Tracer()
+        graph = tracer.trace(module)
+        gm = torch.fx.GraphModule(module, graph)
+
+        kjt = KeyedJaggedTensor(
+            keys=["f0", "f1"],
+            values=torch.tensor([10, 20, 30, 40]),
+            lengths=torch.tensor([2, 2]),
+        )
+
+        original_results = module(kjt)
+        traced_results = gm(kjt)
+
+        self.assertEqual(len(traced_results), len(original_results))
+        for orig, traced in zip(original_results, traced_results):
+            self.assertEqual(orig.keys(), traced.keys())
+            torch.testing.assert_close(orig.values(), traced.values())
+            torch.testing.assert_close(orig.lengths(), traced.lengths())
+
+    def test_single_split_traces_correctly(self) -> None:
+        module = _SplitWithIndexAccessModule(num_splits=1)
+        tracer = torch.fx.Tracer()
+        graph = tracer.trace(module)
+        gm = torch.fx.GraphModule(module, graph)
+
+        kjt = KeyedJaggedTensor(
+            keys=["f0"],
+            values=torch.tensor([10, 20]),
+            lengths=torch.tensor([2]),
+        )
+        results = gm(kjt)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].keys(), ["f0"])
