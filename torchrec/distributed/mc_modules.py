@@ -1578,8 +1578,8 @@ class ShardedQuantManagedCollisionCollection(
                 feature_splits = features.split(self._sharding_feature_splits)
 
             input_dist_result_list = []
-            for feature_split, input_dist in zip(feature_splits, self._input_dists):
-                out = input_dist(feature_split)
+            for i in range(len(self._input_dists)):
+                out = self._input_dists[i](feature_splits[i])
                 input_dist_result_list.append(out.features)
                 if is_sequence_embedding:
                     # pyrefly: ignore[missing-attribute]
@@ -1589,7 +1589,9 @@ class ShardedQuantManagedCollisionCollection(
                             features_before_input_dist=features,
                             unbucketize_permute_tensor=(
                                 out.unbucketize_permute_tensor
-                                if isinstance(input_dist, InferRwSparseFeaturesDist)
+                                if isinstance(
+                                    self._input_dists[i], InferRwSparseFeaturesDist
+                                )
                                 else None
                             ),
                             bucket_mapping_tensor=out.bucket_mapping_tensor,
