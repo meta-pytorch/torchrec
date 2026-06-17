@@ -491,7 +491,7 @@ def add_params_from_parameter_sharding(
         and parameter_sharding.key_value_params is not None
     ):
         kv_params = parameter_sharding.key_value_params
-        key_value_params_dict = asdict(kv_params)
+        key_value_params_dict: Dict[str, Any] = asdict(kv_params)
         key_value_params_dict = {
             k: v for k, v in key_value_params_dict.items() if v is not None
         }
