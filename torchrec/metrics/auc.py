@@ -250,6 +250,12 @@ class AUCMetricComputation(RecMetricComputation):
         if self._grouped_auc:
             getattr(self, GROUPING_KEYS).append(torch.tensor([-1], device=self.device))
 
+    # AUC windows the raw inputs as a growing list of tensors, so this update
+    # guards on the Python list length and on dynamic tensor sizes every warm-up
+    # step and blows past the PT2 recompile limit. Keep it out of the compiled
+    # graph (this used to be covered by the graph break in
+    # RecMetricComputation._aggregate_window_state, removed in D105059434).
+    @torch.compiler.disable
     def update(
         self,
         *,
