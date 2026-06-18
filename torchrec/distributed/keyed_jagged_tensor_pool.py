@@ -488,7 +488,6 @@ class ShardedInferenceKeyedJaggedTensorPool(
 ):
     _local_kjt_pool_shards: torch.nn.ModuleList
     _world_size: int
-    _device: torch.device
 
     def __init__(
         self,
@@ -507,7 +506,7 @@ class ShardedInferenceKeyedJaggedTensorPool(
         self._values_dtype = values_dtype
         self._sharding_env = sharding_env
         self._world_size = self._sharding_env.world_size
-        self._device = device or torch.device("cuda")
+        self._device: torch.device = device or torch.device("cuda")
         self._sharding_plan = sharding_plan
 
         self._is_weighted = is_weighted
