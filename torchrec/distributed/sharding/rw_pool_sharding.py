@@ -179,7 +179,6 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
     """
 
     _world_size: int
-    _device: torch.device
     _block_size: torch.Tensor
     _block_bucketize_row_pos: list[torch.Tensor]
 
@@ -192,7 +191,7 @@ class InferRwObjectPoolInputDist(torch.nn.Module):
     ) -> None:
         super().__init__()
         self._world_size = env.world_size
-        self._device = device
+        self._device: torch.device = device
         self._block_size = block_size
         self._block_bucketize_row_pos: list[torch.Tensor] = (
             [] if block_bucketize_row_pos is None else block_bucketize_row_pos
