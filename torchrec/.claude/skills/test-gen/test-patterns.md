@@ -314,7 +314,6 @@ python_unittest(
     name = "test_my_sharding",
     srcs = ["test_my_sharding.py"],
     remote_execution = re_test_utils.remote_execution(
-        mig = "false",
         platform = "gpu-remote-execution",
         resource_units = 2,
     ),
@@ -333,7 +332,6 @@ python_unittest(
     name = "test_my_sharding",
     srcs = ["test_my_sharding.py"],
     remote_execution = re_test_utils.remote_execution(
-        mig = "false",
         platform = "gpu-remote-execution",
         resource_units = 2,
     ),
