@@ -132,7 +132,6 @@ python_unittest(
     name = "test_my_module",
     srcs = ["test_my_module.py"],
     remote_execution = re_test_utils.remote_execution(
-        mig = "false",
         platform = "gpu-remote-execution",
         resource_units = 2,
     ),
