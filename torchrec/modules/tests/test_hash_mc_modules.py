@@ -35,6 +35,7 @@ from torchrec.modules.mc_modules import (
     ManagedCollisionCollection,
     ManagedCollisionModule,
 )
+from torchrec.modules.utils import make_hash_zch_buckets_non_persistent
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
@@ -2238,3 +2239,40 @@ class TestVBEWithManagedCollision(unittest.TestCase):
             rtol=0,
             atol=0,
         )
+
+
+class TestPersistHashZchBucket(unittest.TestCase):
+    def test_persist_hash_zch_bucket_default(self) -> None:
+        module = HashZchManagedCollisionModule(
+            zch_size=20,
+            device=torch.device("cpu"),
+            total_num_buckets=2,
+        )
+        self.assertIn("_hash_zch_bucket", module.state_dict())
+
+    def test_persist_hash_zch_bucket_false(self) -> None:
+        module = HashZchManagedCollisionModule(
+            zch_size=20,
+            device=torch.device("cpu"),
+            total_num_buckets=2,
+            persist_hash_zch_bucket=False,
+        )
+        # Excluded from state_dict, but still a live (queryable) buffer.
+        self.assertNotIn("_hash_zch_bucket", module.state_dict())
+        self.assertEqual(int(module.get_buffer("_hash_zch_bucket")[0][0].item()), 2)
+
+    def test_make_hash_zch_buckets_non_persistent_helper(self) -> None:
+        parent = torch.nn.Module()
+        parent.add_module(
+            "child",
+            HashZchManagedCollisionModule(
+                zch_size=20,
+                device=torch.device("cpu"),
+                total_num_buckets=2,
+            ),
+        )
+        self.assertIn("child._hash_zch_bucket", parent.state_dict())
+
+        count = make_hash_zch_buckets_non_persistent(parent)
+        self.assertGreaterEqual(count, 1)
+        self.assertNotIn("child._hash_zch_bucket", parent.state_dict())

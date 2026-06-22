@@ -216,6 +216,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         end_bucket: end bucket of the current rank, typically not provided by user
         opt_in_prob: the probability of an ID to be opted in from a statistical aspect
         percent_reserved_slots: percentage of slots to be reserved when opt-in is enabled, the value must be in [0, 100)
+        persist_hash_zch_bucket: when False, exclude the bucket-count buffer from state_dict. Useful for warm-loading checkpoints saved before this buffer existed.
 
     Example::
         module = HashZchManagedCollisionModule(...)
@@ -253,6 +254,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         enable_per_feature_lookups: bool = False,
         no_bag: bool = False,
         write_runtime_meta_dim: int = 0,
+        persist_hash_zch_bucket: bool = True,
     ) -> None:
         if output_segments is None:
             assert (
@@ -359,9 +361,11 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             )
         self._max_probe = max_probe
         self._buckets = total_num_buckets
+        self._persist_hash_zch_bucket: bool = persist_hash_zch_bucket
         self.register_buffer(
             HashZchManagedCollisionModule.BUCKET_BUFFER,
             torch.tensor([[total_num_buckets]]),
+            persistent=persist_hash_zch_bucket,
         )
         # Do not need to store in buffer since this is created and consumed
         # at each step https://fburl.com/code/axzimmbx
@@ -404,7 +408,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{inference_dispatch_div_train_world_size=}, "
             f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, "
             f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
-            f"{self._no_bag=}, {self._write_runtime_meta_dim=}"
+            f"{self._no_bag=}, {self._write_runtime_meta_dim=}, "
+            f"{self._persist_hash_zch_bucket=}"
         )
 
     def _create_zch_buffer(
@@ -839,6 +844,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             enable_per_feature_lookups=self._enable_per_feature_lookups,
             no_bag=self._no_bag,
             write_runtime_meta_dim=self._write_runtime_meta_dim,
+            persist_hash_zch_bucket=self._persist_hash_zch_bucket,
         )
 
     def lookup_runtime_meta(

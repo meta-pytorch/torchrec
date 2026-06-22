@@ -449,3 +449,33 @@ def _get_unbucketize_tensor_via_length_alignment(
     bucket_mapping_tensor: torch.Tensor,
 ) -> torch.Tensor:
     return bucketize_permute_tensor
+
+
+def make_hash_zch_buckets_non_persistent(module: torch.nn.Module) -> int:
+    """
+    Mark the bucket-count buffer non-persistent on every
+    ``HashZchManagedCollisionModule`` reachable from ``module``.
+
+    The bucket-count buffer (``_hash_zch_bucket``) is derived deterministically
+    from config at construction time, so excluding it from ``state_dict`` is
+    safe. This is useful for warm-loading checkpoints that were saved before the
+    buffer existed, which would otherwise fail on the missing key.
+
+    Args:
+        module: root module to walk (e.g. a sharded model parallel wrapper).
+
+    Returns:
+        The number of modules whose bucket buffer was made non-persistent.
+    """
+    # Name registered via HashZchManagedCollisionModule.BUCKET_BUFFER; referenced
+    # by literal here to avoid importing the module (and a potential import cycle).
+    bucket_buffer = "_hash_zch_bucket"
+    count = 0
+    for submodule in module.modules():
+        if (
+            bucket_buffer in submodule._buffers
+            and bucket_buffer not in submodule._non_persistent_buffers_set
+        ):
+            submodule._non_persistent_buffers_set.add(bucket_buffer)
+            count += 1
+    return count
