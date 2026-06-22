@@ -263,9 +263,14 @@ class RecMetricComputation(Metric, abc.ABC):
                 )
             kwargs["persistent"] = False
             window_state_name = self.get_window_state_name(name)
-            # Avoid pyre error
+            # `isinstance` does not narrow the `DefaultValueT` type variable, so
+            # cast to satisfy the type checker after the runtime guard.
             assert isinstance(default, torch.Tensor)
-            super().add_state(window_state_name, default.detach().clone(), **kwargs)
+            super().add_state(
+                window_state_name,
+                cast(torch.Tensor, default).detach().clone(),
+                **kwargs,
+            )
 
             self._batch_window_buffers[window_state_name] = WindowBuffer(
                 max_size=self._window_size,
