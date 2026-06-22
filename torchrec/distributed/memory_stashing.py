@@ -24,6 +24,11 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+# Trunk size for the bulk stash (D2H) / restore (H2D) copies. ~32 MiB trunks
+# keep the copy engine yielding often enough for the main stream's small copies
+# to interleave, at a negligible bandwidth cost (see chunked copy design).
+_STASH_CHUNK_SIZE_BYTES: int = 32 * 1024**2
+
 
 def _tensor_size_text(tensor: Union[List[torch.Tensor], torch.Tensor]) -> str:
     """Return a human-readable size string (MB or GB) for a tensor."""
@@ -146,6 +151,10 @@ class MemoryStashingManager:
     # sites run on every batch; without this guard they would flood the event
     # logger. Intentionally NOT cleared in reset() to avoid re-flooding.
     _logged_event_keys: set[str] = set()
+    # Trunk size (bytes) for the bulk D2H stash / H2D restore copies, used as
+    # ``chunked_copy_``'s ``chunk_size_bytes``. Defaults to
+    # ``_STASH_CHUNK_SIZE_BYTES``; override via ``set_trunk_size``.
+    _stash_chunk_size_bytes: int = _STASH_CHUNK_SIZE_BYTES
 
     @classmethod
     def _log_ems_once(
@@ -202,6 +211,17 @@ class MemoryStashingManager:
         cls._log_ems_once("ems_streams_initialized")
 
     @classmethod
+    def set_trunk_size(cls, size_bytes: int) -> None:
+        """Set the trunk size (in bytes) for bulk stash/restore copies.
+
+        Controls how ``_stash_tensors`` splits each bulk D2H stash and H2D
+        restore via ``chunked_copy_``. Smaller trunks let the copy engine yield
+        to the main stream's small copies more often, at a small bandwidth cost;
+        values <= 0 disable chunking and fall back to a single ``copy_``.
+        """
+        cls._stash_chunk_size_bytes = size_bytes
+
+    @classmethod
     def set_delay_stash(cls, delay: bool) -> None:
         """Enable or disable delayed stashing.
 
@@ -235,6 +255,7 @@ class MemoryStashingManager:
         cls._optimizer_state_restore_callbacks.clear()
         cls._emo_cache_restore_callbacks.clear()
         cls._delay_stash = False
+        cls._stash_chunk_size_bytes = _STASH_CHUNK_SIZE_BYTES
         cls._pending_stash_callbacks.clear()
         if cls._stash_executor is not None:
             cls._stash_executor.shutdown(wait=False)
@@ -361,7 +382,14 @@ class MemoryStashingManager:
                             device="cpu",
                             pin_memory=True,
                         )
-                        cpu_buffer.copy_(tensor, non_blocking=True)
+                        # Chunk the bulk D2H copy so the copy engine yields
+                        # between trunks, letting other streams' small copies
+                        # interleave instead of waiting for the whole transfer.
+                        chunked_copy_(
+                            cpu_buffer,
+                            tensor,
+                            chunk_size_bytes=cls._stash_chunk_size_bytes,
+                        )
                         # Tell the caching allocator this tensor is in use on
                         # d2h_stream so the bytes are not reused by default-
                         # stream allocations until the async D2H copy completes.
@@ -454,7 +482,11 @@ class MemoryStashingManager:
                         stride=hbm_ref.stride(),
                     )
                     with torch.cuda.stream(h2d_stream):
-                        tmp.copy_(cpu_buf, non_blocking=True)
+                        # Chunk the bulk H2D restore so the copy engine yields
+                        # between trunks (see chunked_copy_).
+                        chunked_copy_(
+                            tmp, cpu_buf, chunk_size_bytes=cls._stash_chunk_size_bytes
+                        )
                     # Tell the caching allocator this storage is in use on
                     # h2d_stream so the bytes cannot be reused by main-stream
                     # allocations before the H2D copy completes.
