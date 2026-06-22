@@ -128,7 +128,7 @@ jobs:
         fi
         echo "index_url: $index_url"
         conda run -n build_binary \
-          pip install torch --index-url $index_url
+          pip install torch==2.12.0 --index-url $index_url
         conda run -n build_binary \
           python -c "import torch; print(torch.__version__)"
         echo "torch succeeded"
