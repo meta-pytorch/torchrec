@@ -779,7 +779,11 @@ class InMemoryBinaryCriteoIterDataPipe(IterableDataset):
         # pyrefly: ignore [bad-argument-type, implicit-import]
         np.random.seed(shuffle_training_set_random_seed)
         self.mmap_mode = mmap_mode
-        self.hashes: np.ndarray = np.array(hashes).reshape((1, CAT_FEATURE_COUNT))
+        self.hashes: Optional[np.ndarray] = (
+            np.array(hashes).reshape((1, CAT_FEATURE_COUNT))
+            if hashes is not None
+            else None
+        )
         self.path_manager_key = path_manager_key
         self.path_manager: "PathManager" = _get_path_manager(path_manager_key)
 

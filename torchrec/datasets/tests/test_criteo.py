@@ -540,3 +540,31 @@ class TestInMemoryBinaryCriteoIterDataPipe(CriteoTest):
         self._test_in_memory_training_set_shuffle([100] * 10, 32, 4, random_seed=100)
         self._test_in_memory_training_set_shuffle([10000], 128, 8, random_seed=0)
         self._test_in_memory_training_set_shuffle([10000], 128, 8, random_seed=100)
+
+    def test_dataset_default_hashes_none(self) -> None:
+        num_rows = 20
+        batch_size = 4
+        sparse = np.mgrid[0:num_rows, 0:CAT_FEATURE_COUNT][0].astype(np.int32)
+        with self._create_dataset_npys(num_rows=num_rows, sparse=sparse) as (
+            dense_path,
+            sparse_path,
+            labels_path,
+        ):
+            datapipe = InMemoryBinaryCriteoIterDataPipe(
+                stage="train",
+                dense_paths=[dense_path],
+                sparse_paths=[sparse_path],
+                labels_paths=[labels_path],
+                batch_size=batch_size,
+                rank=0,
+                world_size=1,
+            )
+            self.assertIsNone(datapipe.hashes)
+            row = 0
+            for batch in datapipe:
+                self._validate_batch(batch, batch_size=batch_size)
+                expected = sparse[row : row + batch_size, :].T.reshape(-1)
+                np.testing.assert_array_equal(
+                    batch.sparse_features.values().numpy(), expected
+                )
+                row += batch_size
