@@ -378,15 +378,6 @@ def validate_compute_kernels(
             violations.append(f"{fqn}: unknown compute kernel '{kernel}'")
             continue
 
-        if (
-            kernel == EmbeddingComputeKernel.DENSE.value
-            and so.sharding_type != ShardingType.DATA_PARALLEL.value
-        ):
-            violations.append(
-                f"{fqn}: DENSE kernel requires DATA_PARALLEL sharding, "
-                f"got '{so.sharding_type}'"
-            )
-
         if kernel in _CACHING_KERNELS:
             clf = so.cache_load_factor
             if clf is not None and (clf <= 0 or clf >= 1):

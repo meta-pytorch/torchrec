@@ -1986,18 +1986,6 @@ class TestValidateComputeKernels(unittest.TestCase):
         )
         self.assertIn("unknown compute kernel", str(ctx.exception))
 
-    def test_dense_kernel_wrong_sharding_type(self) -> None:
-        so = self._make_sharding_option(
-            compute_kernel=EmbeddingComputeKernel.DENSE.value,
-            sharding_type=ShardingType.TABLE_WISE.value,
-        )
-        with self.assertRaises(PlannerError) as ctx:
-            validate_compute_kernels([so])
-        self.assertEqual(
-            ctx.exception.error_type, PlannerErrorType.INVALID_COMPUTE_KERNEL
-        )
-        self.assertIn("DENSE kernel requires DATA_PARALLEL", str(ctx.exception))
-
     def test_fused_uvm_caching_missing_cache_load_factor(self) -> None:
         so = self._make_sharding_option(
             compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
@@ -2064,8 +2052,10 @@ class TestValidateComputeKernels(unittest.TestCase):
     def test_multiple_violations(self) -> None:
         so1 = self._make_sharding_option(
             name="table_0",
-            compute_kernel=EmbeddingComputeKernel.DENSE.value,
+            compute_kernel=EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
             sharding_type=ShardingType.TABLE_WISE.value,
+            cache_params=CacheParams(load_factor=0.0),
+            storage=Storage(hbm=500, ddr=1000),
         )
         so2 = self._make_sharding_option(
             name="table_1",
