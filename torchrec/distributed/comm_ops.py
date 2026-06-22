@@ -2767,7 +2767,7 @@ def reduce_scatter_tensor_backward(ctx, grad):
     if ctx.gradient_division:
         grad.div_(ctx.group_size)
 
-    return grad, None, None, None, None, None
+    return grad, None, None, None, None
 
 
 torch.library.register_autograd(
