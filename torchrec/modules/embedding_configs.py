@@ -290,6 +290,9 @@ class TimestampBasedEvictionPolicy(VirtualTableEvictionPolicy):
     )
     eviction_ttl_mins: int = 24 * 60  # 1 day. 0 means no eviction
     inference_eviction_ttl_mins: Optional[int] = None  # 0 means no eviction
+    max_inference_id_num_per_rank: int = (
+        0  # if > 0, hard cap on rows kept per rank at publish on top of TTL; 0 means no cap (TTL is a soft cap only)
+    )
 
     def __post_init__(self) -> None:
         if self.inference_eviction_ttl_mins is None:
