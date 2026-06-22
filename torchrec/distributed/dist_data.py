@@ -375,8 +375,6 @@ class _MergePooledEmbeddingsModuleImpl(torch.nn.Module):
         device (torch.device): device for fbgemm.merge_pooled_embeddings
     """
 
-    current_device: torch.device
-
     def __init__(
         self,
         device: torch.device,
