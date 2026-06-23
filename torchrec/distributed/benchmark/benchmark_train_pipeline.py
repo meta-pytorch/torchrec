@@ -149,6 +149,11 @@ def runner(
     metric_config: RecMetricConfig,
     table_related_configs: Optional[TableExtendedConfigs] = None,
 ) -> BenchmarkResult:
+    # Enable expandable_segments (if requested) before any CUDA initialization
+    # in this worker, since the caching allocator reads PYTORCH_CUDA_ALLOC_CONF
+    # only once at first CUDA use. No-op when the flag is unset.
+    run_option.maybe_enable_expandable_segments()
+
     # Ensure GPUs are available and we have enough of them
     assert (
         torch.cuda.is_available() and torch.cuda.device_count() >= run_option.world_size
