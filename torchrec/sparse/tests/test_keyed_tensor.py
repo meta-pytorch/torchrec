@@ -664,12 +664,13 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             for out, ref in zip(outputs, out_lengths):
                 self.assertEqual(out.shape, (batch_size, ref))
         else:
-            refs = [[] for _ in groups]
+            ref_groups: list[list[torch.Tensor]] = [[] for _ in groups]
             for i in range(permutes.size(0)):
                 in_idx, out, in_start, _, length, _ = permutes[i].tolist()
-                refs[out].append(values[in_idx][:, in_start : (in_start + length)])
-            # pyrefly: ignore[no-matching-overload]
-            refs = [torch.cat(ref, dim=1) for ref in refs]
+                ref_groups[out].append(
+                    values[in_idx][:, in_start : (in_start + length)]
+                )
+            refs = [torch.cat(ref, dim=1) for ref in ref_groups]
             for out, ref in zip(outputs, refs):
                 torch.testing.assert_close(out, ref)
 
@@ -708,12 +709,13 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
             for out, ref in zip(outputs, out_lengths):
                 self.assertEqual(out.shape, (batch_size, ref))
         else:
-            refs = [[] for _ in groups]
+            ref_groups: list[list[torch.Tensor]] = [[] for _ in groups]
             for i in range(permutes.size(0)):
                 in_idx, out, in_start, _, length, _ = permutes[i].tolist()
-                refs[out].append(values[in_idx][:, in_start : (in_start + length)])
-            # pyrefly: ignore[no-matching-overload]
-            refs = [torch.cat(ref, dim=1) for ref in refs]
+                ref_groups[out].append(
+                    values[in_idx][:, in_start : (in_start + length)]
+                )
+            refs = [torch.cat(ref, dim=1) for ref in ref_groups]
             for out, ref in zip(outputs, refs):
                 torch.testing.assert_close(out, ref)
                 self.assertEqual(out.dtype, ref.dtype)
@@ -747,12 +749,13 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         permutes, in_shapes, out_shapes, out_lengths = _kt_regroup_arguments(
             values[0], keys, lengths, groups
         )
-        refs = [[] for _ in groups]
+        ref_groups: list[list[torch.Tensor]] = [[] for _ in groups]
         for i in range(permutes.size(0)):
             in_idx, out_idx, in_start, _, length, _ = permutes[i].tolist()
-            refs[out_idx].append(ref_values[in_idx][:, in_start : (in_start + length)])
-        # pyrefly: ignore[no-matching-overload]
-        refs = [torch.cat(ref, dim=1) for ref in refs]
+            ref_groups[out_idx].append(
+                ref_values[in_idx][:, in_start : (in_start + length)]
+            )
+        refs = [torch.cat(ref, dim=1) for ref in ref_groups]
         outputs = torch.ops.fbgemm.permute_multi_embedding(
             values, permutes, in_shapes, out_shapes, out_lengths
         )
@@ -943,12 +946,13 @@ class TestKeyedTensorRegroupOp(unittest.TestCase):
         permutes, in_shapes, out_shapes, out_lengths = _kt_regroup_arguments(
             values[0], keys, lengths, groups
         )
-        refs = [[] for _ in groups]
+        ref_groups: list[list[torch.Tensor]] = [[] for _ in groups]
         for i in range(permutes.size(0)):
             in_idx, out_idx, in_start, _, length, _ = permutes[i].tolist()
-            refs[out_idx].append(ref_values[in_idx][:, in_start : (in_start + length)])
-        # pyrefly: ignore[no-matching-overload]
-        refs = [torch.cat(ref, dim=1) for ref in refs]
+            ref_groups[out_idx].append(
+                ref_values[in_idx][:, in_start : (in_start + length)]
+            )
+        refs = [torch.cat(ref, dim=1) for ref in ref_groups]
         outputs = torch.ops.fbgemm.regroup_keyed_tensor(
             values,
             keys,
