@@ -461,6 +461,28 @@ def write_report(
     logger.info(f"Report written to {report_file}:\n{report_str}")
 
 
+def set_expandable_segments_env(enabled: bool) -> None:
+    """Merge ``expandable_segments:True`` into ``PYTORCH_CUDA_ALLOC_CONF``.
+
+    No-op when ``enabled`` is False. Merges with any pre-existing config (e.g.
+    ``max_split_size_mb`` / ``roundup_power2_divisions`` set by the launch
+    environment) instead of clobbering it. Must run before the process
+    initializes CUDA, since the caching allocator parses this env var only once.
+    """
+    if not enabled:
+        return
+    existing = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    new_setting = "expandable_segments:True"
+    if "expandable_segments" not in existing:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+            f"{existing},{new_setting}" if existing else new_setting
+        )
+    logger.info(
+        "[expandable_segments] enabled; PYTORCH_CUDA_ALLOC_CONF=%s",
+        os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+    )
+
+
 def multi_process_benchmark(
     callable: Callable[
         ...,
@@ -473,6 +495,11 @@ def multi_process_benchmark(
         if "MASTER_ADDR" not in os.environ:
             os.environ["MASTER_ADDR"] = str("localhost")
             os.environ["MASTER_PORT"] = str(get_free_port())
+        # Enable expandable_segments (if requested) in the parent before any
+        # child process is spawned below; spawned children inherit os.environ,
+        # so the setting lands before their CUDA init. Pop it so it is not
+        # forwarded as an unexpected kwarg to the per-rank callable.
+        set_expandable_segments_env(bool(kwargs.pop("expandable_segments", False)))
 
     assert "world_size" in kwargs
     world_size = kwargs["world_size"]
@@ -1279,6 +1306,27 @@ class BenchFuncConfig:
     profile_all_threads: bool = False
     loglevel: str = "WARNING"
     test_name: str = ""
+    # When True, enable PyTorch's CUDA ``expandable_segments`` caching-allocator
+    # mode for the benchmark process(es). expandable_segments reserves a growable
+    # virtual address range and maps physical pages on demand, so the allocator
+    # reserves close to what is actually used instead of rounding up into fixed
+    # segments. This reduces fragmentation: lower peak *reserved* GPU memory and
+    # fewer/zero malloc retries, with negligible impact on peak *allocated*
+    # memory or throughput.
+    #
+    # Run WITH it (treatment):
+    #   buck2 run @fbcode//mode/opt \
+    #     fbcode//torchrec/distributed/benchmark:benchmark_train_pipeline -- \
+    #     --yaml_config=fbcode/torchrec/distributed/benchmark/yaml/sparse_data_dist_heavy_dense.yml \
+    #     --expandable_segments=true --name=<run_name>
+    # Run WITHOUT it (baseline): the same command, omitting --expandable_segments=true.
+    # (Note: --expandable_segments needs an explicit value, e.g. =true; a bare
+    # flag is rejected because @cmd_conf bool fields parse a value.)
+    #
+    # NOTE: intentionally NOT forwarded via benchmark_func_kwargs() below — it is
+    # consumed at process setup time (before CUDA init), not by
+    # benchmark_func()/func_to_benchmark.
+    expandable_segments: bool = False
 
     def benchmark_func_kwargs(self, **kwargs_to_override) -> Dict[str, Any]:
         return {
@@ -1299,6 +1347,16 @@ class BenchFuncConfig:
     def set_log_level(self) -> None:
         loglevel = logging._nameToLevel[self.loglevel.upper()]
         logging.root.setLevel(loglevel)
+
+    def maybe_enable_expandable_segments(self) -> None:
+        """Enable CUDA expandable_segments if requested by this config.
+
+        Must be called in each worker process BEFORE CUDA is initialized (the
+        caching allocator reads ``PYTORCH_CUDA_ALLOC_CONF`` only once, at first
+        CUDA use). Safe to call unconditionally — it is a no-op when the flag is
+        unset.
+        """
+        set_expandable_segments_env(self.expandable_segments)
 
 
 def benchmark_func(
@@ -1348,6 +1406,21 @@ def benchmark_func(
     """
     if benchmark_func_kwargs is None:
         benchmark_func_kwargs = {}
+
+    if device_type == "cuda":
+        # Log the allocator settings that are actually active (CUDA is already
+        # initialized by this point) to confirm whether expandable_segments took
+        # effect — useful for A/B comparisons. Best-effort: the getter is a
+        # private binding that may be absent on older runtimes.
+        try:
+            active_settings = torch._C._accelerator_getAllocatorSettings()
+            logger.info(
+                "[expandable_segments] active PYTORCH_CUDA_ALLOC_CONF (rank %s): %s",
+                rank,
+                active_settings,
+            )
+        except Exception as e:  # pragma: no cover - best-effort diagnostics
+            logger.debug("could not read allocator settings: %s", e)
 
     run_iter_fn: Callable[[], None] = lambda: func_to_benchmark(
         bench_inputs, **benchmark_func_kwargs
