@@ -17,7 +17,11 @@ from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from torchrec.distributed.logger import one_time_logger, one_time_rank0_logger
+from torchrec.distributed.logger import (
+    one_time_logger,
+    one_time_rank0_logger,
+    static_logger,
+)
 from torchrec.distributed.planner.constants import (
     BATCH_SIZE,
     BWD_COMPUTE_MULTIPLIER,
@@ -48,6 +52,16 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
 )
 from torchrec.modules.mc_embedding_modules import ManagedCollisionEmbeddingCollection
+
+
+# Fractional gap above which a TrainerConfig capacity is treated as a deliberate
+# override of the detected HardwareConfig value. Below this, the difference is
+# attributable to expected noise -- rounding, or the per-rank vs per-host DDR
+# basis (some callers divide the detected per-host DDR by local_world_size) --
+# and is not worth flagging. Above it, the trainer value is almost certainly a
+# static model config diverging from detected hardware, which is the common
+# cause of planner OOMs when a job lands on a different SKU than assumed.
+_CAP_OVERRIDE_THRESHOLD: float = 0.05
 
 
 # ---- Perf ---- #
@@ -450,11 +464,96 @@ class HardwareConfig(TopologyConfigBase):
     # pyrefly: ignore[bad-override]
     additional_params: Dict[str, Any] = field(default_factory=dict)
 
-    def validate(self) -> None:
-        """Validate hardware configuration parameters."""
-        # No strict validation required - values are optional and
-        # will use defaults from Topology class if not provided
-        pass
+    def get_validation_issues(self, compute_device: Optional[str] = None) -> List[str]:
+        """Return human-readable validation issues (pure: no logging, no raise).
+
+        Flags values that are definitively invalid -- detection failures
+        (non-positive capacities/bandwidths) and physical-invariant violations. A
+        detected HardwareConfig value may be legitimately overridden by TrainerConfig
+        precedence, so callers treat these as warnings, not errors; the
+        resolved/effective value is the one worth failing on, and is validated
+        separately post-precedence.
+
+        Exposed as a pure method (vs only logging) so a caller that evaluates
+        many configs in one process (building one topology per candidate
+        config) can report per-config without depending on logger
+        rate-limiting.
+
+        Args:
+            compute_device: optional device hint. The HBM check runs only for
+                HBM-bearing accelerators ("cuda"/"mtia"), where a non-positive
+                HBM (incl. 0) is a detection failure. It is skipped for "cpu"
+                (no HBM device), "meta", None, or any other device, where a
+                0/None HBM is not a failure. (Using an allowlist rather than
+                "!= cpu" avoids false positives on meta/unknown devices.)
+        """
+        issues: List[str] = []
+
+        # HBM only exists on accelerators that have it (cuda/mtia), so a
+        # non-positive value there is a detection failure. Skipped for cpu
+        # (no HBM device), meta, None, or any other device.
+        if (
+            self.hbm_cap_bytes is not None
+            and compute_device in ("cuda", "mtia")
+            and self.hbm_cap_bytes <= 0
+        ):
+            issues.append(f"hbm_cap_bytes={self.hbm_cap_bytes} is non-positive")
+
+        # DDR: every host has DDR, so a non-positive value is a detection or
+        # per-rank-division failure.
+        if self.ddr_cap_bytes is not None and self.ddr_cap_bytes <= 0:
+            issues.append(f"ddr_cap_bytes={self.ddr_cap_bytes} is non-positive")
+
+        # SSD: 0 is legitimate (a host may have no SSD tier); only a negative
+        # value is invalid.
+        if self.ssd_cap_bytes is not None and self.ssd_cap_bytes < 0:
+            issues.append(f"ssd_cap_bytes={self.ssd_cap_bytes} is negative")
+
+        # Bandwidths are divisors in perf estimation; a set non-positive value
+        # is invalid (and is not replaced by a default downstream).
+        for name, value in (
+            ("intra_host_bw", self.intra_host_bw),
+            ("inter_host_bw", self.inter_host_bw),
+            ("hbm_mem_bw", self.hbm_mem_bw),
+            ("ddr_mem_bw", self.ddr_mem_bw),
+            ("hbm_to_ddr_mem_bw", self.hbm_to_ddr_mem_bw),
+            ("ssd_mem_bw", self.ssd_mem_bw),
+        ):
+            if value is not None and value <= 0:
+                issues.append(f"{name}={value} is non-positive")
+
+        # Physical invariant: intra-node bandwidth should be >= inter-node.
+        if (
+            self.intra_host_bw is not None
+            and self.inter_host_bw is not None
+            and self.intra_host_bw < self.inter_host_bw
+        ):
+            issues.append(
+                f"intra_host_bw ({self.intra_host_bw:.0f}) < "
+                f"inter_host_bw ({self.inter_host_bw:.0f}); intra-node "
+                f"bandwidth is typically much higher than inter-node"
+            )
+
+        return issues
+
+    def validate(self, compute_device: Optional[str] = None) -> None:
+        """Validate hardware configuration parameters (warning-only).
+
+        Thin shell over get_validation_issues(): emits a single combined
+        warning and never raises, to avoid breaking existing flows.
+
+        Logs via static_logger (rank 0, uncapped) rather than a per-location
+        rate-limited logger so that a caller building many topologies in one
+        process (one validate() call per candidate config) surfaces a warning
+        for every config instead of only the first.
+
+        Args:
+            compute_device: optional device hint forwarded to
+                get_validation_issues(); see that method.
+        """
+        issues = self.get_validation_issues(compute_device)
+        if issues:
+            static_logger.warning("HardwareConfig validation: " + "; ".join(issues))
 
 
 @dataclass(frozen=True)
@@ -644,6 +743,7 @@ class TopologyFactory:
 
             # Validate configs
             trainer_config.validate()
+            hardware.validate(compute_device=kernel.compute_device)
             kernel.validate()
 
             # Build topology kwargs with precedence resolution
@@ -662,11 +762,11 @@ class TopologyFactory:
             TopologyFactory._add_hardware_params(topology_kwargs, hardware, kernel)
             TopologyFactory._add_comms_params(topology_kwargs, hardware, kernel)
 
-            one_time_rank0_logger.info("TopologyFactor.create_topology called.")
+            one_time_rank0_logger.info("TopologyFactory.create_topology called.")
             topology_kwargs["created_by_factory"] = True
             return Topology(**topology_kwargs)
         except Exception as e:
-            one_time_logger.error(f"TopologyFactor.create_topology failed: {e}")
+            one_time_logger.error(f"TopologyFactory.create_topology failed: {e}")
             raise
 
     @staticmethod
@@ -698,6 +798,29 @@ class TopologyFactory:
             else hardware.ssd_cap_bytes
         )
 
+        # Warn when a TrainerConfig capacity overrides the detected HardwareConfig
+        # value by more than the noise threshold. Skipped in dry-run, where the
+        # effective caps come from the dry_run_* overrides below, not the
+        # trainer/hardware pair.
+        if not trainer.is_dry_run:
+            TopologyFactory._warn_if_cap_override(
+                "hbm_cap",
+                trainer.hbm_cap_bytes,
+                hardware.hbm_cap_bytes,
+                "This may indicate a static model config overriding detected "
+                "hardware.",
+            )
+            # Assumes both ddr values share the same per-rank/per-host basis;
+            # a mismatched basis (e.g. per-host trainer vs per-rank hardware)
+            # can inflate the reported delta.
+            # TODO: revisit once the per-rank/per-host DDR basis is unified so
+            # this can't false-positive.
+            TopologyFactory._warn_if_cap_override(
+                "ddr_cap",
+                trainer.ddr_cap_bytes,
+                hardware.ddr_cap_bytes,
+            )
+
         # Handle dry-run mode overrides
         if trainer.is_dry_run:
             if trainer.dry_run_hbm_bytes is not None:
@@ -716,6 +839,40 @@ class TopologyFactory:
         custom_topology_data = trainer.get_param("custom_topology_data")
         if custom_topology_data is not None:
             kwargs["custom_topology_data"] = custom_topology_data
+
+    @staticmethod
+    def _warn_if_cap_override(
+        name: str,
+        trainer_value: Optional[int],
+        hardware_value: Optional[int],
+        hint: str = "",
+    ) -> None:
+        """Warn when a trainer-supplied capacity deviates from the detected
+        hardware value by more than _CAP_OVERRIDE_THRESHOLD.
+
+        The trainer value takes precedence in topology construction; a large gap
+        usually means a stale static model config overriding detected hardware.
+        No-op when either value is missing or the hardware value is non-positive.
+
+        Logs via static_logger (rank 0, uncapped) for the same reason as
+        HardwareConfig.validate(): a caller building many topologies in one
+        process would otherwise have a per-location rate-limited logger
+        suppress every warning after the first.
+        """
+        if trainer_value is None or hardware_value is None or hardware_value <= 0:
+            return
+        ratio = abs(trainer_value - hardware_value) / hardware_value
+        if ratio > _CAP_OVERRIDE_THRESHOLD:
+            message = (
+                f"TopologyFactory: TrainerConfig {name} "
+                f"({trainer_value / 1024**3:.1f} GiB) differs from "
+                f"HardwareConfig {name} "
+                f"({hardware_value / 1024**3:.1f} GiB) by "
+                f"{ratio:.0%}. Using TrainerConfig value."
+            )
+            if hint:
+                message = f"{message} {hint}"
+            static_logger.warning(message)
 
     @staticmethod
     def _add_hardware_params(
