@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import torch
 from torchrec.metrics.gauc import compute_gauc_3d, compute_window_auc, GAUCMetric
@@ -42,11 +42,12 @@ class TestGAUCMetric(TestMetric):
 
 class GAUCMetricValueTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.predictions = {"DefaultTask": None}
-        self.labels = {"DefaultTask": None}
-        self.weights = {"DefaultTask": None}
-        self.num_candidates = None
-        self.batches = {
+        self.predictions: Dict[str, Optional[torch.Tensor]] = {"DefaultTask": None}
+        self.labels: Dict[str, Optional[torch.Tensor]] = {"DefaultTask": None}
+        # Reassigned to None in some tests to exercise the no-weights path.
+        self.weights: Any = {"DefaultTask": None}
+        self.num_candidates: Optional[torch.Tensor] = None
+        self.batches: Dict[str, Any] = {
             "predictions": self.predictions,
             "labels": self.labels,
             "num_candidates": self.num_candidates,
@@ -136,7 +137,6 @@ class GAUCMetricValueTest(unittest.TestCase):
             "predictions": self.predictions,
             "labels": self.labels,
             "num_candidates": self.num_candidates,
-            # pyrefly: ignore[bad-typed-dict-key]
             "weights": None,
         }
 
@@ -170,7 +170,6 @@ class GAUCMetricValueTest(unittest.TestCase):
             "predictions": self.predictions,
             "labels": self.labels,
             "num_candidates": self.num_candidates,
-            # pyrefly: ignore[bad-typed-dict-key]
             "weights": None,
         }
 
@@ -200,13 +199,11 @@ class GAUCMetricValueTest(unittest.TestCase):
         self.labels["DefaultTask"] = torch.tensor([[1, 1, 0, 1, 0]])
         self.weights["DefaultTask"] = torch.tensor([[1, 1, 1, 1, 1]])
         self.num_candidates = torch.tensor([3, 2])
-        # pyrefly: ignore[bad-assignment]
         self.weights = None
         self.batches = {
             "predictions": self.predictions,
             "labels": self.labels,
             "num_candidates": self.num_candidates,
-            # pyrefly: ignore[bad-typed-dict-key]
             "weights": None,
         }
 
