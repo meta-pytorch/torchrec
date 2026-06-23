@@ -88,6 +88,8 @@ torch.fx.wrap("len")
 
 
 class TimeGapPoolingCollectionModule(FeatureProcessorsCollection):
+    w: torch.Tensor
+
     def __init__(
         self,
         feature_pow: float,
@@ -119,7 +121,6 @@ class TimeGapPoolingCollectionModule(FeatureProcessorsCollection):
             )
             indices = torch.floor(torch.pow(scores, self.feature_pow))
             indices = indices.to(torch.int32)
-            # pyrefly: ignore[no-matching-overload]
             scores = torch.index_select(self.w, 0, indices)
             scores_list.append(scores)
 

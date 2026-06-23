@@ -288,8 +288,6 @@ class LocalShardPool(torch.nn.Module):
         # out is tensor([1,2,3]) i.e. first row of the shard
     """
 
-    current_device: torch.device
-
     def __init__(
         self,
         shard: torch.Tensor,
@@ -326,7 +324,6 @@ class ShardedInferenceTensorPool(
 ):
     _local_shard_pools: torch.nn.ModuleList
     _world_size: int
-    _device: torch.device
     _rank: int
 
     def __init__(
