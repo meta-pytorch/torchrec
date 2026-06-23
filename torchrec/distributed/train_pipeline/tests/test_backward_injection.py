@@ -9,7 +9,8 @@
 
 import copy
 import unittest
-from typing import cast, List, Optional, Tuple
+from typing import Any, cast, List, Optional, Tuple
+from unittest.mock import MagicMock, patch
 
 import torch
 from hypothesis import given, settings, strategies as st
@@ -32,6 +33,10 @@ from torchrec.distributed.train_pipeline.backward_injection import (
     OutputDistTensorFinder,
     register_backward_hook,
 )
+from torchrec.distributed.train_pipeline.experimental_pipelines import (
+    TrainPipelineSparseDistEmbStash,
+)
+from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
 from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -363,6 +368,142 @@ class InjectionSiteTest(unittest.TestCase):
         model.zero_grad()
         model(torch.randn(2, 4)).sum().backward()
         self.assertEqual(call_count[0], 3)
+
+
+_EMS_MODULE = "torchrec.distributed.train_pipeline.experimental_pipelines"
+
+
+def _mock_embstash_parent_init(self_inner: Any, *args: Any, **kwargs: Any) -> None:
+    """Minimal stand-in for ``TrainPipelineSparseDist.__init__`` so that
+    ``TrainPipelineSparseDistEmbStash`` can be constructed without GPU or
+    distributed setup."""
+    self_inner._memcpy_stream = MagicMock()
+    self_inner._model = MagicMock()
+
+
+class TrainPipelineSparseDistEmbStashHookTest(unittest.TestCase):
+    """Unit tests for the delayed-stash backward-hook wiring in
+    ``TrainPipelineSparseDistEmbStash._pipeline_model`` (no GPU/distributed
+    required). Delayed stash execution must use ``register_backward_hook`` with a
+    ``PARAM_GRAD`` ``InjectionSite`` rather than a forward pre-hook, so that it is
+    compile-safe and FSDP2-safe."""
+
+    @patch(f"{_EMS_MODULE}.MemoryStashingManager")
+    @patch(f"{_EMS_MODULE}.torch.cuda.Stream")
+    @patch.object(TrainPipelineSparseDist, "__init__", _mock_embstash_parent_init)
+    def test_with_stash_site_fqn_registers_param_grad_backward_hook(
+        self, mock_cuda_stream: MagicMock, mock_msm: MagicMock
+    ) -> None:
+        pipeline = TrainPipelineSparseDistEmbStash(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            site_fqn="shared_arch",
+            delay_stash=True,
+            stash_site_fqn="dense",
+            stash_hook_position=0.25,
+        )
+
+        with patch.object(TrainPipelineSparseDist, "_pipeline_model"), patch.object(
+            pipeline, "register_backward_hook"
+        ) as register_backward_hook:
+            pipeline._pipeline_model(MagicMock(), MagicMock())
+
+        # Two backward hooks: execute_pending_stashes (at stash_site_fqn) and
+        # restore_embedding_weights (at restore site). No forward pre-hook.
+        self.assertEqual(register_backward_hook.call_count, 2)
+
+        # First hook executes pending stashes on a PARAM_GRAD InjectionSite
+        # built from stash_site_fqn / stash_hook_position, distinct from the
+        # restore site.
+        stash_site = register_backward_hook.call_args_list[0][0][0]
+        self.assertEqual(stash_site.fqn, "dense")
+        self.assertEqual(stash_site.target_type, InjectionTargetType.PARAM_GRAD)
+        self.assertEqual(stash_site.hook_position, 0.25)
+        self.assertIsNot(stash_site, pipeline._injection_site)
+
+        execute_fn = register_backward_hook.call_args_list[0][0][1]
+        mock_msm.reset_mock()
+        execute_fn(pipeline)
+        mock_msm.execute_pending_stashes.assert_called_once()
+
+        # Second hook restores embedding weights at the restore injection site.
+        restore_site = register_backward_hook.call_args_list[1][0][0]
+        self.assertIs(restore_site, pipeline._injection_site)
+        self.assertEqual(restore_site.fqn, "shared_arch")
+
+        restore_fn = register_backward_hook.call_args_list[1][0][1]
+        mock_msm.reset_mock()
+        restore_fn(pipeline)
+        mock_msm.restore_embedding_weights.assert_called_once()
+
+    @patch(f"{_EMS_MODULE}.MemoryStashingManager")
+    @patch(f"{_EMS_MODULE}.torch.cuda.Stream")
+    @patch.object(TrainPipelineSparseDist, "__init__", _mock_embstash_parent_init)
+    def test_delay_stash_without_stash_site_fqn_falls_back_to_injection_site(
+        self, mock_cuda_stream: MagicMock, mock_msm: MagicMock
+    ) -> None:
+        pipeline = TrainPipelineSparseDistEmbStash(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            site_fqn="shared_arch",
+            delay_stash=True,
+            stash_site_fqn=None,
+        )
+
+        with patch.object(TrainPipelineSparseDist, "_pipeline_model"), patch.object(
+            pipeline, "register_backward_hook"
+        ) as register_backward_hook:
+            pipeline._pipeline_model(MagicMock(), MagicMock())
+
+        # Two backward hooks; the execute hook falls back to the restore
+        # injection site (still a backward hook, never a forward pre-hook).
+        self.assertEqual(register_backward_hook.call_count, 2)
+        self.assertIs(
+            register_backward_hook.call_args_list[0][0][0], pipeline._injection_site
+        )
+
+        execute_fn = register_backward_hook.call_args_list[0][0][1]
+        mock_msm.reset_mock()
+        execute_fn(pipeline)
+        mock_msm.execute_pending_stashes.assert_called_once()
+
+        restore_fn = register_backward_hook.call_args_list[1][0][1]
+        mock_msm.reset_mock()
+        restore_fn(pipeline)
+        mock_msm.restore_embedding_weights.assert_called_once()
+
+    @patch(f"{_EMS_MODULE}.MemoryStashingManager")
+    @patch(f"{_EMS_MODULE}.torch.cuda.Stream")
+    @patch.object(TrainPipelineSparseDist, "__init__", _mock_embstash_parent_init)
+    def test_defaults_no_delay_stash_registers_only_restore_hook(
+        self, mock_cuda_stream: MagicMock, mock_msm: MagicMock
+    ) -> None:
+        pipeline = TrainPipelineSparseDistEmbStash(
+            model=MagicMock(),
+            optimizer=MagicMock(),
+            device=torch.device("cpu"),
+            site_fqn="shared_arch",
+        )
+
+        # Defaults: delayed stash disabled, stash_hook_position 0.01.
+        self.assertFalse(pipeline._delay_stash)
+        self.assertIsNone(pipeline._stash_site_fqn)
+        self.assertEqual(pipeline._stash_hook_position, 0.01)
+        mock_msm.set_delay_stash.assert_not_called()
+
+        with patch.object(TrainPipelineSparseDist, "_pipeline_model"), patch.object(
+            pipeline, "register_backward_hook"
+        ) as register_backward_hook:
+            pipeline._pipeline_model(MagicMock(), MagicMock())
+
+        # Only the restore hook is registered when delayed stash is disabled.
+        self.assertEqual(register_backward_hook.call_count, 1)
+        restore_fn = register_backward_hook.call_args_list[0][0][1]
+        mock_msm.reset_mock()
+        restore_fn(pipeline)
+        mock_msm.restore_embedding_weights.assert_called_once()
 
 
 def _create_sharded_model(

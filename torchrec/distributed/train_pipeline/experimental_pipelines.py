@@ -1141,6 +1141,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         free_features_storage_early: bool = False,
         delay_stash: bool = False,
         stash_site_fqn: Optional[str] = None,
+        stash_hook_position: float = 0.01,
         clear_data_dist_inputs: bool = False,
     ) -> None:
         super().__init__(
@@ -1168,7 +1169,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
             self._injection_site = site_fqn
         self._delay_stash = delay_stash
         self._stash_site_fqn = stash_site_fqn
-        self._stash_hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
+        self._stash_hook_position = stash_hook_position
 
         MemoryStashingManager.set_streams(
             self._memcpy_stream,  # pyrefly: ignore[bad-argument-type]
@@ -1214,35 +1215,6 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
         except Exception:
             logger.debug("EMS config logging failed", exc_info=True)
 
-    def _try_hook_stash(self) -> None:
-        """Register a forward pre-hook on ``stash_site_fqn`` to execute
-        pending stashes right before that module's forward pass.
-
-        This follows the same pattern used by
-        ``TrainPipelineCustomizedOrderSparseDist`` to hook SDD steps into
-        specific module forwards.  The hook frees HBM (D2H copy +
-        ``resize_(0)``) just before peak-memory modules run, avoiding PCIe
-        contention with ``start_sparse_data_dist``'s H2D copy.
-        """
-        if self._stash_site_fqn is None or self._stash_hook_handle is not None:
-            return
-
-        model = self._model
-        if isinstance(model, DistributedModelParallel):
-            model = model.module
-
-        target = model.get_submodule(self._stash_site_fqn)
-
-        def _execute_stash_hook(module: torch.nn.Module, args: Any) -> None:
-            with record_function("## execute_pending_stashes ##"):
-                MemoryStashingManager.execute_pending_stashes()
-
-        self._stash_hook_handle = target.register_forward_pre_hook(_execute_stash_hook)
-        logger.info(
-            f"MemoryStashingManager: hooked execute_pending_stashes "
-            f"as forward pre-hook on {self._stash_site_fqn}"
-        )
-
     def _pipeline_model(
         self,
         batch: Optional[In],
@@ -1251,18 +1223,22 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
     ) -> None:
         super()._pipeline_model(batch, context, pipelined_forward)
 
-        if self._delay_stash and self._stash_site_fqn is None:
-            # No forward hook site specified — fall back to executing
-            # pending stashes via backward hook at the injection site.
+        if self._delay_stash:
+
             def execute_work(_pipeline: Any) -> None:
                 with record_function("## execute_pending_stashes ##"):
                     MemoryStashingManager.execute_pending_stashes()
 
-            self.register_backward_hook(self._injection_site, execute_work)
-
-        # Hook stash execution into the target module's forward if configured.
-        if self._delay_stash:
-            self._try_hook_stash()
+            if self._stash_site_fqn is not None:
+                stash_site = InjectionSite(
+                    fqn=self._stash_site_fqn,
+                    tensor_finder=FirstGradTensorFinder(),
+                    target_type=InjectionTargetType.PARAM_GRAD,
+                    hook_position=self._stash_hook_position,
+                )
+                self.register_backward_hook(stash_site, execute_work)
+            elif self._injection_site is not None:
+                self.register_backward_hook(self._injection_site, execute_work)
 
         def work(_pipeline: Any) -> None:
             with record_function("## restore_embedding_weights ##"):
