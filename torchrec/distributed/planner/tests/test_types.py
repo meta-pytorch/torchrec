@@ -16,6 +16,7 @@ import torch
 from torch import multiprocessing
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.logger import static_logger
 from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.perf_models import NoopPerfModel
@@ -1312,6 +1313,162 @@ class TestHardwareConfig(unittest.TestCase):
             self.assertIsNone(config.hbm_cap_bytes)
             self.assertIsNone(config.ddr_cap_bytes)
 
+        # --- get_validation_issues(): pure detection-failure logic (no logger) ---
+        with self.subTest("issues_all_valid_empty"):
+            self.assertEqual(
+                HardwareConfig(
+                    hbm_cap_bytes=80 * 1024**3,
+                    ddr_cap_bytes=512 * 1024**3,
+                    ssd_cap_bytes=1024 * 1024**3,
+                    intra_host_bw=900.0,
+                    inter_host_bw=25.0,
+                    hbm_mem_bw=1000.0,
+                    ddr_mem_bw=100.0,
+                    hbm_to_ddr_mem_bw=50.0,
+                    ssd_mem_bw=10.0,
+                ).get_validation_issues(compute_device="cuda"),
+                [],
+            )
+
+        with self.subTest("issues_hbm_zero_cuda_flagged"):
+            issues = HardwareConfig(hbm_cap_bytes=0).get_validation_issues(
+                compute_device="cuda"
+            )
+            self.assertTrue(any("hbm_cap_bytes" in i for i in issues))
+
+        with self.subTest("issues_hbm_negative_cuda_flagged"):
+            issues = HardwareConfig(hbm_cap_bytes=-1).get_validation_issues(
+                compute_device="cuda"
+            )
+            self.assertTrue(any("hbm_cap_bytes" in i for i in issues))
+
+        with self.subTest("issues_hbm_zero_mtia_flagged"):
+            # MTIA is an HBM-bearing accelerator; hbm=0 is a detection failure.
+            issues = HardwareConfig(hbm_cap_bytes=0).get_validation_issues(
+                compute_device="mtia"
+            )
+            self.assertTrue(any("hbm_cap_bytes" in i for i in issues))
+
+        with self.subTest("issues_hbm_zero_cpu_skipped"):
+            # CPU host has no HBM device; hbm=0 must not be flagged there.
+            self.assertEqual(
+                HardwareConfig(hbm_cap_bytes=0).get_validation_issues(
+                    compute_device="cpu"
+                ),
+                [],
+            )
+
+        with self.subTest("issues_hbm_zero_meta_skipped"):
+            # "meta" (and any non-HBM-bearing device) has no real HBM; hbm=0
+            # must not be flagged there (allowlist is cuda/mtia only).
+            self.assertEqual(
+                HardwareConfig(hbm_cap_bytes=0).get_validation_issues(
+                    compute_device="meta"
+                ),
+                [],
+            )
+
+        with self.subTest("issues_hbm_zero_no_device_hint_skipped"):
+            # No device hint -> cannot confirm the device has HBM -> not flagged.
+            self.assertEqual(
+                HardwareConfig(hbm_cap_bytes=0).get_validation_issues(),
+                [],
+            )
+
+        with self.subTest("issues_hbm_large_ok"):
+            self.assertEqual(
+                HardwareConfig(hbm_cap_bytes=1024 * 1024**3).get_validation_issues(
+                    compute_device="cuda"
+                ),
+                [],
+            )
+
+        with self.subTest("issues_hbm_none_ok"):
+            self.assertEqual(
+                HardwareConfig().get_validation_issues(compute_device="cuda"), []
+            )
+
+        with self.subTest("issues_ddr_zero_flagged"):
+            issues = HardwareConfig(ddr_cap_bytes=0).get_validation_issues()
+            self.assertTrue(any("ddr_cap_bytes" in i for i in issues))
+
+        with self.subTest("issues_ddr_negative_flagged"):
+            issues = HardwareConfig(ddr_cap_bytes=-5).get_validation_issues()
+            self.assertTrue(any("ddr_cap_bytes" in i for i in issues))
+
+        with self.subTest("issues_ddr_large_ok"):
+            self.assertEqual(
+                HardwareConfig(ddr_cap_bytes=8 * 1024**4).get_validation_issues(), []
+            )
+
+        with self.subTest("issues_ssd_zero_ok"):
+            # 0 SSD is legitimate (host may have no SSD tier).
+            self.assertEqual(
+                HardwareConfig(ssd_cap_bytes=0).get_validation_issues(), []
+            )
+
+        with self.subTest("issues_ssd_negative_flagged"):
+            issues = HardwareConfig(ssd_cap_bytes=-1).get_validation_issues()
+            self.assertTrue(any("ssd_cap_bytes" in i for i in issues))
+
+        with self.subTest("issues_bandwidths_nonpositive_flagged"):
+            # Explicit per-field configs (not **{field: 0.0}) so the float value
+            # is type-checked against each float bandwidth param.
+            bandwidth_cases = [
+                ("intra_host_bw", HardwareConfig(intra_host_bw=0.0)),
+                ("inter_host_bw", HardwareConfig(inter_host_bw=0.0)),
+                ("hbm_mem_bw", HardwareConfig(hbm_mem_bw=0.0)),
+                ("ddr_mem_bw", HardwareConfig(ddr_mem_bw=0.0)),
+                ("hbm_to_ddr_mem_bw", HardwareConfig(hbm_to_ddr_mem_bw=0.0)),
+                ("ssd_mem_bw", HardwareConfig(ssd_mem_bw=0.0)),
+            ]
+            for field, config in bandwidth_cases:
+                issues = config.get_validation_issues()
+                self.assertTrue(
+                    any(field in i for i in issues),
+                    f"{field}=0 should be flagged; got {issues}",
+                )
+
+        with self.subTest("issues_intra_lt_inter_flagged"):
+            issues = HardwareConfig(
+                intra_host_bw=10.0, inter_host_bw=20.0
+            ).get_validation_issues()
+            self.assertTrue(any("inter_host_bw" in i for i in issues))
+
+        with self.subTest("issues_intra_eq_inter_ok"):
+            self.assertEqual(
+                HardwareConfig(
+                    intra_host_bw=20.0, inter_host_bw=20.0
+                ).get_validation_issues(),
+                [],
+            )
+
+        with self.subTest("issues_multiple_problems_all_listed"):
+            issues = HardwareConfig(
+                hbm_cap_bytes=0, ddr_cap_bytes=-1, ssd_cap_bytes=-1
+            ).get_validation_issues(compute_device="cuda")
+            self.assertTrue(any("hbm_cap_bytes" in i for i in issues))
+            self.assertTrue(any("ddr_cap_bytes" in i for i in issues))
+            self.assertTrue(any("ssd_cap_bytes" in i for i in issues))
+
+        # --- validate(): warning-only shell over get_validation_issues() ---
+        with self.subTest("validate_emits_warning_for_bad_config"):
+            with self.assertLogs(static_logger, "WARNING") as cm:
+                HardwareConfig(hbm_cap_bytes=0).validate(compute_device="cuda")
+            self.assertTrue(any("HardwareConfig validation" in m for m in cm.output))
+            self.assertTrue(any("hbm_cap_bytes" in m for m in cm.output))
+
+        with self.subTest("validate_silent_for_good_config"):
+            with self.assertNoLogs(static_logger, "WARNING"):
+                HardwareConfig(
+                    hbm_cap_bytes=80 * 1024**3,
+                    ddr_cap_bytes=512 * 1024**3,
+                ).validate(compute_device="cuda")
+
+        with self.subTest("validate_cpu_zero_hbm_silent"):
+            with self.assertNoLogs(static_logger, "WARNING"):
+                HardwareConfig(hbm_cap_bytes=0).validate(compute_device="cpu")
+
 
 class TestTrainerConfig(unittest.TestCase):
     """Tests for TrainerConfig dataclass."""
@@ -1583,6 +1740,57 @@ class TestTopologyFactory(unittest.TestCase):
 
             self.assertEqual(topology.devices[0].storage.hbm, 40 * 1024**3)
             self.assertEqual(topology.devices[1].storage.hbm, 80 * 1024**3)
+
+        with self.subTest("override_above_threshold_warns"):
+            with self.assertLogs(static_logger, "WARNING") as cm:
+                topology = TopologyFactory.create_topology(
+                    trainer_config=TrainerConfig(
+                        world_size=8,
+                        local_world_size=8,
+                        hbm_cap_bytes=80 * 1024**3,
+                    ),
+                    hardware_config=HardwareConfig(hbm_cap_bytes=40 * 1024**3),
+                )
+            # Trainer value still wins...
+            self.assertEqual(topology.devices[0].storage.hbm, 80 * 1024**3)
+            # ...and the >5% divergence is flagged.
+            self.assertTrue(any("TrainerConfig hbm_cap" in m for m in cm.output))
+
+        with self.subTest("override_within_threshold_no_warning"):
+            with self.assertNoLogs(static_logger, "WARNING"):
+                TopologyFactory.create_topology(
+                    trainer_config=TrainerConfig(
+                        world_size=8,
+                        local_world_size=8,
+                        hbm_cap_bytes=80 * 1024**3,
+                    ),
+                    hardware_config=HardwareConfig(hbm_cap_bytes=79 * 1024**3),
+                )
+
+        with self.subTest("dry_run_suppresses_override_warning"):
+            with self.assertNoLogs(static_logger, "WARNING"):
+                TopologyFactory.create_topology(
+                    trainer_config=TrainerConfig(
+                        world_size=8,
+                        local_world_size=8,
+                        hbm_cap_bytes=80 * 1024**3,
+                        is_dry_run=True,
+                        dry_run_hbm_bytes=40 * 1024**3,
+                    ),
+                    hardware_config=HardwareConfig(hbm_cap_bytes=40 * 1024**3),
+                )
+
+        with self.subTest("ddr_override_above_threshold_warns"):
+            with self.assertLogs(static_logger, "WARNING") as cm:
+                TopologyFactory.create_topology(
+                    trainer_config=TrainerConfig(
+                        world_size=8,
+                        local_world_size=8,
+                        ddr_cap_bytes=512 * 1024**3,
+                    ),
+                    hardware_config=HardwareConfig(ddr_cap_bytes=256 * 1024**3),
+                )
+            self.assertTrue(any("TrainerConfig ddr_cap" in m for m in cm.output))
 
     def test_topology_bandwidth_and_multipliers(self) -> None:
         """Test bandwidth and multiplier configurations."""

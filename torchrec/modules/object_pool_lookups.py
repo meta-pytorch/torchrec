@@ -58,7 +58,6 @@ class KeyedJaggedTensorPoolLookup(abc.ABC, torch.nn.Module):
     _key_lengths: torch.Tensor
     _jagged_lengths: torch.Tensor
     _jagged_offsets: torch.Tensor
-    _device: torch.device
 
     def __init__(
         self,

@@ -845,7 +845,7 @@ class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterShardin
         return out
 
     def _serialize(self) -> dict[str, Any]:
-        sharding_plan_dict = {}
+        sharding_plan_dict: dict[str, Any] = {}
         for param_name, param_sharding in self.items():
             sharding_plan_dict[param_name] = {
                 "sharding_type": param_sharding.sharding_type,
@@ -857,9 +857,8 @@ class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterShardin
                 if shards is not None:
                     sharding_plan_dict[param_name]["shards"] = []
                     for shard in shards:
-                        shard_dict = asdict(shard)
+                        shard_dict: dict[str, Any] = asdict(shard)
                         shard_dict["placement"] = str(shard_dict["placement"])
-                        # pyrefly: ignore[missing-attribute]
                         sharding_plan_dict[param_name]["shards"].append(shard_dict)
 
         return sharding_plan_dict
@@ -1569,12 +1568,11 @@ class ObjectPoolShardingPlan(ModuleShardingPlan):
     memory_capacity_per_rank: Optional[list[int]] = None
 
     def _serialize(self) -> dict[str, Any]:
-        output = {
+        output: dict[str, Any] = {
             "sharding_type": self.sharding_type.name,
             "inference": self.inference,
         }
         if self.memory_capacity_per_rank is not None:
-            # pyrefly: ignore[bad-typed-dict-key]
             output["memory_capacity_per_rank"] = self.memory_capacity_per_rank
         return output
 
