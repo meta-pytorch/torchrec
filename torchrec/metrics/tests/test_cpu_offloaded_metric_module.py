@@ -630,6 +630,20 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "weights": torch.ones(1024, device="cuda:1") * 2.0,
             }
 
+            # Warm the pinned-memory cache and the dedicated DtoH stream first.
+            # The first pinned allocation triggers a synchronizing cudaHostAlloc;
+            # if that ran during the measured transfer it would drain the busy
+            # matmuls and complete the event immediately, masking the cuda:0 bug
+            # this test guards against. Warming up lets the measured transfer
+            # reuse cached pinned blocks with no host-alloc sync.
+            warmup_cpu, warmup_event = transfer_tensors_to_cpu(
+                {k: torch.ones_like(v) for k, v in source_tensors.items()}
+            )
+            if warmup_event is not None:
+                warmup_event.synchronize()
+            del warmup_cpu, warmup_event
+            torch.cuda.synchronize("cuda:1")
+
             busy = torch.randn(8192, 8192, device="cuda:1")
             for _ in range(50):
                 busy = busy @ busy
@@ -657,6 +671,68 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 cpu_tensors["weights"],
                 torch.ones(1024) * 2.0,
             )
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_transfer_tensors_to_cpu_source_not_recycled_during_copy(self) -> None:
+        """
+        Regression test for a cross-stream use-after-free on the SOURCE tensor.
+
+        transfer_tensors_to_cpu copies on a dedicated DtoH stream while the
+        source was produced on the default stream. Without record_stream, the
+        caching allocator may recycle the source's GPU block as soon as the
+        default stream frees it — racing the still-in-flight async copy and
+        corrupting the CPU result. record_stream must hold the block until the
+        DtoH stream is done.
+
+        We force the race: queue slow producer work so the copy is delayed,
+        drop the source, then immediately reallocate the same byte size on the
+        default stream and poison it. With the bug, the recycled block's poison
+        is read by the copy and lands in the CPU tensor; with the fix, the
+        block stays reserved and the CPU tensor holds the original value.
+        """
+        device = torch.device("cuda:0")
+        numel = 4 * 1024 * 1024  # 16 MB block, large enough to get its own slab
+        good_value = 3.14
+        poison_value = -1.0
+
+        for _ in range(8):
+            source_tensors = {
+                "predictions": torch.full(
+                    (numel,), good_value, device=device, dtype=torch.float32
+                ),
+            }
+
+            # Delay the DtoH so it is still queued (not yet reading) when we
+            # recycle the source block below.
+            busy = torch.randn(8192, 8192, device=device)
+            for _ in range(30):
+                busy = busy @ busy
+
+            cpu_tensors, event = transfer_tensors_to_cpu(source_tensors)
+            assert event is not None
+
+            # Drop the source ref and force the allocator to hand the freed
+            # block to a default-stream allocation, then overwrite with poison.
+            del source_tensors
+            recycler = torch.empty(numel, device=device, dtype=torch.float32)
+            recycler.fill_(poison_value)
+
+            event.synchronize()
+            torch.testing.assert_close(
+                cpu_tensors["predictions"],
+                torch.full((numel,), good_value),
+                msg=(
+                    "Source GPU block was recycled and overwritten while the "
+                    "DtoH copy was in flight — missing record_stream on the "
+                    "source tensor."
+                ),
+            )
+            del recycler, cpu_tensors, event
+            torch.cuda.synchronize(device)
 
     # pyre-ignore[56]
     @unittest.skipIf(
