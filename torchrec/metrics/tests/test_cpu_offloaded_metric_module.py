@@ -10,6 +10,7 @@
 import logging
 import os
 import queue
+import random
 import threading
 import time
 import unittest
@@ -53,6 +54,30 @@ def wait_until_true(
             raise TimeoutError("Timeout reached while waiting for condition")
 
 
+def _init_process_group_with_retry(backend: str = "gloo", max_retries: int = 5) -> None:
+    """init_process_group on a fresh free port, retrying on "address already in use".
+
+    get_free_port() closes its probe socket before returning, so the port can be taken
+    before the TCPStore binds it. Re-rolling the port per attempt mirrors torch's status
+    quo (torch/testing/_internal/common_utils -> retry_on_connect_failures).
+    """
+    last_error: Optional[RuntimeError] = None
+    for _ in range(max_retries):
+        os.environ["MASTER_PORT"] = str(get_free_port())
+        try:
+            dist.init_process_group(backend=backend)
+            return
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "address already in use" not in msg:
+                raise
+            last_error = e
+            time.sleep(random.random())
+    raise RuntimeError(
+        f"init_process_group failed after {max_retries} retries"
+    ) from last_error
+
+
 class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -66,7 +91,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
 
         self.mock_metric = MockRecMetric(
@@ -78,7 +102,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         )
         self.rec_metrics = RecMetricList([self.mock_metric])
 
-        dist.init_process_group("gloo")
+        _init_process_group_with_retry("gloo")
         self.cpu_module: CPUOffloadedRecMetricModule = self._make_module(
             throughput_metric=ThroughputMetric(
                 world_size=self.world_size,
@@ -1258,7 +1282,6 @@ class WorkerSideBatchingTest(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
 
         self.mock_metric = MockRecMetric(
@@ -1270,7 +1293,7 @@ class WorkerSideBatchingTest(unittest.TestCase):
         )
         self.rec_metrics = RecMetricList([self.mock_metric])
 
-        dist.init_process_group("gloo")
+        _init_process_group_with_retry("gloo")
 
     def tearDown(self) -> None:
         if dist.is_initialized():
@@ -1714,7 +1737,6 @@ class LoadStateDictDevicePinTest(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
         self.mock_metric = MockRecMetric(
             world_size=1,
@@ -1724,7 +1746,7 @@ class LoadStateDictDevicePinTest(unittest.TestCase):
             initial_states=self.initial_states,
         )
         self.rec_metrics = RecMetricList([self.mock_metric])
-        dist.init_process_group("gloo")
+        _init_process_group_with_retry("gloo")
 
     def tearDown(self) -> None:
         if dist.is_initialized():
