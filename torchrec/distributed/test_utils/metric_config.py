@@ -8,10 +8,11 @@
 # pyre-strict
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Type
 
 import torch
 import torch.distributed as dist
+from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
 from torchrec.metrics.metrics_config import (
     MetricsConfig,
@@ -56,6 +57,8 @@ class RecMetricConfig:
             prediction/label/weight keys in model_out. Default is 1.
         rec_compute_mode (str): Computation mode for RecMetrics.
             "unfused" (default), "fused", or "fused_states".
+        enable_cpu_offload (bool): When True, use CPUOffloadedRecMetricModule.
+            Default is False.
     """
 
     enable_metrics: bool = False
@@ -64,6 +67,7 @@ class RecMetricConfig:
     window_size: int = 10_000_000
     num_tasks: int = 1
     rec_compute_mode: str = "unfused"
+    enable_cpu_offload: bool = False
 
     def _generate_tasks(self) -> List[RecTaskInfo]:
         if self.num_tasks == 1:
@@ -143,15 +147,27 @@ class RecMetricConfig:
             compute_interval_steps=self.compute_interval,
         )
 
+        metric_class: Type[RecMetricModule] = (
+            CPUOffloadedRecMetricModule if self.enable_cpu_offload else RecMetricModule
+        )
+        module_kwargs: Optional[Dict[str, Any]] = (
+            {"model_out_device": device} if self.enable_cpu_offload else None
+        )
+        # CPUOffloadedRecMetricModule requires metric state on CPU.
+        factory_device: torch.device = (
+            torch.device("cpu") if self.enable_cpu_offload else device
+        )
+
         module = generate_metric_module(
-            metric_class=RecMetricModule,
+            metric_class=metric_class,
             metrics_config=metrics_config,
             batch_size=batch_size,
             world_size=world_size,
             my_rank=rank,
             state_metrics_mapping={},
-            device=device,
+            device=factory_device,
             process_group=process_group,
+            module_kwargs=module_kwargs,
         )
 
         return module
