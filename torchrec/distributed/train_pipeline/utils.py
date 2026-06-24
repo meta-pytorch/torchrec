@@ -109,12 +109,9 @@ def _batch_tensor_size(batch: Any) -> int:
         return batch.element_size() * batch.numel()
     leaves, _ = tree_flatten(batch)
     if len(leaves) == 1 and leaves[0] is batch:
-        # pytree didn't decompose it — try dataclass fields
+        # pytree didn't decompose it — try dataclass instance attributes
         if dataclasses.is_dataclass(batch) and not isinstance(batch, type):
-            return sum(
-                _batch_tensor_size(getattr(batch, f.name))
-                for f in dataclasses.fields(batch)
-            )
+            return sum(_batch_tensor_size(v) for v in vars(batch).values())
         return 0
     return sum(_batch_tensor_size(leaf) for leaf in leaves)
 
