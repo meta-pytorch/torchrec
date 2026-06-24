@@ -208,6 +208,46 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.cpu_module.compute,
         )
 
+    def test_clone_model_out_false_skips_clone(self) -> None:
+        """clone_model_out=False must not call the defensive _foreach_clone."""
+        module = self._make_module(clone_model_out=False)
+        src = torch.tensor([0.5, 0.7])
+        model_out = {"task1-prediction": src}
+        captured: list[MetricUpdateJob] = []
+        try:
+            # Intercept at enqueue so the worker thread can't drain it first.
+            with patch.object(
+                module.update_queue, "put_nowait", side_effect=captured.append
+            ), patch(
+                "torchrec.metrics.cpu_offloaded_metric_module._foreach_clone_dict"
+            ) as mock_clone_dict, patch(
+                "torchrec.metrics.cpu_offloaded_metric_module._foreach_clone_kwargs"
+            ) as mock_clone_kwargs:
+                module._update_rec_metrics(model_out)
+                mock_clone_dict.assert_not_called()
+                mock_clone_kwargs.assert_not_called()
+            # No clone -> the enqueued tensor is the same object.
+            self.assertIs(captured[0].model_out["task1-prediction"], src)
+        finally:
+            module.shutdown()
+
+    def test_clone_model_out_true_clones(self) -> None:
+        """Default clone_model_out=True must defensively clone model_out."""
+        module = self._make_module(clone_model_out=True)
+        src = torch.tensor([0.5, 0.7])
+        model_out = {"task1-prediction": src}
+        captured: list[MetricUpdateJob] = []
+        try:
+            with patch.object(
+                module.update_queue, "put_nowait", side_effect=captured.append
+            ):
+                module._update_rec_metrics(model_out)
+            # Cloned -> distinct object, equal values.
+            self.assertIsNot(captured[0].model_out["task1-prediction"], src)
+            torch.testing.assert_close(captured[0].model_out["task1-prediction"], src)
+        finally:
+            module.shutdown()
+
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",

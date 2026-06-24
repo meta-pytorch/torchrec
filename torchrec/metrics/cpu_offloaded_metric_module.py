@@ -203,6 +203,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         update_queue_size: int = 100,
         compute_queue_size: int = 100,
         update_batch_size: int = 10,
+        clone_model_out: bool = False,
         *args: Any,
         **kwargs: Any,
     ) -> None:
@@ -226,6 +227,12 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         super().__init__(*args, **kwargs)
         self._model_out_device = model_out_device
         self._update_batch_size: int = max(1, update_batch_size)
+        # Defaults to False: the enqueued job holds references to model_out and
+        # the source-stream guard on the async DtoH keeps the tensors valid, so
+        # the per-step GPU clone is pure overhead. Set True only when the caller
+        # reuses the model_out buffer across steps (e.g. Pyper memcpy_compute),
+        # where the worker would otherwise read mutated data.
+        self._clone_model_out: bool = clone_model_out
         self._shutdown_event: threading.Event = threading.Event()
         self._compute_shutdown_event: threading.Event = threading.Event()
         self._shutdown_complete: bool = False
@@ -344,8 +351,14 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             assert self._captured_exception is not None
             raise self._captured_exception
 
-        snapshot_model_out = _foreach_clone_dict(model_out)
-        snapshot_kwargs = _foreach_clone_kwargs(kwargs)
+        if self._clone_model_out:
+            snapshot_model_out = _foreach_clone_dict(model_out)
+            snapshot_kwargs = _foreach_clone_kwargs(kwargs)
+        else:
+            # Shallow-copy the containers (cheap; no tensor copy) so dict-level
+            # mutation by the caller is isolated; tensor refs are shared.
+            snapshot_model_out = dict(model_out)
+            snapshot_kwargs = dict(kwargs)
 
         try:
             self.update_queue.put_nowait(
