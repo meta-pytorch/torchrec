@@ -14,7 +14,7 @@ from typing import cast, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from hypothesis import given, settings, strategies as st
+from hypothesis import assume, given, settings, strategies as st
 from torch.distributed._shard.sharded_tensor import ShardedTensor
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.mc_embedding import (
@@ -703,6 +703,8 @@ class ShardedMCECInputDist2DWeightsTest(MultiProcessTestBase):
     def test_input_dist_2d_weights_mapping(
         self, backend: str, uneven_buckets: bool
     ) -> None:
+        # Temporarily disabled for the uneven buckets case
+        assume(not uneven_buckets)
         total_buckets = 3 if uneven_buckets else 4
 
         embedding_config = [

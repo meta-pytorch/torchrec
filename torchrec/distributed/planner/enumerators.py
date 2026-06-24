@@ -11,6 +11,7 @@ import copy
 import logging
 from typing import Dict, List, Optional, Set, Tuple, Union
 
+import torch
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner.constants import (
@@ -321,7 +322,23 @@ class EmbeddingEnumerator(Enumerator):
             embedding_configs = module.embedding_configs()
         elif isinstance(module, BaseManagedCollisionEmbeddingCollection):
             all_buckets = module._managed_collision_collection.table_to_number_buckets()
-            return all_buckets[parameter] if parameter in all_buckets else None
+            num_buckets = all_buckets.get(parameter)
+            if num_buckets is None:
+                return None
+            if num_buckets % self._world_size == 0:
+                return None
+            if not torch._utils_internal.justknobs_check(
+                "pytorch/torchrec:enable_uneven_buckets_mpzch",
+                default=False,
+            ):
+                raise ValueError(
+                    f"Table '{parameter}' has uneven buckets per rank "
+                    f"({num_buckets} buckets across {self._world_size} ranks), but "
+                    "uneven-bucket planning is disabled. Enable JK "
+                    "'pytorch/torchrec:enable_uneven_buckets_mpzch' to shard "
+                    "tables with uneven buckets per rank."
+                )
+            return num_buckets
         else:
             # Module does not utilize buckets
             return None
