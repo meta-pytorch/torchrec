@@ -10,7 +10,37 @@
 from typing import List
 
 import torch
-from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
+
+try:
+    from torch.fx.experimental.symbolic_shapes import guard_or_false, guard_or_true
+except ImportError:
+    # Forward-compatibility: older torch builds bundled in prod-pinned
+    # lowering/processing packages predate guard_or_false/guard_or_true.
+    #
+    # This fallback is never actually invoked in practice: older torch only
+    # exists in the deserialization/lowering backend, where is_pt2_compiling() is
+    # False, so the consuming pt2_guard_or_* functions return x before ever
+    # calling these. It exists only so the module can be imported against older
+    # torch (the forward-compat condition that was failing).
+    #
+    # guard_size_oblivious is the exact primitive these two helpers replaced in
+    # D100530526 and reproduces their behavior for the only call sites
+    # (jagged_tensor: numel() == 0 -> guard_or_false; numel() != 0 / > 0 ->
+    # guard_or_true), so it is faithful for the size predicates used here. It is
+    # intentionally not a general-purpose equivalent (guard_or_false biases
+    # False, guard_or_true biases True); that mismatch is moot given the above.
+    #
+    # Kept at module scope (not inlined) because pt2_guard_or_* are TorchScript
+    # compiled, and TorchScript rejects in-function import statements even in the
+    # dead is_scripting() branch.
+    from torch.fx.experimental.symbolic_shapes import guard_size_oblivious
+
+    def guard_or_false(x: bool) -> bool:
+        return guard_size_oblivious(x)
+
+    def guard_or_true(x: bool) -> bool:
+        return guard_size_oblivious(x)
+
 
 USE_TORCHDYNAMO_COMPILING_PATH: bool = False
 
