@@ -88,9 +88,13 @@ ComputeIterType = Iterator[
 
 MAX_BUFFER_COUNT = 1000
 _WINDOW_BUFFER_REGISTRY: weakref.WeakValueDictionary[int, Any] = (
-    weakref.WeakValueDictionary()
+    torch.__dict__.setdefault(
+        "_torchrec_window_buffer_registry", weakref.WeakValueDictionary()
+    )
 )
-_WINDOW_BUFFER_HANDLE_COUNTER: Iterator[int] = itertools.count()
+_WINDOW_BUFFER_HANDLE_COUNTER: Iterator[int] = torch.__dict__.setdefault(
+    "_torchrec_window_buffer_handle_counter", itertools.count()
+)
 
 
 @torch.library.custom_op(
