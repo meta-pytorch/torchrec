@@ -1370,14 +1370,55 @@ class ShardedEmbeddingBagCollection(
                         ),
                     )
 
+                    sharded_tensor_metadata = sharding_spec.build_metadata(
+                        tensor_sizes=self._name_to_table_size[table_name],
+                        tensor_properties=tensor_properties,
+                    )
+
+                    # Use global_rank: torch core's assert in
+                    # ShardedTensor._init_from_local_shards_and_global_metadata
+                    # compares placement.rank() against dist.get_rank() (global).
+                    if isinstance(self._env, ShardingEnv2D):
+                        my_global_rank = self._env.global_rank
+                        expected_for_this_rank = sum(
+                            1
+                            for sm in sharded_tensor_metadata.shards_metadata
+                            if sm.placement is not None
+                            and sm.placement.rank() == my_global_rank
+                        )
+                        if len(local_shards) != expected_for_this_rank:
+                            logger.warning(
+                                "[2d-sharding-diag] shard_count_mismatch table=%s global_rank=%d (see Scuba torchrec_event_logging)",
+                                table_name,
+                                my_global_rank,
+                            )
+                            EventLoggingHandler.log_event(
+                                component=TorchrecComponent.SHARDER.value,
+                                event_name="EmbeddingBagCollectionSharder.2d_diag.shard_count_mismatch",
+                                event_type=EventType.INFO,
+                                metadata={
+                                    "table_name": table_name,
+                                    "local_shards": str(len(local_shards)),
+                                    "expected_for_this_rank": str(
+                                        expected_for_this_rank
+                                    ),
+                                    "total_metadata_shards": str(
+                                        len(sharded_tensor_metadata.shards_metadata)
+                                    ),
+                                    "global_rank": str(my_global_rank),
+                                    "sharding_pg_rank": str(self._env.rank),
+                                    "sharding_pg_size": str(self._env.world_size),
+                                    "global_world_size": str(
+                                        self._env.global_world_size
+                                    ),
+                                },
+                            )
+
                     try:
                         self._model_parallel_name_to_sharded_tensor[table_name] = (
                             ShardedTensor._init_from_local_shards_and_global_metadata(
                                 local_shards=local_shards,
-                                sharded_tensor_metadata=sharding_spec.build_metadata(
-                                    tensor_sizes=self._name_to_table_size[table_name],
-                                    tensor_properties=tensor_properties,
-                                ),
+                                sharded_tensor_metadata=sharded_tensor_metadata,
                                 process_group=(
                                     self._env.sharding_pg
                                     if isinstance(self._env, ShardingEnv2D)
