@@ -11,7 +11,6 @@ import abc
 import inspect
 import itertools
 import math
-import weakref
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
@@ -87,25 +86,6 @@ ComputeIterType = Iterator[
 ]
 
 MAX_BUFFER_COUNT = 1000
-_WINDOW_BUFFER_REGISTRY: weakref.WeakValueDictionary[int, Any] = (
-    weakref.WeakValueDictionary()
-)
-_WINDOW_BUFFER_HANDLE_COUNTER: Iterator[int] = itertools.count()
-
-
-@torch.library.custom_op(
-    "torchrec::window_buffer_aggregate_state",
-    mutates_args={"window_state"},
-)
-def _window_buffer_aggregate_state(
-    window_state: torch.Tensor,
-    curr_state: torch.Tensor,
-    buffer_handle: int,
-    size: int,
-) -> None:
-    _WINDOW_BUFFER_REGISTRY[buffer_handle]._aggregate_state_impl(
-        window_state, curr_state, size
-    )
 
 
 class RecMetricException(Exception):
@@ -116,8 +96,6 @@ class WindowBuffer:
     def __init__(self, max_size: int, max_buffer_count: int) -> None:
         self._max_size: int = max_size
         self._max_buffer_count: int = max_buffer_count
-        self._op_handle: int = next(_WINDOW_BUFFER_HANDLE_COUNTER)
-        _WINDOW_BUFFER_REGISTRY[self._op_handle] = self
 
         self._buffers: Deque[torch.Tensor] = deque(maxlen=max_buffer_count)
         self._used_sizes: Deque[int] = deque(maxlen=max_buffer_count)
@@ -126,20 +104,14 @@ class WindowBuffer:
     def aggregate_state(
         self, window_state: torch.Tensor, curr_state: torch.Tensor, size: int
     ) -> None:
-        _window_buffer_aggregate_state(window_state, curr_state, self._op_handle, size)
-
-    def _aggregate_state_impl(
-        self, window_state: torch.Tensor, curr_state: torch.Tensor, size: int
-    ) -> None:
         def remove(window_state: torch.Tensor) -> None:
             window_state -= self._buffers.popleft()
             self._window_used_size -= self._used_sizes.popleft()
 
         if len(self._buffers) == self._buffers.maxlen:
             remove(window_state)
-        # call curr_state.clone() before stashing in deque to ensure Inductor does not reuse
-        # storage with an alias that it doesn't know about
-        self._buffers.append(curr_state.clone())
+
+        self._buffers.append(curr_state)
         self._used_sizes.append(size)
         window_state += curr_state
         self._window_used_size += size
@@ -277,6 +249,8 @@ class RecMetricComputation(Metric, abc.ABC):
                 max_buffer_count=MAX_BUFFER_COUNT,
             )
 
+    # disable pt2 compile for this function as it would exceed the recompilation limit
+    @torch.compiler.disable
     def _aggregate_window_state(
         self, state_name: str, state: torch.Tensor, num_samples: int
     ) -> None:
