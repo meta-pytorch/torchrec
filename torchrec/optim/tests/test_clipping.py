@@ -220,6 +220,104 @@ class TestGradientClippingOptimizer(unittest.TestCase):
             param_2.grad, expected_grad_2, rtol=1e-05, atol=1e-08
         )
 
+    def test_clip_gradients_value_with_sharded_params(self) -> None:
+        # Value clipping must clip both replicate and sharded params. It is
+        # elementwise, so no collective is required.
+        max_gradient = 1.0
+        param_1 = Variable(torch.tensor([2.0, -4.0]), requires_grad=True)
+        param_2 = Variable(torch.tensor([-3.0, 0.5]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1, "param_2": param_2},
+            {},
+            [{"params": [param_1, param_2]}],
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer,
+            max_gradient=max_gradient,
+            clipping=GradientClipping.VALUE,
+        )
+
+        gradient_clipping_optimizer.zero_grad()
+        param_1.grad = torch.tensor([2.0, -4.0])
+        param_2.grad = torch.tensor([-3.0, 0.5])
+
+        mock_pg = MagicMock()
+        gradient_clipping_optimizer._sharded_params = {(mock_pg,): [param_1]}
+        gradient_clipping_optimizer._replicate_params = [param_2]
+
+        gradient_clipping_optimizer.step()
+
+        # sharded param grad clamped to [-1, 1]
+        torch.testing.assert_close(
+            param_1.grad, torch.tensor([1.0, -1.0]), rtol=0, atol=0
+        )
+        # replicate param grad clamped to [-1, 1]
+        torch.testing.assert_close(
+            param_2.grad, torch.tensor([-1.0, 0.5]), rtol=0, atol=0
+        )
+
+    def test_clip_gradients_value_with_none_and_empty_grads(self) -> None:
+        # Value clipping must skip params with None or empty gradients (across
+        # both replicate and sharded buckets) and still clip the rest.
+        param_clip = Variable(torch.tensor([2.0, -4.0]), requires_grad=True)
+        param_none = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
+        param_empty = Variable(torch.tensor([]), requires_grad=True)
+        param_sharded = Variable(torch.tensor([5.0, -0.5]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {
+                "param_clip": param_clip,
+                "param_none": param_none,
+                "param_empty": param_empty,
+                "param_sharded": param_sharded,
+            },
+            {},
+            [
+                {
+                    "params": [
+                        param_clip,
+                        param_none,
+                        param_empty,
+                        param_sharded,
+                    ]
+                }
+            ],
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer,
+            max_gradient=1.0,
+            clipping=GradientClipping.VALUE,
+        )
+
+        gradient_clipping_optimizer.zero_grad()
+        param_clip.grad = torch.tensor([2.0, -4.0])
+        param_none.grad = None
+        param_empty.grad = torch.tensor([])
+        param_sharded.grad = torch.tensor([5.0, -0.5])
+
+        mock_pg = MagicMock()
+        gradient_clipping_optimizer._replicate_params = [
+            param_clip,
+            param_none,
+            param_empty,
+        ]
+        gradient_clipping_optimizer._sharded_params = {(mock_pg,): [param_sharded]}
+
+        # Should not raise on None/empty grads.
+        gradient_clipping_optimizer.step()
+
+        torch.testing.assert_close(
+            param_clip.grad, torch.tensor([1.0, -1.0]), rtol=0, atol=0
+        )
+        self.assertIsNone(param_none.grad)
+        torch.testing.assert_close(param_empty.grad, torch.tensor([]), rtol=0, atol=0)
+        torch.testing.assert_close(
+            param_sharded.grad, torch.tensor([1.0, -0.5]), rtol=0, atol=0
+        )
+
     def test_last_total_grad_norm_none_before_step(self) -> None:
         param_1 = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
 

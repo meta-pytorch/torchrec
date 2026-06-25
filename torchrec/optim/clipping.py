@@ -39,9 +39,13 @@ class GradientClippingOptimizer(OptimizerWrapper):
         max_gradient (float): max value for clipping
         norm_type (float or str): type of the used p-norm. Can be ``'inf'`` for infinity norm.
         enable_global_grad_clip (bool): whether to enable global gradient clipping.
+            Only affects ``NORM`` clipping, where it controls whether the gradient norm
+            is aggregated across shard process groups (via all-reduce) to form a global
+            norm. ``VALUE`` clipping is elementwise and needs no communication, so it
+            applies the same per-element clip regardless of this flag.
         param_to_pgs (Dict[torch.nn.Parameter, List[dist.ProcessGroup]], optional): Mapping of parameters
             to process groups. Used for global gradient clipping in n-D model parallelism case.
-            Defaults to None, local gradient clipping is used.
+            Defaults to None, local gradient clipping is used. Ignored by ``VALUE`` clipping.
         track_grad_norm (bool): track_grad_norm (bool): If set to True, the optimizer will also track the
             total gradient norm from the most recent step, which can be retrieved
             using the `last_total_grad_norm` property.
@@ -97,13 +101,6 @@ class GradientClippingOptimizer(OptimizerWrapper):
             f"Optimizer found {sharded_param_cnt} dist params and {len(self._replicate_params)} replicate params."
         )
 
-        # Sanity check: this path is currently not used in any production.
-        if self._clipping == GradientClipping.VALUE:
-            if sharded_param_cnt > 0:
-                raise NotImplementedError(
-                    "clip_grad_value_ for sharded parameters is not supported yet"
-                )
-
     def step(self, closure: Any = None) -> None:
         if self._check_meta:
             # skip gradient clipping and early return
@@ -153,9 +150,7 @@ class GradientClippingOptimizer(OptimizerWrapper):
         elif self._clipping == GradientClipping.VALUE:
             if self._track_grad_norm:
                 self._last_total_grad_norm, _ = self.compute_total_grad_norm()
-            torch.nn.utils.clip_grad_value_(
-                parameters=self._replicate_params, clip_value=self._max_gradient
-            )
+            self.clip_grad_value_()
 
         elif self._clipping == GradientClipping.NONE:
             if self._track_grad_norm:
@@ -195,6 +190,25 @@ class GradientClippingOptimizer(OptimizerWrapper):
         )
         return total_norm, all_grads
 
+    def clip_grad_value_(self) -> None:
+        """Clip the gradient values of all parameters elementwise.
+
+        Value clipping is elementwise, so each rank clips its local shard
+        independently and the result is identical to clipping the full
+        (unsharded) gradient -- no collective is needed. This holds for any
+        sharding (FSDP, HSDP, n-D parallelism) since ``max_gradient`` is a
+        user-provided constant that is the same on every rank. ``_get_grads``
+        unwraps DTensors to their local tensors and filters out None/empty
+        gradients, so replicate and sharded params share a single code path.
+        """
+        grads = _get_grads(
+            self._replicate_params
+            + [p for params in self._sharded_params.values() for p in params]
+        )
+        if grads:
+            torch._foreach_clamp_min_(grads, -self._max_gradient)
+            torch._foreach_clamp_max_(grads, self._max_gradient)
+
     def clip_grad_norm_(self) -> Optional[Union[float, torch.Tensor]]:
         """Clip the gradient norm of all parameters."""
 
@@ -210,12 +224,19 @@ class GradientClippingOptimizer(OptimizerWrapper):
 def _get_grads(
     param_list: List[torch.Tensor],
 ) -> List[torch.Tensor]:
-    """Get the gradients of a list of parameters. Converts DTensors to local tensors if needed."""
-    grads = [
-        p.grad._local_tensor if isinstance(p.grad, DTensor) else p.grad
-        for p in param_list
-        if p.grad is not None and p.grad.numel() > 0
-    ]
+    """Get the gradients of a list of parameters. Converts DTensors to local tensors if needed.
+
+    Uses the public ``DTensor.to_local()`` under ``torch.no_grad()``: in the
+    no-grad path ``to_local()`` returns the DTensor's local tensor itself (no
+    autograd graph), so in-place updates to the returned grads propagate back to
+    the original gradients.
+    """
+    with torch.no_grad():
+        grads = [
+            p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+            for p in param_list
+            if p.grad is not None and p.grad.numel() > 0
+        ]
     return grads
 
 
