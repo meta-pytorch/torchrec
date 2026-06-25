@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import torch
 from torchrec.metrics.deferrable_metrics import (
+    _get_metric_dtoh_stream,
     DeferrableMetrics,
     device_supports_async,
     transfer_tensors_to_cpu,
@@ -358,6 +359,52 @@ class TransferTensorsToCpuTest(unittest.TestCase):
         cpu_tensors, event = transfer_tensors_to_cpu({})
         self.assertEqual(len(cpu_tensors), 0)
         self.assertIsNone(event)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_cuda_transfer_uses_dedicated_stream(self) -> None:
+        """Regression test: transfer_tensors_to_cpu must enqueue copies on the
+        dedicated DtoH stream, not the caller's current (default) stream.
+        Default-stream DtoH serializes with training kernels and NCCL
+        collectives, causing severe regressions (validated in
+        fbsource//fbcode/torchrec/distributed/benchmark/yaml/stress/zorm_stream_repro.yml
+        — without this guard, NCCL SendRecv inflates 15x and probe stalls
+        reach 1.3 seconds).
+        """
+        device = torch.device("cuda:0")
+        default_stream = torch.cuda.current_stream(device)
+        dtoh_stream = _get_metric_dtoh_stream(device)
+        self.assertNotEqual(default_stream, dtoh_stream)
+
+        # Block the dedicated stream with a long synthetic op BEFORE calling
+        # transfer_tensors_to_cpu. The returned event must be ordered behind
+        # this blocker because it was recorded on the same (dedicated) stream.
+        # If a future change regressed to recording on the default stream,
+        # the event would be independent of dtoh_stream's queue and
+        # event.query() would return True immediately (default stream idle).
+        with torch.cuda.stream(dtoh_stream):
+            torch.cuda._sleep(int(1e8))  # ~100ms of GPU stall on dtoh_stream
+        tensors: dict[str, Any] = {"x": torch.randn(128, device=device)}
+
+        _cpu, event = transfer_tensors_to_cpu(tensors)
+
+        self.assertIsNotNone(event)
+        self.assertFalse(
+            event.query(),
+            "event must be pending behind the blocker on the dedicated stream; "
+            "if event.query() is True the copy was queued on the wrong stream",
+        )
+        dtoh_stream.synchronize()
+        self.assertTrue(event.query())
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_cuda_transfer_destination_is_pinned(self) -> None:
+        """The CPU destination must be pinned so cudaMemcpyAsync is truly
+        non-blocking on the host. Without pinning, the driver stages
+        through an internal pinned buffer and the host call blocks."""
+        device = torch.device("cuda:0")
+        tensors: dict[str, Any] = {"x": torch.randn(128, device=device)}
+        cpu_tensors, _event = transfer_tensors_to_cpu(tensors)
+        self.assertTrue(cpu_tensors["x"].is_pinned())
 
 
 class DeviceSupportsAsyncTest(unittest.TestCase):
