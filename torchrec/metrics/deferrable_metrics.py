@@ -33,17 +33,51 @@ def device_supports_async(device: torch.device) -> bool:
     return device.type == "cuda"
 
 
+# Dedicated per-device CUDA stream pool for metric DtoH transfers, so ZORM
+# transfers do not serialize with training kernels (and NCCL collectives,
+# and main-thread pageable DtoH) on the default stream. Lazily created on
+# first use, lives for process lifetime. ZORM has a single update worker
+# and a single compute worker per module, so one stream per device suffices.
+_metric_dtoh_streams: dict[torch.device, torch.cuda.Stream] = {}
+
+
+def _get_metric_dtoh_stream(device: torch.device) -> torch.cuda.Stream:
+    # Fast path: already initialized.
+    stream = _metric_dtoh_streams.get(device)
+    if stream is not None:
+        return stream
+    # Slow path: create-and-publish. Explicit `device=device` so the stream
+    # is bound to the source tensors' device regardless of the caller's
+    # current device context. setdefault makes insertion atomic under CPython's
+    # GIL so concurrent first-time callers from the update- and compute-worker
+    # threads agree on a single canonical stream; the losing stream is dropped.
+    new_stream = torch.cuda.Stream(device=device)
+    return _metric_dtoh_streams.setdefault(device, new_stream)
+
+
 def transfer_tensors_to_cpu(
     tensors: dict[str, Any],
 ) -> tuple[dict[str, Any], torch.cuda.Event | None]:
-    """Transfer GPU tensors to CPU using non-blocking copies.
+    """Transfer GPU tensors to pinned CPU using non-blocking copies on a
+    dedicated CUDA stream.
 
-    Returns the CPU tensor dict and a CUDA event that tracks completion.
-    For CPU-only inputs, returns the dict as-is with None event.
-    Non-tensor values are preserved unchanged.
+    Two changes from the default `.to("cpu", non_blocking=True)` pattern:
 
-    Records the CUDA event on the source tensor's device stream (not the
-    default device) to avoid metric corruption on non-rank-0 processes.
+    1. Issues the copies on a dedicated per-device CUDA stream rather than
+       the caller's current stream. The caller's current stream is normally
+       the default training stream, where ZORM's large DtoH would queue
+       behind training kernels and block any subsequent operation submitted
+       there (training kernels, NCCL collectives, main-thread pageable DtoH).
+       The dedicated stream is independent, so ZORM transfers run in parallel.
+    2. Allocates pinned CPU destinations so cudaMemcpyAsync is truly async
+       on the host (no staging buffer wait on the caller side).
+
+    `wait_stream(producer_stream)` preserves the data-dependency on the
+    producer's last write to the source tensors before the transfer starts.
+
+    Returns the CPU tensor dict and a CUDA event recorded on the dedicated
+    stream that tracks completion. For CPU-only inputs, returns the dict
+    as-is with None event. Non-tensor values are preserved unchanged.
     All tensors are assumed to be on the same device.
     """
     source_device: torch.device | None = None
@@ -54,17 +88,33 @@ def transfer_tensors_to_cpu(
     if source_device is None:
         return tensors, None
 
+    dtoh_stream = _get_metric_dtoh_stream(source_device)
+
     with torch.cuda.device(source_device):
-        cpu_tensors: dict[str, Any] = {}
-        for k, v in tensors.items():
-            if isinstance(v, torch.Tensor):
-                dst = torch.empty(v.shape, dtype=v.dtype, device="cpu", pin_memory=True)
-                dst.copy_(v, non_blocking=True)
-                cpu_tensors[k] = dst
-            else:
-                cpu_tensors[k] = v
-        event = torch.cuda.Event()
-        event.record()
+        # Make our transfer wait for the producer's pending writes to drain
+        # (the producer is whatever stream the source tensors were last
+        # written on, typically the default training stream).
+        dtoh_stream.wait_stream(torch.cuda.current_stream())
+
+        with torch.cuda.stream(dtoh_stream):
+            cpu_tensors: dict[str, Any] = {}
+            for k, v in tensors.items():
+                if isinstance(v, torch.Tensor):
+                    dst = torch.empty(
+                        v.shape, dtype=v.dtype, device="cpu", pin_memory=True
+                    )
+                    dst.copy_(v, non_blocking=True)
+                    # The source was allocated on the producer stream; the
+                    # caching allocator would otherwise recycle its memory as
+                    # soon as the producer stream frees it, racing our in-flight
+                    # async copy on dtoh_stream. record_stream holds the block
+                    # until dtoh_stream passes this point.
+                    v.record_stream(dtoh_stream)
+                    cpu_tensors[k] = dst
+                else:
+                    cpu_tensors[k] = v
+            event = torch.cuda.Event()
+            event.record()
 
     return cpu_tensors, event
 
