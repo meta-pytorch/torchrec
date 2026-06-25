@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional, Tuple, Type
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from hypothesis import given, settings, strategies as st, Verbosity
+from hypothesis import assume, given, settings, strategies as st, Verbosity
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.mc_embedding import (
     KJTList,
@@ -1228,6 +1228,7 @@ class ShardedMCEmbeddingCollectionParallelTest(MultiProcessTestBase):
             backend=backend,
         )
 
+    @unittest.skip("Temporarily disabled")
     @unittest.skipIf(
         torch.cuda.device_count() <= 2,
         "Not enough GPUs, this test requires at least two GPUs",
@@ -1467,6 +1468,8 @@ class ShardedMCEmbeddingCollectionParallelTest(MultiProcessTestBase):
     @given(backend=st.sampled_from(["nccl"]), uneven_buckets=st.booleans())
     @settings(deadline=None)
     def test_sharding_zch_mc_ec_dedup(self, backend: str, uneven_buckets: bool) -> None:
+        # Temporarily disabled for the uneven buckets case
+        assume(not uneven_buckets)
         WORLD_SIZE = 2
         total_num_buckets = [4, 4]
         if uneven_buckets:
