@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from typing import Dict, List, Optional, Tuple, Union
+from typing import cast, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -22,6 +22,7 @@ from torchrec.distributed.test_utils.test_model import (
     TestPositionWeightedPreprocModule,
 )
 from torchrec.distributed.test_utils.test_sharding import copy_state_dict
+from torchrec.distributed.train_pipeline.postproc import PipelinedPostproc
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
     TrainPipelineSparseDistTestBase,
 )
@@ -617,6 +618,72 @@ class TrainPipelinePostprocTest(TrainPipelineSparseDistTestBase):
         # Check that both EC and EBC pipelined
         self.assertEqual(len(pipeline._pipelined_modules), 2)
         self.assertEqual(len(pipeline._pipelined_postprocs), 1)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_detach_restores_nested_postproc(self) -> None:
+        """
+        When a postproc module is NESTED under a child module, a detach
+        round-trip should reinstall the ORIGINAL postproc module at its real
+        nested location (not leave a PipelinedPostproc wrapper or an orphan
+        flat-key entry). This exercises the path-aware restore in
+        _pipeline_detach_model.
+        """
+        extra_input = ModelInput.generate(
+            tables=self.extra_tables,
+            weighted_tables=self.extra_weighted_tables,
+            batch_size=self.batch_size,
+            world_size=1,
+            num_float_features=10,
+            randomize_indices=False,
+        )[0].to(self.device)
+
+        postproc_module = TestNegSamplingModule(
+            extra_input=extra_input,
+        )
+        model = self._setup_model(postproc_module=postproc_module)
+
+        class ParentModule(nn.Module):
+            def __init__(
+                self,
+                nested_model: nn.Module,
+            ) -> None:
+                super().__init__()
+                self.nested_model = nested_model
+
+            def forward(
+                self,
+                input: ModelInput,
+            ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+                return self.nested_model(input)
+
+        model = ParentModule(model)
+
+        pipelined_model, pipeline = self._assert_output_equal(
+            model,
+            self.sharding_type,
+        )
+
+        # Postproc is nested: its fqn contains a dot.
+        self.assertEqual(len(pipeline._pipelined_postprocs), 1)
+        postproc_fqn = pipeline._pipelined_postprocs[0].fqn
+        self.assertIn(".", postproc_fqn)
+
+        # While pipelined, the real nested location holds a PipelinedPostproc.
+        base = cast(nn.Module, pipelined_model.module)
+        self.assertIsInstance(
+            base.get_submodule(postproc_fqn),
+            PipelinedPostproc,
+        )
+
+        # Detach round-trip: the real nested attribute must be restored to the
+        # ORIGINAL postproc module, and no orphan flat-key entry is created.
+        pipeline.detach()
+        restored = base.get_submodule(postproc_fqn)
+        self.assertNotIsInstance(restored, PipelinedPostproc)
+        self.assertNotIn(postproc_fqn, base._modules)
 
     @unittest.skipIf(
         not torch.cuda.is_available(),
