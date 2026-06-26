@@ -47,6 +47,16 @@ def _picklable_exception_wrapper(
 
 
 class MultiProcessContext:
+    """Per-rank context for the local multi-process test/benchmark path.
+
+    NOTE: Prefer :class:`torchrec.distributed.test_utils.process_runner.SingleProcessContext`
+    for new code. ``SingleProcessContext`` uses the same per-rank entry path as a
+    torchrun/MAST job, so a benchmark/test written against it runs unchanged both
+    locally and on remote (multi-host) jobs. ``MultiProcessContext`` is retained
+    for the existing callers (largely unit tests) and is being phased out; do not
+    add new usages.
+    """
+
     def __init__(
         self,
         rank: int,
