@@ -89,7 +89,15 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="process-group backend (defaults to nccl on GPU, gloo otherwise).",
     )
-    return parser.parse_args()
+    # torchrun / fb.dist.ddp inject extra args (e.g. --local-rank) into the
+    # worker argv; LOCAL_RANK is read from the environment instead, so ignore
+    # unrecognized args rather than failing with argparse's exit code 2.
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        logger.info(
+            "ignoring unrecognized args (injected by torchrun/MAST): %s", unknown
+        )
+    return args
 
 
 def main() -> None:
