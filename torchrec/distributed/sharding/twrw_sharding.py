@@ -8,6 +8,7 @@
 # pyre-strict
 
 import itertools
+import logging
 import math
 from typing import Any, cast, Dict, List, Optional, Tuple, TypeVar
 
@@ -46,6 +47,7 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingTable,
 )
 from torchrec.distributed.logging_handlers import EventLoggingHandler, TorchrecComponent
+from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.types import (
     Awaitable,
     CommOp,
@@ -63,6 +65,8 @@ C = TypeVar("C", bound=Multistreamable)
 F = TypeVar("F", bound=Multistreamable)
 T = TypeVar("T")
 W = TypeVar("W")
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
@@ -139,13 +143,34 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
         peer_group = get_process_group_ranks(self._pg) if self._is_2D_parallel else None
         for info in sharding_infos:
             # Under 2D parallelism we transform rank to the logical ordering in a regular parallelism scheme
-            rank = (
-                # pyrefly: ignore[unsupported-operation]
-                peer_group.index(info.param_sharding.ranks[0])
-                if peer_group is not None
-                # pyrefly: ignore[unsupported-operation]
-                else info.param_sharding.ranks[0]
-            )
+            # pyrefly: ignore[unsupported-operation]
+            planner_rank = info.param_sharding.ranks[0]
+            if peer_group is not None:
+                pg_members: List[int] = peer_group
+                try:
+                    rank = pg_members.index(planner_rank)
+                except ValueError:
+                    logger.warning(
+                        "[2d-sharding-diag] peer_group_index_failed table=%s planner_rank=%d (see Scuba torchrec_event_logging)",
+                        info.embedding_config.name,
+                        planner_rank,
+                    )
+                    EventLoggingHandler.log_event(
+                        component=TorchrecComponent.SHARDER.value,
+                        event_name="TwRwBaseSharding.2d_diag.peer_group_index_failed",
+                        event_type=EventType.INFO,
+                        metadata={
+                            "table_name": info.embedding_config.name,
+                            "planner_rank": str(planner_rank),
+                            "peer_group_size": str(len(pg_members)),
+                            "peer_group_head": str(pg_members[:8]),
+                            "sharding_pg_size": str(self._world_size),
+                            "global_world_size": str(dist.get_world_size()),
+                        },
+                    )
+                    raise
+            else:
+                rank = planner_rank
             table_node = rank // local_size
             # pyrefly: ignore[missing-attribute]
             shards = info.param_sharding.sharding_spec.shards

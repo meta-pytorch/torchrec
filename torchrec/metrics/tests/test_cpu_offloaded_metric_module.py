@@ -10,6 +10,7 @@
 import logging
 import os
 import queue
+import random
 import threading
 import time
 import unittest
@@ -53,6 +54,30 @@ def wait_until_true(
             raise TimeoutError("Timeout reached while waiting for condition")
 
 
+def _init_process_group_with_retry(backend: str = "gloo", max_retries: int = 5) -> None:
+    """init_process_group on a fresh free port, retrying on "address already in use".
+
+    get_free_port() closes its probe socket before returning, so the port can be taken
+    before the TCPStore binds it. Re-rolling the port per attempt mirrors torch's status
+    quo (torch/testing/_internal/common_utils -> retry_on_connect_failures).
+    """
+    last_error: Optional[RuntimeError] = None
+    for _ in range(max_retries):
+        os.environ["MASTER_PORT"] = str(get_free_port())
+        try:
+            dist.init_process_group(backend=backend)
+            return
+        except RuntimeError as e:
+            msg = str(e).lower()
+            if "address already in use" not in msg:
+                raise
+            last_error = e
+            time.sleep(random.random())
+    raise RuntimeError(
+        f"init_process_group failed after {max_retries} retries"
+    ) from last_error
+
+
 class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -66,7 +91,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
 
         self.mock_metric = MockRecMetric(
@@ -78,7 +102,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         )
         self.rec_metrics = RecMetricList([self.mock_metric])
 
-        dist.init_process_group("gloo")
+        _init_process_group_with_retry("gloo")
         self.cpu_module: CPUOffloadedRecMetricModule = self._make_module(
             throughput_metric=ThroughputMetric(
                 world_size=self.world_size,
@@ -207,6 +231,46 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             "CPUOffloadedRecMetricModule does not support compute\\(\\). Use async_compute\\(\\) instead.",
             self.cpu_module.compute,
         )
+
+    def test_clone_model_out_false_skips_clone(self) -> None:
+        """clone_model_out=False must not call the defensive _foreach_clone."""
+        module = self._make_module(clone_model_out=False)
+        src = torch.tensor([0.5, 0.7])
+        model_out = {"task1-prediction": src}
+        captured: list[MetricUpdateJob] = []
+        try:
+            # Intercept at enqueue so the worker thread can't drain it first.
+            with patch.object(
+                module.update_queue, "put_nowait", side_effect=captured.append
+            ), patch(
+                "torchrec.metrics.cpu_offloaded_metric_module._foreach_clone_dict"
+            ) as mock_clone_dict, patch(
+                "torchrec.metrics.cpu_offloaded_metric_module._foreach_clone_kwargs"
+            ) as mock_clone_kwargs:
+                module._update_rec_metrics(model_out)
+                mock_clone_dict.assert_not_called()
+                mock_clone_kwargs.assert_not_called()
+            # No clone -> the enqueued tensor is the same object.
+            self.assertIs(captured[0].model_out["task1-prediction"], src)
+        finally:
+            module.shutdown()
+
+    def test_clone_model_out_true_clones(self) -> None:
+        """Default clone_model_out=True must defensively clone model_out."""
+        module = self._make_module(clone_model_out=True)
+        src = torch.tensor([0.5, 0.7])
+        model_out = {"task1-prediction": src}
+        captured: list[MetricUpdateJob] = []
+        try:
+            with patch.object(
+                module.update_queue, "put_nowait", side_effect=captured.append
+            ):
+                module._update_rec_metrics(model_out)
+            # Cloned -> distinct object, equal values.
+            self.assertIsNot(captured[0].model_out["task1-prediction"], src)
+            torch.testing.assert_close(captured[0].model_out["task1-prediction"], src)
+        finally:
+            module.shutdown()
 
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
@@ -630,6 +694,20 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "weights": torch.ones(1024, device="cuda:1") * 2.0,
             }
 
+            # Warm the pinned-memory cache and the dedicated DtoH stream first.
+            # The first pinned allocation triggers a synchronizing cudaHostAlloc;
+            # if that ran during the measured transfer it would drain the busy
+            # matmuls and complete the event immediately, masking the cuda:0 bug
+            # this test guards against. Warming up lets the measured transfer
+            # reuse cached pinned blocks with no host-alloc sync.
+            warmup_cpu, warmup_event = transfer_tensors_to_cpu(
+                {k: torch.ones_like(v) for k, v in source_tensors.items()}
+            )
+            if warmup_event is not None:
+                warmup_event.synchronize()
+            del warmup_cpu, warmup_event
+            torch.cuda.synchronize("cuda:1")
+
             busy = torch.randn(8192, 8192, device="cuda:1")
             for _ in range(50):
                 busy = busy @ busy
@@ -657,6 +735,68 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 cpu_tensors["weights"],
                 torch.ones(1024) * 2.0,
             )
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_transfer_tensors_to_cpu_source_not_recycled_during_copy(self) -> None:
+        """
+        Regression test for a cross-stream use-after-free on the SOURCE tensor.
+
+        transfer_tensors_to_cpu copies on a dedicated DtoH stream while the
+        source was produced on the default stream. Without record_stream, the
+        caching allocator may recycle the source's GPU block as soon as the
+        default stream frees it — racing the still-in-flight async copy and
+        corrupting the CPU result. record_stream must hold the block until the
+        DtoH stream is done.
+
+        We force the race: queue slow producer work so the copy is delayed,
+        drop the source, then immediately reallocate the same byte size on the
+        default stream and poison it. With the bug, the recycled block's poison
+        is read by the copy and lands in the CPU tensor; with the fix, the
+        block stays reserved and the CPU tensor holds the original value.
+        """
+        device = torch.device("cuda:0")
+        numel = 4 * 1024 * 1024  # 16 MB block, large enough to get its own slab
+        good_value = 3.14
+        poison_value = -1.0
+
+        for _ in range(8):
+            source_tensors = {
+                "predictions": torch.full(
+                    (numel,), good_value, device=device, dtype=torch.float32
+                ),
+            }
+
+            # Delay the DtoH so it is still queued (not yet reading) when we
+            # recycle the source block below.
+            busy = torch.randn(8192, 8192, device=device)
+            for _ in range(30):
+                busy = busy @ busy
+
+            cpu_tensors, event = transfer_tensors_to_cpu(source_tensors)
+            assert event is not None
+
+            # Drop the source ref and force the allocator to hand the freed
+            # block to a default-stream allocation, then overwrite with poison.
+            del source_tensors
+            recycler = torch.empty(numel, device=device, dtype=torch.float32)
+            recycler.fill_(poison_value)
+
+            event.synchronize()
+            torch.testing.assert_close(
+                cpu_tensors["predictions"],
+                torch.full((numel,), good_value),
+                msg=(
+                    "Source GPU block was recycled and overwritten while the "
+                    "DtoH copy was in flight — missing record_stream on the "
+                    "source tensor."
+                ),
+            )
+            del recycler, cpu_tensors, event
+            torch.cuda.synchronize(device)
 
     # pyre-ignore[56]
     @unittest.skipIf(
@@ -1258,7 +1398,6 @@ class WorkerSideBatchingTest(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
 
         self.mock_metric = MockRecMetric(
@@ -1270,7 +1409,7 @@ class WorkerSideBatchingTest(unittest.TestCase):
         )
         self.rec_metrics = RecMetricList([self.mock_metric])
 
-        dist.init_process_group("gloo")
+        _init_process_group_with_retry("gloo")
 
     def tearDown(self) -> None:
         if dist.is_initialized():
@@ -1714,7 +1853,6 @@ class LoadStateDictDevicePinTest(unittest.TestCase):
         os.environ["WORLD_SIZE"] = "1"
         os.environ["LOCAL_WORLD_SIZE"] = "1"
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
         self.mock_metric = MockRecMetric(
             world_size=1,
@@ -1724,7 +1862,7 @@ class LoadStateDictDevicePinTest(unittest.TestCase):
             initial_states=self.initial_states,
         )
         self.rec_metrics = RecMetricList([self.mock_metric])
-        dist.init_process_group("gloo")
+        _init_process_group_with_retry("gloo")
 
     def tearDown(self) -> None:
         if dist.is_initialized():
