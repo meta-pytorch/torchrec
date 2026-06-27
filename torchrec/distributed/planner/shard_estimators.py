@@ -196,11 +196,17 @@ class EmbeddingStorageEstimator(ShardEstimator):
                 else [sharding_option.batch_size] * sharding_option.num_inputs
             )
 
-            key_value_params: Optional[KeyValueParams] = (
-                constraints.key_value_params
-                if constraints and constraints.key_value_params
-                else None
-            )
+            # Source key_value_params from the option first (like
+            # cache_load_factor above): a planner-injected KEY_VALUE option may
+            # carry its own SSD params, and the estimate must reflect them so the
+            # costed HBM cache matches the emitted plan. Fall back to the
+            # constraint, which the enumerator copies onto the option, so the
+            # canonical path reads the same value either way.
+            key_value_params: Optional[KeyValueParams] = None
+            if sharding_option.key_value_params is not None:
+                key_value_params = sharding_option.key_value_params
+            elif constraints is not None:
+                key_value_params = constraints.key_value_params
             kv_cache_load_factor: float = sharder_data.fused_params.get(
                 "cache_load_factor", KV_CACHING_RATIO
             )
