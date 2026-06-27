@@ -413,9 +413,14 @@ def _pipeline_detach_model(
     if isinstance(model, DistributedModelParallel):
         model = model.module
 
-    # Replace pipelined postproc modules with original postproc modules
+    # Replace pipelined postproc modules with original postproc modules.
+    # Use a path-aware restore so that postprocs registered at a NESTED fqn
+    # (e.g. "hstu._hstu_preprocessor") are reinstalled at their real nested
+    # location instead of creating an orphan flat-key entry that no-ops.
     for postproc_mod in pipelined_postprocs:
-        setattr(model, postproc_mod.fqn, postproc_mod.postproc_module)
+        parent_fqn, _, leaf = postproc_mod.fqn.rpartition(".")
+        parent = model.get_submodule(parent_fqn) if parent_fqn else model
+        setattr(parent, leaf, postproc_mod.postproc_module)
 
 
 def _rewrite_model(  # noqa C901
