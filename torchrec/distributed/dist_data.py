@@ -97,7 +97,16 @@ logger: logging.Logger = logging.getLogger()
 
 
 def _check_pg_for_nccl_error(pg: dist.ProcessGroup) -> None:
-    """Raise if the ProcessGroup has been flagged with an NCCL timeout or error."""
+    """Raise if the ProcessGroup has been flagged with an NCCL timeout or error.
+
+    No-op under torch.compile: the check reaches into the c10d backend via
+    pg._get_backend(), which Dynamo sees as an unregistered member on an
+    OpaqueObject (the ProcessGroup) and raises UnsafeScriptObjectError under
+    fullgraph=True. This is a runtime safety check that only matters with real
+    collective communication, not during graph tracing.
+    """
+    if is_torchdynamo_compiling():
+        return
     try:
         backend = pg._get_backend(torch.device("cuda"))
     except RuntimeError:
@@ -594,6 +603,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
         # collective timed out the watchdog will have flagged the PG by now.
         # Check before the overflow validation below so we report "NCCL
         # timeout" instead of a misleading "int32 overflow on garbage data".
+        # (No-op under torch.compile; see _check_pg_for_nccl_error.)
         _check_pg_for_nccl_error(self._pg)
 
         # Validate collective tag if present. The validation block itself is
