@@ -23,6 +23,7 @@ from torchrec.distributed.planner.storage_reservations import (
     FixedAbsoluteStorageReservation,
     FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
+    SKUAwareStorageReservation,
 )
 from torchrec.distributed.planner.types import PlannerError, PlannerErrorType, Topology
 from torchrec.distributed.planner.utils import gb_to_bytes
@@ -591,3 +592,210 @@ class TestFixedAbsoluteStorageReservation(unittest.TestCase):
     def test_negative_bytes_raises(self) -> None:
         with self.assertRaises(AssertionError):
             FixedAbsoluteStorageReservation(hbm_reserved_bytes=-1)
+
+
+class TestSKUAwareStorageReservation(unittest.TestCase):
+    def _create_model_and_sharders(
+        self,
+    ) -> tuple[TestModel, List[ModuleSharder[nn.Module]]]:
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=10,
+                name="table_0",
+                feature_names=["feature_0"],
+            )
+        ]
+        ebc = EmbeddingBagCollection(tables)
+        model = TestModel(shardable_sparse=ebc)
+        sharders = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+        return model, sharders
+
+    def test_reserves_model_base_plus_overhead(self) -> None:
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 10 * 1024 * 1024 * 1024  # 10 GB
+        topology = Topology(world_size=2, compute_device="cuda", hbm_cap=hbm_cap)
+
+        model_base_bytes = gb_to_bytes(2.0)
+        runtime_overhead_bytes = gb_to_bytes(0.5)
+        reservation = SKUAwareStorageReservation(
+            model_base_bytes=model_base_bytes,
+            runtime_overhead_bytes=runtime_overhead_bytes,
+        )
+
+        reserved_topology = reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        expected_hbm = hbm_cap - (model_base_bytes + runtime_overhead_bytes)
+        self.assertEqual(reserved_topology.devices[0].storage.hbm, expected_hbm)
+        self.assertEqual(reserved_topology.devices[1].storage.hbm, expected_hbm)
+
+    def test_reservation_is_invariant_across_hbm_caps(self) -> None:
+        # The defining SKU-aware property: the reserved amount is absolute and
+        # does not scale with device hbm, so a model reserves the same bytes
+        # regardless of the SKU it lands on (unlike percentage-of-hbm).
+        model, sharders = self._create_model_and_sharders()
+        model_base_bytes = gb_to_bytes(3.0)
+        runtime_overhead_bytes = gb_to_bytes(1.0)
+        expected_reserved = model_base_bytes + runtime_overhead_bytes
+
+        small_cap = 16 * 1024 * 1024 * 1024
+        large_cap = 80 * 1024 * 1024 * 1024
+
+        small_reserved = SKUAwareStorageReservation(
+            model_base_bytes=model_base_bytes,
+            runtime_overhead_bytes=runtime_overhead_bytes,
+        ).reserve(
+            topology=Topology(world_size=1, compute_device="cuda", hbm_cap=small_cap),
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+        large_reserved = SKUAwareStorageReservation(
+            model_base_bytes=model_base_bytes,
+            runtime_overhead_bytes=runtime_overhead_bytes,
+        ).reserve(
+            topology=Topology(world_size=1, compute_device="cuda", hbm_cap=large_cap),
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        self.assertEqual(
+            small_cap - small_reserved.devices[0].storage.hbm, expected_reserved
+        )
+        self.assertEqual(
+            large_cap - large_reserved.devices[0].storage.hbm, expected_reserved
+        )
+
+    def test_zero_reservation_matches_no_reservation(self) -> None:
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 10 * 1024 * 1024 * 1024
+        topology = Topology(world_size=1, compute_device="cuda", hbm_cap=hbm_cap)
+
+        reservation = SKUAwareStorageReservation(
+            model_base_bytes=0, runtime_overhead_bytes=0
+        )
+
+        reserved_topology = reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        self.assertEqual(reserved_topology.devices[0].storage.hbm, hbm_cap)
+
+    def test_insufficient_storage_raises(self) -> None:
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 10 * 1024 * 1024 * 1024  # 10 GB
+        topology = Topology(world_size=1, compute_device="cuda", hbm_cap=hbm_cap)
+
+        # Reserve more than the device can provide.
+        reservation = SKUAwareStorageReservation(
+            model_base_bytes=gb_to_bytes(9.0),
+            runtime_overhead_bytes=gb_to_bytes(2.0),
+        )
+
+        with self.assertRaises(PlannerError) as context:
+            reservation.reserve(
+                topology=topology,
+                batch_size=10,
+                module=model,
+                sharders=sharders,
+            )
+
+        self.assertEqual(
+            context.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
+        )
+
+    def test_exact_capacity_raises(self) -> None:
+        # reserved == available leaves 0 hbm for sharded tables, which is still
+        # infeasible, so the boundary must raise (the >= guard).
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 10 * 1024 * 1024 * 1024  # 10 GB
+        topology = Topology(world_size=1, compute_device="cuda", hbm_cap=hbm_cap)
+
+        reservation = SKUAwareStorageReservation(
+            model_base_bytes=gb_to_bytes(8.0),
+            runtime_overhead_bytes=gb_to_bytes(2.0),
+        )
+
+        with self.assertRaises(PlannerError) as context:
+            reservation.reserve(
+                topology=topology,
+                batch_size=10,
+                module=model,
+                sharders=sharders,
+            )
+
+        self.assertEqual(
+            context.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
+        )
+
+    def test_heterogeneous_topology_guard_uses_smallest_device(self) -> None:
+        # The reservation fits the first device but exceeds a smaller device
+        # later in the topology. The guard must check the smallest device so a
+        # non-uniform topology cannot bypass it (and be silently floored to 0).
+        model, sharders = self._create_model_and_sharders()
+        large_cap = 16 * 1024 * 1024 * 1024  # 16 GB
+        topology = Topology(world_size=2, compute_device="cuda", hbm_cap=large_cap)
+        # Shrink the second device below the reserved amount.
+        topology.devices[1].storage.hbm = 4 * 1024 * 1024 * 1024  # 4 GB
+
+        reservation = SKUAwareStorageReservation(
+            model_base_bytes=gb_to_bytes(5.0),
+            runtime_overhead_bytes=gb_to_bytes(1.0),
+        )
+
+        with self.assertRaises(PlannerError) as context:
+            reservation.reserve(
+                topology=topology,
+                batch_size=10,
+                module=model,
+                sharders=sharders,
+            )
+
+        self.assertEqual(
+            context.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
+        )
+
+    def test_last_reserved_topology_returns_copy(self) -> None:
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 10 * 1024 * 1024 * 1024
+        topology = Topology(world_size=1, compute_device="cuda", hbm_cap=hbm_cap)
+
+        model_base_bytes = gb_to_bytes(2.0)
+        runtime_overhead_bytes = gb_to_bytes(0.5)
+        reservation = SKUAwareStorageReservation(
+            model_base_bytes=model_base_bytes,
+            runtime_overhead_bytes=runtime_overhead_bytes,
+        )
+
+        self.assertIsNone(reservation.last_reserved_topology)
+
+        reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=model,
+            sharders=sharders,
+        )
+
+        cached = reservation.last_reserved_topology
+        self.assertIsNotNone(cached)
+        expected_hbm = hbm_cap - (model_base_bytes + runtime_overhead_bytes)
+        self.assertEqual(cached.devices[0].storage.hbm, expected_hbm)
+
+    def test_negative_model_base_bytes_raises(self) -> None:
+        with self.assertRaises(AssertionError):
+            SKUAwareStorageReservation(model_base_bytes=-1, runtime_overhead_bytes=0)
+
+    def test_negative_runtime_overhead_bytes_raises(self) -> None:
+        with self.assertRaises(AssertionError):
+            SKUAwareStorageReservation(model_base_bytes=0, runtime_overhead_bytes=-1)

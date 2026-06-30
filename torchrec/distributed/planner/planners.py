@@ -40,6 +40,7 @@ from torchrec.distributed.planner.stats import EmbeddingStats
 from torchrec.distributed.planner.storage_reservations import (
     FixedAbsoluteStorageReservation,
     HeuristicalStorageReservation,
+    SKUAwareStorageReservation,
 )
 from torchrec.distributed.planner.types import (
     Enumerator,
@@ -1089,6 +1090,8 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 )
             elif isinstance(self._storage_reservation, FixedAbsoluteStorageReservation):
                 storage_reservation_solution = f"\n\t  Storage reservation: {round(bytes_to_gb(self._storage_reservation._hbm_reserved_bytes), 3)} GB per device, "
+            elif isinstance(self._storage_reservation, SKUAwareStorageReservation):
+                storage_reservation_solution = f"\n\t  Storage reservation: {round(bytes_to_gb(self._storage_reservation._reserved_bytes), 3)} GB per device, "
             else:
                 # pyrefly: ignore[missing-attribute]
                 storage_reservation_solution = f"\n\t  Storage reservation percentage: {self._storage_reservation._percentage}, "
