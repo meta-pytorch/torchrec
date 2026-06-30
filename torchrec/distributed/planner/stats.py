@@ -40,6 +40,7 @@ from torchrec.distributed.planner.storage_reservations import (
     FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
     InferenceStorageReservation,
+    SKUAwareStorageReservation,
 )
 from torchrec.distributed.planner.types import (
     CriticalPathEstimate,
@@ -1073,6 +1074,14 @@ def _compute_storage(
     ):
         reserved_hbm_percent = (
             storage_reservation._hbm_reserved_bytes / topology.devices[0].storage.hbm
+        )
+    elif (
+        isinstance(storage_reservation, SKUAwareStorageReservation)
+        and topology is not None
+        and topology.devices[0].storage.hbm > 0
+    ):
+        reserved_hbm_percent = (
+            storage_reservation._reserved_bytes / topology.devices[0].storage.hbm
         )
     elif isinstance(
         storage_reservation,
