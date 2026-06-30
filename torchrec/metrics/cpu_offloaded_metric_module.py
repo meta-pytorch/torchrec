@@ -11,6 +11,7 @@ import concurrent
 import contextlib
 import logging
 import queue
+import sys
 import threading
 import time
 import traceback
@@ -84,6 +85,21 @@ metric_update_thread_name: str = "metric_update"
 metric_compute_thread_name: str = "metric_compute"
 
 _DRAIN_WAIT_WARN_INTERVAL_SEC: float = 60.0
+
+# Bound the compute-thread join at teardown. If the compute thread is wedged in
+# an orphaned GLOO all_gather (a peer rank skipped the collective), an unbounded
+# join hangs the post_train_teardown lease and the whole job is StuckJob-killed.
+_COMPUTE_SHUTDOWN_JOIN_TIMEOUT_SEC: float = 300.0
+
+
+def _format_thread_stack(thread: threading.Thread) -> str:
+    ident = thread.ident
+    if ident is None:
+        return "<no frame; thread not started>"
+    frame = sys._current_frames().get(ident)
+    if frame is None:
+        return "<no frame; thread not found or already exited>"
+    return "".join(traceback.format_stack(frame))
 
 
 def _safe_merge_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -461,7 +477,17 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         self._compute_shutdown_event.set()
         if self.compute_thread.is_alive():
-            self.compute_thread.join()
+            self.compute_thread.join(timeout=_COMPUTE_SHUTDOWN_JOIN_TIMEOUT_SEC)
+            if self.compute_thread.is_alive():
+                logger.error(
+                    "compute_thread did not exit within "
+                    f"{_COMPUTE_SHUTDOWN_JOIN_TIMEOUT_SEC}s at shutdown; abandoning "
+                    "the join to avoid a teardown deadlock "
+                    f"(compute_queue={self.compute_queue.qsize()}, "
+                    f"captured_exception={self._captured_exception_event.is_set()}, "
+                    f"compute_errors={self._compute_errors}). compute_thread stack:\n"
+                    f"{_format_thread_stack(self.compute_thread)}"
+                )
         logger.info(
             f"Compute thread: alive={self.compute_thread.is_alive()}, "
             f"compute_queue_remaining={self.compute_queue.qsize()}"
