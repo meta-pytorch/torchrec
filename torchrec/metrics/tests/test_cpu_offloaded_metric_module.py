@@ -22,8 +22,10 @@ import torch.distributed as dist
 from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.test_utils.multi_process import MultiProcessTestBase
 from torchrec.metrics.cpu_offloaded_metric_module import (
+    _COMPUTE_SHUTDOWN_JOIN_TIMEOUT_SEC,
     _foreach_clone_dict,
     _foreach_clone_kwargs,
+    _format_thread_stack,
     _merge_update_jobs,
     CPUOffloadedRecMetricModule,
     MetricUpdateJob,
@@ -340,6 +342,53 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         with patch.object(self.cpu_module, "_log_event") as mock_log_event:
             self.cpu_module.shutdown()
             mock_log_event.assert_not_called()
+
+    def test_shutdown_logs_stack_when_compute_thread_will_not_exit(self) -> None:
+        """A compute thread still alive past the bounded join must not hang
+        teardown: shutdown() abandons the join, logs an error with the thread
+        stack, then raises so the job fails loudly."""
+        with patch.object(
+            self.cpu_module.compute_thread, "join", return_value=None
+        ), patch.object(
+            self.cpu_module.compute_thread, "is_alive", return_value=True
+        ), patch.object(
+            self.cpu_module, "_log_event"
+        ), patch(
+            "torchrec.metrics.cpu_offloaded_metric_module.logger"
+        ) as mock_logger:
+            with self.assertRaises(RecMetricException):
+                self.cpu_module.shutdown()
+
+        mock_logger.error.assert_called_once()
+        (msg,) = mock_logger.error.call_args[0]
+        self.assertIn(f"did not exit within {_COMPUTE_SHUTDOWN_JOIN_TIMEOUT_SEC}", msg)
+        self.assertIn("compute_thread stack", msg)
+
+    def test_format_thread_stack(self) -> None:
+        # Not-started thread: ident is None.
+        self.assertIn(
+            "not started", _format_thread_stack(threading.Thread(target=lambda: None))
+        )
+
+        # Live thread: a real formatted stack.
+        started = threading.Event()
+        release = threading.Event()
+
+        def _run() -> None:
+            started.set()
+            release.wait(timeout=5.0)
+
+        live = threading.Thread(target=_run)
+        live.start()
+        try:
+            self.assertTrue(started.wait(timeout=5.0))
+            self.assertIn("File", _format_thread_stack(live))
+        finally:
+            release.set()
+            live.join(timeout=5.0)
+
+        # Exited thread: ident is set but has no current frame.
+        self.assertIn("already exited", _format_thread_stack(live))
 
     def test_shutdown_reraises_captured_exception(self) -> None:
         """If a worker thread crashed before shutdown(), shutdown() must
