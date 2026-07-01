@@ -22,6 +22,44 @@ from torchrec.types import CacheMixin
 torch.fx.wrap("len")
 
 
+@torch.fx.wrap
+def _maybe_quint4x2_to_int8(
+    embedding: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Reinterpret a quint4x2 tensor as packed uint8.
+
+    Why this is needed: quint4x2 is a sub-byte quantized dtype that most tensor
+    ops reject -- e.g. torch.split()/torch.cat() and the downstream host-to-device
+    copy and dequant kernels cannot operate on a quint4x2 tensor directly.
+    Reinterpreting the packed 4-bit payload as uint8 (which all of those ops do
+    support) lets the INT4 embedding output flow through the rest of the graph.
+
+    This OSS variant uses int_repr(), a core aten op that is available and
+    TorchScript-compatible in every build (it copies the packed bytes). The
+    Meta-internal torchrec.fb.modules.utils._maybe_quint4x2_to_int8 is a zero-copy
+    variant used on the TGIF inference path.
+
+    NOTE: despite the name, the returned dtype is torch.uint8, not int8. The
+    function name is load-bearing -- downstream fx graph passes detect this op
+    by name in the traced graph to enable the on-device INT4 dequant dispatch
+    shape. Do not rename it without updating those detectors.
+
+    quint4x2 is a tensor of uint8 values in the range [0, 15], interpreted as
+    two 4-bit values packed into each byte. The first 4-bit value is in the
+    lower 4 bits of the byte, and the second is in the upper 4 bits.
+    """
+    if embedding.dtype == torch.quint4x2:
+        assert embedding.dim() == 2, (
+            "_maybe_quint4x2_to_int8 expects a 2-D quint4x2 tensor, "
+            f"got a {embedding.dim()}-D tensor"
+        )
+        return embedding.int_repr().reshape(
+            [embedding.shape[0], int((embedding.shape[1] + 1) // 2)]
+        )
+    return embedding
+
+
 @dataclass
 class SequenceVBEContext(Multistreamable):
     recat: torch.Tensor
