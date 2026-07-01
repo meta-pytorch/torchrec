@@ -63,6 +63,7 @@ from torchrec.modules.mc_embedding_modules import (
 from torchrec.modules.mc_modules import ManagedCollisionCollection
 from torchrec.modules.utils import (
     _get_batching_hinted_output,
+    _maybe_quint4x2_to_int8,
     construct_jagged_tensors_inference,
 )
 from torchrec.sparse.jagged_tensor import (
@@ -76,6 +77,7 @@ from torchrec.types import ModuleNoCopyMixin
 
 torch.fx.wrap("_get_batching_hinted_output")
 torch.fx.wrap("len")
+torch.fx.wrap("_maybe_quint4x2_to_int8")
 
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
@@ -963,6 +965,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
                 if self.register_tbes
                 else emb_module.forward(indices=indices, offsets=offsets)
             )
+            lookup = _maybe_quint4x2_to_int8(lookup)
             if getattr(self, MODULE_ATTR_USE_UNFLATTENED_LENGTHS_FOR_BATCHING, False):
                 lengths = _get_unflattened_lengths(lengths, len(embedding_names))
                 lookup = _get_batching_hinted_output(lengths=lengths, output=lookup)
