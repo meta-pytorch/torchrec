@@ -10,6 +10,7 @@
 import abc
 import hashlib
 import logging
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1848,6 +1849,352 @@ class CriticalPathEstimate:
 
     def total(self) -> float:
         return self.comms_estimate + self.comp_estimate
+
+
+class TrainingFramework(str, Enum):
+    """Training framework that consumes the sharding plan.
+
+    Selects framework-specific topology behavior (DDR division logic,
+    JustKnob-gated detection, framework-specific adjustments) in downstream
+    consumers. ``UNSET`` is the sentinel for "not set", which yields
+    framework-agnostic defaults.
+
+    Defined here (rather than imported) because this open-source module cannot
+    import the equivalent framework enum that lives in internal code; the string
+    values are the contract that bridges the two.
+
+    Subclasses ``str`` so members behave as their string value: they JSON
+    serialize to the bare string, compare equal to it, and ``UNSET`` ("") is
+    falsy — keeping downstream string-based consumers (fingerprints, configs)
+    working without special-casing the enum.
+    """
+
+    UNSET = ""
+    APF = "apf"
+    PYPER = "pyper"
+    MVAI = "mvai"
+    UNIFIED = "unified"
+
+
+class PlannerVariant(str, Enum):
+    """Planner backend that produces the plan.
+
+    Why an enum rather than a bare string: the frameworks (Pyper/MVAI/APF) pass
+    the backend as a free-form config value today, but the set of backends is
+    small, closed, and fully owned here in OSS. Normalizing that config string
+    into an enum at the request boundary gives (1) a single source of truth for
+    the valid backends, (2) typo-safety and autocomplete at call sites, and (3)
+    exhaustive, checkable dispatch in the executor (which switches on this to
+    pick the planner). Contrast launcher_hardware, kept a ``str`` because its
+    value set is large, still growing, and resolved fb-side — the same rule that
+    keeps TrainingFramework an enum but launcher_hardware a string.
+
+    Where the string -> enum conversion (and validation) happens: at the framework
+    request boundary, via the enum constructor — ``PlannerVariant(cfg_str)`` both
+    converts and raises ``ValueError`` on an unknown value in one call. The field
+    is typed as the enum and ``PlannerConfig`` does no coercion, so every reader
+    sees a ``PlannerVariant`` without a redundant normalization step.
+
+    Subclasses ``str`` so a member serializes/compares as its bare value, keeping
+    it stable in the request content hash and in string-based configs.
+
+    ``UNSET`` ("") is the "not specified" sentinel and the default: the executor
+    treats it as the OSS backend, so callers that do not care get sensible
+    behavior without naming a backend.
+    """
+
+    UNSET = ""
+    OSS = "oss"
+    LINEAR_PROGRAMMING = "linear_programming"
+    MANIFOLD = "manifold"
+
+
+class StorageReservationPolicy(str, Enum):
+    """Policy for reserving non-sharded (dense/overhead) memory before planning.
+
+    An enum for the same reasons as ``PlannerVariant``: a small, closed,
+    OSS-owned set that the frameworks pass as config strings, normalized here for
+    one source of truth, typo-safety, and an exhaustive switch in the
+    storage-reservation resolver (which maps each value to a StorageReservation
+    implementation). As with ``PlannerVariant``, the string -> enum conversion and
+    validation happen at the framework boundary via the enum constructor
+    (``StorageReservationPolicy(cfg_str)``); the field is typed as the enum and
+    ``PlannerConfig`` does no coercion.
+
+    Subclasses ``str`` for the same serialization reasons as ``PlannerVariant``.
+
+    ``UNSET`` ("") is the "not specified" sentinel and the default: the
+    storage-reservation resolver treats it as its default policy (heuristical).
+
+    Only policies with a backing StorageReservation are listed. HEURISTICAL,
+    FIXED_PERCENTAGE, and INFERENCE map to Heuristical/FixedPercentage/Inference
+    StorageReservation respectively; SKU_AWARE is planned (SKUAwareStorageReservation
+    is designed but not yet implemented). "memory_balanced" is intentionally absent
+    — it is a partitioner strategy (MemoryBalancedPartitioner), not a reservation.
+    """
+
+    UNSET = ""
+    HEURISTICAL = "heuristical"
+    FIXED_PERCENTAGE = "fixed_percentage"
+    INFERENCE = "inference"
+    # Planned: SKUAwareStorageReservation (design done, not yet implemented).
+    SKU_AWARE = "sku_aware"
+
+
+@dataclass(frozen=True)
+class LpPlannerConfig:
+    """OSS-safe scalar knobs for the LINEAR_PROGRAMMING planner variant.
+
+    Carried as plain data so it stays serializable/hashable (part of the request
+    content hash) — the fb LinearProgrammingPlanner accepts these scalars (e.g.
+    MVAI already passes ``objective``/``shard_solver_type`` as plain strings). Each
+    field is Optional; None means "use the LP planner's own default", so the fb
+    builder only forwards the ones that are set. The fb-typed forms
+    (OptimObjective/ShardSolverType/EMOConfig) are never referenced from OSS.
+    """
+
+    # Optimization objective, e.g. "max_total_perf" (LP OptimObjective by value)
+    objective: Optional[str] = None
+    # Shard solver, e.g. "greedy" (LP ShardSolverType by value)
+    shard_solver_type: Optional[str] = None
+    # Whether to tune column dimensions
+    tune_col_dims: Optional[bool] = None
+    # Hybrid solver percentage (0-100)
+    hybrid_percentage: Optional[int] = None
+    # Allowed solution-quality worsening percentage (>= 0.0)
+    allowed_worsening_percentage: Optional[float] = None
+    # Whether to apply per-stage timeouts
+    stagewise_timeout: Optional[bool] = None
+    # Whether plan caching is enabled
+    caching_enabled: Optional[bool] = None
+    # Number of local-search cycles
+    num_cycles: Optional[int] = None
+    # Whether to auto-derive column dimensions
+    auto_col_dims: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class PlannerConfig:
+    """Plan-affecting knobs the trainer expresses per request.
+
+    These are *data* (serializable, hashable) that select how the planner runs;
+    the concrete PlannerExecutor maps them to enumerator/estimator/proposer/
+    partitioner/planner instances. Object-valued, framework-specific behavior
+    (custom proposer instances, stats sinks) is injected into the API instance as
+    a per-framework profile, not carried here — so this stays part of the
+    request's content hash and cache key.
+    """
+
+    # Planner backend to run; UNSET (default) resolves to the OSS backend
+    planner_variant: PlannerVariant = PlannerVariant.UNSET
+    # How non-sharded memory is reserved; UNSET (default) resolves to heuristical
+    storage_reservation_policy: StorageReservationPolicy = (
+        StorageReservationPolicy.UNSET
+    )
+    # Fraction (0.0-1.0) to reserve for the chosen policy; None = policy default
+    storage_reservation_percentage: Optional[float] = None
+    # Proposer selector (e.g. "greedy", "grid_search", "dynamic_col_dim"); None =
+    # executor default. Free-form: the proposer set is extensible and custom
+    # proposer instances are injected via the API profile, so it isn't validated.
+    proposer_type: Optional[str] = None
+    # Partitioner selector (e.g. "greedy_perf", "memory_balanced"); None =
+    # executor default. Free-form for the same reason as proposer_type.
+    partitioner_type: Optional[str] = None
+    # Use hardware-capability-based compute estimates instead of the default model
+    use_hardware_based_compute: bool = False
+    # Use hardware-capability-based bandwidths instead of default topology values
+    use_hardware_based_bandwidth: bool = False
+    # Backward-pass compute multiplier for the perf estimate; None = planner default
+    bwd_compute_multiplier: Optional[float] = None
+    # Manifold path to a pre-computed sharding plan, consumed only by the MANIFOLD
+    # planner_variant (ManifoldPlanner loads the plan from here instead of solving).
+    # Required when planner_variant is MANIFOLD; ignored by other variants.
+    manifold_path: Optional[str] = None
+    # Enable planner debug mode (extra logging/validation). Forwarded to the planner.
+    debug: bool = False
+    # Solver timeout in seconds; None = planner default. Forwarded to the planner.
+    timeout_seconds: Optional[int] = None
+    # LINEAR_PROGRAMMING scalar knobs; None = LP planner defaults. Consumed only by
+    # the LP variant's fb builder (ignored by other variants).
+    lp_config: Optional[LpPlannerConfig] = None
+
+    def __post_init__(self) -> None:
+        # planner_variant / storage_reservation_policy are typed as enums, so
+        # callers pass a member (framework builders convert a config string with
+        # PlannerVariant(cfg_str), which validates). No coercion is done here.
+        if (
+            self.storage_reservation_percentage is not None
+            and not 0.0 <= self.storage_reservation_percentage <= 1.0
+        ):
+            raise ValueError(
+                "storage_reservation_percentage must be between 0.0 and 1.0, got "
+                f"{self.storage_reservation_percentage}"
+            )
+        if self.bwd_compute_multiplier is not None and self.bwd_compute_multiplier < 0:
+            raise ValueError(
+                "bwd_compute_multiplier must be non-negative, got "
+                f"{self.bwd_compute_multiplier}"
+            )
+
+
+@dataclass(frozen=True)
+class ShardingPlanRequest:
+    """Request for sharding plan generation.
+
+    Encapsulates the model, sharders, cluster topology parameters, and
+    optional overrides needed to produce a sharding plan. Base type for
+    both runtime and dry-run planning flows.
+
+    Immutability note: ``frozen=True`` only prevents rebinding the fields
+    themselves; it does not deep-freeze their contents. The ``sharders``
+    list and the ``constraints`` dict remain mutable in place (e.g.
+    ``request.sharders.append(...)``). They are kept as ``List``/``Dict``
+    because downstream planner APIs consume those concrete types; callers
+    must treat them as read-only by convention rather than relying on an
+    enforced guarantee.
+    """
+
+    # User-provided nn.Module or a factory for lazy construction;
+    # consumers should use isinstance(model, nn.Module) to distinguish
+    model: Union[nn.Module, Callable[[], nn.Module]]
+    # Code-derived from model architecture + training config via get_default_sharders()
+    sharders: List[ModuleSharder[nn.Module]]
+    # Total number of devices in the cluster
+    world_size: int
+    # Devices per host — determines intra-host vs inter-host communication split
+    local_world_size: int
+    # Batch size affects per-device memory estimates from the perf model
+    batch_size: int
+
+    # Pod size for multi-pod topologies (None = single pod)
+    pod_size: Optional[int] = None
+    # Derived from planner.storage_reservation_policy config
+    storage_reservation: Optional[StorageReservation] = None
+    # Code-derived from embedding tables + fused params + UVM cache stats
+    constraints: Optional[Dict[str, ParameterConstraints]] = None
+    # Training framework that consumes the plan. TrainingFramework.UNSET (the
+    # default) means "not set" and yields framework-agnostic defaults. Typed as
+    # an enum so downstream gets a checked value; a plain string (e.g. from
+    # config) is coerced to the enum in __post_init__ and an unknown value
+    # raises ValueError.
+    training_framework: TrainingFramework = TrainingFramework.UNSET
+    # Override HBM capacity (GB); None = auto-detect from CUDA or hardware registry
+    hbm_gb: Optional[float] = None
+    # Override DDR capacity (GB); None = auto-detect
+    ddr_gb: Optional[float] = None
+    # Launcher hardware identifier for topology creation (e.g. "ZIONEX",
+    # "TC_ANY"); None = auto-detect from the launch environment. Kept free-form:
+    # the recognized values mirror the hardware-type identifiers resolved by
+    # downstream consumers, and that set grows as new accelerators are onboarded,
+    # so it is intentionally not validated here.
+    launcher_hardware: Optional[str] = None
+    # Plan-affecting knobs (planner backend, reservation policy, proposer/
+    # partitioner selection, hardware-based flags). Data-only so it participates
+    # in request_hash; object-valued behavior is injected into the API instance.
+    planner_config: PlannerConfig = field(default_factory=PlannerConfig)
+    # Unique per-instance id for this request, used to correlate it with the
+    # ShardingPlanResult(s) it produces (see ShardingPlanResult.request_id).
+    # Complements request_hash: request_hash is a *content* hash shared by
+    # identical requests (cache/dedup key), whereas request_id is unique per
+    # request object — use it to tell two otherwise-identical requests apart.
+    # Auto-generated; override to thread an externally-supplied id.
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+
+    def __post_init__(self) -> None:
+        # Accept either a TrainingFramework or its string value (e.g. read from
+        # config) and normalize to the enum, so downstream always reads a
+        # TrainingFramework. Unknown strings raise ValueError.
+        if not isinstance(self.training_framework, TrainingFramework):
+            try:
+                object.__setattr__(
+                    self,
+                    "training_framework",
+                    TrainingFramework(self.training_framework),
+                )
+            except ValueError as e:
+                valid = [f.value for f in TrainingFramework]
+                raise ValueError(
+                    f"training_framework must be a TrainingFramework or one of "
+                    f"{valid}, got {self.training_framework!r}"
+                ) from e
+        if self.world_size <= 0:
+            raise ValueError(f"world_size must be positive, got {self.world_size}")
+        if self.local_world_size <= 0:
+            raise ValueError(
+                f"local_world_size must be positive, got {self.local_world_size}"
+            )
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {self.batch_size}")
+        if self.pod_size is not None and self.pod_size <= 0:
+            raise ValueError(f"pod_size must be positive, got {self.pod_size}")
+        if self.hbm_gb is not None and self.hbm_gb < 0:
+            raise ValueError(f"hbm_gb must be non-negative, got {self.hbm_gb}")
+        if self.ddr_gb is not None and self.ddr_gb < 0:
+            raise ValueError(f"ddr_gb must be non-negative, got {self.ddr_gb}")
+        if self.local_world_size > self.world_size:
+            raise ValueError(
+                f"local_world_size ({self.local_world_size}) must not exceed "
+                f"world_size ({self.world_size})"
+            )
+        if self.world_size % self.local_world_size != 0:
+            raise ValueError(
+                f"world_size ({self.world_size}) must be divisible by "
+                f"local_world_size ({self.local_world_size})"
+            )
+
+    @property
+    def request_hash(self) -> str:
+        """Stable content hash identifying this request.
+
+        Deterministic over the planner-affecting parameters, so two requests
+        with the same parameters share a hash. Used to correlate the request
+        with its ShardingPlanResult(s) and PlannerSessionContext, and as a
+        cache key. Excludes `model` and `sharders` (not stably hashable), so
+        callers needing model-level uniqueness should scope by the context's
+        model — mirroring DryRunRequest.fingerprint().
+        """
+        return format(
+            hash_sha256_to_int(
+                [
+                    self.world_size,
+                    self.local_world_size,
+                    self.batch_size,
+                    self.pod_size,
+                    self.hbm_gb,
+                    self.ddr_gb,
+                    self.training_framework.value,
+                    self.launcher_hardware,
+                    self.constraints,
+                    self.planner_config.planner_variant.value,
+                    self.planner_config.storage_reservation_policy.value,
+                    self.planner_config.storage_reservation_percentage,
+                    self.planner_config.proposer_type,
+                    self.planner_config.partitioner_type,
+                    self.planner_config.use_hardware_based_compute,
+                    self.planner_config.use_hardware_based_bandwidth,
+                    self.planner_config.bwd_compute_multiplier,
+                    self.planner_config.manifold_path,
+                    self.planner_config.debug,
+                    self.planner_config.timeout_seconds,
+                    (
+                        (
+                            lp.objective,
+                            lp.shard_solver_type,
+                            lp.tune_col_dims,
+                            lp.hybrid_percentage,
+                            lp.allowed_worsening_percentage,
+                            lp.stagewise_timeout,
+                            lp.caching_enabled,
+                            lp.num_cycles,
+                            lp.auto_col_dims,
+                        )
+                        if (lp := self.planner_config.lp_config) is not None
+                        else None
+                    ),
+                ]
+            ),
+            "x",
+        )[:16]
 
 
 # ---- Types Utils ---- #
