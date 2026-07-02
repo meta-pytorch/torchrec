@@ -118,7 +118,7 @@ class RunOptions(BenchFuncConfig):
     """
 
     world_size: int = 2
-    batch_size: int = 1024 * 32
+    batch_size: int = 1024 * 16
     num_batches: int = 10
     num_benchmarks: int = 5
     num_profiles: int = 2

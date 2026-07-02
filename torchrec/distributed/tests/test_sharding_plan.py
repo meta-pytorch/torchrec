@@ -21,6 +21,7 @@ from torchrec.distributed.quant_embedding import (
 from torchrec.distributed.sharding_plan import (
     _calculate_rw_shard_sizes_and_offsets,
     _calculate_uneven_rw_shard_sizes_and_offsets,
+    calculate_shard_sizes_and_offsets,
     column_wise,
     construct_module_sharding_plan,
     data_parallel,
@@ -1357,6 +1358,18 @@ class RowWiseShardingTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _calculate_rw_shard_sizes_and_offsets(
                 hash_size=100, num_devices=4, columns=16, num_buckets=7
+            )
+
+    def test_rw_sharding_num_buckets_less_than_world_size(self) -> None:
+        """Test that calculate_shard_sizes_and_offsets raises ValueError for row-wise sharding when num_buckets < world_size (a bucket cannot be split across ranks)"""
+        # num_buckets (3) < world_size (4); a bucket cannot be split across ranks
+        with self.assertRaises(ValueError):
+            calculate_shard_sizes_and_offsets(
+                tensor=torch.empty(12, 8),
+                world_size=4,
+                local_world_size=4,
+                sharding_type=ShardingType.ROW_WISE.value,
+                num_buckets=3,
             )
 
     def test_uneven_rw_sharding_hash_size_not_divisible_by_num_buckets(self) -> None:

@@ -122,6 +122,12 @@ def calculate_shard_sizes_and_offsets(
     elif sharding_type == ShardingType.TABLE_WISE.value:
         return [[rows, columns]], [[0, 0]]
     elif sharding_type == ShardingType.ROW_WISE.value:
+        if num_buckets and num_buckets < world_size:
+            raise ValueError(
+                f"Number of buckets ({num_buckets}) must be >= the number of "
+                f"ranks ({world_size}): a bucket cannot be split across ranks. "
+                "Increase total_num_buckets or reduce world_size."
+            )
         return (
             _calculate_rw_shard_sizes_and_offsets(
                 rows, world_size, columns, num_buckets
