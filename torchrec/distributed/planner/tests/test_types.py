@@ -32,11 +32,15 @@ from torchrec.distributed.planner.types import (
     KernelConfig,
     LpPlannerConfig,
     ParameterConstraints,
+    Perf,
     PlannerConfig,
     PlannerVariant,
     Shard,
+    ShardDetail,
     ShardingOption,
+    ShardingOptionDetail,
     ShardingPlanRequest,
+    ShardingPlanResult,
     Storage,
     StorageReservationPolicy,
     Topology,
@@ -2068,3 +2072,202 @@ class PlannerConfigTest(unittest.TestCase):
     def test_negative_bwd_multiplier_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "bwd_compute_multiplier must be"):
             PlannerConfig(bwd_compute_multiplier=-1.0)
+
+
+class ShardingPlanResultTest(unittest.TestCase):
+    def _create_result(self, **kwargs: Any) -> ShardingPlanResult:
+        defaults: Dict[str, Any] = {
+            "sku": "H100",
+            "success": True,
+            "sharding_plan": None,
+            "planner_failure_reason": None,
+            "estimated_max_hbm_bytes": 1_000_000,
+            "estimated_max_ddr_bytes": 2_000_000,
+        }
+        defaults.update(kwargs)
+        return ShardingPlanResult(**defaults)
+
+    def test_success_result_holds_optional_metrics(self) -> None:
+        result = self._create_result(
+            estimated_qps=1000.0,
+            critical_path_ms=5.0,
+            validation_warnings=("close to HBM limit",),
+        )
+        self.assertTrue(result.success)
+        self.assertIsNone(result.planner_failure_reason)
+        self.assertEqual(result.estimated_qps, 1000.0)
+        self.assertEqual(result.critical_path_ms, 5.0)
+        self.assertEqual(result.validation_warnings, ("close to HBM limit",))
+
+    def test_failure_result_carries_reason(self) -> None:
+        result = self._create_result(success=False, planner_failure_reason="OOM_HBM")
+        self.assertFalse(result.success)
+        self.assertEqual(result.planner_failure_reason, "OOM_HBM")
+
+    def test_invalid_single_field_rejected(self) -> None:
+        cases = [
+            ({"sku": ""}, "sku must not be empty"),
+            ({"estimated_max_hbm_bytes": -1}, "estimated_max_hbm_bytes must be"),
+            ({"estimated_max_ddr_bytes": -1}, "estimated_max_ddr_bytes must be"),
+            ({"estimated_qps": -1.0}, "estimated_qps must be non-negative"),
+            ({"critical_path_ms": -1.0}, "critical_path_ms must be non-negative"),
+            ({"solve_time_ms": -1.0}, "solve_time_ms must be non-negative"),
+        ]
+        for overrides, expected_msg in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, expected_msg):
+                    self._create_result(**overrides)
+
+    def test_success_failure_reason_consistency(self) -> None:
+        with self.subTest("success with reason"):
+            with self.assertRaisesRegex(
+                ValueError, "planner_failure_reason must be None when success is True"
+            ):
+                self._create_result(success=True, planner_failure_reason="OOM")
+        with self.subTest("failure without reason"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "planner_failure_reason is required when success is False",
+            ):
+                self._create_result(success=False, planner_failure_reason=None)
+
+    def test_zero_memory_allowed(self) -> None:
+        result = self._create_result(
+            estimated_max_hbm_bytes=0,
+            estimated_max_ddr_bytes=0,
+        )
+        self.assertEqual(result.estimated_max_hbm_bytes, 0)
+        self.assertEqual(result.estimated_max_ddr_bytes, 0)
+
+
+class ShardingOptionDetailTest(unittest.TestCase):
+    def test_from_sharding_option_projects_per_shard_detail(self) -> None:
+        # from_sharding_option captures the per-shard storage/perf the
+        # deployment-facing ShardingPlan drops, and aggregates the totals.
+        shards = [
+            Shard(
+                size=[5000, 80],
+                offset=[0, 0],
+                storage=Storage(hbm=600, ddr=10, ssd=5),
+                perf=Perf(
+                    fwd_compute=1.0, fwd_comms=2.0, bwd_compute=3.0, bwd_comms=4.0
+                ),
+                rank=0,
+            ),
+            Shard(
+                size=[5000, 80],
+                offset=[5000, 0],
+                storage=Storage(hbm=400, ddr=20, ssd=15),
+                perf=Perf(
+                    fwd_compute=0.5, fwd_comms=0.5, bwd_compute=0.5, bwd_comms=0.5
+                ),
+                rank=1,
+            ),
+        ]
+        sharding_option = ShardingOption(
+            name="table_0",
+            tensor=torch.empty(
+                (10000, 80), dtype=torch.float16, device=torch.device("meta")
+            ),
+            module=("ebc", MagicMock()),
+            input_lengths=MagicMock(),
+            batch_size=MagicMock(),
+            sharding_type=ShardingType.ROW_WISE.value,
+            partition_by=MagicMock(),
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=shards,
+        )
+        detail = ShardingOptionDetail.from_sharding_option(sharding_option)
+        self.assertEqual(detail.fqn, "ebc.table_0")
+        self.assertEqual(detail.sharding_type, ShardingType.ROW_WISE.value)
+        self.assertEqual(detail.compute_kernel, EmbeddingComputeKernel.FUSED.value)
+        self.assertEqual(len(detail.shards), 2)
+        self.assertEqual(detail.shards[0].rank, 0)
+        self.assertEqual(detail.shards[0].size, (5000, 80))
+        self.assertEqual(detail.shards[0].offset, (0, 0))
+        self.assertEqual(detail.shards[0].hbm_bytes, 600)
+        self.assertEqual(detail.shards[0].ddr_bytes, 10)
+        self.assertEqual(detail.shards[0].ssd_bytes, 5)
+        self.assertEqual(detail.shards[0].perf_total, 10.0)
+        self.assertEqual(detail.total_hbm_bytes, 1000)
+        self.assertEqual(detail.total_ddr_bytes, 30)
+        self.assertEqual(detail.total_ssd_bytes, 20)
+        self.assertEqual(detail.total_perf, 12.0)
+
+    def test_from_sharding_option_without_estimates(self) -> None:
+        # Shards without storage/perf project to zero bytes and None perf.
+        sharding_option = ShardingOption(
+            name="table_1",
+            tensor=torch.empty(
+                (100, 16), dtype=torch.float16, device=torch.device("meta")
+            ),
+            module=("ebc", MagicMock()),
+            input_lengths=MagicMock(),
+            batch_size=MagicMock(),
+            sharding_type=ShardingType.TABLE_WISE.value,
+            partition_by=MagicMock(),
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=[Shard(size=[100, 16], offset=[0, 0])],
+        )
+        detail = ShardingOptionDetail.from_sharding_option(sharding_option)
+        self.assertEqual(detail.total_hbm_bytes, 0)
+        self.assertEqual(detail.total_ddr_bytes, 0)
+        self.assertEqual(detail.total_ssd_bytes, 0)
+        self.assertIsNone(detail.total_perf)
+        self.assertIsNone(detail.shards[0].perf_total)
+
+    def test_negative_values_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ssd_bytes must be non-negative"):
+            ShardDetail(
+                rank=0,
+                size=(1, 1),
+                offset=(0, 0),
+                hbm_bytes=0,
+                ddr_bytes=0,
+                ssd_bytes=-1,
+            )
+        with self.assertRaisesRegex(ValueError, "perf_total must be non-negative"):
+            ShardDetail(
+                rank=0,
+                size=(1, 1),
+                offset=(0, 0),
+                hbm_bytes=0,
+                ddr_bytes=0,
+                ssd_bytes=0,
+                perf_total=-1.0,
+            )
+        with self.assertRaisesRegex(ValueError, "total_hbm_bytes must be non-negative"):
+            ShardingOptionDetail(
+                fqn="ebc.t0",
+                sharding_type="table_wise",
+                compute_kernel="fused",
+                total_hbm_bytes=-1,
+            )
+
+    def test_total_perf_none_when_any_shard_missing_perf(self) -> None:
+        # A partial perf sum would understate cost, so total_perf is None unless
+        # every shard has an estimate.
+        sharding_option = ShardingOption(
+            name="table_2",
+            tensor=torch.empty(
+                (200, 16), dtype=torch.float16, device=torch.device("meta")
+            ),
+            module=("ebc", MagicMock()),
+            input_lengths=MagicMock(),
+            batch_size=MagicMock(),
+            sharding_type=ShardingType.ROW_WISE.value,
+            partition_by=MagicMock(),
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=[
+                Shard(
+                    size=[100, 16],
+                    offset=[0, 0],
+                    perf=Perf(
+                        fwd_compute=1.0, fwd_comms=1.0, bwd_compute=1.0, bwd_comms=1.0
+                    ),
+                ),
+                Shard(size=[100, 16], offset=[100, 0]),  # no perf estimate
+            ],
+        )
+        detail = ShardingOptionDetail.from_sharding_option(sharding_option)
+        self.assertIsNone(detail.total_perf)
