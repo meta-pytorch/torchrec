@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
-from torchrec.distributed.planner.types import ShardingPlanRequest
+from torchrec.distributed.planner.types import ShardingPlanRequest, ShardingPlanResult
 
 
 @dataclass(frozen=True)
@@ -136,3 +136,26 @@ class DryRunRequest(ShardingPlanRequest):
         }
         canonical = json.dumps(parts, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class DryRunResult(ShardingPlanResult):
+    """Immutable result of dry-run sharding plan validation for a single SKU.
+
+    Extends ShardingPlanResult with the per-SKU request fingerprint. The
+    uploaded-plan URL reuses the inherited sharding_plan_manifold_url; the
+    request-level identity reuses the inherited request_hash (by content) and
+    request_id (by instance).
+    """
+
+    # Per-(request, SKU) key from DryRunRequest.fingerprint(sku); keys the
+    # per-SKU results map and correlates TUO iterative validation runs.
+    # Distinct from the inherited request-level fields: it composes request_hash
+    # with the SKU and per-SKU override, so each SKU's result gets a unique key
+    # (the request-level request_hash/request_id are the same across SKUs).
+    request_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.request_fingerprint:
+            raise ValueError("request_fingerprint must not be empty")
