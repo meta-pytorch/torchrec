@@ -2385,6 +2385,62 @@ class ShardingPlanResult:
             raise ValueError("planner_failure_reason is required when success is False")
 
 
+@dataclass
+class PlannerSessionContext:
+    """Mutable context accumulating state during a planner session.
+
+    Links the ShardingPlanRequest being planned and the per-SKU
+    ShardingPlanResult(s) it produces, plus session-only scratch state
+    (caches, timing, metadata). Fields that already live on the request or
+    its results are intentionally not duplicated here — read them through
+    ``request``/``results`` (e.g. ``request.request_id``, ``request.model``,
+    ``results[sku].validation_warnings``). Unlike the frozen request/result
+    types, this dataclass is mutable to allow incremental updates during
+    execution.
+    """
+
+    # The request this session is planning for (required). Populated once by the
+    # planner API when it constructs the context, before planning begins: it is
+    # the input being planned and the source of truth for model, sharders,
+    # request_id/request_hash, constraints, launcher_hardware, etc. — read those
+    # through `request` rather than duplicating them on the context.
+    request: ShardingPlanRequest
+    # Per-SKU results produced this session, keyed by SKU (required; the planner
+    # API passes an empty dict at session start). Populated incrementally: one
+    # entry is added as each ShardingPlanResult is produced while iterating the
+    # request's SKUs. Each result carries its sharding plan, memory estimates,
+    # validation_warnings, manifold url, and request_id/request_hash back-reference.
+    results: Dict[str, ShardingPlanResult]
+    # Unique session identifier; defaults to a UUID4
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # Topology cache keyed by (sku, world_size, local_world_size) — one per SKU
+    topology_cache: Dict[Tuple[str, int, int], Topology] = field(default_factory=dict)
+    # Wall-clock timing for each session phase (e.g. "topology_creation", "solve").
+    # Session-level aggregate, not per-SKU.
+    timing: Dict[str, float] = field(default_factory=dict)
+    # Storage reservation strategy used per SKU
+    storage_reservations_used: Dict[str, StorageReservation] = field(
+        default_factory=dict
+    )
+    # Hardware overrides applied per SKU
+    hw_overrides_applied: Dict[str, HardwareConfig] = field(default_factory=dict)
+    # Plans retrieved from cache, keyed by request fingerprint (per request+SKU)
+    cached_plans: Dict[str, ShardingPlan] = field(default_factory=dict)
+    # Caller-provided session metadata (e.g. oncall, use_case, experiment_id)
+    client_metadata: Dict[str, str] = field(default_factory=dict)
+    # Whether each SKU's result came from cache — per SKU (SKU -> hit)
+    cache_hit: Dict[str, bool] = field(default_factory=dict)
+    # Source of resolved hardware-capability data per SKU (SKU -> source label,
+    # e.g. "static_registry", "live_detection", "mast", "psutil", "serf"). Kept a
+    # free-form string so it isn't restricted to a fixed set of detection
+    # mechanisms.
+    hw_source: Dict[str, str] = field(default_factory=dict)
+    # External trace / job identifier (e.g. the MAST Job ID) this planning session
+    # corresponds to. Links the request/session to the launching job for
+    # cross-system correlation. Session-level; None until associated with a job.
+    external_trace_id: Optional[str] = None
+
+
 # ---- Types Utils ---- #
 def hash_sha256_to_int(hashable_list: List[Any]) -> int:
     """
