@@ -914,12 +914,6 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
             self.tbes: torch.nn.ModuleList = torch.nn.ModuleList(self._emb_modules)
         setattr(self, MODULE_ATTR_CACHE_FEATURES_ORDER, cache_features_order)
 
-    def _apply_maybe_quint4x2_to_int8(self, embedding: torch.Tensor) -> torch.Tensor:
-        # Overridable seam for the quint4x2 -> uint8 reinterpret. The base uses
-        # the portable int_repr()-based op; subclasses may swap in a zero-copy
-        # variant. Both keep the fx op name that downstream graph passes detect.
-        return _maybe_quint4x2_to_int8(embedding)
-
     def forward(
         self,
         features: KeyedJaggedTensor,
@@ -971,7 +965,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
                 if self.register_tbes
                 else emb_module.forward(indices=indices, offsets=offsets)
             )
-            lookup = self._apply_maybe_quint4x2_to_int8(lookup)
+            lookup = _maybe_quint4x2_to_int8(lookup)
             if getattr(self, MODULE_ATTR_USE_UNFLATTENED_LENGTHS_FOR_BATCHING, False):
                 lengths = _get_unflattened_lengths(lengths, len(embedding_names))
                 lookup = _get_batching_hinted_output(lengths=lengths, output=lookup)
