@@ -415,6 +415,35 @@ class DLRMTest(unittest.TestCase):
             )
         )
 
+    def test_compile_dense_path(self) -> None:
+        # compile_dense_path() wraps the dense compute path (dense_arch,
+        # inter_arch, over_arch) with torch.compile. Wrapping is lazy -- no graph
+        # is captured until a forward -- so this exercises the method on CPU
+        # without a GPU or an Inductor compile. It must also be idempotent.
+        D = 8
+        eb_config = EmbeddingBagConfig(
+            name="t1", embedding_dim=D, num_embeddings=100, feature_names=["f1"]
+        )
+        ebc = EmbeddingBagCollection(tables=[eb_config])
+        sparse_nn = DLRM(
+            embedding_bag_collection=ebc,
+            dense_in_features=100,
+            dense_arch_layer_sizes=[20, D],
+            over_arch_layer_sizes=[5, 1],
+        )
+
+        self.assertFalse(sparse_nn._cuda_graph_enabled)
+        sparse_nn.compile_dense_path()
+        self.assertTrue(sparse_nn._cuda_graph_enabled)
+        # The dense-path submodules are now torch.compile wrappers, not originals.
+        self.assertNotIsInstance(sparse_nn.dense_arch, DenseArch)
+        self.assertNotIsInstance(sparse_nn.inter_arch, InteractionArch)
+
+        # Idempotent: a second call returns early and leaves the wrappers intact.
+        compiled_dense_arch = sparse_nn.dense_arch
+        sparse_nn.compile_dense_path()
+        self.assertIs(sparse_nn.dense_arch, compiled_dense_arch)
+
     def test_one_sparse(self) -> None:
         B = 2
         D = 8

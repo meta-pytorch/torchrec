@@ -468,6 +468,13 @@ class DLRM(nn.Module):
             specified here.
         dense_device (Optional[torch.device]): default compute device.
 
+    To reduce per-step CPU kernel-launch overhead, call `compile_dense_path()`
+    after construction to enable CUDA Graphs on the dense compute path
+    (`dense_arch`, `inter_arch`, `over_arch`) via
+    `torch.compile(mode="reduce-overhead")`. Gate that call behind your own
+    `enable_cuda_graph` feature flag so it can be toggled / rolled back without
+    a model change. `sparse_arch` is intentionally left eager.
+
     Example::
 
         B = 2
@@ -519,6 +526,9 @@ class DLRM(nn.Module):
         dense_device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
+        # Tracks whether the dense compute path has been wrapped for CUDA Graphs.
+        # Used to keep compile_dense_path() idempotent.
+        self._cuda_graph_enabled: bool = False
         assert (
             len(embedding_bag_collection.embedding_bag_configs()) > 0
         ), "At least one embedding bag is required"
@@ -559,6 +569,44 @@ class DLRM(nn.Module):
             layer_sizes=over_arch_layer_sizes,
             device=dense_device,
         )
+
+    def compile_dense_path(self, compile_mode: str = "reduce-overhead") -> None:
+        """
+        Enable CUDA Graphs on the dense compute path via `torch.compile`.
+
+        Wraps `dense_arch`, `inter_arch`, and `over_arch` with
+        `torch.compile(mode=compile_mode)`. With the default
+        ``"reduce-overhead"`` mode, Inductor captures a CUDA graph for each of
+        these blocks, replacing long runs of `cudaLaunchKernel` for small
+        kernels with a single `cudaGraphLaunch` and cutting per-step CPU
+        dispatch overhead.
+
+        `sparse_arch` is intentionally left eager: it runs
+        `EmbeddingBagCollection` lookups over a `KeyedJaggedTensor` whose shapes
+        vary batch-to-batch, which is incompatible with CUDA graph capture.
+
+        This method is additive and idempotent: the eager `forward` is unchanged
+        until it is called, and calling it more than once is a no-op. Call it
+        once, after construction, on a model that is already on a CUDA device;
+        gate the call behind an `enable_cuda_graph` feature flag at the call
+        site so it can be toggled / rolled back without a model change. It works
+        for `DLRM` and its subclasses (`DLRM_DCN`, `DLRM_Projection`) because by
+        the time it runs the subclass `inter_arch`/`over_arch` overrides are
+        already in place.
+
+        Args:
+            compile_mode (str): the `torch.compile` mode. Defaults to
+                ``"reduce-overhead"`` (the CUDA Graphs path).
+        """
+        if self._cuda_graph_enabled:
+            return
+        # pyrefly: ignore[bad-assignment]
+        self.dense_arch = torch.compile(self.dense_arch, mode=compile_mode)
+        # pyrefly: ignore[bad-assignment]
+        self.inter_arch = torch.compile(self.inter_arch, mode=compile_mode)
+        # pyrefly: ignore[bad-assignment]
+        self.over_arch = torch.compile(self.over_arch, mode=compile_mode)
+        self._cuda_graph_enabled = True
 
     def forward(
         self,
