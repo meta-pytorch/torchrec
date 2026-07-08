@@ -171,6 +171,28 @@ class MemoryStashingManager:
         cls._logged_event_keys.add(event_name)
         log_ems_event(event_name, metadata)
 
+    # DCP staging-boundary redirect map (criterion 1: no CUDA invalid-argument).
+    # Maps a *freed* GPU StorageImpl identity (``untyped_storage()._cdata``) to
+    # ``(full_slab_cpu_buffer, base_storage_offset, orphaned_slab_storage,
+    # d2h_done_event)``. The checkpoint stager may
+    # capture a view of ``weights_dev`` BEFORE the forward-pass stash swaps it to
+    # CPU + ``resize_(0)``s the GPU storage; its later ``copy_`` would then read
+    # a 0-byte CUDA storage at a non-zero ``storage_offset`` -> unmapped address
+    # -> ``cudaErrorInvalidValue``. ``staged_cpu_view_for`` lets the stager copy
+    # from the CPU buffer instead. The key is the StorageImpl pointer, which is
+    # SHARED by every aliasing view and SURVIVES ``resize_(0)`` (the StorageImpl
+    # is reused, only its DataPtr is freed), so a single registration covers all
+    # captured siblings regardless of capture-vs-stash ordering.
+    _staged_storage_buffers: Dict[
+        int,
+        Tuple[
+            torch.Tensor,
+            Union[int, torch.SymInt],
+            torch.UntypedStorage,
+            torch.cuda.Event,
+        ],
+    ] = {}
+
     @classmethod
     def thread_submit(cls, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
         """Submit a function to the shared thread pool executor."""
@@ -257,9 +279,49 @@ class MemoryStashingManager:
         cls._delay_stash = False
         cls._stash_chunk_size_bytes = _STASH_CHUNK_SIZE_BYTES
         cls._pending_stash_callbacks.clear()
+        cls._staged_storage_buffers.clear()
         if cls._stash_executor is not None:
             cls._stash_executor.shutdown(wait=False)
             cls._stash_executor = None
+
+    @classmethod
+    def _drop_staging_redirect(cls, storages: List[torch.UntypedStorage]) -> None:
+        """Remove DCP-staging redirect entries for the given (restored) slabs.
+
+        Called from ``restore`` once ``weights_dev`` points back to valid CUDA
+        storage: any view the stager captures from here on is GPU-valid, so the
+        redirect is no longer needed. Popping keeps ``_staged_storage_buffers``
+        from growing across checkpoints and releases the pinned CPU buffers.
+        """
+        for storage in storages:
+            cls._staged_storage_buffers.pop(storage._cdata, None)
+
+    @classmethod
+    def staged_cpu_view_for(cls, obj: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return a CPU view to copy from if ``obj`` aliases a stashed slab.
+
+        Called by the DCP staging boundary (``_staging_utils.create_and_copy_tensor``)
+        when it is about to copy a CUDA tensor whose storage has been freed
+        (``untyped_storage().size() == 0``) by a forward-pass stash. Looks up the
+        original GPU StorageImpl (shared by all aliasing views, stable across
+        ``resize_(0)``) and reconstructs the matching slice of the pinned CPU
+        buffer so the stager performs a valid CPU->CPU copy instead of faulting
+        on the unmapped device address. Returns ``None`` if ``obj`` is not a
+        known stashed slab (then the caller copies from ``obj`` as usual).
+        """
+        entry = cls._staged_storage_buffers.get(obj.untyped_storage()._cdata)
+        if entry is None:
+            return None
+        cpu_buffer, base_storage_offset, _slab_storage, d2h_event = entry
+        cpu_offset = obj.storage_offset() - base_storage_offset
+        if cpu_offset < 0 or cpu_offset + obj.numel() > cpu_buffer.numel():
+            return None
+        # Ensure the async D2H that fills cpu_buffer has completed before the
+        # stager reads it (host-side wait; near-zero cost when already done).
+        d2h_event.synchronize()
+        view = torch.empty(0, dtype=cpu_buffer.dtype, device="cpu")
+        view.set_(cpu_buffer.untyped_storage(), cpu_offset, obj.shape, obj.stride())
+        return view
 
     @classmethod
     def restore_embedding_weights(
@@ -399,6 +461,30 @@ class MemoryStashingManager:
                         tensor.record_stream(d2h_stream)
                         orig_storage_size = tensor.untyped_storage().size()
                         stash_data.append((tensor, cpu_buffer, orig_storage_size))
+                        # Register the (still-CUDA) slab's StorageImpl so the DCP
+                        # stager can redirect to this CPU buffer if it captured a
+                        # view of weights_dev before the ``tensor.data = cpu_buffer``
+                        # swap below. Keyed on the StorageImpl (shared by all
+                        # aliasing siblings, survives the resize_(0) free) so one
+                        # entry covers every captured shard. Dropped on restore.
+                        # Pin the orphaned StorageImpl in the registry value
+                        # itself (not just via _orig_storages) so its _cdata key
+                        # cannot be reused by the allocator for a NEW storage
+                        # while a redirect entry is live (ABA hazard -> would copy
+                        # from a stale CPU buffer). resize_(0) below frees the
+                        # DataPtr, so this pins the 0-byte shell, not HBM.
+                        slab_storage = tensor.untyped_storage()
+                        # Record D2H completion so a checkpoint-time redirect can
+                        # wait for the async copy that fills cpu_buffer before
+                        # reading it (else it could read a not-yet-complete buffer).
+                        d2h_done = torch.cuda.Event()
+                        d2h_done.record()
+                        cls._staged_storage_buffers[slab_storage._cdata] = (
+                            cpu_buffer,
+                            tensor.storage_offset(),
+                            slab_storage,
+                            d2h_done,
+                        )
 
                     # Save original CUDA storage refs and offsets before
                     # freeing, so restore can re-point tensors (and views
@@ -439,63 +525,76 @@ class MemoryStashingManager:
                     "size": size_text,
                 },
             )
-            with record_function(f"restore {label} on device ({size_text})"):
-                for (
-                    (hbm_ref, _cpu_buf, orig_storage_size),
-                    orig_stor,
-                    orig_offset,
-                ) in zip(stash_data, _orig_storages, _orig_storage_offsets):
-                    # Re-allocate the original CUDA storage to its full size
-                    # (which may be larger than this tensor if storage is
-                    # shared).  For shared storage, the first resize allocates
-                    # the full buffer; subsequent resizes for sibling views
-                    # are no-ops since the storage is already large enough.
-                    cur_size = orig_stor.size()
-                    if cur_size < orig_storage_size:
-                        orig_stor.resize_(orig_storage_size)
-                    ref = torch.tensor(
-                        [], dtype=hbm_ref.dtype, device=torch.cuda.current_device()
-                    )
-                    ref.set_(orig_stor, orig_offset, hbm_ref.shape, hbm_ref.stride())
-                    hbm_ref.data = ref
-
-            # Ensure h2d_stream waits for the caller's stream before any
-            # copies.  When called from a background thread the default
-            # stream may differ from the main thread's, so all GPU work
-            # must happen on h2d_stream.
-            if sync_event is not None:
-                h2d_stream.wait_event(sync_event)
-            else:
-                h2d_stream.wait_stream(torch.cuda.current_stream())
-
-            with record_function(f"restore {label} from host ({size_text})"):
-                for hbm_ref, cpu_buf, _ in stash_data:
-                    # Use a temporary tensor viewing the same storage to
-                    # bypass autograd.  copy_() on hbm_ref directly would
-                    # increment its version counter, causing "modified by
-                    # inplace operation" errors during backward.
-                    tmp = torch.tensor([], dtype=hbm_ref.dtype, device=hbm_ref.device)
-                    tmp.set_(
-                        hbm_ref.untyped_storage(),
-                        storage_offset=hbm_ref.storage_offset(),
-                        size=hbm_ref.shape,
-                        stride=hbm_ref.stride(),
-                    )
-                    with torch.cuda.stream(h2d_stream):
-                        # Chunk the bulk H2D restore so the copy engine yields
-                        # between trunks (see chunked_copy_).
-                        chunked_copy_(
-                            tmp, cpu_buf, chunk_size_bytes=cls._stash_chunk_size_bytes
+            try:
+                with record_function(f"restore {label} on device ({size_text})"):
+                    for (
+                        (hbm_ref, _cpu_buf, orig_storage_size),
+                        orig_stor,
+                        orig_offset,
+                    ) in zip(stash_data, _orig_storages, _orig_storage_offsets):
+                        # Re-allocate the original CUDA storage to its full size
+                        # (which may be larger than this tensor if storage is
+                        # shared).  For shared storage, the first resize allocates
+                        # the full buffer; subsequent resizes for sibling views
+                        # are no-ops since the storage is already large enough.
+                        cur_size = orig_stor.size()
+                        if cur_size < orig_storage_size:
+                            orig_stor.resize_(orig_storage_size)
+                        ref = torch.tensor(
+                            [], dtype=hbm_ref.dtype, device=torch.cuda.current_device()
                         )
-                    # Tell the caching allocator this storage is in use on
-                    # h2d_stream so the bytes cannot be reused by main-stream
-                    # allocations before the H2D copy completes.
-                    hbm_ref.record_stream(h2d_stream)
+                        ref.set_(
+                            orig_stor, orig_offset, hbm_ref.shape, hbm_ref.stride()
+                        )
+                        hbm_ref.data = ref
 
-                # Only need to record the last event — the stream is ordered.
-                restore_event = torch.cuda.Event()
-                restore_event.record(h2d_stream)
-                restore_events.append(restore_event)
+                # Ensure h2d_stream waits for the caller's stream before any
+                # copies.  When called from a background thread the default
+                # stream may differ from the main thread's, so all GPU work
+                # must happen on h2d_stream.
+                if sync_event is not None:
+                    h2d_stream.wait_event(sync_event)
+                else:
+                    h2d_stream.wait_stream(torch.cuda.current_stream())
+
+                with record_function(f"restore {label} from host ({size_text})"):
+                    for hbm_ref, cpu_buf, _ in stash_data:
+                        # Use a temporary tensor viewing the same storage to
+                        # bypass autograd.  copy_() on hbm_ref directly would
+                        # increment its version counter, causing "modified by
+                        # inplace operation" errors during backward.
+                        tmp = torch.tensor(
+                            [], dtype=hbm_ref.dtype, device=hbm_ref.device
+                        )
+                        tmp.set_(
+                            hbm_ref.untyped_storage(),
+                            storage_offset=hbm_ref.storage_offset(),
+                            size=hbm_ref.shape,
+                            stride=hbm_ref.stride(),
+                        )
+                        with torch.cuda.stream(h2d_stream):
+                            # Chunk the bulk H2D restore so the copy engine yields
+                            # between trunks (see chunked_copy_).
+                            chunked_copy_(
+                                tmp,
+                                cpu_buf,
+                                chunk_size_bytes=cls._stash_chunk_size_bytes,
+                            )
+                        # Tell the caching allocator this storage is in use on
+                        # h2d_stream so the bytes cannot be reused by main-stream
+                        # allocations before the H2D copy completes.
+                        hbm_ref.record_stream(h2d_stream)
+
+                    # Only need to record the last event — the stream is ordered.
+                    restore_event = torch.cuda.Event()
+                    restore_event.record(h2d_stream)
+                    restore_events.append(restore_event)
+            finally:
+                # Always drop this cycle's DCP-staging redirect entries (even if
+                # the H2D loop raised) so the registry can't leak across cycles.
+                # weights_dev is re-pointed to valid CUDA storage above, so future
+                # captured views are GPU-valid and need no redirect.
+                cls._drop_staging_redirect(_orig_storages)
 
         def await_restore(_grad: Optional[torch.Tensor] = None) -> None:
             """Pause current stream awaiting restore completion."""
