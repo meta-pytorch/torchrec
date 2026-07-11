@@ -347,6 +347,40 @@ class TestGradientClippingOptimizer(unittest.TestCase):
             atol=1e-08,
         )
 
+    def test_last_total_grad_norm_value_clipping_multi_params(self) -> None:
+        # VALUE + track_grad_norm aggregates the pre-clip norm across params via
+        # the on-device get_total_norm path (not the racy _compute_total_norm).
+        param_1 = Variable(torch.tensor([1.0, 2.0]), requires_grad=True)
+        param_2 = Variable(torch.tensor([3.0, 4.0]), requires_grad=True)
+
+        keyed_optimizer = DummyKeyedOptimizer(
+            {"param_1": param_1, "param_2": param_2},
+            {},
+            [{"params": [param_1]}, {"params": [param_2]}],
+        )
+
+        gradient_clipping_optimizer = GradientClippingOptimizer(
+            optimizer=keyed_optimizer,
+            max_gradient=1.0,
+            clipping=GradientClipping.VALUE,
+            track_grad_norm=True,
+        )
+
+        gradient_clipping_optimizer.zero_grad()
+        param_1.grad = torch.tensor([3.0, 4.0])
+        param_2.grad = torch.tensor([0.0, 12.0])
+        gradient_clipping_optimizer.step()
+
+        # norm is computed pre-clip over both params: sqrt(3^2+4^2+12^2) = 13
+        expected_norm = (3.0**2 + 4.0**2 + 12.0**2) ** 0.5
+        self.assertIsNotNone(gradient_clipping_optimizer.last_total_grad_norm)
+        torch.testing.assert_close(
+            gradient_clipping_optimizer.last_total_grad_norm,
+            torch.tensor(expected_norm),
+            rtol=1e-05,
+            atol=1e-08,
+        )
+
     def test_last_total_grad_norm_multi_params(self) -> None:
         param_1 = Variable(torch.tensor([3.0, 4.0]), requires_grad=True)
         param_2 = Variable(torch.tensor([6.0, 8.0]), requires_grad=True)
