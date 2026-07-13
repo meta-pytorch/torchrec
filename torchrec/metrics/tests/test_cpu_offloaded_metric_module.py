@@ -14,7 +14,7 @@ import random
 import threading
 import time
 import unittest
-from typing import Callable, cast, Optional
+from typing import Any, Callable, cast, Optional
 from unittest.mock import patch
 
 import torch
@@ -1969,6 +1969,56 @@ class LoadStateDictDevicePinTest(unittest.TestCase):
         after = self._get_first_state(cpu_module)
         self.assertEqual(after.device.type, "cpu")
         torch.testing.assert_close(before, after)
+
+    def _deposit_cuda_state_out_of_band(
+        self, cpu_module: CPUOffloadedRecMetricModule
+    ) -> tuple[Any, str]:
+        """Write cuda state via setattr, bypassing load_state_dict."""
+        # pyrefly: ignore[bad-index]
+        first_comp = cpu_module.rec_metrics.rec_metrics[0]._metrics_computations[
+            0
+        ]  # pyre-ignore[16]
+        attr_name = next(iter(first_comp._reductions))  # pyre-ignore[16]
+        with torch.no_grad():
+            setattr(first_comp, attr_name, getattr(first_comp, attr_name).to("cuda"))
+        self.assertEqual(getattr(first_comp, attr_name).device.type, "cuda")
+        return first_comp, attr_name
+
+    @unittest.skipIf(torch.cuda.device_count() < 1, "needs GPU")
+    def test_out_of_band_cuda_state_mismatches_without_repin(self) -> None:
+        """Out-of-band cuda state device-mismatches on a CPU-side add."""
+        cpu_module = self._make_module()
+        first_comp, attr_name = self._deposit_cuda_state_out_of_band(cpu_module)
+        state = getattr(first_comp, attr_name)
+        with self.assertRaisesRegex(RuntimeError, "two devices|same device"):
+            state.add_(torch.zeros(state.shape, dtype=state.dtype))
+
+    @unittest.skipIf(torch.cuda.device_count() < 1, "needs GPU")
+    def test_repin_helper_recovers_out_of_band_cuda_state(self) -> None:
+        """The re-pin helper recovers cuda state the post-hook can't see."""
+        cpu_module = self._make_module()
+        first_comp, attr_name = self._deposit_cuda_state_out_of_band(cpu_module)
+        moved = cpu_module._repin_metric_state_to_cpu()
+        self.assertGreaterEqual(moved, 1)
+        self.assertEqual(getattr(first_comp, attr_name).device.type, "cpu")
+
+    @unittest.skipIf(torch.cuda.device_count() < 1, "needs GPU")
+    def test_first_update_repins_out_of_band_cuda_state(self) -> None:
+        """First update re-pins out-of-band cuda state to CPU."""
+        cpu_module = self._make_module()
+        first_comp, attr_name = self._deposit_cuda_state_out_of_band(cpu_module)
+        self.assertFalse(cpu_module._metric_state_repinned)
+
+        model_out = {
+            "task1-prediction": torch.tensor([0.5, 0.7]),
+            "task1-label": torch.tensor([0.0, 1.0]),
+            "task1-weight": torch.tensor([1.0, 1.0]),
+        }
+        cpu_module._process_metric_update_job(MetricUpdateJob(model_out, {}, 1))
+
+        self.assertTrue(cpu_module._metric_state_repinned)
+        self.assertEqual(getattr(first_comp, attr_name).device.type, "cpu")
+        self.assertTrue(self.mock_metric.update_called())
 
 
 if __name__ == "__main__":

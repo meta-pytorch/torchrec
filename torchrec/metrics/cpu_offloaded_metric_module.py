@@ -303,6 +303,9 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         self._update_errors: int = 0
         self._compute_errors: int = 0
 
+        # One-shot guard: re-pin metric state to CPU on the first update.
+        self._metric_state_repinned: bool = False
+
         self.update_thread.start()
         self.compute_thread.start()
 
@@ -428,6 +431,18 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
             if required_inputs:
                 metric_update_job.kwargs["required_inputs"] = required_inputs
+
+            # Cover restores that write state in place (bypassing load_state_dict)
+            # and leave it off-CPU: re-pin once before the first update.
+            if not self._metric_state_repinned:
+                moved = self._repin_metric_state_to_cpu()
+                self._metric_state_repinned = True
+                if moved:
+                    logger.warning(
+                        f"CPUOffloadedRecMetricModule: re-pinned {moved} metric state "
+                        "tensors to CPU on first update; a checkpoint restore deposited "
+                        "non-CPU state without firing the load_state_dict post-hook."
+                    )
 
             self.rec_metrics.update(
                 predictions=predictions,
@@ -981,23 +996,17 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         """
         pass
 
-    @staticmethod
-    def _move_state_to_cpu_after_load(
-        module: torch.nn.Module, incompatible_keys: Any
-    ) -> None:
-        """`load_state_dict` post-hook: move any non-CPU metric state back to CPU.
+    def _repin_metric_state_to_cpu(self) -> int:
+        """Move any non-CPU metric state tensor back to CPU; return the count moved.
 
         torchmetrics `add_state` stores state via `setattr` (not `register_buffer`),
-        and `_load_from_state_dict` writes loaded tensors the same way — so checkpoint
-        restores can deposit cuda state on a CPU-only metric, crashing the next
-        `update()`. Walk `_reductions` on each `RecMetricComputation` and move via
-        getattr/setattr.
+        so a checkpoint restore can deposit accelerator state on a CPU-only metric.
+        Walk `_reductions` on each `RecMetricComputation` and re-pin via
+        getattr/setattr. No-op once everything is already on CPU.
         """
-        if not isinstance(module, CPUOffloadedRecMetricModule):
-            return
         moved = 0
         with torch.no_grad():
-            for metric in module.rec_metrics.rec_metrics:
+            for metric in self.rec_metrics.rec_metrics:
                 for comp in metric._metrics_computations:  # pyre-ignore[16]
                     for attr_name in comp._reductions:
                         state = getattr(comp, attr_name, None)
@@ -1020,6 +1029,20 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                             if list_moved:
                                 setattr(comp, attr_name, new_list)
                                 moved += 1
+        return moved
+
+    @staticmethod
+    def _move_state_to_cpu_after_load(
+        module: torch.nn.Module, incompatible_keys: Any
+    ) -> None:
+        """`load_state_dict` post-hook: re-pin metric state to CPU after a restore.
+
+        Only fires on the `load_state_dict` path; in-place restores are covered by
+        the one-shot guard in `_process_metric_update_job`.
+        """
+        if not isinstance(module, CPUOffloadedRecMetricModule):
+            return
+        moved = module._repin_metric_state_to_cpu()
         if moved:
             logger.info(
                 f"CPUOffloadedRecMetricModule: moved {moved} state tensors to CPU after load_state_dict"
