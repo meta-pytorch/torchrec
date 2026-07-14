@@ -117,11 +117,11 @@ def _merge_update_jobs(jobs: list[MetricUpdateJob]) -> MetricUpdateJob:
     `kwargs['required_inputs']` along the batch dimension (dim=0).
 
     Worker-side input batching: K mini-batches' worth of model outputs
-    are passed to rec_metrics.update as a single (concatenated) call,
-    cutting PyBind crossings on the worker thread by ~K× for sum-style
-    metrics. Semantically equivalent for sum-reduction metrics; for
-    raw-retention metrics (AUC family) the window-eviction math advances
-    by +1 instead of +K, which is negligible when window_size >> K.
+    are passed as a single (concatenated) job, cutting the DtoH transfer,
+    model-output parse, and rec_metrics.update() to one crossing per K
+    calls. K is capped at construction so a merged entry can never exceed
+    the smallest per-rank window (see _capped_update_batch_size), which
+    keeps windowed metrics from over-evicting.
 
     All jobs must share the same model_out key set and required_inputs
     key set; non-tensor kwargs are taken from the first job.
@@ -242,7 +242,10 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         """
         super().__init__(*args, **kwargs)
         self._model_out_device = model_out_device
-        self._update_batch_size: int = max(1, update_batch_size)
+        self._requested_update_batch_size: int = max(1, update_batch_size)
+        self._update_batch_size: int = self._capped_update_batch_size(
+            self._requested_update_batch_size
+        )
         # Defaults to False: the enqueued job holds references to model_out and
         # the source-stream guard on the async DtoH keeps the tensors valid, so
         # the per-step GPU clone is pure overhead. Set True only when the caller
@@ -325,6 +328,8 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 "model_out_device": str(model_out_device),
                 "update_queue_size": str(update_queue_size),
                 "compute_queue_size": str(compute_queue_size),
+                "requested_update_batch_size": str(self._requested_update_batch_size),
+                "update_batch_size": str(self._update_batch_size),
             },
         )
 
@@ -344,6 +349,46 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             error_message=error_message,
             stack_trace=stack_trace,
         )
+
+    def _capped_update_batch_size(self, requested: int) -> int:
+        """Cap worker-side micro-batching K so one merged update() never
+        exceeds the smallest per-rank window across windowed metrics.
+
+        A merged job feeds K per-rank batches (K * batch_size samples) into
+        each metric's WindowBuffer as a single entry. If that entry exceeds
+        a metric's per-rank window (ceil(window_size / world_size)), the
+        buffer evicts it the instant it is appended and the window empties,
+        so the window metric goes NaN (NE) or silently wrong (CTR, MSE, ...).
+        Capping K to floor(min_per_rank_window / batch_size) guarantees the
+        entry fits. On typical configs the per-rank window is far larger than
+        K * batch, so the cap is a no-op and K stays as requested.
+        """
+        cap = requested
+        limiter: Optional[tuple[str, int, int]] = None
+        for metric in self.rec_metrics.rec_metrics:
+            # _window_size is already the per-rank window (global / world_size);
+            # 0 means the metric has no window buffer (nothing to over-evict).
+            per_rank_window = getattr(metric, "_window_size", 0)
+            batch = getattr(metric, "_batch_size", 0)
+            if per_rank_window > 0 and batch > 0:
+                metric_cap = per_rank_window // batch
+                if metric_cap < cap:
+                    cap = metric_cap
+                    limiter = (type(metric).__name__, per_rank_window, batch)
+        cap = max(1, cap)
+        if cap < requested:
+            logger.warning(
+                f"CPUOffloadedRecMetricModule: capped update_batch_size "
+                f"{requested} -> {cap}; a merged window entry must fit the "
+                f"smallest per-rank window (limiting metric/window/batch={limiter}). "
+                f"Requested K would over-evict and corrupt window metrics."
+            )
+        else:
+            logger.info(
+                f"CPUOffloadedRecMetricModule: update_batch_size={cap} "
+                f"(requested={requested}, uncapped; per-rank window has headroom)."
+            )
+        return cap
 
     @override
     def update(self, model_out: Dict[str, torch.Tensor], **kwargs: Any) -> None:
@@ -429,8 +474,9 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 self.get_required_inputs(),
             )
 
+            update_kwargs = dict(metric_update_job.kwargs)
             if required_inputs:
-                metric_update_job.kwargs["required_inputs"] = required_inputs
+                update_kwargs["required_inputs"] = required_inputs
 
             # Cover restores that write state in place (bypassing load_state_dict)
             # and leave it off-CPU: re-pin once before the first update.
@@ -448,7 +494,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 predictions=predictions,
                 labels=labels,
                 weights=weights,
-                **metric_update_job.kwargs,
+                **update_kwargs,
             )
 
             if self.throughput_metric:
