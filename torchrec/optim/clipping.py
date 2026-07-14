@@ -152,14 +152,14 @@ class GradientClippingOptimizer(OptimizerWrapper):
 
         elif self._clipping == GradientClipping.VALUE:
             if self._track_grad_norm:
-                self._last_total_grad_norm, _ = self.compute_total_grad_norm()
+                self._last_total_grad_norm = self._compute_grad_norm_for_logging()
             torch.nn.utils.clip_grad_value_(
                 parameters=self._replicate_params, clip_value=self._max_gradient
             )
 
         elif self._clipping == GradientClipping.NONE:
             if self._track_grad_norm:
-                self._last_total_grad_norm, _ = self.compute_total_grad_norm()
+                self._last_total_grad_norm = self._compute_grad_norm_for_logging()
 
         super().step(closure)
         self._step_num += 1
@@ -169,6 +169,35 @@ class GradientClippingOptimizer(OptimizerWrapper):
         """Returns the total gradient norm from the most recent step, or None
         if no step has run yet."""
         return self._last_total_grad_norm
+
+    def _compute_grad_norm_for_logging(self) -> Optional[torch.Tensor]:
+        """Compute the total gradient norm for monitoring only (no clipping).
+
+        Uses torch's ``get_total_norm`` - the same on-device primitive the
+        non-sharded NORM clip path uses - instead of ``compute_total_grad_norm``.
+        The latter routes through ``_compute_total_norm``, which does a
+        ``non_blocking=True`` GPU->CPU copy of the norm and then reads it
+        immediately; that race intermittently yields a stale/near-zero value in
+        the logged metric. Keeping the reduction on-device avoids it.
+
+        Falls back to ``compute_total_grad_norm`` when sharded params require a
+        cross-rank reduction (VALUE clipping already forbids sharded params).
+        """
+        if len(self._sharded_params) != 0:
+            total_norm, _ = self.compute_total_grad_norm()
+            return total_norm
+        replicate_params = [
+            p._local_tensor if isinstance(p, DTensor) else p
+            for p in self._replicate_params
+        ]
+        grads = [
+            p.grad
+            for p in replicate_params
+            if p.grad is not None and p.grad.numel() > 0
+        ]
+        if not grads:
+            return None
+        return torch.nn.utils.get_total_norm(grads, norm_type=self._norm_type)
 
     def compute_total_grad_norm(
         self,
