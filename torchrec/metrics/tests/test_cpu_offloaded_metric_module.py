@@ -463,6 +463,50 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             "during update-thread flush",
         )
 
+    def test_early_stop_resolves_outstanding_compute_on_shutdown(self) -> None:
+        """APS metric-based early stop: the trainer issues async_compute() to
+        read a metric for the threshold check, the threshold trips, and the job
+        tears down while updates are still queued and that compute is still in
+        flight. shutdown() must drain the pending updates and resolve the
+        outstanding future so the trainer's blocking .resolve() cannot deadlock
+        the teardown lease."""
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.7]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+        for _ in range(5):
+            self.cpu_module.update(model_out)
+
+        # The metric read the early-stop threshold check blocks on.
+        deferred = self.cpu_module.async_compute()
+
+        # Early-stop teardown while work is still in flight.
+        self.cpu_module.shutdown()
+
+        # shutdown() flushes synchronously, so the outstanding future is already
+        # resolved by the time it returns -- .resolve() returns immediately and
+        # cannot hang the trainer.
+        result = deferred.resolve()
+        self.assertIsNotNone(result)
+
+        # No queued update was dropped on the early stop.
+        self.assertEqual(
+            self.cpu_module._total_updates_enqueued,
+            self.cpu_module._total_updates_processed,
+        )
+        # The outstanding compute ran; processed exceeds enqueued by the extra
+        # sync marker shutdown() itself injects before joining the threads.
+        self.assertGreaterEqual(
+            self.cpu_module._total_computes_processed,
+            self.cpu_module._total_computes_enqueued,
+        )
+        self.assertGreaterEqual(self.cpu_module._total_computes_processed, 1)
+        self.assertTrue(self.cpu_module.update_queue.empty())
+        self.assertTrue(self.cpu_module.compute_queue.empty())
+        self.assertFalse(self.cpu_module.update_thread.is_alive())
+        self.assertFalse(self.cpu_module.compute_thread.is_alive())
+
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
