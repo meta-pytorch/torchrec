@@ -1692,7 +1692,9 @@ class ShardedEmbeddingCollection(
             ):
                 embs = lookup(features)
                 if MemoryStashingManager.is_enabled():
-                    stash_result = MemoryStashingManager.stash_embedding_weights(lookup)
+                    stash_result = MemoryStashingManager.stash_embedding_weights(
+                        lookup, caller=self.__class__.__name__
+                    )
                     if stash_result is not None:
                         await_restore, *_ = stash_result
                         embs.register_hook(await_restore)
