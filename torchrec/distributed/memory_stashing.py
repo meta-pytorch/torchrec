@@ -14,6 +14,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from torch.autograd.profiler import record_function
+from torch.distributed._shard.sharded_tensor import ShardedTensor
+from torch.distributed._tensor import DTensor
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
@@ -1065,6 +1067,8 @@ def _collect_cuda_tensors_from_value(
 
     Handles nested structures like:
     - Direct tensors
+    - Sharded optimizer state (ShardedTensor / DTensor), unwrapped to their
+      local shard tensor(s)
     - Tuples/lists of tensors (e.g., Shampoo's factor_matrices)
     - Objects with tensor attributes (e.g., ShampooKroneckerFactors)
     - Nested dicts
@@ -1080,7 +1084,16 @@ def _collect_cuda_tensors_from_value(
     """
     tensors: List[torch.Tensor] = []
 
-    if isinstance(value, torch.Tensor):
+    if isinstance(value, ShardedTensor):
+        for shard in value.local_shards():
+            tensors.extend(
+                _collect_cuda_tensors_from_value(shard.tensor, min_size_bytes)
+            )
+    elif isinstance(value, DTensor):
+        tensors.extend(
+            _collect_cuda_tensors_from_value(value.to_local(), min_size_bytes)
+        )
+    elif isinstance(value, torch.Tensor):
         if value.is_cuda and value.numel() > 0:
             tensor_size_bytes = value.numel() * value.element_size()
             if tensor_size_bytes >= min_size_bytes:
