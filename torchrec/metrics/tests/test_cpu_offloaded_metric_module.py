@@ -33,7 +33,13 @@ from torchrec.metrics.cpu_offloaded_metric_module import (
 from torchrec.metrics.deferrable_metrics import transfer_tensors_to_cpu
 from torchrec.metrics.metric_job_types import SynchronizationMarker
 from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
-from torchrec.metrics.metrics_config import DefaultMetricsConfig
+from torchrec.metrics.metrics_config import (
+    DefaultMetricsConfig,
+    MetricsConfig,
+    RecComputeMode,
+    RecMetricDef,
+    RecMetricEnum,
+)
 from torchrec.metrics.rec_metric import RecMetricException, RecMetricList
 from torchrec.metrics.test_utils import gen_test_tasks
 from torchrec.metrics.test_utils.mock_metrics import (
@@ -462,6 +468,50 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             "compute thread did not process the final SyncMarker enqueued "
             "during update-thread flush",
         )
+
+    def test_early_stop_resolves_outstanding_compute_on_shutdown(self) -> None:
+        """APS metric-based early stop: the trainer issues async_compute() to
+        read a metric for the threshold check, the threshold trips, and the job
+        tears down while updates are still queued and that compute is still in
+        flight. shutdown() must drain the pending updates and resolve the
+        outstanding future so the trainer's blocking .resolve() cannot deadlock
+        the teardown lease."""
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.7]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+        for _ in range(5):
+            self.cpu_module.update(model_out)
+
+        # The metric read the early-stop threshold check blocks on.
+        deferred = self.cpu_module.async_compute()
+
+        # Early-stop teardown while work is still in flight.
+        self.cpu_module.shutdown()
+
+        # shutdown() flushes synchronously, so the outstanding future is already
+        # resolved by the time it returns -- .resolve() returns immediately and
+        # cannot hang the trainer.
+        result = deferred.resolve()
+        self.assertIsNotNone(result)
+
+        # No queued update was dropped on the early stop.
+        self.assertEqual(
+            self.cpu_module._total_updates_enqueued,
+            self.cpu_module._total_updates_processed,
+        )
+        # The outstanding compute ran; processed exceeds enqueued by the extra
+        # sync marker shutdown() itself injects before joining the threads.
+        self.assertGreaterEqual(
+            self.cpu_module._total_computes_processed,
+            self.cpu_module._total_computes_enqueued,
+        )
+        self.assertGreaterEqual(self.cpu_module._total_computes_processed, 1)
+        self.assertTrue(self.cpu_module.update_queue.empty())
+        self.assertTrue(self.cpu_module.compute_queue.empty())
+        self.assertFalse(self.cpu_module.update_thread.is_alive())
+        self.assertFalse(self.cpu_module.compute_thread.is_alive())
 
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
@@ -1040,6 +1090,8 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                     "model_out_device": "cpu",
                     "update_queue_size": "100",
                     "compute_queue_size": "100",
+                    "requested_update_batch_size": "1",
+                    "update_batch_size": "1",
                 },
             )
             module.shutdown()
@@ -2019,6 +2071,283 @@ class LoadStateDictDevicePinTest(unittest.TestCase):
         self.assertTrue(cpu_module._metric_state_repinned)
         self.assertEqual(getattr(first_comp, attr_name).device.type, "cpu")
         self.assertTrue(self.mock_metric.update_called())
+
+
+_MERGE_TEST_METRICS: list[tuple[str, RecMetricEnum]] = [
+    ("NE", RecMetricEnum.NE),
+    ("CTR", RecMetricEnum.CTR),
+    ("CALIBRATION", RecMetricEnum.CALIBRATION),
+    ("MSE", RecMetricEnum.MSE),
+    ("MAE", RecMetricEnum.MAE),
+    ("AUC", RecMetricEnum.AUC),
+    ("TOWER_QPS", RecMetricEnum.TOWER_QPS),
+]
+
+
+class WindowOverEvictionMergeTest(unittest.TestCase):
+    """Repro + generalization + fix-verification for the ZORM window-metric NaN.
+
+    Root cause: CPUOffloadedRecMetricModule micro-batches K MetricUpdateJobs into
+    ONE rec_metrics.update() call (``_merge_update_jobs`` -> ``_safe_merge_tensors``,
+    cat dim=0). Each windowed sum-reduction metric feeds its ``WindowBuffer`` ONE
+    entry per update() call with ``size = num_samples`` (the batch length). The
+    buffer evicts by cumulative size: ``while _window_used_size > _max_size:
+    remove()`` where ``_max_size = ceil(window_size / world_size)`` (per-rank).
+
+    When ``K * per_rank_batch > _max_size`` the single merged entry is evicted the
+    instant it is appended -> the window state empties -> the windowed metric
+    divides 0/0 -> NaN (NE/CTR/CALIBRATION) or masked-to-0 WRONG (MSE/MAE).
+    Lifetime metrics never evict, so they stay valid. AUC self-truncates its raw
+    window and TOWER_QPS has no WindowBuffer, so both stay valid.
+
+    The init guard at rec_metric.py:472 (``_window_size < _batch_size``) checks the
+    UNMERGED batch, so it passes; the MERGED entry (K*batch) still over-evicts.
+
+    Fix (cap-K): CPUOffloadedRecMetricModule caps update_batch_size at
+    construction to floor(min_per_rank_window / batch_size) so a merged entry
+    can never exceed the smallest per-rank window (see
+    _capped_update_batch_size). Here per_rank_window=40, batch=8 -> K is capped
+    10->5, so a merged entry (5*8=40) fits the window exactly and never
+    over-evicts. On prod configs the window dwarfs K*batch, so K stays 10.
+
+    Tests here drive the REAL CPUOffloadedRecMetricModule on CPU (model_out_device
+    = cpu, no GPU) with update_batch_size=K so the fix is exercised end-to-end
+    through the worker thread. The reference is the same module run with K=1;
+    the capped-K window must match the K=1 window within tolerance.
+    """
+
+    K: int = 10
+    BATCH_SIZE: int = 8
+    # Per-rank window (world_size=1 => _max_size == WINDOW_SIZE) chosen so that
+    # BATCH_SIZE <= WINDOW_SIZE < K * BATCH_SIZE: the guard passes (40 >= 8),
+    # K=1 keeps a valid window, but one merged entry of K*BATCH_SIZE=80 over-evicts.
+    WINDOW_SIZE: int = 40
+
+    def setUp(self) -> None:
+        self.tasks = gen_test_tasks(["task1", "task2"])
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["LOCAL_WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+        _init_process_group_with_retry("gloo")
+        self._modules: list[CPUOffloadedRecMetricModule] = []
+
+    def tearDown(self) -> None:
+        for module in self._modules:
+            try:
+                module.shutdown()
+            except RecMetricException as e:
+                # Must not propagate from tearDown (would mask the real failure); log so it stays visible.
+                logging.warning("shutdown() failed in tearDown: %s", e)
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    def _build_config(self, metric_enum: RecMetricEnum) -> MetricsConfig:
+        return MetricsConfig(
+            rec_tasks=self.tasks,
+            rec_metrics={
+                metric_enum: RecMetricDef(
+                    rec_tasks=self.tasks, window_size=self.WINDOW_SIZE
+                )
+            },
+            rec_compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            compute_interval_steps=1,
+        )
+
+    def _build_offloaded_module(
+        self, metric_enum: RecMetricEnum, update_batch_size: int
+    ) -> CPUOffloadedRecMetricModule:
+        module = cast(
+            CPUOffloadedRecMetricModule,
+            generate_metric_module(
+                metric_class=CPUOffloadedRecMetricModule,
+                metrics_config=self._build_config(metric_enum),
+                batch_size=self.BATCH_SIZE,
+                world_size=1,
+                my_rank=0,
+                state_metrics_mapping={},
+                device=torch.device("cpu"),
+                process_group=dist.group.WORLD,
+                module_kwargs={
+                    "model_out_device": torch.device("cpu"),
+                    "update_batch_size": update_batch_size,
+                },
+            ),
+        )
+        self._modules.append(module)
+        return module
+
+    def _gen_batches(self) -> list[dict[str, torch.Tensor]]:
+        torch.manual_seed(1234)
+        batches: list[dict[str, torch.Tensor]] = []
+        for _ in range(self.K):
+            model_out: dict[str, torch.Tensor] = {}
+            for task in self.tasks:
+                model_out[task.prediction_name] = torch.rand(self.BATCH_SIZE)
+                model_out[task.label_name] = torch.randint(
+                    0, 2, (self.BATCH_SIZE,)
+                ).float()
+                model_out[task.weight_name] = torch.rand(self.BATCH_SIZE) + 0.5
+            batches.append(model_out)
+        return batches
+
+    def _run_offloaded(
+        self, metric_enum: RecMetricEnum, update_batch_size: int
+    ) -> dict[str, torch.Tensor]:
+        """Feed K batches through the real worker thread and resolve one compute.
+        Returns the windowed metric values."""
+        module = self._build_offloaded_module(metric_enum, update_batch_size)
+        for b in self._gen_batches():
+            module.update(b)
+        result = module.async_compute().resolve()
+        return {
+            k: cast(torch.Tensor, v)
+            for k, v in result.items()
+            if "window" in k.lower() and isinstance(v, torch.Tensor)
+        }
+
+    @staticmethod
+    def _classify(
+        reference: dict[str, torch.Tensor], candidate: dict[str, torch.Tensor]
+    ) -> str:
+        """NAN | WRONG | VALID for the K-merge candidate vs the K=1 reference."""
+        keys = set(reference) & set(candidate)
+        if not keys:
+            return "VALID"  # metric has no windowed sum-reduction state (TOWER_QPS)
+        if any(torch.isnan(candidate[k]).any().item() for k in keys):
+            return "NAN"
+        all_close = all(
+            torch.allclose(
+                reference[k].double(), candidate[k].double(), rtol=1e-4, atol=1e-6
+            )
+            for k in keys
+        )
+        return "VALID" if all_close else "WRONG"
+
+    # ---- STEP 1: focused NE repro through the real ZORM worker ----
+    def test_step1_ne_window_nan_repro(self) -> None:
+        # Guard is evaluated against the UNMERGED batch; it must not trip.
+        self.assertGreaterEqual(self.WINDOW_SIZE, self.BATCH_SIZE)
+        reference = self._run_offloaded(RecMetricEnum.NE, update_batch_size=1)
+        merged = self._run_offloaded(RecMetricEnum.NE, update_batch_size=self.K)
+        print("\n===== STEP 1 NE OVER-EVICTION REPRO (real ZORM worker) =====")
+        for k in sorted(set(reference) & set(merged)):
+            print(
+                f"  {k}: K=1={reference[k].tolist()} "
+                f"K={self.K}={merged[k].tolist()}"
+            )
+        classification = self._classify(reference, merged)
+        print(f"  classification: {classification}")
+        print("============================================================")
+        self.assertEqual(
+            classification,
+            "VALID",
+            "NE window under K-merge must equal the K=1 reference. On unfixed "
+            "code the merged entry over-evicts the WindowBuffer -> window_ne=NaN.",
+        )
+
+    # ---- STEP 2 + 3: generalized over ALL RecMetric types ----
+    def test_all_metrics_window_valid_under_kmerge(self) -> None:
+        print("\n===== STEP 2/3 OVER-EVICTION TABLE (real ZORM worker) =====")
+        print(
+            f"  K={self.K} BATCH_SIZE={self.BATCH_SIZE} "
+            f"WINDOW_SIZE(per-rank)={self.WINDOW_SIZE} "
+            f"merged_entry_size={self.K * self.BATCH_SIZE}"
+        )
+        results: dict[str, str] = {}
+        for name, metric_enum in _MERGE_TEST_METRICS:
+            reference = self._run_offloaded(metric_enum, update_batch_size=1)
+            merged = self._run_offloaded(metric_enum, update_batch_size=self.K)
+            results[name] = self._classify(reference, merged)
+            print(f"  {name:12s}: {results[name]}")
+        print("===========================================================")
+        bad = {n: c for n, c in results.items() if c != "VALID"}
+        self.assertEqual(
+            bad,
+            {},
+            f"Metrics with broken window under K-merge over-eviction: {bad}. "
+            "cap-K must keep every metric's window within tolerance of K=1.",
+        )
+
+
+class CapUpdateBatchSizeTest(unittest.TestCase):
+    """Directly asserts the cap-K policy: update_batch_size stays at the
+    requested value on prod-shaped configs (window >> K*batch) and is lowered
+    on dlrm-shaped configs (small NE window relative to K*batch)."""
+
+    def setUp(self) -> None:
+        self.tasks = gen_test_tasks(["task1"])
+        os.environ["RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["LOCAL_WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+        _init_process_group_with_retry("gloo")
+        self._modules: list[CPUOffloadedRecMetricModule] = []
+
+    def tearDown(self) -> None:
+        for module in self._modules:
+            try:
+                module.shutdown()
+            except RecMetricException as e:
+                # Must not propagate from tearDown (would mask the real failure); log so it stays visible.
+                logging.warning("shutdown() failed in tearDown: %s", e)
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+    def _effective_k(
+        self, window_size: int, batch_size: int, world_size: int, requested_k: int
+    ) -> int:
+        config = MetricsConfig(
+            rec_tasks=self.tasks,
+            rec_metrics={
+                RecMetricEnum.NE: RecMetricDef(
+                    rec_tasks=self.tasks, window_size=window_size
+                )
+            },
+            rec_compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            compute_interval_steps=1,
+        )
+        module = cast(
+            CPUOffloadedRecMetricModule,
+            generate_metric_module(
+                metric_class=CPUOffloadedRecMetricModule,
+                metrics_config=config,
+                batch_size=batch_size,
+                world_size=world_size,
+                my_rank=0,
+                state_metrics_mapping={},
+                device=torch.device("cpu"),
+                process_group=dist.group.WORLD,
+                module_kwargs={
+                    "model_out_device": torch.device("cpu"),
+                    "update_batch_size": requested_k,
+                },
+            ),
+        )
+        self._modules.append(module)
+        return module._update_batch_size
+
+    def test_prod_settings_k_uncapped(self) -> None:
+        # NE window 1,000,000 / world 16 => per-rank 62,500; batch 2,048 =>
+        # floor(62500/2048)=30 >= 10 => K stays 10.
+        self.assertEqual(
+            self._effective_k(
+                window_size=1_000_000, batch_size=2048, world_size=16, requested_k=10
+            ),
+            10,
+        )
+
+    def test_dlrm_settings_k_capped(self) -> None:
+        # NE window 100,000 / world 16 => per-rank 6,250; batch 1,280 =>
+        # floor(6250/1280)=4 < 10 => K capped to 4.
+        self.assertEqual(
+            self._effective_k(
+                window_size=100_000, batch_size=1280, world_size=16, requested_k=10
+            ),
+            4,
+        )
 
 
 if __name__ == "__main__":
