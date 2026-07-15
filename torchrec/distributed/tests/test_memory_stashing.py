@@ -8,6 +8,7 @@
 # pyre-strict
 
 import math
+import os
 import unittest
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -16,14 +17,21 @@ from unittest.mock import Mock, patch
 import hypothesis.strategies as st
 import torch
 from hypothesis import given, settings
-from torch import nn
+from torch import distributed as dist, nn
+from torch.distributed._shard.sharded_tensor import init_from_local_shards, Shard
+from torch.distributed._tensor import DeviceMesh, distribute_tensor, Replicate
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
-from torchrec.distributed.memory_stashing import chunked_copy_, MemoryStashingManager
-from torchrec.modules.embedding_configs import DataType, PoolingType
+from torchrec.distributed.memory_stashing import (
+    _collect_cuda_tensors_from_value,
+    chunked_copy_,
+    MemoryStashingManager,
+)
+from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig, PoolingType
+from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
 
 class TestStashTensors(unittest.TestCase):
@@ -85,7 +93,9 @@ class TestStashTensors(unittest.TestCase):
         await_restore, restore, _execute_stash = MemoryStashingManager._stash_tensors(
             []
         )
-        # Should not raise
+        # No-op callbacks must be callable and must not raise.
+        self.assertTrue(callable(restore))
+        self.assertTrue(callable(await_restore))
         restore(None)
         await_restore(None)
 
@@ -856,9 +866,6 @@ class TestEmsConfigWiring(unittest.TestCase):
 
     def test_ebc_model_stash_weights_mutation(self) -> None:
         """Simulates the factory bridge: setting stash_weights=True on EBC configs in a model."""
-        from torchrec.modules.embedding_configs import EmbeddingBagConfig
-        from torchrec.modules.embedding_modules import EmbeddingBagCollection
-
         tables = [
             EmbeddingBagConfig(
                 num_embeddings=100,
@@ -892,9 +899,6 @@ class TestEmsConfigWiring(unittest.TestCase):
 
     def test_ebc_model_stash_weights_not_set_when_disabled(self) -> None:
         """When EMS is disabled, stash_weights remains False on all EBC configs."""
-        from torchrec.modules.embedding_configs import EmbeddingBagConfig
-        from torchrec.modules.embedding_modules import EmbeddingBagCollection
-
         tables = [
             EmbeddingBagConfig(
                 num_embeddings=100,
@@ -1091,5 +1095,65 @@ class ChunkedCopyTest(unittest.TestCase):
         self.assertTrue(torch.equal(dst.cpu(), src.cpu()))
 
 
-if __name__ == "__main__":
-    unittest.main()
+class TestCollectCudaTensorsSharded(unittest.TestCase):
+    """``_collect_cuda_tensors_from_value`` must unwrap ShardedTensor / DTensor
+    optimizer state into their local CUDA shard tensors instead of crashing on
+    ``.is_cuda`` (which routes through their ``__torch_function__`` and raises).
+    """
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        if not dist.is_available():
+            self.skipTest("torch.distributed not available")
+        self.device = torch.device("cuda:0")
+        self._created_pg = False
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                rank=0,
+                world_size=1,
+                init_method=f"file:///tmp/trec_memstash_pg_{os.getpid()}",
+            )
+            self._created_pg = True
+
+    def tearDown(self) -> None:
+        if self._created_pg and dist.is_initialized():
+            dist.destroy_process_group()
+
+    def test_collect_unwraps_sharded_tensor(self) -> None:
+        # 1024 * 512 * 4 bytes = 2MB, above the 1MB stash threshold.
+        local = torch.randn(1024, 512, device=self.device)
+        shard = Shard.from_tensor_and_offsets(local, shard_offsets=[0, 0], rank=0)
+        st = init_from_local_shards([shard], 1024, 512)
+
+        collected = _collect_cuda_tensors_from_value(st)
+
+        self.assertEqual(len(collected), 1)
+        self.assertTrue(collected[0].is_cuda)
+        self.assertEqual(collected[0].data_ptr(), local.data_ptr())
+
+    def test_collect_sharded_tensor_in_optimizer_state_dict(self) -> None:
+        # Mirrors the real failure: a sharded optimizer-state tensor nested in
+        # the per-param state dict, as iterated by ``stash_optimizer_state``.
+        local = torch.randn(1024, 512, device=self.device)
+        shard = Shard.from_tensor_and_offsets(local, shard_offsets=[0, 0], rank=0)
+        st = init_from_local_shards([shard], 1024, 512)
+        state_value = {"exp_avg": st, "step": torch.tensor(1)}
+
+        collected = _collect_cuda_tensors_from_value(state_value)
+
+        # exp_avg (sharded, 2MB) is collected; step (tiny CPU scalar) is skipped.
+        self.assertEqual(len(collected), 1)
+        self.assertEqual(collected[0].data_ptr(), local.data_ptr())
+
+    def test_collect_unwraps_dtensor(self) -> None:
+        mesh = DeviceMesh("cuda", [0])
+        # 2MB, above the 1MB stash threshold.
+        local = torch.randn(1024, 512, device=self.device)
+        dt = distribute_tensor(local, mesh, [Replicate()])
+
+        collected = _collect_cuda_tensors_from_value(dt)
+
+        self.assertEqual(len(collected), 1)
+        self.assertTrue(collected[0].is_cuda)
