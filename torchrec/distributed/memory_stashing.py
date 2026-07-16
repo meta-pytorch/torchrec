@@ -363,6 +363,28 @@ class MemoryStashingManager:
             cls._optimizer_state_restore_callbacks.pop()(None, sync_event)
 
     @classmethod
+    def restore_optimizer_state_next(
+        cls,
+        _grad: Optional[torch.Tensor] = None,
+        sync_event: Optional[torch.cuda.Event] = None,
+    ) -> None:
+        """Pop and run exactly ONE optimizer-state restore callback (FIFO).
+
+        Used by the gradual (sliced) restore path: each PARAM_GRAD backward hook
+        restores the next slice. Slice 0 -- registered first, i.e. the
+        output-side / earliest-firing backward hook -- is restored first. No-op
+        when the callback stack is empty (e.g. all slices already restored by the
+        ``_step_optimizer`` pop-all guard, or hooks fired more times than there
+        are slices).
+        """
+        if cls._optimizer_state_restore_callbacks:
+            logger.info(
+                "restore_optimizer_state_next: restoring one slice "
+                f"({len(cls._optimizer_state_restore_callbacks)} remaining)"
+            )
+            cls._optimizer_state_restore_callbacks.pop(0)(None, sync_event)
+
+    @classmethod
     def _stash_tensors(
         cls,
         tensors: List[torch.Tensor],
@@ -913,6 +935,7 @@ class MemoryStashingManager:
         cls,
         optimizer: torch.optim.Optimizer,
         sync_event: Optional[torch.cuda.Event] = None,
+        num_slices: int = 1,
     ) -> Tuple[
         Callable[[Optional[torch.Tensor]], None],
         Callable[[Optional[torch.Tensor]], None],
@@ -932,11 +955,23 @@ class MemoryStashingManager:
 
         Args:
             optimizer: A PyTorch optimizer containing state tensors to stash.
+            sync_event: Optional CUDA event recorded on the caller's stream that
+                the D2H/H2D streams wait on (required when run on a background
+                thread). Forwarded to every slice's stash.
+            num_slices: Number of byte-balanced slices to partition the collected
+                state into for gradual restore. ``1`` (default) preserves the
+                single-shot behavior. When ``> 1`` each slice is stashed
+                independently and its restore is registered as a separate
+                callback (slice 0 first), to be driven per-hook via
+                ``restore_optimizer_state_next``; the returned ``await_restore``
+                then gates on ALL slices' restore completion.
 
         Returns:
             A tuple of two callback functions:
             - await_restore: Pauses current stream awaiting restore completion
+              (of all slices when ``num_slices > 1``)
             - restore: Retrieves stashed data from CPU back to HBM asynchronously
+              (all slices when ``num_slices > 1``)
 
         Usage:
             >>> await_restore, restore = MemoryStashingManager.stash_optimizer_state(optimizer)
@@ -971,16 +1006,58 @@ class MemoryStashingManager:
             },
         )
 
-        await_restore, restore, _execute_stash = cls._stash_tensors(
-            tensors, label="optimizer state", sync_event=sync_event
+        if num_slices <= 1:
+            await_restore, restore, _execute_stash = cls._stash_tensors(
+                tensors, label="optimizer state", sync_event=sync_event
+            )
+            cls._optimizer_state_restore_callbacks.append(restore)
+            return await_restore, restore
+
+        # Gradual (throttled) restore: partition the dense optimizer state into
+        # byte-balanced slices and stash each independently. Each slice's restore
+        # (resize_ + H2D) is registered as its own callback so it can be driven
+        # one-at-a-time by per-hook ``restore_optimizer_state_next`` calls placed
+        # at progressively deeper backward FQNs -- spreading the H2D bandwidth and
+        # deferring each slice's HBM allocation to a later point in backward.
+        slices = _partition_tensors_into_slices(tensors, num_slices)
+        logger.info(
+            f"stash_optimizer_state: partitioned {len(tensors)} tensors into "
+            f"{len(slices)} slices (requested {num_slices})"
         )
-        cls._optimizer_state_restore_callbacks.append(restore)
-        return await_restore, restore
+        slice_awaits: List[Callable[[Optional[torch.Tensor]], None]] = []
+        slice_restores: List[Callable[..., None]] = []
+        for k, slice_tensors in enumerate(slices):
+            await_restore_k, restore_k, _execute_stash_k = cls._stash_tensors(
+                slice_tensors,
+                label=f"optimizer state slice {k + 1}/{len(slices)}",
+                sync_event=sync_event,
+            )
+            slice_awaits.append(await_restore_k)
+            slice_restores.append(restore_k)
+            # Append in slice order so ``restore_optimizer_state_next`` (FIFO)
+            # maps slice k to the k-th hook to fire.
+            cls._optimizer_state_restore_callbacks.append(restore_k)
+
+        def aggregate_await(_grad: Optional[torch.Tensor] = None) -> None:
+            """Gate the current stream on EVERY slice's restore completion."""
+            for slice_await in slice_awaits:
+                slice_await(None)
+
+        def restore_all(
+            _grad: Optional[torch.Tensor] = None,
+            sync_event: Optional[torch.cuda.Event] = None,
+        ) -> None:
+            """Restore all slices (used when no per-hook driver is present)."""
+            for slice_restore in slice_restores:
+                slice_restore(None, sync_event)
+
+        return aggregate_await, restore_all
 
     @classmethod
     def stash_optimizer_state_threaded(
         cls,
         optimizer: torch.optim.Optimizer,
+        num_slices: int = 1,
     ) -> "Future[Tuple[Callable[[Optional[torch.Tensor]], None], Callable[[Optional[torch.Tensor]], None]]]":
         """
         Submit ``stash_optimizer_state`` to a background thread.
@@ -1003,7 +1080,9 @@ class MemoryStashingManager:
             Callable[[Optional[torch.Tensor]], None],
         ]:
             torch.cuda.set_device(device)
-            return cls.stash_optimizer_state(optimizer, sync_event=sync_event)
+            return cls.stash_optimizer_state(
+                optimizer, sync_event=sync_event, num_slices=num_slices
+            )
 
         return cls.thread_submit(_work)
 
@@ -1056,6 +1135,53 @@ class MemoryStashingManager:
             cls.restore_embedding_weights(sync_event=sync_event)
 
         return cls.thread_submit(_work)
+
+
+def _partition_tensors_into_slices(
+    tensors: List[torch.Tensor],
+    num_slices: int,
+) -> List[List[torch.Tensor]]:
+    """Partition ``tensors`` into at most ``num_slices`` byte-balanced sublists.
+
+    Tensors that share the same underlying storage (same
+    ``untyped_storage().data_ptr()``) are kept together in the same slice so a
+    ``resize_(0)`` / ``resize_(orig_size)`` pair is never split across slices
+    (splitting shared storage would free/realloc bytes another slice still
+    references, corrupting the buffer).
+
+    Uses a greedy longest-processing-time (LPT) assignment: storage groups are
+    sorted by descending byte size and each is placed into the currently
+    smallest slice. This is deterministic (stable sort + first-min tie-break),
+    keeping the slice schedule reproducible across ranks and in tests.
+
+    Returns the non-empty slices in order (slice 0 first). When there are fewer
+    storage groups than ``num_slices`` the result has fewer than ``num_slices``
+    slices.
+    """
+    if num_slices <= 1 or len(tensors) <= 1:
+        return [tensors] if tensors else []
+
+    # Group tensors by shared storage, preserving first-seen order.
+    groups: Dict[int, List[torch.Tensor]] = {}
+    for tensor in tensors:
+        storage_ptr = tensor.untyped_storage().data_ptr()
+        groups.setdefault(storage_ptr, []).append(tensor)
+
+    def group_bytes(group: List[torch.Tensor]) -> int:
+        # Count each distinct storage once; tensors in a group share storage.
+        return group[0].untyped_storage().nbytes()
+
+    n = min(num_slices, len(groups))
+    bins: List[List[torch.Tensor]] = [[] for _ in range(n)]
+    bin_bytes: List[int] = [0] * n
+
+    # Largest groups first; assign each to the currently smallest bin.
+    for group in sorted(groups.values(), key=group_bytes, reverse=True):
+        idx = min(range(n), key=lambda i: bin_bytes[i])
+        bins[idx].extend(group)
+        bin_bytes[idx] += group_bytes(group)
+
+    return [b for b in bins if b]
 
 
 def _collect_cuda_tensors_from_value(
