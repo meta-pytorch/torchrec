@@ -9,7 +9,7 @@
 
 import math
 import unittest
-from typing import cast, Dict, List, Tuple
+from typing import cast, Dict, List, Optional, Tuple
 from unittest.mock import MagicMock, Mock, patch
 
 import torch
@@ -57,6 +57,7 @@ from torchrec.distributed.types import (
     CacheStatistics,
     compute_storage_usage,
     get_tensor_size_bytes,
+    KeyValueParams,
     ModuleSharder,
     MultiPassPrefetchConfig,
     PipelineType,
@@ -1687,6 +1688,106 @@ class TestEmbeddingStorageEstimator(unittest.TestCase):
         self.assertIn("tensor.shape=", error_msg)
         self.assertIn("sharding_type=", error_msg)
         self.assertIn("compute_kernel=", error_msg)
+
+    def _estimate_key_value_hbm(
+        self,
+        so_key_value_params: Optional[KeyValueParams],
+        constraint_key_value_params: Optional[KeyValueParams],
+    ) -> int:
+        """Total HBM estimate for one KEY_VALUE option, with key_value_params set
+        on the option and/or its ParameterConstraints. The option is built
+        directly (not via the enumerator) so the two sources can differ."""
+        topology = Topology(world_size=2, compute_device="cuda")
+        constraints = (
+            {
+                "table_kv": ParameterConstraints(
+                    key_value_params=constraint_key_value_params
+                )
+            }
+            if constraint_key_value_params is not None
+            else None
+        )
+        estimator = EmbeddingStorageEstimator(
+            topology=topology, constraints=constraints
+        )
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=1_000_000,
+                embedding_dim=128,
+                name="table_kv",
+                feature_names=["feature_0"],
+            )
+        ]
+        model = TestSparseNN(tables=tables, weighted_tables=[])
+        ebc_module = model.sparse.ebc
+        assert isinstance(ebc_module, torch.nn.Module)
+        sharding_option = ShardingOption(
+            name="table_kv",
+            tensor=torch.zeros(1_000_000, 128, device="meta"),
+            module=("sparse.ebc", ebc_module),
+            input_lengths=[1.0],
+            batch_size=BATCH_SIZE,
+            sharding_type=ShardingType.TABLE_WISE.value,
+            partition_by="host",
+            compute_kernel=EmbeddingComputeKernel.KEY_VALUE.value,
+            shards=[Shard(size=[1_000_000, 128], offset=[0, 0])],
+            key_value_params=so_key_value_params,
+        )
+        sharder_data_map = {
+            sharding_option.module_type_key: SharderData(
+                fused_params={},
+                qcomm_dtype_sizes={},
+                storage_usage_type=StorageUsageType.DEFAULT,
+            ),
+        }
+        estimator.estimate([sharding_option], sharder_data_map=sharder_data_map)
+        return sum(
+            shard.storage.hbm
+            for shard in sharding_option.shards
+            if shard.storage is not None
+        )
+
+    def test_key_value_params_sourced_from_sharding_option(self) -> None:
+        # A larger max_l1_cache_size on the option must raise the estimated HBM
+        # cache. With no ParameterConstraints, only an option-sourced read can
+        # see it; the prior estimator fell back to max_l1_cache_size=0 for both
+        # and produced identical HBM.
+        small = self._estimate_key_value_hbm(
+            so_key_value_params=KeyValueParams(max_l1_cache_size=1),
+            constraint_key_value_params=None,
+        )
+        large = self._estimate_key_value_hbm(
+            so_key_value_params=KeyValueParams(max_l1_cache_size=8),
+            constraint_key_value_params=None,
+        )
+        self.assertGreater(large, small)
+
+    def test_key_value_params_option_overrides_constraint(self) -> None:
+        # The option's key_value_params takes precedence over the constraint's,
+        # mirroring how cache_load_factor is read from the option.
+        option_cap = self._estimate_key_value_hbm(
+            so_key_value_params=KeyValueParams(max_l1_cache_size=1),
+            constraint_key_value_params=KeyValueParams(max_l1_cache_size=8),
+        )
+        constraint_cap = self._estimate_key_value_hbm(
+            so_key_value_params=None,
+            constraint_key_value_params=KeyValueParams(max_l1_cache_size=8),
+        )
+        self.assertLess(option_cap, constraint_cap)
+
+    def test_key_value_params_falls_back_to_constraint(self) -> None:
+        # When the option carries no key_value_params, the estimator still reads
+        # the constraint (the canonical enumerator path copies it onto the
+        # option), so a larger constraint cap raises HBM. Guards backward compat.
+        small = self._estimate_key_value_hbm(
+            so_key_value_params=None,
+            constraint_key_value_params=KeyValueParams(max_l1_cache_size=1),
+        )
+        large = self._estimate_key_value_hbm(
+            so_key_value_params=None,
+            constraint_key_value_params=KeyValueParams(max_l1_cache_size=8),
+        )
+        self.assertGreater(large, small)
 
 
 class TestEmbeddingOffloadStats(unittest.TestCase):

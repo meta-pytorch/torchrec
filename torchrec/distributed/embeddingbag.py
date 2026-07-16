@@ -1977,7 +1977,9 @@ class ShardedEmbeddingBagCollection(
                     # pyrefly: ignore[not-callable]: `wait_for_forward` is dynamically checked
                     lookup.wait_for_forward()
                 if MemoryStashingManager.is_enabled():
-                    stash_result = MemoryStashingManager.stash_embedding_weights(lookup)
+                    stash_result = MemoryStashingManager.stash_embedding_weights(
+                        lookup, caller=self.__class__.__name__
+                    )
                     if stash_result is not None:
                         await_restore, _, _execute_stash = stash_result
                         embs.register_hook(await_restore)

@@ -14,6 +14,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 from torch.autograd.profiler import record_function
+from torch.distributed._shard.sharded_tensor import ShardedTensor
+from torch.distributed._tensor import DTensor
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
@@ -31,12 +33,21 @@ _STASH_CHUNK_SIZE_BYTES: int = 32 * 1024**2
 
 
 def _tensor_size_text(tensor: Union[List[torch.Tensor], torch.Tensor]) -> str:
-    """Return a human-readable size string (MB or GB) for a tensor."""
+    """Return a human-readable size string (KB / MB / GB) for a tensor.
+
+    Uses a KB→MB→GB ladder so small stashed groups (e.g. VLE tables under a
+    shrunk ``max_ind_range``) are still legible in the ``record_function``
+    trace labels for size validation.
+    """
     if isinstance(tensor, list):
-        size_mb = sum(t.numel() * t.element_size() for t in tensor) / (1024**2)
+        size_bytes = sum(t.numel() * t.element_size() for t in tensor)
     else:
-        size_mb = tensor.numel() * tensor.element_size() / (1024**2)
-    if size_mb < 200:
+        size_bytes = tensor.numel() * tensor.element_size()
+    size_kb = size_bytes / 1024
+    if size_kb < 1024:
+        return f"{size_kb:.2f} KB"
+    size_mb = size_kb / 1024
+    if size_mb < 1024:
         return f"{size_mb:.2f} MB"
     return f"{size_mb / 1024:.2f} GB"
 
@@ -615,6 +626,7 @@ class MemoryStashingManager:
     def stash_embedding_weights(
         cls,
         lookup: nn.Module,
+        caller: str = "",
     ) -> Optional[
         Tuple[
             Callable[[Optional[torch.Tensor]], None],
@@ -692,12 +704,15 @@ class MemoryStashingManager:
                 continue
             tensors.append(weights_dev)
 
+        tensor_size = _tensor_size_text(tensors) if tensors else "0.00 Bytes"
         cls._log_ems_once(
             "ems_stash_embedding_weights_collected",
             {
+                "caller": caller,
                 "lookup": type(lookup).__name__,
                 "module": type(module).__name__,
                 "num_tensors": str(len(tensors)),
+                "tensor_size": tensor_size,
             },
         )
 
@@ -1052,6 +1067,8 @@ def _collect_cuda_tensors_from_value(
 
     Handles nested structures like:
     - Direct tensors
+    - Sharded optimizer state (ShardedTensor / DTensor), unwrapped to their
+      local shard tensor(s)
     - Tuples/lists of tensors (e.g., Shampoo's factor_matrices)
     - Objects with tensor attributes (e.g., ShampooKroneckerFactors)
     - Nested dicts
@@ -1067,7 +1084,16 @@ def _collect_cuda_tensors_from_value(
     """
     tensors: List[torch.Tensor] = []
 
-    if isinstance(value, torch.Tensor):
+    if isinstance(value, ShardedTensor):
+        for shard in value.local_shards():
+            tensors.extend(
+                _collect_cuda_tensors_from_value(shard.tensor, min_size_bytes)
+            )
+    elif isinstance(value, DTensor):
+        tensors.extend(
+            _collect_cuda_tensors_from_value(value.to_local(), min_size_bytes)
+        )
+    elif isinstance(value, torch.Tensor):
         if value.is_cuda and value.numel() > 0:
             tensor_size_bytes = value.numel() * value.element_size()
             if tensor_size_bytes >= min_size_bytes:

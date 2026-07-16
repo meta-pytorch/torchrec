@@ -353,6 +353,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         sharding_types: Optional[List[str]] = None,
         use_gather_select: bool = False,
         use_gather_select_per_sharding: Optional[Dict[str, bool]] = None,
+        use_sorted_select: bool = False,
         resize_awaitables: Optional[List[Awaitable[torch.Tensor]]] = None,
     ) -> None:
         super().__init__()
@@ -366,6 +367,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         self._sharding_types = sharding_types
         self._use_gather_select = use_gather_select
         self._use_gather_select_per_sharding = use_gather_select_per_sharding
+        self._use_sorted_select = use_sorted_select
         self._resize_awaitables = resize_awaitables
 
     def _wait_impl(self) -> Dict[str, JaggedTensor]:
@@ -418,6 +420,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                     reverse_indices=reverse_indices,
                     seq_vbe_ctx=seq_vbe_ctx,
                     use_gather_select=use_gather_select,
+                    use_sorted_select=self._use_sorted_select,
                 )
             )
 
@@ -585,6 +588,7 @@ class ShardedEmbeddingCollection(
         self._use_gather_select_per_sharding: Optional[Dict[str, bool]] = (
             module.use_gather_select_per_sharding()
         )
+        self._use_sorted_select: bool = module.use_sorted_select()
         self._inverse_indices_permute_per_sharding: Optional[List[torch.Tensor]] = None
         self._skip_missing_weight_key: List[str] = []
 
@@ -1666,6 +1670,7 @@ class ShardedEmbeddingCollection(
             ctx=ctx,
             use_gather_select=self._use_gather_select,
             use_gather_select_per_sharding=self._use_gather_select_per_sharding,
+            use_sorted_select=self._use_sorted_select,
         )
 
     def compute_and_output_dist(
@@ -1692,7 +1697,9 @@ class ShardedEmbeddingCollection(
             ):
                 embs = lookup(features)
                 if MemoryStashingManager.is_enabled():
-                    stash_result = MemoryStashingManager.stash_embedding_weights(lookup)
+                    stash_result = MemoryStashingManager.stash_embedding_weights(
+                        lookup, caller=self.__class__.__name__
+                    )
                     if stash_result is not None:
                         await_restore, *_ = stash_result
                         embs.register_hook(await_restore)
@@ -1727,6 +1734,7 @@ class ShardedEmbeddingCollection(
             sharding_types=list(self._sharding_type_to_sharding.keys()),
             use_gather_select=self._use_gather_select,
             use_gather_select_per_sharding=self._use_gather_select_per_sharding,
+            use_sorted_select=self._use_sorted_select,
             resize_awaitables=resize_awaitables,
         )
 
