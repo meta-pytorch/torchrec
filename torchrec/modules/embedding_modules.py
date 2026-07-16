@@ -410,6 +410,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         need_indices: bool = False,
         use_gather_select: bool = False,
         use_gather_select_per_sharding: Optional[Dict[str, bool]] = None,
+        use_sorted_select: bool = False,
     ) -> None:
         super().__init__()
         torch._C._log_api_usage_once(f"torchrec.modules.{self.__class__.__name__}")
@@ -421,6 +422,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
         self._use_gather_select_per_sharding: Optional[Dict[str, bool]] = (
             use_gather_select_per_sharding
         )
+        self._use_sorted_select: bool = use_sorted_select
         self._device: torch.device = (
             device if device is not None else torch.device("cpu")
         )
@@ -563,3 +565,12 @@ class EmbeddingCollection(EmbeddingCollectionInterface):
             in this dict, its value takes precedence over ``use_gather_select()``.
         """
         return self._use_gather_select_per_sharding
+
+    def use_sorted_select(self) -> bool:
+        """
+        Returns:
+            bool: Whether the EmbeddingCollection routes the reverse_indices
+            reorder through the sorted segment-reduce backward (atomic-light,
+            faster + more accurate than index_add on AMD). Off by default.
+        """
+        return self._use_sorted_select

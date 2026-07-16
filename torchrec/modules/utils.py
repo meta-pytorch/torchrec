@@ -291,12 +291,21 @@ def construct_jagged_tensors(
     reverse_indices: Optional[torch.Tensor] = None,
     seq_vbe_ctx: Optional[SequenceVBEContext] = None,
     use_gather_select: bool = False,
+    use_sorted_select: bool = False,
 ) -> Dict[str, JaggedTensor]:
     with record_function("## construct_jagged_tensors ##"):
         if original_features is not None:
             features = original_features
         if reverse_indices is not None:
-            if use_gather_select:
+            if use_sorted_select:
+                # sorted segment-reduce backward (fp32, atomic-light): faster and
+                # more accurate than index_add on AMD. Forward is the same gather.
+                # Opt-in via the explicit use_sorted_select flag (threaded from the
+                # EmbeddingCollection config); torchrec reads no env/global state.
+                from torchrec.modules.sorted_index_select import sorted_index_select
+
+                embeddings = sorted_index_select(embeddings, reverse_indices)
+            elif use_gather_select:
                 # gather has better backward performance than index_select in many cases
                 expanded_indices = reverse_indices.unsqueeze(1).expand(
                     -1, embeddings.size(-1)
