@@ -508,8 +508,11 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
     @override
     def shutdown(self) -> None:
         """Two-phase shutdown: stop the update thread, then the compute thread.
-        Idempotent — safe under explicit call + atexit, including the raise paths
-        below (thread-stuck and captured-exception)."""
+        Idempotent — safe under explicit call + atexit. Best-effort: a worker that
+        fails to join is logged (with a failure event), never raised, so metric
+        teardown cannot mask an in-flight training error or fail an otherwise
+        successful job. Both workers are daemon threads, so an abandoned one cannot
+        block process exit."""
 
         if self._shutdown_complete:
             return
@@ -593,7 +596,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 correctness_metadata,
                 error_message="update thread did not shut down gracefully",
             )
-            raise RecMetricException(
+            logger.warning(
                 f"update thread did not shut down gracefully. remaining queue size: {self.update_queue.qsize()}"
             )
         if self.compute_thread.is_alive():
@@ -603,7 +606,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 correctness_metadata,
                 error_message="compute thread did not shut down gracefully",
             )
-            raise RecMetricException(
+            logger.warning(
                 f"compute thread did not shut down gracefully. remaining queue size: {self.compute_queue.qsize()}"
             )
 
