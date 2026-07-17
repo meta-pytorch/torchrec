@@ -27,6 +27,7 @@ from torchrec.distributed.embedding_types import (
 )
 from torchrec.distributed.memory_stashing import (
     _collect_cuda_tensors_from_value,
+    _partition_tensors_into_slices,
     chunked_copy_,
     MemoryStashingManager,
 )
@@ -1157,3 +1158,205 @@ class TestCollectCudaTensorsSharded(unittest.TestCase):
 
         self.assertEqual(len(collected), 1)
         self.assertTrue(collected[0].is_cuda)
+
+
+class TestPartitionTensorsIntoSlices(unittest.TestCase):
+    """Tests for the byte-balanced slice partitioning helper (CUDA-free)."""
+
+    def test_single_slice_returns_all_tensors(self) -> None:
+        tensors = [torch.empty(100), torch.empty(200)]
+        slices = _partition_tensors_into_slices(tensors, num_slices=1)
+        self.assertEqual(len(slices), 1)
+        # num_slices <= 1 returns the original list unmodified.
+        self.assertIs(slices[0], tensors)
+
+    def test_nonpositive_slices_returns_all_tensors(self) -> None:
+        tensors = [torch.empty(100)]
+        slices = _partition_tensors_into_slices(tensors, num_slices=0)
+        self.assertEqual(len(slices), 1)
+        self.assertIs(slices[0], tensors)
+
+    def test_empty_tensor_list_returns_empty(self) -> None:
+        self.assertEqual(_partition_tensors_into_slices([], num_slices=4), [])
+
+    def test_partition_covers_every_tensor_exactly_once(self) -> None:
+        sizes = [100, 200, 300, 400, 500, 600, 700, 800]
+        tensors = [torch.empty(s, dtype=torch.float32) for s in sizes]
+        slices = _partition_tensors_into_slices(tensors, num_slices=4)
+        self.assertEqual(len(slices), 4)
+        flat = [t for one_slice in slices for t in one_slice]
+        self.assertCountEqual(
+            [t.data_ptr() for t in flat],
+            [t.data_ptr() for t in tensors],
+        )
+
+    def test_partition_is_byte_balanced(self) -> None:
+        sizes = [100, 200, 300, 400, 500, 600, 700, 800]
+        tensors = [torch.empty(s, dtype=torch.float32) for s in sizes]
+        slices = _partition_tensors_into_slices(tensors, num_slices=4)
+        bin_bytes = [
+            sum(t.numel() * t.element_size() for t in one_slice) for one_slice in slices
+        ]
+        # Greedy LPT keeps bins within a tensor's worth of each other.
+        self.assertLessEqual(max(bin_bytes) - min(bin_bytes), 800 * 4)
+
+    def test_shared_storage_tensors_stay_in_same_slice(self) -> None:
+        # Two views of one storage must never be split across slices (a
+        # resize_(0)/resize_(size) pair would otherwise corrupt the buffer).
+        base = torch.empty(1000, dtype=torch.float32)
+        view_a = base[:500]
+        view_b = base[500:]
+        other = torch.empty(4000, dtype=torch.float32)
+        tensors = [view_a, other, view_b]
+        slices = _partition_tensors_into_slices(tensors, num_slices=2)
+        slice_of_a = next(
+            i for i, s in enumerate(slices) if any(t is view_a for t in s)
+        )
+        slice_of_b = next(
+            i for i, s in enumerate(slices) if any(t is view_b for t in s)
+        )
+        self.assertEqual(slice_of_a, slice_of_b)
+
+    def test_fewer_groups_than_requested_slices(self) -> None:
+        tensors = [torch.empty(100), torch.empty(200)]
+        slices = _partition_tensors_into_slices(tensors, num_slices=5)
+        # Bounded by the number of distinct storage groups.
+        self.assertEqual(len(slices), 2)
+
+
+class TestStashOptimizerStateSliced(unittest.TestCase):
+    """Tests for gradual (sliced) optimizer-state stash/restore."""
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = torch.device("cuda:0")
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+
+    def _adam_with_state(self) -> torch.optim.Optimizer:
+        # nn.Linear(512, 512): weight is exactly 1MB so Adam keeps two large
+        # state tensors (exp_avg, exp_avg_sq) -> the state forms 2 slices.
+        model = nn.Linear(512, 512).to(self.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True)
+        x = torch.randn(32, 512, device=self.device)
+        model(x).sum().backward()
+        optimizer.step()
+        return optimizer
+
+    def _clone_state(
+        self, optimizer: torch.optim.Optimizer
+    ) -> Dict[Any, Dict[str, torch.Tensor]]:
+        original: Dict[Any, Dict[str, torch.Tensor]] = {}
+        for param, state in optimizer.state.items():
+            if isinstance(state, dict):
+                original[param] = {
+                    k: v.clone()
+                    for k, v in state.items()
+                    if isinstance(v, torch.Tensor)
+                }
+        return original
+
+    def _assert_restored(
+        self,
+        optimizer: torch.optim.Optimizer,
+        original: Dict[Any, Dict[str, torch.Tensor]],
+    ) -> None:
+        for param, state in optimizer.state.items():
+            if param in original and isinstance(state, dict):
+                for key, value in state.items():
+                    if key in original[param]:
+                        self.assertTrue(
+                            torch.allclose(value, original[param][key]),
+                            f"State {key} not restored correctly",
+                        )
+
+    def test_sliced_stash_registers_one_callback_per_slice(self) -> None:
+        optimizer = self._adam_with_state()
+        MemoryStashingManager.stash_optimizer_state(optimizer, num_slices=2)
+        self.assertEqual(
+            len(MemoryStashingManager._optimizer_state_restore_callbacks), 2
+        )
+
+    def test_restore_optimizer_state_next_pops_one_slice(self) -> None:
+        optimizer = self._adam_with_state()
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(
+            optimizer, num_slices=2
+        )
+        callbacks = MemoryStashingManager._optimizer_state_restore_callbacks
+        self.assertEqual(len(callbacks), 2)
+        MemoryStashingManager.restore_optimizer_state_next()
+        self.assertEqual(len(callbacks), 1)
+        MemoryStashingManager.restore_optimizer_state_next()
+        self.assertEqual(len(callbacks), 0)
+        # Popping again with an empty stack is a safe no-op.
+        MemoryStashingManager.restore_optimizer_state_next()
+        self.assertEqual(len(callbacks), 0)
+        await_restore(None)
+
+    def test_pop_all_restores_remaining_slices(self) -> None:
+        optimizer = self._adam_with_state()
+        original = self._clone_state(optimizer)
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(
+            optimizer, num_slices=2
+        )
+        # Drive one slice via the per-hook path, the rest via the pop-all guard.
+        MemoryStashingManager.restore_optimizer_state_next()
+        self.assertEqual(
+            len(MemoryStashingManager._optimizer_state_restore_callbacks), 1
+        )
+        MemoryStashingManager.restore_optimizer_state()
+        self.assertEqual(
+            len(MemoryStashingManager._optimizer_state_restore_callbacks), 0
+        )
+        await_restore(None)
+        torch.cuda.synchronize()
+        self._assert_restored(optimizer, original)
+
+    def test_sliced_round_trip_matches_original(self) -> None:
+        optimizer = self._adam_with_state()
+        original = self._clone_state(optimizer)
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(
+            optimizer, num_slices=2
+        )
+        # All large state tensors should be freed after the sliced stash.
+        for _param, state in optimizer.state.items():
+            if isinstance(state, dict):
+                for value in state.values():
+                    if (
+                        isinstance(value, torch.Tensor)
+                        and value.is_cuda
+                        and value.numel() * value.element_size() >= 1024 * 1024
+                    ):
+                        self.assertEqual(value.untyped_storage().size(), 0)
+        MemoryStashingManager.restore_optimizer_state()
+        await_restore(None)
+        torch.cuda.synchronize()
+        self._assert_restored(optimizer, original)
+
+    def test_sliced_optimizer_step_works_after_restore(self) -> None:
+        model = nn.Linear(512, 512).to(self.device)
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001, foreach=True)
+        x = torch.randn(32, 512, device=self.device)
+        model(x).sum().backward()
+        optimizer.step()
+        optimizer.zero_grad()
+        weights_before = model.weight.detach().clone()
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(
+            optimizer, num_slices=2
+        )
+        MemoryStashingManager.restore_optimizer_state()
+        await_restore(None)
+        # Another training step after the sliced restore must update weights.
+        model(torch.randn(32, 512, device=self.device)).sum().backward()
+        optimizer.step()
+        self.assertFalse(
+            torch.allclose(model.weight, weights_before),
+            "Weights should change after optimizer step",
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

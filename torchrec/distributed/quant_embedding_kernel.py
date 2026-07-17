@@ -35,6 +35,7 @@ from torchrec.distributed.embedding_types import (
 from torchrec.distributed.fused_params import (
     fused_param_bounds_check_mode,
     fused_param_lengths_to_offsets_lookup,
+    is_fused_param_device_ro,
     is_fused_param_quant_state_dict_split_scale_bias,
     is_fused_param_register_tbe,
     tbe_fused_params,
@@ -191,6 +192,15 @@ def _unwrap_kjt(
     )
 
 
+# Keep DeviceRo unwrap behavior identical to _unwrap_kjt, but give FX
+# tracing a distinct target for tagging DeviceRo lookups.
+@torch.fx.wrap
+def _unwrap_ro_kjt(
+    features: KeyedJaggedTensor,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    return _unwrap_kjt(features)
+
+
 def _unwrap_kjt_for_cpu(
     features: KeyedJaggedTensor, weighted: bool
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -277,6 +287,7 @@ class QuantBatchedEmbeddingBag(
         self._quant_state_dict_split_scale_bias: bool = (
             is_fused_param_quant_state_dict_split_scale_bias(fused_params)
         )
+        self._is_device_ro: bool = is_fused_param_device_ro(fused_params)
         bounds_check_mode: Optional[BoundsCheckMode] = fused_param_bounds_check_mode(
             fused_params
         )
@@ -435,7 +446,8 @@ class QuantBatchedEmbeddingBag(
             if self.lengths_to_tbe:
                 indices, lengths, per_sample_weights = _unwrap_kjt_lengths(features)
             else:
-                indices, offsets, per_sample_weights = _unwrap_kjt(features)
+                unwrap_kjt = _unwrap_ro_kjt if self._is_device_ro else _unwrap_kjt
+                indices, offsets, per_sample_weights = unwrap_kjt(features)
 
         return self._emb_module_forward(
             indices,
