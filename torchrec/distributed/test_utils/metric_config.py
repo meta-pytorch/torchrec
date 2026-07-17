@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 
 import torch
 import torch.distributed as dist
+from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
 from torchrec.metrics.metrics_config import (
     MetricsConfig,
@@ -56,6 +57,8 @@ class RecMetricConfig:
             prediction/label/weight keys in model_out. Default is 1.
         rec_compute_mode (str): Computation mode for RecMetrics.
             "unfused" (default), "fused", or "fused_states".
+        enable_zorm (bool): If True, use CPUOffloadedRecMetricModule (ZORM)
+            instead of RecMetricModule. Default is False.
     """
 
     enable_metrics: bool = False
@@ -64,6 +67,13 @@ class RecMetricConfig:
     window_size: int = 10_000_000
     num_tasks: int = 1
     rec_compute_mode: str = "unfused"
+    enable_zorm: bool = False
+    # Per-task "extra" tensors added to model_out beyond pred/label/weight,
+    # to simulate distillation / multi-head outputs / teacher logits that
+    # bloat model_out in production models. Each tensor is shape
+    # [batch_size, extra_dim] float32. num_extras=0 disables.
+    num_extras_per_task: int = 0
+    extra_dim: int = 1024
 
     def _generate_tasks(self) -> List[RecTaskInfo]:
         if self.num_tasks == 1:
@@ -90,12 +100,22 @@ class RecMetricConfig:
         batch_size: int,
         device: torch.device,
     ) -> Dict[str, torch.Tensor]:
-        """Generate synthetic per-task model output tensors for metric update."""
+        """Generate synthetic per-task model output tensors for metric update.
+
+        Beyond the basic prediction/label/weight (1D per task), optionally
+        adds `num_extras_per_task` extra 2D tensors of shape
+        [batch_size, extra_dim] to inflate the model_out size, simulating
+        the teacher logits / distillation / multi-head outputs that
+        production models include in the dict passed to metric.update().
+        """
         model_out: Dict[str, torch.Tensor] = {}
         for task in self._generate_tasks():
             model_out[task.prediction_name] = torch.rand(batch_size, device=device)
             model_out[task.label_name] = torch.rand(batch_size, device=device)
             model_out[task.weight_name] = torch.ones(batch_size, device=device)
+            for j in range(self.num_extras_per_task):
+                key = f"{task.name}__extra_{j}"
+                model_out[key] = torch.rand(batch_size, self.extra_dim, device=device)
         return model_out
 
     def generate_metric_module(
@@ -143,15 +163,27 @@ class RecMetricConfig:
             compute_interval_steps=self.compute_interval,
         )
 
+        if self.enable_zorm:
+            metric_class = CPUOffloadedRecMetricModule
+            module_kwargs = {"model_out_device": device}
+            # ZORM keeps metric states on CPU; worker transfers model_out
+            # from `device` to CPU before calling rec_metrics.update().
+            metric_module_device = torch.device("cpu")
+        else:
+            metric_class = RecMetricModule
+            module_kwargs = None
+            metric_module_device = device
+
         module = generate_metric_module(
-            metric_class=RecMetricModule,
+            metric_class=metric_class,
             metrics_config=metrics_config,
             batch_size=batch_size,
             world_size=world_size,
             my_rank=rank,
             state_metrics_mapping={},
-            device=device,
+            device=metric_module_device,
             process_group=process_group,
+            module_kwargs=module_kwargs,
         )
 
         return module
