@@ -2285,6 +2285,8 @@ class TestFreshRegionSplit(unittest.TestCase):
         total_num_buckets: int,
         percent_fresh_region: float,
         output_segments: Optional[list[int]] = None,
+        disable_fallback: bool = True,
+        opt_in_prob: int = -1,
     ) -> HashZchManagedCollisionModule:
         return HashZchManagedCollisionModule(
             zch_size=zch_size,
@@ -2292,6 +2294,8 @@ class TestFreshRegionSplit(unittest.TestCase):
             total_num_buckets=total_num_buckets,
             percent_fresh_region=percent_fresh_region,
             output_segments=output_segments,
+            disable_fallback=disable_fallback,
+            opt_in_prob=opt_in_prob,
         )
 
     def test_no_fresh_region_by_default(self) -> None:
@@ -2340,3 +2344,11 @@ class TestFreshRegionSplit(unittest.TestCase):
     def test_non_uniform_buckets_raises(self) -> None:
         with self.assertRaises(AssertionError):
             self._build(100, 3, 20.0, output_segments=[0, 34, 67, 100])
+
+    def test_requires_disable_fallback(self) -> None:
+        with self.assertRaises(AssertionError):
+            self._build(1000, 2, 20.0, disable_fallback=False)
+
+    def test_rejects_opt_in(self) -> None:
+        with self.assertRaises(AssertionError):
+            self._build(1000, 2, 20.0, opt_in_prob=0)

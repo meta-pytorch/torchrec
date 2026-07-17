@@ -521,6 +521,12 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         assert (
             0 <= self._percent_fresh_region < 100
         ), f"percent_fresh_region must be in [0, 100), got {self._percent_fresh_region}"
+        assert (
+            self._disable_fallback
+        ), "percent_fresh_region requires disable_fallback=True; otherwise a full Main region falls back into the Fresh tail"
+        assert (
+            self._opt_in_prob == -1
+        ), "percent_fresh_region is incompatible with opt-in; opt_in_prob must be -1"
         unique = torch.unique(size_per_rank[self._start_bucket : self._end_bucket])
         assert (
             unique.numel() == 1
