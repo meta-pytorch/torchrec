@@ -17,7 +17,7 @@ MixedLFULRUStrategy::lxu_record_t MixedLFULRUStrategy::Update(
   Record r{};
   r.time_ = time_->load();
 
-  if (C10_UNLIKELY(!val.has_value())) {
+  if (!val.has_value()) [[unlikely]] {
     r.freq_power_ = min_lfu_power_;
   } else {
     auto freq_power = reinterpret_cast<Record*>(&val.value())->freq_power_;

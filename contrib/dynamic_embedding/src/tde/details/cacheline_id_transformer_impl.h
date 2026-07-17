@@ -93,7 +93,7 @@ inline bool CachelineIDTransformer<
     if (cache_id < 0) {
       if (empty_slot >= 0) {
         // The transformer is full.
-        if (C10_UNLIKELY(bitmap_.Full())) {
+        if (bitmap_.Full()) [[unlikely]] {
           return false;
         }
         auto& cache_value = group_begin[empty_slot];
