@@ -60,6 +60,10 @@ class PipelineConfig:
 
     pipeline: str = "base"
     enable_inplace_copy_batch: bool = False
+    # Offload the in-place H2D copy dispatch to a background thread (base flag on
+    # TrainPipelineSparseDist). Only takes effect together with
+    # enable_inplace_copy_batch=True. Applies to the "sparse" pipeline.
+    async_inplace_copy: bool = False
     free_features_storage_early: bool = False
     clear_data_dist_inputs: bool = False
     pipeline_postproc: bool = False
@@ -183,6 +187,17 @@ class PipelineConfig:
                     clear_data_dist_inputs=self.clear_data_dist_inputs,
                     enable_embedding_lookup_prefetch=self.enable_embedding_lookup_prefetch,
                     **self.get_kwargs(emb_lookup_stream=self.emb_lookup_stream),
+                )
+            case "sparse":
+                return TrainPipelineSparseDist(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    enable_inplace_copy_batch=self.enable_inplace_copy_batch,
+                    async_inplace_copy=self.async_inplace_copy,
+                    free_features_storage_early=self.free_features_storage_early,
+                    clear_data_dist_inputs=self.clear_data_dist_inputs,
+                    **self.get_kwargs(),
                 )
             case _:
                 Pipeline = _pipeline_cls[self.pipeline]

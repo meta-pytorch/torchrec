@@ -11,13 +11,14 @@ import copy
 import dataclasses
 import logging
 from collections import defaultdict, deque
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from threading import Event, Thread
 from typing import (
     Any,
     Callable,
     cast,
+    Deque,
     Dict,
     Generator,
     Generic,
@@ -916,3 +917,97 @@ class FutureDeque(deque):
         if isinstance(item, Future):
             return item.result()
         return item
+
+
+def _init_inplace_copy_worker(device: torch.device) -> None:
+    """ThreadPoolExecutor initializer: bind the single copy worker to the training
+    device so its stream/allocation calls resolve to the correct device (mirrors
+    ``DataLoadingThread.run``)."""
+    device_module = torch.get_device_module(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        device_module.set_device(device)
+    elif device.type == "mtia" and torch.mtia.is_available():
+        device_module.set_device(device)
+
+
+class AsyncInplaceCopyMixin(Generic[In]):
+    """
+    Opt-in, shared primitive that offloads the in-place H2D batch-copy *dispatch* to a
+    single background thread, so the main thread stays free to dispatch GPU kernels.
+    The batch is returned as a ``Future`` placeholder and resolved lazily (via
+    ``FutureDeque``) at consumption time.
+
+    Gated by ``async_inplace_copy`` (default off). When off, ``_setup_async_inplace_copy``
+    is a no-op and the host pipeline behaves byte-for-byte as before.
+
+    Correctness: in-place copy allocates the destination on the *caller's current
+    stream* (so no ``record_stream`` is needed). A worker thread has its own current
+    stream, so we capture the main thread's current stream at submit time and re-enter
+    it inside the worker — reproducing the synchronous semantics exactly, independent of
+    per-thread-default-stream builds.
+
+    Host must set ``self._device`` / ``self._memcpy_stream`` before calling
+    ``_setup_async_inplace_copy`` and expose ``self.batches``.
+    """
+
+    # Declared so the mixin may swap the host's batch queue for a Future-aware one.
+    batches: Deque[Optional[In]]
+    _async_inplace_copy: bool = False
+    _inplace_copy_executor: Optional[ThreadPoolExecutor] = None
+
+    def _setup_async_inplace_copy(self, enabled: bool, device: torch.device) -> None:
+        requested = enabled
+        if enabled and device.type not in ("cuda", "mtia"):
+            logger.warning(
+                "async_inplace_copy requested on non-accelerator device %s; disabling.",
+                device.type,
+            )
+            enabled = False
+        self._async_inplace_copy = enabled
+        self._inplace_copy_executor = None
+        if not enabled:
+            # Logged unconditionally (both branches) so a trace/log search can
+            # confirm what value actually reached the pipeline, not just the on-case.
+            one_time_rank0_logger.info(
+                "async_inplace_copy: DISABLED (requested=%s, device=%s)",
+                requested,
+                device.type,
+            )
+            return
+        self._inplace_copy_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="inplace_copy",
+            initializer=_init_inplace_copy_worker,
+            initargs=(device,),
+        )
+        # Batch queue must resolve Futures lazily at consumption.
+        self.batches = FutureDeque()
+        one_time_rank0_logger.info(
+            "async_inplace_copy: ENABLED (background H2D copy, device=%s)", device.type
+        )
+
+    def _submit_inplace_copy(
+        self,
+        batch: In,
+        device: torch.device,
+        memcpy_stream: Optional[torch.Stream],
+    ) -> "Future[In]":
+        # Capture the consumer's current stream on the MAIN thread; the worker
+        # re-enters it so the destination is allocated on the consumer stream.
+        alloc_stream = torch.get_device_module(device).current_stream(device)
+
+        def _work() -> In:
+            device_module = torch.get_device_module(device)
+            with device_module.stream(alloc_stream):
+                return _to_device(
+                    batch, device, non_blocking=True, data_copy_stream=memcpy_stream
+                )
+
+        assert self._inplace_copy_executor is not None
+        return self._inplace_copy_executor.submit(_work)
+
+    def _shutdown_async_inplace_copy(self) -> None:
+        executor = self._inplace_copy_executor
+        if executor is not None:
+            executor.shutdown(wait=False)
+            self._inplace_copy_executor = None

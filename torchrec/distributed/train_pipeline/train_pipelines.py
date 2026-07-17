@@ -123,6 +123,7 @@ from torchrec.distributed.train_pipeline.utils import (
     _to_device,
     _wait_for_batch,
     _wait_for_events,
+    AsyncInplaceCopyMixin,
     DataLoadingThread,
     prefetch_embeddings,
     use_context_for_postprocs,
@@ -527,7 +528,7 @@ class TrainPipelinePT2(TrainPipelineBase[In, Out]):
         return output
 
 
-class TrainPipelineSparseDist(TrainPipeline[In, Out]):
+class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In]):
     """
     This pipeline overlaps device transfer, and `ShardedModule.input_dist()` with
     forward and backward. This helps hide the all2all latency while preserving the
@@ -583,6 +584,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
         clear_data_dist_inputs: bool = False,
+        async_inplace_copy: bool = False,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -600,6 +602,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
             f"execute_all_batches: {self._execute_all_batches} "
             f"enable_inplace_copy_batch: {enable_inplace_copy_batch} "
+            f"async_inplace_copy: {async_inplace_copy} "
             f"free_features_storage_early: {free_features_storage_early}"
         )
 
@@ -646,6 +649,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._dataloader_exhausted: bool = False
         self._context_type: Type[TrainPipelineContext] = context_type
 
+        # Opt-in: offload the in-place H2D copy dispatch to a background thread.
+        # Must run after self.batches / self._memcpy_stream / self._device are set.
+        self._setup_async_inplace_copy(async_inplace_copy, device)
+
         self._model_fwd: Callable[[Optional[In]], Tuple[torch.Tensor, Out]] = (
             custom_model_fwd if custom_model_fwd else model
         )
@@ -682,6 +689,10 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 f"{self.__class__.__name__}: [Sparse 2D] DMP collection will sync every "
                 f"{self._dmp_collection_sync_interval_batches} batches"
             )
+
+    def __del__(self) -> None:
+        # Best-effort shutdown of the async in-place copy worker (no-op if unused).
+        self._shutdown_async_inplace_copy()
 
     def detach(self) -> torch.nn.Module:
         """
@@ -1085,6 +1096,18 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                     size = _batch_tensor_size(batch)
 
                     log_inplace_copy_batch(size)
+                if self._async_inplace_copy:
+                    # Offload the copy dispatch to the background worker; the Future
+                    # placeholder is resolved lazily (FutureDeque) at consumption.
+                    return (
+                        cast(
+                            In,
+                            self._submit_inplace_copy(
+                                batch, self._device, self._memcpy_stream
+                            ),
+                        ),
+                        context,
+                    )
                 batch = _to_device(
                     batch,
                     self._device,
@@ -2069,6 +2092,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
         clear_data_dist_inputs: bool = False,
+        async_inplace_copy: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -2082,6 +2106,7 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
             clear_data_dist_inputs=clear_data_dist_inputs,
+            async_inplace_copy=async_inplace_copy,
         )
         self._prefetch_stream: Optional[torch.Stream] = (
             (torch.get_device_module(device).Stream())
