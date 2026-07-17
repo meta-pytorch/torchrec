@@ -256,6 +256,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         write_runtime_meta_dim: int = 0,
         persist_hash_zch_bucket: bool = True,
         percent_fresh_region: float = 0,
+        write_to_fresh_region: bool = False,
     ) -> None:
         if output_segments is None:
             assert (
@@ -407,6 +408,11 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 size_per_rank
             )
 
+        self._write_to_fresh_region: bool = write_to_fresh_region
+        assert not (
+            self._write_to_fresh_region and self._percent_fresh_region == 0
+        ), "write_to_fresh_region=True requires a Fresh region (percent_fresh_region != 0)"
+
         logger.info(
             f"HashZchManagedCollisionModule: {self._name=}, {self.device=}, "
             f"{self._zch_size=}, {self._input_hash_size=}, {self._max_probe=}, "
@@ -419,7 +425,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
             f"{self._no_bag=}, {self._write_runtime_meta_dim=}, "
             f"{self._persist_hash_zch_bucket=}, {self._percent_fresh_region=}, "
-            f"{self._main_size=}, {self._fresh_size=}"
+            f"{self._main_size=}, {self._fresh_size=}, {self._write_to_fresh_region=}"
         )
 
     def _create_zch_buffer(
@@ -541,6 +547,21 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"yields ({main_size}, {fresh_size}); both regions must be non-empty"
         )
         return main_size, fresh_size
+
+    def _region_window(
+        self,
+        local_sizes: Optional[torch.Tensor],
+        offsets: Optional[torch.Tensor],
+        is_fresh: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Restrict placement to the target Main or Fresh region within each bucket.
+        main_size = self._main_size
+        fresh_size = self._fresh_size
+        assert main_size is not None and fresh_size is not None
+        assert local_sizes is not None and offsets is not None
+        region_size = fresh_size if is_fresh else main_size
+        region_offset = main_size if is_fresh else 0
+        return torch.full_like(local_sizes, region_size), offsets + region_offset
 
     # TODO: This is hacky as we are using parameters to go through publishing.
     # Can remove once working out buffer solution.
@@ -716,6 +737,12 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     output_offset=self._output_global_offset_tensor,
                 )
 
+                # Region-aware insert
+                if self._percent_fresh_region > 0 and not overwrite_readonly:
+                    local_sizes, offsets = self._region_window(
+                        local_sizes, offsets, is_fresh=self._write_to_fresh_region
+                    )
+
                 num_reserved_slots: int = self.get_reserved_slots_per_bucket()
                 remapped_ids, evictions = self._zero_collision_hash(
                     input=values,
@@ -881,6 +908,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             write_runtime_meta_dim=self._write_runtime_meta_dim,
             persist_hash_zch_bucket=self._persist_hash_zch_bucket,
             percent_fresh_region=self._percent_fresh_region,
+            write_to_fresh_region=self._write_to_fresh_region,
         )
 
     def lookup_runtime_meta(
