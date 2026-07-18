@@ -5,10 +5,10 @@
 namespace tde::details {
 
 bool BitScanner::IsNextNBitsAllZero(uint16_t& n_bits) {
-  if (C10_UNLIKELY((n_bits == 0))) {
+  if ((n_bits == 0)) [[unlikely]] {
     return true;
   }
-  if (C10_UNLIKELY(array_idx_ == size_)) {
+  if (array_idx_ == size_) [[unlikely]] {
     return true;
   }
 
@@ -80,7 +80,7 @@ bool RandomBitsGenerator::IsNextNBitsAllZero(uint16_t n_bits) {
     return false;
   }
 
-  if (C10_UNLIKELY(n_bits != 0)) {
+  if (n_bits != 0) [[unlikely]] {
     return IsNextNBitsAllZero(n_bits);
   } else {
     return true;

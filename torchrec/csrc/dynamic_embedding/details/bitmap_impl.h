@@ -32,7 +32,7 @@ inline int64_t Bitmap<T>::next_free_bit() {
     offset++;
   }
   value = values_[offset];
-  if (C10_LIKELY(value)) {
+  if (value) [[likely]] {
     next_free_bit_ = offset * num_bits_per_value + ctz(value);
   } else {
     next_free_bit_ = num_total_bits_;

@@ -66,6 +66,7 @@ from torchrec.distributed.train_pipeline import (
     TrainPipeline,
 )
 from torchrec.distributed.types import DeviceToHostTensorAwaitable
+from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.metric_module import RecMetricModule
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
@@ -292,7 +293,15 @@ def runner(
                             metric_module.update(metric_model_out)
                         if metric_module.should_compute():
                             with record_function("## metric_compute ##"):
-                                metric_module.compute()
+                                # CPUOffloadedRecMetricModule (ZORM) overrides
+                                # compute() to raise; the async path is
+                                # async_compute().
+                                if isinstance(
+                                    metric_module, CPUOffloadedRecMetricModule
+                                ):
+                                    metric_module.async_compute()
+                                else:
+                                    metric_module.compute()
 
                     if run_option.sync_fwd:
                         fwd_event.synchronize()
