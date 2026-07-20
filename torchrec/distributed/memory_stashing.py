@@ -440,6 +440,13 @@ class MemoryStashingManager:
         # Restore events populated by ``restore`` and consumed by ``await_restore``
         restore_events: List[torch.cuda.Event] = []
 
+        # D2H-completion event recorded by ``execute_stash`` and waited on by
+        # ``restore`` before it re-allocates HBM.  This lets the caching allocator
+        # REUSE the storage the stash just freed instead of handing out a second
+        # block (which double-buffers the state ~2x whenever stash and restore
+        # overlap, e.g. the warmup step).
+        stash_done_events: List[torch.cuda.Event] = []
+
         # For delayed mode, capture the current stream state now so
         # execute_stash can correctly synchronize when called later.
         if delay and sync_event is None:
@@ -540,6 +547,14 @@ class MemoryStashingManager:
 
                 for tensor, cpu_buffer, _ in stash_data:
                     tensor.data = cpu_buffer
+            # Record completion of the D2H copies so ``restore`` can wait for
+            # them before re-allocating, letting the allocator reuse the bytes
+            # this stash just freed instead of double-buffering the state.
+            if stash_data:
+                stash_done_event = torch.cuda.Event()
+                stash_done_event.record(d2h_stream)
+                stash_done_events.clear()
+                stash_done_events.append(stash_done_event)
 
         def restore(
             _grad: Optional[torch.Tensor] = None,
@@ -558,6 +573,19 @@ class MemoryStashingManager:
                     "size": size_text,
                 },
             )
+            # Wait (CPU-side) for the matching stash's D2H copy to finish before
+            # re-allocating HBM.  Until it completes, the bytes this state was
+            # stashed from are still record_stream-protected, so the caching
+            # allocator cannot reuse them and hands out a SECOND block --
+            # double-buffering the state (~2x) until the copy lands.  Because the
+            # allocator's reuse decision is made CPU-side at resize_() time, a
+            # GPU stream-wait is insufficient; we must block the CPU here.  At
+            # steady state the D2H finished during the forward pass, so query()
+            # is already True and this is skipped -- it only costs at warmup /
+            # whenever stash and restore overlap.
+            if stash_done_events and not stash_done_events[-1].query():
+                stash_done_events[-1].synchronize()
+
             try:
                 with record_function(f"restore {label} on device ({size_text})"):
                     for (
