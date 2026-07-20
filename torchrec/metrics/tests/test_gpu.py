@@ -11,6 +11,7 @@ import copy
 import unittest
 
 import torch
+from configerator.configerator_fake import ConfigeratorFake
 from torchrec.metrics.auc import AUCMetric
 from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
 from torchrec.metrics.metrics_config import (
@@ -20,6 +21,11 @@ from torchrec.metrics.metrics_config import (
 )
 from torchrec.metrics.ne import NEMetric
 from torchrec.metrics.test_utils import gen_test_batch
+
+# Install a process-wide Configerator fake so JustKnobs config reads resolve
+# locally instead of each blocking ~55s on the unreachable Configerator under RE
+# network isolation (tpx-no-network use case + test caching).
+_CONFIGERATOR_FAKE: ConfigeratorFake = ConfigeratorFake().create()
 
 
 _CUDA_UNAVAILABLE: bool = not torch.cuda.is_available()
