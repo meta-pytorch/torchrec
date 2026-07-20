@@ -19,7 +19,7 @@ import torch
 from hypothesis import given, settings
 from torch import distributed as dist, nn
 from torch.distributed._shard.sharded_tensor import init_from_local_shards, Shard
-from torch.distributed._tensor import DeviceMesh, distribute_tensor, Replicate
+from torch.distributed._tensor import DeviceMesh, DTensor, Replicate
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
@@ -1152,7 +1152,10 @@ class TestCollectCudaTensorsSharded(unittest.TestCase):
         mesh = DeviceMesh("cuda", [0])
         # 2MB, above the 1MB stash threshold.
         local = torch.randn(1024, 512, device=self.device)
-        dt = distribute_tensor(local, mesh, [Replicate()])
+        # Wrap the already-local tensor as a Replicate DTensor without a
+        # broadcast collective; distribute_tensor's broadcast needs an NCCL
+        # comm that cannot bootstrap in the single-host test sandbox.
+        dt = DTensor.from_local(local, mesh, [Replicate()], run_check=False)
 
         collected = _collect_cuda_tensors_from_value(dt)
 
