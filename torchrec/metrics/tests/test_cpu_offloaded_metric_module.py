@@ -350,9 +350,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             mock_log_event.assert_not_called()
 
     def test_shutdown_logs_stack_when_compute_thread_will_not_exit(self) -> None:
-        """A compute thread still alive past the bounded join must not hang
-        teardown: shutdown() abandons the join, logs an error with the thread
-        stack, then raises so the job fails loudly."""
+        """A compute thread still alive past the bounded join must not hang or
+        fail teardown: shutdown() abandons the join, logs an error with the
+        thread stack, and warns (does not raise) so cleanup stays non-fatal."""
         with patch.object(
             self.cpu_module.compute_thread, "join", return_value=None
         ), patch.object(
@@ -362,13 +362,19 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         ), patch(
             "torchrec.metrics.cpu_offloaded_metric_module.logger"
         ) as mock_logger:
-            with self.assertRaises(RecMetricException):
-                self.cpu_module.shutdown()
+            self.cpu_module.shutdown()  # must not raise
 
         mock_logger.error.assert_called_once()
         (msg,) = mock_logger.error.call_args[0]
         self.assertIn(f"did not exit within {_COMPUTE_SHUTDOWN_JOIN_TIMEOUT_SEC}", msg)
         self.assertIn("compute_thread stack", msg)
+        self.assertTrue(
+            any(
+                "did not shut down gracefully" in call.args[0]
+                for call in mock_logger.warning.call_args_list
+            ),
+            "expected a non-fatal 'did not shut down gracefully' warning",
+        )
 
     def test_format_thread_stack(self) -> None:
         # Not-started thread: ident is None.
