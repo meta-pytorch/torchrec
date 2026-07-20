@@ -1852,7 +1852,59 @@ class MergeUpdateJobsTest(unittest.TestCase):
             )
         )
 
-    def test_safe_merge_zero_dim_falls_back_to_stack(self) -> None:
+    def test_scalar_required_input_expands_to_batch(self) -> None:
+        # Regression: a per-batch scalar required-input (e.g. a TensorWeightedAvg
+        # target) must expand to each job's batch size so it stays row-aligned with
+        # the per-example tensors after a K>1 merge, rather than stacking to (K,).
+        jobs = [
+            MetricUpdateJob(
+                model_out={"prediction": torch.tensor([0.1, 0.2])},
+                kwargs={"required_inputs": {"target_tensor": torch.tensor(5.0)}},
+            ),
+            MetricUpdateJob(
+                model_out={"prediction": torch.tensor([0.3, 0.4])},
+                kwargs={"required_inputs": {"target_tensor": torch.tensor(7.0)}},
+            ),
+        ]
+        merged = _merge_update_jobs(jobs)
+        target = merged.kwargs["required_inputs"]["target_tensor"]
+        self.assertEqual(merged.model_out["prediction"].shape, (4,))
+        self.assertEqual(target.shape, (4,))
+        self.assertTrue(torch.equal(target, torch.tensor([5.0, 5.0, 7.0, 7.0])))
+
+    def test_single_element_required_input_expands_to_batch(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={"prediction": torch.tensor([0.1, 0.2, 0.3])},
+                kwargs={"required_inputs": {"target_tensor": torch.tensor([5.0])}},
+            ),
+            MetricUpdateJob(
+                model_out={"prediction": torch.tensor([0.4, 0.5, 0.6])},
+                kwargs={"required_inputs": {"target_tensor": torch.tensor([7.0])}},
+            ),
+        ]
+        merged = _merge_update_jobs(jobs)
+        target = merged.kwargs["required_inputs"]["target_tensor"]
+        self.assertEqual(target.shape, (6,))
+        self.assertTrue(
+            torch.equal(target, torch.tensor([5.0, 5.0, 5.0, 7.0, 7.0, 7.0]))
+        )
+
+    def test_unalignable_required_input_raises(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={"prediction": torch.tensor([0.1, 0.2, 0.3])},
+                kwargs={"required_inputs": {"target_tensor": torch.tensor([5.0, 6.0])}},
+            ),
+            MetricUpdateJob(
+                model_out={"prediction": torch.tensor([0.4, 0.5, 0.6])},
+                kwargs={"required_inputs": {"target_tensor": torch.tensor([7.0, 8.0])}},
+            ),
+        ]
+        with self.assertRaises(RecMetricException):
+            _merge_update_jobs(jobs)
+
+    def test_scalar_model_out_expands_and_concats(self) -> None:
         jobs = [
             MetricUpdateJob(
                 model_out={"label": torch.tensor(1.0)},

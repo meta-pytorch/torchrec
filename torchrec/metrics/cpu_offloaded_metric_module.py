@@ -102,12 +102,33 @@ def _format_thread_stack(thread: threading.Thread) -> str:
     return "".join(traceback.format_stack(frame))
 
 
-def _safe_merge_tensors(tensors: list[torch.Tensor]) -> torch.Tensor:
-    """Concatenate tensors along the batch dim. Falls back to torch.stack
-    for 0-dim tensors since torch.cat cannot concatenate them."""
-    if tensors[0].dim() == 0:
-        return torch.stack(tensors, dim=0)
-    return torch.cat(tensors, dim=0)
+def _job_batch_size(model_out: Dict[str, torch.Tensor]) -> int:
+    sizes = [t.shape[0] for t in model_out.values() if t.dim() >= 1]
+    return max(sizes) if sizes else 1
+
+
+def _align_to_batch(t: torch.Tensor, batch_size: int) -> torch.Tensor:
+    # Expand per-batch broadcast values (scalar / single-element) to batch_size so
+    # cat(dim=0) stays row-aligned with per-example tensors, matching K=1 broadcast.
+    if t.dim() == 0:
+        return t.reshape(1).expand(batch_size)
+    if t.shape[0] == batch_size:
+        return t
+    if t.shape[0] == 1:
+        return t.expand(batch_size, *t.shape[1:])
+    raise RecMetricException(
+        f"worker-side micro-batching cannot align a tensor with leading dim "
+        f"{t.shape[0]} to batch size {batch_size}: expected a per-example "
+        f"(dim-0 == batch) or per-batch broadcast (scalar/single-element) tensor."
+    )
+
+
+def _merge_tensors_across_jobs(
+    tensors: list[torch.Tensor], batch_sizes: list[int]
+) -> torch.Tensor:
+    return torch.cat(
+        [_align_to_batch(t, b) for t, b in zip(tensors, batch_sizes)], dim=0
+    )
 
 
 def _merge_update_jobs(jobs: list[MetricUpdateJob]) -> MetricUpdateJob:
@@ -130,8 +151,9 @@ def _merge_update_jobs(jobs: list[MetricUpdateJob]) -> MetricUpdateJob:
         return jobs[0]
 
     first = jobs[0]
+    batch_sizes = [_job_batch_size(j.model_out) for j in jobs]
     merged_model_out: Dict[str, torch.Tensor] = {
-        key: _safe_merge_tensors([j.model_out[key] for j in jobs])
+        key: _merge_tensors_across_jobs([j.model_out[key] for j in jobs], batch_sizes)
         for key in first.model_out.keys()
     }
 
@@ -139,7 +161,9 @@ def _merge_update_jobs(jobs: list[MetricUpdateJob]) -> MetricUpdateJob:
     required_inputs_first = first.kwargs.get("required_inputs")
     if isinstance(required_inputs_first, dict) and required_inputs_first:
         merged_required: Dict[str, torch.Tensor] = {
-            key: _safe_merge_tensors([j.kwargs["required_inputs"][key] for j in jobs])
+            key: _merge_tensors_across_jobs(
+                [j.kwargs["required_inputs"][key] for j in jobs], batch_sizes
+            )
             for key in required_inputs_first.keys()
         }
         merged_kwargs["required_inputs"] = merged_required
