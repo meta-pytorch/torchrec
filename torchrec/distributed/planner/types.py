@@ -2256,6 +2256,13 @@ class ShardingPlanRequest:
     # request object — use it to tell two otherwise-identical requests apart.
     # Auto-generated; override to thread an externally-supplied id.
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # Observability opt-in: when True the executor captures the full enumerated
+    # search space onto ctx.search_space (per SKU) and the reproduction upload
+    # persists it to Manifold (URL surfaced on the planner_runs Scuba row). Off by
+    # default -- the search space is large and deterministically re-derivable from
+    # the request_spec + model_arch blobs, so it is captured only on request. Not
+    # plan-affecting, so excluded from request_hash.
+    capture_search_space: bool = False
 
     def __post_init__(self) -> None:
         self._normalize_training_framework()
@@ -2579,6 +2586,19 @@ class ShardingPlanResult:
     estimated_qps: Optional[float] = None
     # Latency of slowest path through sharded model (ms); None if unavailable
     critical_path_ms: Optional[float] = None
+    # Comms / compute split of the critical path (ms) -- the two components that
+    # sum to critical_path_ms. None if the breakdown was not computed. Populated
+    # on the planning rank only: the split needs the per-shard Perf breakdown,
+    # which is not carried in the broadcast plan.
+    comms_critical_path_ms: Optional[float] = None
+    comp_critical_path_ms: Optional[float] = None
+    # Plan quality: peak and mean per-rank modeled perf, and their ratio
+    # (max/mean; 1.0 == perfectly balanced). Derived from the per-shard Perf of
+    # the chosen plan; None off the planning rank. perf_imbalance_ratio is the
+    # headline balance metric for plan-quality dashboards.
+    max_rank_perf: Optional[float] = None
+    mean_rank_perf: Optional[float] = None
+    perf_imbalance_ratio: Optional[float] = None
     # Structured failure taxonomy carried from PlannerError.error_type, so the
     # failure kind (INSUFFICIENT_STORAGE / STRICT_CONSTRAINTS / PARTITION / …)
     # survives for analytics instead of being flattened into the free-form
@@ -2804,6 +2824,27 @@ class PlannerSessionContext:
     # "live_detection" (production MAST/Serf). Kept a free-form string so it isn't
     # restricted to a fixed set of mechanisms (finer attribution is a follow-up).
     hw_source: Dict[str, str] = field(default_factory=dict)
+    # Resolved perf-estimator selection per SKU (SKU -> capability name), captured
+    # by the fb provider. With hardware-based compute estimation on, the estimator
+    # is chosen from the capability *live-detected* on the plan host (SERF), which
+    # can differ from the recorded SKU; persisting the resolved capability makes
+    # the estimator selection recoverable for faithful replay. With it off, the
+    # OSS/basic estimator runs (a pure function of the captured topology) and this
+    # records the sentinel "OSS_DEFAULT" so the estimator used is always explicit
+    # rather than a blank that reads as missing data.
+    resolved_hw_config: Dict[str, str] = field(default_factory=dict)
+    # Full enumerated search space per SKU (SKU -> the enumerator's candidate
+    # ShardingOptions projected to ShardingOptionDetail), captured only when the
+    # request sets capture_search_space. Empty otherwise -- it is large and
+    # deterministically re-derivable from request_spec + model_arch, so it is
+    # opt-in observability, not part of the default capture.
+    search_space: Dict[str, Tuple[ShardingOptionDetail, ...]] = field(
+        default_factory=dict
+    )
+    # Manifold URLs of the per-SKU search-space blobs uploaded when
+    # capture_search_space is set (SKU -> url); surfaced as search_space_url on the
+    # planner_runs Scuba row. Empty when capture is off.
+    search_space_urls: Dict[str, str] = field(default_factory=dict)
     # External trace / job identifier (the MAST job name) this planning session
     # corresponds to. Links the request/session to the launching job for
     # cross-system correlation. Populated by the caller/adapter (None off-MAST,

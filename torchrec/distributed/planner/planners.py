@@ -651,6 +651,16 @@ class EmbeddingPlannerBase(ShardingPlanner):
             "its selected ShardingOptions to the planner executor."
         )
 
+    def get_search_space(self) -> List[ShardingOption]:
+        """The full enumerated candidate set from the most recent ``plan()``.
+
+        Optional observability hook (unlike ``get_selected_options``): the unified
+        executor reads it only when the request opts into capturing the search
+        space. Defaults to empty so planners that do not enumerate (e.g. a plan
+        loaded from Manifold) need not override it.
+        """
+        return []
+
 
 class EmbeddingShardingPlanner(EmbeddingPlannerBase):
     """
@@ -736,11 +746,16 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         self._num_proposals: int = 0
         self._num_plans: int = 0
         self._best_plan: Optional[List[ShardingOption]] = None
+        self._search_space: List[ShardingOption] = []
 
     def get_selected_options(self) -> List[ShardingOption]:
         # The winning proposal from the last plan(); None until plan() runs (or
         # [] on a failed plan whose shards were reset to rank -1).
         return self._best_plan or []
+
+    def get_search_space(self) -> List[ShardingOption]:
+        # The full enumerated candidate set from the last plan(); [] until plan().
+        return self._search_space
 
     @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def collective_plan(
@@ -865,6 +880,10 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
             module=module,
             sharders=sharders,
         )
+        # Retain the full enumerated candidate set for optional observability
+        # capture (see get_search_space); read by the executor only when the
+        # request opts into capturing the search space.
+        self._search_space = search_space
         if not search_space:
             # No shardable parameters
             return ShardingPlan({})
