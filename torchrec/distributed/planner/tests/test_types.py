@@ -9,10 +9,11 @@
 
 import unittest
 from copy import deepcopy
-from typing import cast, Dict, Optional
+from typing import Any, Callable, cast, Dict, Optional
 from unittest.mock import MagicMock, patch
 
 import torch
+import torch.nn as nn
 from torch import multiprocessing
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
@@ -26,16 +27,30 @@ from torchrec.distributed.planner.storage_reservations import (
 from torchrec.distributed.planner.types import (
     BasicCommsBandwidths,
     CustomTopologyData,
+    EmoConfig,
     HardwareConfig,
     hash_planner_context_inputs,
     KernelConfig,
+    LpPlannerConfig,
     ParameterConstraints,
+    Perf,
+    PlannerConfig,
+    PlannerVariant,
+    PlanReportMetadata,
+    ProposerConfig,
     Shard,
+    ShardDetail,
     ShardingOption,
+    ShardingOptionDetail,
+    ShardingPlanRequest,
+    ShardingPlanResult,
     Storage,
+    StorageReservationPolicy,
     Topology,
     TopologyFactory,
     TrainerConfig,
+    TrainingFramework,
+    TuneClfConfig,
 )
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
@@ -1879,3 +1894,508 @@ class TestTopologyFactory(unittest.TestCase):
             self.assertEqual(topology.ddr_mem_bw, 200.0)
             self.assertEqual(topology.hbm_to_ddr_mem_bw, 50.0)
             self.assertEqual(topology.ssd_mem_bw, 10.0)
+
+
+class ShardingPlanRequestTest(unittest.TestCase):
+    def _create_request(self, **kwargs: Any) -> ShardingPlanRequest:
+        defaults: Dict[str, Any] = {
+            "model": nn.Linear(10, 10),
+            "sharders": [],
+            "world_size": 8,
+            "local_world_size": 8,
+            "batch_size": 512,
+        }
+        defaults.update(kwargs)
+        return ShardingPlanRequest(**defaults)
+
+    def test_invalid_single_field_rejected(self) -> None:
+        cases = [
+            ({"world_size": 0}, "world_size must be positive"),
+            ({"world_size": -1}, "world_size must be positive"),
+            ({"local_world_size": 0}, "local_world_size must be positive"),
+            ({"batch_size": 0}, "batch_size must be positive"),
+            ({"hbm_gb": -1.0}, "hbm_gb must be non-negative"),
+            ({"ddr_gb": -10.0}, "ddr_gb must be non-negative"),
+            ({"pod_size": 0}, "pod_size must be positive"),
+            ({"pod_size": -1}, "pod_size must be positive"),
+        ]
+        for overrides, expected_msg in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, expected_msg):
+                    self._create_request(**overrides)
+
+    def test_cross_field_validation(self) -> None:
+        with self.subTest("local exceeds world"):
+            with self.assertRaisesRegex(
+                ValueError, "local_world_size.*must not exceed world_size"
+            ):
+                self._create_request(world_size=4, local_world_size=8)
+
+        with self.subTest("world not divisible by local"):
+            with self.assertRaisesRegex(
+                ValueError, "world_size.*must be divisible by local_world_size"
+            ):
+                self._create_request(world_size=10, local_world_size=3)
+
+        with self.subTest("pod_size exceeds world"):
+            with self.assertRaisesRegex(
+                ValueError, "pod_size.*must not exceed world_size"
+            ):
+                self._create_request(world_size=8, pod_size=16)
+
+    def test_zero_hbm_gb_allowed(self) -> None:
+        request = self._create_request(hbm_gb=0.0)
+        self.assertEqual(request.hbm_gb, 0.0)
+
+    def test_training_framework_enum_accepted(self) -> None:
+        for framework in TrainingFramework:
+            with self.subTest(framework=framework):
+                request = self._create_request(training_framework=framework)
+                self.assertIs(request.training_framework, framework)
+
+    def test_training_framework_string_coerced_to_enum(self) -> None:
+        # A plain string value (e.g. from config) is normalized to the enum so
+        # downstream always reads a TrainingFramework.
+        request = self._create_request(training_framework="apf")
+        self.assertIs(request.training_framework, TrainingFramework.APF)
+
+    def test_invalid_training_framework_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "training_framework must be"):
+            self._create_request(training_framework="tensorflow")
+
+    def test_model_callable_factory(self) -> None:
+        constructed = nn.Linear(10, 10)
+
+        def factory() -> nn.Module:
+            return constructed
+
+        request = self._create_request(model=factory)
+        self.assertNotIsInstance(request.model, nn.Module)
+        # Not an nn.Module, so the Union holds the factory; cast to call it.
+        stored_factory = cast(Callable[[], nn.Module], request.model)
+        self.assertIs(stored_factory(), constructed)
+
+    def test_request_hash_is_deterministic_for_same_params(self) -> None:
+        # Content hash: identical planner-affecting params -> identical hash.
+        self.assertTrue(self._create_request().request_hash)
+        self.assertEqual(
+            self._create_request().request_hash,
+            self._create_request().request_hash,
+        )
+
+    def test_request_hash_differs_for_different_params(self) -> None:
+        base = self._create_request().request_hash
+        self.assertNotEqual(base, self._create_request(batch_size=1024).request_hash)
+        self.assertNotEqual(base, self._create_request(world_size=16).request_hash)
+        self.assertNotEqual(
+            base, self._create_request(training_framework="apf").request_hash
+        )
+
+    def test_default_planner_config(self) -> None:
+        cfg = self._create_request().planner_config
+        self.assertIs(cfg.planner_variant, PlannerVariant.UNSET)
+        self.assertIs(cfg.storage_reservation_policy, StorageReservationPolicy.UNSET)
+
+    def test_request_hash_includes_planner_config(self) -> None:
+        # planner_config is plan-affecting, so it participates in the content hash.
+        base = self._create_request().request_hash
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    planner_variant=PlannerVariant.LINEAR_PROGRAMMING
+                )
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    storage_reservation_policy=StorageReservationPolicy.FIXED_PERCENTAGE
+                )
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    manifold_path="manifold://tree/sharding/plan.json"
+                )
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(planner_config=PlannerConfig(debug=True)).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(timeout_seconds=1200)
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    lp_config=LpPlannerConfig(objective="max_total_perf")
+                )
+            ).request_hash,
+        )
+        # The APF-reconstruction scalar knobs also participate in the hash.
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(pipeline_type="train_sparse_dist")
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(partitioner_sort_by="storage")
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(performance_model="table_size")
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    use_batch_inputs_for_expected_cache_fetches=True
+                )
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    proposer_config=ProposerConfig(kind="dynamic_col_dim", step_size=4)
+                )
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    lp_config=LpPlannerConfig(
+                        emo_config=EmoConfig(integration_type="add_as_constraint")
+                    )
+                )
+            ).request_hash,
+        )
+        # EMO CLF-tuning knobs participate too: two requests differing only in
+        # tune_clf_config must fingerprint differently, else the cache returns one
+        # config's plan for the other.
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    lp_config=LpPlannerConfig(
+                        emo_config=EmoConfig(tune_clf_config=TuneClfConfig(max_clf=0.5))
+                    )
+                )
+            ).request_hash,
+        )
+
+    def test_proposer_type_and_config_mutually_exclusive(self) -> None:
+        # Both set would hash distinctly for the same intent and let OSS vs fb
+        # builders pick differently, so PlannerConfig rejects it.
+        with self.assertRaisesRegex(ValueError, "only one of proposer_type"):
+            PlannerConfig(
+                proposer_type="greedy",
+                proposer_config=ProposerConfig(kind="dynamic_col_dim"),
+            )
+
+    def test_request_hash_constraints_order_independent(self) -> None:
+        # constraints is a dict; two requests with the same entries inserted in
+        # different orders must share a hash (a dict's repr is insertion-ordered,
+        # so the hash normalizes by sorting keys).
+        first = self._create_request(
+            constraints={
+                "table_a": ParameterConstraints(sharding_types=["table_wise"]),
+                "table_b": ParameterConstraints(sharding_types=["row_wise"]),
+            }
+        )
+        second = self._create_request(
+            constraints={
+                "table_b": ParameterConstraints(sharding_types=["row_wise"]),
+                "table_a": ParameterConstraints(sharding_types=["table_wise"]),
+            }
+        )
+        self.assertEqual(first.request_hash, second.request_hash)
+
+    def test_request_id_is_unique_per_instance(self) -> None:
+        # request_id is per-instance (UUID); request_hash is per-content. Two
+        # requests with identical params therefore share a hash but get
+        # distinct ids.
+        first = self._create_request()
+        second = self._create_request()
+        self.assertTrue(first.request_id)
+        self.assertNotEqual(first.request_id, second.request_id)
+        self.assertEqual(first.request_hash, second.request_hash)
+
+
+class PlannerConfigTest(unittest.TestCase):
+    def test_defaults(self) -> None:
+        cfg = PlannerConfig()
+        self.assertIs(cfg.planner_variant, PlannerVariant.UNSET)
+        self.assertIs(cfg.storage_reservation_policy, StorageReservationPolicy.UNSET)
+        self.assertIsNone(cfg.storage_reservation_percentage)
+        self.assertFalse(cfg.use_hardware_based_compute)
+        self.assertFalse(cfg.use_hardware_based_bandwidth)
+        # APF-reconstruction knobs default to "unset / planner default".
+        self.assertIsNone(cfg.pipeline_type)
+        self.assertFalse(cfg.use_batch_inputs_for_expected_cache_fetches)
+        self.assertFalse(cfg.use_linear_regression_prefetch_estimate)
+        self.assertFalse(cfg.balance_modules)
+        self.assertIsNone(cfg.partitioner_sort_by)
+        self.assertIsNone(cfg.memory_balanced_max_search_count)
+        self.assertIsNone(cfg.memory_balanced_tolerance)
+        self.assertIsNone(cfg.performance_model)
+        self.assertIsNone(cfg.proposer_config)
+        self.assertIsNone(cfg.lp_config)
+
+    def test_percentage_range_validated(self) -> None:
+        for bad in (-0.1, 1.1):
+            with self.subTest(pct=bad):
+                with self.assertRaisesRegex(
+                    ValueError, "storage_reservation_percentage must be between"
+                ):
+                    PlannerConfig(storage_reservation_percentage=bad)
+        # Both boundaries are allowed.
+        for good in (0.0, 1.0):
+            with self.subTest(pct=good):
+                self.assertEqual(
+                    PlannerConfig(
+                        storage_reservation_percentage=good
+                    ).storage_reservation_percentage,
+                    good,
+                )
+
+    def test_negative_bwd_multiplier_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "bwd_compute_multiplier must be"):
+            PlannerConfig(bwd_compute_multiplier=-1.0)
+
+
+class PlanReportMetadataTest(unittest.TestCase):
+    def test_defaults(self) -> None:
+        md = PlanReportMetadata()
+        self.assertIsNone(md.trainer)
+        self.assertIsNone(md.pipeline)
+        self.assertIsNone(md.embedding_hash)
+        self.assertIsNone(md.proposer_types)
+        self.assertTrue(md.log_plan)
+
+    def test_carries_provenance(self) -> None:
+        md = PlanReportMetadata(
+            trainer="apf",
+            pipeline="train_sparse_dist",
+            total_model_param_size=100,
+            proposer_types=("dynamic_col_dim",),
+            num_parallel_worlds=2,
+        )
+        self.assertEqual(md.trainer, "apf")
+        self.assertEqual(md.proposer_types, ("dynamic_col_dim",))
+        self.assertEqual(md.num_parallel_worlds, 2)
+
+
+class ShardingPlanResultTest(unittest.TestCase):
+    def _create_result(self, **kwargs: Any) -> ShardingPlanResult:
+        defaults: Dict[str, Any] = {
+            "sku": "H100",
+            "success": True,
+            "sharding_plan": None,
+            "planner_failure_reason": None,
+            "estimated_max_hbm_bytes": 1_000_000,
+            "estimated_max_ddr_bytes": 2_000_000,
+        }
+        defaults.update(kwargs)
+        return ShardingPlanResult(**defaults)
+
+    def test_success_result_holds_optional_metrics(self) -> None:
+        result = self._create_result(
+            estimated_qps=1000.0,
+            critical_path_ms=5.0,
+            validation_warnings=("close to HBM limit",),
+        )
+        self.assertTrue(result.success)
+        self.assertIsNone(result.planner_failure_reason)
+        self.assertEqual(result.estimated_qps, 1000.0)
+        self.assertEqual(result.critical_path_ms, 5.0)
+        self.assertEqual(result.validation_warnings, ("close to HBM limit",))
+
+    def test_failure_result_carries_reason(self) -> None:
+        result = self._create_result(success=False, planner_failure_reason="OOM_HBM")
+        self.assertFalse(result.success)
+        self.assertEqual(result.planner_failure_reason, "OOM_HBM")
+
+    def test_invalid_single_field_rejected(self) -> None:
+        cases = [
+            ({"sku": ""}, "sku must not be empty"),
+            ({"estimated_max_hbm_bytes": -1}, "estimated_max_hbm_bytes must be"),
+            ({"estimated_max_ddr_bytes": -1}, "estimated_max_ddr_bytes must be"),
+            ({"estimated_qps": -1.0}, "estimated_qps must be non-negative"),
+            ({"critical_path_ms": -1.0}, "critical_path_ms must be non-negative"),
+            ({"solve_time_ms": -1.0}, "solve_time_ms must be non-negative"),
+        ]
+        for overrides, expected_msg in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, expected_msg):
+                    self._create_result(**overrides)
+
+    def test_success_failure_reason_consistency(self) -> None:
+        with self.subTest("success with reason"):
+            with self.assertRaisesRegex(
+                ValueError, "planner_failure_reason must be None when success is True"
+            ):
+                self._create_result(success=True, planner_failure_reason="OOM")
+        with self.subTest("failure without reason"):
+            with self.assertRaisesRegex(
+                ValueError,
+                "planner_failure_reason is required when success is False",
+            ):
+                self._create_result(success=False, planner_failure_reason=None)
+
+    def test_zero_memory_allowed(self) -> None:
+        result = self._create_result(
+            estimated_max_hbm_bytes=0,
+            estimated_max_ddr_bytes=0,
+        )
+        self.assertEqual(result.estimated_max_hbm_bytes, 0)
+        self.assertEqual(result.estimated_max_ddr_bytes, 0)
+
+
+class ShardingOptionDetailTest(unittest.TestCase):
+    def test_from_sharding_option_projects_per_shard_detail(self) -> None:
+        # from_sharding_option captures the per-shard storage/perf the
+        # deployment-facing ShardingPlan drops, and aggregates the totals.
+        shards = [
+            Shard(
+                size=[5000, 80],
+                offset=[0, 0],
+                storage=Storage(hbm=600, ddr=10, ssd=5),
+                perf=Perf(
+                    fwd_compute=1.0, fwd_comms=2.0, bwd_compute=3.0, bwd_comms=4.0
+                ),
+                rank=0,
+            ),
+            Shard(
+                size=[5000, 80],
+                offset=[5000, 0],
+                storage=Storage(hbm=400, ddr=20, ssd=15),
+                perf=Perf(
+                    fwd_compute=0.5, fwd_comms=0.5, bwd_compute=0.5, bwd_comms=0.5
+                ),
+                rank=1,
+            ),
+        ]
+        sharding_option = ShardingOption(
+            name="table_0",
+            tensor=torch.empty(
+                (10000, 80), dtype=torch.float16, device=torch.device("meta")
+            ),
+            module=("ebc", MagicMock()),
+            input_lengths=MagicMock(),
+            batch_size=MagicMock(),
+            sharding_type=ShardingType.ROW_WISE.value,
+            partition_by=MagicMock(),
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=shards,
+        )
+        detail = ShardingOptionDetail.from_sharding_option(sharding_option)
+        self.assertEqual(detail.fqn, "ebc.table_0")
+        self.assertEqual(detail.sharding_type, ShardingType.ROW_WISE.value)
+        self.assertEqual(detail.compute_kernel, EmbeddingComputeKernel.FUSED.value)
+        self.assertEqual(len(detail.shards), 2)
+        self.assertEqual(detail.shards[0].rank, 0)
+        self.assertEqual(detail.shards[0].size, (5000, 80))
+        self.assertEqual(detail.shards[0].offset, (0, 0))
+        self.assertEqual(detail.shards[0].hbm_bytes, 600)
+        self.assertEqual(detail.shards[0].ddr_bytes, 10)
+        self.assertEqual(detail.shards[0].ssd_bytes, 5)
+        self.assertEqual(detail.shards[0].perf_total, 10.0)
+        self.assertEqual(detail.total_hbm_bytes, 1000)
+        self.assertEqual(detail.total_ddr_bytes, 30)
+        self.assertEqual(detail.total_ssd_bytes, 20)
+        self.assertEqual(detail.total_perf, 12.0)
+
+    def test_from_sharding_option_without_estimates(self) -> None:
+        # Shards without storage/perf project to zero bytes and None perf.
+        sharding_option = ShardingOption(
+            name="table_1",
+            tensor=torch.empty(
+                (100, 16), dtype=torch.float16, device=torch.device("meta")
+            ),
+            module=("ebc", MagicMock()),
+            input_lengths=MagicMock(),
+            batch_size=MagicMock(),
+            sharding_type=ShardingType.TABLE_WISE.value,
+            partition_by=MagicMock(),
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=[Shard(size=[100, 16], offset=[0, 0])],
+        )
+        detail = ShardingOptionDetail.from_sharding_option(sharding_option)
+        self.assertEqual(detail.total_hbm_bytes, 0)
+        self.assertEqual(detail.total_ddr_bytes, 0)
+        self.assertEqual(detail.total_ssd_bytes, 0)
+        self.assertIsNone(detail.total_perf)
+        self.assertIsNone(detail.shards[0].perf_total)
+
+    def test_negative_values_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "ssd_bytes must be non-negative"):
+            ShardDetail(
+                rank=0,
+                size=(1, 1),
+                offset=(0, 0),
+                hbm_bytes=0,
+                ddr_bytes=0,
+                ssd_bytes=-1,
+            )
+        with self.assertRaisesRegex(ValueError, "perf_total must be non-negative"):
+            ShardDetail(
+                rank=0,
+                size=(1, 1),
+                offset=(0, 0),
+                hbm_bytes=0,
+                ddr_bytes=0,
+                ssd_bytes=0,
+                perf_total=-1.0,
+            )
+        with self.assertRaisesRegex(ValueError, "total_hbm_bytes must be non-negative"):
+            ShardingOptionDetail(
+                fqn="ebc.t0",
+                sharding_type="table_wise",
+                compute_kernel="fused",
+                total_hbm_bytes=-1,
+            )
+
+    def test_total_perf_none_when_any_shard_missing_perf(self) -> None:
+        # A partial perf sum would understate cost, so total_perf is None unless
+        # every shard has an estimate.
+        sharding_option = ShardingOption(
+            name="table_2",
+            tensor=torch.empty(
+                (200, 16), dtype=torch.float16, device=torch.device("meta")
+            ),
+            module=("ebc", MagicMock()),
+            input_lengths=MagicMock(),
+            batch_size=MagicMock(),
+            sharding_type=ShardingType.ROW_WISE.value,
+            partition_by=MagicMock(),
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=[
+                Shard(
+                    size=[100, 16],
+                    offset=[0, 0],
+                    perf=Perf(
+                        fwd_compute=1.0, fwd_comms=1.0, bwd_compute=1.0, bwd_comms=1.0
+                    ),
+                ),
+                Shard(size=[100, 16], offset=[100, 0]),  # no perf estimate
+            ],
+        )
+        detail = ShardingOptionDetail.from_sharding_option(sharding_option)
+        self.assertIsNone(detail.total_perf)
