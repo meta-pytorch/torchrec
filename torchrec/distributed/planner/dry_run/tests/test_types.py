@@ -14,9 +14,14 @@ import torch.nn as nn
 from torchrec.distributed.planner.dry_run.types import (
     CacheConfig,
     DryRunRequest,
+    DryRunResult,
     SkuOverride,
 )
-from torchrec.distributed.planner.types import ParameterConstraints, ShardingPlanRequest
+from torchrec.distributed.planner.types import (
+    ParameterConstraints,
+    ShardingPlanRequest,
+    ShardingPlanResult,
+)
 
 
 class DryRunRequestTest(unittest.TestCase):
@@ -215,3 +220,101 @@ class CacheConfigTest(unittest.TestCase):
             with self.subTest(ttl=ttl):
                 with self.assertRaisesRegex(ValueError, "ttl_seconds must be positive"):
                     CacheConfig(ttl_seconds=ttl)
+
+
+class DryRunResultTest(unittest.TestCase):
+    def _create_success_result(self, **kwargs: Any) -> DryRunResult:
+        defaults: Dict[str, Any] = {
+            "sku": "H100",
+            "success": True,
+            "sharding_plan": None,
+            "planner_failure_reason": None,
+            "estimated_max_hbm_bytes": 40 * 1024**3,
+            "estimated_max_ddr_bytes": 200 * 1024**3,
+            "request_fingerprint": "abc123def456ab00",
+        }
+        defaults.update(kwargs)
+        return DryRunResult(**defaults)
+
+    def _create_failure_result(self, **kwargs: Any) -> DryRunResult:
+        defaults: Dict[str, Any] = {
+            "sku": "H100",
+            "success": False,
+            "sharding_plan": None,
+            "planner_failure_reason": "OOM_HBM",
+            "estimated_max_hbm_bytes": 90 * 1024**3,
+            "estimated_max_ddr_bytes": 200 * 1024**3,
+            "request_fingerprint": "abc123def456ab00",
+        }
+        defaults.update(kwargs)
+        return DryRunResult(**defaults)
+
+    def test_empty_sku_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "sku must not be empty"):
+            self._create_success_result(sku="")
+
+    def test_request_fingerprint_stored(self) -> None:
+        # Positive path: a supplied fingerprint is retained and retrievable.
+        result = self._create_success_result(request_fingerprint="fp_deadbeef00")
+        self.assertEqual(result.request_fingerprint, "fp_deadbeef00")
+
+    def test_empty_request_fingerprint_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "request_fingerprint must not be empty"
+        ):
+            self._create_success_result(request_fingerprint="")
+
+    def test_negative_hbm_bytes_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "estimated_max_hbm_bytes must be non-negative"
+        ):
+            self._create_success_result(estimated_max_hbm_bytes=-1)
+
+    def test_negative_ddr_bytes_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "estimated_max_ddr_bytes must be non-negative"
+        ):
+            self._create_success_result(estimated_max_ddr_bytes=-1)
+
+    def test_success_with_failure_reason_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "planner_failure_reason must be None when success is True"
+        ):
+            self._create_success_result(planner_failure_reason="OOM_HBM")
+
+    def test_failure_without_reason_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "planner_failure_reason is required when success is False"
+        ):
+            self._create_failure_result(planner_failure_reason=None)
+
+    def test_negative_estimated_qps_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "estimated_qps must be non-negative"):
+            self._create_success_result(estimated_qps=-1.0)
+
+    def test_negative_critical_path_ms_rejected(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "critical_path_ms must be non-negative"
+        ):
+            self._create_success_result(critical_path_ms=-0.5)
+
+    def test_validation_warnings_tuple(self) -> None:
+        result = self._create_success_result()
+        self.assertEqual(result.validation_warnings, ())
+        warnings = ("high HBM usage", "close to DDR limit", "untested SKU")
+        result_with = self._create_success_result(validation_warnings=warnings)
+        self.assertEqual(len(result_with.validation_warnings), 3)
+        self.assertIn("untested SKU", result_with.validation_warnings)
+
+    def test_manifold_url(self) -> None:
+        # Uses the inherited sharding_plan_manifold_url (no DryRunResult-specific
+        # manifold_url field).
+        result = self._create_success_result()
+        self.assertIsNone(result.sharding_plan_manifold_url)
+        url = "manifold://tbe_benchmarking/tree/dry_run/plans/abc.json"
+        result_with = self._create_success_result(sharding_plan_manifold_url=url)
+        self.assertEqual(result_with.sharding_plan_manifold_url, url)
+
+    def test_inherits_sharding_plan_result(self) -> None:
+        result = self._create_success_result()
+        self.assertIsInstance(result, ShardingPlanResult)
