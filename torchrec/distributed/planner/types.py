@@ -2687,6 +2687,9 @@ class PlannerSessionContext:
     # Observability provenance for plan reporting (Manifold/Scuba); observability
     # only, not plan-affecting (excluded from request_hash). None -> console-only.
     report_metadata: Optional[PlanReportMetadata] = None
+    # Stats sinks the planner logs to, built by the orchestrator's PlanReporter
+    # from report_metadata and forwarded to the planner. None -> planner default.
+    stats: Optional[List[Stats]] = None
 
 
 # ---- Types Utils ---- #
