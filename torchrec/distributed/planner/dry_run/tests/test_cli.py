@@ -7,6 +7,8 @@
 
 # pyre-strict
 
+import os
+import tempfile
 import unittest
 
 from torchrec.distributed.planner.dry_run import cli
@@ -39,6 +41,38 @@ class DryRunCLITest(unittest.TestCase):
         rc = cli.main(["--sku-list", "H100", "--world-size", "2", *_SMALL_MODEL_ARGS])
         self.assertEqual(rc, 0)
 
+    def test_print_plan_exits_zero(self) -> None:
+        rc = cli.main(
+            [
+                "--sku-list",
+                "H100",
+                "--world-size",
+                "2",
+                "--print-plan",
+                *_SMALL_MODEL_ARGS,
+            ]
+        )
+        self.assertEqual(rc, 0)
+
+    def test_save_plan_dir_writes_a_file_per_sku(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            rc = cli.main(
+                [
+                    "--sku-list",
+                    "H100,GB200",
+                    "--world-size",
+                    "2",
+                    "--save-plan-dir",
+                    d,
+                    *_SMALL_MODEL_ARGS,
+                ]
+            )
+            self.assertEqual(rc, 0)
+            for sku in ("H100", "GB200"):
+                path = os.path.join(d, f"{sku}_sharding_plan.txt")
+                self.assertTrue(os.path.exists(path), path)
+                self.assertGreater(os.path.getsize(path), 0)
+
     def test_local_world_size_defaults_to_world_size(self) -> None:
         args = cli.build_arg_parser().parse_args(
             ["--sku-list", "H100", "--world-size", "4", *_SMALL_MODEL_ARGS]
@@ -47,3 +81,26 @@ class DryRunCLITest(unittest.TestCase):
         request = cli.build_request(args, model, sharders)
         self.assertEqual(request.local_world_size, 4)
         self.assertEqual(request.sku_list, ["H100"])
+
+    def test_sku_resolver_expands_sku_list(self) -> None:
+        # The resolver hook lets a Meta caller expand abstract pools; OSS itself
+        # stays agnostic and just applies whatever callable is injected.
+        args = cli.build_arg_parser().parse_args(
+            ["--sku-list", "POOL", "--world-size", "2", *_SMALL_MODEL_ARGS]
+        )
+        model, sharders = cli.build_model_and_sharders(args)
+        request = cli.build_request(
+            args,
+            model,
+            sharders,
+            sku_resolver=lambda skus: ["H100", "GB200"] if skus == ["POOL"] else skus,
+        )
+        self.assertEqual(request.sku_list, ["H100", "GB200"])
+
+    def test_no_sku_resolver_is_identity(self) -> None:
+        args = cli.build_arg_parser().parse_args(
+            ["--sku-list", "H100,GB200", "--world-size", "2", *_SMALL_MODEL_ARGS]
+        )
+        model, sharders = cli.build_model_and_sharders(args)
+        request = cli.build_request(args, model, sharders)
+        self.assertEqual(request.sku_list, ["H100", "GB200"])
