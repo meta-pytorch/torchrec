@@ -563,6 +563,62 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         region_offset = main_size if is_fresh else 0
         return torch.full_like(local_sizes, region_size), offsets + region_offset
 
+    def _region_read(
+        self,
+        values: torch.Tensor,
+        local_sizes: torch.Tensor,
+        offsets: torch.Tensor,
+        is_fresh: bool,
+    ) -> torch.Tensor:
+        # Read-only probe confined to one (Main or Fresh) region window via
+        # local_sizes/offsets; write-side kernel args are unused, passed as
+        # neutral values.
+        region_sizes, region_offsets = self._region_window(
+            local_sizes, offsets, is_fresh=is_fresh
+        )
+        remapped_ids, _ = self._zero_collision_hash(
+            input=values,
+            identities=self._hash_zch_identities,
+            max_probe=self._max_probe,
+            circular_probe=True,
+            exp_hours=-1,  # deprecated, always -1
+            readonly=True,
+            local_sizes=region_sizes,
+            offsets=region_offsets,
+            metadata=None,
+            output_on_uvm=False,
+            disable_fallback=self._disable_fallback,
+            _modulo_identity_DPRECATED=False,  # deprecated, always False
+            input_metadata=None,
+            eviction_threshold=-1,
+            eviction_policy=0,
+            opt_in_prob=-1,
+            num_reserved_slots=-1,
+            opt_in_rands=None,
+            runtime_meta=None,
+        )
+        return remapped_ids
+
+    def _fresh_wins_read(
+        self,
+        values: torch.Tensor,
+        local_sizes: Optional[torch.Tensor],
+        offsets: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # With Fresh empty every id misses, so this reduces to a Main-only read.
+        assert local_sizes is not None and offsets is not None
+        fresh_ids = self._region_read(values, local_sizes, offsets, is_fresh=True)
+        fresh_miss = fresh_ids == -1
+        main_ids = self._region_read(
+            values[fresh_miss],
+            local_sizes[fresh_miss],
+            offsets[fresh_miss],
+            is_fresh=False,
+        )
+        remapped_ids = fresh_ids.clone()
+        remapped_ids[fresh_miss] = main_ids
+        return remapped_ids
+
     # TODO: This is hacky as we are using parameters to go through publishing.
     # Can remove once working out buffer solution.
     def named_buffers(
@@ -744,36 +800,41 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     )
 
                 num_reserved_slots: int = self.get_reserved_slots_per_bucket()
-                remapped_ids, evictions = self._zero_collision_hash(
-                    input=values,
-                    identities=self._hash_zch_identities,
-                    max_probe=self._max_probe,
-                    circular_probe=True,
-                    exp_hours=-1,  # deprecated, always -1
-                    readonly=overwrite_readonly,
-                    local_sizes=local_sizes,
-                    offsets=offsets,
-                    metadata=overwrite_metadata,
-                    # Use self._is_inference to turn on writing to pinned
-                    # CPU memory directly. But may not have perf benefit.
-                    output_on_uvm=False,  # self._is_inference,
-                    disable_fallback=self._disable_fallback,
-                    _modulo_identity_DPRECATED=False,  # deprecated, always False
-                    input_metadata=input_metadata,
-                    eviction_threshold=eviction_threshold,
-                    eviction_policy=self.eviction_flag,
-                    opt_in_prob=self._opt_in_prob,
-                    num_reserved_slots=num_reserved_slots,
-                    opt_in_rands=opt_in_rands,
-                    # When we use _hash_zch_runtime_meta to save custom metadata, don't pass _hash_zch_runtime_meta to the kernel.
-                    # runtime_meta is managed externally via update_runtime_meta()
-                    # and should not be incremented by the kernel.
-                    runtime_meta=(
-                        None
-                        if self._write_runtime_meta_dim > 0
-                        else self._hash_zch_runtime_meta
-                    ),
-                )
+                if overwrite_readonly and self._percent_fresh_region > 0:
+                    # No eviction on the read path, so evictions is None.
+                    remapped_ids = self._fresh_wins_read(values, local_sizes, offsets)
+                    evictions = None
+                else:
+                    remapped_ids, evictions = self._zero_collision_hash(
+                        input=values,
+                        identities=self._hash_zch_identities,
+                        max_probe=self._max_probe,
+                        circular_probe=True,
+                        exp_hours=-1,  # deprecated, always -1
+                        readonly=overwrite_readonly,
+                        local_sizes=local_sizes,
+                        offsets=offsets,
+                        metadata=overwrite_metadata,
+                        # Use self._is_inference to turn on writing to pinned
+                        # CPU memory directly. But may not have perf benefit.
+                        output_on_uvm=False,  # self._is_inference,
+                        disable_fallback=self._disable_fallback,
+                        _modulo_identity_DPRECATED=False,  # deprecated, always False
+                        input_metadata=input_metadata,
+                        eviction_threshold=eviction_threshold,
+                        eviction_policy=self.eviction_flag,
+                        opt_in_prob=self._opt_in_prob,
+                        num_reserved_slots=num_reserved_slots,
+                        opt_in_rands=opt_in_rands,
+                        # When we use _hash_zch_runtime_meta to save custom metadata, don't pass _hash_zch_runtime_meta to the kernel.
+                        # runtime_meta is managed externally via update_runtime_meta()
+                        # and should not be incremented by the kernel.
+                        runtime_meta=(
+                            None
+                            if self._write_runtime_meta_dim > 0
+                            else self._hash_zch_runtime_meta
+                        ),
+                    )
                 # Zero out runtime_meta at evicted slots so it follows
                 # the same eviction behavior as the identity tensor.
                 if (
