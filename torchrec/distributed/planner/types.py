@@ -2248,6 +2248,208 @@ class ShardingPlanRequest:
         )[:16]
 
 
+@dataclass(frozen=True)
+class ShardDetail:
+    """Per-shard placement and cost breakdown for one shard of a table.
+
+    Serializable projection of a planner Shard: keeps the size/offset/rank and
+    the storage/perf estimates that the deployment-facing ShardingPlan drops,
+    without holding the live tensor/module references.
+    """
+
+    # Rank this shard is placed on; None if unassigned
+    rank: Optional[int]
+    # Shard tensor dimensions
+    size: Tuple[int, ...]
+    # Shard offset within the full table
+    offset: Tuple[int, ...]
+    # Estimated HBM for this shard (bytes)
+    hbm_bytes: int
+    # Estimated DDR for this shard (bytes)
+    ddr_bytes: int
+    # Estimated SSD for this shard (bytes)
+    ssd_bytes: int
+    # Total perf score for this shard; None if the perf model did not run
+    perf_total: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        for name in ("hbm_bytes", "ddr_bytes", "ssd_bytes"):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+        if self.perf_total is not None and self.perf_total < 0:
+            raise ValueError(f"perf_total must be non-negative, got {self.perf_total}")
+
+
+@dataclass(frozen=True)
+class ShardingOptionDetail:
+    """Per-table row of the chosen sharding plan with full cost detail.
+
+    Serializable projection of the ShardingOption selected for one embedding
+    table. Unlike the deployment-facing ShardingPlan (which keeps only
+    sharding_type/compute_kernel/ranks/shard geometry), this retains the
+    per-shard storage/perf estimates for OOM debugging and plan explainability,
+    while staying free of the live tensor/module references that make a raw
+    ShardingOption unserializable.
+    """
+
+    # Fully qualified name of the embedding table (module fqn + table name)
+    fqn: str
+    # Sharding type selected (e.g. "table_wise", "row_wise")
+    sharding_type: str
+    # Compute kernel selected (e.g. "fused", "dense")
+    compute_kernel: str
+    # Per-shard placement and cost breakdown
+    shards: Tuple[ShardDetail, ...] = ()
+    # HBM summed across shards (bytes)
+    total_hbm_bytes: int = 0
+    # DDR summed across shards (bytes)
+    total_ddr_bytes: int = 0
+    # SSD summed across shards (bytes)
+    total_ssd_bytes: int = 0
+    # Perf summed across shards; None unless every shard has a perf estimate, so
+    # the total is never a misleading partial sum
+    total_perf: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        for name in ("total_hbm_bytes", "total_ddr_bytes", "total_ssd_bytes"):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+
+    @classmethod
+    def from_sharding_option(
+        cls, sharding_option: "ShardingOption"
+    ) -> "ShardingOptionDetail":
+        """Build a serializable detail row from a selected ShardingOption."""
+        shards = tuple(
+            ShardDetail(
+                rank=shard.rank,
+                size=tuple(shard.size),
+                offset=tuple(shard.offset),
+                hbm_bytes=shard.storage.hbm if shard.storage is not None else 0,
+                ddr_bytes=shard.storage.ddr if shard.storage is not None else 0,
+                ssd_bytes=shard.storage.ssd if shard.storage is not None else 0,
+                perf_total=shard.perf.total if shard.perf is not None else None,
+            )
+            for shard in sharding_option.shards
+        )
+        # Only aggregate perf when every shard has an estimate; otherwise a
+        # partial sum would understate the true cost while looking complete.
+        if shards and all(s.perf_total is not None for s in shards):
+            total_perf: Optional[float] = sum(
+                s.perf_total for s in shards if s.perf_total is not None
+            )
+        else:
+            total_perf = None
+        return cls(
+            fqn=sharding_option.fqn,
+            sharding_type=sharding_option.sharding_type,
+            compute_kernel=sharding_option.compute_kernel,
+            shards=shards,
+            total_hbm_bytes=sum(s.hbm_bytes for s in shards),
+            total_ddr_bytes=sum(s.ddr_bytes for s in shards),
+            total_ssd_bytes=sum(s.ssd_bytes for s in shards),
+            total_perf=total_perf,
+        )
+
+
+@dataclass(frozen=True)
+class ShardingPlanResult:
+    """Immutable result of sharding plan generation for a single topology.
+
+    Captures the outcome of running the planner, including the sharding
+    plan (when available), failure reason on error, and memory estimates.
+    Base type for both runtime and dry-run result types.
+    """
+
+    # GPU-SKU identifier this result is for (e.g. "H100", "GB200"); also the key
+    # in the API's per-target result map. Distinct from Request.launcher_hardware
+    # (launcher-type vocabulary like "ZIONEX"/"TC_ANY"), which stays on the request.
+    sku: str
+    # Whether the planner found a valid sharding plan
+    success: bool
+    # The computed plan — how tables are distributed across devices. None on
+    # failure, and may also be None on a successful result that carries only
+    # metadata (e.g. cached-miss or estimate-only results).
+    sharding_plan: Optional[ShardingPlan]
+    # Why the plan failed — surfaces root cause (e.g. "OOM_HBM")
+    planner_failure_reason: Optional[str]
+    # Peak per-rank HBM of the sharded-embedding footprint (bytes): the max over
+    # ranks of the summed embedding-shard HBM placed on that rank. This is the
+    # embedding footprint only — it excludes the dense/optimizer/runtime overhead
+    # that StorageReservation carves out of the budget before planning (the
+    # reservation shrinks the HBM available for embeddings but is not added back
+    # into this figure).
+    estimated_max_hbm_bytes: int
+    # Peak per-rank DDR of the sharded-embedding footprint (bytes); same
+    # embedding-only semantics as estimated_max_hbm_bytes.
+    estimated_max_ddr_bytes: int
+
+    # Estimated throughput from perf model; None if perf model unavailable
+    estimated_qps: Optional[float] = None
+    # Latency of slowest path through sharded model (ms); None if unavailable
+    critical_path_ms: Optional[float] = None
+    # Non-fatal warnings even when plan succeeds
+    validation_warnings: Tuple[str, ...] = ()
+    # URL of the sharding plan persisted to Manifold (for sharing/debugging);
+    # None if the plan was not uploaded
+    sharding_plan_manifold_url: Optional[str] = None
+    # Correlates this result with the ShardingPlanRequest.request_hash that
+    # produced it (by content); "" if not set
+    request_hash: str = ""
+    # Correlates this result with the ShardingPlanRequest.request_id that
+    # produced it (by instance); "" if not set. Use this to tie a result to a
+    # specific request object; use request_hash to correlate by content.
+    request_id: str = ""
+    # Time spent in the planner's solver for this result (ms); None if unavailable
+    solve_time_ms: Optional[float] = None
+    # Per-table breakdown of the chosen sharding plan with per-shard storage/perf
+    # detail (the "sharding option table"); empty if the planner did not surface
+    # per-table detail. A serializable projection of the selected ShardingOptions
+    # (see ShardingOptionDetail.from_sharding_option) that explains the aggregate
+    # estimated_max_*_bytes at table/shard granularity.
+    sharding_options: Tuple[ShardingOptionDetail, ...] = ()
+    # Whether this result carries the authoritative plan breakdown/estimates.
+    # On the collective path only the planning rank (rank 0) populates the
+    # per-shard breakdown; other ranks return success=True with the broadcast
+    # plan but empty sharding_options and zero estimates. This flag makes that
+    # asymmetry explicit so an aggregator can filter to the trustworthy result
+    # instead of reading corrupt estimates off a non-planning rank. Defaults to
+    # True: the local path (pg=None) and dry-run always plan on the caller's rank.
+    is_planning_rank: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.sku:
+            raise ValueError("sku must not be empty")
+        if self.estimated_max_hbm_bytes < 0:
+            raise ValueError(
+                f"estimated_max_hbm_bytes must be non-negative, "
+                f"got {self.estimated_max_hbm_bytes}"
+            )
+        if self.estimated_max_ddr_bytes < 0:
+            raise ValueError(
+                f"estimated_max_ddr_bytes must be non-negative, "
+                f"got {self.estimated_max_ddr_bytes}"
+            )
+        if self.estimated_qps is not None and self.estimated_qps < 0:
+            raise ValueError(
+                f"estimated_qps must be non-negative, got {self.estimated_qps}"
+            )
+        if self.critical_path_ms is not None and self.critical_path_ms < 0:
+            raise ValueError(
+                f"critical_path_ms must be non-negative, got {self.critical_path_ms}"
+            )
+        if self.solve_time_ms is not None and self.solve_time_ms < 0:
+            raise ValueError(
+                f"solve_time_ms must be non-negative, got {self.solve_time_ms}"
+            )
+        if self.success and self.planner_failure_reason is not None:
+            raise ValueError("planner_failure_reason must be None when success is True")
+        if not self.success and self.planner_failure_reason is None:
+            raise ValueError("planner_failure_reason is required when success is False")
+
+
 # ---- Types Utils ---- #
 def hash_sha256_to_int(hashable_list: List[Any]) -> int:
     """
