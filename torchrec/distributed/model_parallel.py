@@ -1473,6 +1473,73 @@ class DMPCollection(DistributedModelParallel):
                 indices_slots=reserved_indices,
             )
 
+    def _restore_stashed_sync_tensors(
+        self,
+        ctx: DMPCollectionContext,
+        include_optimizer_state: bool = True,
+    ) -> None:
+        """Restore memory-stashed sync tensors to HBM before the 2D allreduce.
+
+        Memory stashing (e.g. EMS) frees a tensor's HBM via
+        ``storage.resize_(0)`` to reduce peak memory. If ``sync()`` runs while a
+        tensor it is about to allreduce is still stashed, the collective reads
+        freed memory and fails with ``cudaErrorIllegalAddress``. Restore any
+        stashed sync tensors first.
+
+        Gated so it costs nothing on the hot path: a no-op when memory stashing
+        is disabled and when the sync tensors are already resident (the
+        steady-state case, where the pipeline restores them during backward
+        before this post-backward sync). It restores only in the window that
+        would otherwise crash and does NOT re-stash -- the next forward
+        re-stashes as usual, so peak memory is unchanged and no extra D2H is
+        added.
+        """
+        # Local import to avoid any import cycle at module import time.
+        from torchrec.distributed.memory_stashing import MemoryStashingManager
+
+        if not MemoryStashingManager.is_enabled():
+            return
+
+        def _count_stashed(
+            tensors_by_dtype: Dict[torch.dtype, List[torch.Tensor]],
+        ) -> int:
+            return sum(
+                1
+                for tensors in tensors_by_dtype.values()
+                for t in tensors
+                if t.is_cuda and t.untyped_storage().size() == 0
+            )
+
+        num_weights_stashed = _count_stashed(ctx.weights_by_dtype)
+        num_optimizer_stashed = (
+            _count_stashed(ctx.optimizer_tensors_by_dtype)
+            if include_optimizer_state and ctx.optimizer_tensors_by_dtype
+            else 0
+        )
+
+        if num_weights_stashed == 0 and num_optimizer_stashed == 0:
+            # Steady state: tensors already resident -> nothing to do, no extra IO.
+            return
+
+        logger.warning(
+            "[DMP 2D-sync] memory-stashed tensors detected at sync "
+            "(stashed weights=%d, optimizer=%d); restoring to HBM before "
+            "allreduce to avoid an illegal memory access. If this fires every "
+            "step, the stash/restore ordering for these tensors needs review.",
+            num_weights_stashed,
+            num_optimizer_stashed,
+        )
+
+        if num_weights_stashed > 0:
+            MemoryStashingManager.restore_embedding_weights()
+        if num_optimizer_stashed > 0:
+            MemoryStashingManager.restore_optimizer_state()
+
+        # The restore H2D copies run on the stashing H2D stream; make the
+        # current (collective) stream wait for them before the allreduce reads
+        # the tensors.
+        torch.cuda.current_stream().wait_stream(MemoryStashingManager.h2d_stream())
+
     def _sync(
         self,
         ctx: DMPCollectionContext,
@@ -1487,6 +1554,12 @@ class DMPCollection(DistributedModelParallel):
               (if include_optimizer_state is True)
         """
         assert ctx.replica_pg is not None, "replica_pg is not initialized!"
+
+        # Memory stashing (e.g. EMS) may have freed the HBM of the TBE weight /
+        # fused-optimizer tensors this sync allreduces. Restore any that are
+        # currently stashed before the collective to avoid cudaErrorIllegalAddress.
+        # No-op when stashing is off or the tensors are already resident.
+        self._restore_stashed_sync_tensors(ctx, include_optimizer_state)
 
         opts = None
         if self._custom_all_reduce is None:

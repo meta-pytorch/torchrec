@@ -11,6 +11,7 @@ import math
 import os
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import Mock, patch
 
@@ -19,7 +20,7 @@ import torch
 from hypothesis import given, settings
 from torch import distributed as dist, nn
 from torch.distributed._shard.sharded_tensor import init_from_local_shards, Shard
-from torch.distributed._tensor import DeviceMesh, distribute_tensor, Replicate
+from torch.distributed._tensor import DeviceMesh, DTensor, Replicate
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
@@ -31,6 +32,7 @@ from torchrec.distributed.memory_stashing import (
     chunked_copy_,
     MemoryStashingManager,
 )
+from torchrec.distributed.model_parallel import DMPCollection
 from torchrec.modules.embedding_configs import DataType, EmbeddingBagConfig, PoolingType
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 
@@ -1152,7 +1154,10 @@ class TestCollectCudaTensorsSharded(unittest.TestCase):
         mesh = DeviceMesh("cuda", [0])
         # 2MB, above the 1MB stash threshold.
         local = torch.randn(1024, 512, device=self.device)
-        dt = distribute_tensor(local, mesh, [Replicate()])
+        # Wrap the already-local tensor as a Replicate DTensor without a
+        # broadcast collective; distribute_tensor's broadcast needs an NCCL
+        # comm that cannot bootstrap in the single-host test sandbox.
+        dt = DTensor.from_local(local, mesh, [Replicate()], run_check=False)
 
         collected = _collect_cuda_tensors_from_value(dt)
 
@@ -1356,6 +1361,126 @@ class TestStashOptimizerStateSliced(unittest.TestCase):
             torch.allclose(model.weight, weights_before),
             "Weights should change after optimizer step",
         )
+
+
+class TestRestoreStashedSyncTensors(unittest.TestCase):
+    """Tests for DMPCollection._restore_stashed_sync_tensors (the 2D-sync IMA fix).
+
+    The helper restores any memory-stashed TBE weight / optimizer tensors back
+    to HBM before DMPCollection.sync()'s allreduce, so the collective never
+    reads freed memory (cudaErrorIllegalAddress). It is gated to be a no-op when
+    stashing is disabled or the tensors are already resident.
+    """
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = torch.device("cuda:0")
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+
+    def _call_helper(
+        self,
+        ctx: object,
+        include_optimizer_state: bool = True,
+    ) -> None:
+        # The method does not use `self`, so None is fine for this unit test.
+        # pyre-ignore[6]: None self (unused) + SimpleNamespace ctx are test stubs.
+        DMPCollection._restore_stashed_sync_tensors(None, ctx, include_optimizer_state)
+
+    def _stash(self, tensor: torch.Tensor) -> None:
+        """Stash a tensor via the embedding path (registers global restore)."""
+        inner = Mock()
+        inner.weights_dev = tensor
+        emb = Mock()
+        emb._emb_module = inner
+        lookup = Mock(spec=["_emb_modules"])
+        lookup._emb_modules = [emb]
+        self.assertIsNotNone(MemoryStashingManager.stash_embedding_weights(lookup))
+
+    def test_restores_stashed_weight_before_sync(self) -> None:
+        """A stashed sync weight view is restored bit-exact before the allreduce."""
+        # ``weights_dev`` is the TBE weight slab that EMS stashes; ``sync_view``
+        # mirrors the separate per-table tensor DMPCollection caches from
+        # ``split_embedding_weights()`` -- a view sharing weights_dev's storage.
+        weights_dev = torch.randn(256, 128, device=self.device)
+        original = weights_dev.clone()
+        sync_view = weights_dev.detach().view(-1)
+
+        self._stash(weights_dev)
+        # EMS re-points weights_dev to CPU, but the sync view keeps the original
+        # (now freed) CUDA storage -- exactly the signal the helper detects.
+        self.assertTrue(sync_view.is_cuda)
+        self.assertEqual(sync_view.untyped_storage().size(), 0)
+
+        ctx = SimpleNamespace(
+            weights_by_dtype={sync_view.dtype: [sync_view]},
+            optimizer_tensors_by_dtype={},
+        )
+        self._call_helper(ctx)
+        torch.cuda.synchronize()
+
+        # Restored to HBM and bit-exact, so a subsequent allreduce is safe.
+        self.assertGreater(sync_view.untyped_storage().size(), 0)
+        torch.testing.assert_close(
+            sync_view.view(256, 128), original, rtol=1e-05, atol=1e-08
+        )
+
+    def test_restores_stashed_optimizer_tensor(self) -> None:
+        """A stashed optimizer sync tensor view is also restored."""
+        # ``momentum_dev`` is the fused-optimizer slab that EMS stashes;
+        # ``sync_view`` mirrors the per-table tensor DMPCollection caches from
+        # ``get_optimizer_state()["sum"]`` -- a view sharing momentum_dev's
+        # storage. Stash through _stash_tensors and register on the optimizer
+        # callback stack directly to mirror optimizer stashing.
+        momentum_dev = torch.randn(512, 512, device=self.device)
+        original = momentum_dev.clone()
+        sync_view = momentum_dev.detach().view(-1)
+
+        _await, restore, _exec = MemoryStashingManager._stash_tensors([momentum_dev])
+        MemoryStashingManager._optimizer_state_restore_callbacks.append(restore)
+        # The sync view keeps the original (now freed) CUDA storage.
+        self.assertTrue(sync_view.is_cuda)
+        self.assertEqual(sync_view.untyped_storage().size(), 0)
+
+        ctx = SimpleNamespace(
+            weights_by_dtype={},
+            optimizer_tensors_by_dtype={sync_view.dtype: [sync_view]},
+        )
+        self._call_helper(ctx)
+        torch.cuda.synchronize()
+
+        self.assertGreater(sync_view.untyped_storage().size(), 0)
+        torch.testing.assert_close(
+            sync_view.view(512, 512), original, rtol=1e-05, atol=1e-08
+        )
+
+    def test_noop_when_tensors_resident(self) -> None:
+        """Steady state (tensors resident): no-op, data untouched, no extra IO."""
+        weight = torch.randn(64, 64, device=self.device)
+        original = weight.clone()
+        ctx = SimpleNamespace(
+            weights_by_dtype={weight.dtype: [weight]},
+            optimizer_tensors_by_dtype={},
+        )
+        self._call_helper(ctx)
+        torch.cuda.synchronize()
+        self.assertGreater(weight.untyped_storage().size(), 0)
+        torch.testing.assert_close(weight, original, rtol=1e-05, atol=1e-08)
+
+    def test_noop_when_stashing_disabled(self) -> None:
+        """When stashing is disabled the helper returns before touching streams."""
+        MemoryStashingManager.reset()
+        self.assertFalse(MemoryStashingManager.is_enabled())
+        weight = torch.randn(32, 32, device=self.device)
+        ctx = SimpleNamespace(
+            weights_by_dtype={weight.dtype: [weight]},
+            optimizer_tensors_by_dtype={},
+        )
+        # Must not raise (e.g. from h2d_stream() asserting an unset stream).
+        self._call_helper(ctx)
 
 
 if __name__ == "__main__":
