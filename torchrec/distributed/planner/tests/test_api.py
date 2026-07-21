@@ -136,6 +136,9 @@ class ShardingPlannerAPITest(unittest.TestCase):
         self.assertIs(ctx.results["GB200"], results["GB200"])
         self.assertEqual(len(executor.calls), 2)
         self.assertEqual({c["sku"] for c in executor.calls}, {"H100", "GB200"})
+        # The API records the session-level total wall-clock (ms >= 0).
+        self.assertIn("total_planner_time", ctx.timing)
+        self.assertGreaterEqual(ctx.timing["total_planner_time"], 0.0)
 
     def test_plan_runs_local_when_not_distributed(self) -> None:
         # Offline (no initialized process group) => API passes pg=None so the
