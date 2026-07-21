@@ -47,3 +47,26 @@ class DryRunCLITest(unittest.TestCase):
         request = cli.build_request(args, model, sharders)
         self.assertEqual(request.local_world_size, 4)
         self.assertEqual(request.sku_list, ["H100"])
+
+    def test_sku_resolver_expands_sku_list(self) -> None:
+        # The resolver hook lets a Meta caller expand abstract pools; OSS itself
+        # stays agnostic and just applies whatever callable is injected.
+        args = cli.build_arg_parser().parse_args(
+            ["--sku-list", "POOL", "--world-size", "2", *_SMALL_MODEL_ARGS]
+        )
+        model, sharders = cli.build_model_and_sharders(args)
+        request = cli.build_request(
+            args,
+            model,
+            sharders,
+            sku_resolver=lambda skus: ["H100", "GB200"] if skus == ["POOL"] else skus,
+        )
+        self.assertEqual(request.sku_list, ["H100", "GB200"])
+
+    def test_no_sku_resolver_is_identity(self) -> None:
+        args = cli.build_arg_parser().parse_args(
+            ["--sku-list", "H100,GB200", "--world-size", "2", *_SMALL_MODEL_ARGS]
+        )
+        model, sharders = cli.build_model_and_sharders(args)
+        request = cli.build_request(args, model, sharders)
+        self.assertEqual(request.sku_list, ["H100", "GB200"])

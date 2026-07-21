@@ -19,7 +19,7 @@ reuse ``build_request`` / ``print_results`` and pass an orchestrator wired with
 from __future__ import annotations
 
 import argparse
-from typing import cast, List, Mapping, Optional, Tuple
+from typing import Callable, cast, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -47,7 +47,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--sku-list",
         required=True,
         help="Comma-separated SKUs to plan for (TrainingHardware names for the "
-        "fb provider, e.g. 'GRANDTETON,GB200').",
+        "fb provider, e.g. 'GRANDTETON,GB200'). The Meta CLI additionally accepts "
+        "abstract fungible pools (e.g. 'TC_ANY', 'TC_ANY_80G', 'GTT_ANY'), which "
+        "it expands into their candidate SKUs.",
     )
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument(
@@ -119,8 +121,14 @@ def build_request(
     args: argparse.Namespace,
     model: nn.Module,
     sharders: List[ModuleSharder[nn.Module]],
+    sku_resolver: Optional[Callable[[List[str]], List[str]]] = None,
 ) -> DryRunRequest:
     sku_list = [s.strip() for s in args.sku_list.split(",") if s.strip()]
+    # A Meta caller injects a resolver that expands abstract fungible pools
+    # (e.g. TC_ANY) into their concrete candidate SKUs. OSS default is identity:
+    # the list must already be concrete SKUs (OSS has no notion of the pools).
+    if sku_resolver is not None:
+        sku_list = sku_resolver(sku_list)
     return DryRunRequest(
         model=model,
         sharders=sharders,
@@ -142,14 +150,16 @@ def build_request(
 def run(
     args: argparse.Namespace,
     orchestrator: Optional[DryRunOrchestrator] = None,
+    sku_resolver: Optional[Callable[[List[str]], List[str]]] = None,
 ) -> Mapping[str, DryRunResult]:
     """Plan every SKU and return the per-SKU results.
 
     ``orchestrator`` defaults to the OSS ``DefaultPlannerExecutor``; a Meta
-    caller passes one wired with ``FbPlannerProvider``.
+    caller passes one wired with ``FbPlannerProvider``. ``sku_resolver`` is an
+    optional hook to expand abstract fungible pools into concrete SKUs.
     """
     model, sharders = build_model_and_sharders(args)
-    request = build_request(args, model, sharders)
+    request = build_request(args, model, sharders, sku_resolver=sku_resolver)
     ctx = PlannerSessionContext(request=request, results={})
     orchestrator = orchestrator or DryRunOrchestrator(DefaultPlannerExecutor())
     return orchestrator.plan(request, ctx)
@@ -174,9 +184,10 @@ def print_results(results: Mapping[str, DryRunResult]) -> None:
 def main(
     argv: Optional[List[str]] = None,
     orchestrator: Optional[DryRunOrchestrator] = None,
+    sku_resolver: Optional[Callable[[List[str]], List[str]]] = None,
 ) -> int:
     args = build_arg_parser().parse_args(argv)
-    results = run(args, orchestrator=orchestrator)
+    results = run(args, orchestrator=orchestrator, sku_resolver=sku_resolver)
     print_results(results)
     # Non-zero exit if any SKU failed to plan, so scripts can gate on it.
     return 0 if all(r.success for r in results.values()) else 1
