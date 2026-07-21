@@ -9,10 +9,10 @@
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Dict, List, Optional
 
-from torchrec.distributed.planner.types import ShardingPlanRequest
+from torchrec.distributed.planner.types import ShardingPlanRequest, ShardingPlanResult
 
 
 @dataclass(frozen=True)
@@ -146,3 +146,54 @@ class DryRunRequest(ShardingPlanRequest):
         }
         canonical = json.dumps(parts, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class DryRunResult(ShardingPlanResult):
+    """Immutable result of dry-run sharding plan validation for a single SKU.
+
+    Extends ShardingPlanResult with the per-SKU request fingerprint. The
+    uploaded-plan URL reuses the inherited sharding_plan_manifold_url; the
+    request-level identity reuses the inherited request_hash (by content) and
+    request_id (by instance).
+
+    Invariant: ``request_fingerprint == request.fingerprint(sku)`` -- the SKU the
+    fingerprint encodes must match the top-level ``sku``. Build via
+    ``DryRunResult.from_result(request, sku, base_result)``, which guarantees it;
+    direct construction is allowed but must uphold it.
+    """
+
+    # Per-(request, SKU) key from DryRunRequest.fingerprint(sku); keys the
+    # per-SKU results map and correlates TUO iterative validation runs.
+    # Distinct from the inherited request-level fields: it composes request_hash
+    # with the SKU and per-SKU override, so each SKU's result gets a unique key
+    # (the request-level request_hash/request_id are the same across SKUs).
+    # Effectively required: the "" default exists only because the base class has
+    # defaulted fields (so every subclass field must default too); __post_init__
+    # rejects an empty value, so callers must always supply a real fingerprint.
+    request_fingerprint: str = ""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.request_fingerprint:
+            raise ValueError("request_fingerprint must not be empty")
+
+    @classmethod
+    def from_result(
+        cls,
+        request: DryRunRequest,
+        sku: str,
+        result: ShardingPlanResult,
+    ) -> "DryRunResult":
+        """Wrap a base ShardingPlanResult as a DryRunResult for ``sku``.
+
+        The sanctioned constructor: it derives ``request_fingerprint =
+        request.fingerprint(sku)`` and forces ``sku=sku``, so the top-level SKU
+        and the SKU encoded in the fingerprint cannot disagree -- the mismatch is
+        unrepresentable through this path.
+        """
+        base_fields = {
+            f.name: getattr(result, f.name) for f in fields(ShardingPlanResult)
+        }
+        base_fields["sku"] = sku
+        return cls(**base_fields, request_fingerprint=request.fingerprint(sku))
