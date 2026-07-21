@@ -2596,6 +2596,40 @@ class ShardingPlanResult:
             raise ValueError("planner_failure_reason is required when success is False")
 
 
+@dataclass(frozen=True)
+class PlanReportMetadata:
+    """Observability provenance for plan reporting (Manifold/Scuba sinks).
+
+    Carries the framework/model-known facts the reporter needs to build the stats
+    sinks — data our layer cannot derive from the plan/topology/request. It is
+    observability-only and does NOT affect the plan, so it is deliberately kept
+    off ``PlannerConfig`` and excluded from ``request_hash``. Optional; absent ->
+    the reporter falls back to console stats only. (``feature_stats_summary`` and
+    similar summary objects are not projected here yet — a follow-up.)
+
+    One instance describes a single plan (one model), so model-specific fields
+    such as ``proposer_types``, ``embedding_hash`` and the size fields vary across
+    models by design — the caller populates them per request.
+    """
+
+    trainer: Optional[str] = None
+    pipeline: Optional[str] = None
+    total_model_param_size: Optional[int] = None
+    total_sparse_param_size: Optional[int] = None
+    embedding_hash: Optional[str] = None
+    # Tuple (not List) so this frozen dataclass stays hashable: @dataclass(
+    # frozen=True) auto-generates __hash__ over all fields, and a list field
+    # would raise TypeError when an instance carrying proposer types is hashed.
+    proposer_types: Optional[Tuple[str, ...]] = None
+    num_parallel_worlds: Optional[int] = None
+    log_plan: bool = True
+    # Optional override for the Manifold upload directory (relative to the
+    # sharding_analysis bucket, e.g. "tree/sharding_plan/my_dry_run"). None ->
+    # the reporter uses the default job-context path (or the local dry-run
+    # fallback offline). Lets a dry-run pin a known location for later diffing.
+    manifold_path: Optional[str] = None
+
+
 @dataclass
 class PlannerSessionContext:
     """Mutable context accumulating state during a planner session.
@@ -2650,6 +2684,9 @@ class PlannerSessionContext:
     # corresponds to. Links the request/session to the launching job for
     # cross-system correlation. Session-level; None until associated with a job.
     external_trace_id: Optional[str] = None
+    # Observability provenance for plan reporting (Manifold/Scuba); observability
+    # only, not plan-affecting (excluded from request_hash). None -> console-only.
+    report_metadata: Optional[PlanReportMetadata] = None
 
 
 # ---- Types Utils ---- #
