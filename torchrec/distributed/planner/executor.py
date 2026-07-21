@@ -115,6 +115,7 @@ class DefaultPlannerExecutor(PlannerExecutor):
         topology = self._provider.build_topology(sku, ctx.request)
         storage_reservation = self._provider.build_storage_reservation(sku, ctx.request)
         planner = self._provider.build_planner(
+            sku,
             topology=topology,
             storage_reservation=storage_reservation,
             ctx=ctx,
