@@ -10,6 +10,11 @@
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
+# Re-exported for dry-run consumers (see dry_run/__init__); the redundant alias
+# marks it as an intentional re-export for type checkers, noqa for flake8.
+from torchrec.distributed.planner.protocols import (  # noqa: F401
+    PlannerExecutor as PlannerExecutor,
+)
 from torchrec.distributed.types import ShardingPlan
 
 
