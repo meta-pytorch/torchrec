@@ -10,6 +10,7 @@
 import abc
 import dataclasses
 import logging
+import time
 from typing import cast, Dict, List, Mapping, Optional
 
 import torch.distributed as dist
@@ -116,6 +117,9 @@ class ShardingPlannerAPI(abc.ABC):
             raise ValueError("request must be the same object as ctx.request")
         pg = self._get_broadcast_pg()
         results: Dict[str, ShardingPlanResult] = {}
+        # Session-level wall-clock for the whole loop (observability only); the
+        # executor records the per-SKU phase breakdown onto ctx.timing.
+        loop_start = time.perf_counter()
         # dict.fromkeys dedups while preserving order: a subclass returning a
         # duplicate SKU would otherwise trigger a redundant executor.run and
         # silently overwrite the earlier result.
@@ -181,6 +185,7 @@ class ShardingPlannerAPI(abc.ABC):
                 )
             ctx.results[sku] = result
             results[sku] = result
+        ctx.timing["total_planner_time"] = (time.perf_counter() - loop_start) * 1000.0
         return results
 
     def _isolate_target_errors(self) -> bool:

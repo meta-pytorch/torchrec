@@ -98,8 +98,17 @@ class PlannerProvider(Protocol):
     ``torchrec/fb``.
     """
 
-    def build_topology(self, sku: str, request: ShardingPlanRequest) -> Topology:
-        """Build the ``Topology`` for ``sku`` (the target GPU-SKU)."""
+    def build_topology(
+        self,
+        sku: str,
+        request: ShardingPlanRequest,
+        ctx: PlannerSessionContext,
+    ) -> Topology:
+        """Build the ``Topology`` for ``sku`` (the target GPU-SKU).
+
+        Also records the hardware-capability provenance for ``sku`` on ``ctx``
+        (``hw_source`` and ``hw_overrides_applied``) — observability only.
+        """
         ...
 
     def build_storage_reservation(
@@ -135,10 +144,16 @@ class DefaultPlannerProvider(PlannerProvider):
     back here via ``super()``.
     """
 
-    def build_topology(self, sku: str, request: ShardingPlanRequest) -> Topology:
+    def build_topology(
+        self,
+        sku: str,
+        request: ShardingPlanRequest,
+        ctx: PlannerSessionContext,
+    ) -> Topology:
         # OSS builds from the request's explicit caps; the SKU -> hardware mapping
         # is a Meta (HUM) concern handled by FbPlannerProvider. ``sku`` is unused
-        # here but is part of the seam the fb override keys on.
+        # for topology construction here but is part of the seam the fb override
+        # keys on (and the key under which HW provenance is recorded below).
         trainer_config = TrainerConfig(
             world_size=request.world_size,
             local_world_size=request.local_world_size,
@@ -161,9 +176,15 @@ class DefaultPlannerProvider(PlannerProvider):
             if request.compute_device
             else KernelConfig()
         )
+        hardware_config = HardwareConfig()
+        # Observability: OSS resolves capabilities straight from the request's
+        # explicit caps (no hardware registry / live detection), so label the
+        # source accordingly. fb overrides this with the registry/live source.
+        ctx.hw_source[sku] = "request_caps"
+        ctx.hw_overrides_applied[sku] = hardware_config
         return TopologyFactory.create_topology(
             trainer_config=trainer_config,
-            hardware_config=HardwareConfig(),
+            hardware_config=hardware_config,
             kernel_config=kernel_config,
         )
 

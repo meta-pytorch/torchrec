@@ -2658,31 +2658,47 @@ class PlannerSessionContext:
     results: Dict[str, ShardingPlanResult]
     # Unique session identifier; defaults to a UUID4
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    # Topology cache keyed by (sku, world_size, local_world_size) — one per SKU
+    # Topology modeled per SKU, keyed by (sku, world_size, local_world_size) — the
+    # dims that make a topology reusable. Populated by the executor as it builds
+    # each SKU's topology.
     topology_cache: Dict[Tuple[str, int, int], Topology] = field(default_factory=dict)
-    # Wall-clock timing for each session phase (e.g. "topology_creation", "solve").
-    # Session-level aggregate, not per-SKU.
+    # Wall-clock timing (milliseconds) for each planning phase. Populated by the
+    # executor with per-SKU-qualified keys ("topology_build:<sku>",
+    # "storage_reservation:<sku>", "planner_construction:<sku>",
+    # "plan_call:<sku>") plus session-level keys the caller/API add
+    # ("resolve_sku_list", "total_planner_time"). Per-SKU keys keep a multi-SKU
+    # dry-run sweep comparable. "plan_call" is the whole planner.plan() block
+    # (reserve+enumerate+propose+solve+stats); the intra-planner split is a
+    # follow-up. Observability only (excluded from request_hash).
     timing: Dict[str, float] = field(default_factory=dict)
-    # Storage reservation strategy used per SKU
+    # StorageReservation resolved and used per SKU. Populated by the executor.
     storage_reservations_used: Dict[str, StorageReservation] = field(
         default_factory=dict
     )
-    # Hardware overrides applied per SKU
+    # Effective HardwareConfig applied per SKU. Populated by the provider's
+    # build_topology (OSS: the request-caps default; fb: the HUM-resolved config).
     hw_overrides_applied: Dict[str, HardwareConfig] = field(default_factory=dict)
-    # Plans retrieved from cache, keyed by request fingerprint (per request+SKU)
+    # Plans retrieved from cache, keyed by request fingerprint (per request+SKU).
+    # Scaffolding: the current flow has no plan-level cache (the executor always
+    # builds and runs the planner), so this stays empty until a request_hash-keyed
+    # plan cache exists. Paired with ``cache_hit``.
     cached_plans: Dict[str, ShardingPlan] = field(default_factory=dict)
-    # Caller-provided session metadata (e.g. oncall, use_case, experiment_id)
+    # Caller-provided session metadata (e.g. training_framework, model_type,
+    # entitlement). Populated by the caller/adapter at context construction.
     client_metadata: Dict[str, str] = field(default_factory=dict)
-    # Whether each SKU's result came from cache — per SKU (SKU -> hit)
+    # Whether each SKU's result came from cache — per SKU (SKU -> hit). Scaffolding:
+    # empty until a plan-level cache exists (see ``cached_plans``).
     cache_hit: Dict[str, bool] = field(default_factory=dict)
-    # Source of resolved hardware-capability data per SKU (SKU -> source label,
-    # e.g. "static_registry", "live_detection", "mast", "psutil", "serf"). Kept a
-    # free-form string so it isn't restricted to a fixed set of detection
-    # mechanisms.
+    # Source of resolved hardware-capability data per SKU (SKU -> source label).
+    # Populated by the provider's build_topology: OSS records "request_caps"; fb
+    # records "hardware_registry" (dry-run, static HUM registry) or
+    # "live_detection" (production MAST/Serf). Kept a free-form string so it isn't
+    # restricted to a fixed set of mechanisms (finer attribution is a follow-up).
     hw_source: Dict[str, str] = field(default_factory=dict)
-    # External trace / job identifier (e.g. the MAST Job ID) this planning session
+    # External trace / job identifier (the MAST job name) this planning session
     # corresponds to. Links the request/session to the launching job for
-    # cross-system correlation. Session-level; None until associated with a job.
+    # cross-system correlation. Populated by the caller/adapter (None off-MAST,
+    # e.g. an offline dry-run).
     external_trace_id: Optional[str] = None
     # Observability provenance for plan reporting (Manifold/Scuba); observability
     # only, not plan-affecting (excluded from request_hash). None -> console-only.
@@ -2690,6 +2706,13 @@ class PlannerSessionContext:
     # Stats sinks the planner logs to, built by the orchestrator's PlanReporter
     # from report_metadata and forwarded to the planner. None -> planner default.
     stats: Optional[List[Stats]] = None
+    # Session-level, non-fatal diagnostics accumulated while planning this request
+    # (e.g. a candidate SKU dropped from a dry-run sweep because it has no
+    # TrainingHardware mapping). These are request/session-scoped facts with no
+    # single result to attach to, so they live here rather than on a per-SKU
+    # result; observability only (not plan-affecting, excluded from request_hash).
+    # Surfaced by the caller/CLI (e.g. printed in the dry-run report).
+    warnings: List[str] = field(default_factory=list)
 
 
 # ---- Types Utils ---- #
