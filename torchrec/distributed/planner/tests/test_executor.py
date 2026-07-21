@@ -14,10 +14,13 @@ import torch
 import torch.nn as nn
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.executor import DefaultPlannerExecutor
-from torchrec.distributed.planner.partitioners import GreedyPerfPartitioner
+from torchrec.distributed.planner.partitioners import (
+    GreedyPerfPartitioner,
+    MemoryBalancedPartitioner,
+)
 from torchrec.distributed.planner.proposers import GreedyProposer, UniformProposer
 from torchrec.distributed.planner.protocols import PlannerExecutor
-from torchrec.distributed.planner.provider import _build_partitioner, _build_proposer
+from torchrec.distributed.planner.provider import DefaultPlannerProvider
 from torchrec.distributed.planner.types import (
     PlannerConfig,
     PlannerSessionContext,
@@ -106,30 +109,48 @@ class DefaultPlannerExecutorTest(unittest.TestCase):
 
 
 class BuildComponentsFromConfigTest(unittest.TestCase):
-    """The provider turns PlannerConfig scalar selectors into concrete OSS
-    components (rather than taking pre-built objects)."""
+    """The OSS provider turns PlannerConfig scalar selectors into concrete OSS
+    components (overridable hooks; fb-only selectors fall through to fb)."""
+
+    def setUp(self) -> None:
+        self.provider = DefaultPlannerProvider()
 
     def test_build_proposer_maps_known_selectors(self) -> None:
         self.assertIsInstance(
-            _build_proposer(PlannerConfig(proposer_type="greedy")), GreedyProposer
+            self.provider._build_proposer(
+                PlannerConfig(proposer_type="greedy"), local_world_size=8
+            ),
+            GreedyProposer,
         )
         self.assertIsInstance(
-            _build_proposer(PlannerConfig(proposer_type="uniform")), UniformProposer
+            self.provider._build_proposer(
+                PlannerConfig(proposer_type="uniform"), local_world_size=8
+            ),
+            UniformProposer,
         )
 
     def test_build_proposer_none_and_fb_selectors_use_default(self) -> None:
         # None -> planner default set; fb-only selectors aren't OSS-buildable.
-        self.assertIsNone(_build_proposer(PlannerConfig()))
         self.assertIsNone(
-            _build_proposer(PlannerConfig(proposer_type="dynamic_col_dim"))
+            self.provider._build_proposer(PlannerConfig(), local_world_size=8)
+        )
+        self.assertIsNone(
+            self.provider._build_proposer(
+                PlannerConfig(proposer_type="dynamic_col_dim"), local_world_size=8
+            )
         )
 
     def test_build_partitioner(self) -> None:
         self.assertIsInstance(
-            _build_partitioner(PlannerConfig(partitioner_type="greedy_perf")),
+            self.provider._build_partitioner(
+                PlannerConfig(partitioner_type="greedy_perf")
+            ),
             GreedyPerfPartitioner,
         )
-        self.assertIsNone(_build_partitioner(PlannerConfig()))
-        self.assertIsNone(
-            _build_partitioner(PlannerConfig(partitioner_type="memory_balanced"))
+        self.assertIsInstance(
+            self.provider._build_partitioner(
+                PlannerConfig(partitioner_type="memory_balanced")
+            ),
+            MemoryBalancedPartitioner,
         )
+        self.assertIsNone(self.provider._build_partitioner(PlannerConfig()))
