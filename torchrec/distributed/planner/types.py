@@ -2099,6 +2099,10 @@ class PlannerConfig:
     # Resolved PipelineType value for the storage estimator (e.g. "train_sparse_dist");
     # None = estimator default. Mirrors APF's pipeline-aware storage estimation.
     pipeline_type: Optional[str] = None
+    # Estimated dense (non-embedding) per-rank tensor bytes; threaded into
+    # HeuristicalStorageReservation so the reserved HBM matches the legacy
+    # path. None (the base provider default) leaves the reservation unchanged.
+    dense_tensor_estimate: Optional[int] = None
     # Hardware-based perf-estimator flags (apply when use_hardware_based_compute).
     use_batch_inputs_for_expected_cache_fetches: bool = False
     use_linear_regression_prefetch_estimate: bool = False
@@ -2316,6 +2320,7 @@ class ShardingPlanRequest:
                     self.planner_config.debug,
                     self.planner_config.timeout_seconds,
                     self.planner_config.pipeline_type,
+                    self.planner_config.dense_tensor_estimate,
                     self.planner_config.use_batch_inputs_for_expected_cache_fetches,
                     self.planner_config.use_linear_regression_prefetch_estimate,
                     self.planner_config.balance_modules,
