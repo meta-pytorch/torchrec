@@ -140,36 +140,103 @@ _DTYPE_MAX: Dict[torch.dtype, int] = {
 
 _TORCHREC_OVERFLOW_DEBUG: bool = os.environ.get("TORCHREC_OVERFLOW_DEBUG", "0") == "1"
 
+# Per-part length limit for the FNV loop. Each part gets its own slot so
+# a large keys list cannot crowd out a small splits tuple. Callers with
+# multiple safety-critical fields should pass them as separate top-level
+# parts rather than nesting them in one container.
+_COLLECTIVE_TAG_MAX_BYTES: int = 4096
+
+
+def _fnv1a_step(h: int, data: bytes) -> int:
+    """Mix bytes into a 32-bit FNV-1a state. Narrow to int31 at caller
+    return so mid-loop bit 31 is not discarded."""
+    for b in data:
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def _append_digest(buf: bytearray, p: object, remaining: int) -> int:
+    """Write p as bytes into buf. Stops after `remaining` bytes.
+
+    For a str or bytes, writes up to `remaining` bytes of it.
+    For a list or tuple, writes `L{count}\\x00` followed by each element
+    written the same way (recursively), with each element prefixed by
+    its own length so `["a,b"]` and `["a", "b"]` produce different bytes.
+    For anything else, converts to str and takes up to `remaining` bytes.
+
+    Returns the number of bytes written.
+    """
+    if remaining <= 0:
+        return 0
+    if isinstance(p, str):
+        # ASCII-only: code-point slicing may overshoot `remaining` on
+        # non-ASCII input. TorchRec feature keys are identifiers.
+        chunk = p[:remaining].encode()
+    elif isinstance(p, bytes):
+        chunk = p[:remaining]
+    elif isinstance(p, (list, tuple)):
+        header = f"L{len(p)}\x00".encode()[:remaining]
+        buf.extend(header)
+        written = len(header)
+        remaining -= written
+        for elem in p:
+            if remaining <= 0:
+                break
+            # Length-prefix each element to disambiguate boundaries
+            # within the per-part length limit. Past-limit elements
+            # may collide, e.g. at remaining=5 both "apple_pie" and
+            # "apple_bar" frame as "5\x00apple".
+            elem_buf = bytearray()
+            _append_digest(elem_buf, elem, remaining)
+            frame = f"{len(elem_buf)}\x00".encode() + bytes(elem_buf)
+            chunk = frame[:remaining]
+            buf.extend(chunk)
+            written += len(chunk)
+            remaining -= len(chunk)
+        return written
+    else:
+        chunk = str(p).encode()[:remaining]
+    buf.extend(chunk)
+    return len(chunk)
+
+
+def _int_tuple_digest(values: Tuple[int, ...]) -> Tuple[str, int, int]:
+    """Return a compact hash of an integer tuple.
+
+    Every value is hashed, so no value is lost even if the tuple is
+    long. Returns (label, length, 31-bit hash), which the caller can
+    pass as a single small part.
+
+    Meant for splits: a rank-invariant tuple where losing any value
+    would let a rank disagreement go undetected.
+    """
+    h = 0x811C9DC5
+    for v in values:
+        h = _fnv1a_step(h, b"\x00")
+        h = _fnv1a_step(h, str(v).encode())
+    return ("int_tuple_digest", len(values), h & 0x7FFFFFFF)
+
 
 def _collective_tag_from(*parts: object) -> int:
-    """Compute a deterministic collective tag from identifying parts.
+    """Hash a list of parts into a single deterministic tag.
 
-    Returns a non-negative value that fits in signed int32. Uses FNV-1a
-    (deterministic across processes, unlike hash()).
+    Each part contributes at most _COLLECTIVE_TAG_MAX_BYTES bytes to
+    the hash. Bytes past the limit are dropped and do not affect the
+    tag.
 
-    The current call sites use int64 splits tensors, so a wider hash is
-    available in principle. The int32 cap is intentional forward-compat:
-    it guarantees the tag fits in any reasonable signed-integer splits dtype
-    without wrapping negative. Mixing runs in full 32-bit FNV-1a state and is
-    narrowed to 31 bits only at return; ~2.1B buckets leaves collision risk
-    negligible for the small number of distinct collective sites in flight
-    per process group.
+    The same parts always produce the same tag, on every rank. So if
+    two ranks compute this tag and get different values, we know they
+    disagree on something in the parts. Returns a non-negative value
+    that fits in signed int32.
     """
-    # NUL separator (not ",") so str() of parts that themselves contain commas
-    # cannot collide with a different parts arity. Collective identifier parts
-    # (Python identifiers, sharding plan ints, container reprs) never contain
-    # \x00, so this separator is unambiguous in practice.
-    #
-    # In-loop mask is 0xFFFFFFFF (full 32-bit FNV-1a state); narrowing to
-    # signed int32 happens once at return. Masking to 31 bits inside the loop
-    # would discard bit 31 every iteration and weaken the avalanche relative
-    # to the reference algorithm without any benefit.
     h = 0x811C9DC5
-    for b in "\x00".join(str(p) for p in parts).encode():
-        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
-    # Post-loop mask still handles the empty-parts case: the FNV-1a seed
-    # (0x811C9DC5) exceeds signed-int32 max, so without this mask an empty
-    # call would violate the int32-fit contract.
+    for i, p in enumerate(parts):
+        if i > 0:
+            h = _fnv1a_step(h, b"\x00")
+        buf = bytearray()
+        _append_digest(buf, p, _COLLECTIVE_TAG_MAX_BYTES)
+        h = _fnv1a_step(h, bytes(buf))
+    # Final mask handles empty-parts: FNV seed exceeds int32 max.
     return h & 0x7FFFFFFF
 
 
@@ -974,13 +1041,14 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
             # Identity components, all rank-invariant by contract:
             # - input.keys(): pre-AllToAll feature list (NOT local `keys`,
             #   which is the post-AllToAll subset and differs per rank).
-            # - tuple(self._splits): the sharding plan — feature-to-rank
-            #   assignment from the constructor, documented as "Same for
-            #   all ranks." Including this catches divergent sharding
-            #   plans that have the same key set; without it, a config
-            #   bug giving ranks different splits would compute the same
-            #   tag and silently corrupt the all2all.
-            tag_parts = ("KJTAllToAllSplits", input.keys(), tuple(self._splits))
+            # - _int_tuple_digest(splits): hash all the splits values
+            #   into a compact tuple so that a raw splits tuple can't
+            #   be truncated when the keys list is very wide.
+            tag_parts = (
+                "KJTAllToAllSplits",
+                input.keys(),
+                _int_tuple_digest(tuple(self._splits)),
+            )
             collective_tag = _collective_tag_from(*tag_parts)
         self._splits_awaitable = SplitsAllToAllAwaitable(
             input_tensors,
