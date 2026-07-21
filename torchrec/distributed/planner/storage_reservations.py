@@ -40,6 +40,7 @@ class StorageReservationType(str, Enum):
     HEURISTIC = "heuristic"
     FIXED_PERCENTAGE = "fixed_percentage"
     FIXED_ABSOLUTE = "fixed_absolute"
+    SKU_AWARE = "sku_aware"
 
 
 def _get_module_size(module: nn.Module, multiplier: float) -> int:
@@ -264,6 +265,85 @@ class FixedAbsoluteStorageReservation(FixedPercentageStorageReservation):
         _reserve_storage_absolute(reserved_topology, self._hbm_reserved_bytes)
         self._last_reserved_topology = reserved_topology
         return reserved_topology
+
+
+class SKUAwareStorageReservation(StorageReservation):
+    """
+    Reserves a fixed absolute amount of HBM per device expressed in SKU-correct
+    terms: ``model_base_bytes`` (the hardware-independent footprint of the
+    non-sharded model, e.g. dense parameters, optimizer state, and DDP buffers)
+    plus ``runtime_overhead_bytes`` (the per-SKU runtime tax: driver/context,
+    NCCL buffers, and allocator fragmentation).
+
+    Unlike a percentage-of-HBM reservation, the reserved amount does not scale
+    with device capacity, so a model keeps the same reservation when it lands on
+    SKUs with different HBM caps. This avoids the cross-SKU mis-scaling that is a
+    dominant cause of planner OOM/failures under hardware fungibility.
+
+    Both inputs are hardware-aware values resolved by the caller (the OSS planner
+    cannot read the internal hardware registry); see the framework-side factory
+    that constructs this reservation from the resolved SKU.
+
+    Args:
+        model_base_bytes (int): hardware-independent non-sharded model footprint,
+            in bytes.
+        runtime_overhead_bytes (int): per-SKU runtime overhead, in bytes.
+    """
+
+    def __init__(self, model_base_bytes: int, runtime_overhead_bytes: int) -> None:
+        assert model_base_bytes >= 0
+        assert runtime_overhead_bytes >= 0
+        self._model_base_bytes: int = model_base_bytes
+        self._runtime_overhead_bytes: int = runtime_overhead_bytes
+        self._reserved_bytes: int = model_base_bytes + runtime_overhead_bytes
+        self._last_reserved_topology: Optional[Topology] = None
+
+    def reserve(
+        self,
+        topology: Topology,
+        batch_size: int,
+        module: nn.Module,
+        sharders: List[ModuleSharder[nn.Module]],
+        constraints: Optional[Dict[str, ParameterConstraints]] = None,
+    ) -> Topology:
+        reserved_topology = copy.deepcopy(topology)
+
+        # _reserve_storage_absolute floors at max(0, ...), which would silently
+        # hide a reservation that meets or exceeds available hbm. Guard explicitly
+        # (>=, since == leaves 0 hbm for sharded tables) so the over-reservation
+        # surfaces as an actionable error instead of a confusing downstream
+        # "could not place tables" failure.
+        available_hbm = reserved_topology.devices[0].storage.hbm
+        if self._reserved_bytes >= available_hbm:
+            reserved_gb = self._reserved_bytes / (1024**3)
+            model_base_gb = self._model_base_bytes / (1024**3)
+            overhead_gb = self._runtime_overhead_bytes / (1024**3)
+            insufficient_storage_solution = (
+                f"The SKU-aware storage reservation ({reserved_gb:.2f} GB per rank) "
+                "meets or exceeds the available hbm storage per rank "
+                f"({storage_repr_in_gb(topology.devices[0].storage)}), leaving no hbm "
+                "for sharded embedding tables, so it is not possible to find a valid "
+                "sharding plan. "
+                f"\n \n The reservation is model_base_bytes ({model_base_gb:.2f} GB) + "
+                f"runtime_overhead_bytes ({overhead_gb:.2f} GB). "
+                "\n \n Possible solutions:"
+                "\n  1) Reduce model_base_bytes (the non-sharded model footprint), "
+                "e.g. by supplying a more accurate measured estimate. "
+                "\n  2) Use hardware with a higher hbm cap. "
+            )
+            raise PlannerError(
+                error_type=PlannerErrorType.INSUFFICIENT_STORAGE,
+                message=insufficient_storage_solution,
+            )
+
+        _reserve_storage_absolute(reserved_topology, self._reserved_bytes)
+        self._last_reserved_topology = reserved_topology
+        return reserved_topology
+
+    @property
+    def last_reserved_topology(self) -> Optional[Topology]:
+        "Returns a copy of the cached value of the most recent output from the reserve() method."
+        return copy.deepcopy(self._last_reserved_topology)
 
 
 class HeuristicalStorageReservation(StorageReservation):
