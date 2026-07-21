@@ -141,6 +141,26 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             except Exception:
                 pass
 
+    def test_construct_without_process_group(self) -> None:
+        """Constructs with no initialized PG (e.g. single-process model validation);
+        the gloo group is deferred to first compute."""
+        with patch(
+            "torchrec.metrics.cpu_offloaded_metric_module.dist.is_initialized",
+            return_value=False,
+        ), patch(
+            "torchrec.metrics.cpu_offloaded_metric_module.dist.new_group"
+        ) as mock_new_group:
+            module = self._make_module(
+                throughput_metric=ThroughputMetric(
+                    world_size=self.world_size,
+                    batch_size=self.batch_size,
+                    window_seconds=1,
+                ),
+            )
+        mock_new_group.assert_not_called()
+        self.assertIsNone(module.cpu_process_group)
+        module.shutdown()
+
     @unittest.skipIf(
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
