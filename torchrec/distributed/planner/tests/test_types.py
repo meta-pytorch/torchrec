@@ -27,6 +27,7 @@ from torchrec.distributed.planner.storage_reservations import (
 from torchrec.distributed.planner.types import (
     BasicCommsBandwidths,
     CustomTopologyData,
+    EmoConfig,
     HardwareConfig,
     hash_planner_context_inputs,
     KernelConfig,
@@ -35,6 +36,7 @@ from torchrec.distributed.planner.types import (
     Perf,
     PlannerConfig,
     PlannerVariant,
+    ProposerConfig,
     Shard,
     ShardDetail,
     ShardingOption,
@@ -47,6 +49,7 @@ from torchrec.distributed.planner.types import (
     TopologyFactory,
     TrainerConfig,
     TrainingFramework,
+    TuneClfConfig,
 )
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
@@ -2064,6 +2067,46 @@ class ShardingPlanRequestTest(unittest.TestCase):
                 )
             ).request_hash,
         )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    proposer_config=ProposerConfig(kind="dynamic_col_dim", step_size=4)
+                )
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    lp_config=LpPlannerConfig(
+                        emo_config=EmoConfig(integration_type="add_as_constraint")
+                    )
+                )
+            ).request_hash,
+        )
+        # EMO CLF-tuning knobs participate too: two requests differing only in
+        # tune_clf_config must fingerprint differently, else the cache returns one
+        # config's plan for the other.
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(
+                    lp_config=LpPlannerConfig(
+                        emo_config=EmoConfig(tune_clf_config=TuneClfConfig(max_clf=0.5))
+                    )
+                )
+            ).request_hash,
+        )
+
+    def test_proposer_type_and_config_mutually_exclusive(self) -> None:
+        # Both set would hash distinctly for the same intent and let OSS vs fb
+        # builders pick differently, so PlannerConfig rejects it.
+        with self.assertRaisesRegex(ValueError, "only one of proposer_type"):
+            PlannerConfig(
+                proposer_type="greedy",
+                proposer_config=ProposerConfig(kind="dynamic_col_dim"),
+            )
 
     def test_request_hash_constraints_order_independent(self) -> None:
         # constraints is a dict; two requests with the same entries inserted in
@@ -2111,6 +2154,8 @@ class PlannerConfigTest(unittest.TestCase):
         self.assertIsNone(cfg.memory_balanced_max_search_count)
         self.assertIsNone(cfg.memory_balanced_tolerance)
         self.assertIsNone(cfg.performance_model)
+        self.assertIsNone(cfg.proposer_config)
+        self.assertIsNone(cfg.lp_config)
 
     def test_percentage_range_validated(self) -> None:
         for bad in (-0.1, 1.1):
