@@ -207,7 +207,10 @@ class DefaultPlannerProvider(PlannerProvider):
             StorageReservationPolicy.UNSET,
             StorageReservationPolicy.HEURISTICAL,
         ):
-            return HeuristicalStorageReservation(percentage=percentage)
+            return HeuristicalStorageReservation(
+                percentage=percentage,
+                dense_tensor_estimate=cfg.dense_tensor_estimate,
+            )
         if policy == StorageReservationPolicy.FIXED_PERCENTAGE:
             return FixedPercentageStorageReservation(percentage=percentage)
         if policy == StorageReservationPolicy.INFERENCE:
