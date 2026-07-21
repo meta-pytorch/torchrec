@@ -8,18 +8,40 @@
 # pyre-strict
 
 import abc
+import dataclasses
 import logging
-from typing import Dict, List, Mapping, Optional
+from typing import cast, Dict, List, Mapping, Optional
 
 import torch.distributed as dist
 from torchrec.distributed.planner.protocols import PlannerExecutor
+from torchrec.distributed.planner.reporter import DefaultPlanReporter, PlanReporter
 from torchrec.distributed.planner.types import (
     PlannerSessionContext,
     ShardingPlanRequest,
     ShardingPlanResult,
+    Stats,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _plan_dump_location(stats: Optional[List[Stats]]) -> Optional[str]:
+    """Best-effort persisted-plan location from a stats sink, if one provides it.
+
+    A sink that uploads the plan (e.g. the fb ``ManifoldStats``) exposes
+    ``get_most_recent_sharding_plan_dump_location``; read it duck-typed so the OSS
+    layer needs no fb import (the OSS console sink simply lacks it). Returns None
+    when no sink persisted a plan.
+    """
+    for sink in stats or []:
+        getter = getattr(sink, "get_most_recent_sharding_plan_dump_location", None)
+        if callable(getter):
+            # Duck-typed sink -> getter() is untyped; the sink returns the plan's
+            # str location, so cast to satisfy the declared Optional[str] return.
+            location = getter()
+            if location:
+                return cast(str, location)
+    return None
 
 
 class ShardingPlannerAPI(abc.ABC):
@@ -45,9 +67,15 @@ class ShardingPlannerAPI(abc.ABC):
     def __init__(
         self,
         executor: PlannerExecutor,
+        reporter: Optional[PlanReporter] = None,
         broadcast_pg: Optional[dist.ProcessGroup] = None,
     ) -> None:
         self._executor = executor
+        # Observability seam, owned here so dry-run and production share it; OSS
+        # default is console-only, Meta injects the Manifold/Scuba reporter.
+        self._reporter: PlanReporter = (
+            reporter if reporter is not None else DefaultPlanReporter()
+        )
         # Optional caller-injected process group for the rank-0 plan + broadcast.
         # APF passes its Gloo control group (cpu_ctl_dist_pg) here to avoid NCCL
         # object-broadcast corruption on some SKUs (e.g. GB300). When None,
@@ -93,7 +121,41 @@ class ShardingPlannerAPI(abc.ABC):
         # silently overwrite the earlier result.
         for sku in dict.fromkeys(self._targets(request)):
             try:
+                # ctx.stats is reporter-managed (not a caller input): rebuild fresh
+                # sinks per target so a multi-SKU dry-run sweep never reuses stateful
+                # sinks across SKUs. The executor forwards them (via ctx) to the
+                # SKU's planner. Owned here so all paths report alike. Observability
+                # is fail-isolated: building the sinks is best-effort so a telemetry
+                # failure never aborts planning -- on failure we plan with no sinks.
+                try:
+                    ctx.stats = self._reporter.build_stats(ctx, sku)
+                except Exception:
+                    logger.warning(
+                        "[planner] reporter build_stats failed for sku=%s; "
+                        "planning without stats sinks",
+                        sku,
+                        exc_info=True,
+                    )
+                    ctx.stats = []
                 result = self._executor.run(sku=sku, ctx=ctx, pg=pg)
+                # Surface where this SKU's plan was persisted (e.g. the Manifold
+                # upload path) onto the result so callers can locate each plan; the
+                # sink recorded it during executor.run. Result is frozen -> replace.
+                # Best-effort: reading a sink's dump location must not fail the
+                # (already-computed) plan.
+                try:
+                    plan_url = _plan_dump_location(ctx.stats)
+                except Exception:
+                    logger.warning(
+                        "[planner] reading plan dump location failed for sku=%s",
+                        sku,
+                        exc_info=True,
+                    )
+                    plan_url = None
+                if plan_url:
+                    result = dataclasses.replace(
+                        result, sharding_plan_manifold_url=plan_url
+                    )
                 result = self._finalize_result(sku, result, request)
             except Exception as e:
                 # Fail-fast by default (production plans a single SKU: a broken
@@ -103,7 +165,9 @@ class ShardingPlannerAPI(abc.ABC):
                 # what-if sweep -- it is recorded as an unsuccessful result and
                 # the loop keeps going. (``PlannerError`` is already turned into a
                 # success=False result inside the executor; this governs only the
-                # unexpected errors that would otherwise propagate.)
+                # unexpected errors that would otherwise propagate. Observability
+                # failures are already swallowed above, so this catches planning
+                # errors only.)
                 if not self._isolate_target_errors():
                     raise
                 logger.warning(
@@ -226,9 +290,10 @@ class ProductionPlannerOrchestrator(ShardingPlannerAPI):
         self,
         executor: PlannerExecutor,
         sku: str,
+        reporter: Optional[PlanReporter] = None,
         broadcast_pg: Optional[dist.ProcessGroup] = None,
     ) -> None:
-        super().__init__(executor, broadcast_pg=broadcast_pg)
+        super().__init__(executor, reporter, broadcast_pg=broadcast_pg)
         self._sku = sku
 
     def _targets(self, request: ShardingPlanRequest) -> List[str]:
