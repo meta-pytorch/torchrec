@@ -140,6 +140,21 @@ _DTYPE_MAX: Dict[torch.dtype, int] = {
 
 _TORCHREC_OVERFLOW_DEBUG: bool = os.environ.get("TORCHREC_OVERFLOW_DEBUG", "0") == "1"
 
+# Opt-in, job-wide widening of the variable-batch KJT all-to-all recat/offset
+# tensors from int32 to int64. Must be set identically on every rank (the dtype
+# is part of the all-to-all collective contract). See _get_recat for why the
+# choice is an explicit flag rather than a data-dependent upcast.
+_TORCHREC_ENABLE_INT64_RECAT: bool = (
+    os.environ.get("TORCHREC_ENABLE_INT64_RECAT", "0") == "1"
+)
+# The recat dtype is fixed for the lifetime of the job by the env var above, so
+# log it once here at import rather than on every KJT all-to-all construction.
+logger.info(
+    "_get_recat: variable-batch recat dtype=%s (TORCHREC_ENABLE_INT64_RECAT=%s)",
+    torch.int64 if _TORCHREC_ENABLE_INT64_RECAT else torch.int32,
+    _TORCHREC_ENABLE_INT64_RECAT,
+)
+
 
 def _collective_tag_from(*parts: object) -> int:
     """Compute a deterministic collective tag from identifying parts.
@@ -312,6 +327,27 @@ def _get_recat(
             output_offset = [0] + list(
                 itertools.accumulate(permuted_batch_size_per_feature)
             )
+            # Default to int32; int64 is an explicit, job-wide opt-in (dtype is
+            # part of the all-to-all contract, so it must not vary with the data).
+            # At large variable-batch scale the offsets can exceed int32 and
+            # overflow the tensors below; log fatal to enable the flag when so.
+            recat_dtype = torch.int64 if _TORCHREC_ENABLE_INT64_RECAT else torch.int32
+            if (
+                recat_dtype == torch.int32
+                and max(input_offset[-1], output_offset[-1])
+                > torch.iinfo(torch.int32).max
+            ):
+                logger.fatal(
+                    "_get_recat: variable-batch offsets exceed the int32 range "
+                    f"(max offset={max(input_offset[-1], output_offset[-1])} > "
+                    f"{torch.iinfo(torch.int32).max}); the int32 recat/offset "
+                    "tensors below will overflow. Set TORCHREC_ENABLE_INT64_RECAT=1 "
+                    "on every rank to widen the KJT all-to-all recat/offset tensors "
+                    "to int64, or reduce the effective batch size. "
+                    f"batch_size_per_rank={batch_size_per_rank}, "
+                    f"local_split={local_split}, num_splits={num_splits}, "
+                    f"stagger={stagger}."
+                )
 
             _check_int_overflow(
                 "_get_recat",
@@ -326,6 +362,7 @@ def _get_recat(
                 "_get_recat",
                 input_offset,
                 "input_offset",
+                target_dtype=recat_dtype,
                 local_split=local_split,
                 num_splits=num_splits,
             )
@@ -333,6 +370,7 @@ def _get_recat(
                 "_get_recat",
                 output_offset,
                 "output_offset",
+                target_dtype=recat_dtype,
                 local_split=local_split,
                 num_splits=num_splits,
             )
@@ -341,21 +379,21 @@ def _get_recat(
                 recat_tensor = torch.tensor(
                     recat,
                     device=device,
-                    dtype=torch.int32,
+                    dtype=recat_dtype,
                 )
                 input_offset_tensor = torch.tensor(
                     input_offset,
                     device=device,
-                    dtype=torch.int32,
+                    dtype=recat_dtype,
                 )
                 output_offset_tensor = torch.tensor(
                     output_offset,
                     device=device,
-                    dtype=torch.int32,
+                    dtype=recat_dtype,
                 )
             except RuntimeError as e:
                 logger.error(
-                    f"_get_recat: int32 tensor creation failed: {e}. "
+                    f"_get_recat: {recat_dtype} tensor creation failed: {e}. "
                     f"batch_size_per_rank={batch_size_per_rank}, "
                     f"input_offset={input_offset}, "
                     f"output_offset={output_offset}, "
