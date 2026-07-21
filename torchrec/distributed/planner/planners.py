@@ -636,6 +636,21 @@ class EmbeddingPlannerBase(ShardingPlanner):
             self._constraints,
         )
 
+    def get_selected_options(self) -> List[ShardingOption]:
+        """The chosen per-shard ShardingOptions from the most recent ``plan()``.
+
+        The unified PlannerExecutor reads this to build the per-table breakdown
+        and the peak per-rank storage estimates on the ShardingPlanResult. Every
+        planner run under that executor must override it to return the plan it
+        selected. The base raises (rather than returning ``[]``) so a planner that
+        forgets to expose its plan fails loudly instead of silently reporting
+        empty options and zero-byte estimates on a successful plan.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} must implement get_selected_options() to expose "
+            "its selected ShardingOptions to the planner executor."
+        )
+
 
 class EmbeddingShardingPlanner(EmbeddingPlannerBase):
     """
@@ -721,6 +736,11 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         self._num_proposals: int = 0
         self._num_plans: int = 0
         self._best_plan: Optional[List[ShardingOption]] = None
+
+    def get_selected_options(self) -> List[ShardingOption]:
+        # The winning proposal from the last plan(); None until plan() runs (or
+        # [] on a failed plan whose shards were reset to rank -1).
+        return self._best_plan or []
 
     @EventLoggingHandler.event_logger(TorchrecComponent.PLANNER)
     def collective_plan(
