@@ -127,9 +127,15 @@ jobs:
         echo "numpy succeeded"
         conda run -n build_binary \
           pip install pytest
+        # torch.compile/dynamo segfaults on free-threaded Python (GIL disabled)
+        PT2_IGNORES=""
+        if [[ "${{ matrix.python.free_threaded }}" == "true" ]]; then
+          PT2_IGNORES="--ignore=torchrec/distributed/tests/test_pt2.py --ignore=torchrec/distributed/tests/test_pt2_multiprocess.py"
+        fi
         conda run -n build_binary \
           python -m pytest torchrec -v -s -W ignore::pytest.PytestCollectionWarning --continue-on-collection-errors \
         --ignore-glob=**/test_utils/ \
+        $PT2_IGNORES \
         -k "not _disabled_in_oss_compatibility"
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}-${{ inputs.repository }}-${{ github.event_name == 'workflow_dispatch' }}
