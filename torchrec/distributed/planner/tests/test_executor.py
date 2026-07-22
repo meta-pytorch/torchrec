@@ -9,11 +9,12 @@
 
 import unittest
 from typing import cast, List
+from unittest.mock import MagicMock
 
 import torch
 import torch.nn as nn
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
-from torchrec.distributed.planner.executor import DefaultPlannerExecutor
+from torchrec.distributed.planner.executor import _plan_quality, DefaultPlannerExecutor
 from torchrec.distributed.planner.partitioners import (
     GreedyPerfPartitioner,
     MemoryBalancedPartitioner,
@@ -22,9 +23,12 @@ from torchrec.distributed.planner.proposers import GreedyProposer, UniformPropos
 from torchrec.distributed.planner.protocols import PlannerExecutor
 from torchrec.distributed.planner.provider import DefaultPlannerProvider
 from torchrec.distributed.planner.types import (
+    Perf,
     PlannerConfig,
     PlannerSessionContext,
     PlannerVariant,
+    Shard,
+    ShardingOption,
     ShardingPlanRequest,
 )
 from torchrec.distributed.test_utils.test_model import TestSparseNN
@@ -61,6 +65,78 @@ class DefaultPlannerExecutorTest(unittest.TestCase):
 
     def test_conforms_to_protocol(self) -> None:
         self.assertIsInstance(DefaultPlannerExecutor(), PlannerExecutor)
+
+    def _shard(self, rank: int, perf: Perf) -> Shard:
+        shard = Shard(size=[50, 64], offset=[0, 0])
+        shard.rank = rank
+        shard.perf = perf
+        return shard
+
+    def _option(self, name: str, shards: List[Shard]) -> ShardingOption:
+        return ShardingOption(
+            name=name,
+            tensor=MagicMock(),
+            module=MagicMock(),
+            input_lengths=MagicMock(),
+            batch_size=MagicMock(),
+            sharding_type="table_wise",
+            partition_by=MagicMock(),
+            compute_kernel=MagicMock(),
+            shards=shards,
+        )
+
+    def test_plan_quality_critical_path_and_imbalance(self) -> None:
+        # rank 0 shard perf.total = 4+4+1+1 = 10; rank 1 = 2+2+1+1 = 6.
+        best_plan = [
+            self._option(
+                "t0",
+                [
+                    self._shard(
+                        0, Perf(fwd_compute=4, fwd_comms=1, bwd_compute=4, bwd_comms=1)
+                    ),
+                    self._shard(
+                        1, Perf(fwd_compute=2, fwd_comms=1, bwd_compute=2, bwd_comms=1)
+                    ),
+                ],
+            )
+        ]
+        total, comms, comp, max_perf, mean_perf, imbalance = _plan_quality(best_plan)
+        self.assertIsNotNone(total)
+        self.assertAlmostEqual(
+            cast(float, total), cast(float, comms) + cast(float, comp)
+        )
+        self.assertAlmostEqual(cast(float, max_perf), 10.0)
+        self.assertAlmostEqual(cast(float, mean_perf), 8.0)
+        self.assertAlmostEqual(cast(float, imbalance), 1.25)  # max/mean = 10/8
+
+    def test_plan_quality_empty_plan_is_all_none(self) -> None:
+        self.assertEqual(_plan_quality([]), (None, None, None, None, None, None))
+
+    def test_capture_search_space_opt_in(self) -> None:
+        # capture_search_space=True -> the executor stashes the full enumerated
+        # search space (per SKU) on ctx; it is a superset of the selected options.
+        model = self._model()
+        request = ShardingPlanRequest(
+            model=model,
+            sharders=self._sharders(),
+            world_size=2,
+            local_world_size=2,
+            batch_size=512,
+            capture_search_space=True,
+        )
+        ctx = PlannerSessionContext(request=request, results={})
+        result = DefaultPlannerExecutor().run(sku="H100", ctx=ctx, pg=None)
+        self.assertTrue(result.success, result.planner_failure_reason)
+        self.assertIn("H100", ctx.search_space)
+        self.assertGreaterEqual(
+            len(ctx.search_space["H100"]), len(result.sharding_options)
+        )
+
+    def test_search_space_not_captured_by_default(self) -> None:
+        model = self._model()
+        ctx = self._ctx(model)  # capture_search_space defaults False
+        DefaultPlannerExecutor().run(sku="H100", ctx=ctx, pg=None)
+        self.assertEqual(ctx.search_space, {})
 
     def test_embedding_plan_end_to_end(self) -> None:
         # The executor builds topology + storage reservation + planner from the

@@ -7,8 +7,9 @@
 
 # pyre-strict
 
+import logging
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
 
 import torch.distributed as dist
 import torch.nn as nn
@@ -25,6 +26,15 @@ from torchrec.distributed.planner.types import (
     ShardingOptionDetail,
     ShardingPlanResult,
 )
+
+if TYPE_CHECKING:
+    # Type-only import: pulling planners at runtime would import
+    # torchrec.distributed.planner.stats transitively, defeating the lazy
+    # _calculate_critical_path import in _plan_quality. It is used solely as an
+    # annotation in _maybe_capture_search_space.
+    from torchrec.distributed.planner.planners import EmbeddingPlannerBase
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def _peak_per_rank_storage(best_plan: List[ShardingOption]) -> Tuple[int, int]:
@@ -48,6 +58,119 @@ def _peak_per_rank_storage(best_plan: List[ShardingOption]) -> Tuple[int, int]:
         max(hbm_by_rank.values(), default=0),
         max(ddr_by_rank.values(), default=0),
     )
+
+
+def _plan_quality(
+    best_plan: List[ShardingOption],
+) -> Tuple[
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+]:
+    """(critical_path total, comms, comp, max_rank_perf, mean_rank_perf, imbalance).
+
+    Best-effort observability read of the chosen plan's per-shard Perf breakdown.
+    The six values are two independently-guarded halves that do NOT move as a unit:
+    the critical path (total, comms, comp) and the per-rank modeled-perf balance
+    (max, mean, and max/mean ratio -- 1.0 is perfectly balanced). All six are None
+    only for an empty best_plan (off the planning rank, or a no-op plan). Otherwise
+    each half is computed under its own guard, so a failure in one leaves it None
+    while the other is still returned -- e.g. (None, None, None, max, mean, imbalance)
+    if the critical-path read fails, or (total, comms, comp, None, None, None) if the
+    per-rank aggregation fails. Never raises, so a metrics-only failure cannot affect
+    planning.
+    """
+    # Empty plan (off the planning rank, or a no-op plan) -> the breakdown is
+    # unavailable, not zero. Return all-None rather than the 0s that
+    # _calculate_critical_path([]) would produce, so sinks record "absent".
+    if not best_plan:
+        return (None, None, None, None, None, None)
+    # Compute the critical-path breakdown independently of the per-rank perf
+    # balance: a stats-side failure here must leave total/comms/comp None but must
+    # NOT drop the imbalance signal (the O5 metric that motivated this diff), which
+    # is derivable from best_plan alone.
+    total: Optional[float] = None
+    comms: Optional[float] = None
+    comp: Optional[float] = None
+    try:
+        # Imported lazily so the OSS executor never pays the stats import cost on
+        # the planning hot path unless a plan actually needs the breakdown.
+        from torchrec.distributed.planner.stats import _calculate_critical_path
+
+        cp = _calculate_critical_path(best_plan)
+        total, comms, comp = cp.total(), cp.comms_estimate, cp.comp_estimate
+    except Exception:
+        pass
+    # Per-rank modeled-perf balance (independent of the critical-path breakdown);
+    # guarded so this metrics-only read can never raise into planning.
+    try:
+        perf_by_rank: Dict[int, float] = {}
+        for option in best_plan:
+            for shard in option.shards:
+                if shard.rank is None or shard.perf is None:
+                    continue
+                perf_by_rank[shard.rank] = (
+                    perf_by_rank.get(shard.rank, 0.0) + shard.perf.total
+                )
+        if not perf_by_rank:
+            return (total, comms, comp, None, None, None)
+        vals = list(perf_by_rank.values())
+        max_perf = max(vals)
+        mean_perf = sum(vals) / len(vals)
+        imbalance = max_perf / mean_perf if mean_perf > 0 else None
+        return (total, comms, comp, max_perf, mean_perf, imbalance)
+    except Exception:
+        return (total, comms, comp, None, None, None)
+
+
+def _materialize_model(
+    model: Union[nn.Module, Callable[[], nn.Module]],
+) -> nn.Module:
+    """Return the request's model, materializing it if it is a factory callable."""
+    if isinstance(model, nn.Module):
+        return model
+    # Guard callable first so a non-module, non-factory value gets the intended
+    # message instead of a bare "X object is not callable".
+    if not callable(model):
+        raise TypeError(
+            "request.model must be an nn.Module or a factory callable returning "
+            f"one, got {type(model).__name__}"
+        )
+    built = model()
+    if not isinstance(built, nn.Module):
+        raise TypeError(
+            f"request.model factory must return an nn.Module, got {type(built).__name__}"
+        )
+    return built
+
+
+def _maybe_capture_search_space(
+    ctx: PlannerSessionContext, sku: str, planner: "EmbeddingPlannerBase"
+) -> None:
+    """Opt-in, best-effort capture of the full enumerated search space (per SKU).
+
+    Off by default -- the space is large and deterministically re-derivable from
+    request_spec + model_arch -- so a capture failure never affects the plan.
+    """
+    if not ctx.request.capture_search_space:
+        return
+    try:
+        ctx.search_space[sku] = tuple(
+            ShardingOptionDetail.from_sharding_option(option)
+            for option in (planner.get_search_space() or ())
+        )
+    except Exception:
+        # Best-effort (never affects planning), but log so a silent capture
+        # failure is diagnosable rather than surfacing downstream as an
+        # unexplained empty search_space_url (matches maybe_upload_planner_content).
+        logger.warning(
+            "[planner_executor] search-space capture failed for sku=%s",
+            sku,
+            exc_info=True,
+        )
 
 
 class DefaultPlannerExecutor(PlannerExecutor):
@@ -85,21 +208,7 @@ class DefaultPlannerExecutor(PlannerExecutor):
     ) -> ShardingPlanResult:
         # model/sharders come from the request (not passed separately);
         # materialize the model if it is a factory.
-        model = ctx.request.model
-        if not isinstance(model, nn.Module):
-            # Guard callable first so a non-module, non-factory value gets the
-            # intended message instead of a bare "X object is not callable".
-            if not callable(model):
-                raise TypeError(
-                    "request.model must be an nn.Module or a factory callable "
-                    f"returning one, got {type(model).__name__}"
-                )
-            model = model()
-            if not isinstance(model, nn.Module):
-                raise TypeError(
-                    "request.model factory must return an nn.Module, got "
-                    f"{type(model).__name__}"
-                )
+        model = _materialize_model(ctx.request.model)
         sharders = ctx.request.sharders
 
         # Capture the model's sparse-arch surface once per session (the model axis
@@ -197,7 +306,21 @@ class DefaultPlannerExecutor(PlannerExecutor):
         sharding_options = tuple(
             ShardingOptionDetail.from_sharding_option(option) for option in best_plan
         )
+        # Opt-in, best-effort capture of the full enumerated search space (per SKU).
+        _maybe_capture_search_space(ctx, sku, planner)
         max_hbm_bytes, max_ddr_bytes = _peak_per_rank_storage(best_plan)
+        # Plan-quality / critical-path breakdown off the chosen plan's per-shard
+        # Perf (best-effort; all-None off the planning rank where best_plan is
+        # empty). Computed here -- the only place the full Perf survives -- because
+        # ShardingOptionDetail collapses it to a single perf_total downstream.
+        (
+            critical_path_ms,
+            comms_critical_path_ms,
+            comp_critical_path_ms,
+            max_rank_perf,
+            mean_rank_perf,
+            perf_imbalance_ratio,
+        ) = _plan_quality(best_plan)
         return ShardingPlanResult(
             sku=sku,
             success=True,
@@ -210,4 +333,10 @@ class DefaultPlannerExecutor(PlannerExecutor):
             sharding_options=sharding_options,
             solve_time_ms=solve_time_ms,
             is_planning_rank=is_planning_rank,
+            critical_path_ms=critical_path_ms,
+            comms_critical_path_ms=comms_critical_path_ms,
+            comp_critical_path_ms=comp_critical_path_ms,
+            max_rank_perf=max_rank_perf,
+            mean_rank_perf=mean_rank_perf,
+            perf_imbalance_ratio=perf_imbalance_ratio,
         )
