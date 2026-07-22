@@ -33,7 +33,9 @@ from pyre_extensions import none_throws
 from torchrec.distributed.dist_data import (
     _check_pg_for_nccl_error,
     _collective_tag_from,
+    _COLLECTIVE_TAG_MAX_BYTES,
     _get_recat,
+    _int_tuple_digest,
     JaggedTensorAllToAll,
     KJTAllToAll,
     KJTAllToAllSplitsAwaitable,
@@ -1591,29 +1593,32 @@ class CollectiveTagFromTest(unittest.TestCase):
         self.assertLessEqual(tag, self._INT32_MAX)
 
     def test_various_parts_all_fit_signed_int32(self) -> None:
-        # Sanity: a range of realistic call shapes all stay within int32.
-        # Mirrors the actual tag shapes used by the two production call sites
-        # (KJTAllToAllSplitsAwaitable, FusedKJTListSplitsAwaitable). If FNV-1a's
-        # mixing changes or one of the call sites grows a new identity field,
-        # this catches a regression across both.
+        # Sanity check: the tag shapes both production call sites use
+        # produce non-negative int32 values. Splits arrive already
+        # hashed via _int_tuple_digest.
         cases = [
-            # KJTAllToAllSplits production shape: (name, keys, tuple(splits))
-            ("KJTAllToAllSplits", ["f0", "f1"], (1, 1)),
-            # FusedKJTListSplits production shape: (name, tuple of per-request
-            # entries — meta entries are (keys, splits, count); non-meta is None).
+            # KJTAllToAllSplits: (name, keys, hashed splits)
+            ("KJTAllToAllSplits", ["f0", "f1"], _int_tuple_digest((1, 1))),
+            # FusedKJTListSplits flat shape: (name, count, "has_splits",
+            # hashed splits, tensor count, keys, ..., "no_splits", ...).
             (
                 "FusedKJTListSplits",
-                (
-                    (("f0", "f1"), (1, 1), 2),
-                    None,
-                    (("f2",), (1,), 1),
-                ),
+                3,
+                "has_splits",
+                _int_tuple_digest((1, 1)),
+                2,
+                ("f0", "f1"),
+                "no_splits",
+                "has_splits",
+                _int_tuple_digest((1,)),
+                1,
+                ("f2",),
             ),
             # Boundary: empty keys / empty splits
-            ("KJTAllToAllSplits", [], ()),
-            # Boundary: empty fused awaitables list
-            ("FusedKJTListSplits", ()),
-            # Long single string — guards against FNV-1a length-related issues
+            ("KJTAllToAllSplits", [], _int_tuple_digest(())),
+            # Boundary: fused with zero requests
+            ("FusedKJTListSplits", 0),
+            # Long single string, guards against a length-related bug in the hash
             ("x" * 1024,),
         ]
         for parts in cases:
@@ -1623,26 +1628,170 @@ class CollectiveTagFromTest(unittest.TestCase):
                 self.assertLessEqual(tag, self._INT32_MAX)
 
     def test_deterministic(self) -> None:
-        # Determinism is the main reason this exists instead of hash().
-        # If the implementation accidentally introduces nondeterminism
-        # (e.g., switching to hash() under PYTHONHASHSEED randomization),
-        # different ranks would compute different tags and the validation
-        # would false-positive.
+        # The tag must be deterministic across processes. If we ever
+        # switched to Python's hash() (which uses a random seed per
+        # process), different ranks would compute different tags and
+        # validation would false-positive.
         self.assertEqual(
             _collective_tag_from("KJTAllToAllSplits", ["f0", "f1"], 3),
             _collective_tag_from("KJTAllToAllSplits", ["f0", "f1"], 3),
         )
 
+    def test_intra_list_element_boundary_is_unambiguous(self) -> None:
+        # List elements are length-prefixed, so ["a,b", "c"] and
+        # ["a", "b,c"] must produce different tags.
+        self.assertNotEqual(
+            _collective_tag_from("X", ["a,b", "c"]),
+            _collective_tag_from("X", ["a", "b,c"]),
+        )
+
+    def test_doubly_nested_list_framing_disambiguates(self) -> None:
+        # Length-prefixing works through nested containers, so
+        # [[a, b], [c]] and [[a], [b, c]] must produce different tags.
+        self.assertNotEqual(
+            _collective_tag_from("X", [["a", "b"], ["c"]]),
+            _collective_tag_from("X", [["a"], ["b", "c"]]),
+        )
+
     def test_separator_is_unambiguous(self) -> None:
-        # Regression: with a "," separator, _collective_tag_from("a", "b") and
-        # _collective_tag_from("a,b") both serialize to the bytes b"a,b" and
-        # collide, silently disabling validation for any future call site that
-        # passes raw strings containing commas. The NUL separator avoids the
-        # collision because collective identifier parts cannot contain \x00.
+        # Parts are joined by NUL, which is safe because tag parts never
+        # contain \x00. Regression guard: if we ever used a printable
+        # separator, ("a", "b") and ("a,b") would produce the same bytes
+        # and hash to the same tag.
         self.assertNotEqual(
             _collective_tag_from("a", "b"),
             _collective_tag_from("a,b"),
         )
+
+    def test_length_divergence_detected(self) -> None:
+        # Lists of different lengths must produce different tags.
+        self.assertNotEqual(
+            _collective_tag_from("X", ["a"] * 10),
+            _collective_tag_from("X", ["a"] * 11),
+        )
+
+    def test_small_list_element_change_detected_via_iteration(self) -> None:
+        # When the list is small enough to fit in the length limit,
+        # any element change produces a different tag.
+        self.assertNotEqual(
+            _collective_tag_from("X", ["a"] * 10 + ["b"]),
+            _collective_tag_from("X", ["a"] * 10 + ["c"]),
+        )
+
+    def test_large_input_stays_in_int32_and_stays_deterministic(self) -> None:
+        # Even with a huge input, the tag stays in int32 range and
+        # is stable across repeated calls.
+        big = ["k"] * 100_000
+        tag_1 = _collective_tag_from("X", big)
+        tag_2 = _collective_tag_from("X", big)
+        self.assertEqual(tag_1, tag_2)
+        self.assertGreaterEqual(tag_1, 0)
+        self.assertLessEqual(tag_1, self._INT32_MAX)
+
+    def test_length_still_distinguished_beyond_cap(self) -> None:
+        # Two lists of different lengths must produce different tags
+        # even when both are past the length limit.
+        self.assertNotEqual(
+            _collective_tag_from("X", ["k"] * 100_000),
+            _collective_tag_from("X", ["k"] * 200_000),
+        )
+
+    def test_past_cap_middle_divergence_documented_collision(self) -> None:
+        # Documented blind spot: two lists that match up to the length
+        # limit produce the same tag, even if they differ past it.
+        a = ["padding"] * 10_000 + ["same_middle"] + ["padding"] * 9999 + ["tail"]
+        b = ["padding"] * 10_000 + ["diff_middle"] + ["padding"] * 9999 + ["tail"]
+        self.assertEqual(
+            _collective_tag_from("X", a),
+            _collective_tag_from("X", b),
+        )
+
+    def test_huge_scalar_string_and_bytes_bounded_allocation(self) -> None:
+        # A huge str or bytes gets truncated to the length limit, so it
+        # hashes to the same tag as its shorter prefix.
+        huge_str = "x" * 1_000_000
+        huge_bytes = b"x" * 1_000_000
+        prefix_str = "x" * _COLLECTIVE_TAG_MAX_BYTES
+        prefix_bytes = b"x" * _COLLECTIVE_TAG_MAX_BYTES
+        self.assertEqual(
+            _collective_tag_from("X", huge_str),
+            _collective_tag_from("X", prefix_str),
+        )
+        self.assertEqual(
+            _collective_tag_from("X", huge_bytes),
+            _collective_tag_from("X", prefix_bytes),
+        )
+
+    def test_fused_flat_shape_high_n_middle_splits_divergence(self) -> None:
+        # Each request pre-hashes its splits, so a change in one
+        # request's splits values is caught even when the surrounding
+        # keys are very wide.
+        huge_keys = tuple(f"feat_{i}" for i in range(5000))
+        splits_a = (2,) * 64 + (1,) * 63 + (2,)
+        splits_b = (2,) * 64 + (3,) * 63 + (2,)
+
+        def _flat(divergent_at_7: Tuple[int, ...]) -> Tuple[object, ...]:
+            parts: List[object] = ["FusedKJTListSplits", 15]
+            for j in range(15):
+                splits = divergent_at_7 if j == 7 else splits_a
+                parts.extend(("has_splits", _int_tuple_digest(splits), 1, huge_keys))
+            return tuple(parts)
+
+        self.assertNotEqual(
+            _collective_tag_from(*_flat(splits_a)),
+            _collective_tag_from(*_flat(splits_b)),
+        )
+
+    def test_fused_flat_shape_reordered_same_type_requests(self) -> None:
+        # Two requests with the same splits but different keys must
+        # produce different tags depending on their order.
+        splits_digest = _int_tuple_digest((2, 2, 2, 2))
+        req_a = ("has_splits", splits_digest, 1, tuple(f"a{i}" for i in range(256)))
+        req_b = ("has_splits", splits_digest, 1, tuple(f"b{i}" for i in range(256)))
+        self.assertNotEqual(
+            _collective_tag_from("FusedKJTListSplits", 2, *req_a, *req_b),
+            _collective_tag_from("FusedKJTListSplits", 2, *req_b, *req_a),
+        )
+
+    def test_rw_bucketized_keys_do_not_hide_splits_digest(self) -> None:
+        # Realistic RW-bucketized shape: 78 features × 256 world_size
+        # replicas. Because splits are pre-hashed, a change in a single
+        # split value is caught even with a very wide keys list.
+        bucketized_keys = [f"feat_{i}" for i in range(78)] * 256
+        splits_a = _int_tuple_digest((78,) * 256)
+        splits_b = _int_tuple_digest((78,) * 128 + (77,) + (78,) * 127)
+        self.assertNotEqual(
+            _collective_tag_from("KJTAllToAllSplits", bucketized_keys, splits_a),
+            _collective_tag_from("KJTAllToAllSplits", bucketized_keys, splits_b),
+        )
+
+    def test_tower_zero_heavy_split_destination_divergence(self) -> None:
+        # Cross-PG routing shape: mostly-zero splits with a nonzero
+        # entry that moves position. Different positions must produce
+        # different tags.
+        keys = [f"k{i}" for i in range(256)]
+        splits_a = _int_tuple_digest((0, 0, 32, 0, 0, 0, 0, 0))
+        splits_b = _int_tuple_digest((0, 0, 0, 32, 0, 0, 0, 0))
+        self.assertNotEqual(
+            _collective_tag_from("KJTAllToAllSplits", keys, splits_a),
+            _collective_tag_from("KJTAllToAllSplits", keys, splits_b),
+        )
+
+    def test_int_tuple_digest_is_deterministic(self) -> None:
+        self.assertEqual(_int_tuple_digest((1, 2, 3)), _int_tuple_digest((1, 2, 3)))
+
+    def test_int_tuple_digest_separator_disambiguates(self) -> None:
+        # NUL separator ensures [1, 23] and [12, 3] cannot collide.
+        self.assertNotEqual(_int_tuple_digest((1, 23)), _int_tuple_digest((12, 3)))
+
+    def test_int_tuple_digest_catches_past_cap_middle_divergence(self) -> None:
+        # Because every value is hashed, a change at any position in
+        # the tuple is caught, even when the tuple is longer than
+        # _COLLECTIVE_TAG_MAX_BYTES would allow if passed raw.
+        n = 2000  # 2000 ints * ~4 bytes each ~ 8KB, past the 4096 cap
+        splits_a = (2,) * (n // 2) + (1,) + (2,) * (n // 2)
+        splits_b = (2,) * (n // 2) + (3,) + (2,) * (n // 2)
+        self.assertNotEqual(_int_tuple_digest(splits_a), _int_tuple_digest(splits_b))
 
 
 class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):

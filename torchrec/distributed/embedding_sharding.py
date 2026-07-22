@@ -19,6 +19,7 @@ from torch import distributed as dist, nn
 from torchrec.distributed.collective_utils import validate_collectives_enabled
 from torchrec.distributed.dist_data import (
     _collective_tag_from,
+    _int_tuple_digest,
     KJTAllToAllTensorsAwaitable,
     SplitsAllToAllAwaitable,
 )
@@ -958,35 +959,26 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
         collective_tag: Optional[int] = None
         tag_parts: Optional[Tuple[object, ...]] = None
         if validate_collectives_enabled():
-            # Per-request rank-invariant identity, mirroring the tightening
-            # applied to KJTAllToAllSplitsAwaitable. A structural-only tag
-            # (e.g., len(splits_tensors) + self._lengths) collapses on real
-            # models: any two EBCs with identical KJT shape and sharding
-            # type produce the same `_lengths` vector, so a code-path
-            # divergence that fuses different module sets across ranks
-            # would compute the same tag and silently corrupt the all2all.
-            #
-            # Use aw._input.keys() (PRE-AllToAll keys, rank-invariant) —
-            # NOT aw.keys, which is the post-AllToAll local subset. Use
-            # tuple(aw.splits) for the per-request sharding plan
-            # (rank-invariant by KJTAllToAll's documented contract).
-            # Position-preserving: a None placeholder for non-meta
-            # awaitables keeps reordering detectable.
-            tag_parts = (
-                "FusedKJTListSplits",
-                tuple(
-                    (
+            # Walk the fused list. For each real splits request, add
+            # its marker + splits hash + count + keys as parts. For
+            # each placeholder, add just its marker. Splits are hashed
+            # first so they can't be truncated by a wide keys list.
+            # The "has_splits"/"no_splits" marker lets ranks detect
+            # when two ranks disagree on which slot is which.
+            parts_list: List[object] = ["FusedKJTListSplits", len(self._awaitables)]
+            for aw in self._awaitables:
+                if isinstance(aw, KJTSplitsAllToAllMeta):
+                    parts_list.extend(
                         (
-                            tuple(aw._input.keys()),
-                            tuple(aw.splits),
+                            "has_splits",
+                            _int_tuple_digest(tuple(aw.splits)),
                             len(aw.splits_tensors),
+                            tuple(aw._input.keys()),
                         )
-                        if isinstance(aw, KJTSplitsAllToAllMeta)
-                        else None
                     )
-                    for aw in self._awaitables
-                ),
-            )
+                else:
+                    parts_list.append("no_splits")
+            tag_parts = tuple(parts_list)
             collective_tag = _collective_tag_from(*tag_parts)
         self._splits_awaitable: Optional[SplitsAllToAllAwaitable] = (
             SplitsAllToAllAwaitable(
