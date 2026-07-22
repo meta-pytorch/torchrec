@@ -19,7 +19,8 @@ reuse ``build_request`` / ``print_results`` and pass an orchestrator wired with
 from __future__ import annotations
 
 import argparse
-from typing import cast, List, Mapping, Optional, Tuple
+import os
+from typing import Callable, cast, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -47,7 +48,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--sku-list",
         required=True,
         help="Comma-separated SKUs to plan for (TrainingHardware names for the "
-        "fb provider, e.g. 'GRANDTETON,GB200').",
+        "fb provider, e.g. 'GRANDTETON,GB200'). The Meta CLI additionally accepts "
+        "abstract fungible pools (e.g. 'TC_ANY', 'TC_ANY_80G', 'GTT_ANY'), which "
+        "it expands into their candidate SKUs.",
     )
     parser.add_argument("--world-size", type=int, required=True)
     parser.add_argument(
@@ -80,6 +83,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-tables", type=int, default=4)
     parser.add_argument("--num-embeddings", type=int, default=100_000)
     parser.add_argument("--embedding-dim", type=int, default=128)
+    parser.add_argument(
+        "--print-plan",
+        action="store_true",
+        help="After the per-SKU summary, print the full sharding plan (table -> "
+        "sharding_type/kernel -> per-rank shards) for each successful SKU.",
+    )
+    parser.add_argument(
+        "--save-plan-dir",
+        default=None,
+        help="Directory to write each successful SKU's plan to, as "
+        "<dir>/<sku>_sharding_plan.txt. Local files only (this synthetic CLI does "
+        "not persist to Manifold; use the real-model CLI for that).",
+    )
     return parser
 
 
@@ -119,8 +135,14 @@ def build_request(
     args: argparse.Namespace,
     model: nn.Module,
     sharders: List[ModuleSharder[nn.Module]],
+    sku_resolver: Optional[Callable[[List[str]], List[str]]] = None,
 ) -> DryRunRequest:
     sku_list = [s.strip() for s in args.sku_list.split(",") if s.strip()]
+    # A Meta caller injects a resolver that expands abstract fungible pools
+    # (e.g. TC_ANY) into their concrete candidate SKUs. OSS default is identity:
+    # the list must already be concrete SKUs (OSS has no notion of the pools).
+    if sku_resolver is not None:
+        sku_list = sku_resolver(sku_list)
     return DryRunRequest(
         model=model,
         sharders=sharders,
@@ -142,21 +164,29 @@ def build_request(
 def run(
     args: argparse.Namespace,
     orchestrator: Optional[DryRunOrchestrator] = None,
+    sku_resolver: Optional[Callable[[List[str]], List[str]]] = None,
 ) -> Mapping[str, DryRunResult]:
     """Plan every SKU and return the per-SKU results.
 
     ``orchestrator`` defaults to the OSS ``DefaultPlannerExecutor``; a Meta
-    caller passes one wired with ``FbPlannerProvider``.
+    caller passes one wired with ``FbPlannerProvider``. ``sku_resolver`` is an
+    optional hook to expand abstract fungible pools into concrete SKUs.
     """
     model, sharders = build_model_and_sharders(args)
-    request = build_request(args, model, sharders)
+    request = build_request(args, model, sharders, sku_resolver=sku_resolver)
     ctx = PlannerSessionContext(request=request, results={})
     orchestrator = orchestrator or DryRunOrchestrator(DefaultPlannerExecutor())
     return orchestrator.plan(request, ctx)
 
 
-def print_results(results: Mapping[str, DryRunResult]) -> None:
+def print_results(
+    results: Mapping[str, DryRunResult],
+    print_plan: bool = False,
+    save_plan_dir: Optional[str] = None,
+) -> None:
     print(f"Dry-run sharding plan: {len(results)} SKU(s)")
+    if save_plan_dir is not None:
+        os.makedirs(save_plan_dir, exist_ok=True)
     for sku in sorted(results):
         result = results[sku]
         status = "OK" if result.success else "FAIL"
@@ -169,15 +199,30 @@ def print_results(results: Mapping[str, DryRunResult]) -> None:
         )
         if not result.success:
             print(f"    reason: {result.planner_failure_reason}")
+            continue
+        # The synthetic CLI does not persist, so the plan is only surfaced on
+        # request: printed inline and/or written to a local file per SKU.
+        plan = result.sharding_plan
+        if plan is None:
+            continue
+        if print_plan:
+            print(f"    plan for {sku}:")
+            print(plan)
+        if save_plan_dir is not None:
+            path = os.path.join(save_plan_dir, f"{sku}_sharding_plan.txt")
+            with open(path, "w") as f:
+                f.write(str(plan))
+            print(f"    saved plan: {path}")
 
 
 def main(
     argv: Optional[List[str]] = None,
     orchestrator: Optional[DryRunOrchestrator] = None,
+    sku_resolver: Optional[Callable[[List[str]], List[str]]] = None,
 ) -> int:
     args = build_arg_parser().parse_args(argv)
-    results = run(args, orchestrator=orchestrator)
-    print_results(results)
+    results = run(args, orchestrator=orchestrator, sku_resolver=sku_resolver)
+    print_results(results, print_plan=args.print_plan, save_plan_dir=args.save_plan_dir)
     # Non-zero exit if any SKU failed to plan, so scripts can gate on it.
     return 0 if all(r.success for r in results.values()) else 1
 
