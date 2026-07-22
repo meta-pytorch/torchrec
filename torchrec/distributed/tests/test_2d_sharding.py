@@ -13,7 +13,15 @@ from typing import Any, cast, Dict, List, Optional, Tuple, Type
 import torch
 import torch.nn as nn
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
-from hypothesis import assume, given, Phase, settings, strategies as st, Verbosity
+from hypothesis import (
+    assume,
+    example,
+    given,
+    Phase,
+    settings,
+    strategies as st,
+    Verbosity,
+)
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.fbgemm_qcomm_codec import CommType, QCommsConfig
 from torchrec.distributed.planner import ParameterConstraints
@@ -297,12 +305,37 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         pooling=st.sampled_from([PoolingType.SUM]),
         use_inter_host_allreduce=st.booleans(),
         custom_all_reduce=st.booleans(),
+        variable_batch_per_feature=st.booleans(),
     )
     @settings(
         verbosity=Verbosity.verbose,
         max_examples=1,
         deadline=None,
         phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
+    @example(
+        sharder_type=SharderType.EMBEDDING_BAG_COLLECTION.value,
+        kernel_type=EmbeddingComputeKernel.FUSED.value,
+        qcomms_config=None,
+        apply_optimizer_in_backward_config={
+            "embedding_bags": (torch.optim.SGD, {"lr": 0.01}),
+        },
+        pooling=PoolingType.SUM,
+        use_inter_host_allreduce=False,
+        custom_all_reduce=False,
+        variable_batch_per_feature=True,
+    )
+    @example(
+        sharder_type=SharderType.EMBEDDING_BAG_COLLECTION.value,
+        kernel_type=EmbeddingComputeKernel.FUSED.value,
+        qcomms_config=None,
+        apply_optimizer_in_backward_config={
+            "embedding_bags": (torch.optim.SGD, {"lr": 0.01}),
+        },
+        pooling=PoolingType.SUM,
+        use_inter_host_allreduce=False,
+        custom_all_reduce=False,
+        variable_batch_per_feature=False,
     )
     def test_sharding_grid_2D(
         self,
@@ -315,6 +348,7 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
         pooling: PoolingType,
         use_inter_host_allreduce: bool,
         custom_all_reduce: bool,
+        variable_batch_per_feature: bool,
     ) -> None:
         if (
             self.device == torch.device("cpu")
@@ -373,6 +407,7 @@ class TestEmbeddingBagCollection2DParallel(ModelParallelTestShared):
             pooling=pooling,
             use_inter_host_allreduce=use_inter_host_allreduce,
             custom_all_reduce=custom_all_reduce,
+            variable_batch_per_feature=variable_batch_per_feature,
         )
 
     @unittest.skipIf(
