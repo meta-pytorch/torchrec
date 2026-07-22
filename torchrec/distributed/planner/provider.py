@@ -145,10 +145,17 @@ class DefaultPlannerProvider(PlannerProvider):
                 else None
             ),
         )
+        # Honor the caller's runtime device so the plan's shard placements match
+        # the model's device (cpu/cuda/mtia); unset -> KernelConfig's own default.
+        kernel_config = (
+            KernelConfig(compute_device=request.compute_device)
+            if request.compute_device
+            else KernelConfig()
+        )
         return TopologyFactory.create_topology(
             trainer_config=trainer_config,
             hardware_config=HardwareConfig(),
-            kernel_config=KernelConfig(),
+            kernel_config=kernel_config,
         )
 
     def build_storage_reservation(
