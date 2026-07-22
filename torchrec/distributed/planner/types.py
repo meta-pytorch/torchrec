@@ -2683,6 +2683,67 @@ class PlanReportMetadata:
     manifold_path: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class TableArch:
+    """Per-table sparse surface the planner consumes (the replay-minimal arch).
+
+    Exactly the fields needed to rebuild a meta-device table and re-plan;
+    excludes weights and any dense/non-shardable structure the planner never
+    reads. Frozen + tuple-typed so ModelArch stays hashable.
+    """
+
+    name: str
+    num_embeddings: int
+    embedding_dim: int
+    feature_names: Tuple[str, ...]
+    pooling: Optional[str] = None
+    data_type: Optional[str] = None
+    # The sharder type that shards this table (e.g. EmbeddingBagCollectionSharder,
+    # PooledEmbeddingArchSharder). Plan-affecting -- the sharder determines the
+    # table's sharding types / kernels / storage -- so replay must place the table
+    # under the same sharder. Defaulted for back-compat.
+    sharder_type: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SharderArch:
+    """Plan-affecting per-sharder config the planner reads off ``fused_params``.
+
+    The sharder *type* alone is not enough to reproduce a plan: the sparse
+    optimizer (and its scalar hyperparams) changes the storage multiplier
+    (SGD 0x / Adam 2x / RowWiseAdagrad 1/dim), and unlike caching / prefetch /
+    dtype it has no ``ParameterConstraints`` equivalent, so it must be captured
+    here. Frozen + scalar-typed so ModelArch stays hashable. One record per
+    distinct sharder type.
+    """
+
+    sharder_type: str
+    optimizer: Optional[str] = None
+    learning_rate: Optional[float] = None
+    eps: Optional[float] = None
+    weight_decay: Optional[float] = None
+    weight_decay_mode: Optional[str] = None
+    beta1: Optional[float] = None
+    beta2: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class ModelArch:
+    """The model's sparse-architecture surface + sharder identities.
+
+    The model axis of content-addressing (hashed to ``model_arch_hash``). Because
+    the planner consumes only this surface (never model weights), persisting it is
+    sufficient to reproduce the exact planner input for replay.
+    """
+
+    tables: Tuple[TableArch, ...]
+    sharder_types: Tuple[str, ...]
+    # Per-distinct-sharder plan-affecting config (optimizer + hyperparams). Kept
+    # alongside sharder_types (a name-only summary) so replay/dedup discriminate by
+    # optimizer. Defaulted for back-compat with existing callers/blobs.
+    sharders: Tuple[SharderArch, ...] = ()
+
+
 @dataclass
 class PlannerSessionContext:
     """Mutable context accumulating state during a planner session.
@@ -2771,6 +2832,16 @@ class PlannerSessionContext:
     # by every sink, so a flaky JK load can't enable some sinks and disable others
     # within one run. None until resolved; sinks treat None as disabled.
     persistence_enabled: Optional[bool] = None
+    # The model's sparse-arch surface (tables + sharder identities), captured once
+    # by the executor — the model axis of reproduction, hashed to model_arch_hash
+    # by consumers. None until captured; observability/reproduction only (not
+    # plan-affecting, excluded from request_hash).
+    model_arch: Optional[ModelArch] = None
+    # URLs of persisted reproduction artifacts, keyed by kind (e.g. "request_spec",
+    # "model_arch"), populated by the persistence layer when it uploads a blob.
+    # Empty when persistence is disabled or upload failed; observability only, so
+    # the caller/CLI can surface where the run's artifacts live.
+    content_urls: Dict[str, str] = field(default_factory=dict)
 
 
 # ---- Types Utils ---- #

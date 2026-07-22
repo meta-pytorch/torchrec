@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch.distributed as dist
 import torch.nn as nn
+from torchrec.distributed.planner.model_arch import extract_model_arch
 from torchrec.distributed.planner.protocols import PlannerExecutor
 from torchrec.distributed.planner.provider import (
     DefaultPlannerProvider,
@@ -100,6 +101,15 @@ class DefaultPlannerExecutor(PlannerExecutor):
                     f"{type(model).__name__}"
                 )
         sharders = ctx.request.sharders
+
+        # Capture the model's sparse-arch surface once per session (the model axis
+        # of reproduction); best-effort, observability only, so a capture failure
+        # never affects planning.
+        if ctx.model_arch is None:
+            try:
+                ctx.model_arch = extract_model_arch(model, sharders)
+            except Exception:
+                pass
 
         # On the collective path only rank 0 plans and populates the per-shard
         # breakdown; other ranks get the broadcast plan but no breakdown/estimates.
