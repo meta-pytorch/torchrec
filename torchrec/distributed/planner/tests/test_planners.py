@@ -51,7 +51,6 @@ from torchrec.distributed.types import (
     DataType,
     EmbeddingModuleShardingPlan,
     KeyValueParams,
-    ModuleSharder,
     ShardingPlan,
     ShardingType,
 )
