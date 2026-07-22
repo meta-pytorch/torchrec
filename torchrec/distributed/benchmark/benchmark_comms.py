@@ -24,7 +24,7 @@ see README.md for more details
 import logging
 import threading
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, cast, Dict, List
 
 import torch
 import torch.distributed as dist
@@ -894,6 +894,128 @@ def cuda_event_wait(
             f"{n_side_matmuls} matmuls ({cpu_mat_dim}x{cpu_mat_dim}); compare the "
             f"## side-thread matmul ## slices against the spin variant in the trace"
         )
+
+
+@dataclass
+class CommStreamAccessConfig(CommsConfig):
+    """
+    run commands:
+    1. contend (default): comm1 (a2a on ctx.pg) and comm2 (all_reduce on ar_pg)
+       overlap on their own pg-managed comm streams and contend for interconnect
+       bandwidth, slowing the critical-path comm1
+    > python -m torchrec.distributed.benchmark.benchmark_comms comm_stream_access \
+        --name=contend
+
+    2. serialized: make ar_pg's comm stream wait on ctx.pg's comm stream (via the
+       exposed comm stream handle) so comm2 is queued after comm1 and comm1 runs
+       contention-free
+    > python -m torchrec.distributed.benchmark.benchmark_comms comm_stream_access \
+        --name=serialized \
+        --serialized=True
+
+    use case:
+        each NCCL process group owns an internal CUDA stream that its async
+        collectives (async_op=True) run on, so two PGs (a2a ctx.pg + all_reduce
+        ar_pg) run on distinct comm streams and can overlap and contend --
+        slowing the collective on the critical path. This reaches each pg-managed
+        comm stream from Python via the (private)
+        ProcessGroupNCCL._get_comm_stream_info() binding. With serialized=True it
+        makes ar_pg's comm stream wait on ctx.pg's comm stream (a stream-to-
+        stream wait, no CPU / main-stream sync), so the critical-path a2a runs
+        contention-free -- ordering that Work.wait() alone cannot express.
+        Compare the comm1 (a2a) vs comm2 (all_reduce) overlap between the two
+        runs in the chrome trace.
+        see the nccl_comm_stream_access design doc for the diagram
+    """
+
+    serialized: bool = False
+    needs_ar_pg: bool = True
+    all_rank_traces: bool = True
+
+
+@register_benchmark(CommStreamAccessConfig)
+def comm_stream_access(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    serialized: bool = False,
+    ar_pg: dist.ProcessGroup | None = None,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Order two collectives across process groups using their exposed comm streams.
+
+    comm1 = all_to_all on ctx.pg (critical path; op1-b waits on it);
+    comm2 = all_reduce on ar_pg (off critical path, larger, bandwidth-hungry).
+    - serialized=False: comm1 and comm2 overlap on their own comm streams and
+      contend, slowing comm1.
+    - serialized=True: ar_pg's comm stream waits on ctx.pg's comm stream, so
+      comm1 runs contention-free and finishes sooner.
+    """
+
+    def pg_comm_stream(pg: dist.ProcessGroup) -> torch.cuda.Stream:
+        # the internal comm stream only exists once the communicator is
+        # initialized, so call this only after a collective has run on `pg`
+        backend = cast(dist.ProcessGroupNCCL, pg._get_backend(ctx.device))
+        sid, didx, dtype = backend._get_comm_stream_info()
+        return torch.cuda.Stream(stream_id=sid, device_index=didx, device_type=dtype)
+
+    with record_function("## setup ##"):
+        assert ctx.pg is not None and ar_pg is not None
+        # warm up both communicators so their internal comm streams exist
+        dist.barrier(group=ctx.pg)
+        dist.barrier(group=ar_pg)
+        a2a_stream = pg_comm_stream(ctx.pg)
+        ar_stream = pg_comm_stream(ar_pg)
+        assert (
+            a2a_stream.cuda_stream != ar_stream.cuda_stream
+        ), "expected the two process groups to own distinct comm streams"
+        logger.info(
+            f"[rank-{ctx.rank}] a2a comm stream {a2a_stream.cuda_stream:#x}, "
+            f"all_reduce comm stream {ar_stream.cuda_stream:#x}, "
+            f"serialized={serialized}"
+        )
+
+    with record_function("## pre-comms compute ##"):
+        input_a = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+        input_b = _compute(dim=dim, num_mul=num_mul, num_concat=num_concat * 2, ctx=ctx)
+        out_a = torch.zeros_like(input_a)
+        out_b = input_b.clone()
+
+    with record_function("## op1-a: launch comm1 (a2a) on ctx.pg ##"):
+        req1 = dist.all_to_all_single(
+            output=out_a, input=input_a, group=ctx.pg, async_op=True
+        )
+        assert req1 is not None
+
+    with record_function("## op2-a: launch comm2 (all_reduce) on ar_pg ##"):
+        if serialized:
+            # make ar_pg's comm stream wait on ctx.pg's comm stream so comm2 is
+            # queued after comm1 -- a stream-to-stream wait, no CPU / main-stream
+            # sync. This cross-pg ordering needs the exposed comm stream handle.
+            ar_stream.wait_stream(a2a_stream)
+        req2 = dist.all_reduce(out_b, op=dist.ReduceOp.SUM, group=ar_pg, async_op=True)
+        assert req2 is not None
+
+    with record_function("## irrelevant compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## op1-b: critical-path consumer waits on comm1 ##"):
+        req1.wait()
+        checks_a = _validate(out_a, ctx)
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx, x=out_a[0])
+
+    with record_function("## wait comm2 and validate ##"):
+        req2.wait()
+        # all_reduce(SUM) of values from rank 0 in (0,1) and rank 1 in (1,2)
+        # produces sums in (1,3), so int values >= 1
+        checks_b = torch.all(out_b.to(torch.int) >= 1)
+        checks = DeviceToHostTensorAwaitable(checks_a & checks_b)
+
+    with record_function("## assert ##"):
+        assert checks.item()
 
 
 if __name__ == "__main__":
