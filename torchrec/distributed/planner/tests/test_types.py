@@ -36,6 +36,7 @@ from torchrec.distributed.planner.types import (
     Perf,
     PlannerConfig,
     PlannerVariant,
+    PlanReportMetadata,
     ProposerConfig,
     Shard,
     ShardDetail,
@@ -2177,6 +2178,28 @@ class PlannerConfigTest(unittest.TestCase):
     def test_negative_bwd_multiplier_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "bwd_compute_multiplier must be"):
             PlannerConfig(bwd_compute_multiplier=-1.0)
+
+
+class PlanReportMetadataTest(unittest.TestCase):
+    def test_defaults(self) -> None:
+        md = PlanReportMetadata()
+        self.assertIsNone(md.trainer)
+        self.assertIsNone(md.pipeline)
+        self.assertIsNone(md.embedding_hash)
+        self.assertIsNone(md.proposer_types)
+        self.assertTrue(md.log_plan)
+
+    def test_carries_provenance(self) -> None:
+        md = PlanReportMetadata(
+            trainer="apf",
+            pipeline="train_sparse_dist",
+            total_model_param_size=100,
+            proposer_types=("dynamic_col_dim",),
+            num_parallel_worlds=2,
+        )
+        self.assertEqual(md.trainer, "apf")
+        self.assertEqual(md.proposer_types, ("dynamic_col_dim",))
+        self.assertEqual(md.num_parallel_worlds, 2)
 
 
 class ShardingPlanResultTest(unittest.TestCase):
