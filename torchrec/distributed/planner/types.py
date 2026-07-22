@@ -1941,6 +1941,38 @@ class StorageReservationPolicy(str, Enum):
 
 
 @dataclass(frozen=True)
+class TuneClfConfig:
+    """OSS-safe scalar projection of the fb TuneClfConfig (LP CLF search space).
+
+    Plain data so it stays serializable and hashable (part of ``request_hash``):
+    two EMO configs that differ only in CLF tuning must fingerprint differently,
+    or the plan cache would return one's plan for the other. None on a field keeps
+    the LP planner's own default for that knob.
+    """
+
+    increment_size: Optional[float] = None
+    max_clf: Optional[float] = None
+    min_clf: Optional[float] = None
+    min_prefetch_compute_decrease: Optional[float] = None
+    enable_clf_reduction: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class EmoConfig:
+    """OSS-safe scalar projection of the fb EMOConfig (embedding-managed offload).
+
+    Carries the EMO knobs the LP planner consumes as plain data. ``integration_type``
+    is the fb ``EMOIntegrationType`` by value; ``tune_clf_config`` projects the fb
+    CLF-tuning search-space knobs (so they participate in ``request_hash``). None on
+    a field keeps the LP planner's own default for that knob.
+    """
+
+    integration_type: Optional[str] = None
+    prefetch_compute_limit_per_rank: Optional[float] = None
+    tune_clf_config: Optional[TuneClfConfig] = None
+
+
+@dataclass(frozen=True)
 class LpPlannerConfig:
     """OSS-safe scalar knobs for the LINEAR_PROGRAMMING planner variant.
 
@@ -1970,6 +2002,57 @@ class LpPlannerConfig:
     num_cycles: Optional[int] = None
     # Whether to auto-derive column dimensions
     auto_col_dims: Optional[bool] = None
+    # Embedding-managed-offload config; None = LP planner default.
+    emo_config: Optional[EmoConfig] = None
+
+
+@dataclass(frozen=True)
+class ProposerGroup:
+    """One regex group's DynamicColDim args for the grouped-DCD proposer.
+
+    Mirrors a single entry of a framework's ``proposer_group_by_regex``: an fqn
+    regex plus the DynamicColDim knobs applied to the tables it matches. Frozen so
+    a tuple of these stays hashable inside ProposerConfig (part of request_hash).
+    """
+
+    # fqn regex selecting the tables this group's args apply to
+    regex: str
+    step_size: int = 10
+    target: str = "perf"
+    target_reshard_count: Optional[int] = None
+    min_col_dim: int = 20
+    max_inferior_proposals: int = 2
+    max_proposals: int = 10
+
+
+@dataclass(frozen=True)
+class ProposerConfig:
+    """OSS-safe scalar selector + args to reconstruct the planner's proposer(s).
+
+    ``kind`` selects the proposer ("default" keeps the planner's own set); the
+    Optional args mirror what the frameworks pass (DynamicColDim / embedding-offload
+    cache-scaling / scaleup). None keeps that arg's default. Grouped-DCD projects
+    its per-regex arg map into ``groups`` (one ProposerGroup per regex entry).
+    """
+
+    # default | greedy | grid_search | uniform | dynamic_col_dim |
+    # embedding_offload_cache_scaling | embedding_offload_scaleup |
+    # grouped_dynamic_col_dim
+    kind: str = "default"
+    # DynamicColDim / cache-scaling shared knobs
+    step_size: Optional[int] = None
+    target: Optional[str] = None
+    target_reshard_count: Optional[int] = None
+    min_col_dim: Optional[int] = None
+    max_inferior_proposals: Optional[int] = None
+    max_proposals: Optional[int] = None
+    # Embedding-offload cache-scaling knobs
+    allow_scale_down: Optional[bool] = None
+    demote_clf_threshold: Optional[float] = None
+    # Embedding-offload scaleup
+    use_depth: Optional[bool] = None
+    # Grouped-DCD per-regex args (kind="grouped_dynamic_col_dim"); empty otherwise
+    groups: Tuple[ProposerGroup, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2027,11 +2110,24 @@ class PlannerConfig:
     memory_balanced_tolerance: Optional[float] = None
     # Noop performance-model selector ("storage"/"table_size"); None = no perf model.
     performance_model: Optional[str] = None
+    # Proposer selection + scalar args; None = planner default proposer set. The
+    # structured form; mutually exclusive with proposer_type (see __post_init__).
+    proposer_config: Optional[ProposerConfig] = None
     # LINEAR_PROGRAMMING scalar knobs; None = LP planner defaults. Consumed only by
     # the LP variant's fb builder (ignored by other variants).
     lp_config: Optional[LpPlannerConfig] = None
 
     def __post_init__(self) -> None:
+        # proposer_type (OSS scalar selector) and proposer_config (structured form)
+        # are mutually exclusive: both set would hash distinctly for the same intent
+        # (spurious cache miss) and let the OSS vs fb builders pick differently.
+        if self.proposer_type is not None and self.proposer_config is not None:
+            raise ValueError(
+                "Set only one of proposer_type / proposer_config, not both: "
+                "proposer_config is the structured proposer spec (kind + args); "
+                "proposer_type is the simple OSS scalar-selector shortcut "
+                "(greedy/uniform/grid_search)."
+            )
         # planner_variant / storage_reservation_policy are typed as enums, so
         # callers pass a member (framework builders convert a config string with
         # PlannerVariant(cfg_str), which validates). No coercion is done here.
@@ -2229,6 +2325,36 @@ class ShardingPlanRequest:
                     self.planner_config.performance_model,
                     (
                         (
+                            pc.kind,
+                            pc.step_size,
+                            pc.target,
+                            pc.target_reshard_count,
+                            pc.min_col_dim,
+                            pc.max_inferior_proposals,
+                            pc.max_proposals,
+                            pc.allow_scale_down,
+                            pc.demote_clf_threshold,
+                            pc.use_depth,
+                            # Order-sensitive: grouped-DCD matches first regex win,
+                            # so group order is semantically meaningful (not sorted).
+                            tuple(
+                                (
+                                    g.regex,
+                                    g.step_size,
+                                    g.target,
+                                    g.target_reshard_count,
+                                    g.min_col_dim,
+                                    g.max_inferior_proposals,
+                                    g.max_proposals,
+                                )
+                                for g in pc.groups
+                            ),
+                        )
+                        if (pc := self.planner_config.proposer_config) is not None
+                        else None
+                    ),
+                    (
+                        (
                             lp.objective,
                             lp.shard_solver_type,
                             lp.tune_col_dims,
@@ -2238,6 +2364,26 @@ class ShardingPlanRequest:
                             lp.caching_enabled,
                             lp.num_cycles,
                             lp.auto_col_dims,
+                            (
+                                (
+                                    lp.emo_config.integration_type,
+                                    lp.emo_config.prefetch_compute_limit_per_rank,
+                                    (
+                                        (
+                                            tc.increment_size,
+                                            tc.max_clf,
+                                            tc.min_clf,
+                                            tc.min_prefetch_compute_decrease,
+                                            tc.enable_clf_reduction,
+                                        )
+                                        if (tc := lp.emo_config.tune_clf_config)
+                                        is not None
+                                        else None
+                                    ),
+                                )
+                                if lp.emo_config is not None
+                                else None
+                            ),
                         )
                         if (lp := self.planner_config.lp_config) is not None
                         else None
