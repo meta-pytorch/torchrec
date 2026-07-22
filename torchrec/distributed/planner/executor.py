@@ -112,14 +112,30 @@ class DefaultPlannerExecutor(PlannerExecutor):
 
         # Build every per-SKU input and the planner itself via the injected
         # provider — the single dispatch point across OSS/LP/Manifold variants.
-        topology = self._provider.build_topology(sku, ctx.request)
+        # Each phase is timed onto ctx.timing (observability only), keyed per SKU
+        # so a multi-SKU dry-run sweep stays comparable. Times are wall-clock ms.
+        t0 = time.perf_counter()
+        topology = self._provider.build_topology(sku, ctx.request, ctx)
+        ctx.timing[f"topology_build:{sku}"] = (time.perf_counter() - t0) * 1000.0
+        # Record the modeled topology per SKU so callers can inspect the hardware
+        # each SKU was planned against, keyed by the dims that make it reusable.
+        ctx.topology_cache[(sku, topology.world_size, topology.local_world_size)] = (
+            topology
+        )
+
+        t0 = time.perf_counter()
         storage_reservation = self._provider.build_storage_reservation(sku, ctx.request)
+        ctx.timing[f"storage_reservation:{sku}"] = (time.perf_counter() - t0) * 1000.0
+        ctx.storage_reservations_used[sku] = storage_reservation
+
+        t0 = time.perf_counter()
         planner = self._provider.build_planner(
             sku,
             topology=topology,
             storage_reservation=storage_reservation,
             ctx=ctx,
         )
+        ctx.timing[f"planner_construction:{sku}"] = (time.perf_counter() - t0) * 1000.0
 
         start = time.perf_counter()
         try:
@@ -130,6 +146,11 @@ class DefaultPlannerExecutor(PlannerExecutor):
             else:
                 sharding_plan = planner.plan(model, sharders)
         except PlannerError as e:
+            # plan_call bundles reserve + enumerate + propose + solve + stats
+            # (incl. Manifold upload); the intra-planner split lives inside the
+            # planner and is a separate follow-up.
+            solve_time_ms = (time.perf_counter() - start) * 1000.0
+            ctx.timing[f"plan_call:{sku}"] = solve_time_ms
             return ShardingPlanResult(
                 sku=sku,
                 success=False,
@@ -139,10 +160,11 @@ class DefaultPlannerExecutor(PlannerExecutor):
                 estimated_max_ddr_bytes=0,
                 request_id=ctx.request.request_id,
                 request_hash=ctx.request.request_hash,
-                solve_time_ms=(time.perf_counter() - start) * 1000.0,
+                solve_time_ms=solve_time_ms,
                 is_planning_rank=is_planning_rank,
             )
         solve_time_ms = (time.perf_counter() - start) * 1000.0
+        ctx.timing[f"plan_call:{sku}"] = solve_time_ms
 
         # get_selected_options() is the chosen List[ShardingOption] with per-shard
         # storage/perf populated; it is the only source of the full cost breakdown

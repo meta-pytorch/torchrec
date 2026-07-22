@@ -78,6 +78,27 @@ class DefaultPlannerExecutorTest(unittest.TestCase):
         self.assertGreater(result.estimated_max_hbm_bytes, 0)
         self.assertIsNotNone(result.solve_time_ms)
 
+    def test_run_populates_session_observability(self) -> None:
+        # The executor records per-phase timing + the modeled topology, storage
+        # reservation, and hardware provenance onto the session context.
+        model = self._model()
+        ctx = self._ctx(model)
+        DefaultPlannerExecutor().run(sku="H100", ctx=ctx, pg=None)
+        for phase in (
+            "topology_build:H100",
+            "storage_reservation:H100",
+            "planner_construction:H100",
+            "plan_call:H100",
+        ):
+            self.assertIn(phase, ctx.timing)
+            self.assertGreaterEqual(ctx.timing[phase], 0.0)
+        # world_size=2, local_world_size=2 -> exactly one cached topology entry.
+        self.assertEqual(len(ctx.topology_cache), 1)
+        self.assertIn("H100", ctx.storage_reservations_used)
+        # OSS builds from the request caps, so that is the recorded HW source.
+        self.assertEqual(ctx.hw_source["H100"], "request_caps")
+        self.assertIn("H100", ctx.hw_overrides_applied)
+
     def test_embedding_plan_materializes_model_factory(self) -> None:
         # A factory model on the request is materialized by the executor
         # (model is read from ctx.request, not passed to run()).
@@ -139,6 +160,21 @@ class BuildComponentsFromConfigTest(unittest.TestCase):
                 PlannerConfig(proposer_type="dynamic_col_dim"), local_world_size=8
             )
         )
+
+    def test_build_topology_records_request_caps_source(self) -> None:
+        # OSS resolves capabilities from the request's explicit caps (no registry /
+        # live detection), so the recorded provenance is "request_caps".
+        request = ShardingPlanRequest(
+            model=nn.Linear(4, 4),
+            sharders=[],
+            world_size=2,
+            local_world_size=2,
+            batch_size=512,
+        )
+        ctx = PlannerSessionContext(request=request, results={})
+        self.provider.build_topology("H100", request, ctx)
+        self.assertEqual(ctx.hw_source["H100"], "request_caps")
+        self.assertIn("H100", ctx.hw_overrides_applied)
 
     def test_build_partitioner(self) -> None:
         self.assertIsInstance(
