@@ -296,8 +296,12 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             target=self._compute_loop, name=metric_compute_thread_name, daemon=True
         )
 
+        # Created lazily on first compute so the module can be constructed without
+        # an initialized process group (e.g. single-process model validation).
         # pyrefly: ignore
-        self.cpu_process_group: dist.ProcessGroup = dist.new_group(backend="gloo")
+        self.cpu_process_group: Optional[dist.ProcessGroup] = (
+            dist.new_group(backend="gloo") if dist.is_initialized() else None
+        )
         self.comms_module: CPUCommsRecMetricModule = CPUCommsRecMetricModule(
             *args,
             **kwargs,
@@ -750,6 +754,8 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             with record_function("## cpu_all_gather ##"):
                 # Manual distributed sync (replaces TorchMetrics.metric.Metric.sync())
                 all_gather_start_ms = time.time()
+                if self.cpu_process_group is None:
+                    self.cpu_process_group = dist.new_group(backend="gloo")
                 aggregated_states = self.comms_module.get_pre_compute_states(
                     self.cpu_process_group
                 )

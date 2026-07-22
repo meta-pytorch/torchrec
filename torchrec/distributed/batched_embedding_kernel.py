@@ -126,7 +126,7 @@ from torchrec.optim.fused import (
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 if TYPE_CHECKING:
-    from deeplearning.fbgemm.fbgemm_gpu.fb.triton.triton_table_batched_embeddings import (
+    from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
         TritonTableBatchedEmbeddingBags,
     )
 
@@ -3870,7 +3870,7 @@ class TritonBatchedFusedEmbeddingBag(
 
         # Lazy import to avoid pulling in triton dependencies at module load time
         # This is necessary for forward compatibility with prod backends
-        from deeplearning.fbgemm.fbgemm_gpu.fb.triton.triton_table_batched_embeddings import (
+        from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
             TritonTableBatchedEmbeddingBags,
         )
 
