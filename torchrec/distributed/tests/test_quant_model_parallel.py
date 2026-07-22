@@ -37,6 +37,23 @@ from torchrec.types import CopyMixIn
 CUDA_DEVICE_COUNT: int = cuda_device_count()
 
 
+def _cuda_device_count() -> int:
+    """More robust CUDA device count that falls back to probing devices
+    when NVML fails to initialize."""
+    count = torch.cuda.device_count()
+    if count == 0:
+        for i in range(8):
+            try:
+                torch.zeros(1, device=f"cuda:{i}")
+                count = i + 1
+            except (RuntimeError, AssertionError):
+                break
+    return count
+
+
+CUDA_DEVICE_COUNT: int = _cuda_device_count()
+
+
 class CopyModule(nn.Module, CopyMixIn):
     def __init__(self) -> None:
         super().__init__()
