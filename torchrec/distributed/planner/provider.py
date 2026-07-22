@@ -337,6 +337,7 @@ class DefaultPlannerProvider(PlannerProvider):
             partitioner=self._build_partitioner(cfg),
             performance_model=self._build_performance_model(cfg, topology),
             constraints=ctx.request.constraints,
+            stats=ctx.stats,  # built by the orchestrator's reporter; None -> default
             debug=cfg.debug,
             timeout_seconds=cfg.timeout_seconds,
         )
