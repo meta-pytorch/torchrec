@@ -583,6 +583,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
         clear_data_dist_inputs: bool = False,
+        skip_batch_waiting: bool = False,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
@@ -595,6 +596,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self._batch_count = 0
         self._inplace_copy_batch_size_logged = False
         self._clear_data_dist_inputs = clear_data_dist_inputs
+        self._skip_batch_waiting = skip_batch_waiting
 
         logger.info(
             f"enqueue_batch_after_forward: {self._enqueue_batch_after_forward} "
