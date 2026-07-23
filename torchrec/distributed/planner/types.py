@@ -10,6 +10,7 @@
 import abc
 import hashlib
 import logging
+import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1184,6 +1185,49 @@ class Topology:
 
         return hash_sha256_to_int(hashable_list)
 
+    def to_reproduction_dict(self) -> Dict[str, object]:
+        """The plan-affecting topology fields, for reproduction persistence.
+
+        Mirrors the field set of ``_hash`` (everything that changes the plan):
+        sizes, per-device caps, memory/comms bandwidths, and compute multipliers.
+        Devices are homogeneous, so the per-device caps are recorded as a single
+        value (``devices[0]``). The persistence layer stores this so a replay can
+        rebuild the exact hardware model rather than re-deriving it from a
+        since-changed hardware registry.
+        """
+        storage = self._devices[0].storage if self._devices else None
+        return {
+            "world_size": self._world_size,
+            "local_world_size": self._local_world_size,
+            "compute_device": self._compute_device,
+            "intra_group_size": self._intra_group_size,
+            "hbm_cap": storage.hbm if storage is not None else 0,
+            "ddr_cap": storage.ddr if storage is not None else 0,
+            "ssd_cap": storage.ssd if storage is not None else 0,
+            "hbm_mem_bw": self._hbm_mem_bw,
+            "ddr_mem_bw": self._ddr_mem_bw,
+            "ssd_mem_bw": self._ssd_mem_bw,
+            "hbm_to_ddr_mem_bw": self._hbm_to_ddr_mem_bw,
+            "intra_host_bw": self._comms_bandwidths.intra_host_bw,
+            "inter_host_bw": self._comms_bandwidths.inter_host_bw,
+            "bwd_compute_multiplier": self._bwd_compute_multiplier,
+            "weighted_feature_bwd_compute_multiplier": (
+                self._weighted_feature_bwd_compute_multiplier
+            ),
+            "uneven_sharding_perf_multiplier": self._uneven_sharding_perf_multiplier,
+        }
+
+    def reproduction_hash(self) -> str:
+        """Stable 16-char hex hash of the plan-affecting topology fields.
+
+        Drift guard: a replay compares this against a freshly-built topology's hash
+        and can fail loudly if the hardware model changed, instead of silently
+        producing a different plan.
+        """
+        # Zero-pad before truncating so the width is always exactly 16 hex chars
+        # (a small hash value would otherwise render shorter than the promised 16).
+        return f"{self._hash():016x}"[:16]
+
 
 # ---- INPUT / OUTPUT ----- #
 
@@ -1848,6 +1892,997 @@ class CriticalPathEstimate:
 
     def total(self) -> float:
         return self.comms_estimate + self.comp_estimate
+
+
+class TrainingFramework(str, Enum):
+    """Training framework that consumes the sharding plan.
+
+    Selects framework-specific topology behavior (DDR division logic,
+    JustKnob-gated detection, framework-specific adjustments) in downstream
+    consumers. ``UNSET`` is the sentinel for "not set", which yields
+    framework-agnostic defaults.
+
+    Defined here (rather than imported) because this open-source module cannot
+    import the equivalent framework enum that lives in internal code; the string
+    values are the contract that bridges the two.
+
+    Subclasses ``str`` so members behave as their string value: they JSON
+    serialize to the bare string, compare equal to it, and ``UNSET`` ("") is
+    falsy — keeping downstream string-based consumers (fingerprints, configs)
+    working without special-casing the enum.
+    """
+
+    UNSET = ""
+    APF = "apf"
+    PYPER = "pyper"
+    MVAI = "mvai"
+
+
+class PlannerVariant(str, Enum):
+    """Planner backend that produces the plan.
+
+    Why an enum rather than a bare string: the frameworks (Pyper/MVAI/APF) pass
+    the backend as a free-form config value today, but the set of backends is
+    small, closed, and fully owned here in OSS. Normalizing that config string
+    into an enum at the request boundary gives (1) a single source of truth for
+    the valid backends, (2) typo-safety and autocomplete at call sites, and (3)
+    exhaustive, checkable dispatch in the executor (which switches on this to
+    pick the planner). Contrast launcher_hardware, kept a ``str`` because its
+    value set is large, still growing, and resolved fb-side — the same rule that
+    keeps TrainingFramework an enum but launcher_hardware a string.
+
+    Where the string -> enum conversion (and validation) happens: at the framework
+    request boundary, via the enum constructor — ``PlannerVariant(cfg_str)`` both
+    converts and raises ``ValueError`` on an unknown value in one call. The field
+    is typed as the enum and ``PlannerConfig`` does no coercion, so every reader
+    sees a ``PlannerVariant`` without a redundant normalization step.
+
+    Subclasses ``str`` so a member serializes/compares as its bare value, keeping
+    it stable in the request content hash and in string-based configs.
+
+    ``UNSET`` ("") is the "not specified" sentinel and the default: the executor
+    treats it as the OSS backend, so callers that do not care get sensible
+    behavior without naming a backend.
+    """
+
+    UNSET = ""
+    OSS = "oss"
+    LINEAR_PROGRAMMING = "linear_programming"
+    MANIFOLD = "manifold"
+
+
+class StorageReservationPolicy(str, Enum):
+    """Policy for reserving non-sharded (dense/overhead) memory before planning.
+
+    An enum for the same reasons as ``PlannerVariant``: a small, closed,
+    OSS-owned set that the frameworks pass as config strings, normalized here for
+    one source of truth, typo-safety, and an exhaustive switch in the
+    storage-reservation resolver (which maps each value to a StorageReservation
+    implementation). As with ``PlannerVariant``, the string -> enum conversion and
+    validation happen at the framework boundary via the enum constructor
+    (``StorageReservationPolicy(cfg_str)``); the field is typed as the enum and
+    ``PlannerConfig`` does no coercion.
+
+    Subclasses ``str`` for the same serialization reasons as ``PlannerVariant``.
+
+    ``UNSET`` ("") is the "not specified" sentinel and the default: the
+    storage-reservation resolver treats it as its default policy (heuristical).
+
+    Only policies with a backing StorageReservation are listed. HEURISTICAL,
+    FIXED_PERCENTAGE, and INFERENCE map to Heuristical/FixedPercentage/Inference
+    StorageReservation respectively; SKU_AWARE is planned (SKUAwareStorageReservation
+    is designed but not yet implemented). "memory_balanced" is intentionally absent
+    — it is a partitioner strategy (MemoryBalancedPartitioner), not a reservation.
+    """
+
+    UNSET = ""
+    HEURISTICAL = "heuristical"
+    FIXED_PERCENTAGE = "fixed_percentage"
+    INFERENCE = "inference"
+    # Planned: SKUAwareStorageReservation (design done, not yet implemented).
+    SKU_AWARE = "sku_aware"
+
+
+@dataclass(frozen=True)
+class TuneClfConfig:
+    """OSS-safe scalar projection of the fb TuneClfConfig (LP CLF search space).
+
+    Plain data so it stays serializable and hashable (part of ``request_hash``):
+    two EMO configs that differ only in CLF tuning must fingerprint differently,
+    or the plan cache would return one's plan for the other. None on a field keeps
+    the LP planner's own default for that knob.
+    """
+
+    increment_size: Optional[float] = None
+    max_clf: Optional[float] = None
+    min_clf: Optional[float] = None
+    min_prefetch_compute_decrease: Optional[float] = None
+    enable_clf_reduction: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class EmoConfig:
+    """OSS-safe scalar projection of the fb EMOConfig (embedding-managed offload).
+
+    Carries the EMO knobs the LP planner consumes as plain data. ``integration_type``
+    is the fb ``EMOIntegrationType`` by value; ``tune_clf_config`` projects the fb
+    CLF-tuning search-space knobs (so they participate in ``request_hash``). None on
+    a field keeps the LP planner's own default for that knob.
+    """
+
+    integration_type: Optional[str] = None
+    prefetch_compute_limit_per_rank: Optional[float] = None
+    tune_clf_config: Optional[TuneClfConfig] = None
+
+
+@dataclass(frozen=True)
+class LpPlannerConfig:
+    """OSS-safe scalar knobs for the LINEAR_PROGRAMMING planner variant.
+
+    Carried as plain data so it stays serializable/hashable (part of the request
+    content hash) — the fb LinearProgrammingPlanner accepts these scalars (e.g.
+    MVAI already passes ``objective``/``shard_solver_type`` as plain strings). Each
+    field is Optional; None means "use the LP planner's own default", so the fb
+    builder only forwards the ones that are set. The fb-typed forms
+    (OptimObjective/ShardSolverType/EMOConfig) are never referenced from OSS.
+    """
+
+    # Optimization objective, e.g. "max_total_perf" (LP OptimObjective by value)
+    objective: Optional[str] = None
+    # Shard solver, e.g. "greedy" (LP ShardSolverType by value)
+    shard_solver_type: Optional[str] = None
+    # Whether to tune column dimensions
+    tune_col_dims: Optional[bool] = None
+    # Hybrid solver percentage (0-100)
+    hybrid_percentage: Optional[int] = None
+    # Allowed solution-quality worsening percentage (>= 0.0)
+    allowed_worsening_percentage: Optional[float] = None
+    # Whether to apply per-stage timeouts
+    stagewise_timeout: Optional[bool] = None
+    # Whether plan caching is enabled
+    caching_enabled: Optional[bool] = None
+    # Number of local-search cycles
+    num_cycles: Optional[int] = None
+    # Whether to auto-derive column dimensions
+    auto_col_dims: Optional[bool] = None
+    # Embedding-managed-offload config; None = LP planner default.
+    emo_config: Optional[EmoConfig] = None
+
+
+@dataclass(frozen=True)
+class ProposerGroup:
+    """One regex group's DynamicColDim args for the grouped-DCD proposer.
+
+    Mirrors a single entry of a framework's ``proposer_group_by_regex``: an fqn
+    regex plus the DynamicColDim knobs applied to the tables it matches. Frozen so
+    a tuple of these stays hashable inside ProposerConfig (part of request_hash).
+    """
+
+    # fqn regex selecting the tables this group's args apply to
+    regex: str
+    step_size: int = 10
+    target: str = "perf"
+    target_reshard_count: Optional[int] = None
+    min_col_dim: int = 20
+    max_inferior_proposals: int = 2
+    max_proposals: int = 10
+
+
+@dataclass(frozen=True)
+class ProposerConfig:
+    """OSS-safe scalar selector + args to reconstruct the planner's proposer(s).
+
+    ``kind`` selects the proposer ("default" keeps the planner's own set); the
+    Optional args mirror what the frameworks pass (DynamicColDim / embedding-offload
+    cache-scaling / scaleup). None keeps that arg's default. Grouped-DCD projects
+    its per-regex arg map into ``groups`` (one ProposerGroup per regex entry).
+    """
+
+    # default | greedy | grid_search | uniform | dynamic_col_dim |
+    # embedding_offload_cache_scaling | embedding_offload_scaleup |
+    # grouped_dynamic_col_dim
+    kind: str = "default"
+    # DynamicColDim / cache-scaling shared knobs
+    step_size: Optional[int] = None
+    target: Optional[str] = None
+    target_reshard_count: Optional[int] = None
+    min_col_dim: Optional[int] = None
+    max_inferior_proposals: Optional[int] = None
+    max_proposals: Optional[int] = None
+    # Embedding-offload cache-scaling knobs
+    allow_scale_down: Optional[bool] = None
+    demote_clf_threshold: Optional[float] = None
+    # Embedding-offload scaleup
+    use_depth: Optional[bool] = None
+    # Grouped-DCD per-regex args (kind="grouped_dynamic_col_dim"); empty otherwise
+    groups: Tuple[ProposerGroup, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlannerConfig:
+    """Plan-affecting knobs the trainer expresses per request.
+
+    These are *data* (serializable, hashable) that select how the planner runs;
+    the concrete PlannerExecutor maps them to enumerator/estimator/proposer/
+    partitioner/planner instances. Object-valued, framework-specific behavior
+    (custom proposer instances, stats sinks) is injected into the API instance as
+    a per-framework profile, not carried here — so this stays part of the
+    request's content hash and cache key.
+    """
+
+    # Planner backend to run; UNSET (default) resolves to the OSS backend
+    planner_variant: PlannerVariant = PlannerVariant.UNSET
+    # How non-sharded memory is reserved; UNSET (default) resolves to heuristical
+    storage_reservation_policy: StorageReservationPolicy = (
+        StorageReservationPolicy.UNSET
+    )
+    # Fraction (0.0-1.0) to reserve for the chosen policy; None = policy default
+    storage_reservation_percentage: Optional[float] = None
+    # Proposer selector (e.g. "greedy", "grid_search", "dynamic_col_dim"); None =
+    # executor default. Free-form: the proposer set is extensible and custom
+    # proposer instances are injected via the API profile, so it isn't validated.
+    proposer_type: Optional[str] = None
+    # Partitioner selector (e.g. "greedy_perf", "memory_balanced"); None =
+    # executor default. Free-form for the same reason as proposer_type.
+    partitioner_type: Optional[str] = None
+    # Use hardware-capability-based compute estimates instead of the default model
+    use_hardware_based_compute: bool = False
+    # Use hardware-capability-based bandwidths instead of default topology values
+    use_hardware_based_bandwidth: bool = False
+    # Backward-pass compute multiplier for the perf estimate; None = planner default
+    bwd_compute_multiplier: Optional[float] = None
+    # Manifold path to a pre-computed sharding plan, consumed only by the MANIFOLD
+    # planner_variant (ManifoldPlanner loads the plan from here instead of solving).
+    # Required when planner_variant is MANIFOLD; ignored by other variants.
+    manifold_path: Optional[str] = None
+    # Enable planner debug mode (extra logging/validation). Forwarded to the planner.
+    debug: bool = False
+    # Solver timeout in seconds; None = planner default. Forwarded to the planner.
+    timeout_seconds: Optional[int] = None
+    # Resolved PipelineType value for the storage estimator (e.g. "train_sparse_dist");
+    # None = estimator default. Mirrors APF's pipeline-aware storage estimation.
+    pipeline_type: Optional[str] = None
+    # Estimated dense (non-embedding) per-rank tensor bytes; threaded into
+    # HeuristicalStorageReservation so the reserved HBM matches the legacy
+    # path. None (the base provider default) leaves the reservation unchanged.
+    dense_tensor_estimate: Optional[int] = None
+    # Hardware-based perf-estimator flags (apply when use_hardware_based_compute).
+    use_batch_inputs_for_expected_cache_fetches: bool = False
+    use_linear_regression_prefetch_estimate: bool = False
+    # Partitioner knobs: balance shards across modules; GreedyPerf sort key
+    # ("perf"/"storage"); MemoryBalanced search bounds (None = partitioner default).
+    balance_modules: bool = False
+    partitioner_sort_by: Optional[str] = None
+    memory_balanced_max_search_count: Optional[int] = None
+    memory_balanced_tolerance: Optional[float] = None
+    # Noop performance-model selector ("storage"/"table_size"); None = no perf model.
+    performance_model: Optional[str] = None
+    # Proposer selection + scalar args; None = planner default proposer set. The
+    # structured form; mutually exclusive with proposer_type (see __post_init__).
+    proposer_config: Optional[ProposerConfig] = None
+    # LINEAR_PROGRAMMING scalar knobs; None = LP planner defaults. Consumed only by
+    # the LP variant's fb builder (ignored by other variants).
+    lp_config: Optional[LpPlannerConfig] = None
+
+    def __post_init__(self) -> None:
+        # proposer_type (OSS scalar selector) and proposer_config (structured form)
+        # are mutually exclusive: both set would hash distinctly for the same intent
+        # (spurious cache miss) and let the OSS vs fb builders pick differently.
+        if self.proposer_type is not None and self.proposer_config is not None:
+            raise ValueError(
+                "Set only one of proposer_type / proposer_config, not both: "
+                "proposer_config is the structured proposer spec (kind + args); "
+                "proposer_type is the simple OSS scalar-selector shortcut "
+                "(greedy/uniform/grid_search)."
+            )
+        # planner_variant / storage_reservation_policy are typed as enums, so
+        # callers pass a member (framework builders convert a config string with
+        # PlannerVariant(cfg_str), which validates). No coercion is done here.
+        if (
+            self.storage_reservation_percentage is not None
+            and not 0.0 <= self.storage_reservation_percentage <= 1.0
+        ):
+            raise ValueError(
+                "storage_reservation_percentage must be between 0.0 and 1.0, got "
+                f"{self.storage_reservation_percentage}"
+            )
+        if self.bwd_compute_multiplier is not None and self.bwd_compute_multiplier < 0:
+            raise ValueError(
+                "bwd_compute_multiplier must be non-negative, got "
+                f"{self.bwd_compute_multiplier}"
+            )
+
+
+@dataclass(frozen=True)
+class ShardingPlanRequest:
+    """Request for sharding plan generation.
+
+    Encapsulates the model, sharders, cluster topology parameters, and
+    optional overrides needed to produce a sharding plan. Base type for
+    both runtime and dry-run planning flows.
+
+    Immutability note: ``frozen=True`` only prevents rebinding the fields
+    themselves; it does not deep-freeze their contents. The ``sharders``
+    list and the ``constraints`` dict remain mutable in place (e.g.
+    ``request.sharders.append(...)``). They are kept as ``List``/``Dict``
+    because downstream planner APIs consume those concrete types; callers
+    must treat them as read-only by convention rather than relying on an
+    enforced guarantee.
+    """
+
+    # User-provided nn.Module or a factory for lazy construction;
+    # consumers should use isinstance(model, nn.Module) to distinguish
+    model: Union[nn.Module, Callable[[], nn.Module]]
+    # Code-derived from model architecture + training config via get_default_sharders()
+    sharders: List[ModuleSharder[nn.Module]]
+    # Total number of devices in the cluster
+    world_size: int
+    # Devices per host — determines intra-host vs inter-host communication split
+    local_world_size: int
+    # Batch size affects per-device memory estimates from the perf model
+    batch_size: int
+
+    # Pod size for multi-pod topologies (None = single pod)
+    pod_size: Optional[int] = None
+    # Derived from planner.storage_reservation_policy config
+    storage_reservation: Optional[StorageReservation] = None
+    # Code-derived from embedding tables + fused params + UVM cache stats
+    constraints: Optional[Dict[str, ParameterConstraints]] = None
+    # Training framework that consumes the plan. TrainingFramework.UNSET (the
+    # default) means "not set" and yields framework-agnostic defaults. Typed as
+    # an enum so downstream gets a checked value; a plain string (e.g. from
+    # config) is coerced to the enum in __post_init__ and an unknown value
+    # raises ValueError.
+    training_framework: TrainingFramework = TrainingFramework.UNSET
+    # Override HBM capacity (GB); None = auto-detect from CUDA or hardware registry
+    hbm_gb: Optional[float] = None
+    # Override DDR capacity (GB); None = auto-detect
+    ddr_gb: Optional[float] = None
+    # Launcher hardware identifier for topology creation (e.g. "ZIONEX",
+    # "TC_ANY"); None = auto-detect from the launch environment. Kept free-form:
+    # the recognized values mirror the hardware-type identifiers resolved by
+    # downstream consumers, and that set grows as new accelerators are onboarded,
+    # so it is intentionally not validated here.
+    launcher_hardware: Optional[str] = None
+    # Runtime compute device for the plan's topology ("cuda"/"cpu"/"mtia"); None =
+    # let the provider default (production mirrors the framework's real device so
+    # the plan's shard placements match the model's device; dry-run models "cuda").
+    # Plan-affecting (a cpu vs cuda topology changes placement), so it is hashed.
+    compute_device: Optional[str] = None
+    # Plan-affecting knobs (planner backend, reservation policy, proposer/
+    # partitioner selection, hardware-based flags). Data-only so it participates
+    # in request_hash; object-valued behavior is injected into the API instance.
+    planner_config: PlannerConfig = field(default_factory=PlannerConfig)
+    # Unique per-instance id for this request, used to correlate it with the
+    # ShardingPlanResult(s) it produces (see ShardingPlanResult.request_id).
+    # Complements request_hash: request_hash is a *content* hash shared by
+    # identical requests (cache/dedup key), whereas request_id is unique per
+    # request object — use it to tell two otherwise-identical requests apart.
+    # Auto-generated; override to thread an externally-supplied id.
+    request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # Observability opt-in: when True the executor captures the full enumerated
+    # search space onto ctx.search_space (per SKU) and the reproduction upload
+    # persists it to Manifold (URL surfaced on the planner_runs Scuba row). Off by
+    # default -- the search space is large and deterministically re-derivable from
+    # the request_spec + model_arch blobs, so it is captured only on request. Not
+    # plan-affecting, so excluded from request_hash.
+    capture_search_space: bool = False
+
+    def __post_init__(self) -> None:
+        self._normalize_training_framework()
+        self._validate()
+
+    def _normalize_training_framework(self) -> None:
+        # Accept either a TrainingFramework or its string value (e.g. read from
+        # config) and normalize to the enum, so downstream always reads a
+        # TrainingFramework. Unknown strings raise ValueError.
+        if isinstance(self.training_framework, TrainingFramework):
+            return
+        try:
+            object.__setattr__(
+                self,
+                "training_framework",
+                TrainingFramework(self.training_framework),
+            )
+        except ValueError as e:
+            valid = [f.value for f in TrainingFramework]
+            raise ValueError(
+                f"training_framework must be a TrainingFramework or one of "
+                f"{valid}, got {self.training_framework!r}"
+            ) from e
+
+    def _validate(self) -> None:
+        # Positive-required scalars.
+        for name in ("world_size", "local_world_size", "batch_size"):
+            value = getattr(self, name)
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if self.pod_size is not None and self.pod_size <= 0:
+            raise ValueError(f"pod_size must be positive, got {self.pod_size}")
+        # Non-negative-optional scalars.
+        for name in ("hbm_gb", "ddr_gb"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+        # Cross-field constraints.
+        if self.local_world_size > self.world_size:
+            raise ValueError(
+                f"local_world_size ({self.local_world_size}) must not exceed "
+                f"world_size ({self.world_size})"
+            )
+        if self.world_size % self.local_world_size != 0:
+            raise ValueError(
+                f"world_size ({self.world_size}) must be divisible by "
+                f"local_world_size ({self.local_world_size})"
+            )
+        if self.pod_size is not None and self.pod_size > self.world_size:
+            raise ValueError(
+                f"pod_size ({self.pod_size}) must not exceed "
+                f"world_size ({self.world_size})"
+            )
+
+    @property
+    def request_hash(self) -> str:
+        """Stable content hash identifying this request.
+
+        Deterministic over the planner-affecting parameters, so two requests
+        with the same parameters share a hash. Used to correlate the request
+        with its ShardingPlanResult(s) and PlannerSessionContext, and as a
+        cache key.
+
+        Excludes, by design: `model` and `sharders` (not stably hashable);
+        `storage_reservation` (an injected behavior object, not plan-data); and
+        `request_id` (unique per instance — hashing it would defeat the
+        identical-params-share-a-hash guarantee). Callers needing model-level
+        uniqueness should scope by the context's model — mirroring
+        DryRunRequest.fingerprint().
+        """
+        return format(
+            hash_sha256_to_int(
+                [
+                    self.world_size,
+                    self.local_world_size,
+                    self.batch_size,
+                    self.pod_size,
+                    self.hbm_gb,
+                    self.ddr_gb,
+                    self.training_framework.value,
+                    self.launcher_hardware,
+                    self.compute_device,
+                    # Hash constraints order-independently: a dict's repr follows
+                    # insertion order, so sort by key for a stable hash across
+                    # semantically-equal requests built in different orders. Sort
+                    # by key only (ParameterConstraints is not rich-comparable).
+                    (
+                        [(k, self.constraints[k]) for k in sorted(self.constraints)]
+                        if self.constraints is not None
+                        else None
+                    ),
+                    self.planner_config.planner_variant.value,
+                    self.planner_config.storage_reservation_policy.value,
+                    self.planner_config.storage_reservation_percentage,
+                    self.planner_config.proposer_type,
+                    self.planner_config.partitioner_type,
+                    self.planner_config.use_hardware_based_compute,
+                    self.planner_config.use_hardware_based_bandwidth,
+                    self.planner_config.bwd_compute_multiplier,
+                    self.planner_config.manifold_path,
+                    self.planner_config.debug,
+                    self.planner_config.timeout_seconds,
+                    self.planner_config.pipeline_type,
+                    self.planner_config.dense_tensor_estimate,
+                    self.planner_config.use_batch_inputs_for_expected_cache_fetches,
+                    self.planner_config.use_linear_regression_prefetch_estimate,
+                    self.planner_config.balance_modules,
+                    self.planner_config.partitioner_sort_by,
+                    self.planner_config.memory_balanced_max_search_count,
+                    self.planner_config.memory_balanced_tolerance,
+                    self.planner_config.performance_model,
+                    (
+                        (
+                            pc.kind,
+                            pc.step_size,
+                            pc.target,
+                            pc.target_reshard_count,
+                            pc.min_col_dim,
+                            pc.max_inferior_proposals,
+                            pc.max_proposals,
+                            pc.allow_scale_down,
+                            pc.demote_clf_threshold,
+                            pc.use_depth,
+                            # Order-sensitive: grouped-DCD matches first regex win,
+                            # so group order is semantically meaningful (not sorted).
+                            tuple(
+                                (
+                                    g.regex,
+                                    g.step_size,
+                                    g.target,
+                                    g.target_reshard_count,
+                                    g.min_col_dim,
+                                    g.max_inferior_proposals,
+                                    g.max_proposals,
+                                )
+                                for g in pc.groups
+                            ),
+                        )
+                        if (pc := self.planner_config.proposer_config) is not None
+                        else None
+                    ),
+                    (
+                        (
+                            lp.objective,
+                            lp.shard_solver_type,
+                            lp.tune_col_dims,
+                            lp.hybrid_percentage,
+                            lp.allowed_worsening_percentage,
+                            lp.stagewise_timeout,
+                            lp.caching_enabled,
+                            lp.num_cycles,
+                            lp.auto_col_dims,
+                            (
+                                (
+                                    lp.emo_config.integration_type,
+                                    lp.emo_config.prefetch_compute_limit_per_rank,
+                                    (
+                                        (
+                                            tc.increment_size,
+                                            tc.max_clf,
+                                            tc.min_clf,
+                                            tc.min_prefetch_compute_decrease,
+                                            tc.enable_clf_reduction,
+                                        )
+                                        if (tc := lp.emo_config.tune_clf_config)
+                                        is not None
+                                        else None
+                                    ),
+                                )
+                                if lp.emo_config is not None
+                                else None
+                            ),
+                        )
+                        if (lp := self.planner_config.lp_config) is not None
+                        else None
+                    ),
+                ]
+            ),
+            "x",
+        )[:16]
+
+
+@dataclass(frozen=True)
+class ShardDetail:
+    """Per-shard placement and cost breakdown for one shard of a table.
+
+    Serializable projection of a planner Shard: keeps the size/offset/rank and
+    the storage/perf estimates that the deployment-facing ShardingPlan drops,
+    without holding the live tensor/module references.
+    """
+
+    # Rank this shard is placed on; None if unassigned
+    rank: Optional[int]
+    # Shard tensor dimensions
+    size: Tuple[int, ...]
+    # Shard offset within the full table
+    offset: Tuple[int, ...]
+    # Estimated HBM for this shard (bytes)
+    hbm_bytes: int
+    # Estimated DDR for this shard (bytes)
+    ddr_bytes: int
+    # Estimated SSD for this shard (bytes)
+    ssd_bytes: int
+    # Total perf score for this shard; None if the perf model did not run
+    perf_total: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        for name in ("hbm_bytes", "ddr_bytes", "ssd_bytes"):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+        if self.perf_total is not None and self.perf_total < 0:
+            raise ValueError(f"perf_total must be non-negative, got {self.perf_total}")
+
+
+@dataclass(frozen=True)
+class ShardingOptionDetail:
+    """Per-table row of the chosen sharding plan with full cost detail.
+
+    Serializable projection of the ShardingOption selected for one embedding
+    table. Unlike the deployment-facing ShardingPlan (which keeps only
+    sharding_type/compute_kernel/ranks/shard geometry), this retains the
+    per-shard storage/perf estimates for OOM debugging and plan explainability,
+    while staying free of the live tensor/module references that make a raw
+    ShardingOption unserializable.
+    """
+
+    # Fully qualified name of the embedding table (module fqn + table name)
+    fqn: str
+    # Sharding type selected (e.g. "table_wise", "row_wise")
+    sharding_type: str
+    # Compute kernel selected (e.g. "fused", "dense")
+    compute_kernel: str
+    # Per-shard placement and cost breakdown
+    shards: Tuple[ShardDetail, ...] = ()
+    # HBM summed across shards (bytes)
+    total_hbm_bytes: int = 0
+    # DDR summed across shards (bytes)
+    total_ddr_bytes: int = 0
+    # SSD summed across shards (bytes)
+    total_ssd_bytes: int = 0
+    # Perf summed across shards; None unless every shard has a perf estimate, so
+    # the total is never a misleading partial sum
+    total_perf: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        for name in ("total_hbm_bytes", "total_ddr_bytes", "total_ssd_bytes"):
+            value = getattr(self, name)
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+
+    @classmethod
+    def from_sharding_option(
+        cls, sharding_option: "ShardingOption"
+    ) -> "ShardingOptionDetail":
+        """Build a serializable detail row from a selected ShardingOption."""
+        shards = tuple(
+            ShardDetail(
+                rank=shard.rank,
+                size=tuple(shard.size),
+                offset=tuple(shard.offset),
+                hbm_bytes=shard.storage.hbm if shard.storage is not None else 0,
+                ddr_bytes=shard.storage.ddr if shard.storage is not None else 0,
+                ssd_bytes=shard.storage.ssd if shard.storage is not None else 0,
+                perf_total=shard.perf.total if shard.perf is not None else None,
+            )
+            for shard in sharding_option.shards
+        )
+        # Only aggregate perf when every shard has an estimate; otherwise a
+        # partial sum would understate the true cost while looking complete.
+        if shards and all(s.perf_total is not None for s in shards):
+            total_perf: Optional[float] = sum(
+                s.perf_total for s in shards if s.perf_total is not None
+            )
+        else:
+            total_perf = None
+        return cls(
+            fqn=sharding_option.fqn,
+            sharding_type=sharding_option.sharding_type,
+            compute_kernel=sharding_option.compute_kernel,
+            shards=shards,
+            total_hbm_bytes=sum(s.hbm_bytes for s in shards),
+            total_ddr_bytes=sum(s.ddr_bytes for s in shards),
+            total_ssd_bytes=sum(s.ssd_bytes for s in shards),
+            total_perf=total_perf,
+        )
+
+
+@dataclass(frozen=True)
+class ShardingPlanResult:
+    """Immutable result of sharding plan generation for a single topology.
+
+    Captures the outcome of running the planner, including the sharding
+    plan (when available), failure reason on error, and memory estimates.
+    Base type for both runtime and dry-run result types.
+    """
+
+    # GPU-SKU identifier this result is for (e.g. "H100", "GB200"); also the key
+    # in the API's per-target result map. Distinct from Request.launcher_hardware
+    # (launcher-type vocabulary like "ZIONEX"/"TC_ANY"), which stays on the request.
+    sku: str
+    # Whether the planner found a valid sharding plan
+    success: bool
+    # The computed plan — how tables are distributed across devices. None on
+    # failure, and may also be None on a successful result that carries only
+    # metadata (e.g. cached-miss or estimate-only results).
+    sharding_plan: Optional[ShardingPlan]
+    # Why the plan failed — surfaces root cause (e.g. "OOM_HBM")
+    planner_failure_reason: Optional[str]
+    # Peak per-rank HBM of the sharded-embedding footprint (bytes): the max over
+    # ranks of the summed embedding-shard HBM placed on that rank. This is the
+    # embedding footprint only — it excludes the dense/optimizer/runtime overhead
+    # that StorageReservation carves out of the budget before planning (the
+    # reservation shrinks the HBM available for embeddings but is not added back
+    # into this figure).
+    estimated_max_hbm_bytes: int
+    # Peak per-rank DDR of the sharded-embedding footprint (bytes); same
+    # embedding-only semantics as estimated_max_hbm_bytes.
+    estimated_max_ddr_bytes: int
+
+    # Estimated throughput from perf model; None if perf model unavailable
+    estimated_qps: Optional[float] = None
+    # Latency of slowest path through sharded model (ms); None if unavailable
+    critical_path_ms: Optional[float] = None
+    # Comms / compute split of the critical path (ms) -- the two components that
+    # sum to critical_path_ms. None if the breakdown was not computed. Populated
+    # on the planning rank only: the split needs the per-shard Perf breakdown,
+    # which is not carried in the broadcast plan.
+    comms_critical_path_ms: Optional[float] = None
+    comp_critical_path_ms: Optional[float] = None
+    # Plan quality: peak and mean per-rank modeled perf, and their ratio
+    # (max/mean; 1.0 == perfectly balanced). Derived from the per-shard Perf of
+    # the chosen plan; None off the planning rank. perf_imbalance_ratio is the
+    # headline balance metric for plan-quality dashboards.
+    max_rank_perf: Optional[float] = None
+    mean_rank_perf: Optional[float] = None
+    perf_imbalance_ratio: Optional[float] = None
+    # Structured failure taxonomy carried from PlannerError.error_type, so the
+    # failure kind (INSUFFICIENT_STORAGE / STRICT_CONSTRAINTS / PARTITION / …)
+    # survives for analytics instead of being flattened into the free-form
+    # planner_failure_reason string. None on success (or when unavailable).
+    planner_error_type: Optional[PlannerErrorType] = None
+    # Non-fatal warnings even when plan succeeds
+    validation_warnings: Tuple[str, ...] = ()
+    # URL of the sharding plan persisted to Manifold (for sharing/debugging);
+    # None if the plan was not uploaded
+    sharding_plan_manifold_url: Optional[str] = None
+    # Correlates this result with the ShardingPlanRequest.request_hash that
+    # produced it (by content); "" if not set
+    request_hash: str = ""
+    # Correlates this result with the ShardingPlanRequest.request_id that
+    # produced it (by instance); "" if not set. Use this to tie a result to a
+    # specific request object; use request_hash to correlate by content.
+    request_id: str = ""
+    # Time spent in the planner's solver for this result (ms); None if unavailable
+    solve_time_ms: Optional[float] = None
+    # Per-table breakdown of the chosen sharding plan with per-shard storage/perf
+    # detail (the "sharding option table"); empty if the planner did not surface
+    # per-table detail. A serializable projection of the selected ShardingOptions
+    # (see ShardingOptionDetail.from_sharding_option) that explains the aggregate
+    # estimated_max_*_bytes at table/shard granularity.
+    sharding_options: Tuple[ShardingOptionDetail, ...] = ()
+    # Whether this result carries the authoritative plan breakdown/estimates.
+    # On the collective path only the planning rank (rank 0) populates the
+    # per-shard breakdown; other ranks return success=True with the broadcast
+    # plan but empty sharding_options and zero estimates. This flag makes that
+    # asymmetry explicit so an aggregator can filter to the trustworthy result
+    # instead of reading corrupt estimates off a non-planning rank. Defaults to
+    # True: the local path (pg=None) and dry-run always plan on the caller's rank.
+    is_planning_rank: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.sku:
+            raise ValueError("sku must not be empty")
+        if self.estimated_max_hbm_bytes < 0:
+            raise ValueError(
+                f"estimated_max_hbm_bytes must be non-negative, "
+                f"got {self.estimated_max_hbm_bytes}"
+            )
+        if self.estimated_max_ddr_bytes < 0:
+            raise ValueError(
+                f"estimated_max_ddr_bytes must be non-negative, "
+                f"got {self.estimated_max_ddr_bytes}"
+            )
+        if self.estimated_qps is not None and self.estimated_qps < 0:
+            raise ValueError(
+                f"estimated_qps must be non-negative, got {self.estimated_qps}"
+            )
+        if self.critical_path_ms is not None and self.critical_path_ms < 0:
+            raise ValueError(
+                f"critical_path_ms must be non-negative, got {self.critical_path_ms}"
+            )
+        if self.solve_time_ms is not None and self.solve_time_ms < 0:
+            raise ValueError(
+                f"solve_time_ms must be non-negative, got {self.solve_time_ms}"
+            )
+        if self.success and self.planner_failure_reason is not None:
+            raise ValueError("planner_failure_reason must be None when success is True")
+        if not self.success and self.planner_failure_reason is None:
+            raise ValueError("planner_failure_reason is required when success is False")
+
+
+@dataclass(frozen=True)
+class PlanReportMetadata:
+    """Observability provenance for plan reporting (Manifold/Scuba sinks).
+
+    Carries the framework/model-known facts the reporter needs to build the stats
+    sinks — data our layer cannot derive from the plan/topology/request. It is
+    observability-only and does NOT affect the plan, so it is deliberately kept
+    off ``PlannerConfig`` and excluded from ``request_hash``. Optional; absent ->
+    the reporter falls back to console stats only. (``feature_stats_summary`` and
+    similar summary objects are not projected here yet — a follow-up.)
+
+    One instance describes a single plan (one model), so model-specific fields
+    such as ``proposer_types``, ``embedding_hash`` and the size fields vary across
+    models by design — the caller populates them per request.
+    """
+
+    trainer: Optional[str] = None
+    pipeline: Optional[str] = None
+    total_model_param_size: Optional[int] = None
+    total_sparse_param_size: Optional[int] = None
+    embedding_hash: Optional[str] = None
+    # Tuple (not List) so this frozen dataclass stays hashable: @dataclass(
+    # frozen=True) auto-generates __hash__ over all fields, and a list field
+    # would raise TypeError when an instance carrying proposer types is hashed.
+    proposer_types: Optional[Tuple[str, ...]] = None
+    num_parallel_worlds: Optional[int] = None
+    log_plan: bool = True
+    # Optional override for the Manifold upload directory (relative to the
+    # sharding_analysis bucket, e.g. "tree/sharding_plan/my_dry_run"). None ->
+    # the reporter uses the default job-context path (or the local dry-run
+    # fallback offline). Lets a dry-run pin a known location for later diffing.
+    manifold_path: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class TableArch:
+    """Per-table sparse surface the planner consumes (the replay-minimal arch).
+
+    Exactly the fields needed to rebuild a meta-device table and re-plan;
+    excludes weights and any dense/non-shardable structure the planner never
+    reads. Frozen + tuple-typed so ModelArch stays hashable.
+    """
+
+    name: str
+    num_embeddings: int
+    embedding_dim: int
+    feature_names: Tuple[str, ...]
+    pooling: Optional[str] = None
+    data_type: Optional[str] = None
+    # The sharder type that shards this table (e.g. EmbeddingBagCollectionSharder,
+    # PooledEmbeddingArchSharder). Plan-affecting -- the sharder determines the
+    # table's sharding types / kernels / storage -- so replay must place the table
+    # under the same sharder. Defaulted for back-compat.
+    sharder_type: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SharderArch:
+    """Plan-affecting per-sharder config the planner reads off ``fused_params``.
+
+    The sharder *type* alone is not enough to reproduce a plan: the sparse
+    optimizer (and its scalar hyperparams) changes the storage multiplier
+    (SGD 0x / Adam 2x / RowWiseAdagrad 1/dim), and unlike caching / prefetch /
+    dtype it has no ``ParameterConstraints`` equivalent, so it must be captured
+    here. Frozen + scalar-typed so ModelArch stays hashable. One record per
+    distinct sharder type.
+    """
+
+    sharder_type: str
+    optimizer: Optional[str] = None
+    learning_rate: Optional[float] = None
+    eps: Optional[float] = None
+    weight_decay: Optional[float] = None
+    weight_decay_mode: Optional[str] = None
+    beta1: Optional[float] = None
+    beta2: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class ModelArch:
+    """The model's sparse-architecture surface + sharder identities.
+
+    The model axis of content-addressing (hashed to ``model_arch_hash``). Because
+    the planner consumes only this surface (never model weights), persisting it is
+    sufficient to reproduce the exact planner input for replay.
+    """
+
+    tables: Tuple[TableArch, ...]
+    sharder_types: Tuple[str, ...]
+    # Per-distinct-sharder plan-affecting config (optimizer + hyperparams). Kept
+    # alongside sharder_types (a name-only summary) so replay/dedup discriminate by
+    # optimizer. Defaulted for back-compat with existing callers/blobs.
+    sharders: Tuple[SharderArch, ...] = ()
+
+
+@dataclass
+class PlannerSessionContext:
+    """Mutable context accumulating state during a planner session.
+
+    Links the ShardingPlanRequest being planned and the per-SKU
+    ShardingPlanResult(s) it produces, plus session-only scratch state
+    (caches, timing, metadata). Fields that already live on the request or
+    its results are intentionally not duplicated here — read them through
+    ``request``/``results`` (e.g. ``request.request_id``, ``request.model``,
+    ``results[sku].validation_warnings``). Unlike the frozen request/result
+    types, this dataclass is mutable to allow incremental updates during
+    execution.
+    """
+
+    # The request this session is planning for (required). Populated once by the
+    # planner API when it constructs the context, before planning begins: it is
+    # the input being planned and the source of truth for model, sharders,
+    # request_id/request_hash, constraints, launcher_hardware, etc. — read those
+    # through `request` rather than duplicating them on the context.
+    request: ShardingPlanRequest
+    # Per-SKU results produced this session, keyed by SKU (required; the planner
+    # API passes an empty dict at session start). Populated incrementally: one
+    # entry is added as each ShardingPlanResult is produced while iterating the
+    # request's SKUs. Each result carries its sharding plan, memory estimates,
+    # validation_warnings, manifold url, and request_id/request_hash back-reference.
+    results: Dict[str, ShardingPlanResult]
+    # Unique session identifier; defaults to a UUID4
+    session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    # Topology modeled per SKU, keyed by (sku, world_size, local_world_size) — the
+    # dims that make a topology reusable. Populated by the executor as it builds
+    # each SKU's topology.
+    topology_cache: Dict[Tuple[str, int, int], Topology] = field(default_factory=dict)
+    # Wall-clock timing (milliseconds) for each planning phase. Populated by the
+    # executor with per-SKU-qualified keys ("topology_build:<sku>",
+    # "storage_reservation:<sku>", "planner_construction:<sku>",
+    # "plan_call:<sku>") plus session-level keys the caller/API add
+    # ("resolve_sku_list", "total_planner_time"). Per-SKU keys keep a multi-SKU
+    # dry-run sweep comparable. "plan_call" is the whole planner.plan() block
+    # (reserve+enumerate+propose+solve+stats); the intra-planner split is a
+    # follow-up. Observability only (excluded from request_hash).
+    timing: Dict[str, float] = field(default_factory=dict)
+    # StorageReservation resolved and used per SKU. Populated by the executor.
+    storage_reservations_used: Dict[str, StorageReservation] = field(
+        default_factory=dict
+    )
+    # Effective HardwareConfig applied per SKU. Populated by the provider's
+    # build_topology (OSS: the request-caps default; fb: the HUM-resolved config).
+    hw_overrides_applied: Dict[str, HardwareConfig] = field(default_factory=dict)
+    # Plans retrieved from cache, keyed by request fingerprint (per request+SKU).
+    # Scaffolding: the current flow has no plan-level cache (the executor always
+    # builds and runs the planner), so this stays empty until a request_hash-keyed
+    # plan cache exists. Paired with ``cache_hit``.
+    cached_plans: Dict[str, ShardingPlan] = field(default_factory=dict)
+    # Caller-provided session metadata (e.g. training_framework, model_type,
+    # entitlement). Populated by the caller/adapter at context construction.
+    client_metadata: Dict[str, str] = field(default_factory=dict)
+    # Whether each SKU's result came from cache — per SKU (SKU -> hit). Scaffolding:
+    # empty until a plan-level cache exists (see ``cached_plans``).
+    cache_hit: Dict[str, bool] = field(default_factory=dict)
+    # Source of resolved hardware-capability data per SKU (SKU -> source label).
+    # Populated by the provider's build_topology: OSS records "request_caps"; fb
+    # records "hardware_registry" (dry-run, static HUM registry) or
+    # "live_detection" (production MAST/Serf). Kept a free-form string so it isn't
+    # restricted to a fixed set of mechanisms (finer attribution is a follow-up).
+    hw_source: Dict[str, str] = field(default_factory=dict)
+    # Resolved perf-estimator selection per SKU (SKU -> capability name), captured
+    # by the fb provider. With hardware-based compute estimation on, the estimator
+    # is chosen from the capability *live-detected* on the plan host (SERF), which
+    # can differ from the recorded SKU; persisting the resolved capability makes
+    # the estimator selection recoverable for faithful replay. With it off, the
+    # OSS/basic estimator runs (a pure function of the captured topology) and this
+    # records the sentinel "OSS_DEFAULT" so the estimator used is always explicit
+    # rather than a blank that reads as missing data.
+    resolved_hw_config: Dict[str, str] = field(default_factory=dict)
+    # Full enumerated search space per SKU (SKU -> the enumerator's candidate
+    # ShardingOptions projected to ShardingOptionDetail), captured only when the
+    # request sets capture_search_space. Empty otherwise -- it is large and
+    # deterministically re-derivable from request_spec + model_arch, so it is
+    # opt-in observability, not part of the default capture.
+    search_space: Dict[str, Tuple[ShardingOptionDetail, ...]] = field(
+        default_factory=dict
+    )
+    # Manifold URLs of the per-SKU search-space blobs uploaded when
+    # capture_search_space is set (SKU -> url); surfaced as search_space_url on the
+    # planner_runs Scuba row. Empty when capture is off.
+    search_space_urls: Dict[str, str] = field(default_factory=dict)
+    # External trace / job identifier (the MAST job name) this planning session
+    # corresponds to. Links the request/session to the launching job for
+    # cross-system correlation. Populated by the caller/adapter (None off-MAST,
+    # e.g. an offline dry-run).
+    external_trace_id: Optional[str] = None
+    # Observability provenance for plan reporting (Manifold/Scuba); observability
+    # only, not plan-affecting (excluded from request_hash). None -> console-only.
+    report_metadata: Optional[PlanReportMetadata] = None
+    # Stats sinks the planner logs to, built by the orchestrator's PlanReporter
+    # from report_metadata and forwarded to the planner. None -> planner default.
+    stats: Optional[List[Stats]] = None
+    # Session-level, non-fatal diagnostics accumulated while planning this request
+    # (e.g. a candidate SKU dropped from a dry-run sweep because it has no
+    # TrainingHardware mapping). These are request/session-scoped facts with no
+    # single result to attach to, so they live here rather than on a per-SKU
+    # result; observability only (not plan-affecting, excluded from request_hash).
+    # Surfaced by the caller/CLI (e.g. printed in the dry-run report).
+    warnings: List[str] = field(default_factory=list)
+    # Whether the observability/reproduction persistence layer is enabled for this
+    # session. Resolved ONCE from the gating JustKnob by the entrypoint and shared
+    # by every sink, so a flaky JK load can't enable some sinks and disable others
+    # within one run. None until resolved; sinks treat None as disabled.
+    persistence_enabled: Optional[bool] = None
+    # The model's sparse-arch surface (tables + sharder identities), captured once
+    # by the executor — the model axis of reproduction, hashed to model_arch_hash
+    # by consumers. None until captured; observability/reproduction only (not
+    # plan-affecting, excluded from request_hash).
+    model_arch: Optional[ModelArch] = None
+    # URLs of persisted reproduction artifacts, keyed by kind (e.g. "request_spec",
+    # "model_arch"), populated by the persistence layer when it uploads a blob.
+    # Empty when persistence is disabled or upload failed; observability only, so
+    # the caller/CLI can surface where the run's artifacts live.
+    content_urls: Dict[str, str] = field(default_factory=dict)
 
 
 # ---- Types Utils ---- #

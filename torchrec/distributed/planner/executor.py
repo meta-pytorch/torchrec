@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+# pyre-strict
+
+import logging
+import time
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING, Union
+
+import torch.distributed as dist
+import torch.nn as nn
+from torchrec.distributed.planner.model_arch import extract_model_arch
+from torchrec.distributed.planner.protocols import PlannerExecutor
+from torchrec.distributed.planner.provider import (
+    DefaultPlannerProvider,
+    PlannerProvider,
+)
+from torchrec.distributed.planner.types import (
+    PlannerError,
+    PlannerSessionContext,
+    ShardingOption,
+    ShardingOptionDetail,
+    ShardingPlanResult,
+)
+
+if TYPE_CHECKING:
+    # Type-only import: pulling planners at runtime would import
+    # torchrec.distributed.planner.stats transitively, defeating the lazy
+    # _calculate_critical_path import in _plan_quality. It is used solely as an
+    # annotation in _maybe_capture_search_space.
+    from torchrec.distributed.planner.planners import EmbeddingPlannerBase
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _peak_per_rank_storage(best_plan: List[ShardingOption]) -> Tuple[int, int]:
+    """Peak per-rank (HBM, DDR) in bytes across the chosen shards.
+
+    Aggregates each shard's storage onto its assigned rank and returns the
+    maximum over ranks — the memory the tightest device must hold, which is what
+    ShardingPlanResult.estimated_max_*_bytes reports. Shards without resolved
+    storage or rank are skipped, so the reported peak is a lower bound if the
+    planner left any chosen shard un-costed.
+    """
+    hbm_by_rank: Dict[int, int] = {}
+    ddr_by_rank: Dict[int, int] = {}
+    for option in best_plan:
+        for shard in option.shards:
+            if shard.storage is None or shard.rank is None:
+                continue
+            hbm_by_rank[shard.rank] = hbm_by_rank.get(shard.rank, 0) + shard.storage.hbm
+            ddr_by_rank[shard.rank] = ddr_by_rank.get(shard.rank, 0) + shard.storage.ddr
+    return (
+        max(hbm_by_rank.values(), default=0),
+        max(ddr_by_rank.values(), default=0),
+    )
+
+
+def _plan_quality(
+    best_plan: List[ShardingOption],
+) -> Tuple[
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+    Optional[float],
+]:
+    """(critical_path total, comms, comp, max_rank_perf, mean_rank_perf, imbalance).
+
+    Best-effort observability read of the chosen plan's per-shard Perf breakdown.
+    The six values are two independently-guarded halves that do NOT move as a unit:
+    the critical path (total, comms, comp) and the per-rank modeled-perf balance
+    (max, mean, and max/mean ratio -- 1.0 is perfectly balanced). All six are None
+    only for an empty best_plan (off the planning rank, or a no-op plan). Otherwise
+    each half is computed under its own guard, so a failure in one leaves it None
+    while the other is still returned -- e.g. (None, None, None, max, mean, imbalance)
+    if the critical-path read fails, or (total, comms, comp, None, None, None) if the
+    per-rank aggregation fails. Never raises, so a metrics-only failure cannot affect
+    planning.
+    """
+    # Empty plan (off the planning rank, or a no-op plan) -> the breakdown is
+    # unavailable, not zero. Return all-None rather than the 0s that
+    # _calculate_critical_path([]) would produce, so sinks record "absent".
+    if not best_plan:
+        return (None, None, None, None, None, None)
+    # Compute the critical-path breakdown independently of the per-rank perf
+    # balance: a stats-side failure here must leave total/comms/comp None but must
+    # NOT drop the imbalance signal (the O5 metric that motivated this diff), which
+    # is derivable from best_plan alone.
+    total: Optional[float] = None
+    comms: Optional[float] = None
+    comp: Optional[float] = None
+    try:
+        # Imported lazily so the OSS executor never pays the stats import cost on
+        # the planning hot path unless a plan actually needs the breakdown.
+        from torchrec.distributed.planner.stats import _calculate_critical_path
+
+        cp = _calculate_critical_path(best_plan)
+        total, comms, comp = cp.total(), cp.comms_estimate, cp.comp_estimate
+    except Exception:
+        pass
+    # Per-rank modeled-perf balance (independent of the critical-path breakdown);
+    # guarded so this metrics-only read can never raise into planning.
+    try:
+        perf_by_rank: Dict[int, float] = {}
+        for option in best_plan:
+            for shard in option.shards:
+                if shard.rank is None or shard.perf is None:
+                    continue
+                perf_by_rank[shard.rank] = (
+                    perf_by_rank.get(shard.rank, 0.0) + shard.perf.total
+                )
+        if not perf_by_rank:
+            return (total, comms, comp, None, None, None)
+        vals = list(perf_by_rank.values())
+        max_perf = max(vals)
+        mean_perf = sum(vals) / len(vals)
+        imbalance = max_perf / mean_perf if mean_perf > 0 else None
+        return (total, comms, comp, max_perf, mean_perf, imbalance)
+    except Exception:
+        return (total, comms, comp, None, None, None)
+
+
+def _materialize_model(
+    model: Union[nn.Module, Callable[[], nn.Module]],
+) -> nn.Module:
+    """Return the request's model, materializing it if it is a factory callable."""
+    if isinstance(model, nn.Module):
+        return model
+    # Guard callable first so a non-module, non-factory value gets the intended
+    # message instead of a bare "X object is not callable".
+    if not callable(model):
+        raise TypeError(
+            "request.model must be an nn.Module or a factory callable returning "
+            f"one, got {type(model).__name__}"
+        )
+    built = model()
+    if not isinstance(built, nn.Module):
+        raise TypeError(
+            f"request.model factory must return an nn.Module, got {type(built).__name__}"
+        )
+    return built
+
+
+def _maybe_capture_search_space(
+    ctx: PlannerSessionContext, sku: str, planner: "EmbeddingPlannerBase"
+) -> None:
+    """Opt-in, best-effort capture of the full enumerated search space (per SKU).
+
+    Off by default -- the space is large and deterministically re-derivable from
+    request_spec + model_arch -- so a capture failure never affects the plan.
+    """
+    if not ctx.request.capture_search_space:
+        return
+    try:
+        ctx.search_space[sku] = tuple(
+            ShardingOptionDetail.from_sharding_option(option)
+            for option in (planner.get_search_space() or ())
+        )
+    except Exception:
+        # Best-effort (never affects planning), but log so a silent capture
+        # failure is diagnosable rather than surfacing downstream as an
+        # unexplained empty search_space_url (matches maybe_upload_planner_content).
+        logger.warning(
+            "[planner_executor] search-space capture failed for sku=%s",
+            sku,
+            exc_info=True,
+        )
+
+
+class DefaultPlannerExecutor(PlannerExecutor):
+    """The single concrete PlannerExecutor behind ShardingPlannerAPI.
+
+    There is intentionally ONE executor, not one per planner variant: ``run`` is
+    the single integration point that builds the topology, storage reservation,
+    and planner for the request's SKU (via the injected PlannerProvider), runs it
+    (collectively when the API supplies a process group, else locally), and
+    returns a ShardingPlanResult — including the per-table ``sharding_options``
+    breakdown and per-rank memory estimates. This is the single place that
+    replaces the topology/storage/planner-selection-and-invocation block each
+    framework (Pyper/MVAI/APS) currently duplicates.
+
+    The PlannerProvider is the OSS-vs-Meta seam: ``DefaultPlannerProvider`` (OSS)
+    builds the OSS topology + EmbeddingShardingPlanner; ``FbPlannerProvider``
+    (torchrec/fb) overrides it for HUM topology and the LinearProgramming/Manifold
+    planners — so this OSS executor never imports fb, and variant support is
+    injected (not registered by import side effect). Inherits the
+    ``PlannerExecutor`` protocol so conformance is explicit, not just structural.
+    """
+
+    def __init__(self, provider: Optional[PlannerProvider] = None) -> None:
+        # Default to the OSS provider; Meta binaries inject FbPlannerProvider
+        # (e.g. via the fb create_sharding_plan entrypoint).
+        self._provider: PlannerProvider = (
+            provider if provider is not None else DefaultPlannerProvider()
+        )
+
+    def run(
+        self,
+        sku: str,
+        ctx: PlannerSessionContext,
+        pg: Optional[dist.ProcessGroup] = None,
+    ) -> ShardingPlanResult:
+        # model/sharders come from the request (not passed separately);
+        # materialize the model if it is a factory.
+        model = _materialize_model(ctx.request.model)
+        sharders = ctx.request.sharders
+
+        # Capture the model's sparse-arch surface once per session (the model axis
+        # of reproduction); best-effort, observability only, so a capture failure
+        # never affects planning.
+        if ctx.model_arch is None:
+            try:
+                ctx.model_arch = extract_model_arch(model, sharders)
+            except Exception:
+                pass
+
+        # On the collective path only rank 0 plans and populates the per-shard
+        # breakdown; other ranks get the broadcast plan but no breakdown/estimates.
+        # Flag which result is authoritative so aggregators can filter. Local path
+        # (pg=None) always plans on the caller's rank. Use pg.rank() (rank within
+        # the broadcast group) rather than dist.get_rank(pg): the latter routes
+        # through _get_default_group() and so requires an initialized default WORLD
+        # group, a dependency the legacy path never had.
+        is_planning_rank = pg is None or pg.rank() == 0
+
+        # Build every per-SKU input and the planner itself via the injected
+        # provider — the single dispatch point across OSS/LP/Manifold variants.
+        # Each phase is timed onto ctx.timing (observability only), keyed per SKU
+        # so a multi-SKU dry-run sweep stays comparable. Times are wall-clock ms.
+        t0 = time.perf_counter()
+        topology = self._provider.build_topology(sku, ctx.request, ctx)
+        ctx.timing[f"topology_build:{sku}"] = (time.perf_counter() - t0) * 1000.0
+        # Record the modeled topology per SKU so callers can inspect the hardware
+        # each SKU was planned against, keyed by the dims that make it reusable.
+        ctx.topology_cache[(sku, topology.world_size, topology.local_world_size)] = (
+            topology
+        )
+
+        t0 = time.perf_counter()
+        storage_reservation = self._provider.build_storage_reservation(sku, ctx.request)
+        ctx.timing[f"storage_reservation:{sku}"] = (time.perf_counter() - t0) * 1000.0
+        ctx.storage_reservations_used[sku] = storage_reservation
+
+        t0 = time.perf_counter()
+        planner = self._provider.build_planner(
+            sku,
+            topology=topology,
+            storage_reservation=storage_reservation,
+            ctx=ctx,
+        )
+        ctx.timing[f"planner_construction:{sku}"] = (time.perf_counter() - t0) * 1000.0
+
+        start = time.perf_counter()
+        try:
+            # pg is owned by the API: present -> collective (rank-0 plan +
+            # broadcast); None -> local single-rank plan.
+            if pg is not None:
+                sharding_plan = planner.collective_plan(model, sharders, pg)
+            else:
+                sharding_plan = planner.plan(model, sharders)
+        except PlannerError as e:
+            # plan_call bundles reserve + enumerate + propose + solve + stats
+            # (incl. Manifold upload); the intra-planner split lives inside the
+            # planner and is a separate follow-up.
+            solve_time_ms = (time.perf_counter() - start) * 1000.0
+            ctx.timing[f"plan_call:{sku}"] = solve_time_ms
+            return ShardingPlanResult(
+                sku=sku,
+                success=False,
+                sharding_plan=None,
+                planner_failure_reason=str(e),
+                # Preserve the structured failure kind alongside the string, so
+                # downstream analytics can taxonomize failures.
+                planner_error_type=e.error_type,
+                estimated_max_hbm_bytes=0,
+                estimated_max_ddr_bytes=0,
+                request_id=ctx.request.request_id,
+                request_hash=ctx.request.request_hash,
+                solve_time_ms=solve_time_ms,
+                is_planning_rank=is_planning_rank,
+            )
+        solve_time_ms = (time.perf_counter() - start) * 1000.0
+        ctx.timing[f"plan_call:{sku}"] = solve_time_ms
+
+        # get_selected_options() is the chosen List[ShardingOption] with per-shard
+        # storage/perf populated; it is the only source of the full cost breakdown
+        # that the deployment-facing ShardingPlan drops. It is a documented planner
+        # contract (EmbeddingPlannerBase.get_selected_options), so a planner that
+        # doesn't expose its plan fails loudly here rather than silently returning
+        # empty options + zero-byte estimates (the old getattr(_best_plan) read).
+        #
+        # In the collective path only the planning rank (rank 0) computes the
+        # plan, so on other ranks this is empty: those ranks return the
+        # authoritative broadcast sharding_plan but an empty sharding_options
+        # breakdown and zero estimates (the per-shard cost detail is not carried
+        # in the broadcast ShardingPlan, so it cannot be recomputed off-rank).
+        # Consumers that need the breakdown/estimates should read the planning
+        # rank's result.
+        best_plan: List[ShardingOption] = planner.get_selected_options()
+        sharding_options = tuple(
+            ShardingOptionDetail.from_sharding_option(option) for option in best_plan
+        )
+        # Opt-in, best-effort capture of the full enumerated search space (per SKU).
+        _maybe_capture_search_space(ctx, sku, planner)
+        max_hbm_bytes, max_ddr_bytes = _peak_per_rank_storage(best_plan)
+        # Plan-quality / critical-path breakdown off the chosen plan's per-shard
+        # Perf (best-effort; all-None off the planning rank where best_plan is
+        # empty). Computed here -- the only place the full Perf survives -- because
+        # ShardingOptionDetail collapses it to a single perf_total downstream.
+        (
+            critical_path_ms,
+            comms_critical_path_ms,
+            comp_critical_path_ms,
+            max_rank_perf,
+            mean_rank_perf,
+            perf_imbalance_ratio,
+        ) = _plan_quality(best_plan)
+        return ShardingPlanResult(
+            sku=sku,
+            success=True,
+            sharding_plan=sharding_plan,
+            planner_failure_reason=None,
+            estimated_max_hbm_bytes=max_hbm_bytes,
+            estimated_max_ddr_bytes=max_ddr_bytes,
+            request_id=ctx.request.request_id,
+            request_hash=ctx.request.request_hash,
+            sharding_options=sharding_options,
+            solve_time_ms=solve_time_ms,
+            is_planning_rank=is_planning_rank,
+            critical_path_ms=critical_path_ms,
+            comms_critical_path_ms=comms_critical_path_ms,
+            comp_critical_path_ms=comp_critical_path_ms,
+            max_rank_perf=max_rank_perf,
+            mean_rank_perf=mean_rank_perf,
+            perf_imbalance_ratio=perf_imbalance_ratio,
+        )

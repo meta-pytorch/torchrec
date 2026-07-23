@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, cast, Dict, Mapping, Optional, Union
 
 import torch
 from torch import distributed as dist
@@ -298,9 +298,12 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
 
         # Created lazily on first compute so the module can be constructed without
         # an initialized process group (e.g. single-process model validation).
-        # pyrefly: ignore
+        # new_group returns a real ProcessGroup here (ranks=None => every rank is a
+        # member, never NON_GROUP_MEMBER); narrow away the int/None sentinels.
         self.cpu_process_group: Optional[dist.ProcessGroup] = (
-            dist.new_group(backend="gloo") if dist.is_initialized() else None
+            cast(Optional[dist.ProcessGroup], dist.new_group(backend="gloo"))
+            if dist.is_initialized()
+            else None
         )
         self.comms_module: CPUCommsRecMetricModule = CPUCommsRecMetricModule(
             *args,
@@ -755,7 +758,9 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 # Manual distributed sync (replaces TorchMetrics.metric.Metric.sync())
                 all_gather_start_ms = time.time()
                 if self.cpu_process_group is None:
-                    self.cpu_process_group = dist.new_group(backend="gloo")
+                    self.cpu_process_group = cast(
+                        dist.ProcessGroup, dist.new_group(backend="gloo")
+                    )
                 aggregated_states = self.comms_module.get_pre_compute_states(
                     self.cpu_process_group
                 )
