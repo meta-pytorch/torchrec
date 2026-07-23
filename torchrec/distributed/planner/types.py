@@ -1185,6 +1185,49 @@ class Topology:
 
         return hash_sha256_to_int(hashable_list)
 
+    def to_reproduction_dict(self) -> Dict[str, object]:
+        """The plan-affecting topology fields, for reproduction persistence.
+
+        Mirrors the field set of ``_hash`` (everything that changes the plan):
+        sizes, per-device caps, memory/comms bandwidths, and compute multipliers.
+        Devices are homogeneous, so the per-device caps are recorded as a single
+        value (``devices[0]``). The persistence layer stores this so a replay can
+        rebuild the exact hardware model rather than re-deriving it from a
+        since-changed hardware registry.
+        """
+        storage = self._devices[0].storage if self._devices else None
+        return {
+            "world_size": self._world_size,
+            "local_world_size": self._local_world_size,
+            "compute_device": self._compute_device,
+            "intra_group_size": self._intra_group_size,
+            "hbm_cap": storage.hbm if storage is not None else 0,
+            "ddr_cap": storage.ddr if storage is not None else 0,
+            "ssd_cap": storage.ssd if storage is not None else 0,
+            "hbm_mem_bw": self._hbm_mem_bw,
+            "ddr_mem_bw": self._ddr_mem_bw,
+            "ssd_mem_bw": self._ssd_mem_bw,
+            "hbm_to_ddr_mem_bw": self._hbm_to_ddr_mem_bw,
+            "intra_host_bw": self._comms_bandwidths.intra_host_bw,
+            "inter_host_bw": self._comms_bandwidths.inter_host_bw,
+            "bwd_compute_multiplier": self._bwd_compute_multiplier,
+            "weighted_feature_bwd_compute_multiplier": (
+                self._weighted_feature_bwd_compute_multiplier
+            ),
+            "uneven_sharding_perf_multiplier": self._uneven_sharding_perf_multiplier,
+        }
+
+    def reproduction_hash(self) -> str:
+        """Stable 16-char hex hash of the plan-affecting topology fields.
+
+        Drift guard: a replay compares this against a freshly-built topology's hash
+        and can fail loudly if the hardware model changed, instead of silently
+        producing a different plan.
+        """
+        # Zero-pad before truncating so the width is always exactly 16 hex chars
+        # (a small hash value would otherwise render shorter than the promised 16).
+        return f"{self._hash():016x}"[:16]
+
 
 # ---- INPUT / OUTPUT ----- #
 
@@ -2541,6 +2584,11 @@ class ShardingPlanResult:
     estimated_qps: Optional[float] = None
     # Latency of slowest path through sharded model (ms); None if unavailable
     critical_path_ms: Optional[float] = None
+    # Structured failure taxonomy carried from PlannerError.error_type, so the
+    # failure kind (INSUFFICIENT_STORAGE / STRICT_CONSTRAINTS / PARTITION / …)
+    # survives for analytics instead of being flattened into the free-form
+    # planner_failure_reason string. None on success (or when unavailable).
+    planner_error_type: Optional[PlannerErrorType] = None
     # Non-fatal warnings even when plan succeeds
     validation_warnings: Tuple[str, ...] = ()
     # URL of the sharding plan persisted to Manifold (for sharing/debugging);
@@ -2718,6 +2766,11 @@ class PlannerSessionContext:
     # result; observability only (not plan-affecting, excluded from request_hash).
     # Surfaced by the caller/CLI (e.g. printed in the dry-run report).
     warnings: List[str] = field(default_factory=list)
+    # Whether the observability/reproduction persistence layer is enabled for this
+    # session. Resolved ONCE from the gating JustKnob by the entrypoint and shared
+    # by every sink, so a flaky JK load can't enable some sinks and disable others
+    # within one run. None until resolved; sinks treat None as disabled.
+    persistence_enabled: Optional[bool] = None
 
 
 # ---- Types Utils ---- #

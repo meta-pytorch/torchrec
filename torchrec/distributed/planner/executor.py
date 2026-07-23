@@ -156,6 +156,9 @@ class DefaultPlannerExecutor(PlannerExecutor):
                 success=False,
                 sharding_plan=None,
                 planner_failure_reason=str(e),
+                # Preserve the structured failure kind alongside the string, so
+                # downstream analytics can taxonomize failures.
+                planner_error_type=e.error_type,
                 estimated_max_hbm_bytes=0,
                 estimated_max_ddr_bytes=0,
                 request_id=ctx.request.request_id,
