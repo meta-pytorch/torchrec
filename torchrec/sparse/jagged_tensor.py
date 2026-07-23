@@ -2271,7 +2271,9 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         return self
 
     @staticmethod
-    def from_jt_dict(jt_dict: Dict[str, JaggedTensor]) -> "KeyedJaggedTensor":
+    def from_jt_dict(
+        jt_dict: Dict[str, JaggedTensor], force_variable_stride: bool = False
+    ) -> "KeyedJaggedTensor":
         """
         Constructs a KeyedJaggedTensor from a dictionary of JaggedTensors.
         Automatically calls `kjt.sync()` on newly created KJT.
@@ -2313,6 +2315,9 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
 
         Args:
             jt_dict (Dict[str, JaggedTensor]): dictionary of JaggedTensors.
+            force_variable_stride: bool: If true, always builds the KJT with an
+                explicit per-key stride instead of collapsing to a single uniform
+                stride when all per-key strides are equal. Defaults to False.
 
         Returns:
             KeyedJaggedTensor: constructed KeyedJaggedTensor.
@@ -2337,7 +2342,13 @@ class KeyedJaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         kjt_stride, kjt_stride_per_key_per_rank = (
             (stride_per_key[0], None)
             if all(s == stride_per_key[0] for s in stride_per_key)
-            else (None, torch.IntTensor(stride_per_key, device="cpu").reshape(-1, 1))
+            and not force_variable_stride
+            else (
+                None,
+                torch.tensor(stride_per_key, dtype=torch.int32, device="cpu").reshape(
+                    -1, 1
+                ),
+            )
         )
         kjt = KeyedJaggedTensor(
             keys=kjt_keys,
