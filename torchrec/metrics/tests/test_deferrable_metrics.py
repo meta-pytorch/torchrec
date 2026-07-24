@@ -397,6 +397,31 @@ class TransferTensorsToCpuTest(unittest.TestCase):
         self.assertTrue(event.query())
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_mixed_cpu_and_cuda_tensors(self) -> None:
+        """Regression: a dict mixing CPU and CUDA tensors must not crash.
+        Previously the copy loop guarded only on isinstance(v, Tensor) and
+        called v.record_stream (CUDA-only) on the CPU tensors too, raising
+        NotImplementedError. CPU tensors must pass through untouched while the
+        CUDA tensor is transferred to CPU."""
+        cpu_tensor = torch.tensor([1.0, 2.0])
+        tensors: dict[str, Any] = {
+            "cuda_val": torch.tensor([0.5], device="cuda"),
+            "cpu_val": cpu_tensor,
+            "name": "task1",
+        }
+        cpu_tensors, event = transfer_tensors_to_cpu(tensors)
+        self.assertIsNotNone(event)
+        # CUDA tensor transferred to CPU.
+        self.assertEqual(cpu_tensors["cuda_val"].device.type, "cpu")
+        # CPU tensor passed through as the same object (not copied/pinned).
+        self.assertIs(cpu_tensors["cpu_val"], cpu_tensor)
+        # Non-tensor preserved.
+        self.assertEqual(cpu_tensors["name"], "task1")
+        if event is not None:
+            event.synchronize()
+        torch.testing.assert_close(cpu_tensors["cuda_val"], torch.tensor([0.5]))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
     def test_cuda_transfer_destination_is_pinned(self) -> None:
         """The CPU destination must be pinned so cudaMemcpyAsync is truly
         non-blocking on the host. Without pinning, the driver stages

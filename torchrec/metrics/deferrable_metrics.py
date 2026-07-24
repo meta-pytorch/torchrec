@@ -77,8 +77,9 @@ def transfer_tensors_to_cpu(
 
     Returns the CPU tensor dict and a CUDA event recorded on the dedicated
     stream that tracks completion. For CPU-only inputs, returns the dict
-    as-is with None event. Non-tensor values are preserved unchanged.
-    All tensors are assumed to be on the same device.
+    as-is with None event. Only CUDA tensors are transferred; CPU tensors and
+    non-tensor values are passed through unchanged. CUDA tensors are assumed to
+    share a single device.
     """
     source_device: torch.device | None = None
     for v in tensors.values():
@@ -99,7 +100,7 @@ def transfer_tensors_to_cpu(
         with torch.cuda.stream(dtoh_stream):
             cpu_tensors: dict[str, Any] = {}
             for k, v in tensors.items():
-                if isinstance(v, torch.Tensor):
+                if isinstance(v, torch.Tensor) and v.device.type == "cuda":
                     dst = torch.empty(
                         v.shape, dtype=v.dtype, device="cpu", pin_memory=True
                     )
