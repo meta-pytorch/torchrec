@@ -155,6 +155,32 @@ except Exception:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+
+def _get_distinct_streams(
+    device: torch.device, num_streams: int, priority: int = 0
+) -> List[Optional[torch.Stream]]:
+    """Allocate ``num_streams`` device streams guaranteed to be pairwise distinct.
+
+    Requesting streams independently can leave them sharing one underlying stream
+    on some backends, which serializes work that was meant to overlap. Reserving
+    each stream from the pool keeps a pipeline's streams separate. Falls back to
+    plain ``Stream`` allocation on devices or torch builds without reservation
+    support (e.g. MTIA, or a torch without ``Stream(reserve=...)``).
+    """
+    if device.type not in ["cuda", "mtia"]:
+        return [None] * num_streams
+    module = torch.get_device_module(device)
+    try:
+        return [
+            module.Stream(priority=priority, reserve=True)
+            for _ in range(num_streams)
+        ]
+    except TypeError:
+        # Older torch without Stream(reserve=...); a pool-exhaustion RuntimeError
+        # is intentionally not caught here so it still surfaces to the caller.
+        return [module.Stream(priority=priority) for _ in range(num_streams)]
+
+
 # This is required to support older torch package export for older models
 try:
     from torchrec.distributed.comm_ops import torchrec_use_sync_collectives
@@ -617,16 +643,11 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
             else torch.cuda.stream
         )
 
-        self._memcpy_stream: Optional[torch.Stream] = (
-            (torch.get_device_module(device).Stream(priority=-1))
-            if device.type in ["cuda", "mtia"]
-            else None
-        )
-        self._data_dist_stream: Optional[torch.Stream] = (
-            (torch.get_device_module(device).Stream(priority=-1))
-            if device.type in ["cuda", "mtia"]
-            else None
-        )
+        # Allocate the memcpy and data-dist comms streams as a distinct set so
+        # they stay separate and can overlap instead of serializing.
+        _comms_streams = _get_distinct_streams(device, 2, priority=-1)
+        self._memcpy_stream: Optional[torch.Stream] = _comms_streams[0]
+        self._data_dist_stream: Optional[torch.Stream] = _comms_streams[1]
 
         self._original_forwards: List[Callable[..., Any]] = []
 
@@ -2083,16 +2104,11 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
             free_features_storage_early=free_features_storage_early,
             clear_data_dist_inputs=clear_data_dist_inputs,
         )
-        self._prefetch_stream: Optional[torch.Stream] = (
-            (torch.get_device_module(device).Stream())
-            if self._device.type in ["cuda", "mtia"]
-            else None
-        )
-        self._default_stream: Optional[torch.Stream] = (
-            (torch.get_device_module(self._device).Stream())
-            if self._device.type in ["cuda", "mtia"]
-            else None
-        )
+        # Allocate the prefetch and secondary compute streams as a distinct set
+        # so they can overlap.
+        _compute_streams = _get_distinct_streams(self._device, 2, priority=0)
+        self._prefetch_stream: Optional[torch.Stream] = _compute_streams[0]
+        self._default_stream: Optional[torch.Stream] = _compute_streams[1]
 
     def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
         """
