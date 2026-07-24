@@ -6,6 +6,7 @@ RunOptions:
   world_size: 2
   num_batches: 20
   num_benchmarks: 5
+  batch_size: 16384
   num_profiles: 1
   profile_dir: "."
   name: "sparse_data_dist_mpzch"
@@ -49,7 +50,7 @@ EmbeddingTablesConfig:
         data_type: FP16
         mc_config:
           mc_type: "mp-zch"
-          total_num_buckets: 5
+          total_num_buckets: 8
           max_probe: 128
           input_hash_size: 0
           eviction_policy_name: "SINGLE_TTL_EVICTION"
