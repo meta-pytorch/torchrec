@@ -219,6 +219,7 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
     ):
         return (False, res_params)
     res_params.table_names = [table.name for table in config.embedding_tables]
+    res_params.res_enabled_tables = res_enabled_tables or []
     if res_enabled_tables is not None and len(res_enabled_tables) != 0:
         if len(set(res_enabled_tables) & set(res_params.table_names)) == 0:
             logger.info(

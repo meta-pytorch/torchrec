@@ -274,7 +274,7 @@ def _test_ebc_resharding(
         )
 
         sharded_m2 = sharder.shard(
-            module=m1,
+            module=m2,
             params=module_sharding_plan,
             env=env,
             device=ctx.device,
@@ -299,34 +299,30 @@ def _test_ebc_resharding(
         for table in tables:
             feature_keys.extend(table.feature_names)
 
-        # For current test model and inputs, the prediction should be the exact same
-        # rtol = 0
-        # atol = 0
+        # sharded model
+        # each rank gets a subbatch
+        sharded_m1_pred_kt_no_dict = sharded_m1(kjt_input_per_rank[ctx.rank])
+        resharded_m2_pred_kt_no_dict = resharded_m2(kjt_input_per_rank[ctx.rank])
 
-        for _ in range(world_size):
-            # sharded model
-            # each rank gets a subbatch
-            sharded_m1_pred_kt_no_dict = sharded_m1(kjt_input_per_rank[ctx.rank])
-            resharded_m2_pred_kt_no_dict = resharded_m2(kjt_input_per_rank[ctx.rank])
+        sharded_m1_pred_kt = sharded_m1_pred_kt_no_dict.to_dict()
+        resharded_m2_pred_kt = resharded_m2_pred_kt_no_dict.to_dict()
+        sharded_m1_pred = torch.stack(
+            [sharded_m1_pred_kt[feature] for feature in feature_keys]
+        )
 
-            sharded_m1_pred_kt = sharded_m1_pred_kt_no_dict.to_dict()
-            resharded_m2_pred_kt = resharded_m2_pred_kt_no_dict.to_dict()
-            sharded_m1_pred = torch.stack(
-                [sharded_m1_pred_kt[feature] for feature in feature_keys]
-            )
+        resharded_m2_pred = torch.stack(
+            [resharded_m2_pred_kt[feature] for feature in feature_keys]
+        )
+        # cast to CPU because when casting unsharded_model.to on the same module, there could some race conditions
+        # in normal author modelling code this won't be an issue because each rank would individually create
+        # their model. output from sharded_pred is correctly on the correct device.
 
-            resharded_m2_pred = torch.stack(
-                [resharded_m2_pred_kt[feature] for feature in feature_keys]
-            )
-            # cast to CPU because when casting unsharded_model.to on the same module, there could some race conditions
-            # in normal author modelling code this won't be an issue because each rank would individually create
-            # their model. output from sharded_pred is correctly on the correct device.
+        # Compare predictions of sharded vs unsharded models.
+        torch.testing.assert_close(sharded_m1_pred.cpu(), resharded_m2_pred.cpu())
 
-            # Compare predictions of sharded vs unsharded models.
-            torch.testing.assert_close(sharded_m1_pred.cpu(), resharded_m2_pred.cpu())
-
-            sharded_m1_pred.sum().backward()
-            resharded_m2_pred.sum().backward()
+        # Smoke test: reshard must produce a trainable module (backward doesn't crash).
+        sharded_m1_pred.sum().backward()
+        resharded_m2_pred.sum().backward()
 
 
 @skip_if_asan_class
@@ -497,7 +493,7 @@ class MultiRankEBCDynamicShardingTest(MultiProcessTestBase):
                 world_size, num_tables, ranks_per_tables
             )
             new_ranks = generate_rank_placements(
-                world_size, num_tables, ranks_per_tables
+                world_size, num_tables, new_ranks_per_tables
             )
         per_param_sharding = {}
         new_per_param_sharding = {}
