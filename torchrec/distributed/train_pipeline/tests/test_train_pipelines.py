@@ -557,6 +557,135 @@ class TrainPipelineSparseDistTest(TrainPipelineSparseDistTestBase):
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
+    @settings(max_examples=4, deadline=None)
+    @given(
+        sharding_type=st.sampled_from(
+            [
+                ShardingType.TABLE_WISE.value,
+                ShardingType.COLUMN_WISE.value,
+            ]
+        ),
+        kernel_type=st.sampled_from(
+            [
+                EmbeddingComputeKernel.FUSED.value,
+            ]
+        ),
+        execute_all_batches=st.booleans(),
+    )
+    def test_async_inplace_copy_equal_to_non_pipelined(
+        self,
+        sharding_type: str,
+        kernel_type: str,
+        execute_all_batches: bool,
+    ) -> None:
+        """
+        Numerics-parity gate for the background-thread in-place copy
+        (``async_inplace_copy``): offloading the H2D copy dispatch to a worker
+        thread must produce results identical to non-pipelined training. This
+        exercises the cross-thread stream/allocation path that carries the
+        silent-corruption risk.
+        """
+        data = self._generate_data(
+            num_batches=12,
+            batch_size=32,
+        )
+        dataloader = iter(data)
+
+        model = self._setup_model()
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type, {}
+        )
+        (
+            sharded_model_pipelined,
+            optim_pipelined,
+        ) = self._generate_sharded_model_and_optimizer(
+            model, sharding_type, kernel_type, {}
+        )
+        copy_state_dict(
+            sharded_model.state_dict(), sharded_model_pipelined.state_dict()
+        )
+
+        pipeline = self.pipeline_class(
+            model=sharded_model_pipelined,
+            optimizer=optim_pipelined,
+            device=self.device,
+            execute_all_batches=execute_all_batches,
+            enable_inplace_copy_batch=True,
+            async_inplace_copy=True,
+        )
+        # The async path must be active and must swap in the Future-aware queue.
+        self.assertTrue(pipeline._async_inplace_copy)
+        self.assertIsNotNone(pipeline._inplace_copy_executor)
+        self.assertEqual(type(pipeline.batches).__name__, "FutureDeque")
+
+        if not execute_all_batches:
+            data = data[:-2]
+
+        for batch in data:
+            # Forward + backward w/o pipelining
+            batch = batch.to(self.device)
+            optim.zero_grad()
+            loss, pred = sharded_model(batch)
+            loss.backward()
+            optim.step()
+
+            # Forward + backward w/ async in-place-copy pipelining
+            pred_pipeline = pipeline.progress(dataloader)
+            torch.testing.assert_close(pred, pred_pipeline)
+
+        self.assertRaises(StopIteration, pipeline.progress, dataloader)
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_async_inplace_copy_setup_and_lifecycle(self) -> None:
+        """async_inplace_copy: flag-off is a no-op (plain deque, no worker);
+        flag-on swaps in a FutureDeque + a worker that shuts down cleanly and
+        idempotently."""
+        from torchrec.distributed.train_pipeline.utils import FutureDeque
+
+        model = self._setup_model()
+        sharded_model, optim = self._generate_sharded_model_and_optimizer(
+            model,
+            ShardingType.TABLE_WISE.value,
+            EmbeddingComputeKernel.FUSED.value,
+            {},
+        )
+
+        # Flag off (even with inplace copy on): plain deque, no executor.
+        pipeline_off = self.pipeline_class(
+            model=sharded_model,
+            optimizer=optim,
+            device=self.device,
+            enable_inplace_copy_batch=True,
+            async_inplace_copy=False,
+        )
+        self.assertFalse(pipeline_off._async_inplace_copy)
+        self.assertIsNone(pipeline_off._inplace_copy_executor)
+        self.assertNotIsInstance(pipeline_off.batches, FutureDeque)
+
+        # Flag on: FutureDeque + background worker.
+        pipeline_on = self.pipeline_class(
+            model=sharded_model,
+            optimizer=optim,
+            device=self.device,
+            enable_inplace_copy_batch=True,
+            async_inplace_copy=True,
+        )
+        self.assertTrue(pipeline_on._async_inplace_copy)
+        self.assertIsNotNone(pipeline_on._inplace_copy_executor)
+        self.assertIsInstance(pipeline_on.batches, FutureDeque)
+
+        # Explicit shutdown clears the executor and is idempotent (no hang/raise).
+        pipeline_on._shutdown_async_inplace_copy()
+        self.assertIsNone(pipeline_on._inplace_copy_executor)
+        pipeline_on._shutdown_async_inplace_copy()
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
     @given(execute_all_batches=st.booleans())
     @settings(verbosity=Verbosity.verbose, max_examples=2, deadline=None)
     def test_pipelining_fsdp_pre_trace(self, execute_all_batches: bool) -> None:
@@ -2506,3 +2635,20 @@ class TrainPipelineSparseDistCompAutogradTest(TrainPipelineSparseDistTest):
         execute_all_batches: bool,
     ) -> None:
         super().test_equal_to_non_pipelined()
+
+    @unittest.skip(
+        "async_inplace_copy is a base TrainPipelineSparseDist feature; the compiled-autograd variant uses a different pipeline class and hits the same hypothesis multi-executor HealthCheck as test_equal_to_non_pipelined. Threading x compiled autograd is validated separately."
+    )
+    def test_async_inplace_copy_equal_to_non_pipelined(
+        self,
+        sharding_type: str,
+        kernel_type: str,
+        execute_all_batches: bool,
+    ) -> None:
+        super().test_async_inplace_copy_equal_to_non_pipelined()
+
+    @unittest.skip(
+        "Construction-only test; the compiled-autograd variant's tearDown asserts compiled-autograd captures that this test does not trigger. async_inplace_copy is a base TrainPipelineSparseDist feature validated in the eager variant."
+    )
+    def test_async_inplace_copy_setup_and_lifecycle(self) -> None:
+        super().test_async_inplace_copy_setup_and_lifecycle()
