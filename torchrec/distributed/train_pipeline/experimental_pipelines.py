@@ -1168,7 +1168,7 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
             self._injection_site = site_fqn
         self._delay_stash = delay_stash
         self._stash_site_fqn = stash_site_fqn
-        self._stash_hook_handle: Optional[torch.utils.hooks.RemovableHandle] = None
+        self._stash_forward_patched: bool = False
 
         MemoryStashingManager.set_streams(
             self._memcpy_stream,  # pyrefly: ignore[bad-argument-type]
@@ -1215,16 +1215,22 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
             logger.debug("EMS config logging failed", exc_info=True)
 
     def _try_hook_stash(self) -> None:
-        """Register a forward pre-hook on ``stash_site_fqn`` to execute
-        pending stashes right before that module's forward pass.
+        """Patch ``stash_site_fqn``'s ``forward`` to execute pending stashes
+        right before that module's forward pass.
 
-        This follows the same pattern used by
-        ``TrainPipelineCustomizedOrderSparseDist`` to hook SDD steps into
-        specific module forwards.  The hook frees HBM (D2H copy +
-        ``resize_(0)``) just before peak-memory modules run, avoiding PCIe
-        contention with ``start_sparse_data_dist``'s H2D copy.
+        The stash frees HBM (D2H copy + ``resize_(0)``) just before
+        peak-memory modules run, avoiding PCIe contention with
+        ``start_sparse_data_dist``'s H2D copy.
+
+        Forward-patching (``module.forward = wrapped``) is used instead of a
+        ``register_forward_pre_hook`` because ``torch.compile`` bypasses
+        ``Module.__call__`` and therefore erases forward pre-hooks; Dynamo
+        does trace through ``module.forward``, so the patched forward survives
+        compilation. ``@torch.compiler.disable`` confines the graph break to
+        the stash boundary, which is essentially free since the D2H copy would
+        force a device sync anyway.
         """
-        if self._stash_site_fqn is None or self._stash_hook_handle is not None:
+        if self._stash_site_fqn is None or self._stash_forward_patched:
             return
 
         model = self._model
@@ -1232,15 +1238,20 @@ class TrainPipelineSparseDistEmbStash(TrainPipelineSparseDist[In, Out]):
             model = model.module
 
         target = model.get_submodule(self._stash_site_fqn)
+        original_forward = target.forward
 
-        def _execute_stash_hook(module: torch.nn.Module, args: Any) -> None:
+        @torch.compiler.disable
+        def _stash_and_forward(*args: Any, **kwargs: Any) -> Any:
             with record_function("## execute_pending_stashes ##"):
                 MemoryStashingManager.execute_pending_stashes()
+            return original_forward(*args, **kwargs)
 
-        self._stash_hook_handle = target.register_forward_pre_hook(_execute_stash_hook)
+        # pyre-ignore[8]: intentionally rebinding the module's forward method.
+        target.forward = _stash_and_forward
+        self._stash_forward_patched = True
         logger.info(
             f"MemoryStashingManager: hooked execute_pending_stashes "
-            f"as forward pre-hook on {self._stash_site_fqn}"
+            f"by patching forward on {self._stash_site_fqn}"
         )
 
     def _pipeline_model(
