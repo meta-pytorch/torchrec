@@ -2276,3 +2276,67 @@ class TestPersistHashZchBucket(unittest.TestCase):
         count = make_hash_zch_buckets_non_persistent(parent)
         self.assertGreaterEqual(count, 1)
         self.assertNotIn("child._hash_zch_bucket", parent.state_dict())
+
+
+class TestFreshRegionSplit(unittest.TestCase):
+    def _build(
+        self,
+        zch_size: int,
+        total_num_buckets: int,
+        percent_fresh_region: float,
+        output_segments: Optional[list[int]] = None,
+    ) -> HashZchManagedCollisionModule:
+        return HashZchManagedCollisionModule(
+            zch_size=zch_size,
+            device=torch.device("cpu"),
+            total_num_buckets=total_num_buckets,
+            percent_fresh_region=percent_fresh_region,
+            output_segments=output_segments,
+        )
+
+    def test_no_fresh_region_by_default(self) -> None:
+        m = self._build(1000, 2, 0)
+        self.assertIsNone(m._main_size)
+        self.assertIsNone(m._fresh_size)
+
+    def test_no_fresh_region_skips_validation(self) -> None:
+        # percent=0 skips the split, so an otherwise-rejected config (non-uniform
+        # buckets) still constructs — backward compatible for existing callers.
+        m = self._build(100, 3, 0, output_segments=[0, 34, 67, 100])
+        self.assertIsNone(m._main_size)
+        self.assertIsNone(m._fresh_size)
+
+    def test_region_sizes(self) -> None:
+        m = self._build(1000, 2, 20.0)  # bucket_size 500, 20% fresh
+        self.assertEqual(m._main_size, 400)
+        self.assertEqual(m._fresh_size, 100)
+
+    def test_split_floors_not_rounds(self) -> None:
+        m = self._build(10, 1, 39.0)  # bucket_size 10 -> 3.9 -> 3
+        self.assertEqual(m._main_size, 7)
+        self.assertEqual(m._fresh_size, 3)
+
+    def test_fractional_percent(self) -> None:
+        m = self._build(1000, 2, 12.5)  # bucket_size 500 -> 62.5 -> 62
+        self.assertEqual(m._main_size, 438)
+        self.assertEqual(m._fresh_size, 62)
+
+    def test_sharded_module_keeps_split(self) -> None:
+        shard = self._build(1000, 2, 20.0).rebuild_with_output_id_range((500, 1000))
+        self.assertEqual(shard._main_size, 400)
+        self.assertEqual(shard._fresh_size, 100)
+
+    def test_percent_out_of_range_raises(self) -> None:
+        with self.assertRaises(AssertionError):
+            self._build(1000, 2, -1.0)
+        with self.assertRaises(AssertionError):
+            self._build(1000, 2, 100.0)
+
+    def test_percent_too_small_raises(self) -> None:
+        # 10% of a 4-slot bucket floors to 0 fresh slots.
+        with self.assertRaises(AssertionError):
+            self._build(4, 1, 10.0)
+
+    def test_non_uniform_buckets_raises(self) -> None:
+        with self.assertRaises(AssertionError):
+            self._build(100, 3, 20.0, output_segments=[0, 34, 67, 100])
