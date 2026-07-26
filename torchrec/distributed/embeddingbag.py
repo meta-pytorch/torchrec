@@ -9,10 +9,11 @@
 
 import copy
 import logging
+import time
 from collections import defaultdict, OrderedDict
 from dataclasses import dataclass, field
 from functools import partial
-from itertools import zip_longest
+from itertools import count, zip_longest
 from typing import (
     Any,
     cast,
@@ -485,6 +486,13 @@ class EmbeddingBagCollectionContext(Multistreamable):
             self.divisor.record_stream(stream)
 
 
+# Module-level monotonic counter used to derive a unique store key for the
+# pre-DDP barrier. All ranks construct ShardedEmbeddingBagCollection instances
+# in the same order in distributed training, so the counter values are
+# consistent across ranks for the same logical instance.
+_EBC_BARRIER_INSTANCE_COUNTER = count()
+
+
 class ShardedEmbeddingBagCollection(
     ShardedEmbeddingModule[
         KJTList,
@@ -815,6 +823,40 @@ class ShardedEmbeddingBagCollection(
         """
         Initialize data parallel for the embedding bag collection.
         """
+        # Reserve a unique sequence id used to namespace the pre-DDP store
+        # barrier. All ranks construct instances in the same order, so the
+        # value is consistent across ranks for the same logical instance.
+        self._barrier_seq: int = next(_EBC_BARRIER_INSTANCE_COUNTER)
+        _has_dp_sharding = any(
+            isinstance(s, DpPooledEmbeddingSharding) for s in self._embedding_shardings
+        )
+        if _has_dp_sharding and self._env.process_group is not None:
+            _br = self._env.process_group.rank()
+            _ws = self._env.process_group.size()
+            _store = dist.distributed_c10d._get_default_store()
+            if _store is None:
+                logger.warning(
+                    f"[Rank {_br}] EBC: no default c10d store available, "
+                    f"skipping pre-DDP barrier"
+                )
+            else:
+                _barrier_key = f"ebc_pre_ddp_barrier_{self._module_fqn or 'default'}_{self._barrier_seq}"
+                logger.warning(
+                    f"[Rank {_br}] EBC: entering store barrier before DDP wrapping"
+                )
+
+                _store.add(_barrier_key, 1)
+                _t0 = time.monotonic()
+                while _store.add(_barrier_key, 0) < _ws:
+                    if time.monotonic() - _t0 > 600:
+                        raise TimeoutError(
+                            f"[Rank {_br}] EBC store barrier timed out after 600s"
+                        )
+                    time.sleep(0.5)
+                logger.warning(
+                    f"[Rank {_br}] EBC: exited store barrier after "
+                    f"{time.monotonic() - _t0:.1f}s, proceeding to DDP wrapping"
+                )
         for i, (sharding, lookup) in enumerate(
             zip(self._embedding_shardings, self._lookups)
         ):
