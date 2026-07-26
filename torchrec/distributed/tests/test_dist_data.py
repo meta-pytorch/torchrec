@@ -1525,13 +1525,16 @@ class TestJaggedTensorAllToAll(MultiProcessTestBase):
 
 
 class GetRecatOverflowTest(unittest.TestCase):
-    def test_get_recat_logs_and_raises_on_int32_overflow(self) -> None:
-        """Verify that _get_recat raises RuntimeError and logs context when
-        batch_size_per_rank contains values that overflow int32."""
+    def test_get_recat_warns_and_raises_on_int32_overflow(self) -> None:
+        """By default (TORCHREC_ENABLE_INT64_RECAT unset) the dtype is NOT chosen
+        from the data -- a per-batch upcast could make ranks disagree on the
+        all-to-all dtype. When the accumulated per-feature offsets exceed the
+        int32 range, _get_recat warns (pointing at the opt-in) and then raises
+        when the int32 recat/offset tensors overflow."""
         overflow_value = 2_147_483_648  # INT32_MAX + 1
-        with self.assertRaises(RuntimeError) as ctx, self.assertLogs(
-            level="ERROR"
-        ) as log:
+        with unittest.mock.patch(
+            "torchrec.distributed.dist_data._TORCHREC_ENABLE_INT64_RECAT", False
+        ), self.assertRaises(RuntimeError), self.assertLogs(level="WARNING") as log:
             _get_recat(
                 local_split=2,
                 num_splits=4,
@@ -1539,15 +1542,64 @@ class GetRecatOverflowTest(unittest.TestCase):
                 device=torch.device("cpu"),
                 batch_size_per_rank=[32, overflow_value, 32, 32],
             )
-
-        self.assertIn("overflow", str(ctx.exception).lower())
-
         logged = "\n".join(log.output)
         self.assertIn("_get_recat", logged)
-        self.assertIn("batch_size_per_rank", logged)
+        self.assertIn("int32 range", logged)
+        self.assertIn("TORCHREC_ENABLE_INT64_RECAT", logged)
         self.assertIn(str(overflow_value), logged)
-        self.assertIn("input_offset", logged)
-        self.assertIn("output_offset", logged)
+
+    def test_get_recat_uses_int64_when_opted_in(self) -> None:
+        """With TORCHREC_ENABLE_INT64_RECAT enabled, _get_recat builds int64
+        recat + offset tensors (job-wide, rank-consistent) so the downstream
+        fbgemm all-to-all permute can consume offsets beyond the int32 range,
+        without warning. expand_into_jagged_permute is mocked to avoid
+        materializing the multi-billion-element output the large offsets would
+        otherwise allocate."""
+        overflow_value = 2_147_483_648  # INT32_MAX + 1
+        with unittest.mock.patch(
+            "torchrec.distributed.dist_data._TORCHREC_ENABLE_INT64_RECAT", True
+        ), unittest.mock.patch.object(
+            torch.ops.fbgemm,
+            "expand_into_jagged_permute",
+            return_value=torch.zeros(1, dtype=torch.int64),
+        ) as mock_expand, self.assertNoLogs(
+            level="WARNING"
+        ):
+            _get_recat(
+                local_split=2,
+                num_splits=4,
+                stagger=1,
+                device=torch.device("cpu"),
+                batch_size_per_rank=[32, overflow_value, 32, 32],
+            )
+        recat_tensor, input_offset_tensor, output_offset_tensor = (
+            mock_expand.call_args.args[:3]
+        )
+        self.assertEqual(recat_tensor.dtype, torch.int64)
+        self.assertEqual(input_offset_tensor.dtype, torch.int64)
+        self.assertEqual(output_offset_tensor.dtype, torch.int64)
+
+    def test_get_recat_no_warning_when_within_range(self) -> None:
+        """Typical models keep the int32 path with no overflow warning: when the
+        offsets fit in int32, _get_recat builds int32 recat + offset tensors."""
+        with unittest.mock.patch.object(
+            torch.ops.fbgemm,
+            "expand_into_jagged_permute",
+            return_value=torch.zeros(1, dtype=torch.int32),
+        ) as mock_expand, self.assertNoLogs(level="WARNING"):
+            _get_recat(
+                local_split=2,
+                num_splits=4,
+                stagger=1,
+                device=torch.device("cpu"),
+                batch_size_per_rank=[32, 64, 32, 64],
+            )
+        recat_tensor, input_offset_tensor, output_offset_tensor = (
+            mock_expand.call_args.args[:3]
+        )
+        self.assertEqual(recat_tensor.dtype, torch.int32)
+        self.assertEqual(input_offset_tensor.dtype, torch.int32)
+        self.assertEqual(output_offset_tensor.dtype, torch.int32)
 
     def test_get_recat_no_overflow_unchanged_behavior(self) -> None:
         """Verify that _get_recat still returns a valid recat tensor when
