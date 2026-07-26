@@ -16,9 +16,12 @@ from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
 import torch
 from torch import distributed as dist, nn
+from torchrec.distributed._collective_tag import (
+    _collective_tag_from,
+    _COLLECTIVE_TAG_MAX_BYTES,
+)
 from torchrec.distributed.collective_utils import validate_collectives_enabled
 from torchrec.distributed.dist_data import (
-    _collective_tag_from,
     KJTAllToAllTensorsAwaitable,
     SplitsAllToAllAwaitable,
 )
@@ -958,36 +961,45 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
         collective_tag: Optional[int] = None
         tag_parts: Optional[Tuple[object, ...]] = None
         if validate_collectives_enabled():
-            # Per-request rank-invariant identity, mirroring the tightening
-            # applied to KJTAllToAllSplitsAwaitable. A structural-only tag
-            # (e.g., len(splits_tensors) + self._lengths) collapses on real
-            # models: any two EBCs with identical KJT shape and sharding
-            # type produce the same `_lengths` vector, so a code-path
-            # divergence that fuses different module sets across ranks
-            # would compute the same tag and silently corrupt the all2all.
+            # Walk the fused list. For each real splits request, add
+            # its marker + splits + count + keys as parts. For each
+            # placeholder, add just its marker. Splits get length_limit=None
+            # so their full value is hashed and can't be truncated by a
+            # wide keys list. The "has_splits"/"no_splits" marker lets
+            # ranks detect when two ranks disagree on which slot is which.
             #
-            # Use aw._input.keys() (PRE-AllToAll keys, rank-invariant) —
-            # NOT aw.keys, which is the post-AllToAll local subset. Use
-            # tuple(aw.splits) for the per-request sharding plan
-            # (rank-invariant by KJTAllToAll's documented contract).
-            # Position-preserving: a None placeholder for non-meta
-            # awaitables keeps reordering detectable.
-            tag_parts = (
-                "FusedKJTListSplits",
-                tuple(
-                    (
+            # NOTE: parts_list and budgets_list must stay the same length.
+            # If you change what a request contributes, update both.
+            parts_list: List[object] = ["FusedKJTListSplits", len(self._awaitables)]
+            budgets_list: List[Optional[int]] = [
+                _COLLECTIVE_TAG_MAX_BYTES,  # "FusedKJTListSplits"
+                _COLLECTIVE_TAG_MAX_BYTES,  # len(self._awaitables)
+            ]
+            for aw in self._awaitables:
+                if isinstance(aw, KJTSplitsAllToAllMeta):
+                    parts_list.extend(
                         (
-                            tuple(aw._input.keys()),
+                            "has_splits",
                             tuple(aw.splits),
                             len(aw.splits_tensors),
+                            tuple(aw._input.keys()),
                         )
-                        if isinstance(aw, KJTSplitsAllToAllMeta)
-                        else None
                     )
-                    for aw in self._awaitables
-                ),
+                    budgets_list.extend(
+                        [
+                            _COLLECTIVE_TAG_MAX_BYTES,  # "has_splits"
+                            None,  # splits: uncapped
+                            _COLLECTIVE_TAG_MAX_BYTES,  # tensor count
+                            _COLLECTIVE_TAG_MAX_BYTES,  # keys
+                        ]
+                    )
+                else:
+                    parts_list.append("no_splits")
+                    budgets_list.append(_COLLECTIVE_TAG_MAX_BYTES)
+            tag_parts = tuple(parts_list)
+            collective_tag = _collective_tag_from(
+                *tag_parts, per_part_length_limits=budgets_list
             )
-            collective_tag = _collective_tag_from(*tag_parts)
         self._splits_awaitable: Optional[SplitsAllToAllAwaitable] = (
             SplitsAllToAllAwaitable(
                 input_tensors=splits_tensors,

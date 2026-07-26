@@ -30,9 +30,9 @@ import torch.distributed as dist
 import torchrec.distributed.collective_utils as cu
 from hypothesis import given, settings
 from pyre_extensions import none_throws
+from torchrec.distributed._collective_tag import _collective_tag_from
 from torchrec.distributed.dist_data import (
     _check_pg_for_nccl_error,
-    _collective_tag_from,
     _get_recat,
     JaggedTensorAllToAll,
     KJTAllToAll,
@@ -1574,75 +1574,6 @@ class GetRecatOverflowTest(unittest.TestCase):
         )
         self.assertIsNotNone(result)
         self.assertEqual(result.dtype, torch.int32)
-
-
-class CollectiveTagFromTest(unittest.TestCase):
-    # Single-process unit tests for the _collective_tag_from helper.
-    _INT32_MAX = 0x7FFFFFFF
-
-    def test_empty_parts_fits_signed_int32(self) -> None:
-        # Regression: the FNV-1a seed (0x811C9DC5) exceeds signed-int32 max,
-        # so a previous implementation that only masked inside the loop body
-        # returned the raw seed when parts was empty, violating the docstring's
-        # int32-fit contract and risking overflow in callers that assign the
-        # tag to an int32 splits tensor.
-        tag = _collective_tag_from()
-        self.assertGreaterEqual(tag, 0)
-        self.assertLessEqual(tag, self._INT32_MAX)
-
-    def test_various_parts_all_fit_signed_int32(self) -> None:
-        # Sanity: a range of realistic call shapes all stay within int32.
-        # Mirrors the actual tag shapes used by the two production call sites
-        # (KJTAllToAllSplitsAwaitable, FusedKJTListSplitsAwaitable). If FNV-1a's
-        # mixing changes or one of the call sites grows a new identity field,
-        # this catches a regression across both.
-        cases = [
-            # KJTAllToAllSplits production shape: (name, keys, tuple(splits))
-            ("KJTAllToAllSplits", ["f0", "f1"], (1, 1)),
-            # FusedKJTListSplits production shape: (name, tuple of per-request
-            # entries — meta entries are (keys, splits, count); non-meta is None).
-            (
-                "FusedKJTListSplits",
-                (
-                    (("f0", "f1"), (1, 1), 2),
-                    None,
-                    (("f2",), (1,), 1),
-                ),
-            ),
-            # Boundary: empty keys / empty splits
-            ("KJTAllToAllSplits", [], ()),
-            # Boundary: empty fused awaitables list
-            ("FusedKJTListSplits", ()),
-            # Long single string — guards against FNV-1a length-related issues
-            ("x" * 1024,),
-        ]
-        for parts in cases:
-            with self.subTest(parts=parts):
-                tag = _collective_tag_from(*parts)
-                self.assertGreaterEqual(tag, 0)
-                self.assertLessEqual(tag, self._INT32_MAX)
-
-    def test_deterministic(self) -> None:
-        # Determinism is the main reason this exists instead of hash().
-        # If the implementation accidentally introduces nondeterminism
-        # (e.g., switching to hash() under PYTHONHASHSEED randomization),
-        # different ranks would compute different tags and the validation
-        # would false-positive.
-        self.assertEqual(
-            _collective_tag_from("KJTAllToAllSplits", ["f0", "f1"], 3),
-            _collective_tag_from("KJTAllToAllSplits", ["f0", "f1"], 3),
-        )
-
-    def test_separator_is_unambiguous(self) -> None:
-        # Regression: with a "," separator, _collective_tag_from("a", "b") and
-        # _collective_tag_from("a,b") both serialize to the bytes b"a,b" and
-        # collide, silently disabling validation for any future call site that
-        # passes raw strings containing commas. The NUL separator avoids the
-        # collision because collective identifier parts cannot contain \x00.
-        self.assertNotEqual(
-            _collective_tag_from("a", "b"),
-            _collective_tag_from("a,b"),
-        )
 
 
 class SplitsAllToAllCollectiveTagTest(MultiProcessTestBase):
