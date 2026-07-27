@@ -886,7 +886,7 @@ class TestJaggedTensor(unittest.TestCase):
             atol=0,
         )
 
-    def test_from_jt_dict_vb(self) -> None:
+    def test_from_jt_dict_vbe(self) -> None:
         values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
         weights = torch.Tensor([1.0, 0.5, 1.5, 1.0, 0.5, 1.0, 1.0, 1.5])
         keys = ["index_0", "index_1"]
@@ -928,6 +928,49 @@ class TestJaggedTensor(unittest.TestCase):
         torch.testing.assert_close(
             j1.values(),
             torch.Tensor([3.0, 4.0, 5.0, 6.0, 7.0, 8.0]),
+            rtol=0,
+            atol=0,
+        )
+
+        # Test the case when stride per key per rank is the same
+        values = torch.Tensor(
+            [
+                1.0,
+                2.0,
+                3.0,
+                4.0,
+                5.0,
+            ]
+        )
+        weights = torch.Tensor(
+            [
+                1.0,
+                0.5,
+                1.5,
+                1.0,
+                0.5,
+            ]
+        )
+        keys = ["index_0", "index_1"]
+        offsets = torch.IntTensor([0, 2, 3, 4, 5])
+        stride_per_key_per_rank = [[2], [2]]
+        jag_tensor = KeyedJaggedTensor(
+            values=values,
+            keys=keys,
+            offsets=offsets,
+            weights=weights,
+            stride_per_key_per_rank=stride_per_key_per_rank,
+        )
+        jag_tensor_dict = jag_tensor.to_dict()
+        kjt = KeyedJaggedTensor.from_jt_dict(jag_tensor_dict)
+        self.assertIsNone(kjt._stride_per_key_per_rank)
+        kjt = KeyedJaggedTensor.from_jt_dict(
+            jag_tensor_dict, force_variable_stride=True
+        )
+        self.assertIsNotNone(kjt._stride_per_key_per_rank)
+        torch.testing.assert_close(
+            kjt._stride_per_key_per_rank,
+            torch.IntTensor([[2], [2]]),
             rtol=0,
             atol=0,
         )
