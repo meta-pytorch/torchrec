@@ -248,6 +248,7 @@ class RecMetricModule(nn.Module):
     oom_count: int
     compute_count: int
     last_compute_time: float
+    _compute_interval_steps: torch.Tensor
 
     # TODO(chienchin): Reorganize the argument to directly accept a MetricsConfig.
     def __init__(
@@ -378,7 +379,6 @@ class RecMetricModule(nn.Module):
                     # is set to infinite, adding 1.0 to the `min_compute_interval`
                     # increase the chance that the final compute interval is
                     # indeed larger than `min_compute_interval`.
-                    # pyrefly: ignore[unsupported-operation]
                     self._compute_interval_steps[0] = int(
                         (self.min_compute_interval + 1.0) / per_step_time
                     )
@@ -388,19 +388,16 @@ class RecMetricModule(nn.Module):
                     # can increase the chance that the final compute interval
                     # is indeed smaller than `max_compute_interval`
                     offset = 0.0 if self.max_compute_interval <= 1.0 else 1.0
-                    # pyrefly: ignore[unsupported-operation]
                     self._compute_interval_steps[0] = int(
                         (self.max_compute_interval - offset) / per_step_time
                     )
                 else:
-                    # pyrefly: ignore[unsupported-operation]
                     self._compute_interval_steps[0] = int(
                         (self.max_compute_interval + self.min_compute_interval)
                         / 2
                         / per_step_time
                     )
                 dist.all_reduce(self._compute_interval_steps, op=dist.ReduceOp.MAX)
-            # pyrefly: ignore[not-callable]
             self.compute_interval_steps = int(self._compute_interval_steps.item())
             self.min_compute_interval = -1.0
             self.max_compute_interval = -1.0
@@ -469,7 +466,7 @@ class RecMetricModule(nn.Module):
         self,
         metric: RecMetric,
         world_size: int,
-        process_group: Union[dist.ProcessGroup, DeviceMesh],
+        process_group: dist.ProcessGroup,
     ) -> Dict[str, Dict[str, Union[torch.Tensor, List[torch.Tensor]]]]:
         """
         Gather metric states from all ranks and apply reduction.
@@ -768,7 +765,7 @@ def generate_metric_module(
 def _all_gather_tensor(
     tensor: torch.Tensor,
     world_size: int,
-    pg: Union[dist.ProcessGroup, DeviceMesh],
+    pg: dist.ProcessGroup,
 ) -> List[torch.Tensor]:
     """All-gather a single tensor and return the gathered list."""
     out = [torch.empty_like(tensor) for _ in range(world_size)]  # pragma: no cover

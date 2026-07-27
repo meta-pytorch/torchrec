@@ -59,6 +59,7 @@ def invoke_on_rank_and_broadcast_result(
 
         id = invoke_on_rank_and_broadcast_result(pg, 0, allocate_id)
     """
+    object_list: List[Optional[T]]
     if pg.rank() == rank:
         res = func(*args, **kwargs)
         object_list = [res]

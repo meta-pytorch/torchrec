@@ -14,7 +14,7 @@
 import argparse
 import os
 import sys
-from typing import Any, cast, Dict, List, Union
+from typing import Any, cast, Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -277,7 +277,7 @@ def _train_one_epoch(
     loss_logs = []
     train_iterator = iter(train_loader)
     ce = nn.CrossEntropyLoss(ignore_index=0)
-    outputs = [None for _ in range(dist.get_world_size())]
+    outputs: List[Optional[float]] = [None for _ in range(dist.get_world_size())]
     for _ in tqdm(iter(int, 1), desc=f"Epoch {epoch+1}"):
         try:
             batch = next(train_iterator)
@@ -335,7 +335,9 @@ def _validate(
     model.eval()
     if torch.cuda.is_available():
         torch.cuda.set_device(dist.get_rank())
-    outputs = [None for _ in range(dist.get_world_size())]
+    outputs: List[Optional[Dict[str, float]]] = [
+        None for _ in range(dist.get_world_size())
+    ]
     keys = ["Recall@1", "Recall@5", "Recall@10", "NDCG@5", "NDCG@10"]
     metrics_log: Dict[str, List[float]] = {key: [] for key in keys}
 
