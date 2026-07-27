@@ -493,7 +493,7 @@ def allreduce_tensors_with_sharded_relay(
     state: ShardedRelayState,
     tensors_dict: dict[torch.dtype, list[torch.Tensor]],
     annotation: str,
-    op: dist.ReduceOp = dist.ReduceOp.AVG,
+    op: dist.ReduceOp | dist.ReduceOp.RedOpType = dist.ReduceOp.AVG,
 ) -> None:
     """
     Perform allreduce using the fused sharded relay algorithm.

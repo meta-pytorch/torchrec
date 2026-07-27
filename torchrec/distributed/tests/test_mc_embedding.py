@@ -526,7 +526,7 @@ def _test_sharding_and_resharding(  # noqa C901
             if isinstance(tensor, ShardedTensor):
                 tensor = tensor.local_shards()[0].tensor
             cpu_state_dict[key] = tensor.to("cpu")
-        gather_list = [None, None] if ctx.rank == 0 else None
+        gather_list: Optional[List[Any]] = [None, None] if ctx.rank == 0 else None
         torch.distributed.gather_object(cpu_state_dict, gather_list)
 
     if rank == 0:
