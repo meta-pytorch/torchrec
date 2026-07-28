@@ -1040,6 +1040,7 @@ class TritonTBE(torch.autograd.Function):
         precomputed_info_B_mask: int = 0,
         precomputed_total_B: int = 0,
         precomputed_max_B: int = 0,
+        hoist_transpose_to_forward: bool = True,
     ) -> torch.Tensor:
         # VBE support: use pre-computed metadata if available, otherwise compute
         vbe = batch_size_per_feature_per_rank is not None
@@ -1160,6 +1161,46 @@ class TritonTBE(torch.autograd.Function):
         ctx.feature_table_map = feature_table_map
         ctx.stochastic_rounding = stochastic_rounding
         ctx.vbe = vbe
+        ctx.hoist_transpose_to_forward = hoist_transpose_to_forward
+
+        if hoist_transpose_to_forward:
+            # Hoist the backward index transpose (linearize + sort + run-length
+            # encode) into forward. It depends only on indices/offsets/
+            # hash_size_cumsum — all available here — and never on dout, so
+            # moving it off the backward critical path is bit-exact. The sorted
+            # metadata is cached on ctx and read directly by backward (no
+            # recompute). Gated by hoist_transpose_to_forward so the pre-hoist
+            # behavior (transpose in backward) can be A/B-toggled.
+            bwd_info_B_num_bits, bwd_info_B_mask = torch.ops.fbgemm.get_infos_metadata(
+                indices, B, T
+            )
+            (
+                bwd_linear_indices,
+                _bwd_linear_indices_sorted,
+                bwd_infos_sorted,
+                bwd_sorted_linear_indices_run,
+                _bwd_sorted_linear_indices_run_lengths,
+                bwd_sorted_linear_indices_num_runs,
+                bwd_sorted_linear_indices_cumulative_run_lengths,
+            ) = torch.ops.fbgemm.transpose_embedding_input(
+                hash_size_cumsum,
+                total_hash_size_bits,
+                indices,
+                offsets,
+                nobag=False,
+                vbe_b_t_map=vbe_b_t_map if vbe else None,
+                info_B_num_bits=bwd_info_B_num_bits,
+                info_B_mask=bwd_info_B_mask,
+            )
+            ctx.bwd_info_B_num_bits = bwd_info_B_num_bits
+            ctx.bwd_info_B_mask = bwd_info_B_mask
+            ctx.bwd_linear_indices = bwd_linear_indices
+            ctx.bwd_infos_sorted = bwd_infos_sorted
+            ctx.bwd_sorted_linear_indices_run = bwd_sorted_linear_indices_run
+            ctx.bwd_sorted_linear_indices_num_runs = bwd_sorted_linear_indices_num_runs
+            ctx.bwd_sorted_linear_indices_cumulative_run_lengths = (
+                bwd_sorted_linear_indices_cumulative_run_lengths
+            )
 
         num_warps = 1
 
@@ -1275,29 +1316,42 @@ class TritonTBE(torch.autograd.Function):
 
         weighted = per_sample_weights.numel() > 0
 
-        # The first arg can be any device tensor
-        info_B_num_bits, info_B_mask = torch.ops.fbgemm.get_infos_metadata(
-            indices, B, T
-        )
-
-        (
-            linear_indices,
-            linear_indices_sorted,
-            infos_sorted,
-            sorted_linear_indices_run,
-            _,  # sorted_linear_indices_run_lengths,
-            sorted_linear_indices_num_runs,
-            sorted_linear_indices_cumulative_run_lengths,
-        ) = torch.ops.fbgemm.transpose_embedding_input(
-            hash_size_cumsum,
-            total_hash_size_bits,
-            indices,
-            offsets,
-            nobag=False,
-            vbe_b_t_map=vbe_b_t_map if vbe else None,
-            info_B_num_bits=info_B_num_bits,
-            info_B_mask=info_B_mask,
-        )
+        if ctx.hoist_transpose_to_forward:
+            # The index transpose (linearize + sort + run-length encode) was
+            # hoisted to forward() and cached on ctx; read it back instead of
+            # recomputing.
+            info_B_num_bits = ctx.bwd_info_B_num_bits
+            info_B_mask = ctx.bwd_info_B_mask
+            linear_indices = ctx.bwd_linear_indices
+            infos_sorted = ctx.bwd_infos_sorted
+            sorted_linear_indices_run = ctx.bwd_sorted_linear_indices_run
+            sorted_linear_indices_num_runs = ctx.bwd_sorted_linear_indices_num_runs
+            sorted_linear_indices_cumulative_run_lengths = (
+                ctx.bwd_sorted_linear_indices_cumulative_run_lengths
+            )
+        else:
+            # Pre-hoist behavior: compute the index transpose here in backward.
+            info_B_num_bits, info_B_mask = torch.ops.fbgemm.get_infos_metadata(
+                indices, B, T
+            )
+            (
+                linear_indices,
+                _,
+                infos_sorted,
+                sorted_linear_indices_run,
+                _,
+                sorted_linear_indices_num_runs,
+                sorted_linear_indices_cumulative_run_lengths,
+            ) = torch.ops.fbgemm.transpose_embedding_input(
+                hash_size_cumsum,
+                total_hash_size_bits,
+                indices,
+                offsets,
+                nobag=False,
+                vbe_b_t_map=(vbe_b_t_map if vbe else None),
+                info_B_num_bits=info_B_num_bits,
+                info_B_mask=info_B_mask,
+            )
 
         # Debug: validate shapes and values
         if os.environ.get("TRITON_TBE_DEBUG"):
@@ -1707,6 +1761,7 @@ class TritonTBE(torch.autograd.Function):
             None,  # precomputed_info_B_mask
             None,  # precomputed_total_B
             None,  # precomputed_max_B
+            None,  # hoist_transpose_to_forward
         )
 
 
@@ -1727,6 +1782,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         eps: float = 0.1,
         optimizer: OptimType = OptimType.EXACT_SGD,
         device: Optional[torch.device] = None,
+        hoist_transpose_to_forward: bool = False,
     ) -> None:
         super().__init__()
         logging.info("TritonTableBatchedEmbeddingBags init args: %s", locals())
@@ -1808,6 +1864,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         self.learning_rate = learning_rate
         self.eps = eps
         self.optimizer = optimizer
+        self.hoist_transpose_to_forward = hoist_transpose_to_forward
 
         # Initialize optimizer state
         rows = [spec[0] for spec in embedding_specs]
@@ -2014,6 +2071,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             info_B_mask,
             total_B,
             max_B,
+            self.hoist_transpose_to_forward,
         )
 
     def split_embedding_weights(self) -> List[torch.Tensor]:
