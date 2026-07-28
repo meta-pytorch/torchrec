@@ -1051,6 +1051,7 @@ class MemoryStashingManager:
         optimizer: torch.optim.Optimizer,
         sync_event: Optional[torch.cuda.Event] = None,
         num_slices: int = 1,
+        free_scratch_buffers: bool = True,
     ) -> Tuple[
         Callable[[Optional[torch.Tensor]], None],
         Callable[[Optional[torch.Tensor]], None],
@@ -1080,6 +1081,12 @@ class MemoryStashingManager:
                 callback (slice 0 first), to be driven per-hook via
                 ``restore_optimizer_state_next``; the returned ``await_restore``
                 then gates on ALL slices' restore completion.
+            free_scratch_buffers: When True (default), also free the optimizer's
+                disposable communication scratch buffers (e.g. DistributedShampoo's
+                ``_global_dist_buffer`` -- the all-gather buffer for per-rank search
+                directions) via ``resize_(0)``, re-allocating them before the step.
+                Pure scratch: freed/re-alloc'd, NOT copied to host, distinct from
+                the persistent-state stash. When False, they are left resident.
 
         Returns:
             A tuple of two callback functions:
@@ -1123,8 +1130,10 @@ class MemoryStashingManager:
                 tensors, label="optimizer state", sync_event=sync_event
             )
             cls._optimizer_state_restore_callbacks.append(tensor_restore)
-            scratch_buffer_restore = cls._release_optimizer_scratch_buffers(
-                optimizer, sync_event
+            scratch_buffer_restore = (
+                cls._release_optimizer_scratch_buffers(optimizer, sync_event)
+                if free_scratch_buffers
+                else None
             )
 
             def restore(
@@ -1170,8 +1179,10 @@ class MemoryStashingManager:
             # maps slice k to the k-th hook to fire.
             cls._optimizer_state_restore_callbacks.append(restore_k)
 
-        scratch_buffer_restore = cls._release_optimizer_scratch_buffers(
-            optimizer, sync_event
+        scratch_buffer_restore = (
+            cls._release_optimizer_scratch_buffers(optimizer, sync_event)
+            if free_scratch_buffers
+            else None
         )
 
         def aggregate_await(_grad: Optional[torch.Tensor] = None) -> None:
