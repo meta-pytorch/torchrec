@@ -2163,6 +2163,13 @@ class PlannerConfig:
     # LINEAR_PROGRAMMING scalar knobs; None = LP planner defaults. Consumed only by
     # the LP variant's fb builder (ignored by other variants).
     lp_config: Optional[LpPlannerConfig] = None
+    # Explicit per-model non-sharded footprint in bytes for the SKU_AWARE policy;
+    # when set it replaces the home-anchored margin + computed dense with this
+    # measured static base. None (default) keeps the migration proxy. Consumed only
+    # by the SKU_AWARE reservation (mirrors the legacy APF planner-config field);
+    # ignored by every other policy. (Appended last to preserve positional
+    # construction of the pre-existing fields.)
+    model_base_bytes: Optional[int] = None
 
     def __post_init__(self) -> None:
         # proposer_type (OSS scalar selector) and proposer_config (structured form)
