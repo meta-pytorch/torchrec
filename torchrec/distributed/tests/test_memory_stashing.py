@@ -20,7 +20,7 @@ import torch
 from hypothesis import given, settings
 from torch import distributed as dist, nn
 from torch.distributed._shard.sharded_tensor import init_from_local_shards, Shard
-from torch.distributed._tensor import DeviceMesh, DTensor, Replicate
+from torch.distributed._tensor import DeviceMesh, distribute_tensor, DTensor, Replicate
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
@@ -512,6 +512,19 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertFalse(MemoryStashingManager.is_enabled())
 
 
+class ScratchBufferOptimizer(torch.optim.SGD):
+    def __init__(
+        self,
+        params: Any,
+        scratch_buffer: torch.Tensor,
+    ) -> None:
+        super().__init__(params, lr=0.01)
+        self._scratch_buffer = scratch_buffer
+
+    def scratch_buffers(self) -> tuple[torch.Tensor, ...]:
+        return (self._scratch_buffer,)
+
+
 class TestStashOptimizerState(unittest.TestCase):
     """Tests for MemoryStashingManager.stash_optimizer_state method."""
 
@@ -525,6 +538,87 @@ class TestStashOptimizerState(unittest.TestCase):
 
     def tearDown(self) -> None:
         MemoryStashingManager.reset()
+
+    def test_scratch_buffer_only_uses_optimizer_state_stash_restore_api(self) -> None:
+        model = nn.Linear(10, 10).to(self.device)
+        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
+        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
+        scratch_buffer_size = scratch_buffer.untyped_storage().size()
+
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
+
+        self.assertEqual(scratch_buffer.untyped_storage().size(), 0)
+        self.assertEqual(
+            len(MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks),
+            1,
+        )
+
+        MemoryStashingManager.restore_optimizer_state()
+        await_restore(None)
+
+        self.assertEqual(scratch_buffer.untyped_storage().size(), scratch_buffer_size)
+        self.assertEqual(
+            len(MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks),
+            0,
+        )
+
+    def test_returned_restore_consumes_registered_callbacks(self) -> None:
+        model = nn.Linear(10, 10).to(self.device)
+        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
+        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
+        scratch_buffer_size = scratch_buffer.untyped_storage().size()
+
+        await_restore, restore = MemoryStashingManager.stash_optimizer_state(optimizer)
+        restore(None)
+        await_restore(None)
+
+        self.assertEqual(scratch_buffer.untyped_storage().size(), scratch_buffer_size)
+        self.assertEqual(MemoryStashingManager._optimizer_state_restore_callbacks, [])
+        self.assertEqual(
+            MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks,
+            [],
+        )
+
+        MemoryStashingManager.restore_optimizer_state()
+        self.assertEqual(scratch_buffer.untyped_storage().size(), scratch_buffer_size)
+
+    def test_scratch_buffer_restore_can_be_deferred_until_pre_step_guard(self) -> None:
+        model = nn.Linear(10, 10).to(self.device)
+        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
+        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
+
+        MemoryStashingManager.stash_optimizer_state(optimizer)
+        MemoryStashingManager.restore_optimizer_state(restore_scratch_buffer=False)
+
+        self.assertEqual(scratch_buffer.untyped_storage().size(), 0)
+        self.assertEqual(
+            len(MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks),
+            1,
+        )
+
+        MemoryStashingManager.restore_optimizer_state()
+
+        self.assertGreater(scratch_buffer.untyped_storage().size(), 0)
+
+    def test_scratch_buffer_restore_waits_until_all_slices_are_restored(self) -> None:
+        model = nn.Linear(512, 512).to(self.device)
+        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
+        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
+        x = torch.randn(32, 512, device=self.device)
+        model(x).sum().backward()
+        optimizer.step()
+
+        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(
+            optimizer, num_slices=2
+        )
+        MemoryStashingManager.restore_optimizer_state_next()
+
+        self.assertEqual(scratch_buffer.untyped_storage().size(), 0)
+
+        MemoryStashingManager.restore_optimizer_state()
+        await_restore(None)
+
+        self.assertGreater(scratch_buffer.untyped_storage().size(), 0)
 
     def test_basic_adam_optimizer_stash_and_restore(self) -> None:
         """Test basic stash and restore with Adam optimizer."""
@@ -1481,6 +1575,146 @@ class TestRestoreStashedSyncTensors(unittest.TestCase):
         )
         # Must not raise (e.g. from h2d_stream() asserting an unset stream).
         self._call_helper(ctx)
+
+
+class TestCheckpointWhileStashed(unittest.TestCase):
+    """Repro for the checkpoint-while-stashed corruption path.
+
+    When a DCP checkpoint is captured between steps (dense optimizer state stashed
+    to CPU, GPU storage ``resize_(0)``'d), the stager must read the correct
+    pre-stash values via ``staged_cpu_view_for``. If the redirect misses, DCP
+    reads a freed CUDA storage -> corrupt optimizer state is persisted -> the
+    model diverges (NE spike) when the job resumes from that checkpoint.
+    """
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        if not dist.is_available():
+            self.skipTest("torch.distributed not available")
+        self.device = torch.device("cuda:0")
+        self._created_pg = False
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                rank=0,
+                world_size=1,
+                init_method=f"file:///tmp/trec_memstash_ckpt_pg_{os.getpid()}",
+            )
+            self._created_pg = True
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+        if self._created_pg and dist.is_initialized():
+            dist.destroy_process_group()
+
+    def test_dcp_redirect_plain_tensor(self) -> None:
+        """Baseline: a stashed plain CUDA tensor is readable via the redirect.
+
+        Faithfully models DCP: the stager holds a SEPARATE view that keeps
+        referencing the GPU storage, so when the stash swaps ``tensor.data`` to
+        CPU and ``resize_(0)``'s the GPU storage, the captured view points at the
+        freed storage the redirect is keyed on.
+        """
+        tensor = torch.randn(1024, 512, device=self.device)  # 2 MiB
+        original = tensor.detach().clone()
+        captured = tensor.detach().view_as(tensor)  # separate view, shares GPU storage
+
+        MemoryStashingManager._stash_tensors([tensor])
+        self.assertEqual(captured.untyped_storage().size(), 0)  # GPU storage freed
+
+        cpu_src = MemoryStashingManager.staged_cpu_view_for(captured)
+        self.assertIsNotNone(cpu_src)
+        assert cpu_src is not None
+        torch.testing.assert_close(cpu_src, original.cpu())
+
+    def test_dcp_redirect_dtensor_state(self) -> None:
+        """Shampoo-style DTensor optimizer state must round-trip through a
+        checkpoint captured while the state is stashed."""
+        mesh = DeviceMesh("cuda", [0])
+        local = torch.randn(1024, 512, device=self.device)
+        original = local.detach().clone()
+        dtensor = distribute_tensor(local, mesh, [Replicate()])
+
+        # The DCP planner reads a DTensor state value via its local shard.
+        collected = _collect_cuda_tensors_from_value(dtensor)
+        self.assertEqual(len(collected), 1)
+        captured_local = dtensor.to_local()
+
+        MemoryStashingManager._stash_tensors(collected)
+
+        cpu_src = MemoryStashingManager.staged_cpu_view_for(captured_local)
+        self.assertIsNotNone(
+            cpu_src,
+            "DCP redirect missed the stashed DTensor local shard; the checkpoint "
+            "would read freed CUDA memory -> corrupt optimizer state on resume.",
+        )
+        assert cpu_src is not None
+        torch.testing.assert_close(cpu_src, original.cpu())
+
+    def test_dcp_redirect_noncontiguous_tensor(self) -> None:
+        """A non-contiguous stashed tensor must round-trip through the redirect.
+
+        ``chunked_copy_`` fills the pinned buffer, but ``staged_cpu_view_for``
+        reconstructs the view with the ORIGINAL (non-contiguous) stride over that
+        buffer. If the buffer is laid out contiguously while the view is rebuilt
+        with the transposed stride, the checkpoint reads transposed/garbage values.
+        """
+        base = torch.randn(512, 1024, device=self.device)  # 2 MiB
+        noncontig = base.t()  # transposed view: non-contiguous, shares storage
+        self.assertFalse(noncontig.is_contiguous())
+        original = noncontig.detach().clone()  # logical values, contiguous copy
+        captured = noncontig.detach()  # separate view sharing the GPU storage
+
+        MemoryStashingManager._stash_tensors([noncontig])
+
+        cpu_src = MemoryStashingManager.staged_cpu_view_for(captured)
+        self.assertIsNotNone(cpu_src)
+        assert cpu_src is not None
+        torch.testing.assert_close(cpu_src, original.cpu())
+
+    def test_stash_restore_noncontiguous_tensor(self) -> None:
+        """Full stash->restore round-trip must preserve a non-contiguous tensor's
+        logical values."""
+        base = torch.randn(512, 1024, device=self.device)  # 2 MiB
+        noncontig = base.t()
+        self.assertFalse(noncontig.is_contiguous())
+        original = noncontig.detach().clone()
+
+        await_restore, restore, _ = MemoryStashingManager._stash_tensors([noncontig])
+        restore(None)
+        await_restore(None)
+
+        self.assertTrue(noncontig.is_cuda)
+        torch.testing.assert_close(noncontig, original, rtol=1e-05, atol=1e-08)
+
+    def test_dcp_redirect_shampoo_like_noncontiguous_state(self) -> None:
+        """End-to-end via the real collect path: a Shampoo-style non-contiguous
+        state tensor (a strided view, as produced by DistributedShampoo's
+        ``torch.split(...).view(...)`` blocked buffers) stored in ``optimizer.state``,
+        collected by ``_collect_cuda_tensors_from_value`` and stashed, must survive
+        a checkpoint read via the DCP redirect.
+        """
+        backing = torch.randn(512, 1024, device=self.device)
+        state_tensor = backing.t()  # non-contiguous 1024x512 view, 2 MiB > 1 MiB
+        self.assertFalse(state_tensor.is_contiguous())
+        state_value = {"exp_avg": state_tensor, "step": torch.tensor(1)}
+
+        collected = _collect_cuda_tensors_from_value(state_value)
+        self.assertEqual(len(collected), 1)
+        original = collected[0].detach().clone()
+        captured = collected[0].detach()  # separate view for the DCP stager
+
+        MemoryStashingManager._stash_tensors(collected)
+
+        cpu_src = MemoryStashingManager.staged_cpu_view_for(captured)
+        self.assertIsNotNone(
+            cpu_src,
+            "DCP redirect missed the stashed non-contiguous Shampoo-like state.",
+        )
+        assert cpu_src is not None
+        torch.testing.assert_close(cpu_src, original.cpu())
 
 
 if __name__ == "__main__":
