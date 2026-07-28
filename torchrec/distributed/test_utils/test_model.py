@@ -796,10 +796,8 @@ class ModelInput(Pipelineable):
         indices_dtype: torch.dtype,
         offsets_dtype: torch.dtype,
         lengths_dtype: torch.dtype,
+        is_weighted: bool = False,
     ) -> Tuple[KeyedJaggedTensor, List[KeyedJaggedTensor]]:
-        is_weighted = (
-            True if tables and getattr(tables[0], "is_weighted", False) else False
-        )
 
         feature_num_embeddings = {}
 
@@ -907,6 +905,7 @@ class ModelInput(Pipelineable):
                     indices_dtype=indices_dtype,
                     offsets_dtype=offsets_dtype,
                     lengths_dtype=lengths_dtype,
+                    is_weighted=True,
                 )
             )
         else:
