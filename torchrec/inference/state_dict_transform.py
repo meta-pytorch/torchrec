@@ -7,7 +7,7 @@
 
 # pyre-strict
 
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 from torch import distributed as dist
@@ -51,7 +51,7 @@ def state_dict_all_gather_keys(
         pg (ProcessGroup): Process Group used for comms
     """
     names = list(state_dict.keys())
-    all_names = [None] * dist.get_world_size(pg)
+    all_names: List[Optional[List[str]]] = [None] * dist.get_world_size(pg)
     dist.all_gather_object(all_names, names, pg)
     deduped_names = set()
     for local_names in all_names:
