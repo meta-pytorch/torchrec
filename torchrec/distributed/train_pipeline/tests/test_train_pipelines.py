@@ -1076,6 +1076,20 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
         dmp.assert_called_once()
         dmp.sync.assert_called_once()
 
+    def test_skip_batch_waiting_flag_stored(self) -> None:
+        dmp = MagicMock(spec=DMPCollection)
+        optimizer = MagicMock(spec=torch.optim.Optimizer)
+        device = torch.device("cpu")
+
+        self.assertFalse(
+            TrainPipelineSparseDist(dmp, optimizer, device=device)._skip_batch_waiting
+        )
+        self.assertTrue(
+            TrainPipelineSparseDist(
+                dmp, optimizer, device=device, skip_batch_waiting=True
+            )._skip_batch_waiting
+        )
+
     def test_sync_disabled_if_dmp_collection_is_not_used(self) -> None:
         dmp = MagicMock(spec=DistributedModelParallel)
         dmp.training = True
