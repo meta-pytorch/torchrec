@@ -201,21 +201,23 @@ class EmbeddingTablesConfig:
 
     def generate_tables(
         self,
+        name_prefix: str = "",
     ) -> List[List[EmbeddingBagConfig]]:
         """
         Generate embedding bag configurations for both unweighted and weighted features.
 
         This function creates two lists of EmbeddingBagConfig objects:
-        1. Unweighted tables: Named as "table_{i}" with feature names "feature_{i}"
-        2. Weighted tables: Named as "weighted_table_{i}" with feature names "weighted_feature_{i}"
+        1. Unweighted tables: Named as "{name_prefix}table_{i}" with feature names "{name_prefix}feature_{i}"
+        2. Weighted tables: Named as "{name_prefix}weighted_table_{i}" with feature names "{name_prefix}weighted_feature_{i}"
 
         For both types, the number of embeddings scales with the feature index,
         calculated as max(i + 1, 100) * 1000.
 
         Args:
-            num_unweighted_features (int): Number of unweighted features to generate.
-            num_weighted_features (int): Number of weighted features to generate.
-            embedding_feature_dim (int): Dimension of the embedding vectors.
+            name_prefix (str): Prefix prepended to every generated table and feature
+                name. Defaults to "" (unchanged names). Pass a distinct prefix per
+                caller to get disjoint table/feature sets -- e.g. one partition per
+                pipeline stage.
 
         Returns:
             Tuple[List[EmbeddingBagConfig], List[EmbeddingBagConfig]]: A tuple containing
@@ -227,8 +229,8 @@ class EmbeddingTablesConfig:
             EmbeddingBagConfig(
                 num_embeddings=max(i + 1, 100) * self.base_row_size // 100,
                 embedding_dim=self.embedding_feature_dim,
-                name="table_" + str(i),
-                feature_names=["feature_" + str(i)],
+                name=name_prefix + "table_" + str(i),
+                feature_names=[name_prefix + "feature_" + str(i)],
                 data_type=self.table_data_type,
                 stash_weights=self.stash_weights,
             )
@@ -238,8 +240,8 @@ class EmbeddingTablesConfig:
             EmbeddingBagConfig(
                 num_embeddings=max(i + 1, 100) * self.base_row_size // 100,
                 embedding_dim=self.embedding_feature_dim,
-                name="weighted_table_" + str(i),
-                feature_names=["weighted_feature_" + str(i)],
+                name=name_prefix + "weighted_table_" + str(i),
+                feature_names=[name_prefix + "weighted_feature_" + str(i)],
                 data_type=self.table_data_type,
                 stash_weights=self.stash_weights,
             )
