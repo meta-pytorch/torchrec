@@ -290,6 +290,14 @@ class SemisyncOptimizer(KeyedOptimizer):
         ret.append(f"{SEMI_SYNC_GLOBAL_OPTIM_KEY}: {self._global_optimizer.__repr__()}")
         return ", ".join(ret)
 
+    def scratch_buffers(self) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            scratch_buffer
+            for optimizer in (self._optimizer, self._global_optimizer)
+            if hasattr(optimizer, "scratch_buffers")
+            for scratch_buffer in optimizer.scratch_buffers()
+        )
+
     def set_optimizer_step(self, step: int) -> None:
         for opt in [self._optimizer, self._global_optimizer]:
             if hasattr(opt, "set_optimizer_step"):
