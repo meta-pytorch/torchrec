@@ -896,6 +896,206 @@ def cuda_event_wait(
         )
 
 
+@dataclass
+class P2PConfig(CommsConfig):
+    """
+    run commands:
+    1. default: async isend + async irecv, everything on the main stream
+    > python -m torchrec.distributed.benchmark.benchmark_comms p2p_comm_buffer
+
+    2. larger buffer: sweep the transfer size to see the buffer-size effect
+    > python -m torchrec.distributed.benchmark.benchmark_comms p2p_comm_buffer \
+        --name=64mb \
+        --size_mb=64
+
+    use case:
+        probe NCCL point-to-point execution order and buffer-size sensitivity. Both
+        ranks send to and recv from each other on a single communicator (ctx.pg) with
+        everything on the main stream, but only rank 0 runs a heavy pre-comms compute
+        before firing, so rank 1 posts its send/recv early and idles until rank 0 catches
+        up -- the trace shows how NCCL orders the two matching transfers under that skew.
+        Both the send and the recv are async (isend/irecv), issued back-to-back on the
+        main stream and joined later via req.wait(), so the CPU posts both and the
+        following main-stream compute without blocking on either. Compare across --size_mb
+        to see the buffer-size effect: small (eager-protocol) payloads complete without the
+        peer's matching op posted yet, while large (rendezvous) payloads depend on the
+        execution order across ranks (all_rank_traces captures both ranks).
+    """
+
+    # point-to-point buffer size in MiB (float32 payload)
+    size_mb: float = 4
+    all_rank_traces: bool = True
+
+
+# bidirectional point-to-point exchange between 2 ranks
+@register_benchmark(P2PConfig)
+def p2p_comm_buffer(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    size_mb: float,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Rank 0 and rank 1 exchange a buffer: each sends a tensor filled with its own
+    rank id to the peer and receives the peer's. Only rank 0 runs a heavy
+    pre-comms compute, so the two ranks arrive at the P2P at different times.
+
+    One communicator (ctx.pg), everything on the main stream. The async send
+    (isend) and async recv (irecv) are issued back-to-back so they serialize on
+    the single communicator -- no concurrent multi-stream use of one communicator
+    (that corrupts its channel state -> illegal memory access). Both are async, so
+    the CPU posts them and the following main-stream compute without blocking; both
+    are joined later via req.wait().
+    """
+    assert ctx.world_size == 2, "p2p_comm_buffer requires exactly 2 ranks"
+    rank = ctx.rank
+    peer = 1 - rank
+    numel = max(1, int(size_mb * 1024 * 1024) // 4)
+
+    with record_function("## setup ##"):
+        # send buffer carries this rank's id; recv buffer starts at -1 so an
+        # incomplete transfer fails the peer-id validation below
+        send_buf = torch.full((numel,), float(rank), device=ctx.device)
+        recv_buf = torch.full((numel,), -1.0, device=ctx.device)
+
+    # NCCL brings up each P2P connection lazily on first use, via a two-sided
+    # handshake that exchanges the ring-buffer / IPC handles the sender writes into
+    # and the receiver drains -- no bytes move until it completes. If the symmetric
+    # isend/irecv below were the first use, both ranks would send first and each
+    # rank's setup would wait on the peer's not-yet-reached recv: a first-use cycle
+    # that hangs (size-independent -- it's connection setup, not bandwidth). One
+    # matched send/recv here brings a connection up first, which breaks the cycle
+    # (the peer's later isend then returns immediately, so it reaches the recv that
+    # completes the other direction) and the exchange below runs on an established
+    # link.
+    with record_function("## P2P comm lazy init ##"):
+        seed = torch.empty(1, device=ctx.device)
+        if rank == 0:
+            dist.recv(seed, src=peer, group=ctx.pg)  # 1->0
+        else:
+            dist.send(seed, dst=peer, group=ctx.pg)  # 1->0
+
+    # only rank 0 has heavy compute before firing, creating the arrival skew
+    if rank == 0:
+        with record_function("## pre-comms compute ##"):
+            _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## async send ##"):
+        send_req = dist.isend(send_buf, dst=peer, group=ctx.pg)
+
+    with record_function("## async recv ##"):
+        recv_req = dist.irecv(recv_buf, src=peer, group=ctx.pg)
+
+    with record_function("## irrelevant compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## wait and validate ##"):
+        assert send_req is not None and recv_req is not None
+        recv_req.wait()
+        send_req.wait()
+        checks = DeviceToHostTensorAwaitable(torch.all(recv_buf.to(torch.int) == peer))
+
+    with record_function("## post-comms compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## assert ##"):
+        assert checks.item()
+
+
+@dataclass
+class P2PBatchConfig(CommsConfig):
+    """
+    run commands:
+    1. default: batched bidirectional P2P via batch_isend_irecv
+    > python -m torchrec.distributed.benchmark.benchmark_comms p2p_batch_comms
+
+    2. larger buffer: sweep the transfer size to see the buffer-size effect
+    > python -m torchrec.distributed.benchmark.benchmark_comms p2p_batch_comms \
+        --name=64mb \
+        --size_mb=64
+
+    use case:
+        2-rank bidirectional exchange of three buffers each way (two of size_mb, one of
+        half that -- 2 equal, 1 different), submitted together as one P2POp list of 3
+        isends + 3 irecvs through batch_isend_irecv, which wraps them all in a single
+        ncclGroupStart/End. Grouping makes the matching send/recv co-resident, so --
+        unlike the separate isend/irecv in p2p_comm_buffer -- it needs no manual seed and
+        no ordering trick: the first-use P2P connection is brought up inside the group.
+        Compare against p2p_comm_buffer to see the batched-vs-separate tradeoff, and sweep
+        --size_mb for the buffer-size effect (all_rank_traces captures both ranks).
+    """
+
+    # point-to-point buffer size in MiB (float32 payload)
+    size_mb: float = 4
+    all_rank_traces: bool = True
+
+
+# bidirectional point-to-point exchange between 2 ranks via batch_isend_irecv
+@register_benchmark(P2PBatchConfig)
+def p2p_batch_comms(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    size_mb: float,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Rank 0 and rank 1 exchange three buffers with a single batch_isend_irecv over
+    a P2POp list of 3 isends + 3 irecvs (two buffers of size_mb, one of half that
+    -- 2 equal, 1 different). batch_isend_irecv coalesces every op into one
+    ncclGroupStart/End, so all matching send/recv are co-resident and the first-use
+    P2P connection comes up inside the group -- no seed needed (cf. p2p_comm_buffer,
+    whose separate isend/irecv require a seeding send/recv). Only rank 0 runs a
+    heavy pre-comms compute, so the ranks reach the P2P skewed.
+    """
+    assert ctx.world_size == 2, "p2p_batch_comms requires exactly 2 ranks"
+    rank = ctx.rank
+    peer = 1 - rank
+    numel = max(1, int(size_mb * 1024 * 1024) // 4)
+    # 3 transfers each way: two of size_mb, one of half that (2 equal, 1 different)
+    sizes = [numel, numel, max(1, numel // 2)]
+
+    with record_function("## setup ##"):
+        # send buffers carry this rank's id; recv buffers start at -1 so an
+        # incomplete transfer fails the peer-id validation below
+        send_bufs = [torch.full((n,), float(rank), device=ctx.device) for n in sizes]
+        recv_bufs = [torch.full((n,), -1.0, device=ctx.device) for n in sizes]
+
+    # only rank 0 has heavy compute before firing, creating the arrival skew
+    if rank == 0:
+        with record_function("## pre-comms compute ##"):
+            _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## batch_isend_irecv ##"):
+        p2p_op_list = [
+            dist.P2POp(dist.isend, buf, peer, group=ctx.pg) for buf in send_bufs
+        ] + [dist.P2POp(dist.irecv, buf, peer, group=ctx.pg) for buf in recv_bufs]
+        reqs = dist.batch_isend_irecv(p2p_op_list)
+
+    with record_function("## irrelevant compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## wait and validate ##"):
+        for req in reqs:
+            req.wait()
+        checks = DeviceToHostTensorAwaitable(
+            torch.stack(
+                [torch.all(buf.to(torch.int) == peer) for buf in recv_bufs]
+            ).all()
+        )
+
+    with record_function("## post-comms compute ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## assert ##"):
+        assert checks.item()
+
+
 if __name__ == "__main__":
     # pyrefly: ignore[missing-attribute]
     _cc.main()
