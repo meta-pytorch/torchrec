@@ -39,6 +39,15 @@ class DummyOptimizerModule:
         self.tensor.detach().copy_(state_dict["tensor"])
 
 
+class ScratchBufferSGD(torch.optim.SGD):
+    def __init__(self, params: Any, scratch_buffer: torch.Tensor) -> None:
+        super().__init__(params, lr=0.1)
+        self._scratch_buffer = scratch_buffer
+
+    def scratch_buffers(self) -> tuple[torch.Tensor, ...]:
+        return (self._scratch_buffer,)
+
+
 class TestKeyedOptimizer(unittest.TestCase):
     def _assert_state_dict_equals(
         self, dict1: Dict[str, Any], dict2: Dict[str, Any]
@@ -216,6 +225,21 @@ class TestKeyedOptimizer(unittest.TestCase):
         self.assertTrue("state" in opt.state_dict())
         self.assertFalse(opt.state_dict()["state"])
 
+    def test_keyed_optimizer_wrapper_scratch_buffers(self) -> None:
+        param = torch.nn.Parameter(torch.ones(1))
+        scratch_buffer = torch.empty(7)
+        capable = KeyedOptimizerWrapper(
+            {"param": param},
+            lambda params: ScratchBufferSGD(params, scratch_buffer),
+        )
+        incapable = KeyedOptimizerWrapper(
+            {"param": param},
+            lambda params: torch.optim.SGD(params, lr=0.1, foreach=True),
+        )
+
+        self.assertEqual(capable.scratch_buffers(), (scratch_buffer,))
+        self.assertEqual(incapable.scratch_buffers(), ())
+
     def test_pickle(self) -> None:
         dense = torch.nn.Parameter(torch.ones((2, 3), dtype=torch.float))
         sparse = torch.nn.Parameter(torch.ones((1, 4), dtype=torch.float))
@@ -238,6 +262,36 @@ class TestKeyedOptimizer(unittest.TestCase):
 
 
 class TestCombinedOptimizer(unittest.TestCase):
+    def test_scratch_buffers_fan_out_through_nested_children(self) -> None:
+        first_scratch_buffer = torch.empty(3)
+        second_scratch_buffer = torch.empty(5)
+        first_param = torch.nn.Parameter(torch.ones(1))
+        second_param = torch.nn.Parameter(torch.ones(1))
+        first = KeyedOptimizerWrapper(
+            {"first": first_param},
+            lambda params: ScratchBufferSGD(params, first_scratch_buffer),
+        )
+        second = KeyedOptimizerWrapper(
+            {"second": second_param},
+            lambda params: ScratchBufferSGD(params, second_scratch_buffer),
+        )
+        incapable = KeyedOptimizer(
+            {"plain": torch.nn.Parameter(torch.ones(1))},
+            {},
+            [],
+        )
+        optimizer = CombinedOptimizer(
+            [
+                ("nested", CombinedOptimizer([("first", first), ("plain", incapable)])),
+                ("second", second),
+            ]
+        )
+
+        self.assertEqual(
+            optimizer.scratch_buffers(),
+            (first_scratch_buffer, second_scratch_buffer),
+        )
+
     def test_pickle(self) -> None:
         # Set up example KeyedOptimizer 1.
         param_1_t = torch.tensor([1.0, 2.0])
@@ -315,6 +369,20 @@ class TestCombinedOptimizer(unittest.TestCase):
 
 
 class TestOptimizerWrapper(unittest.TestCase):
+    def test_scratch_buffers_forwarding(self) -> None:
+        scratch_buffer = torch.empty(11)
+        param = torch.nn.Parameter(torch.ones(1))
+        capable = OptimizerWrapper(
+            KeyedOptimizerWrapper(
+                {"param": param},
+                lambda params: ScratchBufferSGD(params, scratch_buffer),
+            )
+        )
+        incapable = OptimizerWrapper(KeyedOptimizer({"param": param}, {}, []))
+
+        self.assertEqual(capable.scratch_buffers(), (scratch_buffer,))
+        self.assertEqual(incapable.scratch_buffers(), ())
+
     def test_load_state_dict(self) -> None:
         param_1_t = torch.tensor([1.0, 2.0])
         param_1 = Variable(param_1_t)
