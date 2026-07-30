@@ -823,6 +823,24 @@ def _pre_gpu_load(pre_gpu_load: int, device_type: str) -> None:
             _tmp = _tmp * torch.rand(32768, 32768, device="cuda")
 
 
+def _bench_cuda_device(rank: int) -> int:
+    """Resolve the local CUDA device ordinal to reset/sync/measure for ``rank``.
+
+    ``rank`` is the *global* rank, which on a multi-host job exceeds the per-host
+    GPU count (e.g. rank 15 on a 2x8 job, where each host only exposes
+    ``cuda:0``..``cuda:7``). The process context has already bound this process to
+    its local GPU via ``torch.cuda.set_device``, so the device to operate on is
+    the current device -- indexing CUDA by the global rank would hit a
+    nonexistent ordinal and raise. Every other path (single-process ``rank == -1``,
+    or CUDA unavailable) falls back to device 0 rather than the global ``rank``:
+    returning ``rank`` here would reintroduce the exact ``invalid device ordinal``
+    crash this helper exists to prevent.
+    """
+    if rank >= 0 and torch.cuda.is_available():
+        return torch.cuda.current_device()
+    return 0
+
+
 class PerfWrapper:
     """Wraps per-iteration CUDA + CPU measurements around a benchmark callable.
 
@@ -853,12 +871,20 @@ class PerfWrapper:
         self._sample_count = sample_count
         self._num_benchmarks = num_benchmarks
         self._cur: int = 0
-        self._device: int = rank if rank >= 0 else 0
+        # ``rank`` is kept for identity/labeling; CUDA device-scoped calls use the
+        # local device ordinal so multi-host jobs (global rank > per-host GPUs) work.
+        self._rank: int = rank
+        self._device: int = _bench_cuda_device(rank)
         self._reset_accumulated_memory_stats = reset_accumulated_memory_stats
 
         # Scratch state for in-flight measurement
         self._cpu_start_active_ns: int = 0
         self._wall_start_ns: int = 0
+
+    @property
+    def device(self) -> int:
+        """Local CUDA device ordinal this wrapper measures/synchronizes on."""
+        return self._device
 
     def _start(self) -> None:
         """Record the start of an iteration."""
@@ -956,7 +982,7 @@ class PerfWrapper:
             )
 
         return GPUMemoryStats(
-            rank=self._device,
+            rank=self._rank,
             malloc_retries=_p90([s.malloc_retries for s in self._gpu_mem_stats]),
             max_mem_allocated_mbs=_p90(
                 [s.max_mem_allocated_mbs for s in self._gpu_mem_stats]
@@ -977,7 +1003,7 @@ class PerfWrapper:
             for di in range(world_size):
                 torch.cuda.synchronize(di)
         else:
-            torch.cuda.synchronize(rank)
+            torch.cuda.synchronize(self._device)
 
         all_times = [
             s.elapsed_time(e) for s, e in zip(self._start_events, self._end_events)
@@ -1027,7 +1053,7 @@ def _run_cuda_benchmark(
         # finished so that we do not attribute its wait time to the next
         # CPU measurement.
         if i > 0:
-            torch.cuda.synchronize(rank if rank >= 0 else 0)
+            torch.cuda.synchronize(perf.device)
 
         perf.measure(run_iter_fn)
     logger.info(f"Cuda benchmark finished on rank {rank}")
@@ -1115,7 +1141,7 @@ def _run_cuda_profiling(
         for di in range(torch.cuda.device_count()):
             torch.cuda.synchronize(torch.device(f"cuda:{di}"))
     else:
-        torch.cuda.synchronize(rank)
+        torch.cuda.synchronize(_bench_cuda_device(rank))
 
     if memory_snapshot and (all_rank_traces or rank == 0):
         try:
