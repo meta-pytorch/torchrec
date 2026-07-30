@@ -74,7 +74,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--storage-reservation-policy",
-        choices=["heuristical", "fixed_percentage", "inference"],
+        choices=["heuristical", "fixed_percentage", "inference", "sku_aware"],
         default=None,
     )
     parser.add_argument("--storage-reservation-percentage", type=float, default=None)

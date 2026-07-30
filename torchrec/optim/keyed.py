@@ -414,6 +414,14 @@ class CombinedOptimizer(KeyedOptimizer):
         for _, opt in self._optims:
             opt.save_param_groups(save)
 
+    def scratch_buffers(self) -> tuple[torch.Tensor, ...]:
+        return tuple(
+            scratch_buffer
+            for _, opt in self._optims
+            if hasattr(opt, "scratch_buffers")
+            for scratch_buffer in opt.scratch_buffers()
+        )
+
     def set_optimizer_step(self, step: int) -> None:
         for _, opt in self._optims:
             if hasattr(opt, "set_optimizer_step"):
@@ -450,6 +458,11 @@ class KeyedOptimizerWrapper(KeyedOptimizer):
     # pyrefly: ignore[bad-override]
     def step(self, closure: Any = None) -> None:
         self._optimizer.step(closure=closure)
+
+    def scratch_buffers(self) -> tuple[torch.Tensor, ...]:
+        if hasattr(self._optimizer, "scratch_buffers"):
+            return self._optimizer.scratch_buffers()
+        return ()
 
     def set_optimizer_step(self, step: int) -> None:
         if hasattr(self._optimizer, "set_optimizer_step"):
@@ -504,6 +517,11 @@ class OptimizerWrapper(KeyedOptimizer):
 
     def save_param_groups(self, save: bool) -> None:
         self._optimizer.save_param_groups(save)
+
+    def scratch_buffers(self) -> tuple[torch.Tensor, ...]:
+        if hasattr(self._optimizer, "scratch_buffers"):
+            return self._optimizer.scratch_buffers()
+        return ()
 
     def set_optimizer_step(self, step: int) -> None:
         if hasattr(self._optimizer, "set_optimizer_step"):
