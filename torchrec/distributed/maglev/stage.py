@@ -113,6 +113,38 @@ def build_handoff_process_groups(
     return act_pg, grad_pg
 
 
+def build_cascade_process_groups(
+    stage_ranks: List[List[int]],
+) -> List[dist.ProcessGroup]:
+    """Create one process group per pipeline "cascade" for input distribution.
+
+    A *cascade* is the set of same-position ranks across all stages:
+    ``cascade_pgs[c]`` groups ``stage_ranks[0][c], stage_ranks[1][c], ...`` and so
+    has one rank per stage (size == the number of stages). It is the group over
+    which a rank's full per-stage input set is all-to-all'd so every rank ends up
+    holding its own stage's inputs -- one microbatch contributed by each stage's
+    rank in the cascade (see the benchmark's input-dist driver).
+
+    Like :func:`build_stage_process_groups` / :func:`build_handoff_process_groups`,
+    ``dist.new_group`` is collective: every rank creates every cascade group in the
+    same order, and building these up front (before any DMP sharding) keeps all
+    ``new_group`` collectives contiguous. The group inherits the job's backend
+    (``cpu:gloo,cuda:nccl``), so the same handle drives both the CPU/gloo size
+    exchange and the CUDA/nccl data exchange.
+
+    Args:
+        stage_ranks: ``stage_ranks[i]`` is the global ranks of stage ``i``'s HSD;
+            every stage must have the same number of ranks (cascades).
+    """
+    num_cascades = len(stage_ranks[0]) if stage_ranks else 0
+    pgs: List[dist.ProcessGroup] = []
+    for c in range(num_cascades):
+        ranks = [stage_ranks[s][c] for s in range(len(stage_ranks))]
+        pg = cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
+        pgs.append(pg)
+    return pgs
+
+
 def _all_reduce_dense(params: List[nn.Parameter], stage_pg: dist.ProcessGroup) -> None:
     """DP-average the given params' grads across the HSD's ranks (once per step)."""
     world_size = stage_pg.size()

@@ -13,11 +13,19 @@ Benchmark for the Maglev staged pipeline (MVP).
 Measures the microbatched 1F1B schedule
 (:func:`~torchrec.distributed.maglev.pipeline.run_1f1b`) of a K-stage Maglev
 model across per-stage process groups (one hardware scale-up domain, HSD, each),
-including the cross-HSD activation / gradient hand-off. Each stage is an
-``EmbeddingBagCollection`` feature partition plus dense compute
+including the input distribution and the cross-HSD activation / gradient
+hand-off. Each stage is an ``EmbeddingBagCollection`` feature partition plus
+dense compute
 (:class:`~torchrec.distributed.test_utils.test_model.MaglevTestStage`, shared
-with the correctness test). One measured iteration is one full 1F1B pass over
-``num_microbatches`` microbatches.
+with the correctness test).
+
+Input distribution: every rank holds a full per-stage input set and all-to-alls
+it over its "cascade" (one rank per stage) via
+:func:`~torchrec.distributed.maglev.input_dist.input_dist`, so each rank ends up
+with ``num_stages`` microbatches for its own stage. A queue driver decouples the
+microbatch count from the stage count (more microbatches -> several rounds per
+pass; fewer -> drained a pass at a time). One measured iteration is this
+input-dist plus one full 1F1B pass over ``num_microbatches`` microbatches.
 
 Runs on GPU + nccl by default (the cross-HSD P2P hand-off and the profiler path
 are CUDA-only); `all_rank_traces` defaults on so every stage's HSD shows up in
@@ -41,6 +49,7 @@ from typing import List
 logger: logging.Logger = logging.getLogger(__name__)
 
 import torch
+import torch.distributed as dist
 from torch import nn
 from torchrec.distributed.benchmark.base import (
     BenchFuncConfig,
@@ -50,8 +59,10 @@ from torchrec.distributed.benchmark.base import (
     CPUMemoryStats,
     GPUMemoryStats,
 )
+from torchrec.distributed.maglev.input_dist import input_dist
 from torchrec.distributed.maglev.pipeline import MaglevPipeline, run_1f1b
 from torchrec.distributed.maglev.stage import (
+    build_cascade_process_groups,
     build_handoff_process_groups,
     build_stage_process_groups,
     EmbeddingShard,
@@ -183,6 +194,62 @@ def _make_input(
     )
 
 
+class _InputDistDriver:
+    """Feeds the 1F1B schedule with microbatches produced by ``input_dist``.
+
+    Each rank holds a *full set* of inputs (one ``ModelInput`` per stage); one
+    :func:`input_dist` round over the rank's cascade all-to-alls that set so the
+    rank receives ``num_stages`` inputs for its own stage -- i.e. ``num_stages``
+    microbatches per round. :meth:`take` refills a FIFO queue with whole rounds
+    until it holds at least ``n`` microbatches, then hands back ``n`` and keeps
+    the remainder, decoupling the microbatch count from the stage count:
+
+    * more microbatches than stages (e.g. 8 wanted, 4 stages) -> 2 rounds/pass;
+    * fewer (e.g. 8 wanted, 16 stages) -> one round every other pass, drained
+      ``n`` at a time from the queue.
+
+    The refill count is a deterministic function of ``(queue length, n)`` and the
+    queue starts empty on every rank, so all ranks in a cascade call
+    :func:`input_dist` the same number of times and stay in lock-step.
+
+    Args:
+        send: this rank's full input set; ``send[s]`` is destined for stage ``s``.
+        example: template carrier for reconstruction (a local-stage ModelInput).
+        cascade_pg: the cascade process group (size == num stages) to exchange over.
+    """
+
+    def __init__(
+        self,
+        send: List[ModelInput],
+        example: ModelInput,
+        cascade_pg: dist.ProcessGroup,
+    ) -> None:
+        self._send = send
+        self._example = example
+        self._pg = cascade_pg
+        self._queue: List[ModelInput] = []
+        # Monotonic input-dist round counter, tags the profiler ranges.
+        self._batch_id = 0
+
+    def take(self, n: int) -> List[ModelInput]:
+        while len(self._queue) < n:
+            # Same handle drives both phases: CPU/gloo sizes, CUDA/nccl data.
+            # input_dist returns a LazyAwaitable; wait() completes the exchange.
+            self._queue.extend(
+                input_dist(
+                    self._send,
+                    self._example,
+                    pg_gloo=self._pg,
+                    pg_nccl=self._pg,
+                    batch_id=self._batch_id,
+                ).wait()
+            )
+            self._batch_id += 1
+        out = self._queue[:n]
+        self._queue = self._queue[n:]
+        return out
+
+
 # single-rank runner
 def runner(
     rank: int,
@@ -213,19 +280,30 @@ def runner(
 
         # Collective: every rank builds every stage's process group.
         stage_pgs = build_stage_process_groups(stage_ranks)
-        # Build hand-off pgs up front (before any DMP sharding) so all new_group
-        # collectives stay contiguous and cannot deadlock against sharding comms.
+        # Build hand-off + cascade pgs up front (before any DMP sharding) so all
+        # new_group collectives stay contiguous and cannot deadlock against
+        # sharding comms. Cascade pgs (one rank per stage) carry the input-dist
+        # all-to-all; every rank builds all of them in the same order.
         handoff_pgs = build_handoff_process_groups(stage_ranks)
+        cascade_pgs = build_cascade_process_groups(stage_ranks)
         my_stage_index = rank // ranks_per_stage
+        position = rank - my_stage_index * ranks_per_stage
+        cascade_pg = cascade_pgs[position]
 
+        # All stages' table configs (identical on every rank) so each rank can
+        # generate a full per-stage input set for the input-dist all-to-all.
+        all_tables = [
+            _make_tables(
+                s,
+                run_option.num_tables,
+                run_option.num_embeddings,
+                run_option.emb_dim,
+            )
+            for s in range(num_stages)
+        ]
         # This rank's stage (weights seeded by stage index so an HSD's two DP
         # ranks start identical -> grad all-reduce keeps them in lock-step).
-        tables = _make_tables(
-            my_stage_index,
-            run_option.num_tables,
-            run_option.num_embeddings,
-            run_option.emb_dim,
-        )
+        tables = all_tables[my_stage_index]
         torch.manual_seed(_WEIGHT_SEED + my_stage_index)
         module = MaglevTestStage(
             tables=tables,
@@ -258,16 +336,27 @@ def runner(
         # a plain SGD. (Citrine C2: foreach=True in the dense/replicated SGD.)
         optimizer = stage.configure_optimizer(run_option.lr)
 
-        # Microbatch inputs for this rank's stage; labels only on the last stage.
-        micro_inputs: List[ModelInput] = [
+        # Full per-stage input set for this rank (send[s] is destined for stage
+        # s's rank in the cascade). Generated once, outside the measured region --
+        # data loading is not what we benchmark; the input-dist all-to-all itself
+        # runs inside _func_to_benchmark via the driver.
+        send_set: List[ModelInput] = [
             _make_input(
-                tables,
+                all_tables[s],
                 run_option.batch_size,
                 run_option.num_float_features,
                 device,
             )
-            for _ in range(run_option.num_microbatches)
+            for s in range(num_stages)
         ]
+        # Reconstruction template: a local-stage input (== the item this rank
+        # sends to itself at cascade index my_stage_index).
+        driver = _InputDistDriver(
+            send=send_set,
+            example=send_set[my_stage_index],
+            cascade_pg=cascade_pg,
+        )
+
         labels: List[torch.Tensor] = []
         if pipeline.is_last:
             labels = [
@@ -279,13 +368,16 @@ def runner(
             bench_inputs: List[ModelInput],
             pipeline: MaglevPipeline,
             optimizer: torch.optim.Optimizer,
-            micro_inputs: List[ModelInput],
+            driver: _InputDistDriver,
+            num_microbatches: int,
             labels: List[torch.Tensor],
             criterion: nn.Module,
         ) -> None:
-            # One measured iteration = one full 1F1B pass over all microbatches
+            # One measured iteration = the input-dist all-to-all for this pass's
+            # microbatches (refilling the queue as needed) + one full 1F1B pass
             # (warmup + steady 1F1B + cooldown), including the cross-HSD hand-off
             # and the per-batch DP grad all-reduce + optimizer step.
+            micro_inputs = driver.take(num_microbatches)
             run_1f1b(
                 pipeline=pipeline,
                 microbatch_inputs=micro_inputs,
@@ -301,7 +393,8 @@ def runner(
             benchmark_func_kwargs={
                 "pipeline": pipeline,
                 "optimizer": optimizer,
-                "micro_inputs": micro_inputs,
+                "driver": driver,
+                "num_microbatches": run_option.num_microbatches,
                 "labels": labels,
                 "criterion": criterion,
             },
