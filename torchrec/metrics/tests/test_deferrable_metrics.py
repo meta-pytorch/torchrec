@@ -375,7 +375,18 @@ class TransferTensorsToCpuTest(unittest.TestCase):
         dtoh_stream = _get_metric_dtoh_stream(device)
         self.assertNotEqual(default_stream, dtoh_stream)
 
-        # Block the dedicated stream with a long synthetic op BEFORE calling
+        # Warm up the device and pinned-host caching allocators before arming
+        # the blocker. The first pinned allocation inside transfer_tensors_to_cpu
+        # issues a synchronizing cudaHostAlloc; if it ran between the stall and
+        # the copy it would drain the stall off dtoh_stream (opt builds hit this;
+        # dev happened to run with a warm allocator), leaving the copy on an idle
+        # stream so the event was already complete. Pre-warming keeps that sync
+        # out of the measured window.
+        warmup: dict[str, Any] = {"x": torch.randn(128, device=device)}
+        transfer_tensors_to_cpu(warmup)
+        torch.cuda.synchronize()
+
+        # Block the dedicated stream with a synthetic op BEFORE calling
         # transfer_tensors_to_cpu. The returned event must be ordered behind
         # this blocker because it was recorded on the same (dedicated) stream.
         # If a future change regressed to recording on the default stream,
