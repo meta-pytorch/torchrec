@@ -2964,3 +2964,129 @@ def _get_default_rtol_and_atol(
     actual_rtol, actual_atol = _DTYPE_PRECISIONS.get(actual.dtype, (0.0, 0.0))
     expected_rtol, expected_atol = _DTYPE_PRECISIONS.get(expected.dtype, (0.0, 0.0))
     return max(actual_rtol, expected_rtol), max(actual_atol, expected_atol)
+
+
+class MaglevScaledAdd(nn.Module):
+    """Per-feature scaled residual sum ``a * (1 + alpha) + b * (1 + beta)``.
+
+    Lightweight analogue of ``ScaledAdd`` in the Maglev reference
+    (legokit/backbones/maglev_prototype.py), used by :class:`MaglevTestStage` to
+    fold the previous stage's activation into the current stage.
+
+    Args:
+        dim: width of the per-element learned scales.
+        device: device to build the parameters on.
+
+    Example::
+
+        m = MaglevScaledAdd(8)
+        out = m(torch.randn(2, 8), torch.randn(2, 8))
+    """
+
+    def __init__(self, dim: int, device: Optional[torch.device] = None) -> None:
+        super().__init__()
+        self.alpha: nn.Parameter = nn.Parameter(torch.zeros(dim, device=device))
+        self.beta: nn.Parameter = nn.Parameter(torch.zeros(dim, device=device))
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Combine two tensors with per-element learned scales.
+
+        Args:
+            a: first operand.
+            b: second operand.
+
+        Returns:
+            torch.Tensor: ``a * (1 + alpha) + b * (1 + beta)``.
+        """
+        return a * (1 + self.alpha) + b * (1 + self.beta)
+
+
+class MaglevTestStage(nn.Module):
+    """One Maglev stage for tests and benchmarks.
+
+    A self-contained stage that owns its feature partition (sparse + dense) and
+    consumes a :class:`ModelInput`:
+
+    * ``ebc`` pools this stage's sparse features (``stage_input.idlist_features``)
+      into ``(B, sum(F_t * D_t))``; ``input_proj`` projects that to ``stage_dim``.
+      (Unsharded here; sharding within the HSD is a follow-up.)
+    * ``dense`` projects this stage's float features
+      (``stage_input.float_features``, ``(B, num_float_features)``) to
+      ``stage_dim`` and adds them in (disabled when ``num_float_features == 0``).
+    * non-first stages fold in the previous stage's activation via
+      :class:`MaglevScaledAdd` (the Induct-style residual hand-off),
+    * ``block`` is the stage's dense compute.
+
+    The first stage (``is_first=True``) takes no incoming activation. The output
+    is a ``(B, stage_dim)`` tensor -- the activation handed to the next stage.
+
+    Args:
+        tables: this stage's embedding tables (its sparse feature partition).
+        stage_dim: width of the stage activation carried between stages.
+        is_first: whether this is the first stage (no incoming activation).
+        num_float_features: width of this stage's float feature input. 0 disables
+            the dense path.
+        device: device to build the stage on.
+
+    Example::
+
+        from torchrec.distributed.test_utils.model_input import ModelInput
+
+        tables = [EmbeddingBagConfig(name="t", embedding_dim=8, num_embeddings=16,
+                                     feature_names=["f"])]
+        stage = MaglevTestStage(tables, stage_dim=12, is_first=True, num_float_features=4)
+        mi = ModelInput.generate(batch_size=2, tables=tables, weighted_tables=[],
+                                 num_float_features=4)
+        out = stage(mi, None)
+    """
+
+    def __init__(
+        self,
+        tables: List[EmbeddingBagConfig],
+        stage_dim: int,
+        is_first: bool,
+        num_float_features: int = 0,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        self.is_first = is_first
+        self.ebc: EmbeddingBagCollection = EmbeddingBagCollection(
+            tables=tables, device=device
+        )
+        in_dim = sum(t.embedding_dim * len(t.feature_names) for t in tables)
+        self.input_proj: nn.Linear = nn.Linear(in_dim, stage_dim, device=device)
+        self.dense: Optional[nn.Linear] = (
+            nn.Linear(num_float_features, stage_dim, device=device)
+            if num_float_features > 0
+            else None
+        )
+        self.scaled_add: Optional[MaglevScaledAdd] = (
+            None if is_first else MaglevScaledAdd(stage_dim, device=device)
+        )
+        self.block: nn.Linear = nn.Linear(stage_dim, stage_dim, device=device)
+
+    def forward(
+        self,
+        stage_input: "ModelInput",
+        prev_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run this stage over its ``ModelInput`` and the previous activation.
+
+        Args:
+            stage_input: this stage's ``ModelInput`` (float + sparse features).
+            prev_output: the previous stage's ``(B, stage_dim)`` activation, or
+                ``None`` for the first stage.
+
+        Returns:
+            torch.Tensor: this stage's ``(B, stage_dim)`` output activation.
+        """
+        kjt = stage_input.idlist_features
+        assert isinstance(kjt, KeyedJaggedTensor)
+        pooled = self.ebc(kjt).values()  # (B, in_dim)
+        x = self.input_proj(pooled)  # (B, stage_dim)
+        if self.dense is not None:
+            x = x + self.dense(stage_input.float_features)  # add dense features
+        if not self.is_first:
+            assert prev_output is not None and self.scaled_add is not None
+            x = self.scaled_add(prev_output, x)
+        return torch.relu(self.block(x))
