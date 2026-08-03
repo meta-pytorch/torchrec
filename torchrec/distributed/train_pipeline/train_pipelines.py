@@ -1843,7 +1843,9 @@ class TrainPipelineSemiSync(TrainPipelineSparseDist[In, Out]):
             del context
 
         if len(self.batches) >= 1 and not is_semi_sync:
-            torch.get_device_module().synchronize()  # needed to avoid race condition
+            torch.get_device_module(
+                self._device
+            ).synchronize()  # needed to avoid race condition
             # pyrefly: ignore [bad-argument-type]
             self.start_embedding_lookup(self.batches[0], self.contexts[0])
 
