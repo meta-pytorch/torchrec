@@ -16,6 +16,10 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.autograd.profiler import record_function
+from torchrec.distributed._collective_tag import (
+    _collective_tag_from,
+    _COLLECTIVE_TAG_MAX_BYTES,
+)
 from torchrec.distributed.collective_utils import validate_collectives_enabled
 from torchrec.distributed.comm_ops import (
     all_gather_base_pooled,
@@ -139,38 +143,6 @@ _DTYPE_MAX: Dict[torch.dtype, int] = {
 }
 
 _TORCHREC_OVERFLOW_DEBUG: bool = os.environ.get("TORCHREC_OVERFLOW_DEBUG", "0") == "1"
-
-
-def _collective_tag_from(*parts: object) -> int:
-    """Compute a deterministic collective tag from identifying parts.
-
-    Returns a non-negative value that fits in signed int32. Uses FNV-1a
-    (deterministic across processes, unlike hash()).
-
-    The current call sites use int64 splits tensors, so a wider hash is
-    available in principle. The int32 cap is intentional forward-compat:
-    it guarantees the tag fits in any reasonable signed-integer splits dtype
-    without wrapping negative. Mixing runs in full 32-bit FNV-1a state and is
-    narrowed to 31 bits only at return; ~2.1B buckets leaves collision risk
-    negligible for the small number of distinct collective sites in flight
-    per process group.
-    """
-    # NUL separator (not ",") so str() of parts that themselves contain commas
-    # cannot collide with a different parts arity. Collective identifier parts
-    # (Python identifiers, sharding plan ints, container reprs) never contain
-    # \x00, so this separator is unambiguous in practice.
-    #
-    # In-loop mask is 0xFFFFFFFF (full 32-bit FNV-1a state); narrowing to
-    # signed int32 happens once at return. Masking to 31 bits inside the loop
-    # would discard bit 31 every iteration and weaken the avalanche relative
-    # to the reference algorithm without any benefit.
-    h = 0x811C9DC5
-    for b in "\x00".join(str(p) for p in parts).encode():
-        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
-    # Post-loop mask still handles the empty-parts case: the FNV-1a seed
-    # (0x811C9DC5) exceeds signed-int32 max, so without this mask an empty
-    # call would violate the int32-fit contract.
-    return h & 0x7FFFFFFF
 
 
 def _safe_tolist_2d(tensor: torch.Tensor) -> List[List[int]]:
@@ -971,17 +943,26 @@ class KJTAllToAllSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
         collective_tag: Optional[int] = None
         tag_parts: Optional[Tuple[object, ...]] = None
         if validate_collectives_enabled():
-            # Identity components, all rank-invariant by contract:
-            # - input.keys(): pre-AllToAll feature list (NOT local `keys`,
-            #   which is the post-AllToAll subset and differs per rank).
-            # - tuple(self._splits): the sharding plan — feature-to-rank
-            #   assignment from the constructor, documented as "Same for
-            #   all ranks." Including this catches divergent sharding
-            #   plans that have the same key set; without it, a config
-            #   bug giving ranks different splits would compute the same
-            #   tag and silently corrupt the all2all.
-            tag_parts = ("KJTAllToAllSplits", input.keys(), tuple(self._splits))
-            collective_tag = _collective_tag_from(*tag_parts)
+            # Values that all ranks must agree on:
+            # - input.keys(): the feature list BEFORE the all-to-all (not
+            #   the local `keys` variable, which is the post-all-to-all
+            #   subset and differs per rank).
+            # - splits: the feature-to-rank assignment. Passed with
+            #   length_limit=None so every value is hashed and a wide
+            #   keys list can't truncate a rank disagreement in splits.
+            tag_parts = (
+                "KJTAllToAllSplits",
+                input.keys(),
+                tuple(self._splits),
+            )
+            collective_tag = _collective_tag_from(
+                *tag_parts,
+                per_part_length_limits=[
+                    _COLLECTIVE_TAG_MAX_BYTES,
+                    _COLLECTIVE_TAG_MAX_BYTES,
+                    None,
+                ],
+            )
         self._splits_awaitable = SplitsAllToAllAwaitable(
             input_tensors,
             self._pg,
