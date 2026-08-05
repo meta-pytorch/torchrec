@@ -27,10 +27,15 @@ Both paths create + handshake the process group and inject a live
 into the selected benchmark's ``benchmark_runner``.
 
 Examples:
-    # local: spawn 2 ranks on this host and run the primitive benchmark
+    # local: spawn 2 ranks on this host and run the KJT (sparse index) A2A benchmark
     buck2 run @fbcode//mode/opt \\
         fbcode//torchrec/distributed/test_utils/benchmark_utils:benchmark_launcher -- \\
-        --mode=local --benchmark=primitive --world-size=2
+        --mode=local --benchmark=primitive --name=kjt_a2a --world-size=2
+
+    # local: run the KT (dense pooled-embedding / output_dist) A2A benchmark
+    buck2 run @fbcode//mode/opt \\
+        fbcode//torchrec/distributed/test_utils/benchmark_utils:benchmark_launcher -- \\
+        --mode=local --benchmark=primitive --name=kt_a2a --world-size=2
 
     # remote: invoked per-rank by torchrun/MAST (rendezvous env preset)
     buck2 run @fbcode//mode/opt \\
@@ -40,7 +45,7 @@ Examples:
 
 import argparse
 import logging
-from typing import Callable, Dict
+from typing import Any, Callable, Dict, List, Tuple
 
 import torch
 from torchrec.distributed.benchmark import benchmark_module, benchmark_primitive
@@ -53,14 +58,64 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 # Registry of available benchmarks: name -> per-rank runner. Each runner has the
 # signature ``benchmark_runner(ctx, rank, world_size, **kwargs)`` and is invoked
-# once per rank with the live context injected by the process runner.
-_BENCHMARKS: Dict[str, Callable[..., None]] = {
+# once per rank with the live context injected by the process runner. Runners may
+# return a per-rank result (e.g. ``BenchmarkResult``) or ``None``; the launcher
+# ignores the value, so the registry is typed ``Callable[..., Any]``.
+_BENCHMARKS: Dict[str, Callable[..., Any]] = {
     "primitive": benchmark_primitive.benchmark_runner,
     "module": benchmark_module.benchmark_runner,
 }
 
+# torchrun/torchelastic inject args like ``--local-rank`` into the worker argv;
+# LOCAL_RANK is read from the environment instead, so these must not be forwarded
+# as benchmark kwargs.
+_TORCHRUN_INJECTED_KEYS: frozenset[str] = frozenset({"local_rank"})
 
-def _parse_args() -> argparse.Namespace:
+
+def _coerce(value: str) -> Any:
+    """Best-effort cast a CLI string to ``int``, then ``float``, else leave as ``str``."""
+    for cast in (int, float):
+        try:
+            return cast(value)
+        except ValueError:
+            continue
+    return value
+
+
+def _parse_forwarded_kwargs(unknown: List[str]) -> Dict[str, Any]:
+    """Parse leftover ``--key=value`` / ``--key value`` args into benchmark kwargs.
+
+    Unrecognized args are benchmark-specific options (e.g. ``--batch_size``,
+    ``--dim``) forwarded verbatim to the selected ``benchmark_runner``. Keys are
+    normalized (leading ``--`` stripped, ``-`` -> ``_``) and values are coerced to
+    ``int``/``float`` when possible. torchrun-injected keys (see
+    ``_TORCHRUN_INJECTED_KEYS``) are dropped.
+    """
+    kwargs: Dict[str, Any] = {}
+    i = 0
+    while i < len(unknown):
+        tok = unknown[i]
+        if not tok.startswith("--"):
+            i += 1
+            continue
+        body = tok[2:]
+        if "=" in body:
+            key, value = body.split("=", 1)
+            i += 1
+        elif i + 1 < len(unknown) and not unknown[i + 1].startswith("--"):
+            key, value = body, unknown[i + 1]
+            i += 2
+        else:
+            key, value = body, "true"
+            i += 1
+        key = key.replace("-", "_")
+        if key in _TORCHRUN_INJECTED_KEYS:
+            continue
+        kwargs[key] = _coerce(value)
+    return kwargs
+
+
+def _parse_args() -> Tuple[argparse.Namespace, Dict[str, Any]]:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
@@ -77,6 +132,13 @@ def _parse_args() -> argparse.Namespace:
         help="which benchmark runner to launch.",
     )
     parser.add_argument(
+        "--name",
+        choices=benchmark_primitive.available_primitives(),
+        default="kjt_a2a",
+        help="which primitive op to benchmark when --benchmark=primitive (ignored by "
+        "other benchmarks). Default: kjt_a2a.",
+    )
+    parser.add_argument(
         "--world-size",
         type=int,
         default=2,
@@ -89,22 +151,22 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="process-group backend (defaults to nccl on GPU, gloo otherwise).",
     )
-    # torchrun / fb.dist.ddp inject extra args (e.g. --local-rank) into the
-    # worker argv; LOCAL_RANK is read from the environment instead, so ignore
-    # unrecognized args rather than failing with argparse's exit code 2.
+    # Use parse_known_args so argparse does not fail (exit code 2) on the leftover
+    # args: these are either torchrun/fb.dist.ddp injections (e.g. --local-rank,
+    # dropped) or benchmark-specific options (e.g. --batch_size, --dim) that we
+    # forward to the selected benchmark_runner.
     args, unknown = parser.parse_known_args()
-    if unknown:
-        logger.info(
-            "ignoring unrecognized args (injected by torchrun/MAST): %s", unknown
-        )
-    return args
+    extra_kwargs = _parse_forwarded_kwargs(unknown)
+    if extra_kwargs:
+        logger.info("forwarding benchmark kwargs: %s", extra_kwargs)
+    return args, extra_kwargs
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    args = _parse_args()
+    args, extra_kwargs = _parse_args()
 
-    runner: Callable[..., None] = _BENCHMARKS[args.benchmark]
+    runner: Callable[..., Any] = _BENCHMARKS[args.benchmark]
 
     if args.mode == "local":
         # Validate we have enough GPUs for the requested world_size before
@@ -128,6 +190,8 @@ def main() -> None:
             runner,
             world_size=args.world_size,
             backend=args.backend,
+            name=args.name,
+            **extra_kwargs,
         )
     else:  # remote
         logger.info(
@@ -136,6 +200,8 @@ def main() -> None:
         run_single_process_func(
             runner,
             backend=args.backend,
+            name=args.name,
+            **extra_kwargs,
         )
 
 
