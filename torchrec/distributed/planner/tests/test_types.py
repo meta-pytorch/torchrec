@@ -27,11 +27,9 @@ from torchrec.distributed.planner.storage_reservations import (
 from torchrec.distributed.planner.types import (
     BasicCommsBandwidths,
     CustomTopologyData,
-    EmoConfig,
     HardwareConfig,
     hash_planner_context_inputs,
     KernelConfig,
-    LpPlannerConfig,
     ParameterConstraints,
     Perf,
     PlannerConfig,
@@ -50,7 +48,6 @@ from torchrec.distributed.planner.types import (
     TopologyFactory,
     TrainerConfig,
     TrainingFramework,
-    TuneClfConfig,
 )
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
@@ -2033,14 +2030,6 @@ class ShardingPlanRequestTest(unittest.TestCase):
                 planner_config=PlannerConfig(timeout_seconds=1200)
             ).request_hash,
         )
-        self.assertNotEqual(
-            base,
-            self._create_request(
-                planner_config=PlannerConfig(
-                    lp_config=LpPlannerConfig(objective="max_total_perf")
-                )
-            ).request_hash,
-        )
         # The APF-reconstruction scalar knobs also participate in the hash.
         self.assertNotEqual(
             base,
@@ -2073,29 +2062,6 @@ class ShardingPlanRequestTest(unittest.TestCase):
             self._create_request(
                 planner_config=PlannerConfig(
                     proposer_config=ProposerConfig(kind="dynamic_col_dim", step_size=4)
-                )
-            ).request_hash,
-        )
-        self.assertNotEqual(
-            base,
-            self._create_request(
-                planner_config=PlannerConfig(
-                    lp_config=LpPlannerConfig(
-                        emo_config=EmoConfig(integration_type="add_as_constraint")
-                    )
-                )
-            ).request_hash,
-        )
-        # EMO CLF-tuning knobs participate too: two requests differing only in
-        # tune_clf_config must fingerprint differently, else the cache returns one
-        # config's plan for the other.
-        self.assertNotEqual(
-            base,
-            self._create_request(
-                planner_config=PlannerConfig(
-                    lp_config=LpPlannerConfig(
-                        emo_config=EmoConfig(tune_clf_config=TuneClfConfig(max_clf=0.5))
-                    )
                 )
             ).request_hash,
         )
@@ -2156,7 +2122,6 @@ class PlannerConfigTest(unittest.TestCase):
         self.assertIsNone(cfg.memory_balanced_tolerance)
         self.assertIsNone(cfg.performance_model)
         self.assertIsNone(cfg.proposer_config)
-        self.assertIsNone(cfg.lp_config)
 
     def test_percentage_range_validated(self) -> None:
         for bad in (-0.1, 1.1):

@@ -2016,40 +2016,6 @@ class EmoConfig:
 
 
 @dataclass(frozen=True)
-class LpPlannerConfig:
-    """OSS-safe scalar knobs for the LINEAR_PROGRAMMING planner variant.
-
-    Carried as plain data so it stays serializable/hashable (part of the request
-    content hash) — the fb LinearProgrammingPlanner accepts these scalars (e.g.
-    MVAI already passes ``objective``/``shard_solver_type`` as plain strings). Each
-    field is Optional; None means "use the LP planner's own default", so the fb
-    builder only forwards the ones that are set. The fb-typed forms
-    (OptimObjective/ShardSolverType/EMOConfig) are never referenced from OSS.
-    """
-
-    # Optimization objective, e.g. "max_total_perf" (LP OptimObjective by value)
-    objective: Optional[str] = None
-    # Shard solver, e.g. "greedy" (LP ShardSolverType by value)
-    shard_solver_type: Optional[str] = None
-    # Whether to tune column dimensions
-    tune_col_dims: Optional[bool] = None
-    # Hybrid solver percentage (0-100)
-    hybrid_percentage: Optional[int] = None
-    # Allowed solution-quality worsening percentage (>= 0.0)
-    allowed_worsening_percentage: Optional[float] = None
-    # Whether to apply per-stage timeouts
-    stagewise_timeout: Optional[bool] = None
-    # Whether plan caching is enabled
-    caching_enabled: Optional[bool] = None
-    # Number of local-search cycles
-    num_cycles: Optional[int] = None
-    # Whether to auto-derive column dimensions
-    auto_col_dims: Optional[bool] = None
-    # Embedding-managed-offload config; None = LP planner default.
-    emo_config: Optional[EmoConfig] = None
-
-
-@dataclass(frozen=True)
 class ProposerGroup:
     """One regex group's DynamicColDim args for the grouped-DCD proposer.
 
@@ -2160,9 +2126,6 @@ class PlannerConfig:
     # Proposer selection + scalar args; None = planner default proposer set. The
     # structured form; mutually exclusive with proposer_type (see __post_init__).
     proposer_config: Optional[ProposerConfig] = None
-    # LINEAR_PROGRAMMING scalar knobs; None = LP planner defaults. Consumed only by
-    # the LP variant's fb builder (ignored by other variants).
-    lp_config: Optional[LpPlannerConfig] = None
     # Explicit per-model non-sharded footprint in bytes for the SKU_AWARE policy;
     # when set it replaces the home-anchored margin + computed dense with this
     # measured static base. None (default) keeps the migration proxy. Consumed only
@@ -2170,6 +2133,10 @@ class PlannerConfig:
     # ignored by every other policy. (Appended last to preserve positional
     # construction of the pre-existing fields.)
     model_base_bytes: Optional[int] = None
+
+    def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
+        """Return package-specific planner config data for the request hash."""
+        return None
 
     def __post_init__(self) -> None:
         # proposer_type (OSS scalar selector) and proposer_config (structured form)
@@ -2415,41 +2382,7 @@ class ShardingPlanRequest:
                         if (pc := self.planner_config.proposer_config) is not None
                         else None
                     ),
-                    (
-                        (
-                            lp.objective,
-                            lp.shard_solver_type,
-                            lp.tune_col_dims,
-                            lp.hybrid_percentage,
-                            lp.allowed_worsening_percentage,
-                            lp.stagewise_timeout,
-                            lp.caching_enabled,
-                            lp.num_cycles,
-                            lp.auto_col_dims,
-                            (
-                                (
-                                    lp.emo_config.integration_type,
-                                    lp.emo_config.prefetch_compute_limit_per_rank,
-                                    (
-                                        (
-                                            tc.increment_size,
-                                            tc.max_clf,
-                                            tc.min_clf,
-                                            tc.min_prefetch_compute_decrease,
-                                            tc.enable_clf_reduction,
-                                        )
-                                        if (tc := lp.emo_config.tune_clf_config)
-                                        is not None
-                                        else None
-                                    ),
-                                )
-                                if lp.emo_config is not None
-                                else None
-                            ),
-                        )
-                        if (lp := self.planner_config.lp_config) is not None
-                        else None
-                    ),
+                    self.planner_config.request_hash_extension(),
                 ]
             ),
             "x",
