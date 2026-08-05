@@ -19,7 +19,7 @@ import resource
 import sys
 import time
 import timeit
-from dataclasses import dataclass, fields, is_dataclass, MISSING
+from dataclasses import dataclass, field, fields, is_dataclass, MISSING
 from enum import Enum
 from typing import (
     Any,
@@ -36,7 +36,7 @@ from typing import (
 
 import torch
 import yaml
-from torch import multiprocessing as mp
+from torch import distributed as dist, multiprocessing as mp
 from torch.autograd.profiler import record_function
 from torchrec.distributed.benchmark.utils import (
     create_snapshot_file_name,
@@ -155,6 +155,11 @@ class BenchmarkResult:
     gpu_mem_stats: List[GPUMemoryStats]  # GPU memory stats per rank
     cpu_mem_stats: List[CPUMemoryStats]  # CPU memory stats per rank
     qps: torch.Tensor  # per-iteration queries per second
+    # Per-iteration wall-clock time in milliseconds (from ``time.perf_counter``).
+    # This measures the elapsed CPU-side time of the iteration; for async GPU work
+    # (e.g. a collective enqueued and not awaited on the host) it reflects launch
+    # overhead, not device execution -- use ``gpu_elapsed_time`` for GPU latency.
+    wall_elapsed_time: torch.Tensor = field(default_factory=lambda: torch.zeros(1))
     rank: int = -1
 
     def __str__(self) -> str:
@@ -165,6 +170,10 @@ class BenchmarkResult:
         cpu_runtime = (
             "CPU Runtime (P10/P50/P90)",
             f"{self.runtime_percentile(10, device='cpu'):.2f} / {self.runtime_percentile(50, device='cpu'):.2f} / {self.runtime_percentile(90, device='cpu'):.2f} ms",
+        )
+        wall_runtime = (
+            "Wall Runtime (P10/P50/P90)",
+            f"{self.runtime_percentile(10, device='wall'):.2f} / {self.runtime_percentile(50, device='wall'):.2f} / {self.runtime_percentile(90, device='wall'):.2f} ms",
         )
         cpu_util = (
             "CPU Utilization (P10/P50/P90)",
@@ -210,6 +219,7 @@ class BenchmarkResult:
         for h, c in [
             gpu_runtime,
             cpu_runtime,
+            wall_runtime,
             cpu_util,
             norm_cpu_util,
             mem_alloc,
@@ -238,6 +248,7 @@ class BenchmarkResult:
             "  Runtime:",
             f"    GPU  (P10/P50/P90):     {self.runtime_percentile(10, device='gpu'):.2f} / {self.runtime_percentile(50, device='gpu'):.2f} / {self.runtime_percentile(90, device='gpu'):.2f} ms",
             f"    CPU  (P10/P50/P90):     {self.runtime_percentile(10, device='cpu'):.2f} / {self.runtime_percentile(50, device='cpu'):.2f} / {self.runtime_percentile(90, device='cpu'):.2f} ms",
+            f"    Wall (P10/P50/P90):     {self.runtime_percentile(10, device='wall'):.2f} / {self.runtime_percentile(50, device='wall'):.2f} / {self.runtime_percentile(90, device='wall'):.2f} ms",
             f"    CPU Utilization (P10/P50/P90):  {self.cpu_utilization_percentile(10):.2%} / {self.cpu_utilization_percentile(50):.2%} / {self.cpu_utilization_percentile(90):.2%}",
             f"    Normalized CPU Util (P10/P50/P90):  {self.normalized_cpu_utilization_percentile(10):.2%} / {self.normalized_cpu_utilization_percentile(50):.2%} / {self.normalized_cpu_utilization_percentile(90):.2%}",
         ]
@@ -276,6 +287,9 @@ class BenchmarkResult:
         for p in (10, 50, 90):
             d[f"gpu_runtime_p{p}_ms"] = float(self.runtime_percentile(p, device="gpu"))
             d[f"cpu_runtime_p{p}_ms"] = float(self.runtime_percentile(p, device="cpu"))
+            d[f"wall_runtime_p{p}_ms"] = float(
+                self.runtime_percentile(p, device="wall")
+            )
             d[f"cpu_utilization_p{p}"] = float(self.cpu_utilization_percentile(p))
             d[f"normalized_cpu_utilization_p{p}"] = float(
                 self.normalized_cpu_utilization_percentile(p)
@@ -314,9 +328,15 @@ class BenchmarkResult:
         Args:
             percentile: Percentile to compute.
             interpolation: See ``torch.quantile``.
-            device: 'gpu' for CUDA event timings, 'cpu' for active CPU timings.
+            device: 'gpu' for CUDA event timings, 'cpu' for active CPU timings,
+                'wall' for wall-clock (perf_counter) timings.
         """
-        timings = self.gpu_elapsed_time if device == "gpu" else self.cpu_elapsed_time
+        if device == "gpu":
+            timings = self.gpu_elapsed_time
+        elif device == "wall":
+            timings = self.wall_elapsed_time
+        else:
+            timings = self.cpu_elapsed_time
         return torch.quantile(
             timings,
             percentile / 100.0,
@@ -545,6 +565,7 @@ def multi_process_benchmark(
         ],
         cpu_mem_stats=[CPUMemoryStats(rank, 0) for rank in range(world_size)],
         qps=benchmark_res_per_rank[0].qps,
+        wall_elapsed_time=benchmark_res_per_rank[0].wall_elapsed_time,
         rank=0,
     )
 
@@ -856,6 +877,7 @@ class PerfWrapper:
         rank: int,
         reset_accumulated_memory_stats: bool = True,
         sample_count: int = 0,
+        pg: Optional[dist.ProcessGroup] = None,
     ) -> None:
         self._start_events: List[torch.cuda.Event] = [
             torch.cuda.Event(enable_timing=True) for _ in range(num_benchmarks)
@@ -875,6 +897,10 @@ class PerfWrapper:
         # local device ordinal so multi-host jobs (global rank > per-host GPUs) work.
         self._rank: int = rank
         self._device: int = _bench_cuda_device(rank)
+        # When set, every rank rendezvouses here before each measured iteration so
+        # cross-rank arrival skew is absorbed outside the timing window (see
+        # ``measure``). ``None`` in single-process mode disables the barrier.
+        self._pg: Optional[dist.ProcessGroup] = pg
         self._reset_accumulated_memory_stats = reset_accumulated_memory_stats
 
         # Scratch state for in-flight measurement
@@ -916,7 +942,25 @@ class PerfWrapper:
         self._cur += 1
 
     def measure(self, fn: Callable[[], None]) -> None:
-        """Run ``fn`` bracketed by start/end measurement."""
+        """Run ``fn`` bracketed by start/end measurement.
+
+        When a process group is set, all ranks rendezvous at a ``dist.barrier``
+        *before* ``_start`` opens the timers, so cross-rank arrival skew is
+        absorbed in this untimed region. Otherwise the earliest rank opens its
+        window and then blocks *inside* ``fn``'s collective waiting for the
+        slowest (straggler) rank, charging that wait to its own comm time. The
+        barrier only helps here, ahead of the timers -- inside the timed window it
+        would merely relabel the wait, not exclude it.
+        """
+        if self._pg is not None:
+            dist.barrier(group=self._pg)
+            # A NCCL barrier is asynchronous on the host, so block until it has
+            # actually completed; otherwise the wall-clock timer in ``_start``
+            # would open before the ranks are aligned and the skew would leak back
+            # into the wall measurement (GPU-event timing is already safe because
+            # the barrier's stream op precedes the start event).
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self._device)
         self._start()
         fn()
         self._end()
@@ -939,6 +983,11 @@ class PerfWrapper:
     def cpu_elapsed_time(self) -> torch.Tensor:
         """Per-iteration active CPU time in milliseconds."""
         return self._trim_outliers([t / 1e6 for t in self._cpu_times_active_ns])
+
+    @property
+    def wall_elapsed_time(self) -> torch.Tensor:
+        """Per-iteration wall-clock time in milliseconds (from ``time.perf_counter``)."""
+        return self._trim_outliers([t / 1e6 for t in self._wall_times_ns])
 
     @property
     def cpu_utilization(self) -> torch.Tensor:
@@ -1026,6 +1075,7 @@ class PerfWrapper:
             gpu_mem_stats=[self.gpu_mem_stats_p90],
             cpu_mem_stats=[CPUMemoryStats(rank, self.peak_rss_mbs)],
             qps=self.qps,
+            wall_elapsed_time=self.wall_elapsed_time,
             rank=rank,
         )
 
@@ -1036,15 +1086,17 @@ def _run_cuda_benchmark(
     rank: int,
     reset_accumulated_memory_stats: bool = True,
     sample_count: int = 0,
+    pg: Optional[dist.ProcessGroup] = None,
 ) -> PerfWrapper:
     """Run benchmark iterations on CUDA, collecting GPU/CPU timing and memory stats.
 
     Returns a ``PerfWrapper`` containing raw per-iteration measurements.
     Call ``to_benchmark_result(name, rank, world_size)`` on the result to
-    obtain a ``BenchmarkResult``.
+    obtain a ``BenchmarkResult``. When ``pg`` is set, ranks barrier before each
+    measured iteration so arrival skew stays out of the timing (see ``measure``).
     """
     perf = PerfWrapper(
-        num_benchmarks, rank, reset_accumulated_memory_stats, sample_count
+        num_benchmarks, rank, reset_accumulated_memory_stats, sample_count, pg
     )
     logger.info(f"Running cuda benchmark {num_benchmarks} times on rank {rank}")
 
@@ -1172,6 +1224,7 @@ def _run_benchmark_core(
     profile_all_threads: bool = False,
     sample_count: int = 0,
     test_name: str = "",
+    pg: Optional[dist.ProcessGroup] = None,
 ) -> BenchmarkResult:
     """Internal helper that contains the core benchmarking logic shared by
     ``benchmark`` and ``benchmark_func``.  All heavy–lifting (timing, memory
@@ -1213,6 +1266,7 @@ def _run_benchmark_core(
             rank,
             reset_accumulated_memory_stats,
             sample_count,
+            pg,
         )
         result = perf.to_benchmark_result(name, rank, world_size)
     else:  # CPU benchmarking
@@ -1234,6 +1288,7 @@ def _run_benchmark_core(
             gpu_mem_stats=[],
             cpu_mem_stats=[CPUMemoryStats.for_process(rank)],
             qps=cpu_qps,
+            wall_elapsed_time=cpu_elapsed_time.clone(),
             rank=rank,
         )
 
@@ -1404,6 +1459,7 @@ def benchmark_func(
     profile_all_threads: bool = False,
     sample_count: int = 0,
     test_name: str = "",
+    pg: Optional[dist.ProcessGroup] = None,
 ) -> BenchmarkResult:
     """
     Args:
@@ -1429,6 +1485,10 @@ def benchmark_func(
         all_rank_traces: Whether to export traces from all ranks.
         memory_snapshot: Whether to capture memory snapshot during the profiling
             usage: https://docs.pytorch.org/memory_viz
+        pg: Optional process group. When provided, all ranks barrier before each
+            measured iteration so cross-rank arrival skew is absorbed outside the
+            timing window -- important for collective (e.g. all-to-all) benchmarks
+            where the straggler would otherwise inflate the measured comm time.
     """
     if benchmark_func_kwargs is None:
         benchmark_func_kwargs = {}
@@ -1475,4 +1535,5 @@ def benchmark_func(
         profile_all_threads=profile_all_threads,
         sample_count=sample_count,
         test_name=test_name,
+        pg=pg,
     )
