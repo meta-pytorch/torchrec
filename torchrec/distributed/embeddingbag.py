@@ -37,7 +37,10 @@ from torch.distributed._tensor import DTensor
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.embedding_lookup import PartiallyMaterializedTensor
+from torchrec.distributed.embedding_lookup import (
+    GroupedPooledEmbeddingsLookup,
+    PartiallyMaterializedTensor,
+)
 from torchrec.distributed.embedding_sharding import (
     EmbeddingSharding,
     EmbeddingShardingContext,
@@ -113,6 +116,7 @@ from torchrec.modules.embedding_configs import (
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingBagCollectionInterface,
+    should_skip_data_parallel_grad_sync,
 )
 from torchrec.optim.fused import EmptyFusedOptimizer, FusedOptimizerModule
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizer
@@ -639,6 +643,10 @@ class ShardedEmbeddingBagCollection(
         # pyrefly: ignore [missing-attribute]
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
         self._module_fqn = module_fqn
+        # Opt-out of the DATA_PARALLEL DDP gradient reducer (see embedding_modules).
+        self._skip_data_parallel_grad_sync: bool = should_skip_data_parallel_grad_sync(
+            module
+        )
         # Normalize to lowercase for case-insensitive matching
         self._sharded_module_order_overwrite: Optional[List[str]] = (
             [s.lower() for s in sharded_module_order_overwrite]
@@ -815,6 +823,9 @@ class ShardedEmbeddingBagCollection(
         """
         Initialize data parallel for the embedding bag collection.
         """
+        # Opt-out: skip the DDP wrap; the raw DP lookup forwards on its own.
+        if self._skip_data_parallel_grad_sync:
+            return
         for i, (sharding, lookup) in enumerate(
             zip(self._embedding_shardings, self._lookups)
         ):
@@ -1213,8 +1224,9 @@ class ShardedEmbeddingBagCollection(
 
         for lookup, sharding in zip(self._lookups, self._embedding_shardings):
             if isinstance(sharding, DpPooledEmbeddingSharding):
-                # unwrap DDP
-                lookup = lookup.module
+                # mark_data_parallel_skip_grad_sync modules are never wrapped.
+                while isinstance(lookup, DistributedDataParallel):
+                    lookup = lookup.module
             else:
                 # save local_shards for transforming MP params to DTensor
                 for key, v in lookup.state_dict().items():
@@ -1246,12 +1258,9 @@ class ShardedEmbeddingBagCollection(
                         self._model_parallel_name_to_local_shards[table_name].extend(
                             v.local_shards()
                         )
-            for (
-                table_name,
-                tbe_slice,
-                #  `named_parameters_by_table`.
-                # pyrefly: ignore [missing-attribute]
-            ) in lookup.named_parameters_by_table():
+            for table_name, tbe_slice in cast(
+                GroupedPooledEmbeddingsLookup, lookup
+            ).named_parameters_by_table():
                 # for virtual table, currently we don't expose id tensor and bucket tensor
                 # because they are not updated in real time, and they are created on the fly
                 # whenever state_dict is called
