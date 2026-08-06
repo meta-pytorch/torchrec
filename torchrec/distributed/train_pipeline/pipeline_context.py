@@ -98,6 +98,40 @@ class EmbeddingTrainPipelineContext(TrainPipelineContext):
 
 
 @dataclass
+class PECTrainPipelineContext(EmbeddingTrainPipelineContext):
+    """Context for TrainPipelinePEC.
+
+    Non-PEC precomputed embeddings use the inherited embedding_a2a_requests
+    (+ embedding_tensors etc. read by the InSync forward path). PEC module
+    contexts and raw input_dist requests use the inherited module_contexts /
+    input_dist_tensors_requests — PEC modules go through the shared SDD. The
+    fields below are PEC-only; each dict is keyed by module FQN.
+    """
+
+    # PEC features after input_dist (KJTList, one KJT per sharding group), waited
+    # inside overlap_dist. Held one batch so the next batch's overlap_dist can use
+    # it as prev.
+    pec_dist_inputs: Dict[str, Any] = field(default_factory=dict)
+
+    # List[ForwardPartitionContext] / List[BackwardPartitionContext] from
+    # overlap_dist, one entry per sharding group.
+    pec_forward_ctxs: Dict[str, Any] = field(default_factory=dict)
+    pec_backward_ctxs: Dict[str, Any] = field(default_factory=dict)
+
+    # OL/NOL output-dist awaitables from compute (List per sharding group),
+    # consumed by merge in forward.
+    pec_ol_awaitables: Dict[str, Any] = field(default_factory=dict)
+    pec_nol_awaitables: Dict[str, Any] = field(default_factory=dict)
+
+    # The previous batch's deferred NOL grad inputs, attached at the end of the
+    # previous batch's progress: (module_ctx, nol_features_per_group). This
+    # batch's progress runs the NOL grad A2A + apply from it. module_ctx carries
+    # the nol_grad_apply applier (set during the prev batch's backward); both it
+    # and the nol_features stay alive because this context holds the refs.
+    pec_deferred_nol_grad: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
 class CPUEmbeddingTrainPipelineContext(EmbeddingTrainPipelineContext):
     dense_gpu_device: str = field(default_factory=str)
     # Populated by Stage 2 (copy_to_gpu): embedding results already on GPU, keyed by module FQN
