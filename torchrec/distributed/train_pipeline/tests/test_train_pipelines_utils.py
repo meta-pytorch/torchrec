@@ -10,8 +10,8 @@
 import copy
 import enum
 import unittest
-from typing import Tuple, Union
-from unittest.mock import MagicMock
+from typing import cast, List, NamedTuple, Optional, Tuple, Union
+from unittest.mock import MagicMock, patch
 
 import torch
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -20,8 +20,14 @@ from torchrec.distributed.test_utils.test_model import (
     TestNegSamplingModule,
     TestSparseNN,
 )
-from torchrec.distributed.train_pipeline.pipeline_context import TrainPipelineContext
-from torchrec.distributed.train_pipeline.runtime_forwards import PipelinedForward
+from torchrec.distributed.train_pipeline.pipeline_context import (
+    EmbeddingTrainPipelineContext,
+    TrainPipelineContext,
+)
+from torchrec.distributed.train_pipeline.runtime_forwards import (
+    EmbeddingPipelinedForward,
+    PipelinedForward,
+)
 from torchrec.distributed.train_pipeline.tests.test_train_pipelines_base import (
     TrainPipelineSparseDistTestBase,
 )
@@ -29,10 +35,12 @@ from torchrec.distributed.train_pipeline.tracing import CallArgs, PipelinedPostp
 from torchrec.distributed.train_pipeline.utils import (
     _is_data_loading_retriable,
     _rewrite_model,
+    _start_embedding_lookup,
     DataLoadingThread,
 )
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import Awaitable, ShardedModule, ShardingType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.streamable import Multistreamable
 
 
 class ModelType(enum.Enum):
@@ -427,6 +435,250 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         missing_keys, unexpected_keys = sharded_model.load_state_dict(state_dict)
         self.assertEqual(missing_keys, [])
         self.assertEqual(unexpected_keys, [])
+
+
+# ~50ms on a modern GPU: long enough that a consumer on an unordered stream
+# reliably reads the input-dist output before it has been written.
+_INPUT_DIST_DELAY_CYCLES = 100_000_000
+
+# Fills the KJT before the input dist writes it, so an embedding lookup that runs
+# too early reads this instead of the real values.
+_PRE_INPUT_DIST_SENTINEL = -1
+
+
+@enum.unique
+class _StreamCase(enum.Enum):
+    """Call shapes `_start_embedding_lookup` sees across its callers.
+
+    Named for where the embedding lookup runs relative to the source (data-dist)
+    and target streams.
+    """
+
+    LOOKUP_ON_NEW = enum.auto()
+    LOOKUP_ON_SOURCE = enum.auto()
+    LOOKUP_ON_TARGET = enum.auto()
+    SOURCE_UNSET = enum.auto()
+    NO_STREAMS = enum.auto()
+
+
+class _DelayedInputDistAwaitable(Awaitable[KeyedJaggedTensor]):
+    """Input-dist awaitable that simulates a slow input dist racing the lookup.
+
+    `wait()` enqueues a long GPU delay and then the write on whatever stream is
+    current, which is the source (data-dist) stream, and never synchronizes the
+    host. An embedding lookup running on an unordered stream therefore reads the
+    KJT before it has been written -- the race `_start_embedding_lookup` is
+    responsible for preventing.
+    """
+
+    def __init__(self, kjt: KeyedJaggedTensor, values: torch.Tensor) -> None:
+        super().__init__()
+        self._kjt = kjt
+        self._values = values
+
+    def _wait_impl(self) -> KeyedJaggedTensor:
+        torch.cuda._sleep(_INPUT_DIST_DELAY_CYCLES)
+        self._kjt.values().copy_(self._values)
+        return self._kjt
+
+
+class _RecordingModuleContext(Multistreamable):
+    """Module context that remembers every stream it was recorded on.
+
+    Makes the `record_stream` calls that register the KJT and the module context
+    for caching-allocator lifetime tracking observable. `_start_embedding_lookup`
+    records both on the same streams, and a real KJT forwards `record_stream` to
+    its tensors without leaving a trace, so the streams collected here stand for
+    both calls.
+    """
+
+    def __init__(self) -> None:
+        self.recorded_streams: List[torch.Stream] = []
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        self.recorded_streams.append(stream)
+
+
+class _StreamProbeModule:
+    """Test double for a pipelined `ShardedModule`, replacing the TBE lookup.
+
+    Implements only the surface `_start_embedding_lookup` touches: a `forward`
+    carrying the module name, and `compute_and_output_dist`. Instead of an
+    embedding lookup it copies the KJT it is handed, on whatever stream is
+    current, so the values the embedding-lookup stream actually read can be
+    asserted on directly rather than inferred from embedding outputs.
+    """
+
+    def __init__(self, observed: torch.Tensor) -> None:
+        self.observed = observed
+        # Assigned after construction, since the forward refers back to us.
+        self.forward: Optional[EmbeddingPipelinedForward] = None
+
+    def compute_and_output_dist(
+        self, ctx: Multistreamable, kjt: KeyedJaggedTensor
+    ) -> torch.Tensor:
+        self.observed.copy_(kjt.values())
+        return self.observed
+
+
+def _pipeline_module(
+    name: str, context: EmbeddingTrainPipelineContext, observed: torch.Tensor
+) -> _StreamProbeModule:
+    """Builds a probe module carrying the forward `_rewrite_model` would install.
+
+    `_rewrite_model` replaces a `ShardedModule`'s bound `forward` with an
+    `EmbeddingPipelinedForward`, which is where `_start_embedding_lookup` reads
+    the module name from, so the forward has to be attached after construction.
+    """
+    module = _StreamProbeModule(observed)
+    module.forward = EmbeddingPipelinedForward(
+        name=name,
+        args=CallArgs(args=[], kwargs={}),
+        module=cast(ShardedModule, module),
+        context=context,
+    )
+    return module
+
+
+class _StreamSetup(NamedTuple):
+    """Resolved streams for one `_start_embedding_lookup` call shape.
+
+    Attributes:
+        source_stream: the `source_stream` argument.
+        target_stream: the `target_stream` argument.
+        lookup_stream: stream entered before the call, mirroring the caller's
+            `stream_context(emb_lookup_stream)`. `None` leaves the default stream
+            current, which is what the callers without a stream context do.
+        expected_recorded: streams the module context must be recorded on.
+    """
+
+    source_stream: Optional[torch.cuda.Stream]
+    target_stream: Optional[torch.cuda.Stream]
+    lookup_stream: Optional[torch.cuda.Stream]
+    expected_recorded: List[torch.cuda.Stream]
+
+
+def _build_stream_setup(case: _StreamCase, device: torch.device) -> _StreamSetup:
+    """Builds the streams for one call shape of `_start_embedding_lookup`."""
+    default_stream = torch.cuda.current_stream(device)
+    source_stream = torch.cuda.Stream(device=device)
+    match case:
+        case _StreamCase.NO_STREAMS:
+            # No caller reaches this today: target_stream is always
+            # `current_stream()`, which is non-None even on CPU. Pins the
+            # helper's guard for the case where no device stream is resolvable.
+            return _StreamSetup(None, None, None, [])
+        case _StreamCase.SOURCE_UNSET:
+            # No data-dist stream, as on a CPU device, so the current stream
+            # comes from target_stream.
+            return _StreamSetup(None, default_stream, None, [default_stream])
+        case _StreamCase.LOOKUP_ON_TARGET:
+            # emb_lookup_stream="current", and the TrainPipelineSemiSync call shape.
+            return _StreamSetup(source_stream, default_stream, None, [default_stream])
+        case _StreamCase.LOOKUP_ON_SOURCE:
+            # emb_lookup_stream="data_dist", the TrainPipelineFusedSparseDist
+            # default. The lookup runs on the stream that allocated the KJT, so
+            # only the target stream needs recording.
+            return _StreamSetup(
+                source_stream,
+                default_stream,
+                source_stream,
+                [default_stream],
+            )
+        case _StreamCase.LOOKUP_ON_NEW:
+            # emb_lookup_stream="new": source, target and lookup are all distinct.
+            lookup_stream = torch.cuda.Stream(device=device)
+            return _StreamSetup(
+                source_stream,
+                default_stream,
+                lookup_stream,
+                [lookup_stream, default_stream],
+            )
+
+
+class StartEmbeddingLookupTest(unittest.TestCase):
+    """Tests the stream contract of `_start_embedding_lookup`.
+
+    Steps the helper performs:
+      1. Waits for the input-dist output on `source_stream`.
+      2. Runs `compute_and_output_dist` on the current stream, which callers set
+         to their embedding-lookup stream.
+
+    Expected behavior when those two streams differ:
+      - The current stream waits on an event recorded on `source_stream`. CUDA
+        orders nothing between two streams on its own, so without that edge the
+        lookup reads input-dist output that has not been written yet.
+      - The KJT and module context are recorded on the current stream, so the
+        caching allocator cannot reuse their memory while the lookup reads it.
+      - A stream serving two of these roles at once is recorded only once.
+    """
+
+    def _run_start_embedding_lookup(
+        self, setup: _StreamSetup, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor, _RecordingModuleContext]:
+        """Runs `_start_embedding_lookup` once for the given stream setup.
+
+        Returns:
+            The values the input dist writes, the values the embedding lookup
+            actually read, and the module context that recorded the streams.
+        """
+        name = "sharded_ebc"
+        num_values = 16
+        expected = torch.arange(num_values, dtype=torch.int64, device=device)
+        kjt = KeyedJaggedTensor(
+            keys=["feature_0"],
+            values=torch.full_like(expected, _PRE_INPUT_DIST_SENTINEL),
+            lengths=torch.ones(num_values, dtype=torch.int64, device=device),
+        )
+        observed = torch.full_like(expected, _PRE_INPUT_DIST_SENTINEL)
+        module_context = _RecordingModuleContext()
+        context = EmbeddingTrainPipelineContext(
+            input_dist_tensors_requests={
+                name: _DelayedInputDistAwaitable(kjt, expected)
+            },
+            module_contexts={name: module_context},
+        )
+        # The fixtures above are filled on the default stream but read below on
+        # source_stream and the lookup stream. PyTorch creates streams with
+        # cudaStreamNonBlocking, so they are not implicitly ordered against the
+        # default stream; drain it so a stale fixture read cannot masquerade as
+        # the race under test.
+        torch.cuda.synchronize(device)
+
+        with torch.cuda.stream(setup.lookup_stream):
+            _start_embedding_lookup(
+                module=cast(ShardedModule, _pipeline_module(name, context, observed)),
+                context=context,
+                source_stream=setup.source_stream,
+                target_stream=setup.target_stream,
+                stream_context=torch.cuda.stream,
+            )
+        # `observed` is written on the lookup stream; wait for it before reading.
+        torch.cuda.synchronize(device)
+        return expected, observed, module_context
+
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    @patch("torch._utils_internal.justknobs_check", return_value=True)
+    def test_stream_combinations(self, _mock_justknobs_check: MagicMock) -> None:
+        """
+        Tests every stream combination `_start_embedding_lookup` is called with,
+        asserting for each that the lookup read the fully written input-dist
+        output and that the module context recorded exactly the expected streams.
+        """
+        device = torch.device("cuda:0")
+        for case in _StreamCase:
+            with self.subTest(streams=case.name):
+                setup = _build_stream_setup(case, device)
+                expected, observed, module_context = self._run_start_embedding_lookup(
+                    setup, device
+                )
+                torch.testing.assert_close(observed, expected)
+                self.assertCountEqual(
+                    module_context.recorded_streams, setup.expected_recorded
+                )
 
 
 class _RetryableDataError(Exception):

@@ -294,13 +294,20 @@ def _start_data_dist(
     _fuse_input_dist_splits(context)
 
 
-def _start_embedding_lookup(
+def _start_embedding_lookup_legacy(
     module: ShardedModule,
     context: EmbeddingTrainPipelineContext,
     source_stream: Optional[torch.Stream],
     target_stream: Optional[torch.Stream],
     stream_context: Callable[..., AbstractContextManager[Any, Any]],
 ) -> None:
+    """Records the KJT and module context on target_stream only.
+
+    Retained so `killswitch_emb_lookup_stream_sync` can fall back to it. Races
+    when the embedding lookup runs on a stream other than source_stream: nothing
+    orders the lookup after the stream producing its input, and the stream that
+    actually consumes the KJT is never registered with the caching allocator.
+    """
     # pyrefly: ignore[missing-attribute]
     module_context = context.module_contexts[module.forward.name]
     with stream_context(source_stream):
@@ -313,6 +320,81 @@ def _start_embedding_lookup(
     output_dist_out = module.compute_and_output_dist(module_context, kjt)
     # pyrefly: ignore[missing-attribute]
     context.embedding_a2a_requests[module.forward.name] = output_dist_out
+
+
+def _start_embedding_lookup_stream_synced(
+    module: ShardedModule,
+    context: EmbeddingTrainPipelineContext,
+    source_stream: Optional[torch.Stream],
+    target_stream: Optional[torch.Stream],
+    stream_context: Callable[..., AbstractContextManager[Any, Any]],
+) -> None:
+    """Orders the embedding lookup against the stream producing its input.
+
+    The lookup runs on whatever stream the caller made current, which need not be
+    source_stream or target_stream. When it differs from source_stream, CUDA
+    orders nothing between them, so this records an event on source_stream and
+    has the consumer wait on it, and registers the KJT and module context with
+    every stream that consumes them.
+    """
+    # pyrefly: ignore[missing-attribute]
+    name = module.forward.name
+    module_context = context.module_contexts[name]
+
+    # The caller may have made a third stream current for the lookup itself, so
+    # this is not necessarily source_stream or target_stream.
+    current_stream = None
+    device_stream = source_stream or target_stream
+    if device_stream:
+        current_stream = torch.get_device_module(device_stream.device).current_stream()
+
+    # Waiting here keeps the collective-completion wait and the recat kernels off
+    # the consumer stream, and their output in the data-dist allocator pool.
+    with stream_context(source_stream):
+        kjt = context.input_dist_tensors_requests[name].wait()
+        source_event = (
+            source_stream.record_event()
+            if source_stream is not None and source_stream != current_stream
+            else None
+        )
+
+    # Without this edge the lookup could read input-dist output on a stream that
+    # never waited for the stream producing it.
+    if current_stream is not None and source_event is not None:
+        current_stream.wait_event(source_event)
+
+    consumer_streams = {s for s in (current_stream, target_stream) if s is not None}
+    # source_stream allocated them, and record_stream no-ops on a block's own
+    # allocating stream. discard() rather than `!= source_stream`: torch.Stream
+    # richcompare returns False for every op against None, so `!=` would drop
+    # every stream whenever source_stream is None.
+    consumer_streams.discard(source_stream)
+    for stream in consumer_streams:
+        kjt.record_stream(stream)
+        module_context.record_stream(stream)
+
+    context.embedding_a2a_requests[name] = module.compute_and_output_dist(
+        module_context, kjt
+    )
+
+
+def _start_embedding_lookup(
+    module: ShardedModule,
+    context: EmbeddingTrainPipelineContext,
+    source_stream: Optional[torch.Stream],
+    target_stream: Optional[torch.Stream],
+    stream_context: Callable[..., AbstractContextManager[Any, Any]],
+) -> None:
+    if torch._utils_internal.justknobs_check(
+        "pytorch/torchrec:killswitch_emb_lookup_stream_sync",
+    ):
+        _start_embedding_lookup_stream_synced(
+            module, context, source_stream, target_stream, stream_context
+        )
+    else:
+        _start_embedding_lookup_legacy(
+            module, context, source_stream, target_stream, stream_context
+        )
 
 
 def _fuse_input_dist_splits(context: TrainPipelineContext) -> None:
