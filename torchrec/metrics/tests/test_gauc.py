@@ -60,6 +60,78 @@ class GAUCMetricValueTest(unittest.TestCase):
             tasks=[DefaultTaskInfo],
         )
 
+    def test_max_num_candidates_cpu_matches_legacy(self) -> None:
+        test_cases = [
+            (
+                "exact_bound",
+                torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5]]),
+                torch.tensor([[1, 0, 1, 1, 0]]),
+                torch.tensor([[1, 1, 1, 1, 1]]),
+                torch.tensor([3, 2]),
+                3,
+            ),
+            (
+                "loose_bound",
+                torch.tensor([[0.3, 0.9, 0.1, 0.8, 0.2, 0.8, 0.7, 0.6, 0.5, 0.5]]),
+                torch.tensor([[1, 1, 1, 0, 0, 1, 0, 1, 1, 0]]),
+                torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1]]),
+                torch.tensor([2, 3, 3, 2]),
+                8,
+            ),
+            (
+                "zero_weights_and_tied_predictions",
+                torch.tensor([[0.8, 0.8, 0.3, 0.2]]),
+                torch.tensor([[1, 0, 1, 0]]),
+                torch.tensor([[1, 0, 1, 1]]),
+                torch.tensor([2, 2]),
+                6,
+            ),
+        ]
+
+        for (
+            name,
+            predictions,
+            labels,
+            weights,
+            num_candidates,
+            max_num_candidates,
+        ) in test_cases:
+            with self.subTest(name=name):
+                legacy = GAUCMetric(
+                    world_size=1,
+                    my_rank=0,
+                    batch_size=100,
+                    tasks=[DefaultTaskInfo],
+                )
+                optimized = GAUCMetric(
+                    world_size=1,
+                    my_rank=0,
+                    batch_size=100,
+                    tasks=[DefaultTaskInfo],
+                )
+                batches = {
+                    "predictions": {"DefaultTask": predictions},
+                    "labels": {"DefaultTask": labels},
+                    "num_candidates": num_candidates,
+                    "weights": {"DefaultTask": weights},
+                }
+
+                legacy.update(**batches)
+                optimized.update(
+                    **batches,
+                    max_num_candidates_cpu=torch.tensor(max_num_candidates),
+                )
+
+                legacy_result = legacy.compute()
+                optimized_result = optimized.compute()
+                self.assertEqual(legacy_result.keys(), optimized_result.keys())
+                for key, legacy_value in legacy_result.items():
+                    torch.testing.assert_close(
+                        optimized_result[key],
+                        legacy_value,
+                        equal_nan=True,
+                    )
+
     def test_calc_gauc_simple(self) -> None:
         self.predictions["DefaultTask"] = torch.tensor([[0.9, 0.8, 0.7, 0.6, 0.5]])
         self.labels["DefaultTask"] = torch.tensor([[1, 0, 1, 1, 0]])
@@ -69,6 +141,7 @@ class GAUCMetricValueTest(unittest.TestCase):
             "predictions": self.predictions,
             "labels": self.labels,
             "num_candidates": self.num_candidates,
+            "max_num_candidates_cpu": torch.tensor(4),
             "weights": self.weights,
         }
 
