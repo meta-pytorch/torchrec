@@ -293,17 +293,18 @@ def _pec_forward(
     fwd_next, bwd_cur = results_next[0].wait()
     assert bwd_cur is not None
 
-    # Compute OL/NOL
+    # Compute OL/NOL. compute_and_output_dist_in_partition takes per-sharding-group
+    # lists; this RW-only test has a single group, so wrap in single-element lists.
     ol_awaitables = sharded_pec.compute_and_output_dist_in_partition(
         pec_ctx,
-        fwd_ctx.ol_features,
-        fwd_ctx.splits,
+        [fwd_ctx.ol_features],
+        [fwd_ctx.splits],
         is_overlapped=True,
     )
     nol_awaitables = sharded_pec.compute_and_output_dist_in_partition(
         pec_ctx,
-        fwd_ctx.nol_features,
-        fwd_ctx.splits,
+        [fwd_ctx.nol_features],
+        [fwd_ctx.splits],
         is_overlapped=False,
     )
 
