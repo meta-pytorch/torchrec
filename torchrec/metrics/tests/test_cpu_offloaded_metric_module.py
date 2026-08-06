@@ -1973,6 +1973,26 @@ class MergeUpdateJobsTest(unittest.TestCase):
 
 
 class ForeachCloneTest(unittest.TestCase):
+    def _assert_mixed_dtype_and_layout_clone_preserves_values(
+        self, device: torch.device
+    ) -> None:
+        base = torch.arange(24, dtype=torch.float32, device=device).reshape(4, 6)
+        src = {
+            "dense": torch.arange(8, dtype=torch.float32, device=device).reshape(4, 2),
+            "non_dense": base[:, :2],
+            "double": torch.tensor(1.25, dtype=torch.float64, device=device),
+            "labels": torch.tensor([1, 2, 3, 4], dtype=torch.int64, device=device),
+            "metadata": "preserved",
+        }
+
+        snapshot = _foreach_clone_dict(src)
+
+        self.assertEqual(snapshot["metadata"], "preserved")
+        self.assertEqual(list(snapshot), list(src))
+        for key in ("dense", "non_dense", "double", "labels"):
+            self.assertIsNot(snapshot[key], src[key])
+            torch.testing.assert_close(snapshot[key], src[key])
+
     def test_int_tensors_clone_without_autograd_error(self) -> None:
         d = {
             "labels": torch.tensor([0, 1, 0], dtype=torch.int64),
@@ -2020,6 +2040,13 @@ class ForeachCloneTest(unittest.TestCase):
         torch.testing.assert_close(
             snapshot["labels"], torch.tensor([0, 1, 0], dtype=torch.int64)
         )
+
+    def test_mixed_dtype_and_layout_clone_preserves_values(self) -> None:
+        self._assert_mixed_dtype_and_layout_clone_preserves_values(torch.device("cpu"))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_mixed_dtype_and_layout_cuda_clone_preserves_values(self) -> None:
+        self._assert_mixed_dtype_and_layout_clone_preserves_values(torch.device("cuda"))
 
 
 class LoadStateDictDevicePinTest(unittest.TestCase):
