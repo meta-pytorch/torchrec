@@ -35,9 +35,9 @@ class PECAll2AllSeqInfo:
         backward_splits: Per-rank OL/NOL split sizes for gradient AllToAll.
         pg: Process group for gradient AllToAll.
         ol_grad_apply: OL gradient applier (set by PECAll2AllSeqWait.backward).
-            dist() already called.
+            Pipeline calls dist() via grad_dist.
         nol_grad_apply: NOL gradient applier (set by PECAll2AllSeqWait.backward).
-            Pipeline calls dist() later.
+            Pipeline calls dist() via grad_dist.
     """
 
     forward_permute: torch.Tensor
@@ -59,7 +59,7 @@ def _grad_dist(
     pg: dist.ProcessGroup,
     async_op: bool = True,
 ) -> Tuple[dist.Work, torch.Tensor]:
-    """Starts gradient reverse AllToAll. Shared by OL (autograd) and NOL (pipeline).
+    """Starts gradient reverse AllToAll. Shared by the OL and NOL partitions.
 
     Args:
         grad: gradient tensor to send.
@@ -103,8 +103,9 @@ class PECAll2AllSeqWait(torch.autograd.Function):
     Backward: splits gradient into OL/NOL via backward_ol_permute and
     backward_nol_permute (pre-composed with recat, so index_select
     produces rank-major order directly). Creates PECGradientApply
-    instances for each partition — OL dist() starts immediately,
-    NOL dist() is deferred to the pipeline.
+    instances for each partition. Both OL and NOL dist() are started by
+    the pipeline via grad_dist (not here), so gradient communication is
+    fully pipeline-controlled.
 
     Gradient propagation stops here (returns None) — PECGradientApply
     handles the AllToAll wait and TBE backward application.
@@ -143,16 +144,15 @@ class PECAll2AllSeqWait(torch.autograd.Function):
         ol_grad = grad_output.index_select(0, autograd_ctx.backward_ol_permute)
         nol_grad = grad_output.index_select(0, autograd_ctx.backward_nol_permute)
 
-        # OL: create applier and start AllToAll immediately
+        # Create OL/NOL appliers; the pipeline starts both AllToAlls via
+        # grad_dist (OL before optimizer, NOL deferred to the next batch).
         autograd_ctx.ol_grad_apply = PECGradientApply(
             ol_grad,
             input_splits=splits.input_splits[0],
             output_splits=splits.output_splits[0],
             pg=autograd_ctx.pg,
         )
-        autograd_ctx.ol_grad_apply.dist()
 
-        # NOL: create applier, pipeline calls dist() later
         autograd_ctx.nol_grad_apply = PECGradientApply(
             nol_grad,
             input_splits=splits.input_splits[1],
@@ -175,8 +175,8 @@ class PECGradientApply:
         3. apply(): waits AllToAll, re-lookups features in TBE, calls
            embs.backward(grad) to push gradient through TBE kernel
 
-    For OL: dist() is called in PECAll2AllSeqWait.backward (immediate).
-    For NOL: dist() is called by the pipeline (deferred).
+    dist() is called by the pipeline via grad_dist for both partitions —
+    OL before the optimizer step, NOL deferred to the next batch.
     """
 
     def __init__(

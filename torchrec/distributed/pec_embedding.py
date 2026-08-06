@@ -687,9 +687,9 @@ class ShardedPECEmbeddingCollection(
     ) -> List[Awaitable[None]]:
         """Kicks off gradient AllToAll for one partition and returns awaitables.
 
-        For OL: dist() was already started in PECAll2AllSeqWait.backward
-        (idempotent, so calling again is a no-op).
-        For NOL: dist() starts here.
+        This is the only place either partition's AllToAll is started —
+        backward creates the appliers but does not fire them. dist() is
+        idempotent, so a repeated call is a no-op.
 
         When the returned awaitables are waited, they complete the AllToAll
         and apply the gradient to TBE via re-lookup.
