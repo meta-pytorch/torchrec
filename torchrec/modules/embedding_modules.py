@@ -8,6 +8,7 @@
 # pyre-strict
 
 import abc
+import logging
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -20,6 +21,37 @@ from torchrec.modules.embedding_configs import (
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor, KeyedTensor
 from torchrec.sparse.tensor_dict import maybe_td_to_kjt
+
+
+logger: logging.Logger = logging.getLogger(__name__)
+
+
+# TEMPORARY: out-of-band marker, not part of the module API. Opts an unsharded
+# EBC/EC out of the DATA_PARALLEL DDP gradient reducer, for forward-only modules
+# whose grad buckets would be dead.
+MODULE_ATTR_DATA_PARALLEL_SKIP_GRAD_SYNC: str = "_torchrec_data_parallel_skip_grad_sync"
+
+
+def mark_data_parallel_skip_grad_sync(module: nn.Module) -> None:
+    """Opt ``module`` out of the DATA_PARALLEL DDP gradient reducer once sharded.
+
+    Set by the caller on the *unsharded* module before ``DistributedModelParallel``
+    and read once at shard time; setting it after sharding has no effect.
+    """
+    # ShardedEmbeddingModule sets `_lookups`, so its presence means sharding already
+    # happened and this marker will never be read.
+    if hasattr(module, "_lookups"):
+        logger.warning(
+            "mark_data_parallel_skip_grad_sync() called on an already-sharded %s; "
+            "the marker is read at shard time, so this has no effect.",
+            type(module).__name__,
+        )
+    setattr(module, MODULE_ATTR_DATA_PARALLEL_SKIP_GRAD_SYNC, True)
+
+
+def should_skip_data_parallel_grad_sync(module: nn.Module) -> bool:
+    """Whether ``module`` was marked via ``mark_data_parallel_skip_grad_sync``."""
+    return bool(getattr(module, MODULE_ATTR_DATA_PARALLEL_SKIP_GRAD_SYNC, False))
 
 
 @torch.fx.wrap

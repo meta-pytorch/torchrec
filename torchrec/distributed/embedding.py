@@ -34,7 +34,10 @@ from torch.distributed._tensor import DTensor
 from torch.nn.modules.module import _IncompatibleKeys
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.embedding_lookup import PartiallyMaterializedTensor
+from torchrec.distributed.embedding_lookup import (
+    GroupedEmbeddingsLookup,
+    PartiallyMaterializedTensor,
+)
 from torchrec.distributed.embedding_sharding import (
     EmbeddingSharding,
     EmbeddingShardingInfo,
@@ -103,6 +106,7 @@ from torchrec.modules.embedding_configs import (
 from torchrec.modules.embedding_modules import (
     EmbeddingCollection,
     EmbeddingCollectionInterface,
+    should_skip_data_parallel_grad_sync,
 )
 from torchrec.modules.utils import construct_jagged_tensors, SequenceVBEContext
 from torchrec.optim.fused import EmptyFusedOptimizer, FusedOptimizerModule
@@ -463,6 +467,10 @@ class ShardedEmbeddingCollection(
         self._enable_feature_score_weight_accumulation: bool = False
 
         self._module_fqn = module_fqn
+        # Opt-out of the DATA_PARALLEL DDP gradient reducer (see embedding_modules).
+        self._skip_data_parallel_grad_sync: bool = should_skip_data_parallel_grad_sync(
+            module
+        )
         self._embedding_configs: List[EmbeddingConfig] = module.embedding_configs()
         self._table_names: List[str] = [
             config.name for config in self._embedding_configs
@@ -603,6 +611,9 @@ class ShardedEmbeddingCollection(
         """
         Initialize data parallel for the embedding collection.
         """
+        # Opt-out: skip the DDP wrap; the raw DP lookup forwards on its own.
+        if self._skip_data_parallel_grad_sync:
+            return
         for index, (sharding, lookup) in enumerate(
             zip(
                 self._sharding_type_to_sharding.values(),
@@ -939,8 +950,9 @@ class ShardedEmbeddingCollection(
             self._sharding_type_to_sharding.keys(), self._lookups
         ):
             if sharding_type == ShardingType.DATA_PARALLEL.value:
-                # unwrap DDP
-                lookup = lookup.module
+                # mark_data_parallel_skip_grad_sync modules are never wrapped.
+                while isinstance(lookup, DistributedDataParallel):
+                    lookup = lookup.module
             else:
                 # save local_shards for transforming MP params to shardedTensor
                 for key, v in lookup.state_dict().items():
@@ -972,12 +984,9 @@ class ShardedEmbeddingCollection(
                         self._model_parallel_name_to_local_shards[table_name].extend(
                             v.local_shards()
                         )
-            for (
-                table_name,
-                tbe_slice,
-                #  `named_parameters_by_table`.
-                # pyrefly: ignore[missing-attribute]
-            ) in lookup.named_parameters_by_table():
+            for table_name, tbe_slice in cast(
+                GroupedEmbeddingsLookup, lookup
+            ).named_parameters_by_table():
                 # for virtual table, currently we don't expose id tensor and bucket tensor
                 # because they are not updated in real time, and they are created on the fly
                 # whenever state_dict is called
