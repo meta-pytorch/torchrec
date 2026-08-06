@@ -69,6 +69,21 @@ def get_free_port() -> int:
             )
 
 
+def init_process_group_single_rank(backend: str = "gloo", **kwargs: Any) -> None:
+    """init_process_group for a single-rank group, without picking a port first.
+
+    TCPStore binds an ephemeral port itself and never releases it. Going through
+    MASTER_PORT instead leaves a window where another process can take the port,
+    which surfaces as EADDRINUSE.
+
+    Single-rank only. Spawned ranks cannot share this store object.
+    """
+    store = dist.TCPStore("localhost", 0, 1, is_master=True, wait_for_workers=False)
+    dist.init_process_group(
+        backend=backend, store=store, rank=0, world_size=1, **kwargs
+    )
+
+
 def is_asan() -> bool:
     """Determines if the Python interpreter is running with ASAN"""
     return hasattr(ctypes.CDLL(""), "__asan_init")
