@@ -17,8 +17,8 @@ handshake and injects a live ``SingleProcessContext`` (``ctx``) plus this rank's
 ``rank`` and ``world_size``. The runner must therefore use ``ctx.device`` /
 ``ctx.pg`` directly rather than creating its own context.
 
-Multiple primitive benchmarks live in this file. ``benchmark_runner`` selects which one
-to run via the ``primitive`` flag (see ``_BENCHMARKS``); each benchmark measures latency
+Multiple primitive benchmarks live in this file. ``benchmark_runner`` selects which one(s)
+to run via the ``name`` flag (see ``_BENCHMARKS``); each benchmark measures latency
 only -- outputs are not checked for correctness. The first is ``kjt_a2a``, the All-to-All
 performance of ``KJTAllToAll`` (the ``KeyedJaggedTensor`` A2A collective from
 ``dist_data.py``). The second is ``kt_a2a``, the All-to-All performance of
@@ -40,7 +40,7 @@ MAST or locally.
 
 import logging
 import socket
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import torch
 from torchrec.distributed.benchmark.base import benchmark_func, BenchmarkResult
@@ -55,6 +55,22 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """Interpret a forwarded CLI value as a bool.
+
+    The launcher coerces unrecognized args to int/float and otherwise leaves them as
+    strings, so ``--memory_snapshot=false`` arrives as the string ``"false"`` -- truthy
+    to ``bool()``. Flag-style ``--memory_snapshot`` (no value) arrives as ``"true"``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def _build_splits(num_features: int, world_size: int) -> List[int]:
@@ -152,8 +168,10 @@ def _benchmark_kjt_a2a(
             values_dtype (torch.dtype): dtype of the ``values`` tensor. Default int64.
             num_benchmarks (int): number of measured iterations. Default 20.
             num_profiles (int): number of profiled iterations (requires profile_dir).
-                Default 0.
+                Default 5.
             profile_dir (str): directory for chrome traces; empty disables profiling.
+            memory_snapshot (bool): capture a CUDA memory snapshot alongside the
+                profile (requires profile_dir). Default True.
             name (str): human-readable benchmark name. Default "kjt_a2a".
 
     Returns:
@@ -164,8 +182,9 @@ def _benchmark_kjt_a2a(
     batch_size: int = int(kwargs.get("batch_size", 32 * 1024))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.int64)
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
-    num_profiles: int = int(kwargs.get("num_profiles", 0))
+    num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
+    memory_snapshot: bool = _as_bool(kwargs.get("memory_snapshot"), True)
     name: str = str(kwargs.get("name", "kjt_a2a"))
 
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
@@ -214,6 +233,7 @@ def _benchmark_kjt_a2a(
         num_profiles=num_profiles,
         num_benchmarks=num_benchmarks,
         profile_dir=profile_dir,
+        memory_snapshot=memory_snapshot,
         device_type=ctx.device.type,
         pg=pg,
     )
@@ -302,8 +322,10 @@ def _benchmark_kt_a2a(
                 dtype. Default float32.
             num_benchmarks (int): number of measured iterations. Default 20.
             num_profiles (int): number of profiled iterations (requires profile_dir).
-                Default 0.
+                Default 5.
             profile_dir (str): directory for chrome traces; empty disables profiling.
+            memory_snapshot (bool): capture a CUDA memory snapshot alongside the
+                profile (requires profile_dir). Default True.
             name (str): human-readable benchmark name. Default "kt_a2a".
 
     Returns:
@@ -313,8 +335,9 @@ def _benchmark_kt_a2a(
     dim: int = int(kwargs.get("dim", 3072))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.float32)
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
-    num_profiles: int = int(kwargs.get("num_profiles", 0))
+    num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
+    memory_snapshot: bool = _as_bool(kwargs.get("memory_snapshot"), True)
     name: str = str(kwargs.get("name", "kt_a2a"))
 
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
@@ -361,6 +384,7 @@ def _benchmark_kt_a2a(
         num_profiles=num_profiles,
         num_benchmarks=num_benchmarks,
         profile_dir=profile_dir,
+        memory_snapshot=memory_snapshot,
         device_type=ctx.device.type,
         pg=pg,
     )
@@ -446,8 +470,10 @@ def _benchmark_reduce_scatter(
                 dtype. Default float32.
             num_benchmarks (int): number of measured iterations. Default 20.
             num_profiles (int): number of profiled iterations (requires profile_dir).
-                Default 0.
+                Default 5.
             profile_dir (str): directory for chrome traces; empty disables profiling.
+            memory_snapshot (bool): capture a CUDA memory snapshot alongside the
+                profile (requires profile_dir). Default True.
             name (str): human-readable benchmark name. Default "reduce_scatter".
 
     Returns:
@@ -457,8 +483,9 @@ def _benchmark_reduce_scatter(
     dim: int = int(kwargs.get("dim", 3072))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.float32)
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
-    num_profiles: int = int(kwargs.get("num_profiles", 0))
+    num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
+    memory_snapshot: bool = _as_bool(kwargs.get("memory_snapshot"), True)
     name: str = str(kwargs.get("name", "reduce_scatter"))
 
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
@@ -498,6 +525,7 @@ def _benchmark_reduce_scatter(
         num_profiles=num_profiles,
         num_benchmarks=num_benchmarks,
         profile_dir=profile_dir,
+        memory_snapshot=memory_snapshot,
         device_type=ctx.device.type,
         pg=pg,
     )
@@ -586,8 +614,10 @@ def _benchmark_all_gather(
                 dtype. Default float32.
             num_benchmarks (int): number of measured iterations. Default 20.
             num_profiles (int): number of profiled iterations (requires profile_dir).
-                Default 0.
+                Default 5.
             profile_dir (str): directory for chrome traces; empty disables profiling.
+            memory_snapshot (bool): capture a CUDA memory snapshot alongside the
+                profile (requires profile_dir). Default True.
             name (str): human-readable benchmark name. Default "all_gather".
 
     Returns:
@@ -597,8 +627,9 @@ def _benchmark_all_gather(
     dim: int = int(kwargs.get("dim", 3072))
     values_dtype: torch.dtype = kwargs.get("values_dtype", torch.float32)
     num_benchmarks: int = int(kwargs.get("num_benchmarks", 20))
-    num_profiles: int = int(kwargs.get("num_profiles", 0))
+    num_profiles: int = int(kwargs.get("num_profiles", 5))
     profile_dir: str = str(kwargs.get("profile_dir", ""))
+    memory_snapshot: bool = _as_bool(kwargs.get("memory_snapshot"), True)
     name: str = str(kwargs.get("name", "all_gather"))
 
     pg: Optional[torch.distributed.ProcessGroup] = ctx.pg
@@ -639,6 +670,7 @@ def _benchmark_all_gather(
         num_profiles=num_profiles,
         num_benchmarks=num_benchmarks,
         profile_dir=profile_dir,
+        memory_snapshot=memory_snapshot,
         device_type=ctx.device.type,
         pg=pg,
     )
@@ -659,14 +691,58 @@ _BENCHMARKS: Dict[str, Callable[..., BenchmarkResult]] = {
     "all_gather": _benchmark_all_gather,
 }
 
+# Special ``--name`` token that expands to every benchmark in ``_BENCHMARKS`` (in
+# registry order). Intentionally NOT a key in ``_BENCHMARKS`` -- expanded by
+# :func:`parse_benchmark_names`.
+RUN_ALL: str = "all"
+
 
 def available_primitives() -> List[str]:
-    """Return the sorted names of registered primitive benchmarks.
+    """Return the sorted names of the registered primitive benchmarks.
 
-    These are the valid values for the ``name`` flag consumed by
-    :func:`benchmark_runner` (and surfaced as the launcher's ``--name`` choices).
+    These (plus the special ``"all"`` token, :data:`RUN_ALL`) are the values accepted
+    by the ``--name`` flag; see :func:`parse_benchmark_names`.
     """
     return sorted(_BENCHMARKS)
+
+
+def parse_benchmark_names(value: Union[str, Sequence[str]]) -> List[str]:
+    """Resolve the ``--name`` selector into a concrete list of benchmark names.
+
+    Accepts a comma-separated string (e.g. ``"kjt_a2a,kt_a2a"``) or a sequence of
+    names. The special token ``"all"`` (:data:`RUN_ALL`) expands to every registered
+    benchmark in registry order. Duplicates are dropped while preserving first-seen
+    order. Suitable as an argparse ``type`` -- an unknown name raises ``ValueError``.
+
+    Returns:
+        The ordered, de-duplicated list of benchmark names to run (never empty).
+    """
+    if isinstance(value, str):
+        tokens = [t.strip() for t in value.split(",") if t.strip()]
+    else:
+        tokens = [str(t).strip() for t in value if str(t).strip()]
+
+    resolved: List[str] = []
+    for tok in tokens:
+        if tok == RUN_ALL:
+            resolved.extend(_BENCHMARKS)
+        elif tok in _BENCHMARKS:
+            resolved.append(tok)
+        else:
+            raise ValueError(
+                f"unknown primitive benchmark {tok!r}; available: "
+                f"{sorted(_BENCHMARKS)} (or {RUN_ALL!r} to run all of them)"
+            )
+    if not resolved:
+        raise ValueError("--name must select at least one benchmark")
+
+    seen: set[str] = set()
+    deduped: List[str] = []
+    for benchmark_name in resolved:
+        if benchmark_name not in seen:
+            seen.add(benchmark_name)
+            deduped.append(benchmark_name)
+    return deduped
 
 
 def benchmark_runner(
@@ -674,36 +750,42 @@ def benchmark_runner(
     rank: int,
     world_size: int,
     **kwargs: Any,
-) -> BenchmarkResult:
+) -> List[BenchmarkResult]:
     """Per-rank primitive benchmark entry point.
 
-    Selects which primitive benchmark to run via the ``name`` flag and dispatches to
-    it. The injected ``ctx`` (device + process group), ``rank`` and ``world_size`` plus
-    the remaining ``kwargs`` are forwarded to the selected benchmark.
+    Runs one or more primitive benchmarks, selected via the ``name`` flag, and returns
+    this rank's per-benchmark results. ``name`` is resolved by
+    :func:`parse_benchmark_names`, so it may be a single name, a comma-separated list
+    (e.g. ``"kjt_a2a,kt_a2a"``), or ``"all"`` to run every registered benchmark. The
+    selected benchmarks run sequentially in this one process, reusing the injected
+    ``ctx`` (device + process group), ``rank`` and ``world_size``; the remaining
+    ``kwargs`` are forwarded to each. Each benchmark is dispatched under its own name,
+    so their result files (keyed by name + rank) do not collide.
 
     Args:
         ctx: live single-process context (device + process group) injected by the
             process runner; use ``ctx.device`` / ``ctx.pg`` directly.
         rank: this process' global rank.
         world_size: total number of ranks.
-        **kwargs: ``name`` (str) selects the benchmark (default ``"kjt_a2a"``); the
-            rest are forwarded to the selected benchmark (see its docstring).
+        **kwargs: ``name`` (str | list) selects the benchmark(s) (default
+            ``"kjt_a2a"``); the rest are forwarded to each selected benchmark (see its
+            docstring). Keys a benchmark does not use are ignored by its own lookups.
 
     Returns:
-        This rank's ``BenchmarkResult``.
+        This rank's per-benchmark ``BenchmarkResult`` list, in resolved ``name`` order.
     """
-    name: str = str(kwargs.pop("name", "kjt_a2a"))
-    if name not in _BENCHMARKS:
-        raise ValueError(
-            f"unknown primitive benchmark {name!r}; "
-            f"available: {sorted(_BENCHMARKS)}"
-        )
+    names = parse_benchmark_names(kwargs.pop("name", "kjt_a2a"))
 
     logger.info(
-        "rank=%d local_rank=%d host=%s selected primitive benchmark %r",
+        "rank=%d local_rank=%d host=%s running primitive benchmarks: %s",
         rank,
         ctx.local_rank,
         socket.gethostname(),
-        name,
+        names,
     )
-    return _BENCHMARKS[name](ctx, rank, world_size, **kwargs)
+    return [
+        _BENCHMARKS[benchmark_name](
+            ctx, rank, world_size, name=benchmark_name, **kwargs
+        )
+        for benchmark_name in names
+    ]
