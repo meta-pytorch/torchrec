@@ -127,6 +127,22 @@ class Perf:
             )
         )
 
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "Perf":
+        # Every field is a float, so the generic deepcopy walk (__reduce_ex__ ->
+        # _reconstruct -> _deepcopy_dict) is pure overhead.  The partitioner copies
+        # devices once per candidate host per proposal, which makes this one of the
+        # hottest paths in planning.
+        result = Perf(
+            fwd_compute=self.fwd_compute,
+            fwd_comms=self.fwd_comms,
+            bwd_compute=self.bwd_compute,
+            bwd_comms=self.bwd_comms,
+            input_dist_comms=self.input_dist_comms,
+            prefetch_compute=self.prefetch_compute,
+        )
+        memo[id(self)] = result
+        return result
+
 
 # ---- TOPOLOGY ---- #
 
@@ -161,6 +177,12 @@ class Storage:
     def fits_in(self, other: "Storage") -> bool:
         return self.hbm <= other.hbm and self.ddr <= other.ddr and self.ssd <= other.ssd
 
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "Storage":
+        # See Perf.__deepcopy__: all-scalar fields, copied on the partitioner hot path.
+        result = Storage(hbm=self.hbm, ddr=self.ddr, ssd=self.ssd)
+        memo[id(self)] = result
+        return result
+
 
 @dataclass
 class DeviceHardware:
@@ -184,6 +206,17 @@ class DeviceHardware:
             and self.storage == other.storage
             and self.perf == other.perf
         )
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "DeviceHardware":
+        # Children go through deepcopy() rather than being rebuilt directly so that
+        # objects aliased across a single copy stay aliased in the result.
+        result = DeviceHardware(
+            rank=self.rank,
+            storage=deepcopy(self.storage, memo),
+            perf=deepcopy(self.perf, memo),
+        )
+        memo[id(self)] = result
+        return result
 
 
 class CustomTopologyData:
