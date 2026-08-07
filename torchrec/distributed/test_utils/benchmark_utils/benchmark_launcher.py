@@ -82,7 +82,7 @@ def _coerce(value: str) -> Any:
     return value
 
 
-def _parse_forwarded_kwargs(unknown: List[str]) -> Dict[str, Any]:
+def parse_forwarded_kwargs(unknown: List[str]) -> Dict[str, Any]:
     """Parse leftover ``--key=value`` / ``--key value`` args into benchmark kwargs.
 
     Unrecognized args are benchmark-specific options (e.g. ``--batch_size``,
@@ -115,8 +115,13 @@ def _parse_forwarded_kwargs(unknown: List[str]) -> Dict[str, Any]:
     return kwargs
 
 
-def _parse_args() -> Tuple[argparse.Namespace, Dict[str, Any]]:
-    parser = argparse.ArgumentParser(description=__doc__)
+def add_benchmark_args(parser: argparse.ArgumentParser) -> None:
+    """Register the shared benchmark-selection and dispatch arguments on ``parser``.
+
+    Exposed so internal wrappers can build their CLI on top of the SAME arguments
+    this launcher uses -- then dispatch through :func:`run_benchmark` -- instead of
+    re-declaring the arguments and drifting whenever the benchmark framework changes.
+    """
     parser.add_argument(
         "--mode",
         choices=["local", "remote"],
@@ -151,21 +156,44 @@ def _parse_args() -> Tuple[argparse.Namespace, Dict[str, Any]]:
         default=None,
         help="process-group backend (defaults to nccl on GPU, gloo otherwise).",
     )
+    # Named after the ``profile_dir`` kwarg the benchmark runners consume, so the flag,
+    # the forwarded kwarg and the runner argument are all one name. Accept both
+    # spellings so callers using the hyphen (--profile-dir) and the underscore
+    # (--profile_dir) convention both resolve to the same destination.
+    parser.add_argument(
+        "--profile-dir",
+        "--profile_dir",
+        dest="profile_dir",
+        type=str,
+        default="",
+        help="directory to write structured results (torchrec_benchmark_*.json) "
+        "and any traces/snapshots into. Empty (default) disables result dumping. "
+        "Each rank writes its own per-rank file here.",
+    )
+
+
+def _parse_args() -> Tuple[argparse.Namespace, Dict[str, Any]]:
+    parser = argparse.ArgumentParser(description=__doc__)
+    add_benchmark_args(parser)
     # Use parse_known_args so argparse does not fail (exit code 2) on the leftover
     # args: these are either torchrun/fb.dist.ddp injections (e.g. --local-rank,
     # dropped) or benchmark-specific options (e.g. --batch_size, --dim) that we
     # forward to the selected benchmark_runner.
     args, unknown = parser.parse_known_args()
-    extra_kwargs = _parse_forwarded_kwargs(unknown)
+    extra_kwargs = parse_forwarded_kwargs(unknown)
     if extra_kwargs:
         logger.info("forwarding benchmark kwargs: %s", extra_kwargs)
     return args, extra_kwargs
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    args, extra_kwargs = _parse_args()
+def run_benchmark(args: argparse.Namespace, extra_kwargs: Dict[str, Any]) -> None:
+    """Dispatch to the selected benchmark runner for the requested mode.
 
+    ``args`` must carry the attributes added by :func:`add_benchmark_args`
+    (``mode`` / ``benchmark`` / ``name`` / ``world_size`` / ``backend`` /
+    ``profile_dir``); ``extra_kwargs`` are benchmark-specific options forwarded
+    verbatim to the runner.
+    """
     runner: Callable[..., Any] = _BENCHMARKS[args.benchmark]
 
     if args.mode == "local":
@@ -191,6 +219,7 @@ def main() -> None:
             world_size=args.world_size,
             backend=args.backend,
             name=args.name,
+            profile_dir=args.profile_dir,
             **extra_kwargs,
         )
     else:  # remote
@@ -201,8 +230,15 @@ def main() -> None:
             runner,
             backend=args.backend,
             name=args.name,
+            profile_dir=args.profile_dir,
             **extra_kwargs,
         )
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO)
+    args, extra_kwargs = _parse_args()
+    run_benchmark(args, extra_kwargs)
 
 
 if __name__ == "__main__":
