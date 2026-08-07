@@ -10,7 +10,7 @@
 import itertools
 import logging
 from contextlib import nullcontext
-from typing import Dict, Generic, Iterable, List, Optional, Tuple, TypeVar, Union
+from typing import cast, Dict, Generic, Iterable, List, Optional, Tuple, TypeVar, Union
 
 import torch
 from torch import distributed as dist
@@ -33,9 +33,14 @@ except ImportError:
 
 from torchrec.distributed.embedding_sharding import KJTSplitsAllToAllMeta
 from torchrec.distributed.model_parallel import ShardedModule
+from torchrec.distributed.pec_embedding import (
+    PECEmbeddingCollectionContext,
+    ShardedPECEmbeddingCollection,
+)
 from torchrec.distributed.train_pipeline.pipeline_context import (
     CPUEmbeddingTrainPipelineContext,
     EmbeddingTrainPipelineContext,
+    PECTrainPipelineContext,
     PrefetchTrainPipelineContext,
     TrainPipelineContext,
 )
@@ -283,6 +288,48 @@ class InSyncEmbeddingPipelinedForward(EmbeddingPipelinedForward):
     ) -> None:
         # doing nothing
         pass
+
+
+class PECPipelinedForward(InSyncEmbeddingPipelinedForward):
+    """Shared in-sync pipelined forward for PEC and non-PEC modules.
+
+    Both retrieve embeddings computed one stage ahead — nothing is computed
+    inline. PEC modules (ShardedPECEmbeddingCollection) merge their precomputed
+    OL/NOL partitions via merge_partitioned_embeddings; non-PEC modules use the
+    inherited InSyncEmbeddingPipelinedForward path (embedding_a2a_requests, with
+    a no-op detach so loss.backward flows through to the fused-TBE update).
+
+    Used by TrainPipelinePEC.
+    """
+
+    # pyre-ignore[2,3]
+    def __call__(self, *input, **kwargs):
+        if not isinstance(self._module, ShardedPECEmbeddingCollection):
+            return super().__call__(*input, **kwargs)
+
+        ctx = self._context
+        assert isinstance(ctx, PECTrainPipelineContext)
+        name = self._name
+
+        pec_ctx = cast(PECEmbeddingCollectionContext, ctx.module_contexts[name])
+
+        # OL/NOL awaitables and forward ctxs are forward-only -> pop.
+        ol_awaitables = ctx.pec_ol_awaitables.pop(name)
+        nol_awaitables = ctx.pec_nol_awaitables.pop(name)
+        forward_ctxs = ctx.pec_forward_ctxs.pop(name)
+
+        # Backward ctxs are read non-destructively: they are also needed after
+        # forward (OL grad + deferred NOL). Always present by forward time
+        # (overlap_dist of the next batch / finalize runs earlier this progress).
+        backward_ctxs = ctx.pec_backward_ctxs[name]
+
+        return self._module.merge_partitioned_embeddings(
+            pec_ctx,
+            ol_awaitables,
+            nol_awaitables,
+            forward_ctxs,
+            backward_ctxs,
+        )
 
 
 class PrefetchPipelinedForward(BaseForward[PrefetchTrainPipelineContext]):

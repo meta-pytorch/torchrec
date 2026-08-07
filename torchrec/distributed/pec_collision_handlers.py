@@ -7,7 +7,14 @@
 
 # pyre-strict
 
-from __future__ import annotations
+# NOTE: Do NOT add `from __future__ import annotations` here.
+# This module is loaded inside a torch.package at model-publish time. Combining
+# PEP 563 (string annotations) with @dataclass on Python 3.12 hits
+# https://github.com/python/cpython/issues/115258 — `dataclass._is_type` does
+# `sys.modules.get(cls.__module__).__dict__`, which returns None for
+# torch.package-synthetic module names ("<torch_package_N>.…") and crashes with
+# AttributeError. Keeping annotations as runtime objects avoids that path.
+# For the same reason, do not use string forward references in dataclass fields.
 
 import abc
 from dataclasses import dataclass
@@ -15,13 +22,37 @@ from typing import Dict, List, Tuple
 
 import torch
 import torch.distributed as dist
-from torchrec.distributed.dist_data import TensorAllToAllValuesAwaitable
 from torchrec.distributed.embedding_types import GroupedEmbeddingConfig
 from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.types import Awaitable
 from torchrec.modules.embedding_configs import EmbeddingConfig
 from torchrec.modules.pec_embedding_modules import OverlappingCheckerType
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+
+# TensorAllToAllValuesAwaitable was added to dist_data.py after older torch
+# package exports were frozen. During repackaging the old PackageImporter
+# resolves dist_data from that frozen snapshot, which may predate the symbol.
+# PEC training code is never executed from those packages, so the fallback
+# only needs to keep module import working.
+try:
+    from torchrec.distributed.dist_data import TensorAllToAllValuesAwaitable
+except ImportError:
+    torch._C._log_api_usage_once(
+        "torchrec.distributed.pec_collision_handlers.import_failure."
+        "TensorAllToAllValuesAwaitable"
+    )
+
+    _TENSOR_A2A_UNAVAILABLE = (
+        "TensorAllToAllValuesAwaitable is unavailable in this torch package "
+        "export; PEC training is not supported here."
+    )
+
+    class TensorAllToAllValuesAwaitable:  # type: ignore[misc]
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            raise RuntimeError(_TENSOR_A2A_UNAVAILABLE)
+
+        def wait(self) -> torch.Tensor:
+            raise RuntimeError(_TENSOR_A2A_UNAVAILABLE)
 
 
 @dataclass
@@ -151,6 +182,30 @@ class OverlapSplits:
     output_splits: Tuple[List[int], List[int]]
 
 
+class MaskDistAwaitable(Awaitable[Tuple[torch.Tensor, torch.Tensor]]):
+    """Wraps TensorAllToAllValuesAwaitable for mask AllToAll.
+
+    On wait, returns (post_dist_mask, pre_dist_mask):
+    - post_dist_mask: bool mask after AllToAll
+    - pre_dist_mask: bool mask before AllToAll (needed by compute_splits)
+    """
+
+    def __init__(
+        self,
+        awaitable: TensorAllToAllValuesAwaitable,
+        pre_dist_mask: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self._awaitable = awaitable
+        self._pre_dist_mask = pre_dist_mask
+
+    def _wait_impl(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._awaitable.wait().bool(), self._pre_dist_mask
+
+
+# Declared before OverlapHandler because its method annotations reference
+# MaskDistAwaitable, and without PEP 563 those are evaluated at class-body
+# execution time (see the torch.package NOTE at the top of this file).
 class OverlapHandler(abc.ABC):
     """Interface for PEC overlap detection and distribution handlers.
 
@@ -232,27 +287,6 @@ class OverlapHandler(abc.ABC):
         in rank-major order for AllToAll alignment.
         """
         ...
-
-
-class MaskDistAwaitable(Awaitable[Tuple[torch.Tensor, torch.Tensor]]):
-    """Wraps TensorAllToAllValuesAwaitable for mask AllToAll.
-
-    On wait, returns (post_dist_mask, pre_dist_mask):
-    - post_dist_mask: bool mask after AllToAll
-    - pre_dist_mask: bool mask before AllToAll (needed by compute_splits)
-    """
-
-    def __init__(
-        self,
-        awaitable: TensorAllToAllValuesAwaitable,
-        pre_dist_mask: torch.Tensor,
-    ) -> None:
-        super().__init__()
-        self._awaitable = awaitable
-        self._pre_dist_mask = pre_dist_mask
-
-    def _wait_impl(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._awaitable.wait().bool(), self._pre_dist_mask
 
 
 class RWOverlapHandler(OverlapHandler):
