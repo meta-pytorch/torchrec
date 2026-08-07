@@ -115,6 +115,19 @@ def parse_forwarded_kwargs(unknown: List[str]) -> Dict[str, Any]:
     return kwargs
 
 
+def _name_arg(value: str) -> List[str]:
+    """argparse ``type`` for ``--name``: resolve the selector, report errors inline.
+
+    Delegates to :func:`benchmark_primitive.parse_benchmark_names` (which expands
+    ``"all"`` and validates), converting its ``ValueError`` into an
+    ``ArgumentTypeError`` so argparse surfaces the specific message.
+    """
+    try:
+        return benchmark_primitive.parse_benchmark_names(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from e
+
+
 def add_benchmark_args(parser: argparse.ArgumentParser) -> None:
     """Register the shared benchmark-selection and dispatch arguments on ``parser``.
 
@@ -138,10 +151,15 @@ def add_benchmark_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--name",
-        choices=benchmark_primitive.available_primitives(),
+        type=_name_arg,
         default="kjt_a2a",
-        help="which primitive op to benchmark when --benchmark=primitive (ignored by "
-        "other benchmarks). Default: kjt_a2a.",
+        help=(
+            "comma-separated primitive op(s) to benchmark when --benchmark=primitive "
+            "(e.g. 'kjt_a2a' or 'kjt_a2a,kt_a2a'), or 'all' to run every primitive in "
+            "sequence. Available: "
+            + ", ".join(benchmark_primitive.available_primitives())
+            + ". Ignored by other benchmarks. Default: kjt_a2a."
+        ),
     )
     parser.add_argument(
         "--world-size",
