@@ -8,7 +8,14 @@
 
 # pyre-strict
 
-from __future__ import annotations
+# NOTE: Do NOT add `from __future__ import annotations` here.
+# This module is loaded inside a torch.package at model-publish time. Combining
+# PEP 563 (string annotations) with @dataclass on Python 3.12 hits
+# https://github.com/python/cpython/issues/115258 — `dataclass._is_type` does
+# `sys.modules.get(cls.__module__).__dict__`, which returns None for
+# torch.package-synthetic module names ("<torch_package_N>.…") and crashes with
+# AttributeError. Keeping annotations as runtime objects avoids that path.
+# For the same reason, do not use string forward references in dataclass fields.
 
 from copy import copy
 from dataclasses import dataclass

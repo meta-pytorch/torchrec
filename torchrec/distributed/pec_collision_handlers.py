@@ -7,7 +7,14 @@
 
 # pyre-strict
 
-from __future__ import annotations
+# NOTE: Do NOT add `from __future__ import annotations` here.
+# This module is loaded inside a torch.package at model-publish time. Combining
+# PEP 563 (string annotations) with @dataclass on Python 3.12 hits
+# https://github.com/python/cpython/issues/115258 — `dataclass._is_type` does
+# `sys.modules.get(cls.__module__).__dict__`, which returns None for
+# torch.package-synthetic module names ("<torch_package_N>.…") and crashes with
+# AttributeError. Keeping annotations as runtime objects avoids that path.
+# For the same reason, do not use string forward references in dataclass fields.
 
 import abc
 from dataclasses import dataclass
@@ -151,6 +158,30 @@ class OverlapSplits:
     output_splits: Tuple[List[int], List[int]]
 
 
+class MaskDistAwaitable(Awaitable[Tuple[torch.Tensor, torch.Tensor]]):
+    """Wraps TensorAllToAllValuesAwaitable for mask AllToAll.
+
+    On wait, returns (post_dist_mask, pre_dist_mask):
+    - post_dist_mask: bool mask after AllToAll
+    - pre_dist_mask: bool mask before AllToAll (needed by compute_splits)
+    """
+
+    def __init__(
+        self,
+        awaitable: TensorAllToAllValuesAwaitable,
+        pre_dist_mask: torch.Tensor,
+    ) -> None:
+        super().__init__()
+        self._awaitable = awaitable
+        self._pre_dist_mask = pre_dist_mask
+
+    def _wait_impl(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self._awaitable.wait().bool(), self._pre_dist_mask
+
+
+# Declared before OverlapHandler because its method annotations reference
+# MaskDistAwaitable, and without PEP 563 those are evaluated at class-body
+# execution time (see the torch.package NOTE at the top of this file).
 class OverlapHandler(abc.ABC):
     """Interface for PEC overlap detection and distribution handlers.
 
@@ -232,27 +263,6 @@ class OverlapHandler(abc.ABC):
         in rank-major order for AllToAll alignment.
         """
         ...
-
-
-class MaskDistAwaitable(Awaitable[Tuple[torch.Tensor, torch.Tensor]]):
-    """Wraps TensorAllToAllValuesAwaitable for mask AllToAll.
-
-    On wait, returns (post_dist_mask, pre_dist_mask):
-    - post_dist_mask: bool mask after AllToAll
-    - pre_dist_mask: bool mask before AllToAll (needed by compute_splits)
-    """
-
-    def __init__(
-        self,
-        awaitable: TensorAllToAllValuesAwaitable,
-        pre_dist_mask: torch.Tensor,
-    ) -> None:
-        super().__init__()
-        self._awaitable = awaitable
-        self._pre_dist_mask = pre_dist_mask
-
-    def _wait_impl(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._awaitable.wait().bool(), self._pre_dist_mask
 
 
 class RWOverlapHandler(OverlapHandler):

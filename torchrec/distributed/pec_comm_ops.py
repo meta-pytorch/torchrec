@@ -7,7 +7,15 @@
 
 # pyre-strict
 
-from __future__ import annotations
+# NOTE: Do NOT add `from __future__ import annotations` here.
+# This module is loaded inside a torch.package at model-publish time. Combining
+# PEP 563 (string annotations) with @dataclass on Python 3.12 hits
+# https://github.com/python/cpython/issues/115258 — `dataclass._is_type` does
+# `sys.modules.get(cls.__module__).__dict__`, which returns None for
+# torch.package-synthetic module names ("<torch_package_N>.…") and crashes with
+# AttributeError. Keeping annotations as runtime objects avoids that path.
+# This is also why PECGradientApply is declared before PECAll2AllSeqInfo: the
+# fields referencing it must be real annotations, not string forward refs.
 
 from dataclasses import dataclass
 from typing import Callable, List, Tuple
@@ -17,38 +25,6 @@ import torch.distributed as dist
 from torchrec.distributed.pec_collision_handlers import OverlapSplits
 from torchrec.distributed.types import Awaitable
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
-
-
-@dataclass
-class PECAll2AllSeqInfo:
-    """Metadata for PEC backward gradient re-split and distribution.
-
-    Created by merge_partitioned_embeddings during forward. When
-    backward_ctxs is passed to merge, backward fields are populated
-    automatically. Read by PECAll2AllSeqWait during backward to re-split
-    gradients and create PECGradientApply instances.
-
-    Attributes:
-        forward_permute: Permute tensor for merging [ol, nol] → original order.
-        backward_ol_permute: Original-order indices for OL gradient split.
-        backward_nol_permute: Original-order indices for NOL gradient split.
-        backward_splits: Per-rank OL/NOL split sizes for gradient AllToAll.
-        pg: Process group for gradient AllToAll.
-        ol_grad_apply: OL gradient applier (set by PECAll2AllSeqWait.backward).
-            Pipeline calls dist() via grad_dist.
-        nol_grad_apply: NOL gradient applier (set by PECAll2AllSeqWait.backward).
-            Pipeline calls dist() via grad_dist.
-    """
-
-    forward_permute: torch.Tensor
-    backward_ol_permute: torch.Tensor | None = None
-    backward_nol_permute: torch.Tensor | None = None
-    backward_splits: OverlapSplits | None = None
-    pg: dist.ProcessGroup | None = None
-
-    # Gradient appliers — set by PECAll2AllSeqWait.backward
-    ol_grad_apply: "PECGradientApply | None" = None
-    nol_grad_apply: "PECGradientApply | None" = None
 
 
 def _grad_dist(
@@ -92,6 +68,104 @@ def _grad_dist(
     assert req is not None
 
     return req, output_buffer
+
+
+class PECGradientApply:
+    """Handles gradient AllToAll and application to TBE for one partition.
+
+    Created by PECAll2AllSeqWait.backward — one for OL, one for NOL.
+    Short-lived: exists for one batch, consumed by apply().
+
+    Lifecycle:
+        1. __init__: holds the re-split gradient
+        2. dist(): starts async gradient AllToAll
+        3. apply(): waits AllToAll, re-lookups features in TBE, calls
+           embs.backward(grad) to push gradient through TBE kernel
+
+    dist() is called by the pipeline via grad_dist for both partitions —
+    OL before the optimizer step, NOL deferred to the next batch.
+    """
+
+    def __init__(
+        self,
+        grad: torch.Tensor,
+        input_splits: List[int],
+        output_splits: List[int],
+        pg: dist.ProcessGroup,
+    ) -> None:
+        self._grad = grad
+        self._input_splits = input_splits
+        self._output_splits = output_splits
+        self._pg = pg
+        self._work: dist.Work | None = None
+        self._grad_buffer: torch.Tensor | None = None
+
+    def dist(self) -> None:
+        """Starts async gradient reverse AllToAll. Idempotent — no-op if already started."""
+        if self._work is not None:
+            return
+
+        embedding_dim = self._grad.shape[1]
+        self._work, self._grad_buffer = _grad_dist(
+            self._grad,
+            input_splits=self._input_splits,
+            output_splits=self._output_splits,
+            embedding_dim=embedding_dim,
+            pg=self._pg,
+        )
+        self._grad = None  # type: ignore[assignment]
+
+    def apply(
+        self,
+        features: KeyedJaggedTensor,
+        lookup_fn: Callable[[KeyedJaggedTensor], torch.Tensor],
+        embedding_dim: int,
+    ) -> None:
+        """Waits AllToAll and applies gradient to TBE via re-lookup + backward."""
+        assert self._work is not None
+        assert self._grad_buffer is not None
+
+        self._work.wait()
+
+        if features.values().numel() > 0:
+            with torch.enable_grad():
+                embs = lookup_fn(features).view(-1, embedding_dim)
+                if embs.numel() > 0:
+                    embs.backward(self._grad_buffer.view(-1, embedding_dim))
+        self._work = None
+        self._grad_buffer = None
+
+
+@dataclass
+class PECAll2AllSeqInfo:
+    """Metadata for PEC backward gradient re-split and distribution.
+
+    Created by merge_partitioned_embeddings during forward. When
+    backward_ctxs is passed to merge, backward fields are populated
+    automatically. Read by PECAll2AllSeqWait during backward to re-split
+    gradients and create PECGradientApply instances.
+
+    Attributes:
+        forward_permute: Permute tensor for merging [ol, nol] → original order.
+        backward_ol_permute: Original-order indices for OL gradient split.
+        backward_nol_permute: Original-order indices for NOL gradient split.
+        backward_splits: Per-rank OL/NOL split sizes for gradient AllToAll.
+        pg: Process group for gradient AllToAll.
+        ol_grad_apply: OL gradient applier (set by PECAll2AllSeqWait.backward).
+            Pipeline calls dist() via grad_dist.
+        nol_grad_apply: NOL gradient applier (set by PECAll2AllSeqWait.backward).
+            Pipeline calls dist() via grad_dist.
+    """
+
+    forward_permute: torch.Tensor
+    backward_ol_permute: torch.Tensor | None = None
+    backward_nol_permute: torch.Tensor | None = None
+    backward_splits: OverlapSplits | None = None
+    pg: dist.ProcessGroup | None = None
+
+    # Gradient appliers — set by PECAll2AllSeqWait.backward
+    ol_grad_apply: PECGradientApply | None = None
+    nol_grad_apply: PECGradientApply | None = None
 
 
 class PECAll2AllSeqWait(torch.autograd.Function):
@@ -161,72 +235,6 @@ class PECAll2AllSeqWait(torch.autograd.Function):
         )
 
         return (None, None, None, None)
-
-
-class PECGradientApply:
-    """Handles gradient AllToAll and application to TBE for one partition.
-
-    Created by PECAll2AllSeqWait.backward — one for OL, one for NOL.
-    Short-lived: exists for one batch, consumed by apply().
-
-    Lifecycle:
-        1. __init__: holds the re-split gradient
-        2. dist(): starts async gradient AllToAll
-        3. apply(): waits AllToAll, re-lookups features in TBE, calls
-           embs.backward(grad) to push gradient through TBE kernel
-
-    dist() is called by the pipeline via grad_dist for both partitions —
-    OL before the optimizer step, NOL deferred to the next batch.
-    """
-
-    def __init__(
-        self,
-        grad: torch.Tensor,
-        input_splits: List[int],
-        output_splits: List[int],
-        pg: dist.ProcessGroup,
-    ) -> None:
-        self._grad = grad
-        self._input_splits = input_splits
-        self._output_splits = output_splits
-        self._pg = pg
-        self._work: dist.Work | None = None
-        self._grad_buffer: torch.Tensor | None = None
-
-    def dist(self) -> None:
-        """Starts async gradient reverse AllToAll. Idempotent — no-op if already started."""
-        if self._work is not None:
-            return
-
-        embedding_dim = self._grad.shape[1]
-        self._work, self._grad_buffer = _grad_dist(
-            self._grad,
-            input_splits=self._input_splits,
-            output_splits=self._output_splits,
-            embedding_dim=embedding_dim,
-            pg=self._pg,
-        )
-        self._grad = None  # type: ignore[assignment]
-
-    def apply(
-        self,
-        features: KeyedJaggedTensor,
-        lookup_fn: Callable[[KeyedJaggedTensor], torch.Tensor],
-        embedding_dim: int,
-    ) -> None:
-        """Waits AllToAll and applies gradient to TBE via re-lookup + backward."""
-        assert self._work is not None
-        assert self._grad_buffer is not None
-
-        self._work.wait()
-
-        if features.values().numel() > 0:
-            with torch.enable_grad():
-                embs = lookup_fn(features).view(-1, embedding_dim)
-                if embs.numel() > 0:
-                    embs.backward(self._grad_buffer.view(-1, embedding_dim))
-        self._work = None
-        self._grad_buffer = None
 
 
 class PECGradUpdateAwaitable(Awaitable[None]):
