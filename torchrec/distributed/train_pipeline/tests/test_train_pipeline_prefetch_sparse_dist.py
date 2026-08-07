@@ -23,6 +23,7 @@ from unittest.mock import MagicMock
 
 import torch
 from hypothesis import given, settings, strategies as st
+from parameterized import parameterized
 from torch import nn
 from torch.optim import Optimizer
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -249,22 +250,47 @@ class PrefetchTrainPipelineTest(PrefetchTrainPipelineTestBase):
         self.assertIsNotNone(output1)
         self.assertIsNotNone(output2)
 
+    def _drain_pipeline(self, num_batches: int, execute_all_batches: bool) -> int:
+        """Runs a pipeline to exhaustion and returns how many outputs it produced."""
+        pipeline, dataloader, _, _ = self._create_pipeline(
+            num_batches=num_batches, execute_all_batches=execute_all_batches
+        )
+        outputs = []
+        try:
+            for _ in range(num_batches + 5):
+                outputs.append(pipeline.progress(dataloader))
+        except StopIteration:
+            pass
+        return len(outputs)
+
+    @parameterized.expand(
+        [
+            # (name, num_batches, execute_all_batches, expected_outputs)
+            # Keep num_batches well above the pipeline's 2-batch lookahead so the
+            # two rows expect clearly distinct counts.
+            ("drains_in_flight", 7, True, 7),
+            ("drops_in_flight", 7, False, 5),
+        ]
+    )
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",
     )
-    def test_execute_all_batches_false(self) -> None:
-        """Test pipeline behavior with execute_all_batches=False."""
-        pipeline, dataloader, _, _ = self._create_pipeline(execute_all_batches=False)
+    def test_execute_all_batches_controls_drain(
+        self,
+        _name: str,
+        num_batches: int,
+        execute_all_batches: bool,
+        expected_outputs: int,
+    ) -> None:
+        """`execute_all_batches` decides whether in-flight batches are drained.
 
-        outputs = []
-        try:
-            for _ in range(10):
-                outputs.append(pipeline.progress(dataloader))
-        except StopIteration:
-            pass
-
-        self.assertGreater(len(outputs), 0)
+        On, the pipeline drains and yields one output per batch. Off, it stops as
+        soon as the dataloader is exhausted, dropping the 2 batches in flight.
+        """
+        self.assertEqual(
+            self._drain_pipeline(num_batches, execute_all_batches), expected_outputs
+        )
 
     @unittest.skipIf(
         not torch.cuda.is_available(),
