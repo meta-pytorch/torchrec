@@ -548,28 +548,30 @@ class ShardedPECEmbeddingCollection(
     def compute_and_output_dist_in_partition(
         self,
         ctx: PECEmbeddingCollectionContext,
-        features: KeyedJaggedTensor,
-        overlap_splits: OverlapSplits,
+        features: List[KeyedJaggedTensor],
+        overlap_splits: List[OverlapSplits],
         is_overlapped: bool,
     ) -> List[Awaitable[torch.Tensor]]:
         """Performs embedding lookup and output AllToAll for one partition.
 
         Looks up embeddings for the partition's features using the inner
-        EC's lookup module, then AllToAll's the results back using
+        EC's lookup modules, then AllToAll's the results back using
         partition-specific splits from ForwardPartitionContext.splits.
+        Iterates over sharding groups, zipping the per-group features and
+        splits with the inner EC's per-group lookups.
 
         Called twice per batch: once for OL (is_overlapped=True) and
-        once for NOL (is_overlapped=False). The partition may be empty
+        once for NOL (is_overlapped=False). A partition may be empty
         (e.g., first batch OL when no overlap exists) — empty lookups
         and zero-length AllToAll segments are handled correctly.
 
         Args:
             ctx: PEC context (sharding_contexts must be set from
                 input_dist).
-            features: partition features (OL or NOL KJT from
-                ForwardPartitionContext).
-            overlap_splits: per-rank OL/NOL split sizes from
-                ForwardPartitionContext.splits.
+            features: per-sharding-group partition features (OL or NOL KJT
+                from ForwardPartitionContext), one per sharding group.
+            overlap_splits: per-sharding-group per-rank OL/NOL split sizes
+                from ForwardPartitionContext.splits, one per sharding group.
             is_overlapped: True for overlapped partition (index 0 in
                 splits), False for nonoverlapped (index 1).
 
@@ -581,7 +583,9 @@ class ShardedPECEmbeddingCollection(
         awaitables: List[Awaitable[torch.Tensor]] = []
 
         with torch.no_grad():
-            for lookup, odist, sharding_ctx, sharding_type in zip(
+            for feature, splits, lookup, odist, sharding_ctx, sharding_type in zip(
+                features,
+                overlap_splits,
                 ec._lookups,
                 ec._output_dists,
                 ctx.sharding_contexts,
@@ -590,15 +594,13 @@ class ShardedPECEmbeddingCollection(
                 partition_ctx = copy(sharding_ctx)
 
                 # Replace full-batch lengths with this partition's lengths.
-                partition_ctx.lengths_after_input_dist = features.lengths().view(
-                    -1, features.stride()
+                partition_ctx.lengths_after_input_dist = feature.lengths().view(
+                    -1, feature.stride()
                 )
 
                 # Map overlap splits to embedding AllToAll context
-                partition_ctx.input_splits = overlap_splits.input_splits[partition_idx]
-                partition_ctx.output_splits = overlap_splits.output_splits[
-                    partition_idx
-                ]
+                partition_ctx.input_splits = splits.input_splits[partition_idx]
+                partition_ctx.output_splits = splits.output_splits[partition_idx]
 
                 # In RW sharding, upt maps positions in the full (pre-split)
                 # batch — wrong size for a partition. Reordering is handled by
@@ -606,7 +608,7 @@ class ShardedPECEmbeddingCollection(
                 partition_ctx.unbucketize_permute_tensor = None
 
                 embedding_dim = ec._embedding_dim_for_sharding_type(sharding_type)
-                embs = lookup(features)
+                embs = lookup(feature)
                 awaitables.append(odist(embs.view(-1, embedding_dim), partition_ctx))
 
         return awaitables
