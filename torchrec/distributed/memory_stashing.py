@@ -9,17 +9,7 @@
 
 import logging
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Protocol,
-    runtime_checkable,
-    Tuple,
-    Union,
-)
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
@@ -40,11 +30,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 # keep the copy engine yielding often enough for the main stream's small copies
 # to interleave, at a negligible bandwidth cost (see chunked copy design).
 _STASH_CHUNK_SIZE_BYTES: int = 32 * 1024**2
-
-
-@runtime_checkable
-class _ScratchBufferOptimizer(Protocol):
-    def scratch_buffers(self) -> tuple[torch.Tensor, ...]: ...
 
 
 def _tensor_size_text(tensor: Union[List[torch.Tensor], torch.Tensor]) -> str:
@@ -167,7 +152,6 @@ class MemoryStashingManager:
     _device_to_host_stream: Optional[torch.cuda.Stream] = None
     _embedding_weight_restore_callbacks: List[Callable[..., None]] = []
     _optimizer_state_restore_callbacks: List[Callable[..., None]] = []
-    _optimizer_scratch_buffer_restore_callbacks: List[Callable[..., None]] = []
     _emo_cache_restore_callbacks: List[Callable[..., None]] = []
     _stash_executor: Optional[ThreadPoolExecutor] = None
     _delay_stash: bool = False
@@ -302,7 +286,6 @@ class MemoryStashingManager:
         cls._device_to_host_stream = None
         cls._embedding_weight_restore_callbacks.clear()
         cls._optimizer_state_restore_callbacks.clear()
-        cls._optimizer_scratch_buffer_restore_callbacks.clear()
         cls._emo_cache_restore_callbacks.clear()
         cls._delay_stash = False
         cls._stash_chunk_size_bytes = _STASH_CHUNK_SIZE_BYTES
@@ -376,23 +359,14 @@ class MemoryStashingManager:
         cls,
         _grad: Optional[torch.Tensor] = None,
         sync_event: Optional[torch.cuda.Event] = None,
-        restore_scratch_buffer: bool = True,
     ) -> None:
-        """Restore copied optimizer state and, optionally, disposable scratch buffer."""
+        """Pop and call all optimizer state restore callbacks in reverse order."""
         cls._log_ems_once(
             "ems_restore_optimizer_state_callbacks",
-            {
-                "num_callbacks": str(len(cls._optimizer_state_restore_callbacks)),
-                "num_scratch_buffer_callbacks": str(
-                    len(cls._optimizer_scratch_buffer_restore_callbacks)
-                ),
-            },
+            {"num_callbacks": str(len(cls._optimizer_state_restore_callbacks))},
         )
         while cls._optimizer_state_restore_callbacks:
             cls._optimizer_state_restore_callbacks.pop()(None, sync_event)
-        if restore_scratch_buffer:
-            while cls._optimizer_scratch_buffer_restore_callbacks:
-                cls._optimizer_scratch_buffer_restore_callbacks.pop()(None, sync_event)
 
     @classmethod
     def restore_optimizer_state_next(
@@ -416,18 +390,6 @@ class MemoryStashingManager:
             )
             cls._optimizer_state_restore_callbacks.pop(0)(None, sync_event)
 
-    @staticmethod
-    def _consume_restore_callback(
-        callback: Callable[..., None],
-        callbacks: List[Callable[..., None]],
-        sync_event: Optional[torch.cuda.Event],
-    ) -> None:
-        try:
-            callbacks.remove(callback)
-        except ValueError:
-            return
-        callback(None, sync_event)
-
     @classmethod
     def _stash_tensors(
         cls,
@@ -437,7 +399,7 @@ class MemoryStashingManager:
         delay: bool = False,
     ) -> Tuple[
         Callable[[Optional[torch.Tensor]], None],
-        Callable[..., None],
+        Callable[[Optional[torch.Tensor]], None],
         Callable[[Optional[torch.Tensor]], None],
     ]:
         """
@@ -1003,77 +965,6 @@ class MemoryStashingManager:
         return await_restore, restore
 
     @classmethod
-    def _release_optimizer_scratch_buffers(
-        cls,
-        optimizer: torch.optim.Optimizer,
-        sync_event: Optional[torch.cuda.Event],
-    ) -> Optional[Callable[..., None]]:
-        if not isinstance(optimizer, _ScratchBufferOptimizer):
-            return None
-        if sync_event is not None:
-            sync_event.synchronize()
-
-        scratch_buffer_storages: list[tuple[torch.UntypedStorage, int]] = []
-        seen_storage_ids: set[int] = set()
-        for scratch_buffer in optimizer.scratch_buffers():
-            storage = scratch_buffer.untyped_storage()
-            storage_id = storage._cdata
-            storage_size = storage.size()
-            if storage_size == 0 or storage_id in seen_storage_ids:
-                continue
-            seen_storage_ids.add(storage_id)
-            scratch_buffer_storages.append((storage, storage_size))
-
-        released_scratch_buffer_bytes = sum(
-            storage_size for _, storage_size in scratch_buffer_storages
-        )
-        if released_scratch_buffer_bytes == 0:
-            return None
-        for storage, _ in scratch_buffer_storages:
-            storage.resize_(0)
-
-        cls._log_ems_once(
-            "ems_stash_optimizer_scratch_buffer_released",
-            {
-                "optimizer": type(optimizer).__name__,
-                "size_bytes": str(released_scratch_buffer_bytes),
-            },
-        )
-
-        def restore_scratch_buffer(
-            _grad: Optional[torch.Tensor] = None,
-            _sync_event: Optional[torch.cuda.Event] = None,
-        ) -> None:
-            restored_scratch_buffer_bytes = 0
-            for storage, storage_size in scratch_buffer_storages:
-                if storage.size() == 0:
-                    storage.resize_(storage_size)
-                    restored_scratch_buffer_bytes += storage_size
-            cls._log_ems_once(
-                "ems_restore_optimizer_scratch_buffer",
-                {
-                    "optimizer": type(optimizer).__name__,
-                    "size_bytes": str(restored_scratch_buffer_bytes),
-                },
-            )
-
-        cls._optimizer_scratch_buffer_restore_callbacks.append(restore_scratch_buffer)
-        return restore_scratch_buffer
-
-    @staticmethod
-    def _collect_optimizer_state_tensors(
-        optimizer: torch.optim.Optimizer,
-    ) -> List[torch.Tensor]:
-        """Collect all stashable CUDA tensors from ``optimizer.state``."""
-        tensors: List[torch.Tensor] = []
-        for _param, state_dict in optimizer.state.items():
-            if not isinstance(state_dict, dict):
-                continue
-            for _state_key, state_value in state_dict.items():
-                tensors.extend(_collect_cuda_tensors_from_value(state_value))
-        return tensors
-
-    @classmethod
     def stash_optimizer_state(
         cls,
         optimizer: torch.optim.Optimizer,
@@ -1134,7 +1025,12 @@ class MemoryStashingManager:
             - Supports nested structures like Shampoo's ShampooKroneckerFactors
         """
         # Collect all CUDA tensors from optimizer state
-        tensors: List[torch.Tensor] = cls._collect_optimizer_state_tensors(optimizer)
+        tensors: List[torch.Tensor] = []
+        for _param, state_dict in optimizer.state.items():
+            if not isinstance(state_dict, dict):
+                continue
+            for _state_key, state_value in state_dict.items():
+                tensors.extend(_collect_cuda_tensors_from_value(state_value))
 
         cls._log_ems_once(
             "ems_stash_optimizer_state_collected",
@@ -1144,33 +1040,11 @@ class MemoryStashingManager:
             },
         )
 
-        scratch_buffer_restore: Callable[..., None] | None = None
-
         if num_slices <= 1:
-            await_restore, tensor_restore, _execute_stash = cls._stash_tensors(
+            await_restore, restore, _execute_stash = cls._stash_tensors(
                 tensors, label="optimizer state", sync_event=sync_event
             )
-            cls._optimizer_state_restore_callbacks.append(tensor_restore)
-            scratch_buffer_restore = cls._release_optimizer_scratch_buffers(
-                optimizer, sync_event
-            )
-
-            def restore(
-                _grad: Optional[torch.Tensor] = None,
-                restore_sync_event: Optional[torch.cuda.Event] = None,
-            ) -> None:
-                cls._consume_restore_callback(
-                    tensor_restore,
-                    cls._optimizer_state_restore_callbacks,
-                    restore_sync_event,
-                )
-                if scratch_buffer_restore is not None:
-                    cls._consume_restore_callback(
-                        scratch_buffer_restore,
-                        cls._optimizer_scratch_buffer_restore_callbacks,
-                        restore_sync_event,
-                    )
-
+            cls._optimizer_state_restore_callbacks.append(restore)
             return await_restore, restore
 
         # Gradual (throttled) restore: partition the dense optimizer state into
@@ -1198,10 +1072,6 @@ class MemoryStashingManager:
             # maps slice k to the k-th hook to fire.
             cls._optimizer_state_restore_callbacks.append(restore_k)
 
-        scratch_buffer_restore = cls._release_optimizer_scratch_buffers(
-            optimizer, sync_event
-        )
-
         def aggregate_await(_grad: Optional[torch.Tensor] = None) -> None:
             """Gate the current stream on EVERY slice's restore completion."""
             for slice_await in slice_awaits:
@@ -1209,21 +1079,11 @@ class MemoryStashingManager:
 
         def restore_all(
             _grad: Optional[torch.Tensor] = None,
-            restore_sync_event: Optional[torch.cuda.Event] = None,
+            sync_event: Optional[torch.cuda.Event] = None,
         ) -> None:
-            """Restore all slices, followed by disposable optimizer scratch buffer."""
+            """Restore all slices (used when no per-hook driver is present)."""
             for slice_restore in slice_restores:
-                cls._consume_restore_callback(
-                    slice_restore,
-                    cls._optimizer_state_restore_callbacks,
-                    restore_sync_event,
-                )
-            if scratch_buffer_restore is not None:
-                cls._consume_restore_callback(
-                    scratch_buffer_restore,
-                    cls._optimizer_scratch_buffer_restore_callbacks,
-                    restore_sync_event,
-                )
+                slice_restore(None, sync_event)
 
         return aggregate_await, restore_all
 
