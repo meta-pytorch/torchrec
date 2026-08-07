@@ -24,12 +24,60 @@ from torch.autograd.profiler import record_function
 from torchrec.distributed.types import Awaitable, NoWait, QuantizedCommCodecs
 from torchrec.distributed.utils import none_throws
 from torchrec.pt2.checks import is_torchdynamo_compiling
+from torchrec.sparse.triton_permute_2d import (
+    should_use_triton,
+    triton_permute_2d_sparse_data,
+)
 
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu")
 except OSError:
     pass
+
+
+# Opt-in, off by default. Routes the three all2all-sequence permutes below
+# through torchrec's Triton kernel instead of fbgemm's.
+#
+# Deliberately here and not on KeyedJaggedTensor: that class is pulled into
+# TorchScript by dper_lib/silvertorch/modules/serving/value_model.py's
+# @torch.jit.interface, which makes a mutable class attribute, a classmethod
+# reading one, and a module-level helper naming the class all fail to compile.
+# comm_ops is not on the scripting path, so none of that applies. These are also
+# the sites that matter: the shape they launch is ~75% of the model's total
+# permute_2D_sparse_data GPU time.
+#
+# Read once at import, matching TORCHREC_ENABLE_FP8_ROWWISE_PADDING above, so no
+# caller has to know this kernel exists.
+_USE_TRITON_PERMUTE_2D: bool = bool(
+    int(os.environ.get("TORCHREC_TRITON_PERMUTE_2D", 0))
+)
+
+
+def _permute_2D_sparse_data(
+    permute: Tensor,
+    lengths: Tensor,
+    values: Tensor,
+    weights: Optional[Tensor],
+    permuted_lengths_sum: Optional[int],
+) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+    """fbgemm's permute_2D_sparse_data, or the Triton one when enabled.
+
+    `should_use_triton` decides from shapes alone, so the dispatch itself costs
+    no device synchronisation, and it defers to fbgemm on the segment counts
+    where fbgemm is faster.
+    """
+    if (
+        _USE_TRITON_PERMUTE_2D
+        and values.is_cuda
+        and should_use_triton(permute, lengths, permuted_lengths_sum)
+    ):
+        return triton_permute_2d_sparse_data(
+            permute, lengths, values, weights, permuted_lengths_sum
+        )
+    return torch.ops.fbgemm.permute_2D_sparse_data(
+        permute, lengths, values, weights, permuted_lengths_sum
+    )
 
 
 # OSS
@@ -940,7 +988,7 @@ def all2all_sequence_sync(
                     permuted_lengths_after_sparse_data_all2all,
                     sharded_input_embeddings,
                     _,
-                ) = torch.ops.fbgemm.permute_2D_sparse_data(
+                ) = _permute_2D_sparse_data(
                     forward_recat_tensor,
                     lengths_after_sparse_data_all2all.view(local_T * world_size, -1),
                     sharded_input_embeddings.view(-1),
@@ -1943,7 +1991,7 @@ class All2All_Seq_Req(Function):
                         permuted_lengths_after_sparse_data_all2all,
                         sharded_input_embeddings,
                         _,
-                    ) = torch.ops.fbgemm.permute_2D_sparse_data(
+                    ) = _permute_2D_sparse_data(
                         forward_recat_tensor,
                         lengths_after_sparse_data_all2all.view(
                             local_T * world_size, -1
@@ -2038,7 +2086,7 @@ class All2All_Seq_Req(Function):
         if permuted_lengths_after_sparse_data_all2all is not None:
             with record_function("## All2All_Seq_bwd_permute ##"):
                 if not variable_batch_size:
-                    _, sharded_grad_input, _ = torch.ops.fbgemm.permute_2D_sparse_data(
+                    _, sharded_grad_input, _ = _permute_2D_sparse_data(
                         backward_recat_tensor,
                         permuted_lengths_after_sparse_data_all2all,
                         sharded_grad_input,
