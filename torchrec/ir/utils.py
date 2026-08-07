@@ -128,9 +128,8 @@ def ir_tbe_lookup_fake(
     tensors: List[Optional[torch.Tensor]], batch_size: int, dims: List[int]
 ) -> List[torch.Tensor]:
     device = get_device(tensors)
-    dynamic_batch_size = torch.library.get_ctx().new_dynamic_size()
-    logger.info(f"ir_tbe_lookup_fake -> ({dynamic_batch_size}, {dims}) {device}")
-    return [torch.empty(dynamic_batch_size, dim, device=device) for dim in dims]
+    logger.info(f"ir_tbe_lookup_fake -> ({batch_size}, {dims}) {device}")
+    return [torch.empty(batch_size, dim, device=device) for dim in dims]
 
 
 def encapsulate_ir_modules(

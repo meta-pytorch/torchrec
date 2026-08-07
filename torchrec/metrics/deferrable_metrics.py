@@ -109,8 +109,12 @@ def transfer_tensors_to_cpu(
                     # caching allocator would otherwise recycle its memory as
                     # soon as the producer stream frees it, racing our in-flight
                     # async copy on dtoh_stream. record_stream holds the block
-                    # until dtoh_stream passes this point.
-                    v.record_stream(dtoh_stream)
+                    # until dtoh_stream passes this point. record_stream is only
+                    # implemented for CUDA/MTIA, so skip it for tensors already
+                    # on CPU (a mixed CPU/CUDA input dict would otherwise raise
+                    # NotImplementedError: aten::record_stream on the CPU backend).
+                    if v.is_cuda:
+                        v.record_stream(dtoh_stream)
                     cpu_tensors[k] = dst
                 else:
                     cpu_tensors[k] = v

@@ -15,11 +15,13 @@ from typing import Any, Callable, Dict, List, Optional, Union
 
 import torch
 from torch import nn
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.fx.passes.utils.fuser_utils import fuse_by_partitions
 from torchrec.ir.serializer import JsonSerializer
 from torchrec.ir.utils import (
     decapsulate_ir_modules,
     encapsulate_ir_modules,
+    ir_tbe_lookup_impl,
     mark_dynamic_kjt,
     qualname,
 )
@@ -95,6 +97,36 @@ class CompoundModuleSerializer(JsonSerializer):
         #  got `Union[Module, Tensor]`.
         # pyrefly: ignore[bad-argument-type]
         return CompoundModule(ebc, comp, mlist)
+
+
+class _IRTBELookupModule(nn.Module):
+    def forward(self, offsets: torch.Tensor) -> torch.Tensor:
+        # offset_count = num_features * batch_size + 1; num_features is 2 here.
+        batch_size = (offsets.size(0) - 1) // 2
+        return ir_tbe_lookup_impl([offsets, None, None], batch_size, [3])[0]
+
+
+class IRTBELookupTest(unittest.TestCase):
+    def test_fake_preserves_input_backed_batch_expression(self) -> None:
+        offsets = torch.arange(7, dtype=torch.int32)
+        exported_program = torch.export.export(
+            _IRTBELookupModule(),
+            (offsets,),
+            dynamic_shapes=({0: torch.export.Dim("offset_count", min=5, max=13)},),
+            strict=False,
+        )
+
+        offsets_node = next(
+            node for node in exported_program.graph.nodes if node.op == "placeholder"
+        )
+        lookup_node = next(
+            node
+            for node in exported_program.graph.nodes
+            if node.op == "call_function" and "ir_tbe_lookup" in str(node.target)
+        )
+        offset_count = offsets_node.meta["val"].shape[0]
+        output_batch = lookup_node.meta["val"][0].shape[0]
+        self.assertTrue(statically_known_true(output_batch == (offset_count - 1) // 2))
 
 
 class TestJsonSerializer(unittest.TestCase):
