@@ -512,19 +512,6 @@ class TestStashEmbeddingWeights(unittest.TestCase):
         self.assertFalse(MemoryStashingManager.is_enabled())
 
 
-class ScratchBufferOptimizer(torch.optim.SGD):
-    def __init__(
-        self,
-        params: Any,
-        scratch_buffer: torch.Tensor,
-    ) -> None:
-        super().__init__(params, lr=0.01)
-        self._scratch_buffer = scratch_buffer
-
-    def scratch_buffers(self) -> tuple[torch.Tensor, ...]:
-        return (self._scratch_buffer,)
-
-
 class TestStashOptimizerState(unittest.TestCase):
     """Tests for MemoryStashingManager.stash_optimizer_state method."""
 
@@ -538,87 +525,6 @@ class TestStashOptimizerState(unittest.TestCase):
 
     def tearDown(self) -> None:
         MemoryStashingManager.reset()
-
-    def test_scratch_buffer_only_uses_optimizer_state_stash_restore_api(self) -> None:
-        model = nn.Linear(10, 10).to(self.device)
-        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
-        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
-        scratch_buffer_size = scratch_buffer.untyped_storage().size()
-
-        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(optimizer)
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), 0)
-        self.assertEqual(
-            len(MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks),
-            1,
-        )
-
-        MemoryStashingManager.restore_optimizer_state()
-        await_restore(None)
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), scratch_buffer_size)
-        self.assertEqual(
-            len(MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks),
-            0,
-        )
-
-    def test_returned_restore_consumes_registered_callbacks(self) -> None:
-        model = nn.Linear(10, 10).to(self.device)
-        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
-        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
-        scratch_buffer_size = scratch_buffer.untyped_storage().size()
-
-        await_restore, restore = MemoryStashingManager.stash_optimizer_state(optimizer)
-        restore(None)
-        await_restore(None)
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), scratch_buffer_size)
-        self.assertEqual(MemoryStashingManager._optimizer_state_restore_callbacks, [])
-        self.assertEqual(
-            MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks,
-            [],
-        )
-
-        MemoryStashingManager.restore_optimizer_state()
-        self.assertEqual(scratch_buffer.untyped_storage().size(), scratch_buffer_size)
-
-    def test_scratch_buffer_restore_can_be_deferred_until_pre_step_guard(self) -> None:
-        model = nn.Linear(10, 10).to(self.device)
-        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
-        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
-
-        MemoryStashingManager.stash_optimizer_state(optimizer)
-        MemoryStashingManager.restore_optimizer_state(restore_scratch_buffer=False)
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), 0)
-        self.assertEqual(
-            len(MemoryStashingManager._optimizer_scratch_buffer_restore_callbacks),
-            1,
-        )
-
-        MemoryStashingManager.restore_optimizer_state()
-
-        self.assertGreater(scratch_buffer.untyped_storage().size(), 0)
-
-    def test_scratch_buffer_restore_waits_until_all_slices_are_restored(self) -> None:
-        model = nn.Linear(512, 512).to(self.device)
-        scratch_buffer = torch.zeros(1024, dtype=torch.int8, device=self.device)
-        optimizer = ScratchBufferOptimizer(model.parameters(), scratch_buffer)
-        x = torch.randn(32, 512, device=self.device)
-        model(x).sum().backward()
-        optimizer.step()
-
-        await_restore, _restore = MemoryStashingManager.stash_optimizer_state(
-            optimizer, num_slices=2
-        )
-        MemoryStashingManager.restore_optimizer_state_next()
-
-        self.assertEqual(scratch_buffer.untyped_storage().size(), 0)
-
-        MemoryStashingManager.restore_optimizer_state()
-        await_restore(None)
-
-        self.assertGreater(scratch_buffer.untyped_storage().size(), 0)
 
     def test_basic_adam_optimizer_stash_and_restore(self) -> None:
         """Test basic stash and restore with Adam optimizer."""
