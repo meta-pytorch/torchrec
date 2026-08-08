@@ -185,7 +185,10 @@ def table_batched_embedding_bag_forward_weighted_kernel(
 
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < embedding_dim
-    bag_output = tl.zeros((BLOCK_SIZE,), dtype=tl.float64)
+    accumulator_dtype: tl.constexpr = (
+        tl.float64 if weight_ptr.dtype.element_ty == tl.float32 else tl.float32
+    )
+    bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
 
     # without type hint the unrolling performance will downgrade
     step: tl.constexpr = 4
@@ -270,6 +273,8 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
     T: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
     vbe: tl.constexpr = False,
+    FEATURE_START: tl.constexpr = 0,
+    FEATURE_END: tl.constexpr = -1,
     FUSED_BOUNDS_CHECK: tl.constexpr = False,
 ) -> None:
 
@@ -281,7 +286,8 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
     else:
         output_row_base = output_ptr + b * total_embedding_dim
 
-    for t in range(T):
+    feature_end: tl.constexpr = T if FEATURE_END < 0 else FEATURE_END
+    for t in range(FEATURE_START, feature_end):
         if vbe:
             # VBE: check if this batch index is within feature t's batch size
             B_start = tl.load(B_offsets_ptr + t).to(tl.int64)
@@ -308,7 +314,10 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
             end = tl.load(offsets_ptr + b_t + 1)
 
             mask = col_offsets < embedding_dim
-            bag_output = tl.zeros((BLOCK_SIZE,), dtype=tl.float64)
+            accumulator_dtype: tl.constexpr = (
+                tl.float64 if weight_ptr.dtype.element_ty == tl.float32 else tl.float32
+            )
+            bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
 
             step: tl.constexpr = 4
             ns = (end - start) // step
@@ -397,6 +406,100 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
             bag_output_original = bag_output.to(tl.float32)
             tl.store(output_row_ptrs, bag_output_original, mask=mask)
 
+    if FUSED_BOUNDS_CHECK and warning_count > 0:
+        tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
+
+
+@triton.jit
+def table_batched_embedding_bag_forward_small_table_kernel(
+    output_ptr,
+    indices_ptr,
+    offsets_ptr,
+    weight_ptr,
+    table_offsets_ptr,
+    embedding_dims_ptr,
+    embedding_offsets_ptr,
+    feature_table_map_ptr,
+    bounds_check_warning_ptr,
+    total_embedding_dim: tl.constexpr,
+    B,
+    FEATURE: tl.constexpr,
+    NUM_ROWS: tl.constexpr,
+    ROW_BINS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    FUSED_BOUNDS_CHECK: tl.constexpr = False,
+) -> None:
+    bags_per_program: tl.constexpr = 16
+    histogram_chunk_size: tl.constexpr = 256
+
+    bag_slots = tl.arange(0, bags_per_program)
+    bags = tl.program_id(0).to(tl.int64) * bags_per_program + bag_slots
+    bag_mask = bags < B
+    starts = tl.load(offsets_ptr + FEATURE * B + bags, mask=bag_mask, other=0)
+    ends = tl.load(offsets_ptr + FEATURE * B + bags + 1, mask=bag_mask, other=0)
+    lengths = ends - starts
+
+    positions = tl.arange(0, histogram_chunk_size)
+    input_mask = bag_mask[:, None] & (positions[None, :] < lengths[:, None])
+    row_indices, invalid_indices = _load_checked_index(
+        indices_ptr,
+        starts[:, None] + positions[None, :],
+        NUM_ROWS,
+        input_mask,
+        FUSED_BOUNDS_CHECK,
+    )
+    row_indices = row_indices.to(tl.int32)
+    warning_count = tl.sum(invalid_indices.to(tl.int32))
+    encoded_indices = row_indices + bag_slots[:, None] * ROW_BINS
+    counts = tl.histogram(
+        encoded_indices.reshape((bags_per_program * histogram_chunk_size,)),
+        bags_per_program * ROW_BINS,
+        mask=input_mask.reshape((bags_per_program * histogram_chunk_size,)),
+    ).reshape((bags_per_program, ROW_BINS))
+
+    table_idx = tl.load(feature_table_map_ptr + FEATURE)
+    table_offset = tl.load(table_offsets_ptr + table_idx)
+    embedding_dim = tl.load(embedding_dims_ptr + FEATURE)
+    embedding_offset = tl.load(embedding_offsets_ptr + FEATURE)
+    rows = tl.arange(0, ROW_BINS)
+    columns = tl.arange(0, BLOCK_SIZE)
+    table = tl.load(
+        weight_ptr + table_offset + rows[:, None] * embedding_dim + columns[None, :],
+        mask=(rows[:, None] < NUM_ROWS) & (columns[None, :] < embedding_dim),
+        other=0,
+    )
+    bag_output = tl.dot(counts.to(tl.float16), table)
+
+    tail_lengths = tl.maximum(lengths - histogram_chunk_size, 0)
+    for tail in range(0, tl.max(tail_lengths)):
+        active = bag_mask & (tail < tail_lengths)
+        row_idx, invalid = _load_checked_index(
+            indices_ptr,
+            starts + histogram_chunk_size + tail,
+            NUM_ROWS,
+            active,
+            FUSED_BOUNDS_CHECK,
+        )
+        if FUSED_BOUNDS_CHECK:
+            warning_count += tl.sum(invalid.to(tl.int32))
+        row = tl.load(
+            weight_ptr
+            + table_offset
+            + row_idx[:, None] * embedding_dim
+            + columns[None, :],
+            mask=active[:, None] & (columns[None, :] < embedding_dim),
+            other=0,
+        )
+        bag_output += row.to(tl.float32)
+
+    tl.store(
+        output_ptr
+        + bags[:, None] * total_embedding_dim
+        + embedding_offset
+        + columns[None, :],
+        bag_output,
+        mask=bag_mask[:, None] & (columns[None, :] < embedding_dim),
+    )
     if FUSED_BOUNDS_CHECK and warning_count > 0:
         tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
 
@@ -1153,6 +1256,10 @@ class TritonTBE(torch.autograd.Function):
         precomputed_total_B: int = 0,
         precomputed_max_B: int = 0,
         hoist_transpose_to_forward: bool = True,
+        histogram_feature: int = -1,
+        histogram_num_rows: int = 0,
+        histogram_row_bins: int = 0,
+        histogram_block_size: int = 0,
         bounds_check_warning: Optional[torch.Tensor] = None,
         fused_bounds_check: bool = False,
     ) -> torch.Tensor:
@@ -1368,6 +1475,35 @@ class TritonTBE(torch.autograd.Function):
                 num_warps=num_warps,
             )
         else:
+            use_small_table_kernel = (
+                histogram_feature >= 0
+                and not vbe
+                and not is_amd()
+                and weight.dtype == torch.float16
+            )
+            if use_small_table_kernel:
+                table_batched_embedding_bag_forward_small_table_kernel[
+                    (triton.cdiv(B, 16),)
+                ](
+                    output,
+                    indices,
+                    offsets,
+                    weight,
+                    table_offsets,
+                    embedding_dims,
+                    embedding_offsets,
+                    feature_table_map,
+                    bounds_check_warning_ptr,
+                    total_embedding_dim,
+                    B,
+                    FEATURE=histogram_feature,
+                    NUM_ROWS=histogram_num_rows,
+                    ROW_BINS=histogram_row_bins,
+                    BLOCK_SIZE=histogram_block_size,
+                    FUSED_BOUNDS_CHECK=fused_bounds_check,
+                    num_warps=1,
+                )
+
             if is_amd():
                 _amd_fwd_unweighted_kernel[(B,)](
                     output,
@@ -1388,27 +1524,40 @@ class TritonTBE(torch.autograd.Function):
                     num_warps=num_warps,
                 )
             else:
-                table_batched_embedding_bag_forward_unweighted_kernel[(B,)](
-                    output,
-                    indices,
-                    offsets,
-                    weight,
-                    table_offsets,
-                    embedding_dims,
-                    embedding_offsets,
-                    feature_table_map,
-                    rows_cumsum,
-                    bounds_check_warning_ptr,
-                    row_output_offsets_ptr,
-                    B_offsets_ptr,
-                    total_embedding_dim,
-                    B,
-                    T,
-                    BLOCK_SIZE=block_size,
-                    vbe=vbe,
-                    FUSED_BOUNDS_CHECK=fused_bounds_check,
-                    num_warps=num_warps,
+                feature_ranges = (
+                    [
+                        (0, histogram_feature),
+                        (histogram_feature + 1, T),
+                    ]
+                    if use_small_table_kernel
+                    else [(0, T)]
                 )
+                for feature_start, feature_end in feature_ranges:
+                    if feature_start >= feature_end:
+                        continue
+                    table_batched_embedding_bag_forward_unweighted_kernel[(B,)](
+                        output,
+                        indices,
+                        offsets,
+                        weight,
+                        table_offsets,
+                        embedding_dims,
+                        embedding_offsets,
+                        feature_table_map,
+                        rows_cumsum,
+                        bounds_check_warning_ptr,
+                        row_output_offsets_ptr,
+                        B_offsets_ptr,
+                        total_embedding_dim,
+                        B,
+                        T,
+                        BLOCK_SIZE=block_size,
+                        vbe=vbe,
+                        FEATURE_START=feature_start,
+                        FEATURE_END=feature_end,
+                        FUSED_BOUNDS_CHECK=fused_bounds_check,
+                        num_warps=num_warps,
+                    )
 
         # Record a CUDA event to mark forward kernel completion.
         # This is needed for synchronization before NCCL collectives.
@@ -1906,6 +2055,10 @@ class TritonTBE(torch.autograd.Function):
             None,  # hoist_transpose_to_forward
             None,
             None,
+            None,
+            None,
+            None,
+            None,
         )
 
 
@@ -1927,6 +2080,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         optimizer: OptimType = OptimType.EXACT_SGD,
         device: Optional[torch.device] = None,
         hoist_transpose_to_forward: bool = False,
+        bag_size_hints: Optional[List[int]] = None,
         fused_bounds_check: bool = False,
     ) -> None:
         super().__init__()
@@ -2005,6 +2159,35 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         self.output_dtype = (
             output_dtype if output_dtype is not None else weights_precision
         )
+        if bag_size_hints is not None and len(bag_size_hints) != self.T:
+            raise ValueError(
+                f"bag_size_hints must have {self.T} entries, "
+                f"got {len(bag_size_hints)}"
+            )
+
+        self._histogram_feature = -1
+        self._histogram_num_rows = 0
+        self._histogram_row_bins = 0
+        self._histogram_block_size = 0
+        if (
+            bag_size_hints is not None
+            and weights_precision == torch.float16
+            and self.output_dtype == torch.float32
+        ):
+            candidates = []
+            for feature, table in enumerate(feature_table_map):
+                num_rows = hash_sizes[table]
+                dim = feature_dims[feature]
+                bag_size = bag_size_hints[feature]
+                if num_rows <= 64 and 64 <= dim <= 128 and bag_size >= 64:
+                    candidates.append((bag_size * dim, feature, num_rows, dim))
+            if candidates:
+                _, feature, num_rows, dim = max(candidates)
+                self._histogram_feature = feature
+                self._histogram_num_rows = num_rows
+                self._histogram_row_bins = max(32, triton.next_power_of_2(num_rows))
+                self._histogram_block_size = triton.next_power_of_2(dim)
+
         self.stochastic_rounding = stochastic_rounding
         self.learning_rate = learning_rate
         self.eps = eps
@@ -2269,6 +2452,10 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             total_B,
             max_B,
             self.hoist_transpose_to_forward,
+            self._histogram_feature,
+            self._histogram_num_rows,
+            self._histogram_row_bins,
+            self._histogram_block_size,
             self.bounds_check_warning,
             use_fused_bounds_check,
         )
