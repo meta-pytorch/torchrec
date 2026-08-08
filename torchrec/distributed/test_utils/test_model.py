@@ -44,6 +44,7 @@ from torchrec.modules.mc_modules import (
     ManagedCollisionModule,
     MCHManagedCollisionModule,
 )
+from torchrec.modules.pec_embedding_modules import PECEmbeddingCollection
 from torchrec.modules.regroup import KTRegroupAsDict
 from torchrec.sparse.jagged_tensor import _to_offsets, KeyedJaggedTensor, KeyedTensor
 from torchrec.streamable import Pipelineable
@@ -2945,6 +2946,158 @@ class TestMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
                 cat_emb = torch.cat([ebc_embeddings, ec_embeddings], dim=1)
                 self._restore_callback = restore
                 return cat_emb
+
+        return torch.cat([ebc_embeddings, ec_embeddings], dim=1)
+
+
+class TestPECMixedEmbeddingSparseArch(TestSparseNNBase, CopyableMixin):
+    """
+    Test model that handles both EmbeddingBagCollection and PECEmbeddingCollection tables.
+
+    Mirrors TestMixedEmbeddingSparseArch but wraps the EmbeddingCollection in a
+    PECEmbeddingCollection so the sharded model exercises the PEC train pipeline.
+
+    Args:
+        tables: List[EmbeddingBagConfig] | List[EmbeddingConfig].
+        num_float_features: number of dense features.
+        weighted_tables: Optional[List[EmbeddingBagConfig]].
+        embedding_groups: Optional[Dict[str, List[str]]].
+        dense_device: Optional[torch.device].
+        sparse_device: Optional[torch.device].
+        over_arch_clazz: over-arch module class.
+        device: device for the embedding modules.
+    """
+
+    def __init__(
+        self,
+        tables: Union[List[EmbeddingBagConfig], List[EmbeddingConfig]],
+        num_float_features: int = 10,
+        weighted_tables: Optional[List[EmbeddingBagConfig]] = None,
+        embedding_groups: Optional[Dict[str, List[str]]] = None,
+        dense_device: Optional[torch.device] = None,
+        sparse_device: Optional[torch.device] = None,
+        over_arch_clazz: Type[nn.Module] = TestMixedSequenceOverArch,
+        device: Optional[torch.device] = None,
+        dense_arch_hidden_sizes: Optional[List[int]] = None,
+    ) -> None:
+        if weighted_tables is None:
+            weighted_tables = []
+        super().__init__(
+            tables=cast(List[BaseEmbeddingConfig], tables),
+            weighted_tables=cast(Optional[List[BaseEmbeddingConfig]], weighted_tables),
+            embedding_groups=embedding_groups,
+            dense_device=dense_device,
+            sparse_device=sparse_device,
+        )
+        if device is None:
+            device = torch.device("cpu")
+
+        ebc_tables: List[EmbeddingBagConfig] = []
+        ec_tables: List[EmbeddingConfig] = []
+
+        for table in tables:
+            if isinstance(table, EmbeddingBagConfig):
+                ebc_tables.append(table)
+            elif isinstance(table, EmbeddingConfig):
+                ec_tables.append(table)
+            else:
+                raise ValueError(f"Unsupported table type: {type(table)}")
+
+        self.ebc: Optional[EmbeddingBagCollection] = None
+        if ebc_tables:
+            self.ebc = EmbeddingBagCollection(
+                tables=ebc_tables,
+                device=device,
+            )
+
+        self.pec_ec: Optional[PECEmbeddingCollection] = None
+        if ec_tables:
+            self.pec_ec = PECEmbeddingCollection(
+                EmbeddingCollection(
+                    tables=ec_tables,
+                    device=device,
+                )
+            )
+            self.ec_embedding_dim = self.pec_ec.embedding_dim()
+
+        self._ebc_features: List[str] = [
+            feature for table in ebc_tables for feature in table.feature_names
+        ]
+
+        self._ec_features: List[str] = [
+            feature for table in ec_tables for feature in table.feature_names
+        ]
+
+        self.dense = TestDenseArch(
+            num_float_features,
+            device=dense_device,
+            dense_arch_hidden_sizes=dense_arch_hidden_sizes,
+        )
+        self.over: nn.Module = over_arch_clazz(ebc_tables, ec_tables, [], device)
+        self.register_buffer(
+            "dummy_ones",
+            torch.ones(1, device=dense_device),
+        )
+
+    def dense_forward(
+        self, input: ModelInput, sparse_output: torch.Tensor
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        dense_r = self.dense(input.float_features)
+        over_r = self.over(dense_r, sparse_output)
+        # pyrefly: ignore[unsupported-operation]
+        pred = torch.sigmoid(torch.mean(over_r, dim=1)) + self.dummy_ones
+        if self.training:
+            return (
+                torch.nn.functional.binary_cross_entropy_with_logits(pred, input.label),
+                pred,
+            )
+        else:
+            return pred
+
+    def forward(
+        self,
+        input: ModelInput,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        return self.dense_forward(input, self.sparse_forward(input))
+
+    def sparse_forward(
+        self,
+        input: ModelInput,
+    ) -> torch.Tensor:
+        """
+        Forward pass that processes features through both EBC and PEC-EC modules.
+
+        Args:
+            input: Input features for both EBC and PEC-EC.
+
+        Returns:
+            Concatenated embeddings from all modules.
+        """
+        features = input.idlist_features
+        ebc_embeddings = torch.empty(0)
+        ec_embeddings = torch.empty(0)
+
+        # Process EmbeddingBagCollection features.
+        # EBC internally filters features based on its configured table feature names.
+        if self.ebc is not None and self._ebc_features:
+            ebc_result = self.ebc(features)
+            ebc_embeddings = ebc_result.values()
+
+        # Process PECEmbeddingCollection features.
+        # The EC internally filters features based on its configured table feature names.
+        if self.pec_ec is not None and self._ec_features:
+            ec_result = self.pec_ec(features)
+            padded_embeddings = [
+                torch.ops.fbgemm.jagged_2d_to_dense(
+                    values=ec_result[e].values(),
+                    offsets=ec_result[e].offsets(),
+                    max_sequence_length=20,
+                ).view(-1, 20 * self.ec_embedding_dim)
+                for e in self._ec_features
+            ]
+
+            # Concatenate all EC embeddings along the feature dimension.
+            ec_embeddings = torch.cat(padded_embeddings, dim=1)
 
         return torch.cat([ebc_embeddings, ec_embeddings], dim=1)
 

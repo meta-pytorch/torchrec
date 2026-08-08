@@ -176,24 +176,43 @@ def _merge_update_jobs(jobs: list[MetricUpdateJob]) -> MetricUpdateJob:
 
 
 def _foreach_clone_dict(d: Mapping[str, Any]) -> Dict[str, Any]:
-    """Batched clone of tensor values; one PyBind crossing for N tensors."""
+    """Clone tensor values while preserving their mapping keys."""
     tensor_keys: list[str] = []
     tensor_values: list[torch.Tensor] = []
-    out: Dict[str, Any] = {}
+    out: Dict[str, Any] = dict(d)
     for k, v in d.items():
         if isinstance(v, torch.Tensor):
             tensor_keys.append(k)
             tensor_values.append(v)
-        else:
-            out[k] = v
     if tensor_values:
-        # no_grad bypasses the autograd dispatch on _foreach_clone, which
-        # rejects integer dtypes (e.g., int labels/required_inputs).
-        with torch.no_grad():
-            cloned = torch._foreach_clone(tensor_values)
+        cloned = _foreach_clone_tensors(tensor_values)
         for k, t in zip(tensor_keys, cloned):
             out[k] = t
     return out
+
+
+def _foreach_clone_tensors(tensors: list[torch.Tensor]) -> list[torch.Tensor]:
+    groups: dict[tuple[torch.device, torch.dtype], list[tuple[int, torch.Tensor]]] = {}
+    fallback: list[tuple[int, torch.Tensor]] = []
+    for index, tensor in enumerate(tensors):
+        if (
+            tensor.layout == torch.strided
+            and torch.ops.aten.is_non_overlapping_and_dense.default(tensor)
+        ):
+            groups.setdefault((tensor.device, tensor.dtype), []).append((index, tensor))
+        else:
+            fallback.append((index, tensor))
+
+    cloned: dict[int, torch.Tensor] = {}
+    # A heterogeneous list makes CUDA foreach clone fall back for every tensor.
+    with torch.no_grad():
+        for group in groups.values():
+            group_clones = torch._foreach_clone([tensor for _, tensor in group])
+            for (index, _), clone in zip(group, group_clones):
+                cloned[index] = clone
+        for index, tensor in fallback:
+            cloned[index] = tensor.clone()
+    return [cloned[index] for index in range(len(tensors))]
 
 
 def _foreach_clone_kwargs(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
@@ -205,8 +224,7 @@ def _foreach_clone_kwargs(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
             out[k] = v
     top_keys = [k for k, v in out.items() if isinstance(v, torch.Tensor)]
     if top_keys:
-        with torch.no_grad():
-            cloned = torch._foreach_clone([out[k] for k in top_keys])
+        cloned = _foreach_clone_tensors([out[k] for k in top_keys])
         for k, t in zip(top_keys, cloned):
             out[k] = t
     return out
