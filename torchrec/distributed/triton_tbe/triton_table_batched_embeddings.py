@@ -265,10 +265,7 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
     feature_table_map_ptr,
     rows_cumsum_ptr,
     bounds_check_warning_ptr,
-    # VBE-specific pointers (only used when vbe=True)
-    # pyre-fixme[2]: Parameter must be annotated.
     row_output_offsets_ptr,
-    # pyre-fixme[2]: Parameter must be annotated.
     B_offsets_ptr,
     total_embedding_dim: tl.constexpr,
     B,
@@ -277,136 +274,159 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
     vbe: tl.constexpr = False,
     FEATURE_START: tl.constexpr = 0,
     FEATURE_END: tl.constexpr = -1,
+    BAGS_PER_PROGRAM: tl.constexpr = 1,
     FUSED_BOUNDS_CHECK: tl.constexpr = False,
 ) -> None:
-
-    b = tl.program_id(0).to(tl.int64)
+    base_b = tl.program_id(0).to(tl.int64) * BAGS_PER_PROGRAM
     col_offsets = tl.arange(0, BLOCK_SIZE)
     warning_count = 0
-    if vbe:
-        output_row_base = output_ptr  # unused, VBE uses row_output_offsets
-    else:
-        output_row_base = output_ptr + b * total_embedding_dim
 
     feature_end: tl.constexpr = T if FEATURE_END < 0 else FEATURE_END
     for t in range(FEATURE_START, feature_end):
+        table_idx = tl.load(feature_table_map_ptr + t)
+        table_offset = tl.load(table_offsets_ptr + table_idx)
+        embedding_dim = tl.load(embedding_dims_ptr + t)
+        embedding_offset = tl.load(embedding_offsets_ptr + t)
+        if FUSED_BOUNDS_CHECK:
+            num_rows = tl.load(rows_cumsum_ptr + table_idx + 1) - tl.load(
+                rows_cumsum_ptr + table_idx
+            )
+
         if vbe:
-            # VBE: check if this batch index is within feature t's batch size
             B_start = tl.load(B_offsets_ptr + t).to(tl.int64)
             B_end = tl.load(B_offsets_ptr + t + 1).to(tl.int64)
             B_t = B_end - B_start
-            b_t = B_start + b
-            in_bounds = b < B_t
-        else:
-            b_t = t * B + b
-            in_bounds = True
 
-        if in_bounds:
-            # Map feature index to table index for weight lookup
-            table_idx = tl.load(feature_table_map_ptr + t)
-            table_offset = tl.load(table_offsets_ptr + table_idx)
-            # embedding_dim and embedding_offset are indexed by feature
-            embedding_dim = tl.load(embedding_dims_ptr + t)
-            if FUSED_BOUNDS_CHECK:
-                num_rows = tl.load(rows_cumsum_ptr + table_idx + 1) - tl.load(
-                    rows_cumsum_ptr + table_idx
-                )
+        for bag_slot in tl.static_range(0, BAGS_PER_PROGRAM):
+            b = base_b + bag_slot
+            if vbe:
+                b_t = B_start + b
+                in_bounds = b < B_t
+            else:
+                b_t = t * B + b
+                in_bounds = b < B
 
-            start = tl.load(offsets_ptr + b_t)
-            end = tl.load(offsets_ptr + b_t + 1)
+            if in_bounds:
+                start = tl.load(offsets_ptr + b_t)
+                end = tl.load(offsets_ptr + b_t + 1)
+                mask = col_offsets < embedding_dim
+                accumulator_dtype: tl.constexpr = (
+                    tl.float64
+                    if weight_ptr.dtype.element_ty == tl.float32
+                    else tl.float32
+                )
+                bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
 
-            mask = col_offsets < embedding_dim
-            accumulator_dtype: tl.constexpr = (
-                tl.float64 if weight_ptr.dtype.element_ty == tl.float32 else tl.float32
-            )
-            bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
+                step: tl.constexpr = 4
+                ns = (end - start) // step
+                endn = start + step * ns
 
-            step: tl.constexpr = 4
-            ns = (end - start) // step
-            endn = start + step * ns
-
-            for idx in range(start, endn, step):
-                row_idx_0, invalid_0 = _load_checked_index(
-                    indices_ptr,
-                    idx + 0,
-                    num_rows if FUSED_BOUNDS_CHECK else 0,
-                    True,
-                    FUSED_BOUNDS_CHECK,
-                )
-                row_idx_1, invalid_1 = _load_checked_index(
-                    indices_ptr,
-                    idx + 1,
-                    num_rows if FUSED_BOUNDS_CHECK else 0,
-                    True,
-                    FUSED_BOUNDS_CHECK,
-                )
-                row_idx_2, invalid_2 = _load_checked_index(
-                    indices_ptr,
-                    idx + 2,
-                    num_rows if FUSED_BOUNDS_CHECK else 0,
-                    True,
-                    FUSED_BOUNDS_CHECK,
-                )
-                row_idx_3, invalid_3 = _load_checked_index(
-                    indices_ptr,
-                    idx + 3,
-                    num_rows if FUSED_BOUNDS_CHECK else 0,
-                    True,
-                    FUSED_BOUNDS_CHECK,
-                )
-                if FUSED_BOUNDS_CHECK:
-                    warning_count += (
-                        invalid_0.to(tl.int32)
-                        + invalid_1.to(tl.int32)
-                        + invalid_2.to(tl.int32)
-                        + invalid_3.to(tl.int32)
+                for idx in range(start, endn, step):
+                    row_idx_0, invalid_0 = _load_checked_index(
+                        indices_ptr,
+                        idx + 0,
+                        num_rows if FUSED_BOUNDS_CHECK else 0,
+                        True,
+                        FUSED_BOUNDS_CHECK,
+                    )
+                    row_idx_1, invalid_1 = _load_checked_index(
+                        indices_ptr,
+                        idx + 1,
+                        num_rows if FUSED_BOUNDS_CHECK else 0,
+                        True,
+                        FUSED_BOUNDS_CHECK,
+                    )
+                    row_idx_2, invalid_2 = _load_checked_index(
+                        indices_ptr,
+                        idx + 2,
+                        num_rows if FUSED_BOUNDS_CHECK else 0,
+                        True,
+                        FUSED_BOUNDS_CHECK,
+                    )
+                    row_idx_3, invalid_3 = _load_checked_index(
+                        indices_ptr,
+                        idx + 3,
+                        num_rows if FUSED_BOUNDS_CHECK else 0,
+                        True,
+                        FUSED_BOUNDS_CHECK,
+                    )
+                    if FUSED_BOUNDS_CHECK:
+                        warning_count += (
+                            invalid_0.to(tl.int32)
+                            + invalid_1.to(tl.int32)
+                            + invalid_2.to(tl.int32)
+                            + invalid_3.to(tl.int32)
+                        )
+                    row_0 = tl.load(
+                        weight_ptr
+                        + table_offset
+                        + row_idx_0 * embedding_dim
+                        + col_offsets,
+                        mask=mask,
+                        other=0,
+                    )
+                    row_1 = tl.load(
+                        weight_ptr
+                        + table_offset
+                        + row_idx_1 * embedding_dim
+                        + col_offsets,
+                        mask=mask,
+                        other=0,
+                    )
+                    row_2 = tl.load(
+                        weight_ptr
+                        + table_offset
+                        + row_idx_2 * embedding_dim
+                        + col_offsets,
+                        mask=mask,
+                        other=0,
+                    )
+                    row_3 = tl.load(
+                        weight_ptr
+                        + table_offset
+                        + row_idx_3 * embedding_dim
+                        + col_offsets,
+                        mask=mask,
+                        other=0,
+                    )
+                    bag_output += (
+                        row_0.to(tl.float32)
+                        + row_1.to(tl.float32)
+                        + row_2.to(tl.float32)
+                        + row_3.to(tl.float32)
                     )
 
-                row_start_ptr_0 = weight_ptr + table_offset + row_idx_0 * embedding_dim
-                row_start_ptr_1 = weight_ptr + table_offset + row_idx_1 * embedding_dim
-                row_start_ptr_2 = weight_ptr + table_offset + row_idx_2 * embedding_dim
-                row_start_ptr_3 = weight_ptr + table_offset + row_idx_3 * embedding_dim
+                for idx in range(endn, end):
+                    row_idx, invalid = _load_checked_index(
+                        indices_ptr,
+                        idx,
+                        num_rows if FUSED_BOUNDS_CHECK else 0,
+                        True,
+                        FUSED_BOUNDS_CHECK,
+                    )
+                    if FUSED_BOUNDS_CHECK:
+                        warning_count += invalid.to(tl.int32)
+                    row = tl.load(
+                        weight_ptr
+                        + table_offset
+                        + row_idx * embedding_dim
+                        + col_offsets,
+                        mask=mask,
+                        other=0,
+                    )
+                    bag_output += row.to(tl.float32)
 
-                row_ptrs_0 = row_start_ptr_0 + col_offsets
-                row_ptrs_1 = row_start_ptr_1 + col_offsets
-                row_ptrs_2 = row_start_ptr_2 + col_offsets
-                row_ptrs_3 = row_start_ptr_3 + col_offsets
-
-                row_0 = tl.load(row_ptrs_0, mask=mask, other=0)
-                row_1 = tl.load(row_ptrs_1, mask=mask, other=0)
-                row_2 = tl.load(row_ptrs_2, mask=mask, other=0)
-                row_3 = tl.load(row_ptrs_3, mask=mask, other=0)
-
-                bag_output += (
-                    row_0.to(tl.float32)
-                    + row_1.to(tl.float32)
-                    + row_2.to(tl.float32)
-                    + row_3.to(tl.float32)
-                )
-
-            for idx in range(endn, end):
-                row_idx, invalid = _load_checked_index(
-                    indices_ptr,
-                    idx,
-                    num_rows if FUSED_BOUNDS_CHECK else 0,
-                    True,
-                    FUSED_BOUNDS_CHECK,
-                )
-                if FUSED_BOUNDS_CHECK:
-                    warning_count += invalid.to(tl.int32)
-                row_start_ptr = weight_ptr + table_offset + row_idx * embedding_dim
-                row_ptrs = row_start_ptr + col_offsets
-                row = tl.load(row_ptrs, mask=mask, other=0)
-                bag_output += row.to(tl.float32)
-
-            if vbe:
-                row_output_offset = tl.load(row_output_offsets_ptr + b_t)
-                output_row_ptrs = output_ptr + row_output_offset + col_offsets
-            else:
-                embedding_offset = tl.load(embedding_offsets_ptr + t)
-                output_row_ptrs = output_row_base + embedding_offset + col_offsets
-            bag_output_original = bag_output.to(tl.float32)
-            tl.store(output_row_ptrs, bag_output_original, mask=mask)
+                if vbe:
+                    row_output_offset = tl.load(row_output_offsets_ptr + b_t)
+                    output_row_ptrs = output_ptr + row_output_offset + col_offsets
+                else:
+                    output_row_ptrs = (
+                        output_ptr
+                        + b * total_embedding_dim
+                        + embedding_offset
+                        + col_offsets
+                    )
+                tl.store(output_row_ptrs, bag_output.to(tl.float32), mask=mask)
 
     if FUSED_BOUNDS_CHECK and warning_count > 0:
         tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
@@ -1483,6 +1503,21 @@ class TritonTBE(torch.autograd.Function):
                 and not is_amd()
                 and weight.dtype == torch.float16
             )
+            bags_per_program = (
+                4
+                if use_small_table_kernel
+                else (
+                    2 if not vbe and B >= 65536 and weight.dtype != torch.float32 else 1
+                )
+            )
+            feature_ranges = (
+                [
+                    (0, histogram_feature),
+                    (histogram_feature + 1, T),
+                ]
+                if use_small_table_kernel
+                else [(0, T)]
+            )
             if use_small_table_kernel:
                 table_batched_embedding_bag_forward_small_table_kernel[
                     (triton.cdiv(B, 16),)
@@ -1526,18 +1561,12 @@ class TritonTBE(torch.autograd.Function):
                     num_warps=num_warps,
                 )
             else:
-                feature_ranges = (
-                    [
-                        (0, histogram_feature),
-                        (histogram_feature + 1, T),
-                    ]
-                    if use_small_table_kernel
-                    else [(0, T)]
-                )
                 for feature_start, feature_end in feature_ranges:
                     if feature_start >= feature_end:
                         continue
-                    table_batched_embedding_bag_forward_unweighted_kernel[(B,)](
+                    table_batched_embedding_bag_forward_unweighted_kernel[
+                        (triton.cdiv(B, bags_per_program),)
+                    ](
                         output,
                         indices,
                         offsets,
@@ -1557,6 +1586,7 @@ class TritonTBE(torch.autograd.Function):
                         vbe=vbe,
                         FEATURE_START=feature_start,
                         FEATURE_END=feature_end,
+                        BAGS_PER_PROGRAM=bags_per_program,
                         FUSED_BOUNDS_CHECK=fused_bounds_check,
                         num_warps=num_warps,
                     )
