@@ -2105,8 +2105,9 @@ class PrefetchTrainPipelineSparseDist(TrainPipelineSparseDist[In, Out]):
         Args:
             dataloader_iter: Iterator that produces training batches.
         """
-        # pipeline is already filled
-        if len(self.batches) >= 3:
+        # pipeline is already filled: fill_pipeline primes 2 batches, and progress
+        # holds 2 at its start (it enqueues a 3rd, then dequeues one at the end).
+        if len(self.batches) >= 2:
             return
 
         # executes last batch in pipeline
