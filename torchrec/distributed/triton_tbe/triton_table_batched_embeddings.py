@@ -13,6 +13,7 @@ triton table batched embedding bag with sum reduction mode
 import logging
 import math
 import os
+from dataclasses import dataclass
 from itertools import accumulate
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -78,6 +79,17 @@ def lengths_to_offsets(lengths: List[int], keep_last: bool = False) -> List[int]
     if not keep_last:
         offsets.pop()
     return offsets
+
+
+@dataclass(frozen=True)
+class _SavedHistogramPlan:
+    feature: int
+    table: int
+    num_rows: int
+    row_bins: int
+    embedding_dim: int
+    embedding_offset: int
+    block_size: int
 
 
 @triton.jit
@@ -512,6 +524,8 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
 @triton.jit
 def table_batched_embedding_bag_forward_small_table_kernel(
     output_ptr,
+    histogram_counts_ptr,
+    histogram_counts_invalid_ptr,
     indices_ptr,
     offsets_ptr,
     weight_ptr,
@@ -526,6 +540,8 @@ def table_batched_embedding_bag_forward_small_table_kernel(
     NUM_ROWS: tl.constexpr,
     ROW_BINS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    STORE_COUNTS: tl.constexpr,
+    INVALID_INDEX: tl.constexpr,
     FUSED_BOUNDS_CHECK: tl.constexpr = False,
 ) -> None:
     bags_per_program: tl.constexpr = 16
@@ -550,17 +566,28 @@ def table_batched_embedding_bag_forward_small_table_kernel(
     row_indices = row_indices.to(tl.int32)
     warning_count = tl.sum(invalid_indices.to(tl.int32))
     encoded_indices = row_indices + bag_slots[:, None] * ROW_BINS
+    histogram_input_mask = input_mask & (row_indices != -1)
     counts = tl.histogram(
         encoded_indices.reshape((bags_per_program * histogram_chunk_size,)),
         bags_per_program * ROW_BINS,
-        mask=input_mask.reshape((bags_per_program * histogram_chunk_size,)),
+        mask=histogram_input_mask.reshape((bags_per_program * histogram_chunk_size,)),
     ).reshape((bags_per_program, ROW_BINS))
+
+    rows = tl.arange(0, ROW_BINS)
+    tail_lengths = tl.maximum(lengths - histogram_chunk_size, 0)
+    if STORE_COUNTS:
+        tl.store(
+            histogram_counts_ptr + bags[:, None] * ROW_BINS + rows[None, :],
+            counts.to(tl.float16),
+            mask=bag_mask[:, None],
+        )
+        if tl.max(lengths) > histogram_chunk_size:
+            tl.atomic_or(histogram_counts_invalid_ptr + INVALID_INDEX, 1)
 
     table_idx = tl.load(feature_table_map_ptr + FEATURE)
     table_offset = tl.load(table_offsets_ptr + table_idx)
     embedding_dim = tl.load(embedding_dims_ptr + FEATURE)
     embedding_offset = tl.load(embedding_offsets_ptr + FEATURE)
-    rows = tl.arange(0, ROW_BINS)
     columns = tl.arange(0, BLOCK_SIZE)
     table = tl.load(
         weight_ptr + table_offset + rows[:, None] * embedding_dim + columns[None, :],
@@ -569,7 +596,6 @@ def table_batched_embedding_bag_forward_small_table_kernel(
     )
     bag_output = tl.dot(counts.to(tl.float16), table)
 
-    tail_lengths = tl.maximum(lengths - histogram_chunk_size, 0)
     for tail in range(0, tl.max(tail_lengths)):
         active = bag_mask & (tail < tail_lengths)
         row_idx, invalid = _load_checked_index(
@@ -581,6 +607,7 @@ def table_batched_embedding_bag_forward_small_table_kernel(
         )
         if FUSED_BOUNDS_CHECK:
             warning_count += tl.sum(invalid.to(tl.int32))
+        active = active & (row_idx != -1)
         row = tl.load(
             weight_ptr
             + table_offset
@@ -601,6 +628,61 @@ def table_batched_embedding_bag_forward_small_table_kernel(
     )
     if FUSED_BOUNDS_CHECK and warning_count > 0:
         tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
+
+
+@triton.jit
+def triton_tbe_backward_histogram_apply_rowwise_adagrad(
+    grad_ptr,
+    weight_ptr,
+    momentum_ptr,
+    table_offsets_ptr,
+    rows_cumsum_ptr,
+    learning_rate,
+    eps,
+    NUM_ROWS: tl.constexpr,
+    EMBEDDING_DIM: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    TABLE_IDX: tl.constexpr,
+    STOCHASTIC_ROUNDING: tl.constexpr,
+    stochastic_rounding_seed,
+) -> None:
+    row_idx = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = (row_idx < NUM_ROWS) & (cols < EMBEDDING_DIM)
+
+    table_offset = tl.load(table_offsets_ptr + TABLE_IDX)
+    row_ptrs = weight_ptr + table_offset + row_idx * EMBEDDING_DIM + cols
+    grad = tl.load(
+        grad_ptr + row_idx * EMBEDDING_DIM + cols,
+        mask=mask,
+        other=0.0,
+    )
+    weight = tl.load(row_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    row_offset = tl.load(rows_cumsum_ptr + TABLE_IDX)
+    momentum_idx = row_offset + row_idx
+    grad_square_average = tl.sum(grad * grad) / EMBEDDING_DIM
+    momentum = tl.load(momentum_ptr + momentum_idx, mask=row_idx < NUM_ROWS)
+    momentum_new = momentum + grad_square_average
+    tl.store(
+        momentum_ptr + momentum_idx,
+        momentum_new,
+        mask=row_idx < NUM_ROWS,
+    )
+    adaptive_learning_rate = learning_rate / (tl.sqrt(momentum_new) + eps)
+    row_update = weight - adaptive_learning_rate * grad
+
+    if STOCHASTIC_ROUNDING:
+        sr_offset = table_offset + row_idx * EMBEDDING_DIM + cols
+        _stochastic_rounding_store(
+            row_ptrs,
+            row_update,
+            mask,
+            stochastic_rounding_seed,
+            sr_offset,
+        )
+    else:
+        tl.store(row_ptrs, row_update, mask=mask)
 
 
 @triton.jit
@@ -1359,6 +1441,7 @@ class TritonTBE(torch.autograd.Function):
         histogram_num_rows: int = 0,
         histogram_row_bins: int = 0,
         histogram_block_size: int = 0,
+        saved_histogram_plans: Tuple[_SavedHistogramPlan, ...] = (),
         bounds_check_warning: Optional[torch.Tensor] = None,
         fused_bounds_check: bool = False,
     ) -> torch.Tensor:
@@ -1448,6 +1531,49 @@ class TritonTBE(torch.autograd.Function):
             or vbe
         ):
             raise ValueError("Invalid fused bounds-check configuration")
+        use_small_table_kernel = (
+            histogram_feature >= 0
+            and not weighted
+            and not vbe
+            and not is_amd()
+            and weight.dtype == torch.float16
+        )
+        valid_saved_histogram_prefix = bool(saved_histogram_plans)
+        expected_embedding_offset = 0
+        for expected_feature, plan in enumerate(saved_histogram_plans):
+            valid_saved_histogram_prefix = (
+                valid_saved_histogram_prefix
+                and plan.feature == expected_feature
+                and plan.embedding_offset == expected_embedding_offset
+                and plan.num_rows > 0
+                and plan.row_bins >= plan.num_rows
+                and (plan.row_bins & (plan.row_bins - 1)) == 0
+                and plan.embedding_dim > 0
+                and plan.block_size >= plan.embedding_dim
+                and (plan.block_size & (plan.block_size - 1)) == 0
+            )
+            expected_embedding_offset += plan.embedding_dim
+        use_histogram_backward = (
+            use_small_table_kernel
+            and B > 0
+            and histogram_feature == 0
+            and valid_saved_histogram_prefix
+            and optimizer == OptimType.EXACT_ROWWISE_ADAGRAD
+            and not hoist_transpose_to_forward
+            and not torch.cuda.is_current_stream_capturing()
+        )
+        active_saved_histogram_plans = (
+            saved_histogram_plans if use_histogram_backward else ()
+        )
+        histogram_counts = tuple(
+            torch.empty((B, plan.row_bins), device=weight.device, dtype=torch.float16)
+            for plan in active_saved_histogram_plans
+        )
+        histogram_counts_invalid = torch.zeros(
+            len(active_saved_histogram_plans),
+            device=weight.device,
+            dtype=torch.int32,
+        )
 
         # For VBE backward, save row_output_offsets, B_offsets, and b_t_map
         if vbe:
@@ -1475,6 +1601,8 @@ class TritonTBE(torch.autograd.Function):
             vbe_row_output_offsets,
             vbe_B_offsets,
             vbe_b_t_map,
+            *histogram_counts,
+            histogram_counts_invalid,
         )
 
         ctx.total_embedding_dim = total_embedding_dim
@@ -1491,6 +1619,7 @@ class TritonTBE(torch.autograd.Function):
         ctx.stochastic_rounding = stochastic_rounding
         ctx.vbe = vbe
         ctx.hoist_transpose_to_forward = hoist_transpose_to_forward
+        ctx.saved_histogram_plans = active_saved_histogram_plans
 
         if hoist_transpose_to_forward:
             # Hoist the backward index transpose (linearize + sort + run-length
@@ -1574,32 +1703,27 @@ class TritonTBE(torch.autograd.Function):
                 num_warps=num_warps,
             )
         else:
-            use_small_table_kernel = (
-                histogram_feature >= 0
-                and not vbe
-                and not is_amd()
-                and weight.dtype == torch.float16
+            empty_histogram_counts = torch.empty(
+                0, device=weight.device, dtype=torch.float16
             )
-            bags_per_program = (
-                4
-                if use_small_table_kernel
-                else (
-                    2 if not vbe and B >= 65536 and weight.dtype != torch.float32 else 1
+            histogram_storage = {
+                plan.feature: (counts, plan_index)
+                for plan_index, (plan, counts) in enumerate(
+                    zip(active_saved_histogram_plans, histogram_counts)
                 )
-            )
-            feature_ranges = (
-                [
-                    (0, histogram_feature),
-                    (histogram_feature + 1, T),
-                ]
-                if use_small_table_kernel
-                else [(0, T)]
-            )
+            }
+            optimized_histogram_features = []
             if use_small_table_kernel:
+                stored_counts, invalid_index = histogram_storage.get(
+                    histogram_feature,
+                    (empty_histogram_counts, 0),
+                )
                 table_batched_embedding_bag_forward_small_table_kernel[
                     (triton.cdiv(B, 16),)
                 ](
                     output,
+                    stored_counts,
+                    histogram_counts_invalid,
                     indices,
                     offsets,
                     weight,
@@ -1614,9 +1738,43 @@ class TritonTBE(torch.autograd.Function):
                     NUM_ROWS=histogram_num_rows,
                     ROW_BINS=histogram_row_bins,
                     BLOCK_SIZE=histogram_block_size,
+                    STORE_COUNTS=histogram_feature in histogram_storage,
+                    INVALID_INDEX=invalid_index,
                     FUSED_BOUNDS_CHECK=fused_bounds_check,
                     num_warps=1,
                 )
+                optimized_histogram_features.append(histogram_feature)
+
+            for plan_index, plan in enumerate(active_saved_histogram_plans):
+                if plan.feature == histogram_feature:
+                    continue
+                stored_counts, _ = histogram_storage[plan.feature]
+                table_batched_embedding_bag_forward_small_table_kernel[
+                    (triton.cdiv(B, 16),)
+                ](
+                    output,
+                    stored_counts,
+                    histogram_counts_invalid,
+                    indices,
+                    offsets,
+                    weight,
+                    table_offsets,
+                    embedding_dims,
+                    embedding_offsets,
+                    feature_table_map,
+                    bounds_check_warning_ptr,
+                    total_embedding_dim,
+                    B,
+                    FEATURE=plan.feature,
+                    NUM_ROWS=plan.num_rows,
+                    ROW_BINS=plan.row_bins,
+                    BLOCK_SIZE=plan.block_size,
+                    STORE_COUNTS=True,
+                    INVALID_INDEX=plan_index,
+                    FUSED_BOUNDS_CHECK=fused_bounds_check,
+                    num_warps=1,
+                )
+                optimized_histogram_features.append(plan.feature)
 
             if is_amd():
                 _amd_fwd_unweighted_kernel[(B,)](
@@ -1638,6 +1796,23 @@ class TritonTBE(torch.autograd.Function):
                     num_warps=num_warps,
                 )
             else:
+                bags_per_program = (
+                    4
+                    if optimized_histogram_features
+                    else (
+                        2
+                        if not vbe and B >= 65536 and weight.dtype != torch.float32
+                        else 1
+                    )
+                )
+                feature_ranges = []
+                feature_start = 0
+                for feature in sorted(set(optimized_histogram_features)):
+                    if feature_start < feature:
+                        feature_ranges.append((feature_start, feature))
+                    feature_start = feature + 1
+                if feature_start < T:
+                    feature_ranges.append((feature_start, T))
                 for feature_start, feature_end in feature_ranges:
                     if feature_start >= feature_end:
                         continue
@@ -1682,6 +1857,7 @@ class TritonTBE(torch.autograd.Function):
         # Ensure dout is contiguous for correct memory access in Triton kernels
         dout = dout.contiguous()
 
+        saved_tensors = ctx.saved_tensors
         (
             indices,
             offsets,
@@ -1694,7 +1870,11 @@ class TritonTBE(torch.autograd.Function):
             vbe_row_output_offsets,
             vbe_B_offsets,
             vbe_b_t_map,
-        ) = ctx.saved_tensors
+        ) = saved_tensors[:11]
+        saved_histogram_plans = ctx.saved_histogram_plans
+        num_saved_histograms = len(saved_histogram_plans)
+        histogram_counts = saved_tensors[11 : 11 + num_saved_histograms]
+        histogram_counts_invalid = saved_tensors[11 + num_saved_histograms]
 
         total_hash_size_bits = ctx.total_hash_size_bits
         total_embedding_dim = ctx.total_embedding_dim
@@ -1716,6 +1896,75 @@ class TritonTBE(torch.autograd.Function):
         )
 
         weighted = per_sample_weights.numel() > 0
+
+        feature_table_map = ctx.feature_table_map
+        num_valid_histograms = 0
+        if num_saved_histograms and not torch.cuda.is_current_stream_capturing():
+            for invalid in histogram_counts_invalid.tolist():
+                if invalid:
+                    break
+                num_valid_histograms += 1
+
+        for plan, counts in zip(
+            saved_histogram_plans[:num_valid_histograms],
+            histogram_counts[:num_valid_histograms],
+        ):
+            histogram_dout = dout[
+                :, plan.embedding_offset : plan.embedding_offset + plan.embedding_dim
+            ]
+            histogram_dout_scale = torch.exp2(
+                torch.clamp(
+                    torch.ceil(torch.log2(torch.amax(torch.abs(histogram_dout)))) - 15,
+                    min=0,
+                )
+            )
+            histogram_dout_scaled = histogram_dout / histogram_dout_scale
+            histogram_dout_hi = histogram_dout_scaled.to(torch.float16)
+            histogram_dout_lo = (
+                histogram_dout_scaled - histogram_dout_hi.to(torch.float32)
+            ).to(torch.float16)
+            histogram_counts_t = counts.T[: plan.num_rows]
+            histogram_grad = (
+                torch.mm(
+                    histogram_counts_t,
+                    histogram_dout_hi,
+                    out_dtype=torch.float32,
+                )
+                + torch.mm(
+                    histogram_counts_t,
+                    histogram_dout_lo,
+                    out_dtype=torch.float32,
+                )
+            ) * histogram_dout_scale
+            triton_tbe_backward_histogram_apply_rowwise_adagrad[(plan.num_rows,)](
+                histogram_grad,
+                weight,
+                momentum,
+                table_offsets,
+                rows_cumsum,
+                learning_rate,
+                eps,
+                NUM_ROWS=plan.num_rows,
+                EMBEDDING_DIM=plan.embedding_dim,
+                BLOCK_SIZE=plan.block_size,
+                TABLE_IDX=plan.table,
+                STOCHASTIC_ROUNDING=stochastic_rounding,
+                stochastic_rounding_seed=stochastic_rounding_seed,
+                num_warps=1,
+            )
+
+        if num_valid_histograms:
+            histogram_prefix = int(offsets[num_valid_histograms * B].item())
+            indices = indices[histogram_prefix:]
+            offsets = offsets[num_valid_histograms * B :] - histogram_prefix
+            embedding_dims = embedding_dims[num_valid_histograms:]
+            embedding_offsets = embedding_offsets[num_valid_histograms:]
+            hash_size_cumsum = hash_size_cumsum[num_valid_histograms:]
+            feature_table_map = feature_table_map[num_valid_histograms:]
+            T -= num_valid_histograms
+
+        if T == 0:
+            return (None,) * len(ctx.needs_input_grad)
 
         if ctx.hoist_transpose_to_forward:
             # The index transpose (linearize + sort + run-length encode) was
@@ -1862,7 +2111,7 @@ class TritonTBE(torch.autograd.Function):
                 table_offsets,
                 embedding_dims,
                 embedding_offsets,
-                ctx.feature_table_map,
+                feature_table_map,
                 hash_size_cumsum,
                 momentum,
                 rows_cumsum,
@@ -1909,7 +2158,7 @@ class TritonTBE(torch.autograd.Function):
                     sorted_linear_indices_cumulative_run_lengths,
                     long_run_original_ids,
                     table_offsets,
-                    ctx.feature_table_map,
+                    feature_table_map,
                     hash_size_cumsum,
                     momentum,
                     rows_cumsum,
@@ -1977,7 +2226,7 @@ class TritonTBE(torch.autograd.Function):
                     num_long_runs_t,
                     table_offsets,
                     embedding_dims,
-                    ctx.feature_table_map,
+                    feature_table_map,
                     hash_size_cumsum,
                     momentum,
                     rows_cumsum,
@@ -2009,7 +2258,7 @@ class TritonTBE(torch.autograd.Function):
                 table_offsets,
                 embedding_dims,
                 embedding_offsets,
-                ctx.feature_table_map,
+                feature_table_map,
                 hash_size_cumsum,
                 momentum,
                 rows_cumsum,
@@ -2054,7 +2303,7 @@ class TritonTBE(torch.autograd.Function):
                     sorted_linear_indices_cumulative_run_lengths,
                     long_run_original_ids,
                     table_offsets,
-                    ctx.feature_table_map,
+                    feature_table_map,
                     hash_size_cumsum,
                     momentum,
                     rows_cumsum,
@@ -2122,7 +2371,7 @@ class TritonTBE(torch.autograd.Function):
                     num_long_runs_t,
                     table_offsets,
                     embedding_dims,
-                    ctx.feature_table_map,
+                    feature_table_map,
                     hash_size_cumsum,
                     momentum,
                     rows_cumsum,
@@ -2185,6 +2434,7 @@ class TritonTBE(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -2236,12 +2486,13 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         # Feature-level properties (indexed by feature_table_map)
         # These are used for forward pass and output shape calculation
         feature_dims = [table_embedding_dims[t] for t in feature_table_map]
+        feature_embedding_offsets = lengths_to_offsets(feature_dims)
         self.total_embedding_dim = sum(feature_dims)
         self.table_offsets = torch.tensor(
             lengths_to_offsets(table_sizes), dtype=torch.int64, device=device
         )
         self.embedding_offsets = torch.tensor(
-            lengths_to_offsets(feature_dims), dtype=torch.int64, device=device
+            feature_embedding_offsets, dtype=torch.int64, device=device
         )
         self.embedding_dims = torch.tensor(
             feature_dims, dtype=torch.int64, device=device
@@ -2295,6 +2546,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         self._histogram_num_rows = 0
         self._histogram_row_bins = 0
         self._histogram_block_size = 0
+        self._saved_histogram_plans: Tuple[_SavedHistogramPlan, ...] = ()
         if (
             bag_size_hints is not None
             and weights_precision == torch.float16
@@ -2313,6 +2565,22 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
                 self._histogram_num_rows = num_rows
                 self._histogram_row_bins = max(32, triton.next_power_of_2(num_rows))
                 self._histogram_block_size = triton.next_power_of_2(dim)
+                if (
+                    feature == 0
+                    and bag_size_hints[feature] <= 256
+                    and feature_table_map.count(feature_table_map[feature]) == 1
+                ):
+                    self._saved_histogram_plans = (
+                        _SavedHistogramPlan(
+                            feature=feature,
+                            table=feature_table_map[feature],
+                            num_rows=num_rows,
+                            row_bins=self._histogram_row_bins,
+                            embedding_dim=dim,
+                            embedding_offset=feature_embedding_offsets[feature],
+                            block_size=self._histogram_block_size,
+                        ),
+                    )
 
         self.stochastic_rounding = stochastic_rounding
         self.learning_rate = learning_rate
@@ -2582,6 +2850,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             self._histogram_num_rows,
             self._histogram_row_bins,
             self._histogram_block_size,
+            self._saved_histogram_plans,
             self.bounds_check_warning,
             use_fused_bounds_check,
         )
