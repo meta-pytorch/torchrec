@@ -3895,6 +3895,7 @@ class TritonBatchedFusedEmbeddingBag(
         output_dtype = output_dtype_sparse.as_dtype()
         stochastic_rounding = fused_params.get("stochastic_rounding", True)
         bag_size_hints: Optional[List[int]] = fused_params.get("bag_size_hints")
+        fused_bounds_check: bool = fused_params.get("fused_bounds_check", False)
 
         # Create Triton TBE module with feature_table_map for correct batch size handling
         self._emb_module: TritonTableBatchedEmbeddingBags = (
@@ -3909,6 +3910,7 @@ class TritonBatchedFusedEmbeddingBag(
                 optimizer=optimizer,
                 device=device,
                 bag_size_hints=bag_size_hints,
+                fused_bounds_check=fused_bounds_check,
             )
         )
 
