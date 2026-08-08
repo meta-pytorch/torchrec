@@ -1891,10 +1891,16 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             rows_per_feature, dtype=torch.int64, device=device
         )
         self.bounds_check_warning = torch.tensor([0], device=device, dtype=torch.int64)
-        # Use WARNING mode by default. We don't support environment variable override
-        # because TritonTBE only uses bounds check v1 kernel, while the env var
-        # (FBGEMM_TBE_BOUNDS_CHECK_MODE) can also set v2 modes (V2_IGNORE, V2_WARNING, V2_FATAL).
-        self.bounds_check_mode: BoundsCheckMode = BoundsCheckMode.WARNING
+        self.bounds_check_mode: BoundsCheckMode = BoundsCheckMode.V2_WARNING
+
+    def _bounds_check_config(self) -> Tuple[BoundsCheckMode, int]:
+        is_v2 = self.bounds_check_mode.name.startswith("V2_")
+        mode = (
+            BoundsCheckMode[self.bounds_check_mode.name[3:]]
+            if is_v2
+            else self.bounds_check_mode
+        )
+        return mode, 1 + int(is_v2)
 
     def prepare_inputs(
         self,
@@ -1929,14 +1935,16 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         ):
             per_sample_weights = per_sample_weights.float()
 
-        if self.bounds_check_mode != BoundsCheckMode.NONE:
+        bounds_check_mode, bounds_check_version = self._bounds_check_config()
+        if bounds_check_mode != BoundsCheckMode.NONE:
             torch.ops.fbgemm.bounds_check_indices(
                 self.rows_per_table,
                 indices,
                 offsets,
-                self.bounds_check_mode,
+                bounds_check_mode,
                 self.bounds_check_warning,
                 per_sample_weights,
+                bounds_check_version=bounds_check_version,
             )
 
         return indices, offsets, per_sample_weights
@@ -2023,12 +2031,13 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             )
 
         # Bounds check (VBE-aware)
-        if self.bounds_check_mode != BoundsCheckMode.NONE:
+        bounds_check_mode, bounds_check_version = self._bounds_check_config()
+        if bounds_check_mode != BoundsCheckMode.NONE:
             torch.ops.fbgemm.bounds_check_indices(
                 self.rows_per_table,
                 indices,
                 offsets,
-                self.bounds_check_mode,
+                bounds_check_mode,
                 self.bounds_check_warning,
                 per_sample_weights,
                 B_offsets=vbe_metadata.B_offsets if vbe_metadata is not None else None,
@@ -2036,6 +2045,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
                 b_t_map=b_t_map,
                 info_B_num_bits=info_B_num_bits if info_B_num_bits > 0 else -1,
                 info_B_mask=info_B_mask if info_B_mask > 0 else -1,
+                bounds_check_version=bounds_check_version,
             )
 
         return TritonTBE.apply(
