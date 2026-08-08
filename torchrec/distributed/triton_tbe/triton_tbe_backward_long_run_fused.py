@@ -62,7 +62,7 @@ def triton_tbe_backward_long_run_fused_weighted(
     applies the optimizer update — eliminating a separate apply kernel launch.
     """
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    buffer_size: tl.constexpr = 16
+    buffer_size: tl.constexpr = 8
     buffer_offsets = tl.arange(0, buffer_size)
 
     clc_phase_producer = 1
