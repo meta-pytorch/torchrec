@@ -541,7 +541,7 @@ def triton_tbe_backward_short_run_unweighted(
 ) -> None:
     """Backward kernel for short runs only. Each program handles one short run."""
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    buffer_size: tl.constexpr = 16
+    buffer_size: tl.constexpr = 8
     buffer_offsets = tl.arange(0, buffer_size)
 
     if USE_CLC:
@@ -1037,7 +1037,7 @@ def triton_tbe_backward_long_run_grad_accum_unweighted(
     and atomically adds the partial result into a temp gradient buffer.
     """
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    buffer_size: tl.constexpr = 16
+    buffer_size: tl.constexpr = 8
     buffer_offsets = tl.arange(0, buffer_size)
 
     pid = tl.program_id(0)
