@@ -275,6 +275,7 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
     FEATURE_START: tl.constexpr = 0,
     FEATURE_END: tl.constexpr = -1,
     BAGS_PER_PROGRAM: tl.constexpr = 1,
+    UNROLL8: tl.constexpr = False,
     FUSED_BOUNDS_CHECK: tl.constexpr = False,
 ) -> None:
     base_b = tl.program_id(0).to(tl.int64) * BAGS_PER_PROGRAM
@@ -317,7 +318,7 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
                 )
                 bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
 
-                step: tl.constexpr = 4
+                step: tl.constexpr = 8 if UNROLL8 else 4
                 ns = (end - start) // step
                 endn = start + step * ns
 
@@ -357,6 +358,42 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
                             + invalid_2.to(tl.int32)
                             + invalid_3.to(tl.int32)
                         )
+                    if UNROLL8:
+                        row_idx_4, invalid_4 = _load_checked_index(
+                            indices_ptr,
+                            idx + 4,
+                            num_rows if FUSED_BOUNDS_CHECK else 0,
+                            True,
+                            FUSED_BOUNDS_CHECK,
+                        )
+                        row_idx_5, invalid_5 = _load_checked_index(
+                            indices_ptr,
+                            idx + 5,
+                            num_rows if FUSED_BOUNDS_CHECK else 0,
+                            True,
+                            FUSED_BOUNDS_CHECK,
+                        )
+                        row_idx_6, invalid_6 = _load_checked_index(
+                            indices_ptr,
+                            idx + 6,
+                            num_rows if FUSED_BOUNDS_CHECK else 0,
+                            True,
+                            FUSED_BOUNDS_CHECK,
+                        )
+                        row_idx_7, invalid_7 = _load_checked_index(
+                            indices_ptr,
+                            idx + 7,
+                            num_rows if FUSED_BOUNDS_CHECK else 0,
+                            True,
+                            FUSED_BOUNDS_CHECK,
+                        )
+                        if FUSED_BOUNDS_CHECK:
+                            warning_count += (
+                                invalid_4.to(tl.int32)
+                                + invalid_5.to(tl.int32)
+                                + invalid_6.to(tl.int32)
+                                + invalid_7.to(tl.int32)
+                            )
                     row_0 = tl.load(
                         weight_ptr
                         + table_offset
@@ -389,12 +426,52 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
                         mask=mask,
                         other=0,
                     )
+                    if UNROLL8:
+                        row_4 = tl.load(
+                            weight_ptr
+                            + table_offset
+                            + row_idx_4 * embedding_dim
+                            + col_offsets,
+                            mask=mask,
+                            other=0,
+                        )
+                        row_5 = tl.load(
+                            weight_ptr
+                            + table_offset
+                            + row_idx_5 * embedding_dim
+                            + col_offsets,
+                            mask=mask,
+                            other=0,
+                        )
+                        row_6 = tl.load(
+                            weight_ptr
+                            + table_offset
+                            + row_idx_6 * embedding_dim
+                            + col_offsets,
+                            mask=mask,
+                            other=0,
+                        )
+                        row_7 = tl.load(
+                            weight_ptr
+                            + table_offset
+                            + row_idx_7 * embedding_dim
+                            + col_offsets,
+                            mask=mask,
+                            other=0,
+                        )
                     bag_output += (
                         row_0.to(tl.float32)
                         + row_1.to(tl.float32)
                         + row_2.to(tl.float32)
                         + row_3.to(tl.float32)
                     )
+                    if UNROLL8:
+                        bag_output += (
+                            row_4.to(tl.float32)
+                            + row_5.to(tl.float32)
+                            + row_6.to(tl.float32)
+                            + row_7.to(tl.float32)
+                        )
 
                 for idx in range(endn, end):
                     row_idx, invalid = _load_checked_index(
@@ -1587,6 +1664,7 @@ class TritonTBE(torch.autograd.Function):
                         FEATURE_START=feature_start,
                         FEATURE_END=feature_end,
                         BAGS_PER_PROGRAM=bags_per_program,
+                        UNROLL8=bags_per_program == 2,
                         FUSED_BOUNDS_CHECK=fused_bounds_check,
                         num_warps=num_warps,
                     )
