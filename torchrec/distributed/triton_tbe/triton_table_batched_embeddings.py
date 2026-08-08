@@ -42,7 +42,9 @@ from torchrec.distributed.triton_tbe.triton_tbe_backward_long_run_fused import (
     triton_tbe_backward_long_run_fused_weighted,
 )
 from torchrec.distributed.triton_tbe.triton_tbe_backward_utils import (
+    _CLC_FIXED_GRID,
     _expand_long_runs,
+    _FIXED_GRID,
     _LONG_RUN_THRESHOLD,
     _stochastic_rounding_store,
     get_grid_size,
@@ -1774,7 +1776,10 @@ class TritonTBE(torch.autograd.Function):
                 stochastic_rounding_seed=stochastic_rounding_seed,
                 vbe=vbe,
             )
-            if use_clc:
+            use_fused_clc_long_run = (
+                use_clc and max_num_runs > _CLC_FIXED_GRID * _LONG_RUN_THRESHOLD
+            )
+            if use_fused_clc_long_run:
                 # CLC path: fused long-run grad accumulation + optimizer apply
                 # CLC Path is exclusive to CUDA B200+.
                 grad_accum_counter = programs_per_long_run.clone()
@@ -1818,12 +1823,17 @@ class TritonTBE(torch.autograd.Function):
             else:
                 # Non-CLC path: separate grad accumulation + apply kernels
                 # Kernel 2: long-run grad accumulation (weighted)
+                long_accum_grid_size = (
+                    min(_FIXED_GRID, max_long_run_programs)
+                    if use_clc
+                    else long_accum_or_fused_grid_size
+                )
                 bwd_long_accum_w = (
                     _amd_bwd_long_accum_weighted
                     if _use_amd
                     else triton_tbe_backward_long_run_grad_accum_weighted
                 )
-                bwd_long_accum_w[(long_accum_or_fused_grid_size,)](
+                bwd_long_accum_w[(long_accum_grid_size,)](
                     dout,
                     infos_sorted,
                     long_run_program_seg_starts,
@@ -1912,7 +1922,10 @@ class TritonTBE(torch.autograd.Function):
                 stochastic_rounding_seed=stochastic_rounding_seed,
                 vbe=vbe,
             )
-            if use_clc:
+            use_fused_clc_long_run = (
+                use_clc and max_num_runs > _CLC_FIXED_GRID * _LONG_RUN_THRESHOLD
+            )
+            if use_fused_clc_long_run:
                 # CLC path: fused long-run grad accumulation + optimizer apply
                 # CLC Path is exclusive to CUDA B200+.
                 grad_accum_counter = programs_per_long_run.clone()
@@ -1955,12 +1968,17 @@ class TritonTBE(torch.autograd.Function):
             else:
                 # Non-CLC path: separate grad accumulation + apply kernels
                 # Kernel 2: long-run grad accumulation
+                long_accum_grid_size = (
+                    min(_FIXED_GRID, max_long_run_programs)
+                    if use_clc
+                    else long_accum_or_fused_grid_size
+                )
                 bwd_long_accum_uw = (
                     _amd_bwd_long_accum_unweighted
                     if _use_amd
                     else triton_tbe_backward_long_run_grad_accum_unweighted
                 )
-                bwd_long_accum_uw[(long_accum_or_fused_grid_size,)](
+                bwd_long_accum_uw[(long_accum_grid_size,)](
                     dout,
                     infos_sorted,
                     long_run_program_seg_starts,
