@@ -64,9 +64,9 @@ def main():
             # fbgemm only supports cuda 12.6, 12.8, and 13.0
             # Re-enable once fbgemm-gpu releases cu132 nightly builds
             continue
-        if entry["python_version"] in ("3.9"):
-            # stop python3.9 support
-            # for python version: https://devguide.python.org/versions/
+        if entry["python_version"] == "3.15":
+            # fbgemm-gpu does not support python3.15 yet
+            # Re-enable once fbgemm-gpu releases python3.15 nightly builds
             continue
         new_matrix_entries.append(entry)
 
