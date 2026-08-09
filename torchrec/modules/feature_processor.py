@@ -101,7 +101,10 @@ class PositionWeightedModule(BaseFeatureProcessor):
                 values=features[key].values(),
                 lengths=features[key].lengths(),
                 offsets=features[key].offsets(),
-                weights=torch.gather(position_weight, dim=0, index=seq),
+                # Publishing can intentionally keep weights on CPU while exporting
+                # GPU preproc. Gather on the runtime index device so PT2 export and
+                # serving do not mix a CPU position weight with CUDA indices.
+                weights=torch.gather(position_weight.to(seq.device), dim=0, index=seq),
             )
         return position_weighted_module_update_features(features, weighted_features)
 
@@ -202,7 +205,7 @@ class PositionWeightedProcessor(BaseGroupedFeatureProcessor):
                 weighted_features_values.append(features_dict[key].values())
                 weighted_features_lengths.append(features_dict[key].lengths())
                 weighted_features_weights.append(
-                    torch.gather(position_weight, dim=0, index=seq)
+                    torch.gather(position_weight.to(seq.device), dim=0, index=seq)
                 )
             return KeyedJaggedTensor.from_lengths_sync(
                 keys=weighted_features_names,
@@ -249,10 +252,11 @@ class PositionWeightedProcessor(BaseGroupedFeatureProcessor):
                 if not has_normal_id_list_feature:
                     processed_features_weights: List[torch.Tensor] = []
                     for feature_index, feature_name in enumerate(feature_names):
+                        seq = seqs[feature_index]
                         processed_weight = torch.gather(
-                            self.position_weights[feature_name],
+                            self.position_weights[feature_name].to(seq.device),
                             dim=0,
-                            index=seqs[feature_index],
+                            index=seq,
                         )
                         processed_features_weights.append(processed_weight)
                     fp_features = KeyedJaggedTensor(
@@ -282,10 +286,11 @@ class PositionWeightedProcessor(BaseGroupedFeatureProcessor):
                         if feature_name in self.max_feature_lengths:
                             feature_value = feature_values[feature_index]
                             feature_length = feature_lengths[feature_index]
+                            seq = seqs[feature_index]
                             processed_weight = torch.gather(
-                                self.position_weights[feature_name],
+                                self.position_weights[feature_name].to(seq.device),
                                 dim=0,
-                                index=seqs[feature_index],
+                                index=seq,
                             )
                             processed_features_names.append(feature_name)
                             processed_features_lengths.append(feature_length)

@@ -97,7 +97,7 @@ class PositionWeightedModule(FeatureProcessor):
             values=features.values(),
             lengths=features.lengths(),
             offsets=features.offsets(),
-            weights=torch.gather(self.position_weight, dim=0, index=seq),
+            weights=torch.gather(self.position_weight.to(seq.device), dim=0, index=seq),
         )
         return weighted_features
 
