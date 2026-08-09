@@ -157,7 +157,17 @@ def get_weights_list(
     seqs = torch.split(cat_seq, features.length_per_key())
     for key, seq in zip(features.keys(), seqs):
         if key in position_weights.keys():
-            weights_list.append(torch.gather(position_weights[key], dim=0, index=seq))
+            # Gather on the index's device. PositionWeightedModuleCollection caches
+            # plain references in `position_weights_dict`, which (unlike the
+            # `position_weights` ParameterDict) does NOT follow a module `.to(device)`
+            # -- so under GPU preproc (the `local` net exported on cuda) the param can
+            # still be on cpu while `seq` is cuda, tripping
+            # FakeTensorDeviceMismatchError("... found at least two devices, cpu and
+            # cuda:0") during PT2/sigmoid export. Mirrors the `device=` already used by
+            # the else-branch below; a no-op when both are already co-located.
+            weights_list.append(
+                torch.gather(position_weights[key].to(seq.device), dim=0, index=seq)
+            )
         else:
             weights_list.append(
                 torch.ones(seq.shape[0], device=features.values().device)
