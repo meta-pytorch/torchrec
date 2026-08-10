@@ -326,7 +326,9 @@ def create_sharding_infos_by_sharding_device_group(
                         getattr(config, "virtual_table_eviction_policy", None)
                         # TODO: Need to check if attribute exists for BC
                     ),
-                    stash_weights=getattr(config, "stash_weights", False),
+                    stash_weights=MemoryStashingManager.resolve_stash_weights(
+                        table_name, config
+                    ),
                 ),
                 param_sharding=parameter_sharding,
                 param=param,
@@ -960,7 +962,9 @@ class ShardedEmbeddingBagCollection(
                         getattr(config, "virtual_table_eviction_policy", None)
                         # TODO: Need to check if attribute exists for BC
                     ),
-                    stash_weights=getattr(config, "stash_weights", False),
+                    stash_weights=MemoryStashingManager.resolve_stash_weights(
+                        table_name, config
+                    ),
                 ),
                 param_sharding=parameter_sharding,
                 param=param,
