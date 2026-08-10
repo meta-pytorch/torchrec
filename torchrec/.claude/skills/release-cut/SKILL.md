@@ -142,6 +142,33 @@ Beyond checking that the workflows succeed, the user should also inspect the **r
    Successfully installed torch-2.10.0+cpu
    ```
 
+### Local Wheel Validation on a devgpu (Meta-internal)
+
+The `Validate binaries` workflow covers a fixed matrix. To exercise the published wheels directly across every python and CUDA variant, run `fbcode/torchrec/fb/scripts/pip_lib_validation.sh` from a devgpu inside fbsource. It creates one conda env per combination, pip-installs `torch` / `fbgemm-gpu` / `torchrec` from `download.pytorch.org`, imports each, and prints a pass/fail summary.
+
+```bash
+# full matrix for the 1.8 release line; CHANNEL defaults to test
+PYTHON="3.10 3.11 3.12 3.13 3.14" CUDA="cpu cu126 cu130" \
+  fbcode/torchrec/fb/scripts/pip_lib_validation.sh 1.8
+```
+
+The argument names the torchrec/fbgemm-gpu release line (`8`, `1.8`, `v1.8` and `v1.8.0` are equivalent); torch is derived as `2.(minor + 5)`. `CHANNEL=nightly` and `CHANNEL=release` check the other channels — `test` is the correct one before promotion (Step 14), for the same reason `Validate binaries` uses it. A healthy run ends with `15/15 passed`.
+
+**Interpreting an `undefined symbol` failure.** If importing `fbgemm_gpu` raises `OSError: ... undefined symbol: ...`, the `.so` exists but was built against a different libtorch than the `torch` it resolved to. Confirm which symbol is missing before escalating:
+
+```bash
+# what fbgemm needs vs what libc10 provides
+nm -D --undefined-only <site-packages>/fbgemm_gpu/<failing>.so | c++filt | grep -i cow
+nm -D --defined-only  <site-packages>/torch/lib/libc10.so     | c++filt | grep -i cow
+```
+
+A genuine mismatch means the published `fbgemm-gpu` wheel needs an FBGEMM-side rebuild against the final torch — it is not a torchrec-side fix, and it blocks the release. Rule out a stale conda env first (the script reuses an env whose name matches, and the name encodes only python and CUDA, not the release line), by removing the envs and re-running:
+
+```bash
+conda env list
+for e in $(conda env list | awk '/^pip_validation_/{print $1}'); do conda env remove -yn "$e"; done
+```
+
 ## Step 11 — Create a Release Candidate Tag
 
 Create a release candidate tag following the naming pattern `v<version>-rc<N>` (e.g., `v1.5.0-rc1` for the first candidate):
