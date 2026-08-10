@@ -59,6 +59,24 @@ class PositionWeightedModuleTest(unittest.TestCase):
         gm = torch.fx.GraphModule(pw, Tracer().trace(pw))
         torch.jit.script(gm)
 
+    def test_default_fx_trace_preserves_gather_graph(self) -> None:
+        graph = torch.fx.Tracer().trace(PositionWeightedModule({"f1": 10}))
+
+        self.assertFalse(
+            any(
+                node.op == "call_method" and node.target == "to" for node in graph.nodes
+            )
+        )
+        self.assertFalse(
+            any(
+                node.op == "call_function"
+                and node.target == getattr
+                and len(node.args) > 1
+                and node.args[1] == "device"
+                for node in graph.nodes
+            )
+        )
+
     def test_populate_weights_PositionWeightedProcessor(self) -> None:
         features_max_length = {"f1": 10, "f2": 3}
         pw = PositionWeightedProcessor(features_max_length)
