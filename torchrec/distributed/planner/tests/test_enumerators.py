@@ -9,7 +9,7 @@
 
 import math
 import unittest
-from typing import cast, List
+from typing import cast, List, NamedTuple
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -40,6 +40,8 @@ from torchrec.distributed.test_utils.test_model import (
 )
 from torchrec.distributed.types import ModuleSharder, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.feature_processor_ import PositionWeightedModuleCollection
+from torchrec.modules.fp_embedding_modules import FeatureProcessedEmbeddingBagCollection
 
 EXPECTED_RW_SHARD_SIZES = [
     [[13, 20], [13, 20], [13, 20], [13, 20], [13, 20], [13, 20], [13, 20], [9, 20]],
@@ -553,6 +555,86 @@ class TestEnumerators(unittest.TestCase):
         )
         self.addCleanup(_get_optimizer_multipler_patcher.stop)
         self._get_optimizer_multipler_mock = _get_optimizer_multipler_patcher.start()
+
+    def test_get_stash_weights_ebc(self) -> None:
+        # EMS stash awareness: the enumerator reads the per-table stash_weights flag
+        # off EmbeddingBagCollection configs (set before planning).
+        ebc = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    num_embeddings=100,
+                    embedding_dim=16,
+                    name="stash_table",
+                    feature_names=["f0"],
+                    stash_weights=True,
+                ),
+                EmbeddingBagConfig(
+                    num_embeddings=100,
+                    embedding_dim=16,
+                    name="plain_table",
+                    feature_names=["f1"],
+                ),
+            ],
+        )
+        self.assertTrue(self.enumerator._get_stash_weights("stash_table", ebc))
+        self.assertFalse(self.enumerator._get_stash_weights("plain_table", ebc))
+        self.assertFalse(self.enumerator._get_stash_weights("missing_table", ebc))
+
+    def test_get_stash_weights_via_tables_accessor(self) -> None:
+        # FB pooled-embedding modules (e.g. VariableLengthEmbeddingArch) expose their
+        # per-table configs via tables(); the enumerator reads stash_weights through
+        # that accessor without importing the FB module type.
+        class _FakeConfig(NamedTuple):
+            name: str
+            stash_weights: bool
+
+        class _FakeVLEModule(torch.nn.Module):
+            def tables(self) -> List[_FakeConfig]:
+                return [
+                    _FakeConfig("vle_stash", True),
+                    _FakeConfig("vle_plain", False),
+                ]
+
+        module = _FakeVLEModule()
+        self.assertTrue(self.enumerator._get_stash_weights("vle_stash", module))
+        self.assertFalse(self.enumerator._get_stash_weights("vle_plain", module))
+        self.assertFalse(self.enumerator._get_stash_weights("missing", module))
+
+    def test_get_stash_weights_unknown_module_returns_false(self) -> None:
+        # A module that exposes no embedding configs contributes no stashing.
+        self.assertFalse(self.enumerator._get_stash_weights("any", torch.nn.Module()))
+
+    def test_get_stash_weights_fp_ebc(self) -> None:
+        # FeatureProcessedEmbeddingBagCollection (e.g. position_ebc /
+        # score_bucketize_ebc) wraps an EmbeddingBagCollection. The enumerator hands
+        # _get_stash_weights the OUTER FP-EBC, which is neither an EBC/EC nor exposes
+        # a tables() accessor, so the flag must be read by unwrapping the inner EBC's
+        # configs -- mirroring how the training framework marks them via recursion.
+        inner_ebc = EmbeddingBagCollection(
+            tables=[
+                EmbeddingBagConfig(
+                    num_embeddings=100,
+                    embedding_dim=16,
+                    name="fp_stash_table",
+                    feature_names=["f0"],
+                    stash_weights=True,
+                ),
+                EmbeddingBagConfig(
+                    num_embeddings=100,
+                    embedding_dim=16,
+                    name="fp_plain_table",
+                    feature_names=["f1"],
+                ),
+            ],
+            is_weighted=True,
+        )
+        fp_ebc = FeatureProcessedEmbeddingBagCollection(
+            inner_ebc,
+            PositionWeightedModuleCollection(max_feature_lengths={"f0": 10, "f1": 10}),
+        )
+        self.assertTrue(self.enumerator._get_stash_weights("fp_stash_table", fp_ebc))
+        self.assertFalse(self.enumerator._get_stash_weights("fp_plain_table", fp_ebc))
+        self.assertFalse(self.enumerator._get_stash_weights("missing_table", fp_ebc))
 
     def test_dp_sharding(self) -> None:
         sharding_options = self.enumerator.enumerate(
