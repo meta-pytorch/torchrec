@@ -85,21 +85,15 @@ conda run -n "${CONDA_ENV}" python --version
 
 
 # figure out CUDA VERSION
+# fbgemm only supports cuda 12.6 and 13.0, skip any other version in the matrix
 if [[ ${MATRIX_GPU_ARCH_TYPE} = 'cuda' ]]; then
-    if [[ ${MATRIX_GPU_ARCH_VERSION} = '11.8' ]]; then
-        export CUDA_VERSION="cu118"
-    elif [[ ${MATRIX_GPU_ARCH_VERSION} = '12.1' ]]; then
-        export CUDA_VERSION="cu121"
-    elif [[ ${MATRIX_GPU_ARCH_VERSION} = '12.6' ]]; then
+    if [[ ${MATRIX_GPU_ARCH_VERSION} = '12.6' ]]; then
         export CUDA_VERSION="cu126"
-    elif [[ ${MATRIX_GPU_ARCH_VERSION} = '12.8' ]]; then
-        export CUDA_VERSION="cu128"
-    elif [[ ${MATRIX_GPU_ARCH_VERSION} = '12.9' ]]; then
-        export CUDA_VERSION="cu129"
     elif [[ ${MATRIX_GPU_ARCH_VERSION} = '13.0' ]]; then
         export CUDA_VERSION="cu130"
     else
-        export CUDA_VERSION="cu126"
+        echo "Skipping validation: cuda ${MATRIX_GPU_ARCH_VERSION} is not supported by fbgemm-gpu"
+        exit 0
     fi
 else
     export CUDA_VERSION="cpu"

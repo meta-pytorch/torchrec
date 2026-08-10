@@ -60,9 +60,9 @@ def main():
     new_matrix_entries = []
 
     for entry in full_matrix["include"]:
-        if entry["desired_cuda"] == "cu132":
-            # fbgemm only supports cuda 12.6, 12.8, and 13.0
-            # Re-enable once fbgemm-gpu releases cu132 nightly builds
+        if entry["desired_cuda"] not in ("cpu", "cu126", "cu130"):
+            # fbgemm only supports cuda 12.6 and 13.0
+            # Re-enable a version once fbgemm-gpu releases builds for it
             continue
         if entry["python_version"] in ("3.9"):
             # stop python3.9 support
