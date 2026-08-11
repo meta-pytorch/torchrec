@@ -13,23 +13,13 @@ import logging as logger
 import os
 from collections import defaultdict, OrderedDict
 from functools import wraps
-from typing import (
-    Any,
-    Callable,
-    cast,
-    Dict,
-    Iterator,
-    List,
-    Optional,
-    Protocol,
-    runtime_checkable,
-    Set,
-    Tuple,
-    Type,
-)
+from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Set, Tuple, Type
 
 import torch
 import torch.distributed as dist
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+    SplitTableBatchedEmbeddingBagsCodegen,
+)
 from torch import nn
 from torch.autograd.profiler import record_function
 from torch.distributed.algorithms.ddp_comm_hooks import (
@@ -100,11 +90,14 @@ except OSError:
 _DDP_STATE_DICT_PREFIX = "module."
 
 
-@runtime_checkable
-class _EmbeddingKernelWithSyncTensors(Protocol):
-    def split_embedding_weights(self) -> Any: ...
+def _is_triton_tbe(module: nn.Module) -> bool:
+    return getattr(module, "_is_triton_tbe", False) is True
 
-    def get_optimizer_state(self) -> Any: ...
+
+def _is_embedding_kernel_with_sync_tensors(module: nn.Module) -> bool:
+    return isinstance(module, SplitTableBatchedEmbeddingBagsCodegen) or _is_triton_tbe(
+        module
+    )
 
 
 def _populate_updatable_modules(
@@ -1572,10 +1565,13 @@ class DMPCollection(DistributedModelParallel):
         """
         assert ctx.replica_pg is not None, "replica_pg is not initialized!"
 
+        sync_modules = [module for module, _ in ctx.modules_to_sync]
         if (
             self._custom_all_reduce is None
             and not self._use_sharded_relay
             and ctx.replica_pg.size() == 1
+            and bool(sync_modules)
+            and all(_is_triton_tbe(module) for module in sync_modules)
         ):
             return
 
@@ -1877,7 +1873,9 @@ class DMPCollection(DistributedModelParallel):
                 return
             visited_module_ids.add(module_id)
 
-            if isinstance(module, _EmbeddingKernelWithSyncTensors):
+            if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
+                sharded_modules.append((module, prev_module))
+            elif _is_triton_tbe(module):
                 sharded_modules.append((module, prev_module))
             if isinstance(module, BaseShardedManagedCollisionEmbeddingCollection):
                 sharded_modules.append((module, prev_module))
@@ -1910,7 +1908,9 @@ class DMPCollection(DistributedModelParallel):
                 return
             visited_module_ids.add(module_id)
 
-            if isinstance(module, _EmbeddingKernelWithSyncTensors):
+            if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
+                sharded_modules.append((module, prev_module))
+            elif _is_triton_tbe(module):
                 sharded_modules.append((module, prev_module))
             if isinstance(module, sharded_module):  # pyre-ignore[6]
                 for lookup in module._lookups:  # pyre-ignore[29]
@@ -1940,11 +1940,12 @@ class DMPCollection(DistributedModelParallel):
             )
             hash_zch_modules: List[Tuple[nn.Module, str]] = []
             for emb_kernel, _ in context.modules_to_sync:
-                if isinstance(emb_kernel, _EmbeddingKernelWithSyncTensors):
+                if _is_embedding_kernel_with_sync_tensors(emb_kernel):
+                    sync_kernel = cast(Any, emb_kernel)
                     # If kernel is TBE, then cache the weights and optimizer tensors
-                    for w in emb_kernel.split_embedding_weights():  # pyre-ignore[29]
+                    for w in sync_kernel.split_embedding_weights():
                         weights_by_dtype[w.dtype].append(w)
-                    for state in emb_kernel.get_optimizer_state():
+                    for state in sync_kernel.get_optimizer_state():
                         opt_tensor = state["sum"]
                         optimizer_by_dtype[opt_tensor.dtype].append(opt_tensor)
 

@@ -33,6 +33,7 @@ class MockModule(nn.Module):
 class MockSyncableEmbeddingKernel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self._is_triton_tbe = True
         self.weight = nn.Parameter(torch.ones(2, 3))
         self.optimizer_state = torch.ones(2)
 
@@ -292,7 +293,7 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
         dmp._dmp_wrapped_module = module
         return dmp
 
-    def test_structural_kernel_discovery_caches_sync_tensors_once(self) -> None:
+    def test_marked_triton_kernel_discovery_caches_sync_tensors_once(self) -> None:
         kernel = MockSyncableEmbeddingKernel()
         dmp = self._dmp_shell(MockLookupContainer(kernel))
         context = self._context()
@@ -307,18 +308,49 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
             {torch.float32: [kernel.optimizer_state]},
         )
 
+    def test_unmarked_structural_kernel_is_ignored(self) -> None:
+        kernel = MockSyncableEmbeddingKernel()
+        del kernel._is_triton_tbe
+        dmp = self._dmp_shell(MockLookupContainer(kernel))
+        context = self._context()
+
+        dmp._group_sharded_modules([context])
+        dmp._cache_sync_tensors([context])
+
+        self.assertEqual(context.modules_to_sync, [])
+        self.assertEqual(context.weights_by_dtype, {})
+        self.assertEqual(context.optimizer_tensors_by_dtype, {})
+
     def test_sync_skips_default_allreduce_for_single_replica(self) -> None:
         dmp = self._dmp_shell(MockModule())
         dmp._custom_all_reduce = None
         dmp._use_sharded_relay = False
         dmp._allreduce_tensors = MagicMock()
         context = self._context()
+        kernel = MockSyncableEmbeddingKernel()
+        context.modules_to_sync = [(kernel, kernel)]
         context.replica_pg = MagicMock()
         context.replica_pg.size.return_value = 1
 
         dmp._sync(context)
 
         dmp._allreduce_tensors.assert_not_called()
+
+    def test_sync_keeps_default_allreduce_for_non_triton_module(self) -> None:
+        dmp = self._dmp_shell(MockModule())
+        dmp._custom_all_reduce = None
+        dmp._use_sharded_relay = False
+        dmp._restore_stashed_sync_tensors = MagicMock()
+        dmp._allreduce_tensors = MagicMock()
+        context = self._context()
+        module = MockModule()
+        context.modules_to_sync = [(module, module)]
+        context.replica_pg = MagicMock()
+        context.replica_pg.size.return_value = 1
+
+        dmp._sync(context)
+
+        dmp._allreduce_tensors.assert_called_once()
 
 
 class TestShardingStrategy(unittest.TestCase):

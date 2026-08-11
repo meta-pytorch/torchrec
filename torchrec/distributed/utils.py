@@ -451,6 +451,7 @@ def add_params_from_parameter_sharding(
 
     if parameter_sharding.compute_kernel != EmbeddingComputeKernel.FUSED_TRITON.value:
         fused_params.pop("fused_bounds_check", None)
+        fused_params.pop("enable_triton_tbe_optimizations", None)
 
     # update fused_params using params from parameter_sharding
     # this will take precidence over the fused_params provided from sharders
