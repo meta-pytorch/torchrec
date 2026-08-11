@@ -12,10 +12,19 @@ from typing import Dict, List, Mapping, Optional
 
 import torch
 from torch import distributed as dist, nn
+from torch.fx._symbolic_trace import is_fx_symbolic_tracing
 from torch.nn.modules.module import _IncompatibleKeys
 from torchrec.pt2.checks import is_non_strict_exporting
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 from torchrec.types import CopyMixIn
+
+
+def _position_weight_for_gather(
+    position_weight: torch.Tensor, index: torch.Tensor
+) -> torch.Tensor:
+    if torch.jit.is_scripting() or not is_fx_symbolic_tracing():
+        return position_weight.to(index.device)
+    return position_weight
 
 
 class FeatureProcessor(nn.Module):
@@ -97,7 +106,11 @@ class PositionWeightedModule(FeatureProcessor):
             values=features.values(),
             lengths=features.lengths(),
             offsets=features.offsets(),
-            weights=torch.gather(self.position_weight, dim=0, index=seq),
+            weights=torch.gather(
+                _position_weight_for_gather(self.position_weight, seq),
+                dim=0,
+                index=seq,
+            ),
         )
         return weighted_features
 
