@@ -17,6 +17,7 @@ from typing import (
     Optional,
     Protocol,
     runtime_checkable,
+    Set,
     Tuple,
     Union,
 )
@@ -182,6 +183,7 @@ class MemoryStashingManager:
     # ``chunked_copy_``'s ``chunk_size_bytes``. Defaults to
     # ``_STASH_CHUNK_SIZE_BYTES``; override via ``set_trunk_size``.
     _stash_chunk_size_bytes: int = _STASH_CHUNK_SIZE_BYTES
+    _stashed_tables: Optional[Set[str]] = None
 
     @classmethod
     def _log_ems_once(
@@ -243,6 +245,27 @@ class MemoryStashingManager:
     def is_enabled(cls) -> bool:
         """Return whether memory stashing streams have been initialized."""
         return cls._device_to_host_stream is not None
+
+    @classmethod
+    def set_stashed_tables(cls, tables: Optional[Set[str]]) -> None:
+        """Set the table names selected for stashing by the planner, or None to clear."""
+        cls._stashed_tables = tables
+
+    @classmethod
+    def get_stashed_tables(cls) -> Optional[Set[str]]:
+        """Return the planner-selected stashed table names, or None if not set."""
+        return cls._stashed_tables
+
+    @classmethod
+    def resolve_stash_weights(cls, table_name: str, config: Any) -> bool:
+        """Resolve whether a table should be stashed.
+
+        Checks the planner-selected table set first. Falls back to the
+        per-table ``stash_weights`` attribute on the config object.
+        """
+        if cls._stashed_tables is not None:
+            return table_name in cls._stashed_tables
+        return getattr(config, "stash_weights", False)
 
     @classmethod
     def set_streams(
@@ -308,6 +331,7 @@ class MemoryStashingManager:
         cls._stash_chunk_size_bytes = _STASH_CHUNK_SIZE_BYTES
         cls._pending_stash_callbacks.clear()
         cls._staged_storage_buffers.clear()
+        cls._stashed_tables = None
         if cls._stash_executor is not None:
             cls._stash_executor.shutdown(wait=False)
             cls._stash_executor = None
