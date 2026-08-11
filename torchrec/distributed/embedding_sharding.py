@@ -487,6 +487,8 @@ def _get_grouping_fused_params(
     if FUSED_PARAM_SSD_TABLE_LIST in grouping_fused_params:
         del grouping_fused_params[FUSED_PARAM_SSD_TABLE_LIST]
 
+    grouping_fused_params.pop("bag_size_hints", None)
+
     if grouping_fused_params.get(USE_ONE_TBE_PER_TABLE, False):
         # Replace with unique value to force it into singleton group.
         # Name is used as unique value so we won't group multiple shard belonging
@@ -550,6 +552,25 @@ def _all_tables_are_quant_kernel(
     Return if all tables have quant compute kernel.
     """
     return all(table.compute_kernel == EmbeddingComputeKernel.QUANT for table in tables)
+
+
+def _get_grouped_bag_size_hints(
+    grouped_tables: List[ShardedEmbeddingTable],
+) -> Optional[List[int]]:
+    grouped_bag_size_hints: List[int] = []
+    # Grouping preserves table order. GroupedEmbeddingConfig.feature_names() uses
+    # the same table and per-table feature order consumed by the TBE.
+    for table in grouped_tables:
+        table_bag_size_hints = (table.fused_params or {}).get("bag_size_hints")
+        if table_bag_size_hints is None:
+            return None
+        if len(table_bag_size_hints) != table.num_features():
+            raise ValueError(
+                f"bag_size_hints for {table.name} must have "
+                f"{table.num_features()} entries, got {len(table_bag_size_hints)}"
+            )
+        grouped_bag_size_hints.extend(table_bag_size_hints)
+    return grouped_bag_size_hints
 
 
 # group tables by `DataType`, `PoolingType`, and `EmbeddingComputeKernel`.
@@ -650,6 +671,11 @@ def group_tables(
             cache_load_factor = _get_weighted_avg_cache_load_factor(grouped_tables)
             if cache_load_factor is not None:
                 per_tbe_fused_params[CACHE_LOAD_FACTOR_STR] = cache_load_factor
+
+            if compute_kernel_type == EmbeddingComputeKernel.FUSED_TRITON:
+                grouped_bag_size_hints = _get_grouped_bag_size_hints(grouped_tables)
+                if grouped_bag_size_hints is not None:
+                    per_tbe_fused_params["bag_size_hints"] = grouped_bag_size_hints
 
             grouped_embedding_configs.append(
                 GroupedEmbeddingConfig(

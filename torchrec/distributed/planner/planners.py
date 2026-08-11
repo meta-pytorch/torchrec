@@ -202,6 +202,15 @@ def to_sharding_plan(
             bounds_check_mode=sharding_option.bounds_check_mode,
             output_dtype=sharding_option.output_dtype,
             key_value_params=sharding_option.key_value_params,
+            bag_size_hints=(
+                [
+                    max(0, round(input_length))
+                    for input_length in sharding_option.input_lengths
+                ]
+                if sharding_option.compute_kernel
+                == EmbeddingComputeKernel.FUSED_TRITON.value
+                else None
+            ),
         )
         plan[sharding_option.path] = module_plan
     # pyrefly: ignore[bad-argument-type]
