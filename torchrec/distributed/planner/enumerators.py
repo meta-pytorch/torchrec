@@ -442,10 +442,15 @@ class EmbeddingEnumerator(Enumerator):
                 if compute_kernel not in GUARDED_COMPUTE_KERNELS
             ]
 
-        # setup filtered_compute_kernels
-        filtered_compute_kernels = list(
-            set(constrained_compute_kernels) & set(allowed_compute_kernels)
-        )
+        if (
+            EmbeddingComputeKernel.FUSED_TRITON.value in constrained_compute_kernels
+            and EmbeddingComputeKernel.FUSED_TRITON.value in allowed_compute_kernels
+        ):
+            filtered_compute_kernels = [EmbeddingComputeKernel.FUSED_TRITON.value]
+        else:
+            filtered_compute_kernels = list(
+                set(constrained_compute_kernels) & set(allowed_compute_kernels)
+            )
 
         # Remove KEY_VALUE if no device has SSD capacity — avoids expanding
         # the search space with infeasible options that fits_in() would reject.

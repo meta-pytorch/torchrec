@@ -994,6 +994,32 @@ class TestEnumerators(unittest.TestCase):
             [EmbeddingComputeKernel.FUSED_TRITON.value],
         )
 
+        fallback_constraints = {
+            "table_0": ParameterConstraints(
+                compute_kernels=[
+                    EmbeddingComputeKernel.FUSED_TRITON.value,
+                    EmbeddingComputeKernel.FUSED.value,
+                ]
+            )
+        }
+        fallback = EmbeddingEnumerator(
+            topology=MagicMock(),
+            batch_size=MagicMock(),
+            constraints=fallback_constraints,
+        )
+        self.assertEqual(
+            fallback._filter_compute_kernels("table_0", sharder_kernels, sharding_type),
+            [EmbeddingComputeKernel.FUSED_TRITON.value],
+        )
+        self.assertEqual(
+            fallback._filter_compute_kernels(
+                "table_0",
+                [EmbeddingComputeKernel.FUSED.value],
+                sharding_type,
+            ),
+            [EmbeddingComputeKernel.FUSED.value],
+        )
+
     def test_filter_compute_kernels_mch_ebc(self) -> None:
         constraint = ParameterConstraints(
             compute_kernels=[
