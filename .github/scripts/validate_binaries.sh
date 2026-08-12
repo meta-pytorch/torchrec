@@ -65,6 +65,12 @@ echo "Expected torch version: $EXPECTED_TORCH_VERSION.*"
 export PYTORCH_CUDA_PKG=""
 export CONDA_ENV="build_binary"
 
+# torchrec does not support python 3.15 yet, skip it in the validation matrix
+if [[ ${MATRIX_PYTHON_VERSION} = '3.15' || ${MATRIX_PYTHON_VERSION} = '3.15t' ]]; then
+    echo "Skipping validation: python ${MATRIX_PYTHON_VERSION} is not supported by torchrec"
+    exit 0
+fi
+
 if [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
     # use conda-forge to install python3.14t
     conda create -y -n "${CONDA_ENV}" python-freethreading=3.14
