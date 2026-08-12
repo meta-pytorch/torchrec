@@ -60,9 +60,8 @@ def main():
     new_matrix_entries = []
 
     for entry in full_matrix["include"]:
-        if entry["desired_cuda"] == "cu132":
-            # fbgemm only supports cuda 12.6, 12.8, and 13.0
-            # Re-enable once fbgemm-gpu releases cu132 nightly builds
+        if entry["desired_cuda"] in ("cu132", "cu134"):
+            # Keep TorchRec's matrix within FBGEMM wheel support.
             continue
         if entry["python_version"] in ("3.15", "3.15t"):
             # fbgemm-gpu does not support python3.15 yet
