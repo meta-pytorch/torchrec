@@ -1303,6 +1303,10 @@ class ShardingOption:
             by the planner to produce a more balanced plan.
         key_value_params (Optional[KeyValueParams]): Params for SSD TBE, either
             for SSD or PS.
+        stash_weights (bool): whether EMS (embedding memory stashing) stashes this
+            table's weights GPU->CPU during the dense forward/backward. Set on the
+            table config before planning; the planner reflects the HBM that stashing
+            frees in its storage estimates.
     """
 
     def __init__(
@@ -1326,6 +1330,7 @@ class ShardingOption:
         output_dtype: Optional[DataType] = None,
         key_value_params: Optional[KeyValueParams] = None,
         num_poolings: Optional[List[float]] = None,
+        stash_weights: bool = False,
     ) -> None:
         self.name = name
         self._tensor = tensor
@@ -1353,6 +1358,7 @@ class ShardingOption:
         self.output_dtype: Optional[DataType] = output_dtype
         self.key_value_params: Optional[KeyValueParams] = key_value_params
         self.num_poolings: Optional[List[float]] = num_poolings
+        self.stash_weights: bool = stash_weights
 
         child_module = module[1]
         self._module_type_key: str = (

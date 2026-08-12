@@ -9,7 +9,7 @@
 
 import copy
 import logging
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, cast, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -52,6 +52,7 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollection,
 )
 from torchrec.modules.embedding_tower import EmbeddingTower, EmbeddingTowerCollection
+from torchrec.modules.fp_embedding_modules import FeatureProcessedEmbeddingBagCollection
 from torchrec.modules.mc_embedding_modules import (
     BaseManagedCollisionEmbeddingCollection,
 )
@@ -284,6 +285,9 @@ class EmbeddingEnumerator(Enumerator):
                                 feature_names=feature_names,
                                 output_dtype=output_dtype,
                                 key_value_params=key_value_params,
+                                stash_weights=self._get_stash_weights(
+                                    name, child_module
+                                ),
                             )
                         )
                 if not sharding_options_per_table:
@@ -350,6 +354,46 @@ class EmbeddingEnumerator(Enumerator):
 
         # If table with matching name not found, return None
         return None
+
+    def _get_stash_weights(self, parameter: str, module: nn.Module) -> bool:
+        """Whether EMS (embedding memory stashing) stashes this table's weights.
+
+        Reads the per-table ``stash_weights`` flag, which is set on the embedding
+        config before planning by the training framework. The planner uses this to
+        reflect the HBM that stashing frees in its storage estimates. Returns
+        ``False`` when the module/table has no such config.
+
+        Args:
+            parameter (str): name of the embedding table.
+            module (nn.Module): module to be sharded.
+
+        Returns:
+            bool: the table's ``stash_weights`` flag, or False if not found.
+        """
+        embedding_configs: Sequence[Any]
+        if isinstance(module, EmbeddingBagCollection):
+            embedding_configs = module.embedding_bag_configs()
+        elif isinstance(module, FeatureProcessedEmbeddingBagCollection):
+            # FP-EBC wraps an EmbeddingBagCollection; the enumerator hands the
+            # outer FP-EBC here, so unwrap to the inner EBC's configs. The training
+            # framework flags these tables for stashing by recursing into the inner
+            # EBC, so the planner must read them the same way -- otherwise it
+            # under-counts the HBM stashing frees for feature-processed tables.
+            embedding_configs = module._embedding_bag_collection.embedding_bag_configs()
+        elif isinstance(module, EmbeddingCollection):
+            embedding_configs = module.embedding_configs()
+        else:
+            # Other pooled-embedding modules may expose their per-table
+            # configs via a tables() accessor.
+            tables_fn = getattr(module, "tables", None)
+            if not callable(tables_fn):
+                return False
+            embedding_configs = cast(Sequence[Any], tables_fn())
+
+        for config in embedding_configs:
+            if config.name == parameter:
+                return bool(getattr(config, "stash_weights", False))
+        return False
 
     @property
     def sharder_map(self) -> Dict[str, ModuleSharder[nn.Module]]:

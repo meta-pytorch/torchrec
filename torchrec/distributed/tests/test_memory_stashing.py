@@ -1717,5 +1717,63 @@ class TestCheckpointWhileStashed(unittest.TestCase):
         torch.testing.assert_close(cpu_src, original.cpu())
 
 
+class TestResolveStashWeights(unittest.TestCase):
+    """The runtime seam that decides which tables stash: resolve_stash_weights and
+    the planner-selection set/get. This is the code path that keeps every rank's
+    stashed set identical, so it needs direct coverage."""
+
+    def setUp(self) -> None:
+        MemoryStashingManager.reset()
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+
+    def _config(self, stash_weights: bool) -> Mock:
+        cfg = Mock()
+        cfg.stash_weights = stash_weights
+        return cfg
+
+    def test_default_falls_back_to_config_flag(self) -> None:
+        # No planner selection -> resolve from the per-table config flag.
+        self.assertIsNone(MemoryStashingManager.get_stashed_tables())
+        self.assertTrue(
+            MemoryStashingManager.resolve_stash_weights("t", self._config(True))
+        )
+        self.assertFalse(
+            MemoryStashingManager.resolve_stash_weights("t", self._config(False))
+        )
+
+    def test_config_missing_flag_defaults_false(self) -> None:
+        cfg = Mock(spec=[])  # no stash_weights attribute
+        self.assertFalse(MemoryStashingManager.resolve_stash_weights("t", cfg))
+
+    def test_selection_overrides_config_by_membership(self) -> None:
+        MemoryStashingManager.set_stashed_tables({"a", "b"})
+        self.assertEqual(MemoryStashingManager.get_stashed_tables(), {"a", "b"})
+        # Membership decides, regardless of the config flag.
+        self.assertTrue(
+            MemoryStashingManager.resolve_stash_weights("a", self._config(False))
+        )
+        self.assertFalse(
+            MemoryStashingManager.resolve_stash_weights("c", self._config(True))
+        )
+
+    def test_empty_selection_stashes_nothing(self) -> None:
+        # An empty (non-None) set means "stash no tables", overriding the config.
+        MemoryStashingManager.set_stashed_tables(set())
+        self.assertFalse(
+            MemoryStashingManager.resolve_stash_weights("a", self._config(True))
+        )
+
+    def test_reset_clears_selection(self) -> None:
+        MemoryStashingManager.set_stashed_tables({"a"})
+        MemoryStashingManager.reset()
+        self.assertIsNone(MemoryStashingManager.get_stashed_tables())
+        # Back to config fallback after reset.
+        self.assertTrue(
+            MemoryStashingManager.resolve_stash_weights("a", self._config(True))
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
