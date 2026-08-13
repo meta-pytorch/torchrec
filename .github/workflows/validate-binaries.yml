@@ -30,13 +30,57 @@ on:
         type: string
 
 jobs:
-  validate-binaries:
-    uses: pytorch/test-infra/.github/workflows/validate-domain-library.yml@main
+  generate-matrix:
+    uses: pytorch/test-infra/.github/workflows/generate_binary_build_matrix.yml@main
     with:
-      package_type: "wheel"
-      os: "linux"
+      package-type: wheel
+      os: linux
       channel: ${{ inputs.channel }}
-      repository: "meta-pytorch/torchrec"
-      smoke_test: "source ./.github/scripts/validate_binaries.sh"
-      with_cuda: enable
-      with_rocm: false
+      test-infra-repository: pytorch/test-infra
+      test-infra-ref: main
+      with-cuda: enable
+      with-rocm: false
+  filter-matrix:
+    needs: generate-matrix
+    runs-on: linux.24_04.4x
+    outputs:
+      matrix: ${{ steps.filter.outputs.matrix }}
+    steps:
+    - uses: actions/setup-python@v4
+    - name: Checkout torchrec repository
+      uses: actions/checkout@v4
+      with:
+        repository: meta-pytorch/torchrec
+        # filter.py is release-branch specific, so it must come from the ref
+        # being validated rather than from the default branch
+        ref: ${{ inputs.ref || github.ref }}
+    - name: Filter Generated Build Matrix
+      id: filter
+      env:
+        MAT: ${{ needs.generate-matrix.outputs.matrix }}
+      run: |
+        set -ex
+        MATRIX_BLOB="$(python .github/scripts/filter.py)"
+        echo "${MATRIX_BLOB}"
+        echo "matrix=${MATRIX_BLOB}" >> "${GITHUB_OUTPUT}"
+  validate-binaries:
+    needs: filter-matrix
+    strategy:
+      matrix: ${{ fromJson(needs.filter-matrix.outputs.matrix) }}
+      fail-fast: false
+    uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
+    name: "linux-${{ matrix.package_type }}-${{ matrix.python_version }}-${{ matrix.desired_cuda }}"
+    permissions:
+      id-token: write
+      contents: read
+    with:
+      runner: ${{ matrix.validation_runner }}
+      repository: meta-pytorch/torchrec
+      ref: ${{ inputs.ref || github.ref }}
+      job-name: "linux-${{ matrix.package_type }}-${{ matrix.python_version }}-${{ matrix.desired_cuda }}"
+      binary-matrix: ${{ toJSON(matrix) }}
+      script: |
+        set -ex
+        export ENV_NAME="conda-env-${{ github.run_id }}"
+        export SMOKE_TEST="source ./.github/scripts/validate_binaries.sh"
+        eval $SMOKE_TEST

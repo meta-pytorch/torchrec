@@ -64,8 +64,17 @@ def main():
             # fbgemm only supports cuda 12.6 and 13.0
             # Re-enable a version once fbgemm-gpu releases builds for it
             continue
-        if entry["python_version"] in ("3.9"):
-            # stop python3.9 support
+        if entry["python_version"] not in (
+            "3.10",
+            "3.11",
+            "3.12",
+            "3.13",
+            "3.13t",
+            "3.14",
+            "3.14t",
+        ):
+            # torchrec supports python 3.10 - 3.14, including the free-threaded
+            # builds 3.13t and 3.14t
             # for python version: https://devguide.python.org/versions/
             continue
         new_matrix_entries.append(entry)
