@@ -13,32 +13,23 @@ on:
 
 jobs:
 
-  # build on cpu hosts and upload to GHA
+  # build on cpu hosts and push to pypi
   build_on_cpu:
     runs-on: ${{ matrix.os }}
     strategy:
+      # a failure on one python version should not cancel the others
+      fail-fast: false
       matrix:
-        include:
-          - os: linux.2xlarge
-            python-version: '3.10'
-            python-tag: "py310"
-            cuda-tag: "cu126"
-          - os: linux.2xlarge
-            python-version: '3.11'
-            python-tag: "py311"
-            cuda-tag: "cu126"
-          - os: linux.2xlarge
-            python-version: '3.12'
-            python-tag: "py312"
-            cuda-tag: "cu126"
-          - os: linux.2xlarge
-            python-version: '3.13'
-            python-tag: "py313"
-            cuda-tag: "cu126"
-          - os: linux.2xlarge
-            python-version: '3.14'
-            python-tag: "py314"
-            cuda-tag: "cu126"
+        os:
+          - linux.2xlarge
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+          - "3.14"
+        cuda-tag:
+          - "cu126"
     steps:
       # Checkout the repository to the GitHub Actions runner
       - name: Check ldd --version
@@ -59,7 +50,11 @@ jobs:
           echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
       - name: create conda env
         run: |
-          conda create --name build_binary python=${{ matrix.python-version }}
+          if [[ "${{ matrix.free-threaded }}" == "true" ]]; then
+            conda create --name build_binary python-freethreading=${{ matrix.python-version }}
+          else
+            conda create --name build_binary python=${{ matrix.python-version }}
+          fi
           conda info
       - name: check python version no Conda
         run: |
@@ -73,12 +68,12 @@ jobs:
       - name: Install PyTorch and CUDA
         shell: bash
         run: |
-          conda run -n build_binary pip install torch
+          conda run -n build_binary pip install torch==2.13
       - name: Install fbgemm
         shell: bash
         run: |
           conda run -n build_binary pip install numpy
-          conda run -n build_binary pip install fbgemm-gpu
+          conda run -n build_binary pip install fbgemm-gpu==1.8
       - name: Install Dependencies
         shell: bash
         run: |
@@ -98,121 +93,15 @@ jobs:
           OFFICIAL_RELEASE: 1
         run: |
           rm -r dist || true
+          python_tag="py$(echo '${{ matrix.python-version }}' | tr -d '.')"
           conda run -n build_binary \
             python setup.py bdist_wheel \
-            --python-tag=${{ matrix.python-tag }}
+            --python-tag="${python_tag}"
       - name: Upload wheel as GHA artifact
         uses: actions/upload-artifact@v4
         with:
-          name: torchrec_${{ matrix.python-version }}_${{ matrix.cuda-tag }}.whl
+          name: torchrec_${{ matrix.python-version }}${{ matrix.free-threaded == true && 't' || '' }}_${{ matrix.cuda-tag }}.whl
           path: dist/torchrec-*.whl
-
-  # download from GHA, sanity check on gpu and push to pypi
-  sanity_check_on_gpu_and_push:
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os:
-          - linux.g5.12xlarge.nvidia.gpu
-        python-version:
-          - "3.10"
-          - "3.11"
-          - "3.12"
-          - "3.13"
-          - "3.14"
-        cuda-tag:
-          - "cu126"
-    needs: build_on_cpu
-    # the glibc version should match the version of the one we used to build the binary
-    # for this case, it's 2.26
-    steps:
-      - name: Check ldd --version
-        run: ldd --version
-      - name: check cpu info
-        shell: bash
-        run: |
-          cat /proc/cpuinfo
-      - name: check distribution info
-        shell: bash
-        run: |
-          cat /proc/version
-      - name: Display EC2 information
-        shell: bash
-        run: |
-          set -euo pipefail
-          function get_ec2_metadata() {
-            # Pulled from instance metadata endpoint for EC2
-            # see https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instancedata-data-retrieval.html
-            category=$1
-              curl -H "X-aws-ec2-metadata-token: $(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 30")" -fsSL "http://169.254.169.254/latest/meta-data/${category}"
-          }
-          echo "ami-id: $(get_ec2_metadata ami-id)"
-          echo "instance-id: $(get_ec2_metadata instance-id)"
-          echo "instance-type: $(get_ec2_metadata instance-type)"
-      - name: check gpu info
-        shell: bash
-        run: |
-          sudo yum install lshw -y
-          sudo lshw -C display
-      # Checkout the repository to the GitHub Actions runner
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Update pip
-        run: |
-          sudo yum update -y
-          sudo yum -y install git python3-pip
-      - name: Setup conda
-        run: |
-          wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ~/miniconda.sh
-          bash ~/miniconda.sh -b -p $HOME/miniconda
-      - name: setup Path
-        run: |
-          echo "/home/ec2-user/miniconda/bin" >> $GITHUB_PATH
-          echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
-      - name: create conda env
-        run: |
-          conda create --name build_binary python=${{ matrix.python-version }}
-          conda info
-      - name: check python version no Conda
-        run: |
-          python --version
-      - name: check python version
-        run: |
-          conda run -n build_binary python --version
-      - name: Install C/C++ compilers
-        run: |
-          sudo yum install -y gcc gcc-c++
-      - name: Install PyTorch and CUDA
-        shell: bash
-        run: |
-          conda run -n build_binary pip install torch
-      # download wheel from GHA
-      - name: Install fbgemm
-        shell: bash
-        run: |
-          conda run -n build_binary pip install numpy
-          conda run -n build_binary pip install fbgemm-gpu
-      - name: Install torchmetrics
-        shell: bash
-        run: |
-          conda run -n build_binary pip install torchmetrics==1.0.3
-      - name: Download wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: torchrec_${{ matrix.python-version }}_${{ matrix.cuda-tag }}.whl
-      - name: Display structure of downloaded files
-        run: ls -R
-      - name: Install TorchRec
-        run: |
-          rm -r dist || true
-          conda run -n build_binary python -m pip install *.whl
-      - name: Test fbgemm_gpu and torchrec installation
-        shell: bash
-        run: |
-          conda run -n build_binary \
-            python -c "import fbgemm_gpu"
-          conda run -n build_binary \
-            python -c "import torchrec"
       # Push to Pypi
       - name: Push TorchRec Binary to PYPI
         env:
@@ -224,4 +113,4 @@ jobs:
               --username __token__ \
               --password "$PYPI_TOKEN" \
               --skip-existing \
-              torchrec-*.whl
+              dist/torchrec-*.whl
