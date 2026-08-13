@@ -261,7 +261,7 @@ def get_grid_size(
         return (
             min(_AMD_FIXED_GRID, max_num_runs),
             min(_AMD_FIXED_GRID, max_long_run_programs),
-            min(_AMD_FIXED_GRID, max_long_run_programs),
+            max_long_runs,
         )
 
     if use_clc:
