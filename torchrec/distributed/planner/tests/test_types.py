@@ -27,6 +27,8 @@ from torchrec.distributed.planner.storage_reservations import (
 from torchrec.distributed.planner.types import (
     BasicCommsBandwidths,
     CustomTopologyData,
+    DeviceHardware,
+    EmoConfig,
     HardwareConfig,
     hash_planner_context_inputs,
     KernelConfig,
@@ -2364,3 +2366,70 @@ class ShardingOptionDetailTest(unittest.TestCase):
         )
         detail = ShardingOptionDetail.from_sharding_option(sharding_option)
         self.assertIsNone(detail.total_perf)
+
+
+class TestValueTypeDeepcopy(unittest.TestCase):
+    """`Perf`, `Storage` and `DeviceHardware` define `__deepcopy__` to skip the
+    generic reflective copy, which the partitioner runs millions of times per plan.
+    These tests pin the semantics that fast path has to preserve."""
+
+    def _perf(self, base: float = 1.0) -> Perf:
+        return Perf(
+            fwd_compute=base,
+            fwd_comms=base + 1,
+            bwd_compute=base + 2,
+            bwd_comms=base + 3,
+            input_dist_comms=base + 4,
+            prefetch_compute=base + 5,
+        )
+
+    def test_perf_deepcopy_is_equal_and_independent(self) -> None:
+        original = self._perf()
+        copied = deepcopy(original)
+        self.assertEqual(original, copied)
+        self.assertIsNot(original, copied)
+        copied.fwd_compute = 99.0
+        self.assertEqual(original.fwd_compute, 1.0)
+
+    def test_storage_deepcopy_is_equal_and_independent(self) -> None:
+        original = Storage(hbm=1, ddr=2, ssd=3)
+        copied = deepcopy(original)
+        self.assertEqual(original, copied)
+        self.assertIsNot(original, copied)
+        copied.hbm = 99
+        self.assertEqual(original.hbm, 1)
+
+    def test_device_hardware_deepcopy_copies_children(self) -> None:
+        original = DeviceHardware(
+            rank=3, storage=Storage(hbm=1, ddr=2, ssd=3), perf=self._perf()
+        )
+        copied = deepcopy(original)
+        self.assertEqual(original, copied)
+        self.assertIsNot(original.storage, copied.storage)
+        self.assertIsNot(original.perf, copied.perf)
+        copied.storage.hbm = 99
+        copied.perf.fwd_compute = 99.0
+        self.assertEqual(original.storage.hbm, 1)
+        self.assertEqual(original.perf.fwd_compute, 1.0)
+
+    def test_deepcopy_preserves_aliasing(self) -> None:
+        # Two devices sharing one Storage/Perf must still share after the copy,
+        # which is what registering in `memo` buys us.
+        storage = Storage(hbm=1, ddr=2, ssd=3)
+        perf = self._perf()
+        devices = [
+            DeviceHardware(rank=0, storage=storage, perf=perf),
+            DeviceHardware(rank=1, storage=storage, perf=perf),
+        ]
+        copied = deepcopy(devices)
+        self.assertIs(copied[0].storage, copied[1].storage)
+        self.assertIs(copied[0].perf, copied[1].perf)
+        self.assertIsNot(copied[0].storage, storage)
+
+    def test_topology_deepcopy_is_independent(self) -> None:
+        # Storage reservation deepcopies the topology and then mutates hbm in place.
+        topology = Topology(world_size=2, compute_device="cuda")
+        reserved = deepcopy(topology)
+        for device in reserved.devices:
+            device.storage.hbm = 7
+        self.assertTrue(all(d.storage.hbm != 7 for d in topology.devices))
