@@ -13,6 +13,7 @@ from typing import Any, Callable, cast, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torchrec.distributed.embedding_types import KJTList
 from torchrec.distributed.pec_embedding import (
     BackwardPartitionContext,
     ForwardPartitionContext,
@@ -26,7 +27,7 @@ from torchrec.distributed.train_pipeline.pipeline_context import (
 )
 from torchrec.distributed.train_pipeline.runtime_forwards import PECPipelinedForward
 from torchrec.distributed.train_pipeline.train_pipelines import TrainPipelineSparseDist
-from torchrec.distributed.types import LazyAwaitable
+from torchrec.distributed.types import Awaitable, LazyAwaitable
 from torchrec.streamable import Pipelineable
 
 In = Pipelineable
@@ -313,3 +314,87 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
                 [fc.splits for fc in fwd_ctxs],
                 is_overlapped=False,
             )
+
+    def _start_pec_ol_grad(
+        self, context: PECTrainPipelineContext
+    ) -> Dict[str, List[Awaitable[None]]]:
+        """Starts the OL gradient AllToAll for every PEC module.
+
+        The gradient was split into OL/NOL in backward (PECAll2AllSeqWait);
+        grad_dist starts the OL partition's AllToAll (idempotent) and returns
+        per-sharding-group awaitables that apply the gradient to TBE on wait.
+        Consumed the same progress (the context is still live).
+
+        Args:
+            context: context holding the backward partition contexts.
+
+        Returns:
+            Per-module lists of gradient-apply awaitables.
+        """
+        awaitables: Dict[str, List[Awaitable[None]]] = {}
+        for name, pec in self._pec_modules.items():
+            bwd_ctxs: List[BackwardPartitionContext] = context.pec_backward_ctxs[name]
+            awaitables[name] = pec.grad_dist(
+                self._pec_module_ctx(context, name),
+                KJTList([bc.ol_features for bc in bwd_ctxs]),
+                is_overlapped=True,
+            )
+        return awaitables
+
+    def _defer_nol_grad(
+        self,
+        ctx_cur: PECTrainPipelineContext,
+        ctx_next: PECTrainPipelineContext,
+    ) -> None:
+        """Attaches ctx_cur's NOL grad inputs onto ctx_next for the next progress.
+
+        NOL gradient is deferred one batch (safe: those values are not in the
+        next batch). The next progress runs the NOL grad AllToAll + apply via
+        _start_deferred_nol_grad. ctx_next holding the refs keeps ctx_cur's
+        module context (carrying the nol_grad_apply set in backward) and the
+        per-group NOL features alive across ctx_cur's dequeue. For the final
+        batch ctx_next is ctx_cur, so it can be drained in the same progress.
+
+        Args:
+            ctx_cur: context whose NOL gradient is being deferred.
+            ctx_next: context the deferred NOL gradient is attached to.
+        """
+        for name in self._pec_modules:
+            if name not in ctx_cur.pec_backward_ctxs:
+                continue
+            bwd_ctxs: List[BackwardPartitionContext] = ctx_cur.pec_backward_ctxs[name]
+            ctx_next.pec_deferred_nol_grad[name] = (
+                self._pec_module_ctx(ctx_cur, name),
+                [bc.nol_features for bc in bwd_ctxs],
+            )
+
+    def _start_deferred_nol_grad(
+        self, context: PECTrainPipelineContext
+    ) -> Dict[str, List[Awaitable[None]]]:
+        """Starts the NOL gradient AllToAll deferred onto this context.
+
+        The inputs were attached by the previous batch's _defer_nol_grad (empty
+        on the first progress). grad_dist starts the NOL partition's AllToAll
+        and returns per-sharding-group awaitables that apply the gradient on
+        wait. The deferred inputs are cleared once started.
+
+        Args:
+            context: context carrying the deferred NOL grad inputs.
+
+        Returns:
+            Per-module lists of gradient-apply awaitables.
+        """
+        awaitables: Dict[str, List[Awaitable[None]]] = {}
+        for name, (module_ctx, nol_features) in context.pec_deferred_nol_grad.items():
+            awaitables[name] = self._pec_modules[name].grad_dist(
+                module_ctx, KJTList(nol_features), is_overlapped=False
+            )
+        context.pec_deferred_nol_grad.clear()
+        return awaitables
+
+    @staticmethod
+    def _wait_pec_grad(awaitables: Dict[str, List[Awaitable[None]]]) -> None:
+        """Waits per-module gradient-apply awaitables (AllToAll + TBE apply)."""
+        for module_awaitables in awaitables.values():
+            for awaitable in module_awaitables:
+                awaitable.wait()
