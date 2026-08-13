@@ -156,15 +156,13 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
 
     @staticmethod
     def _pec_module_ctx(
-        ctx: Optional[PECTrainPipelineContext], name: str
-    ) -> Optional[PECEmbeddingCollectionContext]:
-        """Returns the PEC module context for name, or None when ctx is None.
+        ctx: PECTrainPipelineContext, name: str
+    ) -> PECEmbeddingCollectionContext:
+        """Returns name's PEC module context.
 
         module_contexts is typed as Multistreamable; PEC modules always store a
         PECEmbeddingCollectionContext, so the cast is localized here.
         """
-        if ctx is None:
-            return None
         return cast(PECEmbeddingCollectionContext, ctx.module_contexts[name])
 
     def _pec_overlap_dist(
@@ -203,19 +201,25 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
         with self._stream_context(self._data_dist_stream):
             for name, pec in self._pec_modules.items():
                 dist_input = None
+                current_module_ctx = None
                 if current_ctx is not None:
                     dist_input = current_ctx.input_dist_tensors_requests.pop(
                         name
                     ).wait()
                     current_ctx.pec_dist_inputs[name] = dist_input
+                    current_module_ctx = self._pec_module_ctx(current_ctx, name)
+
+                prev_module_ctx = None
+                prev_dist_input = None
+                if prev_ctx is not None:
+                    prev_module_ctx = self._pec_module_ctx(prev_ctx, name)
+                    prev_dist_input = prev_ctx.pec_dist_inputs[name]
 
                 results = pec.overlap_dist(
-                    ctx=self._pec_module_ctx(current_ctx, name),
+                    ctx=current_module_ctx,
                     dist_input=dist_input,
-                    prev_ctx=self._pec_module_ctx(prev_ctx, name),
-                    prev_dist_input=(
-                        prev_ctx.pec_dist_inputs[name] if prev_ctx is not None else None
-                    ),
+                    prev_ctx=prev_module_ctx,
+                    prev_dist_input=prev_dist_input,
                 )
                 fwd_ctxs, bwd_ctxs = self._wait_pec_overlap_results(
                     results, default_stream
@@ -229,3 +233,83 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
             # Mark overlap_dist's data-dist work complete so main-stream
             # consumers (NOL compute) can order against it via wait_event.
             self._overlap_dist_event.record(self._data_dist_stream)
+
+    def _compute_and_output_dist(self, context: PECTrainPipelineContext) -> None:
+        """Runs compute + output_dist for non-PEC pipelined modules.
+
+        The input-dist AllToAlls are waited on the data-dist stream; the main
+        stream is then ordered after them via the data-dist event and runs the
+        embedding lookups, storing each output awaitable in
+        context.embedding_a2a_requests (consumed by the inherited InSync forward
+        path). The waited KJTs / module contexts are recorded on the main stream
+        so the allocator does not reuse their data-dist memory mid-lookup. PEC
+        modules are skipped -- their OL/NOL compute is done manually (see
+        _pec_ol_compute / _pec_nol_compute).
+
+        Args:
+            context: context whose input_dist tensors are looked up.
+        """
+        main_stream = torch.get_device_module(self._device).current_stream()
+        non_pec_modules = [
+            module
+            for module in self._pipelined_modules
+            if not isinstance(module, ShardedPECEmbeddingCollection)
+        ]
+
+        # Wait the input-dist AllToAlls on the data-dist stream.
+        waited_kjts: Dict[str, Any] = {}
+        # pyrefly: ignore [bad-argument-type]
+        with self._stream_context(self._data_dist_stream):
+            for module in non_pec_modules:
+                name = module.forward.name  # pyre-ignore[16]
+                waited_kjts[name] = context.input_dist_tensors_requests[name].wait()
+
+        # Order the main stream after the waits, then look up on the main stream.
+        self._input_dist_event.record(self._data_dist_stream)
+        main_stream.wait_event(self._input_dist_event)
+
+        for module in non_pec_modules:
+            name = module.forward.name  # pyre-ignore[16]
+            kjt = waited_kjts[name]
+            kjt.record_stream(main_stream)
+            module_ctx = context.module_contexts[name]
+            module_ctx.record_stream(main_stream)
+            context.embedding_a2a_requests[name] = module.compute_and_output_dist(
+                module_ctx, kjt
+            )
+
+    def _pec_ol_compute(self, context: PECTrainPipelineContext) -> None:
+        """Computes + output_dist the OL partition for every PEC module.
+
+        Runs in the same progress as forward (fresh weights). Stores per-group
+        awaitables in context.pec_ol_awaitables, consumed by merge in forward.
+
+        Args:
+            context: context holding the forward partition contexts.
+        """
+        for name, pec in self._pec_modules.items():
+            fwd_ctxs: List[ForwardPartitionContext] = context.pec_forward_ctxs[name]
+            context.pec_ol_awaitables[name] = pec.compute_and_output_dist_in_partition(
+                self._pec_module_ctx(context, name),
+                [fc.ol_features for fc in fwd_ctxs],
+                [fc.splits for fc in fwd_ctxs],
+                is_overlapped=True,
+            )
+
+    def _pec_nol_compute(self, context: PECTrainPipelineContext) -> None:
+        """Computes + output_dist the NOL partition for every PEC module.
+
+        Runs one batch ahead (stale weights are safe for NOL). Stores per-group
+        awaitables in context.pec_nol_awaitables, consumed by merge in forward.
+
+        Args:
+            context: context holding the forward partition contexts.
+        """
+        for name, pec in self._pec_modules.items():
+            fwd_ctxs: List[ForwardPartitionContext] = context.pec_forward_ctxs[name]
+            context.pec_nol_awaitables[name] = pec.compute_and_output_dist_in_partition(
+                self._pec_module_ctx(context, name),
+                [fc.nol_features for fc in fwd_ctxs],
+                [fc.splits for fc in fwd_ctxs],
+                is_overlapped=False,
+            )
