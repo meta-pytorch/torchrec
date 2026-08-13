@@ -7,7 +7,7 @@
 
 # pyre-strict
 
-from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, TypeVar, Union
+from typing import Any, Callable, cast, Dict, List, Optional, Set, Tuple, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -290,6 +290,12 @@ class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
     def embedding_names(self) -> List[str]:
         return self._combined_embedding_names
 
+    def uncombined_embedding_dims(self) -> List[int]:
+        return self._embedding_dims
+
+    def uncombined_embedding_names(self) -> List[str]:
+        return self._embedding_names
+
     def embedding_names_per_rank(self) -> List[List[str]]:
         raise NotImplementedError
 
@@ -377,18 +383,14 @@ class GridPooledEmbeddingDist(
             if qcomm_codecs_registry
             else None
         )
-        self._intra_dist: Optional[
-            Union[
-                PooledEmbeddingsReduceScatter,
-                VariableBatchPooledEmbeddingsReduceScatter,
-            ]
+        self._intra_dist: Optional[PooledEmbeddingsReduceScatter] = None
+        self._cross_dist: Optional[PooledEmbeddingsAllToAll] = None
+        self._variable_intra_dist: Optional[
+            VariableBatchPooledEmbeddingsReduceScatter
         ] = None
-        self._cross_dist: Optional[
-            Union[
-                PooledEmbeddingsAllToAll,
-                VariableBatchPooledEmbeddingsAllToAll,
-            ]
-        ] = None
+        self._variable_cross_dist: Optional[VariableBatchPooledEmbeddingsAllToAll] = (
+            None
+        )
         self._callbacks = callbacks
 
     @EventLoggingHandler.event_logger(
@@ -412,7 +414,35 @@ class GridPooledEmbeddingDist(
         if self._intra_dist is None or self._cross_dist is None:
             self._create_output_dist_modules(sharding_ctx)
         local_rank = self._rank % self._intra_pg.size()
-        if sharding_ctx is not None and len(set(sharding_ctx.batch_size_per_rank)) > 1:
+        current_node = self._rank // self._intra_pg.size()
+        if sharding_ctx is not None and sharding_ctx.variable_batch_per_feature:
+            (
+                batch_size_per_rank_per_feature_by_cross_group,
+                batch_size_per_feature_sum_by_cross_group,
+            ) = self._preprocess_batch_size_per_rank_per_feature(
+                self._intra_pg.size(),
+                self._cross_pg.size(),
+                sharding_ctx.batch_size_per_rank_per_feature,
+            )
+            rs_result = cast(
+                VariableBatchPooledEmbeddingsReduceScatter, self._variable_intra_dist
+            )(
+                local_embs,
+                batch_size_per_rank_per_feature=batch_size_per_feature_sum_by_cross_group,
+                embedding_dims=self._emb_dim_per_node_per_feature[current_node],
+            ).wait()
+            return cast(
+                VariableBatchPooledEmbeddingsAllToAll, self._variable_cross_dist
+            )(
+                rs_result,
+                batch_size_per_rank_per_feature=batch_size_per_rank_per_feature_by_cross_group[
+                    local_rank
+                ],
+                batch_size_per_feature_pre_a2a=sharding_ctx.batch_size_per_feature_pre_a2a,
+            )
+        elif (
+            sharding_ctx is not None and len(set(sharding_ctx.batch_size_per_rank)) > 1
+        ):
             # preprocess batch_size_per_rank
             (
                 batch_size_per_rank_by_cross_group,
@@ -457,9 +487,61 @@ class GridPooledEmbeddingDist(
 
         return batch_size_per_rank_by_cross_group, batch_size_sum_by_cross_group
 
+    def _preprocess_batch_size_per_rank_per_feature(
+        self,
+        local_size: int,
+        nodes: int,
+        batch_size_per_rank_per_feature_stagger: List[List[int]],
+    ) -> Tuple[List[List[List[int]]], List[List[int]]]:
+        """
+        Reorders `batch_size_per_rank_per_feature_stagger` so it's aligned with
+        reordered features after AlltoAll.
+        """
+        if not batch_size_per_rank_per_feature_stagger:
+            return [[]] * local_size, []
+        batch_size_per_rank_per_feature_by_cross_group: List[List[List[int]]] = []
+        batch_size_per_feature_sum_by_cross_group: List[List[int]] = []
+        for local_rank in range(local_size):
+            batch_size_by_node_per_rank_per_feature: List[List[int]] = []
+            batch_size_per_feature_sum = [0] * len(
+                batch_size_per_rank_per_feature_stagger[0]
+            )
+            for node in range(nodes):
+                batch_size = batch_size_per_rank_per_feature_stagger[
+                    local_rank * nodes + node
+                ]
+                batch_size_by_node_per_rank_per_feature.append(batch_size)
+                batch_size_per_feature_sum = [
+                    sum(x) for x in zip(batch_size_per_feature_sum, batch_size)
+                ]
+            batch_size_per_rank_per_feature_by_cross_group.append(
+                batch_size_by_node_per_rank_per_feature
+            )
+            batch_size_per_feature_sum_by_cross_group.append(batch_size_per_feature_sum)
+
+        return (
+            batch_size_per_rank_per_feature_by_cross_group,
+            batch_size_per_feature_sum_by_cross_group,
+        )
+
     def _create_output_dist_modules(
         self, sharding_ctx: Optional[EmbeddingShardingContext] = None
     ) -> None:
+        if sharding_ctx is not None and sharding_ctx.variable_batch_per_feature:
+            self._variable_intra_dist = VariableBatchPooledEmbeddingsReduceScatter(
+                pg=self._intra_pg,
+                codecs=self._intra_codecs,
+            )
+            # No permute callback here (unlike the plain cross_dist below): the
+            # ragged output is reassembled globally by
+            # VariableBatchEmbeddingBagCollectionAwaitable using uncombined_embedding_dims/names().
+            self._variable_cross_dist = VariableBatchPooledEmbeddingsAllToAll(
+                pg=self._cross_pg,
+                emb_dim_per_rank_per_feature=self._emb_dim_per_node_per_feature,
+                device=self._device,
+                callbacks=None,
+                codecs=self._cross_codecs,
+            )
         self._intra_dist = PooledEmbeddingsReduceScatter(
             pg=self._intra_pg,
             codecs=self._intra_codecs,

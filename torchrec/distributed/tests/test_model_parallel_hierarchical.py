@@ -479,3 +479,51 @@ class ModelParallelHierarchicalTest(ModelParallelTestShared):
             global_constant_batch=global_constant_batch,
             pooling=pooling,
         )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 3,
+        "Not enough GPUs, this test requires at least four GPUs",
+    )
+    @given(
+        variable_batch_per_feature=st.booleans(),
+        global_constant_batch=st.booleans(),
+    )
+    @settings(
+        verbosity=Verbosity.verbose,
+        max_examples=2,
+        deadline=None,
+        phases=[Phase.explicit, Phase.generate, Phase.target],
+    )
+    def test_sharding_grid_variable_batch(
+        self,
+        variable_batch_per_feature: bool,
+        global_constant_batch: bool,
+    ) -> None:
+        # GRID_SHARD requires explicit per-table constraints; min_partition is
+        # half of each table's embedding_dim (16, 24, 32, 40, 16, 24) so it
+        # spans both of the 2 node-groups (world_size=4, local_size=2).
+        constraints = {
+            name: ParameterConstraints(
+                min_partition=min_partition,
+                sharding_types=[ShardingType.GRID_SHARD.value],
+            )
+            for name, min_partition in zip(self.table_names, [8, 12, 16, 20, 8, 12])
+        }
+        self._test_sharding(
+            # pyrefly: ignore[bad-argument-type]
+            sharders=[
+                create_test_sharder(
+                    SharderType.EMBEDDING_BAG_COLLECTION.value,
+                    ShardingType.GRID_SHARD.value,
+                    EmbeddingComputeKernel.FUSED.value,
+                    device=torch.device("cuda"),
+                ),
+            ],
+            backend="nccl",
+            world_size=4,
+            local_size=2,
+            constraints=constraints,
+            variable_batch_per_feature=variable_batch_per_feature,
+            has_weighted_tables=False,
+            global_constant_batch=global_constant_batch,
+        )
