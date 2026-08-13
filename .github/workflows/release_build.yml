@@ -27,22 +27,9 @@ jobs:
           - "3.11"
           - "3.12"
           - "3.13"
+          - "3.14"
         cuda-tag:
           - "cu126"
-        # 3.14 is listed here rather than above. An include entry that matches
-        # an existing combination is merged into it instead of adding a job, so
-        # keeping 3.14 in python-version would fold both entries below into that
-        # one job rather than giving a plain and a free-threaded build
-        include:
-          - os: linux.2xlarge
-            python-version: '3.14'
-            python-tag: "py314"
-            cuda-tag: "cu126"
-          - os: linux.2xlarge
-            python-version: '3.14'
-            python-tag: "py314"
-            cuda-tag: "cu126"
-            free-threaded: true
     steps:
       # Checkout the repository to the GitHub Actions runner
       - name: Check ldd --version
