@@ -8,6 +8,12 @@
 import json
 import os
 
+# torch version this release is built against. build_wheels_linux.yml copies
+# matrix["stable_version"] into PYTORCH_VERSION on the test channel, and
+# pkg-helpers turns that into `pip install torch==<version>`. Without this the
+# build picks up whatever test-infra currently calls stable.
+TORCH_VERSION = "2.10.0"
+
 
 def main():
     """
@@ -60,13 +66,30 @@ def main():
     new_matrix_entries = []
 
     for entry in full_matrix["include"]:
-        # if entry["desired_cuda"] == "cu130":
-        #     # fbgemm only supports cuda 12.6, 12.8, 12.9, 13.0
-        #     continue
-        if entry["python_version"] in ("3.9"):
-            # stop python3.9 support, and skipp python3.14 due to incompatibility with torch.compile
+        if entry["desired_cuda"] not in (
+            "cpu",
+            "cu126",
+            "cu128",
+            "cu129",
+            "cu130",
+        ):
+            # fbgemm only supports cuda 12.6, 12.8, 12.9, 13.0
+            # Re-enable a version once fbgemm-gpu releases builds for it
+            continue
+        if entry["python_version"] not in (
+            "3.10",
+            "3.11",
+            "3.12",
+            "3.13",
+            "3.13t",
+            "3.14",
+            "3.14t",
+        ):
+            # torchrec supports python 3.10 - 3.14, including the free-threaded
+            # builds 3.13t and 3.14t
             # for python version: https://devguide.python.org/versions/
             continue
+        entry["stable_version"] = TORCH_VERSION
         new_matrix_entries.append(entry)
 
     new_matrix = {"include": new_matrix_entries}

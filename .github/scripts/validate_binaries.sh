@@ -9,6 +9,16 @@
 export PYTORCH_CUDA_PKG=""
 export CONDA_ENV="build_binary"
 
+# torchrec supports python 3.10 - 3.14, skip anything else in the validation
+# matrix (e.g. 3.15, 3.15t)
+case "${MATRIX_PYTHON_VERSION}" in
+    3.10|3.11|3.12|3.13|3.13t|3.14|3.14t) ;;
+    *)
+        echo "Skipping validation: python ${MATRIX_PYTHON_VERSION} is not supported by torchrec"
+        exit 0
+        ;;
+esac
+
 if [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
     # use conda-forge to install python3.14t
     conda create -y -n "${CONDA_ENV}" python-freethreading=3.14
@@ -29,12 +39,10 @@ conda run -n "${CONDA_ENV}" python --version
 
 
 # figure out CUDA VERSION
+# fbgemm only supports cuda 12.6, 12.8, 12.9 and 13.0, skip any other version
+# the validation matrix generates (e.g. 13.2, 13.4)
 if [[ ${MATRIX_GPU_ARCH_TYPE} = 'cuda' ]]; then
-    if [[ ${MATRIX_GPU_ARCH_VERSION} = '11.8' ]]; then
-        export CUDA_VERSION="cu118"
-    elif [[ ${MATRIX_GPU_ARCH_VERSION} = '12.1' ]]; then
-        export CUDA_VERSION="cu121"
-    elif [[ ${MATRIX_GPU_ARCH_VERSION} = '12.6' ]]; then
+    if [[ ${MATRIX_GPU_ARCH_VERSION} = '12.6' ]]; then
         export CUDA_VERSION="cu126"
     elif [[ ${MATRIX_GPU_ARCH_VERSION} = '12.8' ]]; then
         export CUDA_VERSION="cu128"
@@ -43,7 +51,8 @@ if [[ ${MATRIX_GPU_ARCH_TYPE} = 'cuda' ]]; then
     elif [[ ${MATRIX_GPU_ARCH_VERSION} = '13.0' ]]; then
         export CUDA_VERSION="cu130"
     else
-        export CUDA_VERSION="cu126"
+        echo "Skipping validation: cuda ${MATRIX_GPU_ARCH_VERSION} is not supported by fbgemm-gpu"
+        exit 0
     fi
 else
     export CUDA_VERSION="cpu"
@@ -81,10 +90,10 @@ conda env config vars set -n ${CONDA_ENV}  \
 #     export PYTORCH_CUDA_PKG="pytorch-cuda=${MATRIX_GPU_ARCH_VERSION}"
 # fi
 
-conda run -n "${CONDA_ENV}" pip install torch --index-url "$PYTORCH_URL"
+conda run -n "${CONDA_ENV}" pip install torch==2.10.0 --index-url "$PYTORCH_URL"
 
 # install fbgemm
-conda run -n "${CONDA_ENV}" pip install fbgemm-gpu --index-url "$PYTORCH_URL"
+conda run -n "${CONDA_ENV}" pip install fbgemm-gpu==1.5.0 --index-url "$PYTORCH_URL"
 
 # install other requirements
 conda run -n "${CONDA_ENV}" pip install -r requirements.txt
@@ -149,8 +158,8 @@ if [[ ${MATRIX_GPU_ARCH_VERSION} != '12.6' ]]; then
 fi
 
 echo "checking pypi release"
-conda run -n "${CONDA_ENV}" pip install torch
-conda run -n "${CONDA_ENV}" pip install fbgemm-gpu
+conda run -n "${CONDA_ENV}" pip install torch==2.10.0
+conda run -n "${CONDA_ENV}" pip install fbgemm-gpu==1.5.0
 conda run -n "${CONDA_ENV}" pip install torchrec
 
 # Check version matching again for PyPI
