@@ -8,15 +8,18 @@
 # pyre-strict
 
 import copy
+import hashlib
 import logging
 import pdb  # noqa
 import sys
 from collections import OrderedDict
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict
-from typing import Any, Dict, List, Optional, Set, Tuple, Type, TypeVar, Union
+from operator import itemgetter
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type, TypeVar, Union
 
 import torch
+import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SparseType,
@@ -35,6 +38,7 @@ from torchrec.distributed.types import (
     ParameterSharding,
     ShardedModule,
     ShardingBucketMetadata,
+    ShardingEnv,
     ShardingType,
     ShardMetadata,
 )
@@ -50,6 +54,45 @@ torch.package safe functions from pyre_extensions. However, pyre_extensions is
 not safe to use in code that will be torch.packaged, as it requires sys for
 version checks
 """
+
+
+def is_plan_leader(env: ShardingEnv) -> bool:
+    """True on rank 0 of the process group this env's plan is shared over.
+
+    Do not use `env.rank == 0`. Under 2D sharding `env.rank` counts within the
+    sharding group, so it is 0 on every replica's leader.
+
+    Gating per group rather than per job is deliberate. The plan is broadcast
+    over this process group, so it is identical across it and can differ across
+    groups. Tower sharding builds one env per node and pipeline-stage sharding
+    one per stage, and most of those groups do not contain global rank 0.
+    """
+    pg = env.process_group
+    if pg is not None:
+        return dist.get_rank(pg) == 0
+    # Inference and single-process construction never build a process group.
+    return env.rank == 0
+
+
+def sharding_plan_fingerprint(
+    table_shardings: Iterable[Tuple[str, str]],
+) -> str:
+    """Short stable fingerprint of a (table name, sharding type) plan.
+
+    Ranks that agree on the plan produce the same value, so a mismatch means a
+    rank sharded differently. Offline checks recompute it, so both sides must
+    call this one function.
+
+    Two things here look removable but are not. blake2b, because hash() on str
+    is salted per process. Sorted, because the caller's table order can differ
+    across ranks. Sorting on the name alone is safe, since
+    EmbeddingBagCollection rejects duplicate names.
+    """
+    joined = "\n".join(
+        f"{table_name}={sharding_type}"
+        for table_name, sharding_type in sorted(table_shardings, key=itemgetter(0))
+    )
+    return hashlib.blake2b(joined.encode("utf-8"), digest_size=16).hexdigest()
 
 
 def get_device_type() -> str:
