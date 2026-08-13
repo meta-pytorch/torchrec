@@ -8,6 +8,7 @@
 # pyre-strict
 
 import ctypes
+import logging
 import os
 import random
 import socket
@@ -25,6 +26,8 @@ from torch import nn
 
 TParams = ParameterSpecification("TParams")
 TReturn = TypeVar("TReturn")
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 def get_free_port() -> int:
@@ -67,6 +70,30 @@ def get_free_port() -> int:
             raise Exception(
                 f"Binding failed with address 127.0.0.1 while getting free port {e}"
             )
+
+
+def init_process_group_single_rank(backend: str = "gloo", **kwargs: Any) -> None:
+    """init_process_group for a single-rank group, without picking a port first.
+
+    HashStore lives in process memory, so there is no port to lose. Going through
+    MASTER_PORT instead leaves a window where another process can take the port,
+    which surfaces as EADDRINUSE.
+
+    Single-rank only. Spawned ranks cannot share this store object.
+    """
+    already_initialized = dist.is_initialized()
+    try:
+        dist.init_process_group(
+            backend=backend, store=dist.HashStore(), rank=0, world_size=1, **kwargs
+        )
+    except Exception:
+        # A group leaked by an earlier test is the usual cause, and torch's error
+        # for it does not mention that.
+        logger.exception(
+            f"init_process_group_single_rank failed. backend={backend}, "
+            f"already_initialized={already_initialized}"
+        )
+        raise
 
 
 def is_asan() -> bool:
