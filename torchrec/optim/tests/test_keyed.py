@@ -8,7 +8,6 @@
 # pyre-strict
 
 import io
-import os
 import unittest
 from typing import Any, Dict, List
 
@@ -22,7 +21,7 @@ from torchrec.optim.keyed import (
     KeyedOptimizerWrapper,
     OptimizerWrapper,
 )
-from torchrec.test_utils import get_free_port
+from torchrec.test_utils import init_process_group_single_rank
 
 
 class DummyOptimizerModule:
@@ -76,9 +75,7 @@ class TestKeyedOptimizer(unittest.TestCase):
         )
 
     def test_load_state_dict(self) -> None:
-        os.environ["MASTER_ADDR"] = str("localhost")
-        os.environ["MASTER_PORT"] = str(get_free_port())
-        dist.init_process_group("gloo", rank=0, world_size=1)
+        init_process_group_single_rank("gloo")
 
         # Set up example KeyedOptimizer.
         param_1_t, param_2_t = torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])
