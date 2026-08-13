@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, cast, Dict, List, Optional, Tuple
+from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -398,3 +398,49 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
         for module_awaitables in awaitables.values():
             for awaitable in module_awaitables:
                 awaitable.wait()
+
+    def fill_pipeline(self, dataloader_iter: Iterator[In]) -> None:
+        """Cold-starts the 2-ahead pipeline.
+
+        After fill: contexts[0] has overlap_dist(0) + NOL compute(0) done (OL(0)
+        and non-PEC compute(0) run in the first progress); contexts[1] has its
+        shared input_dist started and split-waited so the first progress can run
+        overlap_dist(1). No-op once the pipeline is already filled.
+
+        Args:
+            dataloader_iter: iterator yielding input batches.
+        """
+        if len(self.batches) >= 2:
+            return
+        if self.batches and self._execute_all_batches:
+            return
+
+        # Batch 0: _init_pipelined_modules runs start_sparse_data_dist for all
+        # modules; wait_sparse_data_dist completes the splits.
+        if not self.enqueue_batch(dataloader_iter):
+            return
+        self._init_pipelined_modules(
+            # pyrefly: ignore [bad-argument-type]
+            self.batches[0],
+            self.contexts[0],
+            # pyrefly: ignore [bad-argument-type]
+            self._pipelined_forward_type,
+        )
+        self.wait_sparse_data_dist(self.contexts[0])
+
+        ctx0: PECTrainPipelineContext = cast(PECTrainPipelineContext, self.contexts[0])
+        # overlap_dist(0, prev=None): waits + pops PEC features, builds forward
+        # ctx(0) and records _overlap_dist_event. NOL compute(0) consumes the
+        # forward ctx on the main stream, so order it after the event.
+        self._pec_overlap_dist(ctx0, None)
+        torch.get_device_module(self._device).current_stream().wait_event(
+            self._overlap_dist_event
+        )
+        self._pec_nol_compute(ctx0)
+
+        # Batch 1: shared input_dist (start + split-wait) so the first progress
+        # can run overlap_dist(1).
+        if not self.enqueue_batch(dataloader_iter):
+            return
+        self.start_sparse_data_dist(self.batches[1], self.contexts[1])
+        self.wait_sparse_data_dist(self.contexts[1])
