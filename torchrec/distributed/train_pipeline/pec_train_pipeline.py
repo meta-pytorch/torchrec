@@ -13,6 +13,7 @@ from typing import Any, Callable, cast, Dict, Iterator, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+from torch.autograd.profiler import record_function
 from torchrec.distributed.embedding_types import KJTList
 from torchrec.distributed.pec_embedding import (
     BackwardPartitionContext,
@@ -444,3 +445,135 @@ class TrainPipelinePEC(TrainPipelineSparseDist[In, Out]):
             return
         self.start_sparse_data_dist(self.batches[1], self.contexts[1])
         self.wait_sparse_data_dist(self.contexts[1])
+
+    def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        """Runs one compute-ahead + in-sync-backward step for batch N.
+
+        See the module schedule: OL/non-PEC compute for N happen up front on the
+        main stream; input_dist for N+2 and overlap_dist for N+1 run on the
+        data-dist stream concurrently with forward N; gradient AllToAlls are
+        pipeline-triggered (OL applied this step, NOL deferred one step).
+
+        Args:
+            dataloader_iter: iterator yielding input batches.
+
+        Returns:
+            The model forward output for batch N.
+
+        Raises:
+            StopIteration: when the dataloader is exhausted and no batch remains.
+        """
+        self.fill_pipeline(dataloader_iter)
+        if not self.batches:
+            raise StopIteration
+
+        ctx0: PECTrainPipelineContext = cast(PECTrainPipelineContext, self.contexts[0])
+        ctx1: Optional[PECTrainPipelineContext] = (
+            cast(PECTrainPipelineContext, self.contexts[1])
+            if len(self.contexts) > 1
+            else None
+        )
+
+        # Point the (PEC + non-PEC) pipelined forwards at batch N.
+        self._set_module_context(self.contexts[0])
+
+        # #3 copy batch N+2 to device.
+        self.enqueue_batch(dataloader_iter)
+
+        # #1 PEC OL compute (fresh weights) + #2 non-PEC compute, on the main stream.
+        with record_function("## pec_ol_compute ##"):
+            self._pec_ol_compute(ctx0)
+        with record_function("## pec_compute_and_output_dist ##"):
+            self._compute_and_output_dist(ctx0)
+
+        # #5 overlap_dist for N+1 (forward ctx[N+1] + backward ctx[N]). On the
+        #    last batch ctx1 is None, so this is the finalize call (current=None)
+        #    producing only N's backward ctx. Runs on the data-dist stream and
+        #    records _overlap_dist_event.
+        with record_function("## pec_overlap_dist ##"):
+            self._pec_overlap_dist(ctx1, ctx0)
+
+        # #4 start (NOT wait) the N+2 splits AllToAll; overlaps forward.
+        if len(self.batches) > 2:
+            self.start_sparse_data_dist(self.batches[2], self.contexts[2])
+
+        # #6 start the deferred NOL grad AllToAll for N-1 (empty on the first
+        #    progress); overlaps forward.
+        with record_function("## pec_nol_grad_a2a ##"):
+            nol_grad_awaitables = self._start_deferred_nol_grad(ctx0)
+
+        # #7 forward N. No _wait_for_batch: its wait_stream(data_dist) would
+        #    serialize forward behind the #4/#5 data-dist comm we launched to
+        #    overlap it. The main stream is already past batch N's H2D copy (#2
+        #    gates main on N's input-dist, which runs after the copy; the
+        #    pipelined forward also waits the embedding output-dist awaitables).
+        #    The batch is allocated on the memcpy stream and only recorded onto
+        #    data_dist by start_sparse_data_dist, but forward reads its dense
+        #    features on the main stream -- record it there too so the allocator
+        #    keeps it alive through forward/backward. Inplace copy reuses a
+        #    persistent buffer, so there is nothing to protect.
+        if not self._enable_inplace_copy_batch:
+            main_stream = torch.get_device_module(self._device).current_stream()
+            # pyrefly: ignore [missing-attribute]
+            self.batches[0].record_stream(main_stream)
+
+        if self._model.training:
+            self._optimizer.zero_grad()
+
+        with record_function("## forward ##"):
+            losses, output = self._model_fwd(self.batches[0])
+
+        # #8 wait the N+2 splits AllToAll (after forward, which it overlapped).
+        if len(self.batches) > 2:
+            self.wait_sparse_data_dist(self.contexts[2])
+
+        # #9 apply the deferred NOL grad for N-1.
+        with record_function("## pec_nol_grad_apply ##"):
+            self._wait_pec_grad(nol_grad_awaitables)
+
+        # #10 NOL compute N+1 -- the first consumer of overlap_dist's forward
+        #     ctx[N+1]. Order the main stream after overlap_dist (#5, which
+        #     recorded _overlap_dist_event) only here, where the consumer runs;
+        #     skipped on the finalize step (ctx1 None, no forward ctx produced).
+        #     Done after forward so the data-dist work overlapped it.
+        if ctx1 is not None:
+            torch.get_device_module(self._device).current_stream().wait_event(
+                self._overlap_dist_event
+            )
+            with record_function("## pec_nol_compute ##"):
+                self._pec_nol_compute(ctx1)
+
+        if self._model.training:
+            # #11 backward N (splits grad, creates appliers; no AllToAll).
+            #     Independent of overlap_dist, so on the finalize step it overlaps
+            #     the finalize backward-ctx data-dist work.
+            self._backward(losses)
+
+            # overlap_dist's backward ctx[N] is first consumed by the OL grad
+            # below. If #10's NOL compute didn't already order the main stream
+            # after overlap_dist (finalize step, ctx1 None), do it now.
+            if ctx1 is None:
+                torch.get_device_module(self._device).current_stream().wait_event(
+                    self._overlap_dist_event
+                )
+
+            # #12 OL grad AllToAll N.
+            with record_function("## pec_ol_grad_a2a ##"):
+                ol_grad_awaitables = self._start_pec_ol_grad(ctx0)
+
+            # #13 optimizer N (dense), overlaps the OL grad AllToAll.
+            with record_function("## optimizer ##"):
+                self._optimizer.step()
+
+            # #14 apply OL grad N, then defer N's NOL grad to N+1 (or, on the
+            #     final batch, attach to N itself and drain now).
+            with record_function("## pec_ol_grad_apply ##"):
+                self._wait_pec_grad(ol_grad_awaitables)
+            if ctx1 is not None:
+                self._defer_nol_grad(ctx0, ctx1)
+            else:
+                self._defer_nol_grad(ctx0, ctx0)
+                self._wait_pec_grad(self._start_deferred_nol_grad(ctx0))
+
+        self.dequeue_batch()
+        return output
