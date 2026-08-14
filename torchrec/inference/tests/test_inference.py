@@ -177,7 +177,7 @@ class InferenceTest(unittest.TestCase):
                             pruning_dict[config.name],
                         )
             elif module.__class__.__name__ == "IntNBitTableBatchedEmbeddingBagsCodegen":
-                # pyrefly: ignore[bad-argument-type]
+                # pyrefly: ignore [bad-argument-type, not-iterable]
                 for i, spec in enumerate(module.embedding_specs):
                     if spec[0] in pruning_dict:
                         self.assertEqual(
@@ -222,7 +222,7 @@ class InferenceTest(unittest.TestCase):
         for module in quantized_model.modules():
             if module.__class__.__name__ == "IntNBitTableBatchedEmbeddingBagsCodegen":
                 num_tbes += 1
-                # pyrefly: ignore[bad-argument-type]
+                # pyrefly: ignore [bad-argument-type, not-iterable]
                 for i, spec in enumerate(module.embedding_specs):
                     self.assertEqual(spec[3], SparseType.INT4)
 
@@ -297,7 +297,7 @@ class InferenceTest(unittest.TestCase):
 
         for module in quantized_model.modules():
             if module.__class__.__name__ == "IntNBitTableBatchedEmbeddingBagsCodegen":
-                # pyrefly: ignore[bad-argument-type]
+                # pyrefly: ignore [bad-argument-type, not-iterable]
                 for i, spec in enumerate(module.embedding_specs):
                     if spec[0] in expected_num_embeddings:
                         # We only expect the first table to be quantized to int4 due to test set up

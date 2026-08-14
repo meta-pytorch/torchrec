@@ -115,6 +115,10 @@ def kernel_bw_lookup(
             "cuda",
             EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
         ): hbm_to_ddr_mem_bw,
+        # TODO: revisit update the values
+        ("tpu", EmbeddingComputeKernel.DENSE.value): 0.5 * hbm_mem_bw,
+        ("tpu", EmbeddingComputeKernel.FUSED.value): 1 * hbm_mem_bw,
+        ("tpu", EmbeddingComputeKernel.QUANT.value): 1 * hbm_mem_bw,
     }
 
     if (

@@ -20,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import torch.distributed as dist
-from torchrec.distributed.comm import _CROSS_PG, _INTRA_PG
+from torchrec.distributed import comm as _comm
 from torchrec.test_utils import (
     get_free_port,
     init_distributed_single_host,
@@ -113,10 +113,20 @@ class MultiProcessContext:
         return self
 
     def __exit__(self, exc_type, exc_instance, traceback) -> None:
-        if _INTRA_PG is not None:
-            dist.destroy_process_group(_INTRA_PG)
-        if _CROSS_PG is not None:
-            dist.destroy_process_group(_CROSS_PG)
+        # Access via `_comm.X`, not `from comm import X`: a `from`-import snapshots
+        # the value at import time, so a re-entered context would see the stale handle.
+        if _comm._INTRA_PG is not None:
+            dist.destroy_process_group(_comm._INTRA_PG)
+            _comm._INTRA_PG = None
+        if _comm._CROSS_PG is not None:
+            dist.destroy_process_group(_comm._CROSS_PG)
+            _comm._CROSS_PG = None
+        if _comm._INTRA_PG_2D is not None:
+            dist.destroy_process_group(_comm._INTRA_PG_2D)
+            _comm._INTRA_PG_2D = None
+        if _comm._CROSS_PG_2D is not None:
+            dist.destroy_process_group(_comm._CROSS_PG_2D)
+            _comm._CROSS_PG_2D = None
         dist.destroy_process_group(self.pg)
         torch.use_deterministic_algorithms(False)
         if torch.cuda.is_available() and self.disable_cuda_tf_32:

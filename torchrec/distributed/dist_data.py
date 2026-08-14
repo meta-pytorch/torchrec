@@ -501,6 +501,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                         )
                     )
             # To avoid hasattr in _wait_impl to check self._splits_awaitable
+            # pyrefly: ignore [bad-assignment]
             self._splits_awaitable = None
         else:
             with record_function("## all2all_data:kjt splits ##"):
@@ -511,6 +512,7 @@ class SplitsAllToAllAwaitable(Awaitable[List[List[int]]]):
                 )
                 input_tensor = torch.stack(input_tensors, dim=1).flatten()
                 self._input_tensor = input_tensor
+                # pyrefly: ignore [bad-assignment]
                 self._splits_awaitable: dist.Work = dist.all_to_all_single(
                     output=self._output_tensor,
                     input=input_tensor,

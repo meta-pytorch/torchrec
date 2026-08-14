@@ -838,7 +838,7 @@ class ShardedEmbeddingBagCollection(
                     device_ids=(
                         [self._device]
                         if self._device is not None
-                        and (self._device.type in {"cuda", "mtia"})
+                        and (self._device.type in {"cuda", "mtia", "tpu"})
                         else None
                     ),
                     process_group=self._env.process_group,
@@ -1951,6 +1951,7 @@ class ShardedEmbeddingBagCollection(
         # register callback if there are features that need mean pooling
         if self._has_mean_pooling_callback:
             awaitable.callbacks.append(
+                # pyrefly: ignore [bad-argument-type]
                 partial(_apply_mean_pooling, divisor=ctx.divisor)
             )
 
@@ -2046,6 +2047,7 @@ class ShardedEmbeddingBagCollection(
         # register callback if there are features that need mean pooling
         if self._has_mean_pooling_callback:
             awaitable.callbacks.append(
+                # pyrefly: ignore [bad-argument-type]
                 partial(_apply_mean_pooling, divisor=ctx.divisor)
             )
 

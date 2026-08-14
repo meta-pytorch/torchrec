@@ -2728,8 +2728,8 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         if not self.weights_sharded:
             return
         self.ensure_reduce_scatter_complete()
-        # pyrefly: ignore [missing-attribute]
-        shard_size = self._shard_buf.numel()
+        shard_buf = none_throws(self._shard_buf)
+        shard_size = shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
 
         self._unsharded_param.untyped_storage().resize_(
@@ -2757,15 +2757,14 @@ class ShardedBatchedFusedEmbedding(BatchedFusedEmbedding):
         with record_function("## 2d_allgather_fully_sharded ##"):
             dist.all_gather_into_tensor(
                 output_tensor=output_tensor,
-                input_tensor=self._shard_buf,
+                input_tensor=shard_buf,
                 group=self._env.replica_pg,
                 async_op=False,
             )
         self._emb_module.weights_dev = self._unsharded_param[
             : self._original_shape.numel()
         ]
-        # pyrefly: ignore [missing-attribute]
-        self._shard_buf.untyped_storage().resize_(0)
+        shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
     def _hybird_sharded_backward_hook(
@@ -4510,8 +4509,8 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
             return
         self.ensure_reduce_scatter_complete()
 
-        # pyrefly: ignore [missing-attribute]
-        shard_size = self._shard_buf.numel()
+        shard_buf = none_throws(self._shard_buf)
+        shard_size = shard_buf.numel()
         padded_total_size = shard_size * self._env.num_sharding_groups()
 
         self._unsharded_param.untyped_storage().resize_(
@@ -4539,15 +4538,14 @@ class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):
         with record_function("## 2d_allgather_fully_sharded ##"):
             dist.all_gather_into_tensor(
                 output_tensor=output_tensor,
-                input_tensor=self._shard_buf,
+                input_tensor=shard_buf,
                 group=self._env.replica_pg,
                 async_op=False,
             )
         self._emb_module.weights_dev = self._unsharded_param[
             : self._original_shape.numel()
         ]
-        # pyrefly: ignore [missing-attribute]
-        self._shard_buf.untyped_storage().resize_(0)
+        shard_buf.untyped_storage().resize_(0)
         self.weights_sharded = False
 
     def _hybird_sharded_backward_hook(

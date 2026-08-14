@@ -344,8 +344,7 @@ class TransferTensorsToCpuTest(unittest.TestCase):
             torch.testing.assert_close(tensor, tensors[key])
 
     def test_non_tensor_values_preserved(self) -> None:
-        # pyre-ignore[6]
-        tensors: dict[str, torch.Tensor] = {
+        tensors: dict[str, torch.Tensor | str | int] = {
             "predictions": torch.tensor([1.0]),
             "name": "task1",
             "count": 42,
