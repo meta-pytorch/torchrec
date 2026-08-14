@@ -835,7 +835,7 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
             ebc_sharding_lookups = self._lookups[sharding]
             sharding_mcebc_lookups: List[ShardedMCEBCLookup] = []
             for j, ec_lookup in enumerate(
-                # pyrefly: ignore[bad-argument-type]
+                # pyrefly: ignore [bad-argument-type, not-iterable]
                 ebc_sharding_lookups._embedding_lookups_per_rank
             ):
                 sharding_mcebc_lookups.append(
@@ -875,7 +875,7 @@ class ShardedQuantManagedCollisionEmbeddingBagCollection(
             dist_input_i = dist_input[i]
             lookups = self._mcebc_lookup[i]
             sharding_ret: List[torch.Tensor] = []
-            # pyrefly: ignore[bad-argument-type]
+            # pyrefly: ignore [bad-argument-type, not-iterable]
             for j, lookup in enumerate(lookups):
                 rank_ret = lookup(
                     features=dist_input_i[j],

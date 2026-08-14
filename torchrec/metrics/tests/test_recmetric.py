@@ -240,6 +240,7 @@ class RecMetricTest(unittest.TestCase):
 
     def test_invalid_window_size(self) -> None:
         with self.assertRaises(ValueError):
+            # pyrefly: ignore [bad-instantiation]
             RecMetric(
                 world_size=8,
                 my_rank=0,
@@ -293,6 +294,7 @@ class RecMetricTest(unittest.TestCase):
                 "prediction": torch.tensor(
                     [0.0, 1.0, 0.0, 1.0], device=torch.device("cuda:0")
                 ),
+                # pyrefly: ignore [bad-assignment]
                 "session_id": ["1", "1", "2", "2"],
             },
             required_inputs_list=["session_id"],

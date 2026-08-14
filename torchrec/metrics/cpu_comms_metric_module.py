@@ -127,6 +127,7 @@ class CPUCommsRecMetricModule(RecMetricModule):
         cloned_metrics = []
         for metric in self.rec_metrics.rec_metrics:
             metric = cast(RecMetric, metric)
+            # pyrefly: ignore [bad-instantiation]
             cloned_metric = type(metric)(
                 world_size=metric._world_size,
                 my_rank=metric._my_rank,

@@ -1951,6 +1951,7 @@ class ShardedEmbeddingBagCollection(
         # register callback if there are features that need mean pooling
         if self._has_mean_pooling_callback:
             awaitable.callbacks.append(
+                # pyrefly: ignore [bad-argument-type]
                 partial(_apply_mean_pooling, divisor=ctx.divisor)
             )
 
@@ -2046,6 +2047,7 @@ class ShardedEmbeddingBagCollection(
         # register callback if there are features that need mean pooling
         if self._has_mean_pooling_callback:
             awaitable.callbacks.append(
+                # pyrefly: ignore [bad-argument-type]
                 partial(_apply_mean_pooling, divisor=ctx.divisor)
             )
 

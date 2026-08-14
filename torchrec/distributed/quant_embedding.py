@@ -1354,7 +1354,7 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
             ec_sharding_lookups = self._lookups[sharding]
             sharding_mcec_lookups: List[ShardedMCECLookup] = []
             for j, ec_lookup in enumerate(
-                # pyrefly: ignore[bad-argument-type]
+                # pyrefly: ignore [bad-argument-type, not-iterable]
                 ec_sharding_lookups._embedding_lookups_per_rank
             ):
                 sharding_mcec_lookups.append(
@@ -1403,7 +1403,7 @@ class ShardedQuantManagedCollisionEmbeddingCollection(ShardedQuantEmbeddingColle
             dist_input_i = dist_input[i]
             lookups = self._mcec_lookup[i]
             sharding_ret: List[torch.Tensor] = []
-            # pyrefly: ignore[bad-argument-type]
+            # pyrefly: ignore [bad-argument-type, not-iterable]
             for j, lookup in enumerate(lookups):
                 embedding_result, remapped_kjt = lookup(
                     features=dist_input_i[j],

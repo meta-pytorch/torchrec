@@ -98,7 +98,7 @@ class QuantPruneTest(unittest.TestCase):
         for module in sharded_model.modules():
             if module.__class__.__name__ == "IntNBitTableBatchedEmbeddingBagsCodegen":
                 #  `Union[Tensor, Module]`.
-                # pyrefly: ignore[bad-argument-type]
+                # pyrefly: ignore [bad-argument-type, not-iterable]
                 for i, spec in enumerate(module.embedding_specs):
                     if spec[0] in pruned_dict:
                         self.assertEqual(
