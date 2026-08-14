@@ -221,7 +221,9 @@ def triton_permute_2d_sparse_data(
             permute,
             B,
             n_seg,
+            # pyrefly: ignore[bad-argument-type]
             HAS_W=has_w,
+            # pyrefly: ignore[bad-argument-type]
             BLOCK=block,
         )
     else:
@@ -240,7 +242,9 @@ def triton_permute_2d_sparse_data(
             torch.searchsorted(out_off, ends, right=True) - 1,
             B,
             n_out,
+            # pyrefly: ignore[bad-argument-type]
             HAS_W=has_w,
+            # pyrefly: ignore[bad-argument-type]
             BLOCK=block,
         )
 
