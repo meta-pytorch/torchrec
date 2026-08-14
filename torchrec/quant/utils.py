@@ -48,7 +48,7 @@ def populate_fx_names(
             # pyrefly: ignore[bad-argument-type]
             emb_dist_module._fx_path = f"embedding_dist.{i}"
             #  `Union[Module, Tensor]`.
-            # pyrefly: ignore[bad-argument-type]
+            # pyrefly: ignore [bad-argument-type, not-iterable]
             for rank, rank_module in enumerate(emb_module._embedding_lookups_per_rank):
                 rank_fx_path = f"{embedding_fx_path}.rank_{rank}"
                 rank_module._fx_path = rank_fx_path

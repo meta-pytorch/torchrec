@@ -188,7 +188,7 @@ class BaseCwEmbeddingSharding(BaseTwEmbeddingSharding[C, F, T, W]):
                     stride=info.param.stride(),
                 )
 
-            # pyrefly: ignore[bad-argument-type]
+            # pyrefly: ignore [bad-argument-type, not-iterable]
             for i, rank in enumerate(info.param_sharding.ranks):
                 # Remap rank by number of replica groups if 2D parallelism is enabled
                 rank = (

@@ -248,7 +248,7 @@ class BaseGridEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
                 )
 
             # Expectation is planner CW shards across a node, so each CW shard will have local_size number of row shards
-            # pyrefly: ignore[bad-argument-type]
+            # pyrefly: ignore [bad-argument-type, not-iterable]
             for i, rank in enumerate(info.param_sharding.ranks):
                 rank = (
                     # pyrefly: ignore[missing-attribute]
