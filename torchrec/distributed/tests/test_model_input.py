@@ -8,13 +8,17 @@
 
 # pyre-strict
 
+import math
 import unittest
 from collections import Counter
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import torch
-from torchrec.distributed.test_utils.model_input import ModelInput
+from torchrec.distributed.test_utils.model_input import (
+    generate_overlapping_batches,
+    ModelInput,
+)
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -687,6 +691,301 @@ class TestModelInput(unittest.TestCase):
                 device=None,
             )
         self.assertIn("num_embeddings must be >= 1", str(context.exception))
+
+
+class TestGenerateOverlappingBatches(unittest.TestCase):
+    """Tests for generate_overlapping_batches."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(42)
+        self.tables: List[EmbeddingBagConfig] = [
+            EmbeddingBagConfig(
+                name="table_0",
+                feature_names=["feature_0"],
+                embedding_dim=64,
+                num_embeddings=10000,
+            ),
+            EmbeddingBagConfig(
+                name="table_1",
+                feature_names=["feature_1"],
+                embedding_dim=32,
+                num_embeddings=5000,
+            ),
+        ]
+        self.batch_size = 32
+        self.world_size = 4
+        self.pooling_avg = 10
+
+    def _get_global_unique_per_feature(
+        self,
+        batches: List[List[ModelInput]],
+        batch_idx: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Collect unique indices per feature across all ranks for a given batch."""
+        per_feature: Dict[str, List[torch.Tensor]] = {}
+        for r in range(len(batches[batch_idx])):
+            kjt = batches[batch_idx][r].idlist_features
+            assert kjt is not None
+            keys = kjt.keys()
+            lengths = kjt.lengths()
+            values = kjt.values()
+            num_features = len(keys)
+            stride = lengths.numel() // num_features
+            lengths_2d = lengths.view(num_features, stride)
+            offset = 0
+            for f_idx, key in enumerate(keys):
+                n = int(lengths_2d[f_idx].sum().item())
+                if key not in per_feature:
+                    per_feature[key] = []
+                per_feature[key].append(values[offset : offset + n])
+                offset += n
+        return {k: torch.cat(v).unique() for k, v in per_feature.items()}
+
+    def test_structure(self) -> None:
+        """Output should have correct shape and types."""
+        batches = generate_overlapping_batches(
+            tables=self.tables,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            num_batches=3,
+            overlap_ratio=0.5,
+            pooling_avg=self.pooling_avg,
+        )
+
+        self.assertEqual(len(batches), 3)
+        for batch in batches:
+            self.assertEqual(len(batch), self.world_size)
+            for mi in batch:
+                self.assertIsInstance(mi, ModelInput)
+                self.assertEqual(mi.float_features.shape[0], self.batch_size)
+                self.assertEqual(mi.label.shape[0], self.batch_size)
+                kjt = mi.idlist_features
+                self.assertIsNotNone(kjt)
+                assert kjt is not None
+                self.assertEqual(kjt.keys(), ["feature_0", "feature_1"])
+
+    def test_kjt_validity(self) -> None:
+        """KJT lengths sum should match values length, indices in valid range."""
+        batches = generate_overlapping_batches(
+            tables=self.tables,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            num_batches=2,
+            overlap_ratio=0.5,
+            pooling_avg=self.pooling_avg,
+        )
+
+        for batch in batches:
+            for mi in batch:
+                kjt = mi.idlist_features
+                assert kjt is not None
+                self.assertEqual(int(kjt.lengths().sum().item()), kjt.values().numel())
+                self.assertTrue(torch.all(kjt.values() >= 0))
+                num_features = len(kjt.keys())
+                stride = kjt.lengths().numel() // num_features
+                lengths_2d = kjt.lengths().view(num_features, stride)
+                offset = 0
+                for f_idx, table in enumerate(self.tables):
+                    n = int(lengths_2d[f_idx].sum().item())
+                    f_values = kjt.values()[offset : offset + n]
+                    self.assertTrue(
+                        torch.all(f_values < table.num_embeddings),
+                        f"feature {f_idx} has values >= {table.num_embeddings}",
+                    )
+                    offset += n
+
+    def test_global_overlap_accuracy(self) -> None:
+        """Global overlap ratio should approximate the target."""
+        target = 0.7
+        batches = generate_overlapping_batches(
+            tables=self.tables,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            num_batches=5,
+            overlap_ratio=target,
+            pooling_avg=self.pooling_avg,
+        )
+
+        for b in range(1, len(batches)):
+            prev_unique = self._get_global_unique_per_feature(batches, b - 1)
+            curr_unique = self._get_global_unique_per_feature(batches, b)
+
+            for key in prev_unique:
+                prev_set = set(prev_unique[key].tolist())
+                curr_set = set(curr_unique[key].tolist())
+                if len(prev_set) == 0:
+                    continue
+                overlap = len(prev_set & curr_set) / len(prev_set)
+                self.assertAlmostEqual(
+                    overlap,
+                    target,
+                    delta=0.1,
+                    msg=f"batch {b}, feature {key}: overlap={overlap:.3f}",
+                )
+
+    def test_per_rank_overlap(self) -> None:
+        """Per-rank post-A2A overlap should approximate the global target."""
+        target = 0.7
+        batches = generate_overlapping_batches(
+            tables=self.tables,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            num_batches=3,
+            overlap_ratio=target,
+            pooling_avg=self.pooling_avg,
+        )
+
+        for table in self.tables:
+            block_size = math.ceil(table.num_embeddings / self.world_size)
+            feature_name = table.feature_names[0]
+
+            for rank in range(self.world_size):
+                post_a2a_unique_per_batch: List[set] = []
+                for b in range(len(batches)):
+                    global_unique = self._get_global_unique_per_feature(batches, b)
+                    indices = global_unique[feature_name]
+                    rank_mask = (indices // block_size) == rank
+                    post_a2a_unique_per_batch.append(set(indices[rank_mask].tolist()))
+
+                for b in range(1, len(batches)):
+                    prev_set = post_a2a_unique_per_batch[b - 1]
+                    curr_set = post_a2a_unique_per_batch[b]
+                    if len(prev_set) == 0:
+                        continue
+                    overlap = len(prev_set & curr_set) / len(prev_set)
+                    self.assertAlmostEqual(
+                        overlap,
+                        target,
+                        delta=0.15,
+                        msg=(
+                            f"rank {rank}, batch {b}, feature {feature_name}: "
+                            f"overlap={overlap:.3f}"
+                        ),
+                    )
+
+    def test_overlap_zero(self) -> None:
+        """With overlap_ratio=0.0, consecutive batches should have minimal overlap."""
+        batches = generate_overlapping_batches(
+            tables=self.tables,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            num_batches=3,
+            overlap_ratio=0.0,
+            pooling_avg=self.pooling_avg,
+        )
+
+        for b in range(1, len(batches)):
+            prev_unique = self._get_global_unique_per_feature(batches, b - 1)
+            curr_unique = self._get_global_unique_per_feature(batches, b)
+
+            for key in prev_unique:
+                prev_set = set(prev_unique[key].tolist())
+                curr_set = set(curr_unique[key].tolist())
+                if len(prev_set) == 0:
+                    continue
+                overlap = len(prev_set & curr_set) / len(prev_set)
+                self.assertLess(overlap, 0.15)
+
+    def test_overlap_one(self) -> None:
+        """With overlap_ratio=1.0, all previous indices should reappear."""
+        batches = generate_overlapping_batches(
+            tables=self.tables,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            num_batches=3,
+            overlap_ratio=1.0,
+            pooling_avg=self.pooling_avg,
+        )
+
+        for b in range(1, len(batches)):
+            prev_unique = self._get_global_unique_per_feature(batches, b - 1)
+            curr_unique = self._get_global_unique_per_feature(batches, b)
+
+            for key in prev_unique:
+                prev_set = set(prev_unique[key].tolist())
+                curr_set = set(curr_unique[key].tolist())
+                if len(prev_set) == 0:
+                    continue
+                overlap = len(prev_set & curr_set) / len(prev_set)
+                self.assertGreater(overlap, 0.85)
+
+    def test_with_weighted_tables(self) -> None:
+        """Weighted tables should produce valid idscore KJTs with weights."""
+        weighted_tables = [
+            EmbeddingBagConfig(
+                name="weighted_table_0",
+                feature_names=["weighted_feature_0"],
+                embedding_dim=64,
+                num_embeddings=5000,
+            ),
+        ]
+
+        batches = generate_overlapping_batches(
+            tables=self.tables,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            num_batches=2,
+            overlap_ratio=0.5,
+            weighted_tables=weighted_tables,
+            pooling_avg=self.pooling_avg,
+        )
+
+        for batch in batches:
+            for mi in batch:
+                self.assertIsNotNone(mi.idscore_features)
+                idscore = mi.idscore_features
+                assert idscore is not None
+                self.assertIsNotNone(idscore.weights_or_none())
+                self.assertEqual(idscore.weights().numel(), idscore.values().numel())
+
+    def test_overlap_tables_filter(self) -> None:
+        """Only tables in overlap_tables should get controlled overlap."""
+        target = 0.9
+        batches = generate_overlapping_batches(
+            tables=self.tables,
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            num_batches=4,
+            overlap_ratio=target,
+            pooling_avg=self.pooling_avg,
+            overlap_tables=["table_0"],
+        )
+
+        overlapped = []
+        plain = []
+        for b in range(1, len(batches)):
+            prev_unique = self._get_global_unique_per_feature(batches, b - 1)
+            curr_unique = self._get_global_unique_per_feature(batches, b)
+            for key, samples in (("feature_0", overlapped), ("feature_1", plain)):
+                prev_set = set(prev_unique[key].tolist())
+                curr_set = set(curr_unique[key].tolist())
+                if len(prev_set) == 0:
+                    continue
+                samples.append(len(prev_set & curr_set) / len(prev_set))
+
+        # table_0 (overlapped) tracks the target; table_1 (plain random) is well
+        # below it -- only accidental overlap, which is sizeable for a small
+        # index range but far under the controlled 0.9 target.
+        self.assertAlmostEqual(sum(overlapped) / len(overlapped), target, delta=0.1)
+        self.assertLess(sum(plain) / len(plain), 0.5)
+
+    def test_single_rank(self) -> None:
+        """Should work with world_size=1."""
+        batches = generate_overlapping_batches(
+            tables=self.tables,
+            batch_size=self.batch_size,
+            world_size=1,
+            num_batches=2,
+            overlap_ratio=0.5,
+            pooling_avg=self.pooling_avg,
+        )
+
+        self.assertEqual(len(batches), 2)
+        for batch in batches:
+            self.assertEqual(len(batch), 1)
+            kjt = batch[0].idlist_features
+            assert kjt is not None
+            self.assertEqual(int(kjt.lengths().sum().item()), kjt.values().numel())
 
 
 if __name__ == "__main__":
