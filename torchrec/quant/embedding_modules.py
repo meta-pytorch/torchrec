@@ -75,6 +75,15 @@ from torchrec.sparse.jagged_tensor import (
 from torchrec.tensor_types import UInt2Tensor, UInt4Tensor
 from torchrec.types import ModuleNoCopyMixin
 
+try:
+    # Zero-copy quint4x2 -> uint8 reinterpret (torch.ops.gr.quantized_to_uint8_view)
+    # on the Meta-internal TGIF inference path. Falls back to the portable
+    # int_repr()-based copy above in OSS builds. Same fx op name either way, which
+    # downstream graph passes detect.
+    from torchrec.fb.modules.utils import _maybe_quint4x2_to_int8  # noqa: F811
+except ImportError:
+    pass
+
 torch.fx.wrap("_get_batching_hinted_output")
 torch.fx.wrap("len")
 torch.fx.wrap("_maybe_quint4x2_to_int8")
