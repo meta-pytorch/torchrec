@@ -202,6 +202,8 @@ def runner(
         bench_inputs = input_config.generate_batches(
             tables=tables,
             weighted_tables=weighted_tables,
+            world_size=world_size,
+            rank=rank,
         )
 
         total_bytes = 0
