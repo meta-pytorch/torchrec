@@ -9,7 +9,7 @@
 
 import random
 from dataclasses import dataclass, field
-from typing import cast, List, Optional, Tuple, Union
+from typing import cast, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 from tensordict import TensorDict
@@ -1062,3 +1062,307 @@ class VariableBatchModelInput(ModelInput):
 class TdModelInput(ModelInput):
     # pyrefly: ignore[bad-override]
     idlist_features: TensorDict
+
+
+def _generate_overlap_indices(
+    total_indices: int,
+    index_range: int,
+    overlap_ratio: float,
+    prev_unique_indices: Optional[torch.Tensor],
+    device: torch.device,
+    dtype: torch.dtype = torch.int64,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generates indices in [0, index_range) with controlled overlap vs the prev batch.
+
+    Overlap ratio is defined as |S_t intersect S_{t+1}| / |S_t|. Fresh indices are
+    drawn exclusively from the complement of prev_unique_indices (via a boolean
+    mask) to avoid accidental overlap.
+
+    Args:
+        total_indices: number of indices to generate.
+        index_range: exclusive upper bound of the index range.
+        overlap_ratio: target fraction of prev unique indices to reuse.
+        prev_unique_indices: unique indices from the previous batch, or None.
+        device: device for the output tensors.
+        dtype: dtype for the output tensors.
+
+    Returns:
+        (generated indices, unique indices in the new batch).
+    """
+    if total_indices == 0:
+        empty = torch.empty(0, dtype=dtype, device=device)
+        return empty, empty
+
+    if prev_unique_indices is None or prev_unique_indices.numel() == 0:
+        indices = torch.randint(
+            0, index_range, (total_indices,), dtype=dtype, device=device
+        )
+        return indices, indices.unique()
+
+    num_prev = len(prev_unique_indices)
+    num_reuse = min(round(overlap_ratio * num_prev), total_indices)
+    num_fresh = total_indices - num_reuse
+
+    # Reuse: sample num_reuse indices from prev_unique_indices.
+    reuse = prev_unique_indices[torch.randperm(num_prev, device=device)[:num_reuse]]
+
+    # Fresh: sample from [0, index_range) excluding prev_unique_indices.
+    if num_fresh > 0 and num_prev < index_range:
+        mask = torch.ones(index_range, dtype=torch.bool, device=device)
+        mask[prev_unique_indices.long()] = False
+        available = mask.nonzero(as_tuple=False).squeeze(1).to(dtype)
+        fresh = available[torch.randint(0, len(available), (num_fresh,), device=device)]
+    elif num_fresh > 0:
+        # index_range exhausted by prev; fall back to sampling from prev.
+        fresh = prev_unique_indices[
+            torch.randint(0, num_prev, (num_fresh,), device=device)
+        ]
+    else:
+        fresh = torch.empty(0, dtype=dtype, device=device)
+
+    indices = torch.cat([reuse, fresh])
+    indices = indices[torch.randperm(total_indices, device=device)]
+    return indices, indices.unique()
+
+
+def _generate_global_kjt_with_overlap(
+    tables: List[EmbeddingBagConfig],
+    batch_size: int,
+    overlap_ratio: float,
+    prev_unique_per_feature: Dict[str, torch.Tensor],
+    device: torch.device,
+    pooling_avg: int = 10,
+    indices_dtype: torch.dtype = torch.int64,
+    lengths_dtype: torch.dtype = torch.int32,
+    weighted: bool = False,
+    overlap_tables: Optional[Set[str]] = None,
+) -> Tuple[KeyedJaggedTensor, Dict[str, torch.Tensor]]:
+    """Generates a global KJT with controlled per-feature index overlap vs the prev batch.
+
+    Args:
+        tables: embedding table configs defining features and num_embeddings.
+        batch_size: global batch size (typically B * W).
+        overlap_ratio: target overlap ratio for unique indices across batches.
+        prev_unique_per_feature: previous batch's unique indices per feature name.
+        pooling_avg: average pooling factor (number of indices per sample).
+        device: device for the output tensors.
+        indices_dtype: dtype for index tensors.
+        lengths_dtype: dtype for length tensors.
+        weighted: if True, generate random weights via _assemble_kjt.
+        overlap_tables: if provided, only apply overlap control to features of
+            tables whose names are in this set; other features use plain random
+            indices.
+
+    Returns:
+        (global KJT, the new batch's unique indices per overlap feature).
+    """
+    features: List[str] = []
+    lengths_per_feature: List[torch.Tensor] = []
+    indices_per_feature: List[torch.Tensor] = []
+    new_prev_unique: Dict[str, torch.Tensor] = {}
+
+    for table in tables:
+        num_embeddings = table.num_embeddings_post_pruning or table.num_embeddings
+        use_overlap = overlap_tables is None or table.name in overlap_tables
+
+        for feature_name in table.feature_names:
+            features.append(feature_name)
+
+            lengths = torch.max(
+                torch.normal(
+                    float(pooling_avg),
+                    float(pooling_avg) / 10.0,
+                    [batch_size],
+                    device=device,
+                ),
+                torch.tensor(1.0, device=device),
+            ).to(lengths_dtype)
+            lengths_per_feature.append(lengths)
+
+            total_indices = cast(int, lengths.sum().item())
+            if use_overlap:
+                prev = prev_unique_per_feature.get(feature_name, None)
+                indices, new_unique = _generate_overlap_indices(
+                    total_indices=total_indices,
+                    index_range=num_embeddings,
+                    overlap_ratio=overlap_ratio,
+                    prev_unique_indices=prev,
+                    device=device,
+                    dtype=indices_dtype,
+                )
+                new_prev_unique[feature_name] = new_unique
+            else:
+                indices = torch.randint(
+                    0,
+                    num_embeddings,
+                    (total_indices,),
+                    device=device,
+                    dtype=indices_dtype,
+                )
+            indices_per_feature.append(indices)
+
+    kjt = ModelInput._assemble_kjt(
+        features=features,
+        lengths_per_feature=lengths_per_feature,
+        indices_per_feature=indices_per_feature,
+        weighted=weighted,
+        device=device,
+    )
+    return kjt, new_prev_unique
+
+
+def _split_kjt(
+    global_kjt: KeyedJaggedTensor,
+    world_size: int,
+) -> List[KeyedJaggedTensor]:
+    """Splits a global KJT into world_size per-rank KJTs along the batch dimension.
+
+    Reshapes lengths from [F, B*W] to [F*W, B] and uses a single
+    permute_2D_sparse_data call to regroup from feature-major to rank-major
+    order, then slices the result.
+
+    Args:
+        global_kjt: KJT with stride = B * W.
+        world_size: number of ranks to split into.
+
+    Returns:
+        A list of world_size KJTs, each with stride = B.
+    """
+    total_batch = global_kjt.stride()
+    local_batch = total_batch // world_size
+    keys = global_kjt.keys()
+    num_features = len(keys)
+    values = global_kjt.values()
+    weights = global_kjt.weights_or_none()
+    device = values.device
+
+    # Reshape [F, B*W] -> [F*W, B]: each row is one (feature, chunk) pair.
+    lengths_fw_b = global_kjt.lengths().view(num_features * world_size, local_batch)
+
+    # Single permutation feature-major -> rank-major: input row (f, r) at index
+    # f*W+r, output row (r, f) at index r*F+f, so permute[r*F + f] = f*W + r.
+    r_idx = torch.arange(world_size, device=device).unsqueeze(1)
+    f_idx = torch.arange(num_features, device=device).unsqueeze(0)
+    permute = (f_idx * world_size + r_idx).reshape(-1).int()
+
+    out_lengths, out_values, out_weights = torch.ops.fbgemm.permute_2D_sparse_data(
+        permute, lengths_fw_b, values, weights, values.numel()
+    )
+
+    # Slice into W rank chunks.
+    out_lengths_per_rank = out_lengths.view(world_size, num_features * local_batch)
+    value_splits = out_lengths_per_rank.sum(dim=1).tolist()
+    value_chunks = out_values.split(value_splits)
+    weight_chunks = (
+        out_weights.split(value_splits) if weights is not None else [None] * world_size
+    )
+
+    return [
+        KeyedJaggedTensor(
+            keys=list(keys),
+            values=value_chunks[r],
+            lengths=out_lengths_per_rank[r],
+            weights=weight_chunks[r],
+        )
+        for r in range(world_size)
+    ]
+
+
+def generate_overlapping_batches(
+    tables: List[EmbeddingBagConfig],
+    batch_size: int,
+    world_size: int,
+    num_batches: int,
+    overlap_ratio: float = 0.5,
+    weighted_tables: Optional[List[EmbeddingBagConfig]] = None,
+    num_float_features: int = 16,
+    pooling_avg: int = 10,
+    device: Optional[torch.device] = None,
+    indices_dtype: torch.dtype = torch.int64,
+    lengths_dtype: torch.dtype = torch.int32,
+    overlap_tables: Optional[List[str]] = None,
+    pin_memory: bool = False,
+) -> List[List[ModelInput]]:
+    """Generates batches of ModelInput with controlled post-A2A index overlap.
+
+    Intended for PEC RW-sharding training benchmarks/tests. Generates a global
+    KJT (batch size B * W) with per-feature overlap control, then splits it into
+    per-rank KJTs; under a uniform index distribution, per-rank post-A2A overlap
+    approximates the global overlap.
+
+    Args:
+        tables: embedding table configs for unweighted (idlist) features.
+        batch_size: per-rank batch size (B).
+        world_size: number of ranks (W).
+        num_batches: number of batches to generate.
+        overlap_ratio: target |S_t intersect S_{t+1}| / |S_t| for unique indices
+            across consecutive batches (0.0 to 1.0).
+        weighted_tables: optional embedding table configs for weighted features.
+        num_float_features: number of dense float features.
+        pooling_avg: average pooling factor per feature.
+        device: device for the output tensors.
+        indices_dtype: dtype for index tensors.
+        lengths_dtype: dtype for length tensors.
+        overlap_tables: if provided, only apply overlap control to tables whose
+            names are in this list; other tables use plain random indices.
+        pin_memory: if True, pin each ModelInput's tensors for fast async H2D
+            copy in the pipeline (matches ModelInput.generate).
+
+    Returns:
+        batches[b][r]: ModelInput for batch b, rank r (pre-A2A format).
+    """
+    device = device if device is not None else torch.device("cpu")
+    global_batch_size = batch_size * world_size
+    prev_unique_idlist: Dict[str, torch.Tensor] = {}
+    prev_unique_idscore: Dict[str, torch.Tensor] = {}
+    all_batches: List[List[ModelInput]] = []
+    overlap_set: Optional[Set[str]] = (
+        set(overlap_tables) if overlap_tables is not None else None
+    )
+
+    for _ in range(num_batches):
+        global_idlist_kjt, prev_unique_idlist = _generate_global_kjt_with_overlap(
+            tables=tables,
+            batch_size=global_batch_size,
+            overlap_ratio=overlap_ratio,
+            prev_unique_per_feature=prev_unique_idlist,
+            pooling_avg=pooling_avg,
+            device=device,
+            indices_dtype=indices_dtype,
+            lengths_dtype=lengths_dtype,
+            overlap_tables=overlap_set,
+        )
+        per_rank_idlist = _split_kjt(global_idlist_kjt, world_size)
+
+        per_rank_idscore: Optional[List[KeyedJaggedTensor]] = None
+        if weighted_tables:
+            global_idscore_kjt, prev_unique_idscore = _generate_global_kjt_with_overlap(
+                tables=weighted_tables,
+                batch_size=global_batch_size,
+                overlap_ratio=overlap_ratio,
+                prev_unique_per_feature=prev_unique_idscore,
+                pooling_avg=pooling_avg,
+                device=device,
+                indices_dtype=indices_dtype,
+                lengths_dtype=lengths_dtype,
+                weighted=True,
+                overlap_tables=overlap_set,
+            )
+            per_rank_idscore = _split_kjt(global_idscore_kjt, world_size)
+
+        batch: List[ModelInput] = []
+        for r in range(world_size):
+            float_features = torch.rand(batch_size, num_float_features, device=device)
+            label = torch.rand(batch_size, device=device)
+            idlist = per_rank_idlist[r]
+            idscore = per_rank_idscore[r] if per_rank_idscore is not None else None
+            if pin_memory:
+                # Pin so the pipeline's H2D copy can be truly async, matching the
+                # standard ModelInput.generate path.
+                float_features, idlist, idscore, label, _ = ModelInput._pin_memory(
+                    float_features, idlist, idscore, label
+                )
+            batch.append(ModelInput(float_features, idlist, idscore, label))
+        all_batches.append(batch)
+
+    return all_batches
