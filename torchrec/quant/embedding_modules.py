@@ -75,6 +75,15 @@ from torchrec.sparse.jagged_tensor import (
 from torchrec.tensor_types import UInt2Tensor, UInt4Tensor
 from torchrec.types import ModuleNoCopyMixin
 
+try:
+    # Zero-copy quint4x2 -> uint8 reinterpret (torch.ops.gr.quantized_to_uint8_view)
+    # on the Meta-internal TGIF inference path. Falls back to the portable
+    # int_repr()-based copy above in OSS builds. Same fx op name either way, which
+    # downstream graph passes detect.
+    from torchrec.fb.modules.utils import _maybe_quint4x2_to_int8  # noqa: F811
+except ImportError:
+    pass
+
 torch.fx.wrap("_get_batching_hinted_output")
 torch.fx.wrap("len")
 torch.fx.wrap("_maybe_quint4x2_to_int8")
@@ -914,6 +923,12 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
             self.tbes: torch.nn.ModuleList = torch.nn.ModuleList(self._emb_modules)
         setattr(self, MODULE_ATTR_CACHE_FEATURES_ORDER, cache_features_order)
 
+    def _apply_maybe_quint4x2_to_int8(self, embedding: torch.Tensor) -> torch.Tensor:
+        # Overridable seam for the quint4x2 -> uint8 reinterpret. The base uses
+        # the portable int_repr()-based op; subclasses may swap in a zero-copy
+        # variant. Both keep the fx op name that downstream graph passes detect.
+        return _maybe_quint4x2_to_int8(embedding)
+
     def forward(
         self,
         features: KeyedJaggedTensor,
@@ -965,7 +980,7 @@ class EmbeddingCollection(EmbeddingCollectionInterface, ModuleNoCopyMixin):
                 if self.register_tbes
                 else emb_module.forward(indices=indices, offsets=offsets)
             )
-            lookup = _maybe_quint4x2_to_int8(lookup)
+            lookup = self._apply_maybe_quint4x2_to_int8(lookup)
             if getattr(self, MODULE_ATTR_USE_UNFLATTENED_LENGTHS_FOR_BATCHING, False):
                 lengths = _get_unflattened_lengths(lengths, len(embedding_names))
                 lookup = _get_batching_hinted_output(lengths=lengths, output=lookup)
