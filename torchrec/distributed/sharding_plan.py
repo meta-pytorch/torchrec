@@ -28,6 +28,7 @@ from torchrec.distributed.mc_embeddingbag import (
     ManagedCollisionEmbeddingBagCollectionSharder,
 )
 from torchrec.distributed.mc_modules import InferManagedCollisionCollectionSharder
+from torchrec.distributed.pec_embedding import PECEmbeddingCollectionSharder
 from torchrec.distributed.planner.constants import MIN_CW_DIM
 from torchrec.distributed.quant_embedding import (
     QuantEmbeddingCollectionSharder,
@@ -50,6 +51,7 @@ def get_default_sharders() -> List[ModuleSharder[nn.Module]]:
         cast(ModuleSharder[nn.Module], EmbeddingBagCollectionSharder()),
         cast(ModuleSharder[nn.Module], FeatureProcessedEmbeddingBagCollectionSharder()),
         cast(ModuleSharder[nn.Module], EmbeddingCollectionSharder()),
+        cast(ModuleSharder[nn.Module], PECEmbeddingCollectionSharder()),
         cast(ModuleSharder[nn.Module], FusedEmbeddingBagCollectionSharder()),
         cast(ModuleSharder[nn.Module], QuantEmbeddingBagCollectionSharder()),
         cast(ModuleSharder[nn.Module], QuantEmbeddingCollectionSharder()),
