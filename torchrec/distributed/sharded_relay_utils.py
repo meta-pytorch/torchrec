@@ -815,19 +815,7 @@ def allreduce_tensors_with_sharded_relay(
 
             device = my_tensor_list[0].device
 
-            # --- Step 1: Pack ---
-            # torch.cat(out=) writes all tensors into the pre-allocated flat
-            # buffer in a single fused CUDA kernel, replacing N individual
-            # copy_() calls (N = number of embedding tables, typically 101 for
-            # BM-FM).  Each copy_() incurs a separate kernel launch (~1-5μs on
-            # AMD); fusing them into one eliminates ~100 launches for pack.
-            active_flat = _get_active_flat_buf(state, my_total, dtype, device)
-            torch.cat(
-                [t.flatten() for t in my_tensor_list],
-                out=active_flat,
-            )
-
-            # --- Step 2: Metadata (allgather once, cache forever) ---
+            # --- Step 1: Metadata (allgather once, cache forever) ---
             meta_key = annotation + str(dtype)
             per_group_total_counts: list[int]
 
@@ -865,17 +853,30 @@ def allreduce_tensors_with_sharded_relay(
             else:
                 per_group_total_counts = state._flat_metadata_cache[meta_key]
 
-            # --- Step 3: Build group tensor list ---
+            # --- Step 3: Build per-group tensors ---
+            # Each group contributes ONE contiguous tensor. The active group's
+            # per-table tensors are packed into a single flat buffer (the
+            # single-segment zero-copy fast path); helper groups pass a single
+            # passthrough scratch buffer. Results are unpacked back into the
+            # caller tensors after the call.
             group_tensors: list[torch.Tensor] = []
             group_sizes: list[int] = []
 
             # Compute num_chunks for passthrough helper size (mirrors C++).
             num_chunks = (local_size - sparse_group_size) + 1
 
+            unpack_flat: torch.Tensor | None = None
+            unpack_dst: list[torch.Tensor] | None = None
+
             for g in range(num_sparse_groups):
                 if g == my_sparse_group:
-                    group_tensors.append(active_flat)
+                    in_flat = _get_active_flat_buf(state, my_total, dtype, device)
+                    _pack_into_flat(my_tensor_list, in_flat)
+                    group_tensors.append(in_flat)
                     group_sizes.append(my_total)
+                    # In-place: the kernel writes back into in_flat.
+                    unpack_flat = in_flat
+                    unpack_dst = my_tensor_list
                 else:
                     total_g = per_group_total_counts[g]
                     if sparse_group_size > 2:
@@ -894,6 +895,7 @@ def allreduce_tensors_with_sharded_relay(
                     group_sizes.append(total_g)  # full count goes to the kernel
 
             # --- Step 4: ONE fused call — all groups, all data, phase-synchronized ---
+            # In-place: results are written directly into my_tensor_list.
             state.fused.allreduce_multi_group(
                 tensors=group_tensors,
                 num_groups=num_sparse_groups,
@@ -903,16 +905,9 @@ def allreduce_tensors_with_sharded_relay(
                 skip_validation=True,
             )
 
-            # --- Step 5: Unpack ---
-            # torch._foreach_copy_ dispatches all N copies as a single batched
-            # operation, replacing N individual copy_() calls.  The split()
-            # produces views (no allocation), so this is still a pure HBM copy
-            # but with a single kernel launch instead of N.
-            slices = active_flat.split([t.numel() for t in my_tensor_list])
-            torch._foreach_copy_(
-                my_tensor_list,
-                [s.view(t.shape) for s, t in zip(slices, my_tensor_list)],
-            )
+            # --- Step 5: Unpack the active-group result into caller tensors ---
+            if unpack_flat is not None and unpack_dst is not None:
+                _unpack_from_flat(unpack_flat, unpack_dst)
 
 
 def all_to_all_tensors_with_sharded_relay(
