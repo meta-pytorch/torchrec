@@ -444,6 +444,47 @@ def bench_all_to_all_flat(
 
 
 # ---------------------------------------------------------------------------
+# Benchmark F: fused all-gather (sharded relay)
+# ---------------------------------------------------------------------------
+
+
+def bench_all_gather_flat(
+    fused: Any,
+    input_flat: torch.Tensor,
+    output_flat: torch.Tensor,
+    num_sparse_groups: int,
+    my_sparse_group: int,
+    all_active_ranks: list[list[int]],
+    helper_bufs: list[torch.Tensor],
+    per_group_send_counts: list[int],
+) -> None:
+    """ONE fused all-gather call across all sparse groups.
+
+    input_flat holds send_count elements; output_flat holds nActiveRanks x
+    send_count elements. Each helper group uses its own passthrough-sized
+    scratch buffer for both send and recv.
+    """
+    input_group_tensors: list[torch.Tensor] = []
+    output_group_tensors: list[torch.Tensor] = []
+    for g in range(num_sparse_groups):
+        if g == my_sparse_group:
+            input_group_tensors.append(input_flat)
+            output_group_tensors.append(output_flat)
+        else:
+            input_group_tensors.append(helper_bufs[g])
+            output_group_tensors.append(helper_bufs[g])
+
+    fused.all_gather_multi_group(
+        input_tensors=input_group_tensors,
+        output_tensors=output_group_tensors,
+        num_groups=num_sparse_groups,
+        per_group_send_counts=per_group_send_counts,
+        all_active_ranks=all_active_ranks,
+        skip_validation=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # NCCL baseline: 4 parallel 2-rank dist.all_reduce calls
 # ---------------------------------------------------------------------------
 
@@ -636,6 +677,27 @@ def _bench_a_worker(rank: int, world_size: int, results_dict: Any) -> None:
 
     if rank == 0:
         results_dict["A_a2a"] = (mean_a2a_base, std_a2a_base)
+
+    # NCCL all-gather baseline on the same 2-rank sub-group PG. Free the
+    # all-to-all baseline tensors first. send_count = prod_total // 4 so the
+    # output (nActiveRanks x send_count) matches the sharded-relay all-gather
+    # benchmark's footprint.
+    a2a_in = torch.empty(0, dtype=dtype, device=device)
+    a2a_out = torch.empty(0, dtype=dtype, device=device)
+    torch.cuda.empty_cache()
+    ag_send = prod_totals[my_sparse_group] // 4
+    ag_in = torch.ones(ag_send, dtype=dtype, device=device)
+    ag_out = torch.empty(sparse_group_size * ag_send, dtype=dtype, device=device)
+
+    def run_ag_baseline() -> None:
+        ag_in.fill_(1.0)
+        dist.all_gather_into_tensor(ag_out, ag_in, group=my_pg)
+
+    mean_ag_base, std_ag_base = _measure_ms(run_ag_baseline, warmup, bench_iters)
+    _store_barrier()
+
+    if rank == 0:
+        results_dict["A_ag"] = (mean_ag_base, std_ag_base)
 
     dist.destroy_process_group()
 
@@ -933,6 +995,47 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
 
     mean_a2a, std_a2a = _measure_ms(run_all_to_all, warmup, bench_iters)
 
+    # -------------------------------------------------------------------------
+    # Benchmark F: fused all-gather. Release the all-to-all buffers first.
+    # send_count = prod_total // 4 so the output (nActiveRanks x send_count)
+    # matches the all-to-all footprint.
+    # -------------------------------------------------------------------------
+    a2a_input = torch.empty(0, dtype=dtype, device=device)
+    a2a_output = torch.empty(0, dtype=dtype, device=device)
+    a2a_helper_bufs = []
+    torch.cuda.empty_cache()
+
+    ag_send_counts = [t // 4 for t in prod_totals]
+    my_ag_send = ag_send_counts[my_sparse_group]
+    ag_input = torch.ones(my_ag_send, dtype=dtype, device=device)
+    ag_output = torch.empty(sparse_group_size * my_ag_send, dtype=dtype, device=device)
+    ag_helper_bufs: list[torch.Tensor] = []
+    for g in range(num_sparse_groups):
+        if g == my_sparse_group:
+            ag_helper_bufs.append(ag_output)  # unused for the active group
+        else:
+            ag_helper_size_g = _passthrough_helper_size(
+                ag_send_counts[g], sparse_group_size, num_chunks
+            )
+            ag_helper_bufs.append(
+                torch.empty(ag_helper_size_g, dtype=dtype, device=device)
+            )
+
+    def run_all_gather() -> None:
+        ag_input.fill_(1.0)
+        bench_all_gather_flat(
+            fused=fused,
+            input_flat=ag_input,
+            output_flat=ag_output,
+            num_sparse_groups=num_sparse_groups,
+            my_sparse_group=my_sparse_group,
+            all_active_ranks=all_active_ranks,
+            helper_bufs=ag_helper_bufs,
+            per_group_send_counts=ag_send_counts,
+        )
+
+    mean_ag, std_ag = _measure_ms(run_all_gather, warmup, bench_iters)
+
     if rank == 0:
         total_bytes = sum(sz * dtype.itemsize for sz in sizes)
         kernel_bytes = kernel_elements * dtype.itemsize
@@ -953,6 +1056,12 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
         )
         bench_a_a2a_std = (
             float(results_dict["A_a2a"][1]) if "A_a2a" in results_dict else 0.0
+        )
+        bench_a_ag_mean = (
+            float(results_dict["A_ag"][0]) if "A_ag" in results_dict else 0.0
+        )
+        bench_a_ag_std = (
+            float(results_dict["A_ag"][1]) if "A_ag" in results_dict else 0.0
         )
 
         rs_output_bytes = my_rs_recv * dtype.itemsize
@@ -1070,6 +1179,37 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
             print(
                 f"  >> All-to-all speedup (NCCL → sharded relay): "
                 f"{speedup_a2a:.2f}x"
+            )
+
+        # ----- ALL-GATHER -----
+        ag_send_bytes = my_ag_send * dtype.itemsize
+        print()
+        print("-" * 72)
+        print("ALL-GATHER")
+        print("-" * 72)
+        if bench_a_ag_mean > 0:
+            print(
+                f"  [A] NCCL all_gather_into_tensor (baseline, "
+                f"{ag_send_bytes / 1024 / 1024:.0f} MB send/group):"
+            )
+            print(
+                f"       {bench_a_ag_mean:.2f} ms  ±  {bench_a_ag_std:.2f} ms  |  "
+                f"{rs_bw(ag_send_bytes, bench_a_ag_mean):.1f} GB/s"
+            )
+        else:
+            print("  [A] NCCL all_gather_into_tensor (baseline): N/A")
+        print(
+            f"  [B] SHARDED RELAY (1 fused call, passthrough helpers, "
+            f"{ag_send_bytes / 1024 / 1024:.0f} MB send/group):"
+        )
+        print(
+            f"       {mean_ag:.2f} ms  ±  {std_ag:.2f} ms  |  "
+            f"{rs_bw(ag_send_bytes, mean_ag):.1f} GB/s"
+        )
+        if bench_a_ag_mean > 0 and mean_ag > 0:
+            speedup_ag = bench_a_ag_mean / mean_ag
+            print(
+                f"  >> All-gather speedup (NCCL → sharded relay): " f"{speedup_ag:.2f}x"
             )
         print("=" * 72)
 
