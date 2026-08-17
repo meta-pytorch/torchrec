@@ -73,12 +73,29 @@ Environment variables (all optional):
 The benchmark automatically sweeps BOTH 2-active and 4-active sharded relay
 groups and prints a full report for each. The 4-active sweep covers all four
 collectives: allreduce, reduce-scatter, all-to-all, and all-gather.
+
+Message-size sweep (all collectives, 2- & 4-rank, bf16):
+    A separate test method, test_collectives_msg_size_sweep, sweeps a fixed list
+    of message sizes (4 KB .. 1 GB) for every collective (allreduce,
+    reduce-scatter, all-to-all, all-gather) at both 2 and 4 active ranks, and
+    reports the sharded-relay speedup over NCCL in the FUSED scenario:
+    (NUM_GPUS // A) concurrent A-rank groups in one multi-group relay kernel vs
+    the matching NCCL baseline run in parallel on each rank's A-rank sub-group.
+    It prints one table per (collective, active-rank-count). The swept size is the
+    per-active-rank input tensor byte size, so sizes stay comparable across
+    collectives. The single-group scenario is benchmarked separately (see
+    test_parallel_2rank_allreduce_sweep). Run it selectively so the production
+    test above does not also run:
+        buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \\
+            //torchrec/distributed/tests:bench_sharded_relay_perf -- \\
+            torchrec.distributed.tests.bench_sharded_relay_perf.BenchShardedRelayPerfTest.test_collectives_msg_size_sweep
 """
 
 from __future__ import annotations
 
 import os
 import unittest
+from functools import partial
 from typing import Any
 
 import torch
@@ -166,6 +183,52 @@ def _default_totals(dtype: torch.dtype) -> list[int]:
     totals = _PROD_TOTALS_FP16 if dtype != torch.float32 else _PROD_TOTALS_FP32
     cap = _DEFAULT_MAX_BYTES_PER_GROUP // dtype.itemsize
     return [min(total, cap) for total in totals]
+
+
+# ---------------------------------------------------------------------------
+# Message-size sweep (test_allreduce_msg_size_sweep)
+# ---------------------------------------------------------------------------
+
+_KIB: int = 1024
+_MIB: int = 1024 * 1024
+
+# (human label, bytes) for each swept allreduce message size. Each value is the
+# byte size of the input tensor a single active rank contributes to the
+# allreduce; element count = bytes // dtype.itemsize.
+_MSG_SWEEP_SIZES: list[tuple[str, int]] = [
+    ("4 KB", 4 * _KIB),
+    ("9 KB", 9 * _KIB),
+    ("18 KB", 18 * _KIB),
+    ("36 KB", 36 * _KIB),
+    ("72 KB", 72 * _KIB),
+    ("144 KB", 144 * _KIB),
+    ("288 KB", 288 * _KIB),
+    ("576 KB", 576 * _KIB),
+    ("4.5 MB", int(4.5 * _MIB)),
+    ("9 MB", 9 * _MIB),
+    ("13.5 MB", int(13.5 * _MIB)),
+    ("27 MB", 27 * _MIB),
+    ("31.5 MB", int(31.5 * _MIB)),
+    ("36 MB", 36 * _MIB),
+    ("63 MB", 63 * _MIB),
+    ("67.5 MB", int(67.5 * _MIB)),
+    ("72 MB", 72 * _MIB),
+    ("135 MB", 135 * _MIB),
+    ("144 MB", 144 * _MIB),
+    ("256 MB", 256 * _MIB),
+    ("512 MB", 512 * _MIB),
+    ("1 GB", 1024 * _MIB),
+]
+
+# Active-rank counts and collectives swept by test_collectives_msg_size_sweep.
+# The sweep prints one table per (collective, active-rank-count) = 8 tables.
+_MSG_SWEEP_ACTIVE_RANKS: tuple[int, ...] = (2, 4)
+_MSG_SWEEP_COLLECTIVES: tuple[str, ...] = (
+    "allreduce",
+    "reduce_scatter",
+    "all_to_all",
+    "all_gather",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1512,6 +1575,652 @@ def _benchmark_worker(
 
 
 # ---------------------------------------------------------------------------
+# Message-size sweep workers (test_collectives_msg_size_sweep)
+#
+# Sweeps every collective (allreduce, reduce-scatter, all-to-all, all-gather) at
+# both 2 and 4 active ranks over a fixed list of message sizes and reports, per
+# size, the sharded-relay speedup over NCCL for the FUSED scenario:
+#   FUSED — (NUM_GPUS // A) concurrent A-rank groups in one multi-group kernel
+#           call, vs the NCCL baseline run in parallel on each rank's A-rank
+#           sub-group.
+# The single-group scenario is benchmarked separately (see the parallel
+# independent-comm sweep, test_parallel_2rank_allreduce_sweep).
+# Fixed at bf16. NCCL allreduce/reduce-scatter baselines use SUM + manual divide
+# (RCCL on MI350X lacks the AVG kernel); the relay path uses AVG in the kernel.
+# all-to-all / all-gather do no reduction. The swept nbytes is the per-active-rank
+# input tensor byte size, so sizes stay comparable across collectives.
+# ---------------------------------------------------------------------------
+
+# Data type for the message-size sweep comparison.
+_MSG_SWEEP_DTYPE: torch.dtype = torch.bfloat16
+
+
+# ----- Per-collective buffer/shape helpers (shared by NCCL + relay) ---------
+
+
+def _active_io(
+    collective: str,
+    active_ranks: int,
+    elements: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(input, output) tensors an ACTIVE rank contributes for one collective.
+
+    `elements` is the per-active-rank input size (the swept size axis).
+    """
+    if collective == "allreduce":
+        t = torch.ones(elements, dtype=dtype, device=device)
+        return t, t  # in place
+    if collective == "reduce_scatter":
+        recv = elements // active_ranks
+        return (
+            torch.ones(elements, dtype=dtype, device=device),  # A * recv
+            torch.empty(recv, dtype=dtype, device=device),
+        )
+    if collective == "all_to_all":
+        return (
+            torch.ones(elements, dtype=dtype, device=device),  # A * seg
+            torch.empty(elements, dtype=dtype, device=device),
+        )
+    if collective == "all_gather":
+        return (
+            torch.ones(elements, dtype=dtype, device=device),  # send
+            torch.empty(active_ranks * elements, dtype=dtype, device=device),
+        )
+    raise ValueError(f"unknown collective {collective!r}")
+
+
+def _relay_helper_size(
+    collective: str, active_ranks: int, elements: int, num_chunks: int
+) -> int:
+    """Helper-buffer element count for a single helper group's relay tensor.
+
+    Mirrors the per-collective helper sizing _benchmark_worker uses for A=2 vs A>2.
+    """
+    if collective == "allreduce":
+        if active_ranks > 2:
+            return 2 * elements
+        return _passthrough_helper_size(elements, active_ranks, num_chunks)
+    if collective == "reduce_scatter":
+        recv = elements // active_ranks
+        return _passthrough_helper_size(recv, active_ranks, num_chunks)
+    if collective == "all_to_all":
+        if active_ranks > 2:
+            return 1  # pure-direct A>2 all-to-all: helper does no relay work
+        seg = elements // active_ranks
+        return _passthrough_helper_size(seg, active_ranks, num_chunks)
+    if collective == "all_gather":
+        if active_ranks > 2:
+            return active_ranks * elements
+        return _passthrough_helper_size(elements, active_ranks, num_chunks)
+    raise ValueError(f"unknown collective {collective!r}")
+
+
+def _relay_counts(
+    collective: str, active_ranks: int, elements: int, num_groups: int
+) -> list[int]:
+    """Per-group declared count vector passed to the fused relay call."""
+    if collective in ("allreduce", "all_gather"):
+        return [elements] * num_groups
+    if collective in ("reduce_scatter", "all_to_all"):
+        return [elements // active_ranks] * num_groups
+    raise ValueError(f"unknown collective {collective!r}")
+
+
+def _build_relay_bufs(
+    collective: str,
+    active_ranks: int,
+    elements: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    num_groups: int,
+    my_sparse_group: int,
+    num_chunks: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    """Build (active_in, active_out, per_group_helper_bufs) for one FUSED relay
+    call. Every rank is active in exactly one of the num_groups groups; the
+    helper slot for the active group is a placeholder (unused by the kernel)."""
+    active_in, active_out = _active_io(
+        collective, active_ranks, elements, dtype, device
+    )
+    helper_size = _relay_helper_size(collective, active_ranks, elements, num_chunks)
+    bufs: list[torch.Tensor] = []
+    for g in range(num_groups):
+        if g == my_sparse_group:
+            bufs.append(active_out)  # active group slot — unused by the kernel
+        else:
+            bufs.append(torch.empty(helper_size, dtype=dtype, device=device))
+    return active_in, active_out, bufs
+
+
+def _build_relay_group_lists(
+    active_in: torch.Tensor,
+    active_out: torch.Tensor,
+    bufs: list[torch.Tensor],
+    num_groups: int,
+    my_sparse_group: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """Per-group (input, output) tensor lists for a FUSED relay call, built ONCE
+    outside the timed loop: the active group slot holds this rank's real
+    tensors; every other (helper) slot holds that group's passthrough scratch.
+    For allreduce (in-place) out_list mirrors in_list and is otherwise unused."""
+    in_list: list[torch.Tensor] = []
+    out_list: list[torch.Tensor] = []
+    for g in range(num_groups):
+        if g == my_sparse_group:
+            in_list.append(active_in)
+            out_list.append(active_out)
+        else:
+            in_list.append(bufs[g])
+            out_list.append(bufs[g])
+    return in_list, out_list
+
+
+def _run_relay_once(
+    collective: str,
+    relay: Any,
+    in_list: list[torch.Tensor],
+    out_list: list[torch.Tensor],
+    counts: list[int],
+    num_groups: int,
+    my_sparse_group: int,
+    all_active_ranks: list[list[int]],
+) -> None:
+    """One sharded-relay collective call with PRE-BUILT per-group tensor lists.
+
+    The per-group input/output lists (and inputs) are constructed once outside
+    the timed loop, so the timed region is just the wrapper dispatch — on par
+    with the NCCL baseline's single call. Inputs stay ones (AVG of ones = ones;
+    the non-allreduce collectives are out-of-place), so no per-call refill."""
+    if collective == "allreduce":
+        relay.allreduce_multi_group(
+            tensors=in_list,
+            num_groups=num_groups,
+            per_group_sizes=counts,
+            all_active_ranks=all_active_ranks,
+            op=dist.ReduceOp.AVG,
+            skip_validation=True,
+        )
+    elif collective == "reduce_scatter":
+        relay.reduce_scatter_multi_group(
+            input_tensors=in_list,
+            output_tensors=out_list,
+            num_groups=num_groups,
+            per_group_recv_counts=counts,
+            all_active_ranks=all_active_ranks,
+            op=dist.ReduceOp.AVG,
+            skip_validation=True,
+        )
+    elif collective == "all_to_all":
+        relay.all_to_all_multi_group(
+            input_tensors=in_list,
+            output_tensors=out_list,
+            num_groups=num_groups,
+            per_group_segment_counts=counts,
+            all_active_ranks=all_active_ranks,
+            skip_validation=True,
+        )
+    elif collective == "all_gather":
+        relay.all_gather_multi_group(
+            input_tensors=in_list,
+            output_tensors=out_list,
+            num_groups=num_groups,
+            per_group_send_counts=counts,
+            all_active_ranks=all_active_ranks,
+            skip_validation=True,
+        )
+    else:
+        raise ValueError(f"unknown collective {collective!r}")
+
+
+# ----- NCCL baseline op builders (one per collective) ----------------------
+
+
+def _nccl_ops_allreduce(
+    active_ranks: int,
+    elements: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    fused_pg: dist.ProcessGroup,
+    ar_opts: Any,
+) -> Any:
+    ft = torch.ones(elements, dtype=dtype, device=device)
+
+    def run_fused() -> None:
+        fused_pg.allreduce_coalesced([ft], opts=ar_opts).wait()
+        ft.div_(active_ranks)
+
+    return run_fused
+
+
+def _nccl_ops_reduce_scatter(
+    active_ranks: int,
+    elements: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    fused_pg: dist.ProcessGroup,
+    _ar_opts: Any,
+) -> Any:
+    recv = elements // active_ranks
+    fin = torch.ones(elements, dtype=dtype, device=device)  # A * recv
+    fout = torch.empty(recv, dtype=dtype, device=device)
+
+    def run_fused() -> None:
+        dist.reduce_scatter_tensor(fout, fin, op=dist.ReduceOp.SUM, group=fused_pg)
+        fout.div_(active_ranks)
+
+    return run_fused
+
+
+def _nccl_ops_all_to_all(
+    active_ranks: int,
+    elements: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    fused_pg: dist.ProcessGroup,
+    _ar_opts: Any,
+) -> Any:
+    fin = torch.ones(elements, dtype=dtype, device=device)  # A * seg
+    fout = torch.empty(elements, dtype=dtype, device=device)
+
+    def run_fused() -> None:
+        dist.all_to_all_single(fout, fin, group=fused_pg, async_op=True).wait()
+
+    return run_fused
+
+
+def _nccl_ops_all_gather(
+    active_ranks: int,
+    elements: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    fused_pg: dist.ProcessGroup,
+    _ar_opts: Any,
+) -> Any:
+    fin = torch.ones(elements, dtype=dtype, device=device)  # send
+    fout = torch.empty(active_ranks * elements, dtype=dtype, device=device)
+
+    def run_fused() -> None:
+        dist.all_gather_into_tensor(fout, fin, group=fused_pg, async_op=True).wait()
+
+    return run_fused
+
+
+def _nccl_baseline_op(
+    collective: str,
+    active_ranks: int,
+    elements: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    fused_pg: dist.ProcessGroup,
+    ar_opts: Any,
+) -> Any:
+    """Return the FUSED NCCL baseline closure for one size (runs on this rank's
+    A-rank sub-group)."""
+    builders = {
+        "allreduce": _nccl_ops_allreduce,
+        "reduce_scatter": _nccl_ops_reduce_scatter,
+        "all_to_all": _nccl_ops_all_to_all,
+        "all_gather": _nccl_ops_all_gather,
+    }
+    return builders[collective](
+        active_ranks, elements, dtype, device, fused_pg, ar_opts
+    )
+
+
+def _msg_sweep_nccl_worker(
+    rank: int,
+    world_size: int,
+    results_dict: Any,
+    port_offset: int = 0,
+) -> None:
+    """NCCL FUSED baselines for the message-size sweep.
+
+    Writes, for each (collective, active-rank-count A, size index i) (rank 0 only):
+      results_dict["nccl_{collective}_a{A}_fused_{i}"] = (best_ms, std_ms)
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(_NCCL_PORT + 200 + port_offset)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    local_rank = rank
+    is_master = rank == 0
+
+    store = dist.TCPStore(
+        host_name="localhost",
+        port=_TCPSTORE_PORT + 200 + port_offset,
+        world_size=world_size,
+        is_master=is_master,
+        wait_for_workers=True,
+    )
+    dist.init_process_group(
+        backend="nccl", rank=rank, world_size=world_size, store=store
+    )
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    dtype = _MSG_SWEEP_DTYPE
+    warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
+    bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
+
+    # Build the A-rank sub-group PGs once per A (all ranks call new_group for
+    # every group collectively). pgs_by_a[A][rank // A] is this rank's FUSED
+    # sub-group.
+    pgs_by_a: dict[int, list[dist.ProcessGroup]] = {}
+    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+        num_groups = world_size // active_ranks
+        groups = [
+            list(range(g * active_ranks, (g + 1) * active_ranks))
+            for g in range(num_groups)
+        ]
+        pgs_by_a[active_ranks] = [dist.new_group(ranks=grp) for grp in groups]
+
+    # SUM + manual divide (RCCL on MI350X lacks the AVG kernel).
+    _ar_opts = dist.AllreduceCoalescedOptions()
+    _ar_opts.reduceOp = dist.ReduceOp.SUM
+
+    # Warm up each FUSED sub-group communicator.
+    _wt = torch.ones(1, dtype=dtype, device=device)
+    for active_ranks, pgs in pgs_by_a.items():
+        dist.all_reduce(_wt, op=dist.ReduceOp.SUM, group=pgs[rank // active_ranks])
+    torch.cuda.synchronize()
+    del _wt
+
+    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+        pgs = pgs_by_a[active_ranks]
+        fused_pg = pgs[rank // active_ranks]
+        for collective in _MSG_SWEEP_COLLECTIVES:
+            for i, (_label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+                elements = nbytes // dtype.itemsize
+                if elements % active_ranks != 0:
+                    continue
+                run_fused_base = _nccl_baseline_op(
+                    collective,
+                    active_ranks,
+                    elements,
+                    dtype,
+                    device,
+                    fused_pg,
+                    _ar_opts,
+                )
+                best_f, std_f = _measure_ms(run_fused_base, warmup, bench_iters)
+                # Drop the per-size tensors held by the closure before the next
+                # (larger) size.
+                del run_fused_base
+                torch.cuda.empty_cache()
+
+                if rank == 0:
+                    key = f"{collective}_a{active_ranks}"
+                    results_dict[f"nccl_{key}_fused_{i}"] = (best_f, std_f)
+
+    # Match the relay worker: let every rank finish its collectives before any
+    # rank tears the process group down.
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _measure_relay_for(
+    collective: str,
+    active_ranks: int,
+    relay_fused: Any,
+    nbytes: int,
+    dtype: torch.dtype,
+    device: torch.device,
+    rank: int,
+    world_size: int,
+    warmup: int,
+    bench_iters: int,
+) -> tuple[float, float]:
+    """Time the FUSED (num_groups = world // A) relay collective for one message
+    size. Returns (best_ms, std_ms)."""
+    elements = nbytes // dtype.itemsize
+    if active_ranks == 0 or elements % active_ranks != 0:
+        return 0.0, 0.0
+    num_chunks = (world_size - active_ranks) + 1
+
+    num_groups = world_size // active_ranks
+    my_sparse_group = rank // active_ranks
+    fused_active_ranks = [
+        list(range(g * active_ranks, (g + 1) * active_ranks)) for g in range(num_groups)
+    ]
+    active_in, active_out, bufs = _build_relay_bufs(
+        collective,
+        active_ranks,
+        elements,
+        dtype,
+        device,
+        num_groups,
+        my_sparse_group,
+        num_chunks,
+    )
+    counts = _relay_counts(collective, active_ranks, elements, num_groups)
+    in_list, out_list = _build_relay_group_lists(
+        active_in, active_out, bufs, num_groups, my_sparse_group
+    )
+    best_f, std_f = _measure_ms(
+        partial(
+            _run_relay_once,
+            collective,
+            relay_fused,
+            in_list,
+            out_list,
+            counts,
+            num_groups,
+            my_sparse_group,
+            fused_active_ranks,
+        ),
+        warmup,
+        bench_iters,
+    )
+    del active_in, active_out, bufs, in_list, out_list
+    torch.cuda.empty_cache()
+    return best_f, std_f
+
+
+def _msg_sweep_relay_warmup(
+    fused_by_a: dict[int, Any],
+    rank: int,
+    world_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Tiny FUSED relay calls for every (A, collective) so each distinct HIP
+    kernel config JIT-compiles before timing."""
+    torch.cuda.synchronize()
+    dist.barrier()
+    # The A=2 reduce-scatter/all-to-all 2-active relay path requires the chunked
+    # quantity Q = elements // A >= 128 * numChunks (= 128 * (world - A + 1)); for
+    # 8 ranks, A=2 that is Q >= 896, i.e. elements >= A * 896 = 1792. Use 2048 so
+    # every (collective, A) warmup config clears the floor (the real sweep starts
+    # at 4 KB = 2048 elements, so it is always valid too).
+    warm_elems = 2048
+    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+        num_chunks = (world_size - active_ranks) + 1
+        num_groups = world_size // active_ranks
+        my_sparse_group = rank // active_ranks
+        fused_active_ranks = [
+            list(range(g * active_ranks, (g + 1) * active_ranks))
+            for g in range(num_groups)
+        ]
+        for collective in _MSG_SWEEP_COLLECTIVES:
+            a_in, a_out, bufs = _build_relay_bufs(
+                collective,
+                active_ranks,
+                warm_elems,
+                dtype,
+                device,
+                num_groups,
+                my_sparse_group,
+                num_chunks,
+            )
+            counts = _relay_counts(collective, active_ranks, warm_elems, num_groups)
+            in_list, out_list = _build_relay_group_lists(
+                a_in, a_out, bufs, num_groups, my_sparse_group
+            )
+            for _ in range(3):
+                _run_relay_once(
+                    collective,
+                    fused_by_a[active_ranks],
+                    in_list,
+                    out_list,
+                    counts,
+                    num_groups,
+                    my_sparse_group,
+                    fused_active_ranks,
+                )
+            del a_in, a_out, bufs, in_list, out_list
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+
+def _msg_sweep_relay_worker(
+    rank: int,
+    world_size: int,
+    results_dict: Any,
+    port_offset: int = 0,
+) -> None:
+    """Sharded-relay FUSED collectives for the message-size sweep.
+
+    Writes, for each (collective, active-rank-count A, size index i) (rank 0 only):
+      results_dict["relay_{collective}_a{A}_fused_{i}"] = (best_ms, std_ms)
+
+    Rank 0 prints the final summary tables using both the relay results and the
+    NCCL results written earlier by _msg_sweep_nccl_worker.
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(_NCCL_PORT + 300 + port_offset)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = str(world_size)
+
+    local_rank = rank
+    is_master = rank == 0
+
+    store = dist.TCPStore(
+        host_name="localhost",
+        port=_TCPSTORE_PORT + 300 + port_offset,
+        world_size=world_size,
+        is_master=is_master,
+        wait_for_workers=True,
+    )
+    dist.init_process_group(
+        backend="nccl", rank=rank, world_size=world_size, store=store
+    )
+
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    dtype = _MSG_SWEEP_DTYPE
+    warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
+    bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
+
+    # One shared intra-node RCCLX comm, then a FUSED (num_groups = world // A)
+    # relay object per active-rank count. Every rank constructs all objects
+    # collectively.
+    rcclx_comm = _setup_rcclx_comm(local_rank, world_size, 0, store)
+    fused_by_a: dict[int, Any] = {}
+    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+        fused_by_a[active_ranks] = _make_fused(
+            rcclx_comm, local_rank, world_size, active_ranks
+        )
+    if rcclx_comm is None or any(v is None for v in fused_by_a.values()):
+        if rank == 0:
+            print("[bench] FusedShardedRelayMultiGroup not available. Exiting.")
+        dist.destroy_process_group()
+        return
+
+    # Pre-compile every distinct HIP kernel config before timing.
+    _msg_sweep_relay_warmup(fused_by_a, rank, world_size, dtype, device)
+
+    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+        relay_fused = fused_by_a[active_ranks]
+        for collective in _MSG_SWEEP_COLLECTIVES:
+            for i, (_label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+                best_f, std_f = _measure_relay_for(
+                    collective=collective,
+                    active_ranks=active_ranks,
+                    relay_fused=relay_fused,
+                    nbytes=nbytes,
+                    dtype=dtype,
+                    device=device,
+                    rank=rank,
+                    world_size=world_size,
+                    warmup=warmup,
+                    bench_iters=bench_iters,
+                )
+                if rank == 0:
+                    key = f"{collective}_a{active_ranks}"
+                    results_dict[f"relay_{key}_fused_{i}"] = (best_f, std_f)
+
+    if rank == 0:
+        _print_msg_sweep_report(results_dict, dtype)
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _sweep_get_ms(results_dict: Any, key: str) -> float:
+    v = results_dict.get(key)
+    return float(v[0]) if v is not None else 0.0
+
+
+def _sweep_fmt_ms(v: float) -> str:
+    return f"{v:.3f}" if v > 0 else "N/A"
+
+
+def _sweep_fmt_speedup(nccl: float, relay: float) -> str:
+    return f"{nccl / relay:.2f}x" if nccl > 0 and relay > 0 else "N/A"
+
+
+def _print_sweep_table(
+    results_dict: Any, dtype: torch.dtype, collective: str, active_ranks: int
+) -> None:
+    """Print one (collective, active-rank-count) FUSED message-size sweep table."""
+    num_groups = NUM_GPUS // active_ranks
+    key = f"{collective}_a{active_ranks}"
+    title = collective.replace("_", "-").upper()
+    width = 55
+    line = "=" * width
+    print("\n" + line)
+    print(
+        f"Sharded Relay {title} — Message-Size Sweep "
+        f"(MI350X, {NUM_GPUS} GPUs, {dtype})"
+    )
+    print(
+        f"  {active_ranks} active ranks/group; times = best-of-N (min), "
+        "barrier-aligned + hipEvent-timed"
+    )
+    print(
+        f"  FUSED = {num_groups}-group sharded relay  vs  "
+        f"NCCL baseline ({num_groups} concurrent {active_ranks}-rank groups)"
+    )
+    print(line)
+    print(f"{'':>10} | {f'FUSED ({num_groups} groups)':^33}")
+    print(f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} {'Speedup':>9}")
+    print("-" * width)
+    for i, (label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+        elements = nbytes // dtype.itemsize
+        if elements % active_ranks != 0:
+            continue
+        nf = _sweep_get_ms(results_dict, f"nccl_{key}_fused_{i}")
+        rf = _sweep_get_ms(results_dict, f"relay_{key}_fused_{i}")
+        print(
+            f"{label:>10} | {_sweep_fmt_ms(nf):>10} {_sweep_fmt_ms(rf):>10} "
+            f"{_sweep_fmt_speedup(nf, rf):>9}"
+        )
+    print(line)
+
+
+def _print_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> None:
+    """Print one FUSED message-size sweep table per (collective, active-rank-count)."""
+    for collective in _MSG_SWEEP_COLLECTIVES:
+        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+            _print_sweep_table(results_dict, dtype, collective, active_ranks)
+
+
+# ---------------------------------------------------------------------------
 # TestCase — works with both "buck2 test" and "buck2 run" (same as the old
 # test_sharded_relay_2d_integration.py pattern).
 # ---------------------------------------------------------------------------
@@ -1572,6 +2281,55 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
                 nprocs=NUM_GPUS,
                 join=True,
             )
+
+        manager.shutdown()
+
+    def test_collectives_msg_size_sweep(self) -> None:
+        """All-collective, 2- & 4-rank sharded relay message-size sweep (bf16).
+
+        Sweeps the fixed message sizes in _MSG_SWEEP_SIZES for every collective
+        (allreduce, reduce-scatter, all-to-all, all-gather) at both 2 and 4
+        active ranks and, per size, reports the sharded-relay FUSED speedup over
+        NCCL (one table per (collective, active-rank-count)):
+          FUSED — (NUM_GPUS // A) concurrent A-rank groups in one multi-group
+                  kernel call vs the matching NCCL baseline on each rank's A-rank
+                  sub-group.
+        The single-group scenario is benchmarked separately (see
+        test_parallel_2rank_allreduce_sweep).
+
+        Run selectively (so the production test_benchmark does not also run).
+        The buck2 test runner imports the module, so the selector must be the
+        fully-qualified module.Class.method path:
+            buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \\
+                //torchrec/distributed/tests:bench_sharded_relay_perf -- \\
+                torchrec.distributed.tests.bench_sharded_relay_perf.BenchShardedRelayPerfTest.test_collectives_msg_size_sweep
+        """
+        manager = mp.Manager()
+        results: Any = manager.dict()
+
+        # Pin the GPU HW-queue count to the production regime: BM-FM runs with
+        # GPU_MAX_HW_QUEUES=2. Set before mp.spawn so the spawned workers inherit
+        # it before the HIP runtime initializes. Fused is queue-insensitive (one
+        # comm, one multi-group launch), so this only aligns it with the parallel
+        # sweep, which needs =2 to avoid uncoordinated multi-comm XGMI contention.
+        os.environ["GPU_MAX_HW_QUEUES"] = "2"
+
+        # Phase 1: NCCL FUSED baselines per collective and A.
+        mp.spawn(
+            _msg_sweep_nccl_worker,
+            args=(NUM_GPUS, results, 0),
+            nprocs=NUM_GPUS,
+            join=True,
+        )
+
+        # Phase 2: sharded relay FUSED per collective and A via RCCLX;
+        # rank 0 prints all 8 summary tables.
+        mp.spawn(
+            _msg_sweep_relay_worker,
+            args=(NUM_GPUS, results, 0),
+            nprocs=NUM_GPUS,
+            join=True,
+        )
 
         manager.shutdown()
 
