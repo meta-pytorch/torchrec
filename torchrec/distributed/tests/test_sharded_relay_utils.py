@@ -223,6 +223,59 @@ class FlatAllreduceTest(unittest.TestCase):
         self.assertEqual(self._call_count(state), 1)
 
     # ------------------------------------------------------------------
+    # Out-of-place vs in-place wiring
+    # ------------------------------------------------------------------
+
+    def test_out_of_place_active_output_wired_distinctly(self) -> None:
+        """output_tensors_dict routes the active group's reduced result to a
+        separate destination (out-of-place). The active input and output are
+        distinct internal flat buffers; the caller's out buffer receives the
+        result via the unpack step while the caller's input is preserved."""
+        state = _make_state(rank=0)  # active for group 0
+        inp = torch.ones(100)
+        out = torch.zeros(100)
+
+        sentinel = 42.0
+
+        def _fill_active_output(*args, **kwargs) -> None:
+            # Simulate the reduced result landing in the active output flat buf.
+            outs = kwargs["output_tensors"]
+            outs[state.my_sparse_group].fill_(sentinel)
+
+        state.fused.allreduce_multi_group.side_effect = _fill_active_output
+
+        allreduce_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [inp]},
+            "test",
+            output_tensors_dict={torch.float32: [out]},
+        )
+
+        call_kwargs = self._all_calls(state)[0].kwargs
+        self.assertIn("output_tensors", call_kwargs)
+        output_tensors = call_kwargs["output_tensors"]
+        self.assertIsNotNone(output_tensors)
+
+        active = state.my_sparse_group
+        active_input = call_kwargs["tensors"][active]
+        active_output = output_tensors[active]
+        # Active input and output are distinct flat buffers (out-of-place).
+        self.assertNotEqual(active_output.data_ptr(), active_input.data_ptr())
+        # The result is unpacked into the caller's out buffer...
+        self.assertTrue(torch.all(out == sentinel))
+        # ...while the caller's input buffer is preserved.
+        self.assertTrue(torch.all(inp == 1.0))
+
+    def test_in_place_passes_no_output_tensors(self) -> None:
+        """Default (no output_tensors_dict) → in-place: output_tensors is None."""
+        state = _make_state(rank=0)
+        allreduce_tensors_with_sharded_relay(
+            state, {torch.float32: [torch.zeros(100)]}, "test"
+        )
+        call_kwargs = self._all_calls(state)[0].kwargs
+        self.assertIsNone(call_kwargs.get("output_tensors"))
+
+    # ------------------------------------------------------------------
     # Flat buffer sizing passed to allreduce_multi_group
     # ------------------------------------------------------------------
 
@@ -651,6 +704,7 @@ class FusedShardedRelayValidationTest(unittest.TestCase):
                 per_group_sizes=per_group_sizes,
                 all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
                 op=dist.ReduceOp.SUM,
+                skip_validation=False,
             )
 
         err = str(cm.exception)

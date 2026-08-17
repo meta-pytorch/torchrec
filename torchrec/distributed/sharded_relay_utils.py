@@ -761,6 +761,7 @@ def allreduce_tensors_with_sharded_relay(
     tensors_dict: dict[torch.dtype, list[torch.Tensor]],
     annotation: str,
     op: dist.ReduceOp | dist.ReduceOp.RedOpType = dist.ReduceOp.AVG,
+    output_tensors_dict: dict[torch.dtype, list[torch.Tensor]] | None = None,
 ) -> None:
     """
     Perform allreduce using the fused sharded relay algorithm.
@@ -797,6 +798,14 @@ def allreduce_tensors_with_sharded_relay(
         op: Reduction op to apply. Only ``ReduceOp.AVG`` and ``ReduceOp.SUM``
             are supported by the underlying RCCLX kernel; other values will
             be rejected by the backend.
+        output_tensors_dict: Optional destination tensors, grouped by dtype
+            and parallel to ``tensors_dict``. When ``None`` (default) the
+            allreduce is in-place — results are written back into
+            ``tensors_dict``. When provided, the active group's reduced result
+            is written out-of-place into these tensors while the inputs are
+            preserved; per dtype, ``output_tensors_dict[dtype]`` must mirror
+            ``tensors_dict[dtype]`` in per-tensor shapes and total element
+            count.
     """
     sparse_group_size = state.sparse_group_size
     my_sparse_group = state.my_sparse_group
@@ -862,11 +871,18 @@ def allreduce_tensors_with_sharded_relay(
             group_tensors: list[torch.Tensor] = []
             group_sizes: list[int] = []
 
-            # Compute num_chunks for passthrough helper size (mirrors C++).
-            num_chunks = (local_size - sparse_group_size) + 1
+            # Out-of-place: build a parallel per-group output list. The active
+            # group's output points at a separate flat destination buffer;
+            # helper groups reuse their passthrough scratch (unused by the
+            # kernel, but keeps the per-group list shape consistent). Left empty
+            # on the in-place path, where the call below passes None instead.
+            output_group_tensors: list[torch.Tensor] = []
 
             unpack_flat: torch.Tensor | None = None
             unpack_dst: list[torch.Tensor] | None = None
+
+            # Compute num_chunks for passthrough helper size (mirrors C++).
+            num_chunks = (local_size - sparse_group_size) + 1
 
             for g in range(num_sparse_groups):
                 if g == my_sparse_group:
@@ -874,9 +890,17 @@ def allreduce_tensors_with_sharded_relay(
                     _pack_into_flat(my_tensor_list, in_flat)
                     group_tensors.append(in_flat)
                     group_sizes.append(my_total)
-                    # In-place: the kernel writes back into in_flat.
-                    unpack_flat = in_flat
-                    unpack_dst = my_tensor_list
+                    if output_tensors_dict is not None:
+                        out_flat = _get_active_output_flat_buf(
+                            state, my_total, dtype, device
+                        )
+                        output_group_tensors.append(out_flat)
+                        unpack_flat = out_flat
+                        unpack_dst = output_tensors_dict[dtype]
+                    else:
+                        # In-place: the kernel writes back into in_flat.
+                        unpack_flat = in_flat
+                        unpack_dst = my_tensor_list
                 else:
                     total_g = per_group_total_counts[g]
                     if sparse_group_size > 2:
@@ -893,9 +917,10 @@ def allreduce_tensors_with_sharded_relay(
                     )
                     group_tensors.append(helper_buf)
                     group_sizes.append(total_g)  # full count goes to the kernel
+                    if output_tensors_dict is not None:
+                        output_group_tensors.append(helper_buf)
 
             # --- Step 4: ONE fused call — all groups, all data, phase-synchronized ---
-            # In-place: results are written directly into my_tensor_list.
             state.fused.allreduce_multi_group(
                 tensors=group_tensors,
                 num_groups=num_sparse_groups,
@@ -903,6 +928,9 @@ def allreduce_tensors_with_sharded_relay(
                 all_active_ranks=precomputed_active_ranks,
                 op=op,
                 skip_validation=True,
+                output_tensors=(
+                    output_group_tensors if output_tensors_dict is not None else None
+                ),
             )
 
             # --- Step 5: Unpack the active-group result into caller tensors ---
