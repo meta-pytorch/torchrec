@@ -1229,9 +1229,12 @@ def all_gather_tensors_with_sharded_relay(
                     unpack_flat = out_flat
                 else:
                     send_g = per_group_send_counts[g]
-                    helper_size_g = _passthrough_helper_size(
-                        send_g, sparse_group_size, num_chunks
-                    )
+                    if sparse_group_size > 2:
+                        helper_size_g = sparse_group_size * send_g
+                    else:
+                        helper_size_g = _passthrough_helper_size(
+                            send_g, sparse_group_size, num_chunks
+                        )
                     helper_buf = _get_helper_flat_buf(
                         state, g, helper_size_g, dtype, device
                     )
