@@ -10,6 +10,7 @@
 import abc
 import hashlib
 import logging
+import math
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -2173,6 +2174,13 @@ class PlannerConfig:
     # ignored by every other policy. (Appended last to preserve positional
     # construction of the pre-existing fields.)
     model_base_bytes: Optional[int] = None
+    # Dense-footprint multiplier for the Heuristical and SKU-aware reservations;
+    # None = the reservation's own default (6.0). Plan-affecting (it sizes the
+    # reserved dense HBM), so it is carried here to stay in request_hash -- a
+    # framework that overrides it (e.g. MVAI) must not silently fall back to 6.0.
+    # (Appended last, like model_base_bytes: this dataclass is not kw_only, so
+    # inserting mid-list would silently rebind existing positional arguments.)
+    parameter_multiplier: Optional[float] = None
 
     def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
         """Return package-specific planner config data for the request hash."""
@@ -2204,6 +2212,19 @@ class PlannerConfig:
             raise ValueError(
                 "bwd_compute_multiplier must be non-negative, got "
                 f"{self.bwd_compute_multiplier}"
+            )
+        # Validated here rather than in the provider: the provider resolves this
+        # per-SKU, so a bad value would otherwise surface N times mid-sweep (or as
+        # a nonsensical reservation) instead of once at config construction. NaN is
+        # rejected explicitly -- every comparison against it is False, so a bare
+        # "< 0" check would let it through and silently poison the reserved HBM.
+        if self.parameter_multiplier is not None and (
+            not math.isfinite(self.parameter_multiplier)
+            or self.parameter_multiplier < 0
+        ):
+            raise ValueError(
+                "parameter_multiplier must be a finite non-negative number, got "
+                f"{self.parameter_multiplier}"
             )
 
 
@@ -2375,6 +2396,7 @@ class ShardingPlanRequest:
                     self.planner_config.planner_variant.value,
                     self.planner_config.storage_reservation_policy.value,
                     self.planner_config.storage_reservation_percentage,
+                    self.planner_config.parameter_multiplier,
                     self.planner_config.proposer_type,
                     self.planner_config.partitioner_type,
                     self.planner_config.use_hardware_based_compute,

@@ -1995,6 +1995,46 @@ class ShardingPlanRequestTest(unittest.TestCase):
         self.assertIs(cfg.planner_variant, PlannerVariant.UNSET)
         self.assertIs(cfg.storage_reservation_policy, StorageReservationPolicy.UNSET)
 
+    def test_request_hash_includes_parameter_multiplier(self) -> None:
+        """parameter_multiplier sizes the reserved dense HBM, so two requests that
+        differ only in it are different requests and must not share a hash."""
+        base = self._create_request().request_hash
+        self.assertNotEqual(
+            base,
+            self._create_request(
+                planner_config=PlannerConfig(parameter_multiplier=8.0)
+            ).request_hash,
+        )
+        self.assertNotEqual(
+            self._create_request(
+                planner_config=PlannerConfig(parameter_multiplier=8.0)
+            ).request_hash,
+            self._create_request(
+                planner_config=PlannerConfig(parameter_multiplier=4.0)
+            ).request_hash,
+        )
+
+    def test_parameter_multiplier_rejects_negative_and_non_finite(self) -> None:
+        for bad in (-1.0, float("nan"), float("inf")):
+            with self.assertRaisesRegex(ValueError, "parameter_multiplier"):
+                PlannerConfig(parameter_multiplier=bad)
+        # 0.0 is a legitimate "reserve no dense footprint" request.
+        self.assertEqual(
+            PlannerConfig(parameter_multiplier=0.0).parameter_multiplier, 0.0
+        )
+
+    def test_planner_config_positional_construction_is_stable(self) -> None:
+        """PlannerConfig is not kw_only, so new fields must be appended, never
+        inserted -- inserting silently rebinds existing positional arguments."""
+        cfg = PlannerConfig(
+            PlannerVariant.OSS,
+            StorageReservationPolicy.HEURISTICAL,
+            0.15,
+            "greedy",
+        )
+        self.assertEqual(cfg.proposer_type, "greedy")
+        self.assertIsNone(cfg.parameter_multiplier)
+
     def test_request_hash_includes_planner_config(self) -> None:
         # planner_config is plan-affecting, so it participates in the content hash.
         base = self._create_request().request_hash
