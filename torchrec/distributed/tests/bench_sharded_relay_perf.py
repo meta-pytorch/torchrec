@@ -402,6 +402,48 @@ def bench_reduce_scatter_flat(
 
 
 # ---------------------------------------------------------------------------
+# Benchmark E: fused all-to-all (sharded relay)
+# ---------------------------------------------------------------------------
+
+
+def bench_all_to_all_flat(
+    fused: Any,
+    input_flat: torch.Tensor,
+    output_flat: torch.Tensor,
+    num_sparse_groups: int,
+    my_sparse_group: int,
+    all_active_ranks: list[list[int]],
+    helper_bufs: list[torch.Tensor],
+    per_group_segment_counts: list[int],
+) -> None:
+    """ONE fused all-to-all call across all sparse groups.
+
+    input_flat and output_flat each hold nActiveRanks x segment_count elements
+    (two segments for sparse_group_size=2) and must be distinct buffers
+    (all-to-all is out-of-place only). Each helper group uses its own
+    passthrough-sized scratch buffer for both send and recv.
+    """
+    input_group_tensors: list[torch.Tensor] = []
+    output_group_tensors: list[torch.Tensor] = []
+    for g in range(num_sparse_groups):
+        if g == my_sparse_group:
+            input_group_tensors.append(input_flat)
+            output_group_tensors.append(output_flat)
+        else:
+            input_group_tensors.append(helper_bufs[g])
+            output_group_tensors.append(helper_bufs[g])
+
+    fused.all_to_all_multi_group(
+        input_tensors=input_group_tensors,
+        output_tensors=output_group_tensors,
+        num_groups=num_sparse_groups,
+        per_group_segment_counts=per_group_segment_counts,
+        all_active_ranks=all_active_ranks,
+        skip_validation=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # NCCL baseline: 4 parallel 2-rank dist.all_reduce calls
 # ---------------------------------------------------------------------------
 
@@ -573,6 +615,27 @@ def _bench_a_worker(rank: int, world_size: int, results_dict: Any) -> None:
 
     if rank == 0:
         results_dict["A_rs"] = (mean_rs_base, std_rs_base)
+
+    # NCCL all-to-all baseline on the same 2-rank sub-group PG. Free the
+    # reduce-scatter baseline tensors first. segment_count = prod_total // 4 so
+    # the in/out buffers (2 x segment_count) match the sharded-relay all-to-all
+    # benchmark's footprint.
+    rs_in = torch.empty(0, dtype=dtype, device=device)
+    rs_out = torch.empty(0, dtype=dtype, device=device)
+    torch.cuda.empty_cache()
+    a2a_seg = prod_totals[my_sparse_group] // 4
+    a2a_in = torch.ones(2 * a2a_seg, dtype=dtype, device=device)
+    a2a_out = torch.empty(2 * a2a_seg, dtype=dtype, device=device)
+
+    def run_a2a_baseline() -> None:
+        a2a_in.fill_(1.0)
+        dist.all_to_all_single(a2a_out, a2a_in, group=my_pg)
+
+    mean_a2a_base, std_a2a_base = _measure_ms(run_a2a_baseline, warmup, bench_iters)
+    _store_barrier()
+
+    if rank == 0:
+        results_dict["A_a2a"] = (mean_a2a_base, std_a2a_base)
 
     dist.destroy_process_group()
 
@@ -829,6 +892,47 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
 
     mean_rs, std_rs = _measure_ms(run_reduce_scatter, warmup, bench_iters)
 
+    # -------------------------------------------------------------------------
+    # Benchmark E: fused all-to-all. Release the reduce-scatter buffers first.
+    # segment_count = prod_total // 4 so the in/out buffers (2 x segment_count)
+    # stay within HBM (all-to-all needs distinct in and out buffers).
+    # -------------------------------------------------------------------------
+    rs_input = torch.empty(0, dtype=dtype, device=device)
+    rs_output = torch.empty(0, dtype=dtype, device=device)
+    rs_helper_bufs = []
+    torch.cuda.empty_cache()
+
+    a2a_seg_counts = [t // 4 for t in prod_totals]
+    my_a2a_seg = a2a_seg_counts[my_sparse_group]
+    a2a_input = torch.ones(2 * my_a2a_seg, dtype=dtype, device=device)
+    a2a_output = torch.empty(2 * my_a2a_seg, dtype=dtype, device=device)
+    a2a_helper_bufs: list[torch.Tensor] = []
+    for g in range(num_sparse_groups):
+        if g == my_sparse_group:
+            a2a_helper_bufs.append(a2a_output)  # unused for the active group
+        else:
+            a2a_helper_size_g = _passthrough_helper_size(
+                a2a_seg_counts[g], sparse_group_size, num_chunks
+            )
+            a2a_helper_bufs.append(
+                torch.empty(a2a_helper_size_g, dtype=dtype, device=device)
+            )
+
+    def run_all_to_all() -> None:
+        a2a_input.fill_(1.0)
+        bench_all_to_all_flat(
+            fused=fused,
+            input_flat=a2a_input,
+            output_flat=a2a_output,
+            num_sparse_groups=num_sparse_groups,
+            my_sparse_group=my_sparse_group,
+            all_active_ranks=all_active_ranks,
+            helper_bufs=a2a_helper_bufs,
+            per_group_segment_counts=a2a_seg_counts,
+        )
+
+    mean_a2a, std_a2a = _measure_ms(run_all_to_all, warmup, bench_iters)
+
     if rank == 0:
         total_bytes = sum(sz * dtype.itemsize for sz in sizes)
         kernel_bytes = kernel_elements * dtype.itemsize
@@ -843,6 +947,12 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
         )
         bench_a_rs_std = (
             float(results_dict["A_rs"][1]) if "A_rs" in results_dict else 0.0
+        )
+        bench_a_a2a_mean = (
+            float(results_dict["A_a2a"][0]) if "A_a2a" in results_dict else 0.0
+        )
+        bench_a_a2a_std = (
+            float(results_dict["A_a2a"][1]) if "A_a2a" in results_dict else 0.0
         )
 
         rs_output_bytes = my_rs_recv * dtype.itemsize
@@ -928,6 +1038,38 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
             print(
                 f"  >> Reduce-scatter speedup (NCCL → sharded relay): "
                 f"{speedup_rs:.2f}x"
+            )
+
+        # ----- ALL-TO-ALL -----
+        a2a_seg_bytes = my_a2a_seg * dtype.itemsize
+        print()
+        print("-" * 72)
+        print("ALL-TO-ALL")
+        print("-" * 72)
+        if bench_a_a2a_mean > 0:
+            print(
+                f"  [A] NCCL all_to_all_single (baseline, "
+                f"{a2a_seg_bytes / 1024 / 1024:.0f} MB segment/group):"
+            )
+            print(
+                f"       {bench_a_a2a_mean:.2f} ms  ±  {bench_a_a2a_std:.2f} ms  |  "
+                f"{rs_bw(a2a_seg_bytes, bench_a_a2a_mean):.1f} GB/s"
+            )
+        else:
+            print("  [A] NCCL all_to_all_single (baseline): N/A")
+        print(
+            f"  [B] SHARDED RELAY (1 fused call, passthrough helpers, "
+            f"{a2a_seg_bytes / 1024 / 1024:.0f} MB segment/group):"
+        )
+        print(
+            f"       {mean_a2a:.2f} ms  ±  {std_a2a:.2f} ms  |  "
+            f"{rs_bw(a2a_seg_bytes, mean_a2a):.1f} GB/s"
+        )
+        if bench_a_a2a_mean > 0 and mean_a2a > 0:
+            speedup_a2a = bench_a_a2a_mean / mean_a2a
+            print(
+                f"  >> All-to-all speedup (NCCL → sharded relay): "
+                f"{speedup_a2a:.2f}x"
             )
         print("=" * 72)
 
