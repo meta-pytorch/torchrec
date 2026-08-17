@@ -15,6 +15,7 @@ import hypothesis.strategies as st
 import torch
 from hypothesis import given, settings, Verbosity
 from torchrec import distributed as trec_dist
+from torchrec.distributed.pec_embedding import PECEmbeddingCollectionSharder
 from torchrec.distributed.quant_embedding import (
     QuantManagedCollisionEmbeddingCollectionSharder,
 )
@@ -65,6 +66,7 @@ from torchrec.modules.mc_embedding_modules import (
     ManagedCollisionEmbeddingBagCollection,
     ManagedCollisionEmbeddingCollection,
 )
+from torchrec.modules.pec_embedding_modules import PECEmbeddingCollection
 from torchrec.quant.embedding_modules import (
     EmbeddingBagCollection as QuantEmbeddingBagCollection,
     EmbeddingCollection as QuantEmbeddingCollection,
@@ -1195,6 +1197,7 @@ movie_id | [2048, 0]     | [2048, 32]  | rank:0/cuda:1
                 EmbeddingBagCollection,
                 FeatureProcessedEmbeddingBagCollection,
                 EmbeddingCollection,
+                PECEmbeddingCollection,
                 FusedEmbeddingBagCollection,
                 QuantEmbeddingBagCollection,
                 QuantEmbeddingCollection,
@@ -1205,6 +1208,9 @@ movie_id | [2048, 0]     | [2048, 32]  | rank:0/cuda:1
         )
         self.assertIsInstance(
             default_sharder_map[EmbeddingBagCollection], EmbeddingBagCollectionSharder
+        )
+        self.assertIsInstance(
+            default_sharder_map[PECEmbeddingCollection], PECEmbeddingCollectionSharder
         )
         self.assertIsInstance(
             default_sharder_map[FeatureProcessedEmbeddingBagCollection],

@@ -1,0 +1,61 @@
+# PEC (Pipelined Embedding Collection) benchmark config.
+# Mixed EBC + PEC-EC model run through TrainPipelinePEC with controlled
+# batch-to-batch index overlap on the EC tables (where PEC overlap helps).
+# EC/PEC tables use row_wise sharding (PECEmbeddingCollectionSharder enforces RW).
+RunOptions:
+  world_size: 4
+  num_batches: 10
+  num_benchmarks: 1
+  num_profiles: 1
+  sharding_type: table_wise
+  profile_dir: "."
+  name: "pec_overlap"
+  loglevel: "info"
+PipelineConfig:
+  pipeline: "pec"
+ModelInputConfig:
+  num_float_features: 100
+  feature_pooling_avg: 30
+  overlap_ratio: 0.3
+  overlap_tables: ["ec_table_0", "ec_table_1"]
+ModelSelectionConfig:
+  model_name: "pec_mixed_embedding"
+  model_config:
+    num_float_features: 100
+EmbeddingTablesConfig:
+  num_unweighted_features: 70
+  num_weighted_features: 70
+  embedding_feature_dim: 256
+  additional_tables:
+    # First list: unweighted tables (EBC + PEC-EC mixed)
+    - - name: ebc_table_0
+        embedding_dim: 256
+        num_embeddings: 100_000
+        feature_names: ["ebc_feature_0"]
+      - name: ebc_table_1
+        embedding_dim: 256
+        num_embeddings: 200_000
+        feature_names: ["ebc_feature_1"]
+      # EC tables - use config_class to specify EmbeddingConfig; wrapped in
+      # PECEmbeddingCollection by the pec_mixed_embedding model.
+      - name: ec_table_0
+        embedding_dim: 1024
+        num_embeddings: 1_000_000
+        feature_names: ["ec_feature_0"]
+        config_class: EmbeddingConfig
+      - name: ec_table_1
+        embedding_dim: 1024
+        num_embeddings: 2_000_000
+        feature_names: ["ec_feature_1"]
+        config_class: EmbeddingConfig
+    # Second list: weighted tables (empty for this config)
+    - []
+PlannerConfig:
+  pooling_factors: [30.0]
+  hardware:  # A100
+    hbm_cap: 85899345920  # 80GB
+  additional_constraints:
+    ec_table_0:
+      sharding_types: [row_wise]
+    ec_table_1:
+      sharding_types: [row_wise]
