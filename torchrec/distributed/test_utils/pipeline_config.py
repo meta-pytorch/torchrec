@@ -26,6 +26,7 @@ from torchrec.distributed.train_pipeline.experimental_pipelines import (
     TrainPipelineSparseDistOptStash,
     TrainPipelineSparseDistT,
 )
+from torchrec.distributed.train_pipeline.pec_train_pipeline import TrainPipelinePEC
 from torchrec.distributed.train_pipeline.train_pipelines import (
     EvalPipelineFusedSparseDist,
     EvalPipelineSparseDist,
@@ -78,13 +79,13 @@ class PipelineConfig:
             kwargs["pipeline_postproc"] = True
         if "sharding_type" in kwargs:
             kwargs["sharding_type"] = ShardingType(kwargs["sharding_type"])
-        if self.pipeline in ("base", "sparse", "sparse_lite", "prefetch"):
+        if self.pipeline in ("base", "sparse", "sparse_lite", "prefetch", "pec"):
             for key in ("site_fqn", "sharding_type"):
                 if key in kwargs:
                     kwargs.pop(key)
         if self.pipeline in ("sparse-emb-stash", "prefetch-ems"):
             kwargs.pop("sharding_type", None)
-        if self.pipeline in ("base", "eval-sdd"):
+        if self.pipeline in ("base", "eval-sdd", "pec"):
             kwargs.pop("pipeline_postproc", None)
         return kwargs
 
@@ -142,6 +143,7 @@ class PipelineConfig:
             "sparse-emb-stash": TrainPipelineSparseDistEmbStash,
             "prefetch-ems": TrainPipelinePrefetchEMS,
             "eval-cpu-sparse": EvalPipelineCPUSparse,
+            "pec": TrainPipelinePEC,
         }
 
         match self.pipeline:
@@ -183,6 +185,15 @@ class PipelineConfig:
                     clear_data_dist_inputs=self.clear_data_dist_inputs,
                     enable_embedding_lookup_prefetch=self.enable_embedding_lookup_prefetch,
                     **self.get_kwargs(emb_lookup_stream=self.emb_lookup_stream),
+                )
+            case "pec":
+                # TrainPipelinePEC owns its full progress and does not accept the
+                # inplace-copy / free-features / clear-data-dist knobs.
+                return TrainPipelinePEC(
+                    model=model,
+                    optimizer=opt,
+                    device=device,
+                    **self.get_kwargs(),
                 )
             case _:
                 Pipeline = _pipeline_cls[self.pipeline]

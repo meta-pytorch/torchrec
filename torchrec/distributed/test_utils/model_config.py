@@ -31,6 +31,7 @@ from torchrec.distributed.test_utils.test_model import (
     TestOverArch,
     TestOverArchLarge,
     TestOverArchRegroupModule,
+    TestPECMixedEmbeddingSparseArch,
     TestSparseNN,
     TestTowerCollectionSparseNN,
     TestTowerSparseNN,
@@ -275,6 +276,33 @@ class MixedEmbeddingConfig(BaseModelConfig):
 
 
 @dataclass
+class PECMixedEmbeddingConfig(MixedEmbeddingConfig):
+    """Configuration for mixed EBC + PEC-EC model using TestPECMixedEmbeddingSparseArch.
+
+    Same as MixedEmbeddingConfig but wraps the EmbeddingCollection tables in a
+    PECEmbeddingCollection so the model exercises the PEC train pipeline.
+    """
+
+    def generate_model(
+        self,
+        tables: Union[List[EmbeddingBagConfig], List[EmbeddingConfig]],
+        weighted_tables: Optional[List[EmbeddingBagConfig]] = None,
+        dense_device: Optional[torch.device] = None,
+        **kwargs: Any,
+    ) -> nn.Module:
+        return TestPECMixedEmbeddingSparseArch(
+            tables=tables,
+            num_float_features=self.num_float_features,
+            weighted_tables=weighted_tables,
+            embedding_groups=self.embedding_groups,
+            dense_device=dense_device,
+            sparse_device=torch.device("meta"),
+            over_arch_clazz=self.over_arch_clazz,
+            dense_arch_hidden_sizes=self.dense_arch_hidden_sizes,
+        )
+
+
+@dataclass
 class TestModelWithPreprocConfig(BaseModelConfig):
     """Configuration for TestModelWithPreproc model (model with postproc modules)."""
 
@@ -309,6 +337,7 @@ def create_model_config(model_name: str, **kwargs: Any) -> BaseModelConfig:
         "deepfm": DeepFMConfig,
         "dlrm": DLRMConfig,
         "mixed_embedding": MixedEmbeddingConfig,
+        "pec_mixed_embedding": PECMixedEmbeddingConfig,
         "test_model_with_preproc": TestModelWithPreprocConfig,
     }
 
@@ -344,6 +373,8 @@ class ModelSelectionConfig:
                 return DLRMConfig
             case "mixed_embedding":
                 return MixedEmbeddingConfig
+            case "pec_mixed_embedding":
+                return PECMixedEmbeddingConfig
             case "test_model_with_preproc":
                 return TestModelWithPreprocConfig
             case _:
