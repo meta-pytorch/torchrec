@@ -1698,6 +1698,9 @@ def _relay_helper_size(
         return _passthrough_helper_size(elements, active_ranks, num_chunks)
     if collective == "reduce_scatter":
         recv = elements // active_ranks
+        if active_ranks > 2:
+            # A>2 reduces at the helper: one chunk per (owner, source) pair.
+            return 2 * recv
         return _passthrough_helper_size(recv, active_ranks, num_chunks)
     if collective == "all_to_all":
         if active_ranks > 2:
