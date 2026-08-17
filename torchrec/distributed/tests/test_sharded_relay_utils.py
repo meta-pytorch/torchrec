@@ -2191,7 +2191,7 @@ class FlatAllToAll4ActiveTest(unittest.TestCase):
             kwargs["output_tensors"][my_g].data_ptr(),
         )
 
-    def test_helper_buffers_passthrough_sized_4active(self) -> None:
+    def test_helper_buffers_one_segment_sized_4active(self) -> None:
         state = _make_state(rank=0, sparse_group_size=4, local_size=8)
         # input total 800 -> segment_count 200
         all_to_all_tensors_with_sharded_relay(
@@ -2210,9 +2210,9 @@ class FlatAllToAll4ActiveTest(unittest.TestCase):
                 self.assertEqual(in_tensors[g].numel(), 800)
                 self.assertEqual(out_tensors[g].numel(), 800)
                 continue
-            # Flat A>2 all-to-all is pure-direct: helpers do no work, so the
-            # util passes a tiny placeholder (size 1), not a full helper buffer.
-            self.assertEqual(in_tensors[g].numel(), 1)
+            # One segment bounds the routed A=4 XOR helper scratch; direct
+            # routes keep the same production allocation unused.
+            self.assertEqual(in_tensors[g].numel(), 200)
             # Helper uses one scratch buffer for both send and recv.
             self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
             helper_ptrs.add(in_tensors[g].data_ptr())

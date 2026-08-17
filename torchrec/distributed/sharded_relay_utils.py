@@ -976,11 +976,10 @@ def all_to_all_tensors_with_sharded_relay(
 
     All-to-all analogue of reduce_scatter_tensors_with_sharded_relay. For each
     dtype, the active group's input tensors are packed into a single flat send
-    buffer (holding nActiveRanks x segment_count elements:
-    input = [sendSeg[0]|sendSeg[1]]), ONE fused call all-to-alls all groups
-    simultaneously (phase-synchronized, no XGMI contention), and the transposed
-    output (output = [recvSeg[0]|recvSeg[1]]) is unpacked into the caller's
-    output tensors.
+    buffer holding nActiveRanks x segment_count elements, ONE fused call
+    all-to-alls all groups simultaneously (phase-synchronized, no XGMI
+    contention), and the transposed output is unpacked into the caller's output
+    tensors.
 
     All-to-all performs NO reduction (no op) and is OUT-OF-PLACE ONLY: a separate
     flat output buffer is always used (distinct from the input flat buffer), as
@@ -1103,10 +1102,10 @@ def all_to_all_tensors_with_sharded_relay(
                     # numHelpers + 1.
                     seg_g = per_group_segment_counts[g]
                     if sparse_group_size > 2:
-                        # Flat A>2 all-to-all is PURE-DIRECT (no helper relay),
-                        # so a helper rank does no work for this group. A tiny
-                        # placeholder satisfies the per-group tensor-list slot.
-                        helper_size_g = 1
+                        # The routed A=4 XOR path needs 3 * relayCount elements,
+                        # which is bounded by one segment. Direct routes leave
+                        # this production-sized helper buffer unused.
+                        helper_size_g = seg_g
                     else:
                         helper_size_g = _passthrough_helper_size(
                             seg_g, sparse_group_size, num_chunks
@@ -1114,7 +1113,7 @@ def all_to_all_tensors_with_sharded_relay(
                     helper_buf = _get_helper_flat_buf(
                         state, g, helper_size_g, dtype, device
                     )
-                    # Helper uses one two-slot scratch buffer for send and recv.
+                    # Helper uses one route-sized scratch buffer for send and recv.
                     input_group_tensors.append(helper_buf)
                     output_group_tensors.append(helper_buf)
 
