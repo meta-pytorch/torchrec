@@ -35,6 +35,7 @@ from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.model_parallel import HybridEvalDMP
+from torchrec.distributed.pec_embedding import PECEmbeddingCollectionSharder
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import POOLING_FACTOR
 from torchrec.distributed.planner.storage_reservations import (
@@ -321,6 +322,12 @@ def _get_sharders_with_fused_params(
         cast(
             ModuleSharder[nn.Module],
             EmbeddingCollectionSharder(fused_params=fused_params),
+        ),
+        cast(
+            ModuleSharder[nn.Module],
+            PECEmbeddingCollectionSharder(
+                EmbeddingCollectionSharder(fused_params=fused_params)
+            ),
         ),
     ]
 
