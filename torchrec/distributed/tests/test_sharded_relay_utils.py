@@ -43,6 +43,7 @@ from torchrec.distributed.sharded_relay_utils import (
     _get_active_output_flat_buf,
     _get_helper_flat_buf,
     _passthrough_helper_size,
+    all_gather_tensors_with_sharded_relay,
     all_to_all_tensors_with_sharded_relay,
     allreduce_tensors_with_sharded_relay,
     reduce_scatter_tensors_with_sharded_relay,
@@ -1464,6 +1465,344 @@ class FusedAllToAllValidationTest(unittest.TestCase):
                 output_tensors=output_tensors,
                 num_groups=4,
                 per_group_segment_counts=per_group_segment_counts,
+                all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+            )
+        self.assertNotIsInstance(cm.exception, ValueError)
+
+
+# ---------------------------------------------------------------------------
+# Tests for all_gather_tensors_with_sharded_relay (flat-concat approach)
+# ---------------------------------------------------------------------------
+
+
+class FlatAllGatherTest(unittest.TestCase):
+    """Tests for the all-gather flat-concat helper (in-place + out-of-place).
+
+    The active group's input holds send_count elements (this rank's
+    contribution); its output holds nActiveRanks x send_count elements.
+    fused.all_gather_multi_group is a MagicMock that records every call.
+    """
+
+    def _call_count(self, state: ShardedRelayState) -> int:
+        return state.fused.all_gather_multi_group.call_count
+
+    def _all_calls(self, state: ShardedRelayState):
+        return state.fused.all_gather_multi_group.call_args_list
+
+    def test_returns_immediately_when_no_tensors(self) -> None:
+        state = _make_state(rank=0)
+        all_gather_tensors_with_sharded_relay(state, {}, {}, "test")
+        self.assertEqual(self._call_count(state), 0)
+
+    def test_single_call_output_is_group_size_times_input(self) -> None:
+        state = _make_state(rank=0)
+        # input total 100 (send_count); output total 200 (2 x send_count)
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(100)]},
+            {torch.float32: [torch.zeros(200)]},
+            "test",
+        )
+        self.assertEqual(self._call_count(state), 1)
+        kwargs = self._all_calls(state)[0].kwargs
+        self.assertEqual(kwargs["per_group_send_counts"][state.my_sparse_group], 100)
+
+    def test_single_call_per_dtype(self) -> None:
+        state = _make_state(rank=0)
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {
+                torch.float16: [torch.zeros(20, dtype=torch.float16)],
+                torch.float32: [torch.zeros(20, dtype=torch.float32)],
+            },
+            {
+                torch.float16: [torch.zeros(40, dtype=torch.float16)],
+                torch.float32: [torch.zeros(40, dtype=torch.float32)],
+            },
+            "test",
+        )
+        self.assertEqual(self._call_count(state), 2)
+
+    def test_active_input_and_output_buffer_sizes(self) -> None:
+        state = _make_state(rank=0)
+        in_sizes = [100, 200]  # send_count 300
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(s) for s in in_sizes]},
+            {torch.float32: [torch.zeros(600)]},  # 2 x 300
+            "test",
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        my_g = state.my_sparse_group
+        self.assertEqual(kwargs["per_group_send_counts"][my_g], 300)
+        self.assertEqual(kwargs["input_tensors"][my_g].numel(), 300)
+        self.assertEqual(kwargs["output_tensors"][my_g].numel(), 600)
+
+    def test_raises_when_output_total_mismatches(self) -> None:
+        state = _make_state(rank=0)
+        with self.assertRaises(ValueError):
+            all_gather_tensors_with_sharded_relay(
+                state,
+                {torch.float32: [torch.zeros(100)]},  # send 100 -> output 200
+                {torch.float32: [torch.zeros(150)]},  # wrong
+                "test",
+            )
+
+    def test_helper_buffers_passthrough_sized_and_distinct(self) -> None:
+        state = _make_state(rank=0)
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(200)]},  # send 200
+            {torch.float32: [torch.zeros(400)]},
+            "test",
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        in_tensors = kwargs["input_tensors"]
+        out_tensors = kwargs["output_tensors"]
+        send = kwargs["per_group_send_counts"]
+        num_chunks = (state.local_size - state.sparse_group_size) + 1
+
+        helper_ptrs = set()
+        for g in range(state.num_sparse_groups):
+            if g == state.my_sparse_group:
+                continue
+            expected = _passthrough_helper_size(
+                send[g], state.sparse_group_size, num_chunks
+            )
+            self.assertEqual(in_tensors[g].numel(), expected)
+            self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
+            helper_ptrs.add(in_tensors[g].data_ptr())
+
+        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+
+    def test_active_input_is_separate_flat_buffer(self) -> None:
+        # Flat-concat scheme: the active group's input is a separate internal
+        # flat send buffer (one contiguous tensor per group), distinct from the
+        # caller's input tensor (packed into it before the call).
+        state = _make_state(rank=1)
+        in_tensor = torch.zeros(100)
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [in_tensor]},  # send 100
+            {torch.float32: [torch.zeros(200)]},
+            "test",
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        my_g = state.my_sparse_group
+        in_seg = kwargs["input_tensors"][my_g]
+        self.assertEqual(in_seg.numel(), 100)
+        self.assertNotEqual(in_seg.data_ptr(), in_tensor.data_ptr())
+
+    def test_out_of_place_input_distinct_from_output(self) -> None:
+        state = _make_state(rank=0)
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(100)]},
+            {torch.float32: [torch.zeros(200)]},
+            "test",
+            in_place=False,
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        my_g = state.my_sparse_group
+        self.assertNotEqual(
+            kwargs["input_tensors"][my_g].data_ptr(),
+            kwargs["output_tensors"][my_g].data_ptr(),
+        )
+
+    def test_in_place_input_aliases_output_own_slot(self) -> None:
+        # In-place: the active input is an owned-slot view into the active
+        # output flat buffer at offset my_active_index * send_count (the
+        # inverse of the out-of-place distinct-pointer assertion above).
+        state = _make_state(rank=1)  # my_active_index = 1 within group 0
+        send_count = 100
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(send_count)]},
+            {torch.float32: [torch.zeros(2 * send_count)]},
+            "test",
+            in_place=True,
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        my_g = state.my_sparse_group
+        in_seg = kwargs["input_tensors"][my_g]
+        out_flat = kwargs["output_tensors"][my_g]
+        self.assertEqual(out_flat.numel(), 2 * send_count)
+        self.assertEqual(in_seg.numel(), send_count)
+        self.assertEqual(
+            in_seg.data_ptr(),
+            out_flat.data_ptr() + send_count * out_flat.element_size(),
+        )
+
+    def test_values_written_back_to_output_tensors(self) -> None:
+        state = _make_state(rank=0)
+        out_tensor = torch.zeros(200)
+        sentinel = 5.0
+
+        def _fill(*args, **kwargs) -> None:
+            outs = kwargs["output_tensors"]
+            outs[state.my_sparse_group].fill_(sentinel)
+
+        state.fused.all_gather_multi_group.side_effect = _fill
+
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(100)]},
+            {torch.float32: [out_tensor]},
+            "test",
+        )
+        self.assertTrue(torch.all(out_tensor == sentinel))
+
+    def test_unpack_handles_multiple_output_tensors(self) -> None:
+        state = _make_state(rank=0)
+        o0 = torch.zeros(80)
+        o1 = torch.zeros(120)  # total 200 == 2 x send 100
+        fill_values = [6.0, 7.0]
+
+        def _fill_by_slice(*args, **kwargs) -> None:
+            flat = kwargs["output_tensors"][state.my_sparse_group]
+            flat[:80].fill_(fill_values[0])
+            flat[80:200].fill_(fill_values[1])
+
+        state.fused.all_gather_multi_group.side_effect = _fill_by_slice
+
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(100)]},
+            {torch.float32: [o0, o1]},
+            "test",
+        )
+        self.assertTrue(torch.all(o0 == fill_values[0]))
+        self.assertTrue(torch.all(o1 == fill_values[1]))
+
+    @patch("torchrec.distributed.sharded_relay_utils.dist")
+    def test_metadata_cache_skips_allgather_after_first_call(
+        self, mock_dist: MagicMock
+    ) -> None:
+        state = _make_state(rank=0)
+        state = dataclasses.replace(state, intra_node_pytorch_pg=MagicMock())
+
+        def _allgather_side_effect(tensor_list, _tensor, **_kwargs) -> None:
+            for t in tensor_list:
+                t.fill_(100)  # send_count 100 for all ranks
+
+        mock_dist.all_gather.side_effect = _allgather_side_effect
+        mock_dist.ReduceOp = dist.ReduceOp
+
+        ins = {torch.float32: [torch.zeros(100)]}
+        outs = {torch.float32: [torch.zeros(200)]}
+
+        all_gather_tensors_with_sharded_relay(state, ins, outs, "step")
+        self.assertEqual(mock_dist.all_gather.call_count, 1)
+
+        all_gather_tensors_with_sharded_relay(state, ins, outs, "step")
+        self.assertEqual(mock_dist.all_gather.call_count, 1)
+
+        all_gather_tensors_with_sharded_relay(state, ins, outs, "other")
+        self.assertEqual(mock_dist.all_gather.call_count, 2)
+
+
+# ---------------------------------------------------------------------------
+# Tests for FusedShardedRelayMultiGroup.all_gather_multi_group validation
+# ---------------------------------------------------------------------------
+
+
+class FusedAllGatherValidationTest(unittest.TestCase):
+    def _make_fused(self, rank: int = 0):
+        try:
+            from caffe2.torch.distributed.fb.sharded_relay_process_group import (  # type: ignore[import]
+                FusedShardedRelayMultiGroup,
+            )
+        except ImportError:
+            self.skipTest("FusedShardedRelayMultiGroup not available")
+
+        all_active_ranks = [[0, 1], [2, 3], [4, 5], [6, 7]]
+        return FusedShardedRelayMultiGroup(
+            rcclx_comm=None,
+            world_size=8,
+            rank=rank,
+            all_active_ranks=all_active_ranks,
+        )
+
+    def test_raises_on_active_input_too_small(self) -> None:
+        fused = self._make_fused(rank=0)  # active for group 0
+        # send_count 100 -> input must be >= 100; pass 90.
+        input_tensors = [
+            torch.zeros(90),
+            torch.zeros(10),
+            torch.zeros(10),
+            torch.zeros(10),
+        ]
+        output_tensors = [
+            torch.zeros(200),
+            torch.zeros(10),
+            torch.zeros(10),
+            torch.zeros(10),
+        ]
+        per_group_send_counts = [100, 5, 5, 5]
+
+        with self.assertRaises(ValueError) as cm:
+            fused.all_gather_multi_group(
+                input_tensors=input_tensors,
+                output_tensors=output_tensors,
+                num_groups=4,
+                per_group_send_counts=per_group_send_counts,
+                all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                skip_validation=False,
+            )
+        self.assertIn("100", str(cm.exception))
+
+    def test_raises_on_active_output_too_small(self) -> None:
+        fused = self._make_fused(rank=0)
+        # send_count 100 -> output must be >= 200; pass 150.
+        input_tensors = [
+            torch.zeros(100),
+            torch.zeros(10),
+            torch.zeros(10),
+            torch.zeros(10),
+        ]
+        output_tensors = [
+            torch.zeros(150),
+            torch.zeros(10),
+            torch.zeros(10),
+            torch.zeros(10),
+        ]
+        per_group_send_counts = [100, 5, 5, 5]
+
+        with self.assertRaises(ValueError) as cm:
+            fused.all_gather_multi_group(
+                input_tensors=input_tensors,
+                output_tensors=output_tensors,
+                num_groups=4,
+                per_group_send_counts=per_group_send_counts,
+                all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                skip_validation=False,
+            )
+        self.assertIn("200", str(cm.exception))
+
+    def test_send_count_zero_skips_validation(self) -> None:
+        """send_count=0 group carries a placeholder and must skip validation."""
+        fused = self._make_fused(rank=0)
+        input_tensors = [
+            torch.zeros(1),
+            torch.zeros(10),
+            torch.zeros(10),
+            torch.zeros(10),
+        ]
+        output_tensors = [
+            torch.zeros(1),
+            torch.zeros(10),
+            torch.zeros(10),
+            torch.zeros(10),
+        ]
+        per_group_send_counts = [0, 5, 5, 5]
+
+        # Must NOT raise ValueError. RuntimeError (no native API) is expected.
+        with self.assertRaises(RuntimeError) as cm:
+            fused.all_gather_multi_group(
+                input_tensors=input_tensors,
+                output_tensors=output_tensors,
+                num_groups=4,
+                per_group_send_counts=per_group_send_counts,
                 all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
             )
         self.assertNotIsInstance(cm.exception, ValueError)
