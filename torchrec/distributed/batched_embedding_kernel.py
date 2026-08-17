@@ -3912,6 +3912,8 @@ class TritonBatchedFusedEmbeddingBag(
                 fused_bounds_check=fused_bounds_check,
             )
         )
+        if "bounds_check_mode" in fused_params:
+            self._emb_module.bounds_check_mode = fused_params["bounds_check_mode"]
 
         # Create a simple fused optimizer that delegates to the Triton TBE
         self._optim: TritonEmbeddingFusedOptimizer = TritonEmbeddingFusedOptimizer(

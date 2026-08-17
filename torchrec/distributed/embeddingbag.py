@@ -2272,6 +2272,8 @@ class EmbeddingBagCollectionSharder(BaseEmbeddingSharder[EmbeddingBagCollection]
     This implementation uses non-fused `EmbeddingBagCollection`
     """
 
+    supports_fused_triton: bool = True
+
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
         self,
