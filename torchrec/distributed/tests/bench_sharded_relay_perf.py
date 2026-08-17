@@ -362,6 +362,46 @@ def bench_kernel_direct(
 
 
 # ---------------------------------------------------------------------------
+# Benchmark D: fused reduce-scatter (sharded relay)
+# ---------------------------------------------------------------------------
+
+
+def bench_reduce_scatter_flat(
+    fused: Any,
+    input_flat: torch.Tensor,
+    output_flat: torch.Tensor,
+    num_sparse_groups: int,
+    my_sparse_group: int,
+    all_active_ranks: list[list[int]],
+    helper_bufs: list[torch.Tensor],
+    per_group_recv_counts: list[int],
+) -> None:
+    """ONE fused reduce-scatter call across all sparse groups.
+
+    Each helper group passes its single passthrough scratch buffer.
+    """
+    input_group_tensors: list[torch.Tensor] = []
+    output_group_tensors: list[torch.Tensor] = []
+    for g in range(num_sparse_groups):
+        if g == my_sparse_group:
+            input_group_tensors.append(input_flat)
+            output_group_tensors.append(output_flat)
+        else:
+            input_group_tensors.append(helper_bufs[g])
+            output_group_tensors.append(helper_bufs[g])
+
+    fused.reduce_scatter_multi_group(
+        input_tensors=input_group_tensors,
+        output_tensors=output_group_tensors,
+        num_groups=num_sparse_groups,
+        per_group_recv_counts=per_group_recv_counts,
+        all_active_ranks=all_active_ranks,
+        op=dist.ReduceOp.AVG,
+        skip_validation=True,
+    )
+
+
+# ---------------------------------------------------------------------------
 # NCCL baseline: 4 parallel 2-rank dist.all_reduce calls
 # ---------------------------------------------------------------------------
 
@@ -511,6 +551,28 @@ def _bench_a_worker(rank: int, world_size: int, results_dict: Any) -> None:
 
     if rank == 0:
         results_dict["A"] = (mean_serial, std_serial)
+
+    # NCCL reduce-scatter baseline on the same 2-rank sub-group PG.
+    # Free the allreduce tensors first to reclaim HBM. recv_count =
+    # prod_total // 2 so the input (2 x recv_count) matches the sharded-relay
+    # reduce-scatter benchmark's active footprint.
+    my_tensors = []
+    torch.cuda.empty_cache()
+    rs_recv = prod_totals[my_sparse_group] // 2
+    rs_in = torch.ones(2 * rs_recv, dtype=dtype, device=device)
+    rs_out = torch.empty(rs_recv, dtype=dtype, device=device)
+
+    # Use SUM + manual divide (RCCL on MI350X lacks the AVG+fp16 kernel).
+    def run_rs_baseline() -> None:
+        rs_in.fill_(1.0)
+        dist.reduce_scatter_tensor(rs_out, rs_in, op=dist.ReduceOp.SUM, group=my_pg)
+        rs_out.div_(sparse_group_size)
+
+    mean_rs_base, std_rs_base = _measure_ms(run_rs_baseline, warmup, bench_iters)
+    _store_barrier()
+
+    if rank == 0:
+        results_dict["A_rs"] = (mean_rs_base, std_rs_base)
 
     dist.destroy_process_group()
 
@@ -724,6 +786,49 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
     torch.cuda.synchronize()
     peak_hbm_bytes = torch.cuda.max_memory_allocated()
 
+    # -------------------------------------------------------------------------
+    # Benchmark D: fused reduce-scatter. Release the Bench C kernel tensors
+    # first to reclaim HBM — reduce-scatter's input buffer is 2x its output
+    # (two blocks), so the active footprint is larger than allreduce's.
+    # Reassign (instead of `del`) so the run_kernel closure stays valid.
+    # -------------------------------------------------------------------------
+    kernel_tensor = torch.empty(0, dtype=dtype, device=device)
+    kernel_scratch = []
+    torch.cuda.empty_cache()
+
+    # recv_count = prod_total // 2 so the input (2 x recv_count) matches the
+    # allreduce active footprint (one prod_total per group).
+    rs_recv_counts = [t // 2 for t in prod_totals]
+    my_rs_recv = rs_recv_counts[my_sparse_group]
+    rs_input = torch.ones(2 * my_rs_recv, dtype=dtype, device=device)
+    rs_output = torch.empty(my_rs_recv, dtype=dtype, device=device)
+    rs_helper_bufs: list[torch.Tensor] = []
+    for g in range(num_sparse_groups):
+        if g == my_sparse_group:
+            rs_helper_bufs.append(rs_output)  # unused for the active group
+        else:
+            rs_helper_size_g = _passthrough_helper_size(
+                rs_recv_counts[g], sparse_group_size, num_chunks
+            )
+            rs_helper_bufs.append(
+                torch.empty(rs_helper_size_g, dtype=dtype, device=device)
+            )
+
+    def run_reduce_scatter() -> None:
+        rs_input.fill_(1.0)
+        bench_reduce_scatter_flat(
+            fused=fused,
+            input_flat=rs_input,
+            output_flat=rs_output,
+            num_sparse_groups=num_sparse_groups,
+            my_sparse_group=my_sparse_group,
+            all_active_ranks=all_active_ranks,
+            helper_bufs=rs_helper_bufs,
+            per_group_recv_counts=rs_recv_counts,
+        )
+
+    mean_rs, std_rs = _measure_ms(run_reduce_scatter, warmup, bench_iters)
+
     if rank == 0:
         total_bytes = sum(sz * dtype.itemsize for sz in sizes)
         kernel_bytes = kernel_elements * dtype.itemsize
@@ -733,9 +838,25 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
 
         bench_a_mean = float(results_dict["A"][0]) if "A" in results_dict else 0.0
         bench_a_std = float(results_dict["A"][1]) if "A" in results_dict else 0.0
+        bench_a_rs_mean = (
+            float(results_dict["A_rs"][0]) if "A_rs" in results_dict else 0.0
+        )
+        bench_a_rs_std = (
+            float(results_dict["A_rs"][1]) if "A_rs" in results_dict else 0.0
+        )
+
+        rs_output_bytes = my_rs_recv * dtype.itemsize
+
+        def rs_bw(nbytes: int, ms: float) -> float:
+            # Reduce-scatter busBW factor for n active ranks is (n-1)/n.
+            return (
+                (sparse_group_size - 1) / sparse_group_size * nbytes / (ms / 1000) / 1e9
+                if ms > 0
+                else 0.0
+            )
 
         print("\n" + "=" * 72)
-        print(f"Sharded Relay Allreduce Benchmark — MI350X ({world_size} GPUs)")
+        print(f"Sharded Relay Benchmark — MI350X ({world_size} GPUs)")
         print("=" * 72)
         print(f"  dtype:          {dtype}")
         print(f"  num_tables:     {num_tables}")
@@ -744,23 +865,26 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
             f"({table_size * dtype.itemsize / 1024 / 1024:.1f} MB)"
         )
         print(f"  total data/grp: {total_bytes / 1024 / 1024:.1f} MB")
+
+        # ----- ALLREDUCE -----
         print()
+        print("-" * 72)
+        print("ALLREDUCE")
+        print("-" * 72)
         if bench_a_mean > 0:
-            print(f"  [A] COALESCED ({num_tables} tensors, allreduce_coalesced):")
+            print(f"  [A] NCCL COALESCED (baseline, {num_tables} tensors):")
             print(
                 f"       {bench_a_mean:.2f} ms  ±  {bench_a_std:.2f} ms  |  "
                 f"{bw(total_bytes, bench_a_mean):.1f} GB/s"
             )
         else:
-            print("  [A] COALESCED: N/A")
-        print()
-        print("  [B] FUSED FLAT (1 call, passthrough helpers, phase-sync kernel):")
+            print("  [A] NCCL COALESCED (baseline): N/A")
+        print("  [B] SHARDED RELAY (1 fused call, passthrough helpers):")
         print(
             f"       {mean_fused:.2f} ms  ±  {std_fused:.2f} ms  |  "
             f"{bw(total_bytes, mean_fused):.1f} GB/s"
         )
         print(f"       Peak HBM: {peak_hbm_bytes / 1024 / 1024 / 1024:.2f} GiB")
-        print()
         print(
             f"  [C] KERNEL DIRECT (1 large tensor, {kernel_bytes / 1024 / 1024:.0f} MB):"
         )
@@ -768,10 +892,43 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
             f"       {mean_kernel:.2f} ms  ±  {std_kernel:.2f} ms  |  "
             f"{bw(kernel_bytes, mean_kernel):.1f} GB/s"
         )
+        if bench_a_mean > 0 and mean_fused > 0:
+            speedup_ar = bench_a_mean / mean_fused
+            print(
+                f"  >> Allreduce speedup (NCCL coalesced → sharded relay): "
+                f"{speedup_ar:.2f}x"
+            )
+
+        # ----- REDUCE-SCATTER -----
         print()
-        if bench_a_mean > 0:
-            speedup_ab = bench_a_mean / mean_fused if mean_fused > 0 else float("inf")
-            print(f"  A→B speedup (coalesced → fused flat):  {speedup_ab:.2f}x")
+        print("-" * 72)
+        print("REDUCE-SCATTER")
+        print("-" * 72)
+        if bench_a_rs_mean > 0:
+            print(
+                f"  [A] NCCL reduce_scatter_tensor (baseline, "
+                f"{rs_output_bytes / 1024 / 1024:.0f} MB output/group):"
+            )
+            print(
+                f"       {bench_a_rs_mean:.2f} ms  ±  {bench_a_rs_std:.2f} ms  |  "
+                f"{rs_bw(rs_output_bytes, bench_a_rs_mean):.1f} GB/s"
+            )
+        else:
+            print("  [A] NCCL reduce_scatter_tensor (baseline): N/A")
+        print(
+            f"  [B] SHARDED RELAY (1 fused call, passthrough helpers, "
+            f"{rs_output_bytes / 1024 / 1024:.0f} MB output/group):"
+        )
+        print(
+            f"       {mean_rs:.2f} ms  ±  {std_rs:.2f} ms  |  "
+            f"{rs_bw(rs_output_bytes, mean_rs):.1f} GB/s"
+        )
+        if bench_a_rs_mean > 0 and mean_rs > 0:
+            speedup_rs = bench_a_rs_mean / mean_rs
+            print(
+                f"  >> Reduce-scatter speedup (NCCL → sharded relay): "
+                f"{speedup_rs:.2f}x"
+            )
         print("=" * 72)
 
     dist.barrier()
