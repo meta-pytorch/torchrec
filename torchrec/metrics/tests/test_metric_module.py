@@ -15,7 +15,7 @@ import os
 import tempfile
 import unittest
 from collections.abc import Mapping
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, cast, Dict, List, Optional
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -99,6 +99,15 @@ class TestMetricModule(RecMetricModule):
             self.rec_tasks, model_out
         )
         self.rec_metrics.update(predictions=predictions, labels=labels, weights=weights)
+
+
+class PreparingMetricModule(RecMetricModule):
+    def _prepare_model_out_for_metrics(
+        self, model_out: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        prepared_model_out = dict(model_out)
+        prepared_model_out["task-prediction"] = prepared_model_out["raw-prediction"]
+        return prepared_model_out
 
 
 class MetricModuleTest(unittest.TestCase):
@@ -188,6 +197,41 @@ class MetricModuleTest(unittest.TestCase):
                 self.assertTrue("throughput-throughput|total_examples" in ret)
                 self.assertTrue("optimizers-optimizers|learning_rate" in ret)
             dist.destroy_process_group()
+
+    def test_prepares_model_output_before_parsing(self) -> None:
+        tasks = gen_test_tasks(["task"])
+        rec_metric = MockRecMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=2,
+            tasks=tasks,
+        )
+        metric_module = PreparingMetricModule(
+            batch_size=2,
+            world_size=1,
+            rec_tasks=tasks,
+            rec_metrics=RecMetricList([rec_metric]),
+        )
+        raw_predictions = torch.tensor([0.25, 0.75])
+        model_out = gen_test_batch(
+            batch_size=2,
+            label_name="task-label",
+            prediction_name="unused-prediction",
+            weight_name="task-weight",
+        )
+        model_out["raw-prediction"] = raw_predictions
+
+        metric_module.update(model_out)
+
+        self.assertEqual(1, rec_metric.update_called_count)
+        actual_predictions = rec_metric.predictions_update_calls[0]
+        self.assertIsInstance(actual_predictions, dict)
+        self.assertTrue(
+            torch.equal(
+                raw_predictions,
+                cast(Dict[str, torch.Tensor], actual_predictions)["task"],
+            )
+        )
 
     def test_rectask_info(self) -> None:
         mock_optimizer = MockOptimizer()

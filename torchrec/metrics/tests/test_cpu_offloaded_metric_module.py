@@ -61,6 +61,68 @@ def wait_until_true(
             raise TimeoutError("Timeout reached while waiting for condition")
 
 
+class _PreparingCPUOffloadedRecMetricModule(CPUOffloadedRecMetricModule):
+    def _prepare_model_out_for_metrics(
+        self, model_out: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "task1-prediction": model_out["raw_prediction"],
+            "task1-label": model_out["raw_label"],
+            "task1-weight": model_out["raw_weight"],
+        }
+
+
+class CPUOffloadedRecMetricModulePreparationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tasks = gen_test_tasks(["task1"])
+        self.mock_metric = MockRecMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=1,
+            tasks=self.tasks,
+            initial_states=create_tensor_states(["cross_entropy_sum"]),
+        )
+        self.module = _PreparingCPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=1,
+            world_size=1,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([self.mock_metric]),
+            update_batch_size=1,
+        )
+
+    def tearDown(self) -> None:
+        with patch.object(self.module, "_process_metric_compute_job", return_value={}):
+            self.module.shutdown()
+
+    def test_prepare_model_out_for_metrics_runs_before_worker_parsing(self) -> None:
+        raw_prediction = torch.tensor([0.25])
+        raw_label = torch.tensor([1.0])
+        raw_weight = torch.tensor([0.75])
+
+        self.module.update(
+            {
+                "raw_prediction": raw_prediction,
+                "raw_label": raw_label,
+                "raw_weight": raw_weight,
+            }
+        )
+        wait_until_true(self.mock_metric.update_called, timeout=5.0)
+
+        predictions = cast(
+            dict[str, torch.Tensor], self.mock_metric.predictions_update_calls[0]
+        )
+        labels = cast(dict[str, torch.Tensor], self.mock_metric.labels_update_calls[0])
+        torch.testing.assert_close(predictions["task1"], raw_prediction)
+        torch.testing.assert_close(labels["task1"], raw_label)
+        weights = self.mock_metric.weights_update_calls[0]
+        if weights is None:
+            self.fail("expected task weights")
+        torch.testing.assert_close(
+            cast(dict[str, torch.Tensor], weights)["task1"], raw_weight
+        )
+
+
 class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 
     def setUp(self) -> None:
@@ -1894,7 +1956,173 @@ class MergeUpdateJobsTest(unittest.TestCase):
                 kwargs={"required_inputs": {"target_tensor": torch.tensor([7.0, 8.0])}},
             ),
         ]
-        with self.assertRaises(RecMetricException):
+        with self.assertRaisesRegex(
+            RecMetricException,
+            "failed to merge required_inputs key 'target_tensor'",
+        ):
+            _merge_update_jobs(jobs)
+
+    def test_all_empty_unused_model_output_is_preserved(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.1, 0.2]),
+                    "optional_teacher_label": torch.empty(0),
+                },
+                kwargs={},
+            ),
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.3, 0.4]),
+                    "optional_teacher_label": torch.empty(0),
+                },
+                kwargs={},
+            ),
+        ]
+
+        merged = _merge_update_jobs(jobs)
+
+        self.assertEqual(merged.model_out["prediction"].shape, (4,))
+        self.assertEqual(merged.model_out["optional_teacher_label"].shape, (0,))
+
+    def test_all_empty_model_outputs_require_matching_trailing_shapes(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.1, 0.2]),
+                    "optional_teacher_label": torch.empty(0, 5),
+                },
+                kwargs={},
+            ),
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.3, 0.4]),
+                    "optional_teacher_label": torch.empty(0, 3),
+                },
+                kwargs={},
+            ),
+        ]
+
+        with self.assertRaisesRegex(
+            RecMetricException,
+            "failed to merge model_out key 'optional_teacher_label'.*"
+            "dimensions after dim 0 must match",
+        ):
+            _merge_update_jobs(jobs)
+
+    def test_jagged_values_and_lengths_preserve_variable_cardinality(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.1, 0.2]),
+                    "campaign_id": torch.empty(0, dtype=torch.long),
+                    "campaign_id_lengths": torch.tensor([0, 0]),
+                },
+                kwargs={},
+            ),
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.3, 0.4]),
+                    "campaign_id": torch.tensor([7, 7, 8]),
+                    "campaign_id_lengths": torch.tensor([2, 1]),
+                },
+                kwargs={},
+            ),
+        ]
+
+        merged = _merge_update_jobs(jobs, jagged_value_keys={"campaign_id"})
+
+        torch.testing.assert_close(
+            merged.model_out["prediction"], torch.tensor([0.1, 0.2, 0.3, 0.4])
+        )
+        torch.testing.assert_close(
+            merged.model_out["campaign_id"], torch.tensor([7, 7, 8])
+        )
+        torch.testing.assert_close(
+            merged.model_out["campaign_id_lengths"], torch.tensor([0, 0, 2, 1])
+        )
+
+    def test_jagged_required_inputs_preserve_variable_cardinality(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={"prediction": torch.tensor([0.1, 0.2])},
+                kwargs={
+                    "required_inputs": {
+                        "session_id": torch.empty(0, dtype=torch.long),
+                        "session_id_lengths": torch.tensor([0, 0]),
+                    }
+                },
+            ),
+            MetricUpdateJob(
+                model_out={"prediction": torch.tensor([0.3, 0.4])},
+                kwargs={
+                    "required_inputs": {
+                        "session_id": torch.tensor([9, 9, 10]),
+                        "session_id_lengths": torch.tensor([2, 1]),
+                    }
+                },
+            ),
+        ]
+
+        merged = _merge_update_jobs(jobs, jagged_value_keys={"session_id"})
+
+        torch.testing.assert_close(
+            merged.kwargs["required_inputs"]["session_id"],
+            torch.tensor([9, 9, 10]),
+        )
+        torch.testing.assert_close(
+            merged.kwargs["required_inputs"]["session_id_lengths"],
+            torch.tensor([0, 0, 2, 1]),
+        )
+
+    def test_unlisted_lengths_pair_uses_normal_batch_alignment(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.1, 0.2]),
+                    "metadata": torch.tensor([5.0]),
+                    "metadata_lengths": torch.tensor([1, 1]),
+                },
+                kwargs={},
+            ),
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.3, 0.4]),
+                    "metadata": torch.tensor([7.0]),
+                    "metadata_lengths": torch.tensor([1, 1]),
+                },
+                kwargs={},
+            ),
+        ]
+
+        merged = _merge_update_jobs(jobs)
+
+        torch.testing.assert_close(
+            merged.model_out["metadata"], torch.tensor([5.0, 5.0, 7.0, 7.0])
+        )
+
+    def test_unpaired_mixed_empty_tensor_remains_invalid(self) -> None:
+        jobs = [
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.1, 0.2]),
+                    "ambiguous": torch.empty(0),
+                },
+                kwargs={},
+            ),
+            MetricUpdateJob(
+                model_out={
+                    "prediction": torch.tensor([0.3, 0.4]),
+                    "ambiguous": torch.tensor([1.0]),
+                },
+                kwargs={},
+            ),
+        ]
+
+        with self.assertRaisesRegex(
+            RecMetricException,
+            "failed to merge model_out key 'ambiguous'",
+        ):
             _merge_update_jobs(jobs)
 
     def test_scalar_model_out_expands_and_concats(self) -> None:
