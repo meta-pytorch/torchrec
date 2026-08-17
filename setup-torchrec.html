@@ -748,20 +748,20 @@ Below, we’ll run a simple forward pass with TorchRec data types: <code class="
 <span class="kn">from</span><span class="w"> </span><span class="nn">torchrec.sparse.jagged_tensor</span><span class="w"> </span><span class="kn">import</span> <span class="n">JaggedTensor</span><span class="p">,</span> <span class="n">KeyedJaggedTensor</span>
 
 <span class="n">ebc</span> <span class="o">=</span> <span class="n">torchrec</span><span class="o">.</span><span class="n">EmbeddingBagCollection</span><span class="p">(</span>
-    <span class="n">device</span><span class="o">=</span><span class="s2">&quot;cpu&quot;</span><span class="p">,</span>
+    <span class="n">device</span><span class="o">=</span><span class="s2">"cpu"</span><span class="p">,</span>
     <span class="n">tables</span><span class="o">=</span><span class="p">[</span>
         <span class="n">torchrec</span><span class="o">.</span><span class="n">EmbeddingBagConfig</span><span class="p">(</span>
-            <span class="n">name</span><span class="o">=</span><span class="s2">&quot;product_table&quot;</span><span class="p">,</span>
+            <span class="n">name</span><span class="o">=</span><span class="s2">"product_table"</span><span class="p">,</span>
             <span class="n">embedding_dim</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span>
             <span class="n">num_embeddings</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
-            <span class="n">feature_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;product&quot;</span><span class="p">],</span>
+            <span class="n">feature_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"product"</span><span class="p">],</span>
             <span class="n">pooling</span><span class="o">=</span><span class="n">torchrec</span><span class="o">.</span><span class="n">PoolingType</span><span class="o">.</span><span class="n">SUM</span><span class="p">,</span>
         <span class="p">),</span>
         <span class="n">torchrec</span><span class="o">.</span><span class="n">EmbeddingBagConfig</span><span class="p">(</span>
-            <span class="n">name</span><span class="o">=</span><span class="s2">&quot;user_table&quot;</span><span class="p">,</span>
+            <span class="n">name</span><span class="o">=</span><span class="s2">"user_table"</span><span class="p">,</span>
             <span class="n">embedding_dim</span><span class="o">=</span><span class="mi">16</span><span class="p">,</span>
             <span class="n">num_embeddings</span><span class="o">=</span><span class="mi">4096</span><span class="p">,</span>
-            <span class="n">feature_names</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;user&quot;</span><span class="p">],</span>
+            <span class="n">feature_names</span><span class="o">=</span><span class="p">[</span><span class="s2">"user"</span><span class="p">],</span>
             <span class="n">pooling</span><span class="o">=</span><span class="n">torchrec</span><span class="o">.</span><span class="n">PoolingType</span><span class="o">.</span><span class="n">SUM</span><span class="p">,</span>
         <span class="p">)</span>
     <span class="p">]</span>
@@ -773,9 +773,9 @@ Below, we’ll run a simple forward pass with TorchRec data types: <code class="
 <span class="n">user_jt</span> <span class="o">=</span> <span class="n">JaggedTensor</span><span class="p">(</span><span class="n">values</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">4</span><span class="p">,</span> <span class="mi">1</span><span class="p">]),</span> <span class="n">lengths</span><span class="o">=</span><span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([</span><span class="mi">2</span><span class="p">,</span> <span class="mi">2</span><span class="p">]))</span>
 
 <span class="c1"># Q1: How many batches are there, and which values are in the first batch for product_jt and user_jt?</span>
-<span class="n">kjt</span> <span class="o">=</span> <span class="n">KeyedJaggedTensor</span><span class="o">.</span><span class="n">from_jt_dict</span><span class="p">({</span><span class="s2">&quot;product&quot;</span><span class="p">:</span> <span class="n">product_jt</span><span class="p">,</span> <span class="s2">&quot;user&quot;</span><span class="p">:</span> <span class="n">user_jt</span><span class="p">})</span>
+<span class="n">kjt</span> <span class="o">=</span> <span class="n">KeyedJaggedTensor</span><span class="o">.</span><span class="n">from_jt_dict</span><span class="p">({</span><span class="s2">"product"</span><span class="p">:</span> <span class="n">product_jt</span><span class="p">,</span> <span class="s2">"user"</span><span class="p">:</span> <span class="n">user_jt</span><span class="p">})</span>
 
-<span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Call EmbeddingBagCollection Forward: &quot;</span><span class="p">,</span> <span class="n">ebc</span><span class="p">(</span><span class="n">kjt</span><span class="p">))</span>
+<span class="nb">print</span><span class="p">(</span><span class="s2">"Call EmbeddingBagCollection Forward: "</span><span class="p">,</span> <span class="n">ebc</span><span class="p">(</span><span class="n">kjt</span><span class="p">))</span>
 </pre></div>
 </div>
 <p>Save the above code to a file named <code class="docutils literal notranslate"><span class="pre">torchrec_example.py</span></code>. Then, you should be able to

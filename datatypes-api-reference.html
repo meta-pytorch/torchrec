@@ -1163,8 +1163,8 @@ expand deduplicated embedding output for variable stride per key.</p></li>
 </dl>
 <p>Example:</p>
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span>#              0       1        2  &lt;-- dim_1
-# &quot;Feature0&quot;   [V0,V1] None    [V2]
-# &quot;Feature1&quot;   [V3]    [V4]    [V5,V6,V7]
+# "Feature0"   [V0,V1] None    [V2]
+# "Feature1"   [V3]    [V4]    [V5,V6,V7]
 #   ^
 #  dim_0
 
@@ -1178,8 +1178,8 @@ values: torch.Tensor = [V0, V1, V2, V3, V4, V5, V6, V7]  # V == any tensor datat
 weights: torch.Tensor = [W0, W1, W2, W3, W4, W5, W6, W7]  # W == any tensor datatype
 lengths: torch.Tensor = [2, 0, 1, 1, 1, 3]  # representing the jagged slice
 offsets: torch.Tensor = [0, 2, 2, 3, 4, 5, 8]  # offsets from 0 for each jagged slice
-keys: List[str] = [&quot;Feature0&quot;, &quot;Feature1&quot;]  # correspond to each value of dim_0
-index_per_key: Dict[str, int] = {&quot;Feature0&quot;: 0, &quot;Feature1&quot;: 1}  # index for each key
+keys: List[str] = ["Feature0", "Feature1"]  # correspond to each value of dim_0
+index_per_key: Dict[str, int] = {"Feature0": 0, "Feature1": 1}  # index for each key
 offset_per_key: List[int] = [0, 3, 8]  # start offset for each key and final offset
 </pre></div>
 </div>
@@ -1841,9 +1841,9 @@ Common use cases uses include storage of pooled embeddings of different dimensio
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="c1"># kt is KeyedTensor holding</span>
 
 <span class="c1">#                         0           1           2</span>
-<span class="c1">#     &quot;Embedding A&quot;    [1,1]       [1,1]        [1,1]</span>
-<span class="c1">#     &quot;Embedding B&quot;    [2,1,2]     [2,1,2]      [2,1,2]</span>
-<span class="c1">#     &quot;Embedding C&quot;    [3,1,2,3]   [3,1,2,3]    [3,1,2,3]</span>
+<span class="c1">#     "Embedding A"    [1,1]       [1,1]        [1,1]</span>
+<span class="c1">#     "Embedding B"    [2,1,2]     [2,1,2]      [2,1,2]</span>
+<span class="c1">#     "Embedding C"    [3,1,2,3]   [3,1,2,3]    [3,1,2,3]</span>
 
 <span class="n">tensor_list</span> <span class="o">=</span> <span class="p">[</span>
     <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">1</span><span class="p">,</span><span class="mi">1</span><span class="p">]]</span> <span class="o">*</span> <span class="mi">3</span><span class="p">),</span>
@@ -1851,7 +1851,7 @@ Common use cases uses include storage of pooled embeddings of different dimensio
     <span class="n">torch</span><span class="o">.</span><span class="n">tensor</span><span class="p">([[</span><span class="mi">3</span><span class="p">,</span><span class="mi">1</span><span class="p">,</span><span class="mi">2</span><span class="p">,</span><span class="mi">3</span><span class="p">]]</span> <span class="o">*</span> <span class="mi">3</span><span class="p">),</span>
 <span class="p">]</span>
 
-<span class="n">keys</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;Embedding A&quot;</span><span class="p">,</span> <span class="s2">&quot;Embedding B&quot;</span><span class="p">,</span> <span class="s2">&quot;Embedding C&quot;</span><span class="p">]</span>
+<span class="n">keys</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"Embedding A"</span><span class="p">,</span> <span class="s2">"Embedding B"</span><span class="p">,</span> <span class="s2">"Embedding C"</span><span class="p">]</span>
 
 <span class="n">kt</span> <span class="o">=</span> <span class="n">KeyedTensor</span><span class="o">.</span><span class="n">from_tensor_list</span><span class="p">(</span><span class="n">keys</span><span class="p">,</span> <span class="n">tensor_list</span><span class="p">)</span>
 
@@ -1864,7 +1864,7 @@ Common use cases uses include storage of pooled embeddings of different dimensio
 <span class="c1">#     ]</span>
 <span class="c1"># )</span>
 
-<span class="n">kt</span><span class="p">[</span><span class="s2">&quot;Embedding B&quot;</span><span class="p">]</span>
+<span class="n">kt</span><span class="p">[</span><span class="s2">"Embedding B"</span><span class="p">]</span>
 <span class="c1"># torch.Tensor([[2, 1, 2], [2, 1, 2], [2, 1, 2]])</span>
 </pre></div>
 </div>

@@ -724,7 +724,7 @@ look like:</p>
 <span class="c1"># - User 2 interacted with 3 items</span>
 <span class="c1"># - User 3 interacted with 1 item</span>
 <span class="n">lengths</span> <span class="o">=</span> <span class="p">[</span><span class="mi">2</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="mi">1</span><span class="p">]</span>
-<span class="n">offsets</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">5</span><span class="p">]</span>  <span class="c1"># Starting index of each user&#39;s interactions</span>
+<span class="n">offsets</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="mi">5</span><span class="p">]</span>  <span class="c1"># Starting index of each user's interactions</span>
 <span class="n">values</span> <span class="o">=</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">([</span><span class="mi">101</span><span class="p">,</span> <span class="mi">102</span><span class="p">,</span> <span class="mi">201</span><span class="p">,</span> <span class="mi">202</span><span class="p">,</span> <span class="mi">203</span><span class="p">,</span> <span class="mi">301</span><span class="p">])</span>  <span class="c1"># Item IDs interacted with</span>
 <span class="n">jt</span> <span class="o">=</span> <span class="n">JaggedTensor</span><span class="p">(</span><span class="n">lengths</span><span class="o">=</span><span class="n">lengths</span><span class="p">,</span> <span class="n">values</span><span class="o">=</span><span class="n">values</span><span class="p">)</span>
 <span class="c1"># OR</span>
@@ -747,7 +747,7 @@ Similar to a <code class="docutils literal notranslate"><span class="pre">Jagged
 <code class="docutils literal notranslate"><span class="pre">offsets</span></code> and <code class="docutils literal notranslate"><span class="pre">lengths</span></code> function in the same manner. You can also
 access the <code class="docutils literal notranslate"><span class="pre">lengths</span></code>, <code class="docutils literal notranslate"><span class="pre">offsets</span></code>, and <code class="docutils literal notranslate"><span class="pre">values</span></code> of a feature by
 accessing the key from the <code class="docutils literal notranslate"><span class="pre">KeyedJaggedTensor</span></code>.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">keys</span> <span class="o">=</span> <span class="p">[</span><span class="s2">&quot;user_features&quot;</span><span class="p">,</span> <span class="s2">&quot;item_features&quot;</span><span class="p">]</span>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">keys</span> <span class="o">=</span> <span class="p">[</span><span class="s2">"user_features"</span><span class="p">,</span> <span class="s2">"item_features"</span><span class="p">]</span>
 <span class="c1"># Lengths of interactions:</span>
 <span class="c1"># - User features: 2 users, with 2 and 3 interactions respectively</span>
 <span class="c1"># - Item features: 2 items, with 1 and 2 interactions respectively</span>
@@ -756,9 +756,9 @@ accessing the key from the <code class="docutils literal notranslate"><span clas
 <span class="c1"># Create a KeyedJaggedTensor</span>
 <span class="n">kjt</span> <span class="o">=</span> <span class="n">KeyedJaggedTensor</span><span class="p">(</span><span class="n">keys</span><span class="o">=</span><span class="n">keys</span><span class="p">,</span> <span class="n">lengths</span><span class="o">=</span><span class="n">lengths</span><span class="p">,</span> <span class="n">values</span><span class="o">=</span><span class="n">values</span><span class="p">)</span>
 <span class="c1"># Access the features by key</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">kjt</span><span class="p">[</span><span class="s2">&quot;user_features&quot;</span><span class="p">])</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">kjt</span><span class="p">[</span><span class="s2">"user_features"</span><span class="p">])</span>
 <span class="c1"># Outputs user features</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">kjt</span><span class="p">[</span><span class="s2">&quot;item_features&quot;</span><span class="p">])</span>
+<span class="nb">print</span><span class="p">(</span><span class="n">kjt</span><span class="p">[</span><span class="s2">"item_features"</span><span class="p">])</span>
 </pre></div>
 </div>
 </section>
