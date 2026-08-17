@@ -451,6 +451,10 @@ def add_params_from_parameter_sharding(
     if fused_params is None:
         fused_params = {}
 
+    if parameter_sharding.compute_kernel != EmbeddingComputeKernel.FUSED_TRITON.value:
+        fused_params.pop("fused_bounds_check", None)
+        fused_params.pop("enable_triton_tbe_optimizations", None)
+
     # update fused_params using params from parameter_sharding
     # this will take precidence over the fused_params provided from sharders
     if parameter_sharding.cache_params is not None:
@@ -481,6 +485,12 @@ def add_params_from_parameter_sharding(
 
     if parameter_sharding.output_dtype is not None:
         fused_params["output_dtype"] = parameter_sharding.output_dtype
+
+    if (
+        parameter_sharding.compute_kernel == EmbeddingComputeKernel.FUSED_TRITON.value
+        and parameter_sharding.bag_size_hints is not None
+    ):
+        fused_params["bag_size_hints"] = parameter_sharding.bag_size_hints
 
     if (
         parameter_sharding.compute_kernel

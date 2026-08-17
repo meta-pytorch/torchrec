@@ -20,6 +20,7 @@ import torch.distributed as dist
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import SparseType
 from hypothesis import given, settings, strategies as st, Verbosity
 from torchrec.distributed.embedding_sharding import bucketize_kjt_before_all2all
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.test_utils.test_model import TestSparseNN
@@ -32,6 +33,7 @@ from torchrec.distributed.types import (
     MultiPassPrefetchConfig,
     ParameterSharding,
     ShardingBucketMetadata,
+    ShardingType,
     ShardMetadata,
 )
 from torchrec.distributed.utils import (
@@ -861,6 +863,32 @@ class AddParamsFromParameterShardingTest(unittest.TestCase):
             "multipass_prefetch_config": MultiPassPrefetchConfig(num_passes=2),
         }
         self.assertEqual(fused_params, expected_fused_params)
+
+    def test_fused_bounds_check_is_only_forwarded_to_triton(self) -> None:
+        fused_params = add_params_from_parameter_sharding(
+            {
+                "fused_bounds_check": True,
+                "enable_triton_tbe_optimizations": True,
+            },
+            self.parameter_sharding,
+        )
+        self.assertNotIn("fused_bounds_check", fused_params)
+        self.assertNotIn("enable_triton_tbe_optimizations", fused_params)
+
+        triton_sharding = ParameterSharding(
+            sharding_type=ShardingType.TABLE_WISE.value,
+            compute_kernel=EmbeddingComputeKernel.FUSED_TRITON.value,
+            ranks=[0],
+        )
+        fused_params = add_params_from_parameter_sharding(
+            {
+                "fused_bounds_check": True,
+                "enable_triton_tbe_optimizations": True,
+            },
+            triton_sharding,
+        )
+        self.assertTrue(fused_params["fused_bounds_check"])
+        self.assertTrue(fused_params["enable_triton_tbe_optimizations"])
 
 
 class ConvertFusedParamsTest(unittest.TestCase):

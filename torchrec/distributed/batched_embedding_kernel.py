@@ -34,6 +34,7 @@ from typing import (
 import torch
 import torch.distributed as dist
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
+from fbgemm_gpu.split_table_batched_embeddings_ops_common import BoundsCheckMode
 from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
     IntNBitTableBatchedEmbeddingBagsCodegen,
 )
@@ -3895,6 +3896,9 @@ class TritonBatchedFusedEmbeddingBag(
         stochastic_rounding = fused_params.get("stochastic_rounding", True)
         bag_size_hints: Optional[List[int]] = fused_params.get("bag_size_hints")
         fused_bounds_check: bool = fused_params.get("fused_bounds_check", False)
+        enable_triton_tbe_optimizations: bool = fused_params.get(
+            "enable_triton_tbe_optimizations", False
+        )
 
         # Create Triton TBE module with feature_table_map for correct batch size handling
         self._emb_module: TritonTableBatchedEmbeddingBags = (
@@ -3910,8 +3914,17 @@ class TritonBatchedFusedEmbeddingBag(
                 device=device,
                 bag_size_hints=bag_size_hints,
                 fused_bounds_check=fused_bounds_check,
+                enable_triton_tbe_optimizations=enable_triton_tbe_optimizations,
             )
         )
+        if "bounds_check_mode" in fused_params:
+            bounds_check_mode = fused_params["bounds_check_mode"]
+            if (
+                enable_triton_tbe_optimizations
+                and bounds_check_mode == BoundsCheckMode.WARNING
+            ):
+                bounds_check_mode = BoundsCheckMode.V2_WARNING
+            self._emb_module.bounds_check_mode = bounds_check_mode
 
         # Create a simple fused optimizer that delegates to the Triton TBE
         self._optim: TritonEmbeddingFusedOptimizer = TritonEmbeddingFusedOptimizer(

@@ -90,6 +90,16 @@ except OSError:
 _DDP_STATE_DICT_PREFIX = "module."
 
 
+def _is_triton_tbe(module: nn.Module) -> bool:
+    return getattr(module, "_is_triton_tbe", False) is True
+
+
+def _is_embedding_kernel_with_sync_tensors(module: nn.Module) -> bool:
+    return isinstance(module, SplitTableBatchedEmbeddingBagsCodegen) or _is_triton_tbe(
+        module
+    )
+
+
 def _populate_updatable_modules(
     func: Callable[..., nn.Module],
 ) -> Callable[..., nn.Module]:
@@ -1555,6 +1565,16 @@ class DMPCollection(DistributedModelParallel):
         """
         assert ctx.replica_pg is not None, "replica_pg is not initialized!"
 
+        sync_modules = [module for module, _ in ctx.modules_to_sync]
+        if (
+            self._custom_all_reduce is None
+            and not self._use_sharded_relay
+            and ctx.replica_pg.size() == 1
+            and bool(sync_modules)
+            and all(_is_triton_tbe(module) for module in sync_modules)
+        ):
+            return
+
         # Memory stashing (e.g. EMS) may have freed the HBM of the TBE weight /
         # fused-optimizer tensors this sync allreduces. Restore any that are
         # currently stashed before the collective to avoid cudaErrorIllegalAddress.
@@ -1842,12 +1862,20 @@ class DMPCollection(DistributedModelParallel):
         # pyre-ignore[9]
         modules_to_skip: List[nn.Module] = [c.sharded_module for c in contexts[1:]]
         sharded_modules: List[Tuple[nn.Module, nn.Module]] = []
+        visited_module_ids: Set[int] = set()
 
         def _find_sharded_modules(
             module: nn.Module,
             prev_module: nn.Module,
         ) -> None:
+            module_id = id(module)
+            if module_id in visited_module_ids:
+                return
+            visited_module_ids.add(module_id)
+
             if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
+                sharded_modules.append((module, prev_module))
+            elif _is_triton_tbe(module):
                 sharded_modules.append((module, prev_module))
             if isinstance(module, BaseShardedManagedCollisionEmbeddingCollection):
                 sharded_modules.append((module, prev_module))
@@ -1872,9 +1900,17 @@ class DMPCollection(DistributedModelParallel):
         # Traverse module and find all sharded module kernels matching the sharded module
         # Post init DMP, save the embedding kernels
         sharded_modules: List[Tuple[nn.Module, nn.Module]] = []
+        visited_module_ids: Set[int] = set()
 
         def _find_sharded_modules(module: nn.Module, prev_module: nn.Module) -> None:
+            module_id = id(module)
+            if module_id in visited_module_ids:
+                return
+            visited_module_ids.add(module_id)
+
             if isinstance(module, SplitTableBatchedEmbeddingBagsCodegen):
+                sharded_modules.append((module, prev_module))
+            elif _is_triton_tbe(module):
                 sharded_modules.append((module, prev_module))
             if isinstance(module, sharded_module):  # pyre-ignore[6]
                 for lookup in module._lookups:  # pyre-ignore[29]
@@ -1904,11 +1940,12 @@ class DMPCollection(DistributedModelParallel):
             )
             hash_zch_modules: List[Tuple[nn.Module, str]] = []
             for emb_kernel, _ in context.modules_to_sync:
-                if isinstance(emb_kernel, SplitTableBatchedEmbeddingBagsCodegen):
+                if _is_embedding_kernel_with_sync_tensors(emb_kernel):
+                    sync_kernel = cast(Any, emb_kernel)
                     # If kernel is TBE, then cache the weights and optimizer tensors
-                    for w in emb_kernel.split_embedding_weights():  # pyre-ignore[29]
+                    for w in sync_kernel.split_embedding_weights():
                         weights_by_dtype[w.dtype].append(w)
-                    for state in emb_kernel.get_optimizer_state():
+                    for state in sync_kernel.get_optimizer_state():
                         opt_tensor = state["sum"]
                         optimizer_by_dtype[opt_tensor.dtype].append(opt_tensor)
 
