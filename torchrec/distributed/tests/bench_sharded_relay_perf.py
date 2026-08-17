@@ -41,8 +41,15 @@ BM-FM production numbers (from aps-bm_fm_amd_srinathb_20260420_200640-ea51247ebd
       [479_250_475, 553_440_942, 634_386_550, 560_128_334]
       ≈ 1.8–2.4 GiB per group (fp32)
 
-The production per-group totals above are the defaults.  Run with no extra flags:
+The production per-group totals above are capped to a 1 GiB-per-group default so
+the benchmark fits alongside other work on a shared GPU host and in CI.  Run with
+no extra flags:
     buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \\
+        //torchrec/distributed/tests:bench_sharded_relay_perf
+
+Production scale (uncapped, needs an otherwise-idle host):
+    BENCH_TABLE_SIZE=12002982488 BENCH_KERNEL_SIZE_GB=22.4 \\
+        buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \\
         //torchrec/distributed/tests:bench_sharded_relay_perf
 
 Optimizer-sync scale (fp32):
@@ -57,8 +64,8 @@ Small-scale smoke run (101 tables × 1M elements ≈ 100M per group):
 Environment variables (all optional):
     BENCH_DTYPE          bf16|fp16|fp32   (default: fp16)
     BENCH_NUM_TABLES     int              (default: 1)
-    BENCH_TABLE_SIZE     int              (default: production total for active group)
-    BENCH_KERNEL_SIZE_GB float            (default: production total for active group)
+    BENCH_TABLE_SIZE     int              (default: capped production total, <=1 GiB/group)
+    BENCH_KERNEL_SIZE_GB float            (default: capped production total, <=1 GiB/group)
     BENCH_WARMUP_ITERS   int              (default: 5)
     BENCH_BENCH_ITERS    int              (default: 20)
     BENCH_LOG_SIZES      1                (print sizes and exit; for calibration)
@@ -135,6 +142,18 @@ _PROD_TOTALS_FP32: list[int] = [
     634_386_550,  # group 2
     560_128_334,  # group 3
 ]
+
+# The production totals above are ~22 GiB per group, which needs ~69 GiB per rank
+# once helper and scratch buffers are included and OOMs whenever the host is
+# shared (or in CI). Cap the per-group default and use BENCH_TABLE_SIZE /
+# BENCH_KERNEL_SIZE_GB to measure at production scale on an idle host.
+_DEFAULT_MAX_BYTES_PER_GROUP: int = 1024**3  # 1 GiB
+
+
+def _default_totals(dtype: torch.dtype) -> list[int]:
+    totals = _PROD_TOTALS_FP16 if dtype != torch.float32 else _PROD_TOTALS_FP32
+    cap = _DEFAULT_MAX_BYTES_PER_GROUP // dtype.itemsize
+    return [min(total, cap) for total in totals]
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +456,7 @@ def _bench_a_worker(rank: int, world_size: int, results_dict: Any) -> None:
         for g in range(num_sparse_groups)
     ]
 
-    prod_totals = _PROD_TOTALS_FP16 if dtype != torch.float32 else _PROD_TOTALS_FP32
+    prod_totals = _default_totals(dtype)
 
     num_tables = _env_int("BENCH_NUM_TABLES", 1)
     table_sizes_all = [
@@ -550,7 +569,7 @@ def _benchmark_worker(rank: int, world_size: int, results_dict: Any) -> None:
     ]
 
     # Production per-group totals: groups have heterogeneous sizes matching BM-FM.
-    prod_totals = _PROD_TOTALS_FP16 if dtype != torch.float32 else _PROD_TOTALS_FP32
+    prod_totals = _default_totals(dtype)
 
     # Tensors for Benchmark B.
     # Default: one flat tensor per group at the production total for this rank's
