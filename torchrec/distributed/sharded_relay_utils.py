@@ -480,6 +480,26 @@ def _get_helper_flat_buf(
     return buf if buf.numel() == total else buf.narrow(0, 0, total)
 
 
+def _relay_helper_size(
+    total_g: int,
+    sparse_group_size: int,
+) -> int:
+    """Helper scratch size (in elements) for one group when the relay reduces at
+    the helper.
+
+    The A>2 relay paths give each helper one position slice of every block and
+    have it sum the contributing sources before forwarding, which needs one chunk
+    per (owner, source) pair:
+
+        A * (A - 1) * chunk,  chunk = total_g // (A + H)
+
+    On the 8-GPU node (A == H == 4) that is 1.5 * total_g. Rather than tracking H
+    here, allocate 2 * total_g, which covers every supported (A, H) split and
+    matches the allreduce A>2 contract.
+    """
+    return 2 * total_g
+
+
 def _passthrough_helper_size(
     count_g: int,
     sparse_group_size: int,
@@ -730,9 +750,16 @@ def reduce_scatter_tensors_with_sharded_relay(
                         unpack_flat = out_flat
                 else:
                     recv_count_g = per_group_recv_counts[g]
-                    helper_size_g = _passthrough_helper_size(
-                        recv_count_g, sparse_group_size, num_chunks
-                    )
+                    if sparse_group_size > 2:
+                        # A>2 reduces at the helper, which needs one chunk per
+                        # (owner, source) pair rather than two passthrough slots.
+                        helper_size_g = _relay_helper_size(
+                            recv_count_g, sparse_group_size
+                        )
+                    else:
+                        helper_size_g = _passthrough_helper_size(
+                            recv_count_g, sparse_group_size, num_chunks
+                        )
                     helper_buf = _get_helper_flat_buf(
                         state, g, helper_size_g, dtype, device
                     )

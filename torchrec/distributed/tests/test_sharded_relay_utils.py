@@ -2042,7 +2042,7 @@ class FlatReduceScatter4ActiveTest(unittest.TestCase):
             100,
         )
 
-    def test_helper_buffers_passthrough_sized_4active(self) -> None:
+    def test_helper_buffers_sized_to_2x_recv_count_4active(self) -> None:
         state = _make_state(rank=0, sparse_group_size=4, local_size=8)
         # input total 800 -> recv_count 200
         reduce_scatter_tensors_with_sharded_relay(
@@ -2055,8 +2055,6 @@ class FlatReduceScatter4ActiveTest(unittest.TestCase):
         in_tensors = kwargs["input_tensors"]
         out_tensors = kwargs["output_tensors"]
         recv = kwargs["per_group_recv_counts"]
-        # num_chunks = local_size - sparse_group_size + 1 = 8 - 4 + 1 = 5
-        num_chunks = (state.local_size - state.sparse_group_size) + 1
 
         helper_ptrs = set()
         for g in range(state.num_sparse_groups):
@@ -2064,9 +2062,9 @@ class FlatReduceScatter4ActiveTest(unittest.TestCase):
                 self.assertEqual(in_tensors[g].numel(), 800)
                 self.assertEqual(out_tensors[g].numel(), 200)
                 continue
-            expected = _passthrough_helper_size(
-                recv[g], state.sparse_group_size, num_chunks
-            )
+            # A>2 reduce-scatter reduces at the helper and retains the
+            # 2 * recvCount helper-buffer contract.
+            expected = 2 * recv[g]
             self.assertEqual(in_tensors[g].numel(), expected)
             # Helper uses one scratch buffer for both send and recv.
             self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
