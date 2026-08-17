@@ -2830,6 +2830,14 @@ class PlannerSessionContext:
     # capture_search_space is set (SKU -> url); surfaced as search_space_url on the
     # planner_runs Scuba row. Empty when capture is off.
     search_space_urls: Dict[str, str] = field(default_factory=dict)
+    # Planner-input context hash per SKU (SKU -> hash as str), recorded by the
+    # Manifold sink that computes it. This is the key the Manifold plan cache is
+    # addressed by ({job_name}-planner_input_context_hash_{hash}/...), so persisting
+    # it is what lets a later run find a reusable plan. Distinct from
+    # request_hash: it is computed post reserve()+enumerate() and covers the
+    # resolved topology + enumerated search space, not just the request params.
+    # Empty when the sink could not compute it (missing enumerator/reservation).
+    input_context_hash: Dict[str, str] = field(default_factory=dict)
     # External trace / job identifier (the MAST job name) this planning session
     # corresponds to. Links the request/session to the launching job for
     # cross-system correlation. Populated by the caller/adapter (None off-MAST,
