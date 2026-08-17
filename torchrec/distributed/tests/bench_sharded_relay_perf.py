@@ -72,7 +72,7 @@ Environment variables (all optional):
 
 The benchmark automatically sweeps BOTH 2-active and 4-active sharded relay
 groups and prints a full report for each. The 4-active sweep covers allreduce
-only (reduce-scatter / all-to-all / all-gather are 2-active only).
+and reduce-scatter (all-to-all / all-gather are still 2-active only).
 """
 
 from __future__ import annotations
@@ -400,7 +400,9 @@ def bench_reduce_scatter_flat(
 ) -> None:
     """ONE fused reduce-scatter call across all sparse groups.
 
-    Each helper group passes its single passthrough scratch buffer.
+    Each group contributes ONE contiguous tensor: the active group passes the
+    single contiguous input_flat/output_flat; each helper group passes its
+    single passthrough scratch buffer.
     """
     input_group_tensors: list[torch.Tensor] = []
     output_group_tensors: list[torch.Tensor] = []
@@ -696,33 +698,38 @@ def _bench_a_worker(
     if rank == 0:
         results_dict["A"] = (mean_serial, std_serial)
 
-    # NCCL reduce-scatter / all-to-all / all-gather baselines run on the same
-    # sub-group PG. They are 2-active only (paired with the 2-active sharded
-    # relay benches), so skip them for a 4-active allreduce sweep. All ranks
-    # share the same env-driven sparse_group_size, so the _store_barrier()
-    # calls stay balanced.
+    # NCCL reduce-scatter baseline runs for all active-rank counts (paired with
+    # the now-4-active sharded relay reduce-scatter bench). recv_count =
+    # prod_total // sparse_group_size so the input (A x recv_count) matches the
+    # sharded-relay reduce-scatter benchmark's active footprint. Free the
+    # allreduce tensors first to reclaim HBM.
+    my_tensors = []
+    torch.cuda.empty_cache()
+    rs_recv = prod_totals[my_sparse_group] // sparse_group_size
+    rs_in = torch.ones(sparse_group_size * rs_recv, dtype=dtype, device=device)
+    rs_out = torch.empty(rs_recv, dtype=dtype, device=device)
+
+    # Use SUM + manual divide (RCCL on MI350X lacks the AVG+fp16 kernel).
+    def run_rs_baseline() -> None:
+        rs_in.fill_(1.0)
+        dist.reduce_scatter_tensor(rs_out, rs_in, op=dist.ReduceOp.SUM, group=my_pg)
+        rs_out.div_(sparse_group_size)
+
+    mean_rs_base, std_rs_base = (
+        _measure_ms(run_rs_baseline, warmup, bench_iters)
+        if _want("reduce_scatter")
+        else (0.0, 0.0)
+    )
+    _store_barrier()
+
+    if rank == 0:
+        results_dict["A_rs"] = (mean_rs_base, std_rs_base)
+
+    # NCCL all-to-all / all-gather baselines are 2-active only (paired with the
+    # 2-active sharded relay A2A/AG benches), so skip them for a 4-active sweep.
+    # All ranks share the same env-driven sparse_group_size, so the
+    # _store_barrier() calls stay balanced.
     if sparse_group_size == 2:
-        # NCCL reduce-scatter baseline. Free the allreduce tensors first to
-        # reclaim HBM. recv_count = prod_total // 2 so the input (2 x recv_count)
-        # matches the sharded-relay reduce-scatter benchmark's active footprint.
-        my_tensors = []
-        torch.cuda.empty_cache()
-        rs_recv = prod_totals[my_sparse_group] // 2
-        rs_in = torch.ones(2 * rs_recv, dtype=dtype, device=device)
-        rs_out = torch.empty(rs_recv, dtype=dtype, device=device)
-
-        # Use SUM + manual divide (RCCL on MI350X lacks the AVG+fp16 kernel).
-        def run_rs_baseline() -> None:
-            rs_in.fill_(1.0)
-            dist.reduce_scatter_tensor(rs_out, rs_in, op=dist.ReduceOp.SUM, group=my_pg)
-            rs_out.div_(sparse_group_size)
-
-        mean_rs_base, std_rs_base = _measure_ms(run_rs_baseline, warmup, bench_iters)
-        _store_barrier()
-
-        if rank == 0:
-            results_dict["A_rs"] = (mean_rs_base, std_rs_base)
-
         # NCCL all-to-all baseline. Free the reduce-scatter baseline tensors
         # first. segment_count = prod_total // 4 so the in/out buffers
         # (2 x segment_count) match the sharded-relay all-to-all footprint.
@@ -782,9 +789,9 @@ def _benchmark_worker(
     spawned child processes in the Meta environment.
 
     sharding_group_size selects the active-ranks-per-group (2 or 4). At 4 the
-    reduce-scatter / all-to-all / all-gather benches (2-active only) are
-    skipped and only the allreduce benches run. port_offset isolates ports
-    across the 2-rank and 4-rank sweep iterations.
+    all-to-all / all-gather benches (2-active only) are skipped; allreduce and
+    reduce-scatter run at both 2 and 4. port_offset isolates ports across the
+    2-rank and 4-rank sweep iterations.
     """
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(_NCCL_PORT + port_offset)
@@ -1005,55 +1012,98 @@ def _benchmark_worker(
     else:
         peak_hbm_bytes = 0
 
-    # The reduce-scatter / all-to-all / all-gather sharded-relay benches only
-    # support 2 active ranks today, so they are skipped during the 4-active
-    # allreduce sweep.
-    mean_rs = std_rs = mean_a2a = std_a2a = mean_ag = std_ag = 0.0
-    my_rs_recv = my_a2a_seg = my_ag_send = 0
-    if sparse_group_size == 2:
-        # ---------------------------------------------------------------------
-        # Benchmark D: fused reduce-scatter. Release the Bench C kernel tensors
-        # first to reclaim HBM — reduce-scatter's input buffer is 2x its output
-        # (two blocks), so the active footprint is larger than allreduce's.
-        # Reassign (instead of `del`) so the run_kernel closure stays valid.
-        # ---------------------------------------------------------------------
-        kernel_tensor = torch.empty(0, dtype=dtype, device=device)
-        kernel_scratch = []
-        torch.cuda.empty_cache()
+    # The all-to-all / all-gather sharded-relay benches only support 2 active
+    # ranks today, so they are skipped during the 4-active sweep. Reduce-scatter
+    # supports 2 or 4 and always runs.
+    mean_a2a = std_a2a = mean_ag = std_ag = 0.0
+    my_a2a_seg = my_ag_send = 0
 
-        # recv_count = prod_total // 2 so the input (2 x recv_count) matches the
-        # allreduce active footprint (one prod_total per group).
-        rs_recv_counts = [t // 2 for t in prod_totals]
-        my_rs_recv = rs_recv_counts[my_sparse_group]
-        rs_input = torch.ones(2 * my_rs_recv, dtype=dtype, device=device)
-        rs_output = torch.empty(my_rs_recv, dtype=dtype, device=device)
-        rs_helper_bufs: list[torch.Tensor] = []
-        for g in range(num_sparse_groups):
-            if g == my_sparse_group:
-                rs_helper_bufs.append(rs_output)  # unused for the active group
-            else:
-                rs_helper_size_g = _passthrough_helper_size(
-                    rs_recv_counts[g], sparse_group_size, num_chunks
-                )
-                rs_helper_bufs.append(
-                    torch.empty(rs_helper_size_g, dtype=dtype, device=device)
-                )
+    # -------------------------------------------------------------------------
+    # Benchmark D: fused reduce-scatter (runs for all active-rank counts).
+    # Release the Bench C kernel tensors first to reclaim HBM — reduce-scatter's
+    # input buffer is A x its output (A blocks), so the active footprint is
+    # larger than allreduce's. Reassign (instead of `del`) so the run_kernel
+    # closure stays valid.
+    # -------------------------------------------------------------------------
+    kernel_tensor = torch.empty(0, dtype=dtype, device=device)
+    kernel_scratch = []
+    torch.cuda.empty_cache()
 
-        def run_reduce_scatter() -> None:
-            rs_input.fill_(1.0)
-            bench_reduce_scatter_flat(
-                fused=fused,
-                input_flat=rs_input,
-                output_flat=rs_output,
-                num_sparse_groups=num_sparse_groups,
-                my_sparse_group=my_sparse_group,
-                all_active_ranks=all_active_ranks,
-                helper_bufs=rs_helper_bufs,
-                per_group_recv_counts=rs_recv_counts,
+    # recv_count = prod_total // sparse_group_size so the input (A x recv_count)
+    # matches the allreduce active footprint (one prod_total per group). Index by
+    # range(num_sparse_groups) — NOT `for t in prod_totals` — because prod_totals
+    # always has 4 entries while num_sparse_groups = local_size // sparse_group_size
+    # (2 at 4-active), and per_group_recv_counts must match input_tensors length.
+    rs_recv_counts = [
+        prod_totals[g] // sparse_group_size for g in range(num_sparse_groups)
+    ]
+    my_rs_recv = rs_recv_counts[my_sparse_group]
+    rs_input = torch.ones(sparse_group_size * my_rs_recv, dtype=dtype, device=device)
+    rs_output = torch.empty(my_rs_recv, dtype=dtype, device=device)
+    # Production per-table model tensors: packed into / unpacked from the flat
+    # buffers so the measured cost includes the cat/copy the production util
+    # (reduce_scatter_tensors_with_sharded_relay) performs.
+    rs_in_model = [
+        torch.ones(sparse_group_size * my_rs_recv, dtype=dtype, device=device)
+    ]
+    rs_out_model = [torch.empty(my_rs_recv, dtype=dtype, device=device)]
+    rs_helper_bufs: list[torch.Tensor] = []
+    for g in range(num_sparse_groups):
+        if g == my_sparse_group:
+            rs_helper_bufs.append(rs_output)  # unused for the active group
+        else:
+            rs_helper_size_g = _passthrough_helper_size(
+                rs_recv_counts[g], sparse_group_size, num_chunks
+            )
+            rs_helper_bufs.append(
+                torch.empty(rs_helper_size_g, dtype=dtype, device=device)
             )
 
-        mean_rs, std_rs = _measure_ms(run_reduce_scatter, warmup, bench_iters)
+    def run_reduce_scatter() -> None:
+        # Production path: pack the per-table model input into the contiguous
+        # flat send buffer, run the fused call, then unpack into the model output.
+        for t in rs_in_model:
+            t.fill_(1.0)
+        rs_input.copy_(rs_in_model[0].reshape(-1))
+        bench_reduce_scatter_flat(
+            fused=fused,
+            input_flat=rs_input,
+            output_flat=rs_output,
+            num_sparse_groups=num_sparse_groups,
+            my_sparse_group=my_sparse_group,
+            all_active_ranks=all_active_ranks,
+            helper_bufs=rs_helper_bufs,
+            per_group_recv_counts=rs_recv_counts,
+        )
+        rs_out_model[0].reshape(-1).copy_(rs_output)
 
+    mean_rs, std_rs = (
+        _measure_ms(run_reduce_scatter, warmup, bench_iters)
+        if _want("reduce_scatter")
+        else (0.0, 0.0)
+    )
+
+    def run_reduce_scatter_kernel() -> None:
+        # Kernel-direct: raw kernel on the contiguous flat buffers, no pack/copy.
+        rs_input.fill_(1.0)
+        bench_reduce_scatter_flat(
+            fused=fused,
+            input_flat=rs_input,
+            output_flat=rs_output,
+            num_sparse_groups=num_sparse_groups,
+            my_sparse_group=my_sparse_group,
+            all_active_ranks=all_active_ranks,
+            helper_bufs=rs_helper_bufs,
+            per_group_recv_counts=rs_recv_counts,
+        )
+
+    mean_rs_kernel, std_rs_kernel = (
+        _measure_ms(run_reduce_scatter_kernel, warmup, bench_iters)
+        if _want("reduce_scatter")
+        else (0.0, 0.0)
+    )
+
+    if sparse_group_size == 2:
         # ---------------------------------------------------------------------
         # Benchmark E: fused all-to-all. Release the reduce-scatter buffers
         # first. segment_count = prod_total // 4 so the in/out buffers
@@ -1063,6 +1113,8 @@ def _benchmark_worker(
         rs_input = torch.empty(0, dtype=dtype, device=device)
         rs_output = torch.empty(0, dtype=dtype, device=device)
         rs_helper_bufs = []
+        rs_in_model = [torch.empty(0, dtype=dtype, device=device)]
+        rs_out_model = [torch.empty(0, dtype=dtype, device=device)]
         torch.cuda.empty_cache()
 
         a2a_seg_counts = [t // 4 for t in prod_totals]
@@ -1231,40 +1283,52 @@ def _benchmark_worker(
                 f"{bench_a_mean / mean_kernel:.2f}x"
             )
 
-        # ----- REDUCE-SCATTER / ALL-TO-ALL / ALL-GATHER -----
-        # These sharded-relay benches are 2-active only; skip during the
-        # 4-active allreduce sweep.
-        if sparse_group_size == 2:
-            print()
-            print("-" * 72)
-            print("REDUCE-SCATTER")
-            print("-" * 72)
-            if bench_a_rs_mean > 0:
-                print(
-                    f"  [A] NCCL reduce_scatter_tensor (baseline, "
-                    f"{rs_output_bytes / 1024 / 1024:.0f} MB output/group):"
-                )
-                print(
-                    f"       {bench_a_rs_mean:.2f} ms  ±  {bench_a_rs_std:.2f} ms  |  "
-                    f"{rs_bw(rs_output_bytes, bench_a_rs_mean):.1f} GB/s"
-                )
-            else:
-                print("  [A] NCCL reduce_scatter_tensor (baseline): N/A")
+        # ----- REDUCE-SCATTER (runs for 2 or 4 active ranks) -----
+        print()
+        print("-" * 72)
+        print("REDUCE-SCATTER")
+        print("-" * 72)
+        if bench_a_rs_mean > 0:
             print(
-                f"  [B] SHARDED RELAY (1 fused call, passthrough helpers, "
+                f"  [A] NCCL reduce_scatter_tensor (baseline, "
                 f"{rs_output_bytes / 1024 / 1024:.0f} MB output/group):"
             )
             print(
-                f"       {mean_rs:.2f} ms  ±  {std_rs:.2f} ms  |  "
-                f"{rs_bw(rs_output_bytes, mean_rs):.1f} GB/s"
+                f"       {bench_a_rs_mean:.2f} ms  ±  {bench_a_rs_std:.2f} ms  |  "
+                f"{rs_bw(rs_output_bytes, bench_a_rs_mean):.1f} GB/s"
             )
-            if bench_a_rs_mean > 0 and mean_rs > 0:
-                speedup_rs = bench_a_rs_mean / mean_rs
-                print(
-                    f"  >> Reduce-scatter speedup (NCCL → sharded relay): "
-                    f"{speedup_rs:.2f}x"
-                )
+        else:
+            print("  [A] NCCL reduce_scatter_tensor (baseline): N/A")
+        print(
+            f"  [B] SHARDED RELAY (1 fused call, passthrough helpers, "
+            f"{rs_output_bytes / 1024 / 1024:.0f} MB output/group):"
+        )
+        print(
+            f"       {mean_rs:.2f} ms  ±  {std_rs:.2f} ms  |  "
+            f"{rs_bw(rs_output_bytes, mean_rs):.1f} GB/s"
+        )
+        print(
+            f"  [C] KERNEL DIRECT (no pack/copy, "
+            f"{rs_output_bytes / 1024 / 1024:.0f} MB output/group):"
+        )
+        print(
+            f"       {mean_rs_kernel:.2f} ms  ±  {std_rs_kernel:.2f} ms  |  "
+            f"{rs_bw(rs_output_bytes, mean_rs_kernel):.1f} GB/s"
+        )
+        if bench_a_rs_mean > 0 and mean_rs > 0:
+            speedup_rs = bench_a_rs_mean / mean_rs
+            print(
+                f"  >> Reduce-scatter speedup (NCCL → sharded relay): "
+                f"{speedup_rs:.2f}x"
+            )
+        if bench_a_rs_mean > 0 and mean_rs_kernel > 0:
+            print(
+                f"  >> Reduce-scatter KERNEL speedup (NCCL → kernel-direct): "
+                f"{bench_a_rs_mean / mean_rs_kernel:.2f}x"
+            )
 
+        # ----- ALL-TO-ALL / ALL-GATHER (2-active only) -----
+        if sparse_group_size == 2:
             # ----- ALL-TO-ALL -----
             a2a_seg_bytes = my_a2a_seg * dtype.itemsize
             print()
