@@ -1421,6 +1421,33 @@ class ShardingOption:
                 # pyrefly: ignore[not-callable]: `Module` has no attribute `is_weighted`
                 self.is_weighted = child_module.is_weighted()
 
+        child_module = module[1]
+        self._module_type_key: str = (
+            type(child_module).__module__ + "." + type(child_module).__name__
+        )
+        _module_has_fp = (
+            hasattr(child_module, "_feature_processor")
+            and hasattr(
+                child_module._feature_processor,
+                "feature_processor_modules",
+            )
+            and isinstance(
+                # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+                child_module._feature_processor.feature_processor_modules,
+                nn.ModuleDict,
+            )
+        )
+        self._has_feature_processor: bool = (
+            _module_has_fp
+            and name
+            # pyre-ignore[16]: `Module` has no attribute `_feature_processor`
+            in child_module._feature_processor.feature_processor_modules.keys()
+        )
+        if hasattr(child_module, "is_weighted") and callable(child_module.is_weighted):
+            if isinstance(child_module, EmbeddingBagCollectionInterface):
+                # pyre-ignore[29]: `Module` has no attribute `is_weighted`
+                self.is_weighted = child_module.is_weighted()
+
     @property
     def tensor(self) -> torch.Tensor:
         return self._tensor
