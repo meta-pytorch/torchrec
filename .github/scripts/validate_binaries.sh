@@ -98,6 +98,8 @@ if [[ ${MATRIX_GPU_ARCH_TYPE} = 'cuda' ]]; then
         export CUDA_VERSION="cu129"
     elif [[ ${MATRIX_GPU_ARCH_VERSION} = '13.0' ]]; then
         export CUDA_VERSION="cu130"
+    elif [[ ${MATRIX_GPU_ARCH_VERSION} = '13.2' ]]; then
+        export CUDA_VERSION="cu132"
     else
         export CUDA_VERSION="cu126"
     fi
