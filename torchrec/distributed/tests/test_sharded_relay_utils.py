@@ -2090,5 +2090,147 @@ class FusedReduceScatter4ActiveValidationTest(unittest.TestCase):
         self.assertNotIsInstance(cm.exception, ValueError)
 
 
+class FlatAllToAll4ActiveTest(unittest.TestCase):
+    """all_to_all_tensors_with_sharded_relay with sparse_group_size=4.
+
+    8-rank node -> 2 groups of 4 active ranks. The active group's input/output
+    each hold nActiveRanks x segment_count elements (out-of-place). Verifies the
+    flat-concat path is generic over the active-rank count.
+    """
+
+    def _all_calls(self, state: ShardedRelayState):
+        return state.fused.all_to_all_multi_group.call_args_list
+
+    def test_single_call_two_groups(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        # input total 400 -> segment_count 100 (sparse_group_size=4)
+        all_to_all_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(400)]},
+            {torch.float32: [torch.zeros(400)]},
+            "test",
+        )
+        self.assertEqual(state.fused.all_to_all_multi_group.call_count, 1)
+        kwargs = self._all_calls(state)[0].kwargs
+        self.assertEqual(kwargs["num_groups"], 2)
+        self.assertEqual(kwargs["per_group_segment_counts"][state.my_sparse_group], 100)
+        self.assertEqual(
+            kwargs["input_tensors"][state.my_sparse_group].numel(),
+            400,
+        )
+        self.assertEqual(
+            kwargs["output_tensors"][state.my_sparse_group].numel(),
+            400,
+        )
+
+    def test_output_flat_distinct_from_input_flat_4active(self) -> None:
+        """All-to-all is out-of-place: active output flat must differ from input."""
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        all_to_all_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(400)]},
+            {torch.float32: [torch.zeros(400)]},
+            "test",
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        my_g = state.my_sparse_group
+        self.assertNotEqual(
+            kwargs["input_tensors"][my_g].data_ptr(),
+            kwargs["output_tensors"][my_g].data_ptr(),
+        )
+
+    def test_helper_buffers_passthrough_sized_4active(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        # input total 800 -> segment_count 200
+        all_to_all_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(800)]},
+            {torch.float32: [torch.zeros(800)]},
+            "test",
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        in_tensors = kwargs["input_tensors"]
+        out_tensors = kwargs["output_tensors"]
+
+        helper_ptrs = set()
+        for g in range(state.num_sparse_groups):
+            if g == state.my_sparse_group:
+                self.assertEqual(in_tensors[g].numel(), 800)
+                self.assertEqual(out_tensors[g].numel(), 800)
+                continue
+            # Flat A>2 all-to-all is pure-direct: helpers do no work, so the
+            # util passes a tiny placeholder (size 1), not a full helper buffer.
+            self.assertEqual(in_tensors[g].numel(), 1)
+            # Helper uses one scratch buffer for both send and recv.
+            self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
+            helper_ptrs.add(in_tensors[g].data_ptr())
+
+        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+
+    def test_active_group_is_group_zero_for_rank0(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        self.assertEqual(state.my_sparse_group, 0)
+        self.assertEqual(state.num_sparse_groups, 2)
+        self.assertEqual(state.precomputed_active_ranks, [[0, 1, 2, 3], [4, 5, 6, 7]])
+
+
+class FusedAllToAll4ActiveValidationTest(unittest.TestCase):
+    def _make_fused(self, rank: int = 0):
+        try:
+            from caffe2.torch.distributed.fb.sharded_relay_process_group import (  # type: ignore[import]
+                FusedShardedRelayMultiGroup,
+            )
+        except ImportError:
+            self.skipTest("FusedShardedRelayMultiGroup not available")
+
+        all_active_ranks = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        return FusedShardedRelayMultiGroup(
+            rcclx_comm=None,
+            world_size=8,
+            rank=rank,
+            all_active_ranks=all_active_ranks,
+        )
+
+    def test_4active_validation_accepts(self) -> None:
+        """all_to_all_multi_group must accept 4 active ranks (no ValueError);
+        without a native comm it falls through to RuntimeError. The active
+        input/output each hold nActiveRanks x segment_count = 4 x 100, distinct
+        (out-of-place)."""
+        fused = self._make_fused(rank=0)
+        input_tensors = [torch.zeros(400), torch.zeros(400)]
+        output_tensors = [torch.zeros(400), torch.zeros(400)]
+        per_group_segment_counts = [100, 100]
+
+        with self.assertRaises(RuntimeError) as cm:
+            fused.all_to_all_multi_group(
+                input_tensors=input_tensors,
+                output_tensors=output_tensors,
+                num_groups=2,
+                per_group_segment_counts=per_group_segment_counts,
+                all_active_ranks=[[0, 1, 2, 3], [4, 5, 6, 7]],
+            )
+        self.assertNotIsInstance(cm.exception, ValueError)
+
+    def test_4active_in_place_rejected(self) -> None:
+        """In-place (input aliases output) for the active group must raise at 4
+        active ranks too."""
+        fused = self._make_fused(rank=0)
+        shared = torch.zeros(400)
+        input_tensors = [shared, torch.zeros(400)]
+        output_tensors = [shared, torch.zeros(400)]  # aliases input for group 0
+        per_group_segment_counts = [100, 100]
+
+        with self.assertRaises(ValueError) as cm:
+            fused.all_to_all_multi_group(
+                input_tensors=input_tensors,
+                output_tensors=output_tensors,
+                num_groups=2,
+                per_group_segment_counts=per_group_segment_counts,
+                all_active_ranks=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                skip_validation=False,
+            )
+        self.assertIn("in-place", str(cm.exception))
+
+
 if __name__ == "__main__":
     unittest.main()
