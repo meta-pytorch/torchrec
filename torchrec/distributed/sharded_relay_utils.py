@@ -78,14 +78,14 @@ class ShardedRelayState:
     are unpacked back into the original tensors. This matches the intended
     usage of the C++ ncclShardedRelayMultiGroupAllReduceImpl kernel.
 
-    Buffer aliasing for helper groups
+    Buffer handling for helper groups
     ---------------------------------
-    With phase-synchronized execution, all groups are processed simultaneously,
-    so each helper group MUST have its own buffer (no aliasing across groups).
-    Helper buffers are sized to nActiveRanks × chunkSize (two-slot passthrough),
-    which is much smaller than the full per-group total.  Across the 3 helper
-    groups per rank (in a 4-group topology), the total helper memory is
-    6 × chunkSize per rank.
+    With phase-synchronized execution, all groups are processed simultaneously.
+    Helper groups no longer stage into a caller-provided buffer: the C++ kernel
+    allocates its own internal scratch (sized from the per-group geometry) and
+    never touches the tensor passed for a helper slot. Callers therefore pass a
+    single shared 1-element placeholder for every helper slot, so the invocation
+    is uniform and the helper staging-size details stay inside the kernel.
 
     Caches
     ------
@@ -93,11 +93,9 @@ class ShardedRelayState:
         Used as the pack/allreduce/unpack buffer. Keyed by dtype so weights
         (bf16) and optimizer states (fp32) each have their own buffer.
 
-    _helper_flat_cache : per-(group_idx, dtype) grow-only flat scratch buffer
-        for helper groups. Sized to the passthrough minimum
-        (nActiveRanks × chunkSize) for each group. Each helper group has its
-        own buffer because all groups are processed simultaneously under
-        phase-sync.
+    _placeholder_cache : per-(dtype, device) shared 1-element placeholder for
+        helper group slots. The kernel ignores it, so one tiny buffer is reused
+        across all helper groups and both in/out slots.
 
     _flat_metadata_cache : per-(annotation+dtype) cached allgather results.
         Stores per_group_total_counts (total elements per group). Populated
@@ -126,10 +124,11 @@ class ShardedRelayState:
     _active_output_flat_cache: dict[torch.dtype, torch.Tensor] = field(
         default_factory=dict
     )
-    # Grow-only flat scratch buffer for helper groups: (group_idx, dtype) → tensor.
-    # Each helper group has its own buffer (no aliasing) because phase-sync
-    # processes all groups simultaneously.
-    _helper_flat_cache: dict[tuple[int, torch.dtype], torch.Tensor] = field(
+    # Shared 1-element placeholder buffer for helper group slots: (dtype, device)
+    # → tensor. The C++ kernel stages helpers into its own internal scratch and
+    # never touches this buffer, so one tiny placeholder is reused across all
+    # helper groups and both in/out slots.
+    _placeholder_cache: dict[tuple[torch.dtype, torch.device], torch.Tensor] = field(
         default_factory=dict
     )
     # Cached allgather metadata: (annotation + str(dtype)) → per_group_total_counts.
@@ -453,88 +452,29 @@ def _get_active_flat_buf(
     return buf if buf.numel() == total else buf.narrow(0, 0, total)
 
 
-def _get_helper_flat_buf(
+def _get_placeholder_buf(
     state: ShardedRelayState,
-    group_idx: int,
-    total: int,
     dtype: torch.dtype,
     device: torch.device,
 ) -> torch.Tensor:
-    """Return a grow-only flat scratch buffer for a specific helper group.
+    """Return a shared 1-element placeholder buffer for helper group slots.
 
-    Keyed by (group_idx, dtype) because phase-sync processes all groups
-    simultaneously — each helper group needs its own buffer.  Weights (bf16)
-    and optimizer states (fp32) have separate buffers and do not evict each
-    other across training steps.
+    Helper groups no longer stage into a caller-provided buffer: the C++ kernel
+    allocates its own internal scratch (sized from the per-group geometry) and
+    never touches the tensor passed for a helper slot. Callers therefore pass a
+    minimal placeholder, keeping the invocation uniform and keeping the helper
+    staging-size details entirely inside the kernel.
 
-    The buffer is sized to ``total``, which should be
-    _passthrough_helper_size(count_g, ...) for the count the kernel receives for
-    this group -- the group total for allreduce/reduce-scatter, the per-segment
-    count for all-to-all.
+    A single 1-element buffer per (dtype, device) is reused across every helper
+    group and across in/out slots — it is never read or written, so aliasing is
+    harmless and this adds negligible memory.
     """
-    key = (group_idx, dtype)
-    existing = state._helper_flat_cache.get(key)
-    if existing is None or existing.numel() < total or existing.device != device:
-        state._helper_flat_cache[key] = torch.empty(total, dtype=dtype, device=device)
-    buf = state._helper_flat_cache[key]
-    return buf if buf.numel() == total else buf.narrow(0, 0, total)
-
-
-def _relay_helper_size(
-    total_g: int,
-    sparse_group_size: int,
-) -> int:
-    """Helper scratch size (in elements) for one group when the relay reduces at
-    the helper.
-
-    The A>2 relay paths give each helper one position slice of every block and
-    have it sum the contributing sources before forwarding, which needs one chunk
-    per (owner, source) pair:
-
-        A * (A - 1) * chunk,  chunk = total_g // (A + H)
-
-    On the 8-GPU node (A == H == 4) that is 1.5 * total_g. Rather than tracking H
-    here, allocate 2 * total_g, which covers every supported (A, H) split and
-    matches the allreduce A>2 contract.
-    """
-    return 2 * total_g
-
-
-def _passthrough_helper_size(
-    count_g: int,
-    sparse_group_size: int,
-    num_chunks: int,
-) -> int:
-    """Compute the passthrough helper buffer size for one group.
-
-    ``count_g`` is the per-group element count that the KERNEL receives for this
-    group, which is not always the caller's group total. Allreduce and
-    reduce-scatter hand the kernel their group total, so they pass that;
-    all-to-all hands it segmentCounts[g], so it passes the per-segment count. The
-    kernel derives its chunking from whichever count it was given, so the helper
-    size has to be derived from that same value -- passing a group total where the
-    kernel sees a segment count (or the reverse) mis-sizes the buffer.
-
-    ``num_chunks`` must equal the kernel's numHelpers + 1.
-
-    Returns the allocation size (in elements) for the two-slot passthrough
-    helper buffer:
-
-        min(count_g, sparse_group_size × chunk_aligned)
-
-    where chunk_aligned = (count_g // num_chunks) rounded down to
-    CHUNK_ALIGN_ELEMENTS = 128 elements, falling back to count_g when
-    count_g < num_chunks × 128.
-
-    This is the canonical Python-side mirror of the C++ ``minRequired``
-    formula in TorchCommRCCLX.cpp.
-    """
-    CHUNK_ALIGN_ELEMENTS = 128
-    chunk = count_g // num_chunks
-    chunk_aligned = (chunk // CHUNK_ALIGN_ELEMENTS) * CHUNK_ALIGN_ELEMENTS
-    if chunk_aligned == 0:
-        chunk_aligned = count_g
-    return min(count_g, sparse_group_size * chunk_aligned)
+    key = (dtype, device)
+    buf = state._placeholder_cache.get(key)
+    if buf is None or buf.device != device:
+        buf = torch.empty(1, dtype=dtype, device=device)
+        state._placeholder_cache[key] = buf
+    return buf
 
 
 def _get_active_output_flat_buf(
@@ -717,15 +657,13 @@ def reduce_scatter_tensors_with_sharded_relay(
             # --- Step 3: Build per-group tensors ---
             # Each group contributes ONE contiguous tensor. The active group's
             # per-table inputs are packed into a single flat send buffer (the
-            # single-segment zero-copy fast path); helper groups pass a single
-            # passthrough scratch buffer. The reduced output block is unpacked
-            # into my_output_list after the call.
+            # single-segment zero-copy fast path); helper groups pass a shared
+            # placeholder buffer (the kernel stages into internal scratch). The
+            # reduced output block is unpacked into my_output_list after the call.
             input_group_tensors: list[torch.Tensor] = []
             output_group_tensors: list[torch.Tensor] = []
 
             unpack_flat: torch.Tensor | None = None
-
-            num_chunks = (local_size - sparse_group_size) + 1
 
             for g in range(num_sparse_groups):
                 if g == my_sparse_group:
@@ -749,21 +687,9 @@ def reduce_scatter_tensors_with_sharded_relay(
                         output_group_tensors.append(out_flat)
                         unpack_flat = out_flat
                 else:
-                    recv_count_g = per_group_recv_counts[g]
-                    if sparse_group_size > 2:
-                        # A>2 reduces at the helper, which needs one chunk per
-                        # (owner, source) pair rather than two passthrough slots.
-                        helper_size_g = _relay_helper_size(
-                            recv_count_g, sparse_group_size
-                        )
-                    else:
-                        helper_size_g = _passthrough_helper_size(
-                            recv_count_g, sparse_group_size, num_chunks
-                        )
-                    helper_buf = _get_helper_flat_buf(
-                        state, g, helper_size_g, dtype, device
-                    )
-                    # Helper uses one two-slot scratch buffer for send and recv.
+                    # Helper slot: the kernel stages into internal scratch and
+                    # never touches this buffer, so pass a shared placeholder.
+                    helper_buf = _get_placeholder_buf(state, dtype, device)
                     input_group_tensors.append(helper_buf)
                     output_group_tensors.append(helper_buf)
 
@@ -806,7 +732,7 @@ def allreduce_tensors_with_sharded_relay(
        allgather never needs to repeat.
 
     3. **Build group tensors**: active group → flat pack buffer; each helper
-       group → grow-only flat scratch buffer sized to that group's total.
+       group → shared 1-element placeholder (the kernel uses internal scratch).
 
     4. **One fused call**: ``allreduce_multi_group`` with 4 big flat buffers,
        one per sparse group.  All groups execute in lockstep phases
@@ -892,24 +818,21 @@ def allreduce_tensors_with_sharded_relay(
             # --- Step 3: Build per-group tensors ---
             # Each group contributes ONE contiguous tensor. The active group's
             # per-table tensors are packed into a single flat buffer (the
-            # single-segment zero-copy fast path); helper groups pass a single
-            # passthrough scratch buffer. Results are unpacked back into the
-            # caller tensors after the call.
+            # single-segment zero-copy fast path); helper groups pass a shared
+            # placeholder buffer (the kernel stages into internal scratch).
+            # Results are unpacked back into the caller tensors after the call.
             group_tensors: list[torch.Tensor] = []
             group_sizes: list[int] = []
 
             # Out-of-place: build a parallel per-group output list. The active
             # group's output points at a separate flat destination buffer;
-            # helper groups reuse their passthrough scratch (unused by the
+            # helper groups reuse the shared placeholder (unused by the
             # kernel, but keeps the per-group list shape consistent). Left empty
             # on the in-place path, where the call below passes None instead.
             output_group_tensors: list[torch.Tensor] = []
 
             unpack_flat: torch.Tensor | None = None
             unpack_dst: list[torch.Tensor] | None = None
-
-            # Compute num_chunks for passthrough helper size (mirrors C++).
-            num_chunks = (local_size - sparse_group_size) + 1
 
             for g in range(num_sparse_groups):
                 if g == my_sparse_group:
@@ -930,20 +853,12 @@ def allreduce_tensors_with_sharded_relay(
                         unpack_dst = my_tensor_list
                 else:
                     total_g = per_group_total_counts[g]
-                    if sparse_group_size > 2:
-                        # Flat A>2 allreduce: helper holds A source chunks + 1
-                        # reduced chunk per offload slice ((A+1)*oChunk <=
-                        # 1.25*total_g for f<=1); 2*total_g covers it.
-                        helper_size_g = 2 * total_g
-                    else:
-                        helper_size_g = _passthrough_helper_size(
-                            total_g, sparse_group_size, num_chunks
-                        )
-                    helper_buf = _get_helper_flat_buf(
-                        state, g, helper_size_g, dtype, device
-                    )
+                    # Helper slot: the kernel stages into internal scratch and
+                    # never touches this buffer, so pass a shared placeholder.
+                    # The full count still drives the kernel geometry.
+                    helper_buf = _get_placeholder_buf(state, dtype, device)
                     group_tensors.append(helper_buf)
-                    group_sizes.append(total_g)  # full count goes to the kernel
+                    group_sizes.append(total_g)
                     if output_tensors_dict is not None:
                         output_group_tensors.append(helper_buf)
 
@@ -1071,14 +986,12 @@ def all_to_all_tensors_with_sharded_relay(
             # out-of-place only: the active group's per-table inputs are packed
             # into a single flat send buffer and a separate flat output buffer
             # receives the transposed result (single-segment fast path); helper
-            # groups pass a single passthrough scratch buffer. The output is
-            # unpacked into my_output_list after the call.
+            # groups pass a shared placeholder buffer (the kernel uses internal
+            # scratch). The output is unpacked into my_output_list after the call.
             input_group_tensors: list[torch.Tensor] = []
             output_group_tensors: list[torch.Tensor] = []
 
             unpack_flat: torch.Tensor | None = None
-
-            num_chunks = (local_size - sparse_group_size) + 1
 
             for g in range(num_sparse_groups):
                 if g == my_sparse_group:
@@ -1091,29 +1004,9 @@ def all_to_all_tensors_with_sharded_relay(
                     output_group_tensors.append(out_flat)
                     unpack_flat = out_flat
                 else:
-                    # _passthrough_helper_size's first argument is the per-group
-                    # count the KERNEL receives, not this caller's group total.
-                    # All-to-all hands the kernel segmentCounts[g], so it derives
-                    # chunkSize = align_down(seg / numChunks, 128) from the
-                    # segment count and each helper stages nActiveRanks slots of
-                    # that -- exactly what this returns. (The allreduce path
-                    # passes its group total for the same reason: that is the
-                    # count its kernel sees.) num_chunks matches the kernel's
-                    # numHelpers + 1.
-                    seg_g = per_group_segment_counts[g]
-                    if sparse_group_size > 2:
-                        # The routed A=4 XOR path needs 3 * relayCount elements,
-                        # which is bounded by one segment. Direct routes leave
-                        # this production-sized helper buffer unused.
-                        helper_size_g = seg_g
-                    else:
-                        helper_size_g = _passthrough_helper_size(
-                            seg_g, sparse_group_size, num_chunks
-                        )
-                    helper_buf = _get_helper_flat_buf(
-                        state, g, helper_size_g, dtype, device
-                    )
-                    # Helper uses one route-sized scratch buffer for send and recv.
+                    # Helper slot: the kernel stages into internal scratch and
+                    # never touches this buffer, so pass a shared placeholder.
+                    helper_buf = _get_placeholder_buf(state, dtype, device)
                     input_group_tensors.append(helper_buf)
                     output_group_tensors.append(helper_buf)
 
@@ -1242,17 +1135,15 @@ def all_gather_tensors_with_sharded_relay(
             # Each group contributes ONE contiguous tensor. The active group's
             # per-table inputs are packed into a single flat send buffer and a
             # single flat output buffer receives the gathered result
-            # (single-segment fast path); helper groups pass a single
-            # passthrough scratch buffer. Out-of-place packs the input into a
-            # separate flat send buffer; in-place packs the input into the
-            # active rank's own slot of the output flat. The gathered output is
-            # unpacked into my_output_list after the call.
+            # (single-segment fast path); helper groups pass a shared
+            # placeholder buffer (the kernel uses internal scratch). Out-of-place
+            # packs the input into a separate flat send buffer; in-place packs
+            # the input into the active rank's own slot of the output flat. The
+            # gathered output is unpacked into my_output_list after the call.
             input_group_tensors: list[torch.Tensor] = []
             output_group_tensors: list[torch.Tensor] = []
 
             unpack_flat: torch.Tensor | None = None
-
-            num_chunks = (local_size - sparse_group_size) + 1
 
             for g in range(num_sparse_groups):
                 if g == my_sparse_group:
@@ -1277,17 +1168,9 @@ def all_gather_tensors_with_sharded_relay(
                     output_group_tensors.append(out_flat)
                     unpack_flat = out_flat
                 else:
-                    send_g = per_group_send_counts[g]
-                    if sparse_group_size > 2:
-                        helper_size_g = sparse_group_size * send_g
-                    else:
-                        helper_size_g = _passthrough_helper_size(
-                            send_g, sparse_group_size, num_chunks
-                        )
-                    helper_buf = _get_helper_flat_buf(
-                        state, g, helper_size_g, dtype, device
-                    )
-                    # Helper uses one two-slot scratch buffer for send and recv.
+                    # Helper slot: the kernel stages into internal scratch and
+                    # never touches this buffer, so pass a shared placeholder.
+                    helper_buf = _get_placeholder_buf(state, dtype, device)
                     input_group_tensors.append(helper_buf)
                     output_group_tensors.append(helper_buf)
 
