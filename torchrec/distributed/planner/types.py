@@ -2766,6 +2766,13 @@ class ModelArch:
     sharders: Tuple[SharderArch, ...] = ()
 
 
+# Marker prefix on session warnings that record an external-dependency failure
+# (see PlannerSessionContext.record_external_failure). Kept as a constant so
+# consumers can separate "a dependency was down" from the ordinary planning
+# diagnostics that share the warnings list.
+_EXTERNAL_FAILURE_PREFIX = "external_failure"
+
+
 @dataclass
 class PlannerSessionContext:
     """Mutable context accumulating state during a planner session.
@@ -2822,8 +2829,11 @@ class PlannerSessionContext:
     # Caller-provided session metadata (e.g. training_framework, model_type,
     # entitlement). Populated by the caller/adapter at context construction.
     client_metadata: Dict[str, str] = field(default_factory=dict)
-    # Whether each SKU's result came from cache — per SKU (SKU -> hit). Scaffolding:
-    # empty until a plan-level cache exists (see ``cached_plans``).
+    # Whether each SKU's result came from cache — per SKU (SKU -> hit). Set by the
+    # planner when it consults its plan cache; left unset when that path did not
+    # run, so "did not attempt" stays distinct from a miss. Note this tracks the
+    # planner's own cache, not the request-keyed ``cached_plans`` scaffolding below,
+    # which is still unused.
     cache_hit: Dict[str, bool] = field(default_factory=dict)
     # Source of resolved hardware-capability data per SKU (SKU -> source label).
     # Populated by the provider's build_topology: OSS records "request_caps"; fb
@@ -2893,6 +2903,29 @@ class PlannerSessionContext:
     # Empty when persistence is disabled or upload failed; observability only, so
     # the caller/CLI can surface where the run's artifacts live.
     content_urls: Dict[str, str] = field(default_factory=dict)
+
+    def record_external_failure(
+        self, system: str, operation: str, exc: BaseException
+    ) -> None:
+        """Note that a best-effort call to an external system failed.
+
+        Blob upload and run persistence must never fail a plan, so those call
+        sites swallow their exceptions. Swallowing silently makes an outage
+        indistinguishable from "there was nothing to do" -- the artifact URL is
+        simply absent either way. Recording it here puts the failure on the
+        session warnings, where the reporter surfaces it, so a dependency being
+        down is a queryable fact rather than a log line.
+
+        Observability only, and itself best-effort: never raises, so a failure to
+        record a failure cannot escalate into a planning failure.
+        """
+        try:
+            self.warnings.append(
+                f"{_EXTERNAL_FAILURE_PREFIX} {system}:{operation}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
 
 
 # ---- Types Utils ---- #
