@@ -1808,5 +1808,151 @@ class FusedAllGatherValidationTest(unittest.TestCase):
         self.assertNotIsInstance(cm.exception, ValueError)
 
 
+# ---------------------------------------------------------------------------
+# Tests for the 4-active-rank allreduce path (2 groups x 4 active per group)
+# ---------------------------------------------------------------------------
+
+
+class FlatAllreduce4ActiveTest(unittest.TestCase):
+    """allreduce_tensors_with_sharded_relay with sparse_group_size=4.
+
+    8-rank node -> 2 groups of 4 active ranks; each rank is helper for the 1
+    other group. Verifies the flat-concat path is generic over the active-rank
+    count.
+    """
+
+    def _all_calls(self, state: ShardedRelayState):
+        return state.fused.allreduce_multi_group.call_args_list
+
+    def test_single_call_two_groups(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        allreduce_tensors_with_sharded_relay(
+            state, {torch.float32: [torch.zeros(400)]}, "test"
+        )
+        self.assertEqual(state.fused.allreduce_multi_group.call_count, 1)
+        kwargs = self._all_calls(state)[0].kwargs
+        self.assertEqual(kwargs["num_groups"], 2)
+        self.assertEqual(kwargs["per_group_sizes"][state.my_sparse_group], 400)
+
+    def test_helper_buffers_passthrough_sized_4active(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        allreduce_tensors_with_sharded_relay(
+            state, {torch.float32: [torch.zeros(800)]}, "test"
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        iter_tensors = kwargs["tensors"]
+        iter_sizes = kwargs["per_group_sizes"]
+
+        helper_ptrs = set()
+        for g in range(state.num_sparse_groups):
+            if g == state.my_sparse_group:
+                self.assertEqual(iter_tensors[g].numel(), 800)
+                continue
+            # Flat A>2 allreduce: the util sizes the helper 2*total_g
+            # ((A+1)*oChunk <= 1.25*total_g), not the recursive _passthrough.
+            expected = 2 * iter_sizes[g]
+            self.assertEqual(iter_tensors[g].numel(), expected)
+            helper_ptrs.add(iter_tensors[g].data_ptr())
+
+        # Each rank is helper for exactly num_sparse_groups - 1 == 1 group.
+        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+
+    def test_active_group_is_group_zero_for_rank0(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        self.assertEqual(state.my_sparse_group, 0)
+        self.assertEqual(state.num_sparse_groups, 2)
+        self.assertEqual(state.precomputed_active_ranks, [[0, 1, 2, 3], [4, 5, 6, 7]])
+
+
+class FusedAllreduce4ActiveValidationTest(unittest.TestCase):
+    def _make_fused(self, rank: int = 0):
+        try:
+            from caffe2.torch.distributed.fb.sharded_relay_process_group import (  # type: ignore[import]
+                FusedShardedRelayMultiGroup,
+            )
+        except ImportError:
+            self.skipTest("FusedShardedRelayMultiGroup not available")
+
+        all_active_ranks = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        return FusedShardedRelayMultiGroup(
+            rcclx_comm=None,
+            world_size=8,
+            rank=rank,
+            all_active_ranks=all_active_ranks,
+        )
+
+    def test_4active_validation_accepts(self) -> None:
+        """allreduce_multi_group must accept 4 active ranks (no ValueError);
+        without a native comm it falls through to RuntimeError."""
+        fused = self._make_fused(rank=0)
+        tensors = [torch.zeros(400), torch.zeros(400)]
+        per_group_sizes = [400, 400]
+
+        with self.assertRaises(RuntimeError) as cm:
+            fused.allreduce_multi_group(
+                tensors=tensors,
+                num_groups=2,
+                per_group_sizes=per_group_sizes,
+                all_active_ranks=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                op=dist.ReduceOp.SUM,
+            )
+        self.assertNotIsInstance(cm.exception, ValueError)
+
+
+class _PassthroughHelperSize4ActivePolicyTest(unittest.TestCase):
+    """_passthrough_helper_size against hand-computed sizes, not the formula.
+
+    Every expected value below is worked out by hand from the documented
+    contract and written in as a literal. Re-deriving it with the same
+    ``min(total_g, A * align_down(total_g // num_chunks, 128))`` expression the
+    implementation uses would make the assertion unfalsifiable: any change to
+    the formula would move both sides together and the test would still pass.
+    The three branches of that contract are covered -- ordinary alignment loss,
+    the ``min()`` clamp, and the ``chunk_aligned == 0`` fallback.
+    """
+
+    def test_passthrough_size_4active(self) -> None:
+        # 4-active on an 8-rank node: num_chunks = (8 - 4) + 1 = 5.
+        #
+        # 12_002_982_488 // 5      = 2_400_596_497   (remainder 3)
+        # align_down(.., 128)      = 2_400_596_480   (trims 17 elements)
+        # 4 * 2_400_596_480        = 9_602_385_920   (< total_g, so no clamp)
+        self.assertEqual(_passthrough_helper_size(12_002_982_488, 4, 5), 9_602_385_920)
+        # A total that is already a multiple of num_chunks * 128 loses nothing to
+        # alignment, and lands on the same size because the case above only had a
+        # sub-128 remainder to trim.
+        self.assertEqual(_passthrough_helper_size(12_002_982_400, 4, 5), 9_602_385_920)
+
+    def test_passthrough_size_per_slot_is_chunk_aligned(self) -> None:
+        # The buffer holds sparse_group_size slots, so whenever min() has not
+        # clamped, each slot must be a whole number of 128-element chunks. This
+        # is the property the 128-alignment exists for.
+        for total_g, sparse_group_size, num_chunks in (
+            (12_002_982_488, 4, 5),
+            (12_002_982_488, 2, 7),
+            (1_000_000, 4, 5),
+        ):
+            with self.subTest(total_g=total_g, A=sparse_group_size):
+                result = _passthrough_helper_size(
+                    total_g, sparse_group_size, num_chunks
+                )
+                self.assertLess(result, total_g, "expected no min() clamp here")
+                self.assertEqual(result % (sparse_group_size * 128), 0)
+
+    def test_passthrough_size_clamps_to_total(self) -> None:
+        # sparse_group_size >= num_chunks makes A * chunk_aligned exceed total_g,
+        # so min() clamps: 10_000 // 2 = 5_000 -> 4_992 -> 4 * 4_992 = 19_968,
+        # which is larger than total_g.
+        self.assertEqual(_passthrough_helper_size(10_000, 4, 2), 10_000)
+
+    def test_passthrough_size_falls_back_below_one_chunk(self) -> None:
+        # 500 // 5 = 100, and align_down(100, 128) == 0, so the fallback replaces
+        # chunk_aligned with total_g; min() then clamps the product back to 500.
+        self.assertEqual(_passthrough_helper_size(500, 4, 5), 500)
+        # 2-active production shape, for contrast: num_chunks = (8 - 2) + 1 = 7,
+        # 12_002_982_488 // 7 = 1_714_711_784 -> 1_714_711_680 -> x2.
+        self.assertEqual(_passthrough_helper_size(12_002_982_488, 2, 7), 3_429_423_360)
+
+
 if __name__ == "__main__":
     unittest.main()
