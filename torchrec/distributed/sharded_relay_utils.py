@@ -897,3 +897,165 @@ def allreduce_tensors_with_sharded_relay(
                 my_tensor_list,
                 [s.view(t.shape) for s, t in zip(slices, my_tensor_list)],
             )
+
+
+def all_to_all_tensors_with_sharded_relay(
+    state: ShardedRelayState,
+    input_tensors_dict: dict[torch.dtype, list[torch.Tensor]],
+    output_tensors_dict: dict[torch.dtype, list[torch.Tensor]],
+    annotation: str,
+) -> None:
+    """
+    Perform all-to-all using the fused sharded relay algorithm.
+
+    All-to-all analogue of reduce_scatter_tensors_with_sharded_relay. For each
+    dtype, the active group's input tensors are packed into a single flat send
+    buffer (holding nActiveRanks x segment_count elements:
+    input = [sendSeg[0]|sendSeg[1]]), ONE fused call all-to-alls all groups
+    simultaneously (phase-synchronized, no XGMI contention), and the transposed
+    output (output = [recvSeg[0]|recvSeg[1]]) is unpacked into the caller's
+    output tensors.
+
+    All-to-all performs NO reduction (no op) and is OUT-OF-PLACE ONLY: a separate
+    flat output buffer is always used (distinct from the input flat buffer), as
+    required by the underlying collective.
+
+    Args:
+        state: Sharded relay runtime state (pre-computed invariants + comms).
+        input_tensors_dict: Send tensors grouped by dtype. The active group's
+            tensors for a dtype must total nActiveRanks x segment_count elements.
+        output_tensors_dict: Receive tensors grouped by dtype. The active group's
+            tensors for a dtype must total the same number of elements as the
+            input (nActiveRanks x segment_count).
+        annotation: Profiling annotation string for record_function.
+    """
+    sparse_group_size = state.sparse_group_size
+    my_sparse_group = state.my_sparse_group
+    num_sparse_groups = state.num_sparse_groups
+    local_size = state.local_size
+    precomputed_active_ranks = state.precomputed_active_ranks
+
+    with record_function(f"{annotation}_fused_sharded_relay_all_to_all"):
+        for dtype, my_input_list in input_tensors_dict.items():
+            if not my_input_list:
+                continue
+
+            my_input_total = sum(t.numel() for t in my_input_list)
+            if my_input_total == 0:
+                continue
+
+            if my_input_total % sparse_group_size != 0:
+                raise ValueError(
+                    f"all_to_all_tensors_with_sharded_relay: active input total "
+                    f"({my_input_total}) for dtype {dtype} must be divisible by "
+                    f"sparse_group_size ({sparse_group_size})."
+                )
+            my_segment_count = my_input_total // sparse_group_size
+
+            my_output_list = output_tensors_dict.get(dtype, [])
+            my_output_total = sum(t.numel() for t in my_output_list)
+            if my_output_total != my_input_total:
+                raise ValueError(
+                    f"all_to_all_tensors_with_sharded_relay: active output total "
+                    f"({my_output_total}) for dtype {dtype} must equal the input "
+                    f"total ({my_input_total})."
+                )
+
+            device = my_input_list[0].device
+
+            # --- Step 1: Metadata (allgather segment counts once, cache) ---
+            meta_key = "a2a_" + annotation + str(dtype)
+            per_group_segment_counts: list[int]
+
+            if meta_key not in state._flat_metadata_cache:
+                if state.intra_node_pytorch_pg is not None:
+                    my_seg_tensor = torch.tensor(
+                        [my_segment_count], dtype=torch.int64, device=device
+                    )
+                    all_seg_list = [
+                        torch.zeros(1, dtype=torch.int64, device=device)
+                        for _ in range(local_size)
+                    ]
+                    dist.all_gather(
+                        all_seg_list,
+                        my_seg_tensor,
+                        group=state.intra_node_pytorch_pg,
+                    )
+                    per_group_segment_counts = [
+                        int(all_seg_list[g * sparse_group_size].item())
+                        for g in range(num_sparse_groups)
+                    ]
+                else:
+                    logger.warning(
+                        "[TorchRec 2D Parallel] no intra_node_pytorch_pg! "
+                        "Assuming all groups have the same segment count."
+                    )
+                    per_group_segment_counts = [my_segment_count] * num_sparse_groups
+
+                state._flat_metadata_cache[meta_key] = per_group_segment_counts
+                logger.info(
+                    f"[TorchRec 2D Parallel] flat all-to-all metadata cached: "
+                    f"annotation={annotation!r}, dtype={dtype}, "
+                    f"per_group_segment_counts={per_group_segment_counts}"
+                )
+            else:
+                per_group_segment_counts = state._flat_metadata_cache[meta_key]
+
+            # --- Step 3: Build per-group tensors ---
+            # Each group contributes ONE contiguous tensor. All-to-all is
+            # out-of-place only: the active group's per-table inputs are packed
+            # into a single flat send buffer and a separate flat output buffer
+            # receives the transposed result (single-segment fast path); helper
+            # groups pass a single passthrough scratch buffer. The output is
+            # unpacked into my_output_list after the call.
+            input_group_tensors: list[torch.Tensor] = []
+            output_group_tensors: list[torch.Tensor] = []
+
+            unpack_flat: torch.Tensor | None = None
+
+            num_chunks = (local_size - sparse_group_size) + 1
+
+            for g in range(num_sparse_groups):
+                if g == my_sparse_group:
+                    in_flat = _get_active_flat_buf(state, my_input_total, dtype, device)
+                    _pack_into_flat(my_input_list, in_flat)
+                    out_flat = _get_active_output_flat_buf(
+                        state, my_input_total, dtype, device
+                    )
+                    input_group_tensors.append(in_flat)
+                    output_group_tensors.append(out_flat)
+                    unpack_flat = out_flat
+                else:
+                    # _passthrough_helper_size's first argument is the per-group
+                    # count the KERNEL receives, not this caller's group total.
+                    # All-to-all hands the kernel segmentCounts[g], so it derives
+                    # chunkSize = align_down(seg / numChunks, 128) from the
+                    # segment count and each helper stages nActiveRanks slots of
+                    # that -- exactly what this returns. (The allreduce path
+                    # passes its group total for the same reason: that is the
+                    # count its kernel sees.) num_chunks matches the kernel's
+                    # numHelpers + 1.
+                    seg_g = per_group_segment_counts[g]
+                    helper_size_g = _passthrough_helper_size(
+                        seg_g, sparse_group_size, num_chunks
+                    )
+                    helper_buf = _get_helper_flat_buf(
+                        state, g, helper_size_g, dtype, device
+                    )
+                    # Helper uses one two-slot scratch buffer for send and recv.
+                    input_group_tensors.append(helper_buf)
+                    output_group_tensors.append(helper_buf)
+
+            # --- Step 4: ONE fused call — all groups, phase-synchronized ---
+            state.fused.all_to_all_multi_group(
+                input_tensors=input_group_tensors,
+                output_tensors=output_group_tensors,
+                num_groups=num_sparse_groups,
+                per_group_segment_counts=per_group_segment_counts,
+                all_active_ranks=precomputed_active_ranks,
+                skip_validation=True,
+            )
+
+            # --- Step 5: Unpack the active-group result into caller tensors ---
+            if unpack_flat is not None:
+                _unpack_from_flat(unpack_flat, my_output_list)
