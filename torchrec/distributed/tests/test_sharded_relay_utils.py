@@ -2232,5 +2232,154 @@ class FusedAllToAll4ActiveValidationTest(unittest.TestCase):
         self.assertIn("in-place", str(cm.exception))
 
 
+class FlatAllGather4ActiveTest(unittest.TestCase):
+    """all_gather_tensors_with_sharded_relay with sparse_group_size=4.
+
+    8-rank node -> 2 groups of 4 active ranks. The active group's input holds
+    send_count elements and the output holds nActiveRanks x send_count. Verifies
+    the flat-concat path is generic over the active-rank count, in both in-place
+    and out-of-place modes.
+    """
+
+    def _all_calls(self, state: ShardedRelayState):
+        return state.fused.all_gather_multi_group.call_args_list
+
+    def test_single_call_two_groups(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        # input total 100 (send_count); output total 400 (4 x send_count)
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(100)]},
+            {torch.float32: [torch.zeros(400)]},
+            "test",
+        )
+        self.assertEqual(state.fused.all_gather_multi_group.call_count, 1)
+        kwargs = self._all_calls(state)[0].kwargs
+        self.assertEqual(kwargs["num_groups"], 2)
+        self.assertEqual(kwargs["per_group_send_counts"][state.my_sparse_group], 100)
+        self.assertEqual(
+            kwargs["input_tensors"][state.my_sparse_group].numel(),
+            100,
+        )
+        self.assertEqual(
+            kwargs["output_tensors"][state.my_sparse_group].numel(),
+            400,
+        )
+
+    def test_helper_buffers_passthrough_sized_4active(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        # send_count 200 -> output 800
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(200)]},
+            {torch.float32: [torch.zeros(800)]},
+            "test",
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        in_tensors = kwargs["input_tensors"]
+        out_tensors = kwargs["output_tensors"]
+        send = kwargs["per_group_send_counts"]
+
+        helper_ptrs = set()
+        for g in range(state.num_sparse_groups):
+            if g == state.my_sparse_group:
+                self.assertEqual(in_tensors[g].numel(), 200)
+                self.assertEqual(out_tensors[g].numel(), 800)
+                continue
+            # Flat A>2 all-gather: the util sizes the helper A*send_count
+            # (matches the kernel's A*cs broadcast scratch), not _passthrough.
+            expected = state.sparse_group_size * send[g]
+            self.assertEqual(in_tensors[g].numel(), expected)
+            self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
+            helper_ptrs.add(in_tensors[g].data_ptr())
+
+        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+
+    def test_active_input_is_separate_flat_buffer_4active(self) -> None:
+        # Flat-concat scheme: the active group's input is a separate internal
+        # flat send buffer (one contiguous tensor per group), distinct from the
+        # caller's input tensor (packed into it before the call).
+        state = _make_state(rank=1, sparse_group_size=4, local_size=8)
+        in_tensor = torch.zeros(100)
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [in_tensor]},  # send 100
+            {torch.float32: [torch.zeros(400)]},
+            "test",
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        my_g = state.my_sparse_group
+        in_seg = kwargs["input_tensors"][my_g]
+        self.assertEqual(in_seg.numel(), 100)
+        self.assertNotEqual(in_seg.data_ptr(), in_tensor.data_ptr())
+
+    def test_in_place_input_aliases_output_own_slot(self) -> None:
+        # 4-active in-place: the active input is an owned-slot view into the
+        # active output flat buffer at offset my_active_index * send_count.
+        state = _make_state(rank=2, sparse_group_size=4, local_size=8)
+        send_count = 100
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(send_count)]},
+            {torch.float32: [torch.zeros(4 * send_count)]},
+            "test",
+            in_place=True,
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        my_g = state.my_sparse_group
+        in_seg = kwargs["input_tensors"][my_g]
+        out_flat = kwargs["output_tensors"][my_g]
+        self.assertEqual(in_seg.numel(), send_count)
+        # rank=2 -> my_active_index = 2 within its group.
+        self.assertEqual(
+            in_seg.data_ptr(),
+            out_flat.data_ptr() + 2 * send_count * out_flat.element_size(),
+        )
+
+    def test_active_group_is_group_zero_for_rank0(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        self.assertEqual(state.my_sparse_group, 0)
+        self.assertEqual(state.num_sparse_groups, 2)
+        self.assertEqual(state.precomputed_active_ranks, [[0, 1, 2, 3], [4, 5, 6, 7]])
+
+
+class FusedAllGather4ActiveValidationTest(unittest.TestCase):
+    def _make_fused(self, rank: int = 0):
+        try:
+            from caffe2.torch.distributed.fb.sharded_relay_process_group import (  # type: ignore[import]
+                FusedShardedRelayMultiGroup,
+            )
+        except ImportError:
+            self.skipTest("FusedShardedRelayMultiGroup not available")
+
+        all_active_ranks = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        return FusedShardedRelayMultiGroup(
+            rcclx_comm=None,
+            world_size=8,
+            rank=rank,
+            all_active_ranks=all_active_ranks,
+        )
+
+    def test_4active_validation_accepts(self) -> None:
+        """all_gather_multi_group must accept 4 active ranks (no ValueError);
+        without a native comm it falls through to RuntimeError. The active input
+        holds send_count = 100 and the output holds nActiveRanks x send_count =
+        400."""
+        fused = self._make_fused(rank=0)
+        input_tensors = [torch.zeros(100), torch.zeros(100)]
+        output_tensors = [torch.zeros(400), torch.zeros(400)]
+        per_group_send_counts = [100, 100]
+
+        with self.assertRaises(RuntimeError) as cm:
+            fused.all_gather_multi_group(
+                input_tensors=input_tensors,
+                output_tensors=output_tensors,
+                num_groups=2,
+                per_group_send_counts=per_group_send_counts,
+                all_active_ranks=[[0, 1, 2, 3], [4, 5, 6, 7]],
+            )
+        self.assertNotIsInstance(cm.exception, ValueError)
+
+
 if __name__ == "__main__":
     unittest.main()
