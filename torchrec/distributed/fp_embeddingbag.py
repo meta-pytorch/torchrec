@@ -218,6 +218,8 @@ class ShardedFeatureProcessedEmbeddingBagCollection(
 class FeatureProcessedEmbeddingBagCollectionSharder(
     BaseEmbeddingSharder[FeatureProcessedEmbeddingBagCollection]
 ):
+    supports_fused_triton: bool = True
+
     def __init__(
         self,
         ebc_sharder: Optional[EmbeddingBagCollectionSharder] = None,
