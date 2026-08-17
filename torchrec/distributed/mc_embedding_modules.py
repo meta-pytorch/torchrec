@@ -39,6 +39,7 @@ from torchrec.distributed.types import (
     ParameterSharding,
     QuantizedCommCodecs,
     ShardingEnv,
+    ShardingType,
 )
 from torchrec.distributed.utils import append_prefix
 from torchrec.modules.embedding_modules import (
@@ -395,12 +396,19 @@ class BaseManagedCollisionEmbeddingCollectionSharder(BaseEmbeddingSharder[M]):
         sharding_type: str,
         compute_device_type: str,
     ) -> List[str]:
-        return [
+        kernels = [
             EmbeddingComputeKernel.FUSED.value,
             EmbeddingComputeKernel.FUSED_UVM_CACHING.value,
             EmbeddingComputeKernel.FUSED_UVM.value,
             EmbeddingComputeKernel.KEY_VALUE.value,
         ]
+        if (
+            compute_device_type == "cuda"
+            and sharding_type != ShardingType.DATA_PARALLEL.value
+            and self._e_sharder.supports_fused_triton
+        ):
+            kernels.append(EmbeddingComputeKernel.FUSED_TRITON.value)
+        return kernels
 
     def sharding_types(self, compute_device_type: str) -> List[str]:
         return list(

@@ -1044,6 +1044,64 @@ class TestEnumerators(unittest.TestCase):
             },
         )
 
+    def test_fused_triton_compute_kernel_requires_constraint(self) -> None:
+        sharder = EmbeddingBagCollectionSharder()
+        sharding_type = ShardingType.ROW_WISE.value
+        sharder_kernels = sharder.compute_kernels(sharding_type, "cuda")
+
+        unconstrained = EmbeddingEnumerator(
+            topology=MagicMock(),
+            batch_size=MagicMock(),
+        )
+        self.assertNotIn(
+            EmbeddingComputeKernel.FUSED_TRITON.value,
+            unconstrained._filter_compute_kernels(
+                "table_0", sharder_kernels, sharding_type
+            ),
+        )
+
+        constrained = EmbeddingEnumerator(
+            topology=MagicMock(),
+            batch_size=MagicMock(),
+            constraints={
+                "table_0": ParameterConstraints(
+                    compute_kernels=[EmbeddingComputeKernel.FUSED_TRITON.value]
+                )
+            },
+        )
+        self.assertEqual(
+            constrained._filter_compute_kernels(
+                "table_0", sharder_kernels, sharding_type
+            ),
+            [EmbeddingComputeKernel.FUSED_TRITON.value],
+        )
+
+        fallback_constraints = {
+            "table_0": ParameterConstraints(
+                compute_kernels=[
+                    EmbeddingComputeKernel.FUSED_TRITON.value,
+                    EmbeddingComputeKernel.FUSED.value,
+                ]
+            )
+        }
+        fallback = EmbeddingEnumerator(
+            topology=MagicMock(),
+            batch_size=MagicMock(),
+            constraints=fallback_constraints,
+        )
+        self.assertEqual(
+            fallback._filter_compute_kernels("table_0", sharder_kernels, sharding_type),
+            [EmbeddingComputeKernel.FUSED_TRITON.value],
+        )
+        self.assertEqual(
+            fallback._filter_compute_kernels(
+                "table_0",
+                [EmbeddingComputeKernel.FUSED.value],
+                sharding_type,
+            ),
+            [EmbeddingComputeKernel.FUSED.value],
+        )
+
     def test_filter_compute_kernels_mch_ebc(self) -> None:
         constraint = ParameterConstraints(
             compute_kernels=[
