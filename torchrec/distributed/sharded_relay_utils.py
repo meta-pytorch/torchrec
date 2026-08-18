@@ -156,12 +156,22 @@ def _validate_sharded_relay_preconditions(
         )
         return False
 
-    # The RCCLX C++ kernel (buildShardedRelayRankConfig) requires exactly 2
-    # active ranks per group.  Any other sharding_group_size is unsupported.
-    if sharding_group_size != 2:
+    # The RCCLX C++ kernel (buildShardedRelayRankConfig) requires a power-of-two
+    # number of active ranks per group; 2 and 4 are supported. It also needs at
+    # least one helper (local_size > sharding_group_size).
+    if sharding_group_size != 2 and sharding_group_size != 4:
         logger.warning(
-            f"[TorchRec 2D Parallel] Sharded relay requires sharding_group_size=2, "
-            f"but got sharding_group_size={sharding_group_size}. "
+            f"[TorchRec 2D Parallel] Sharded relay requires sharding_group_size "
+            f"of 2 or 4, but got sharding_group_size={sharding_group_size}. "
+            "Disabling sharded relay mode."
+        )
+        return False
+
+    if local_size <= sharding_group_size:
+        logger.warning(
+            f"[TorchRec 2D Parallel] Sharded relay requires at least one helper "
+            f"rank (local_size={local_size} must exceed "
+            f"sharding_group_size={sharding_group_size}). "
             "Disabling sharded relay mode."
         )
         return False
@@ -312,8 +322,8 @@ def setup_sharded_relay(
         world_size: Total number of ranks (all nodes combined).
         use_inter_host_allreduce: If True, sharded relay is not supported.
         sharding_group_size: Number of active ranks per sparse group. The
-            underlying C++ kernel requires exactly 2; any other value disables
-            sharded relay.
+            underlying C++ kernel supports 2 or 4 (power of two); any other
+            value disables sharded relay.
 
     Returns:
         ShardedRelayState on success, None to disable sharded relay.
@@ -868,9 +878,15 @@ def allreduce_tensors_with_sharded_relay(
                     group_sizes.append(my_total)
                 else:
                     total_g = per_group_total_counts[g]
-                    helper_size_g = _passthrough_helper_size(
-                        total_g, sparse_group_size, num_chunks
-                    )
+                    if sparse_group_size > 2:
+                        # Flat A>2 allreduce: helper holds A source chunks + 1
+                        # reduced chunk per offload slice ((A+1)*oChunk <=
+                        # 1.25*total_g for f<=1); 2*total_g covers it.
+                        helper_size_g = 2 * total_g
+                    else:
+                        helper_size_g = _passthrough_helper_size(
+                            total_g, sparse_group_size, num_chunks
+                        )
                     helper_buf = _get_helper_flat_buf(
                         state, g, helper_size_g, dtype, device
                     )
