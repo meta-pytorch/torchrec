@@ -84,16 +84,41 @@ Message-size sweep (all collectives, 2- & 4-rank, bf16):
     It prints one table per (collective, active-rank-count). The swept size is the
     per-active-rank input tensor byte size, so sizes stay comparable across
     collectives. The single-group scenario is benchmarked separately (see
-    test_parallel_2rank_allreduce_sweep). Run it selectively so the production
+    test_parallel_collectives_msg_size_sweep). Run it selectively so the production
     test above does not also run:
         buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \\
             //torchrec/distributed/tests:bench_sharded_relay_perf -- \\
             torchrec.distributed.tests.bench_sharded_relay_perf.BenchShardedRelayPerfTest.test_collectives_msg_size_sweep
+
+Parallel separate-job sweep (all collectives, 2- & 4-rank, bf16):
+    A separate test method, test_parallel_collectives_msg_size_sweep, sweeps the
+    same fixed message sizes for every collective (allreduce, reduce-scatter,
+    all-to-all, all-gather) at both 2 and 4 active ranks. It models N = NUM_GPUS
+    // A independent workloads the way production runs them: as N SEPARATE
+    co-resident jobs on one 8-GPU node, each owning its OWN full 8-rank
+    communicator and issuing exactly ONE single-group A-rank sharded relay call
+    (its own process, CUDA context, and GPU_MAX_HW_QUEUES budget). For each A it
+    spawns N * NUM_GPUS processes (process p → job = p // NUM_GPUS,
+    rank_in_job = p % NUM_GPUS on cuda:rank_in_job), so the N jobs are
+    co-resident (N processes per GPU); a gloo PG across all processes overlaps
+    the jobs and the reported time is the max across jobs. This is the
+    production-faithful counterpart to the FUSED scenario: because each workload
+    owns a separate communicator the multi-group fused kernel cannot be used, so
+    it measures single-group A-rank relay performance under real inter-process
+    XGMI contention. The NCCL baseline is N disjoint A-rank NCCL collectives run
+    as separate processes (one per GPU), overlapped, max across jobs. It prints
+    one table per (collective, active-rank-count). Run it selectively:
+        buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \\
+            //torchrec/distributed/tests:bench_sharded_relay_perf -- \\
+            torchrec.distributed.tests.bench_sharded_relay_perf.BenchShardedRelayPerfTest.test_parallel_collectives_msg_size_sweep
 """
 
 from __future__ import annotations
 
 import os
+import socket
+import sys
+import tempfile
 import unittest
 from functools import partial
 from typing import Any
@@ -128,6 +153,18 @@ except ImportError:
 
 def _env_int(key: str, default: int) -> int:
     return int(os.environ.get(key, str(default)))
+
+
+def _find_free_port() -> int:
+    """Return a currently-free localhost TCP port.
+
+    Chosen at runtime (in the parent process, before mp.spawn) and passed to the
+    workers so rank 0's TCPStore never collides with a hardcoded port left in
+    TIME_WAIT by a prior run or by another phase of the same test.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
 
 
 def _env_float(key: str, default: float) -> float:
@@ -588,7 +625,12 @@ def bench_nccl_baseline(
 # ---------------------------------------------------------------------------
 
 
-def _measure_ms(fn: Any, warmup: int, iters: int) -> tuple[float, float]:
+def _measure_ms(
+    fn: Any,
+    warmup: int,
+    iters: int,
+    device_barrier_group: Any = None,
+) -> tuple[float, float]:
     """Time fn() over 'iters' runs after 'warmup' warmups.
 
     Returns (best_ms, std_ms). The BEST (min) is the headline metric: collective
@@ -601,6 +643,13 @@ def _measure_ms(fn: Any, warmup: int, iters: int) -> tuple[float, float]:
     - A full-world barrier precedes each timed iteration so all ranks start the
       collective aligned (rank skew otherwise inflates the measured time, and
       differently every run). The barrier is OUTSIDE the timed region.
+    - device_barrier_group (optional): an additional barrier on this group is
+      issued after the default barrier. The parallel sweep passes a per-job NCCL
+      group so each job's participants are aligned ON-DEVICE (removing P2P
+      partner skew that inflates latency-bound relay times), while the default
+      barrier (a global CPU/gloo group there) deterministically overlaps all
+      co-resident jobs each iteration. Both baselines pass the same pair, so the
+      comparison is apples-to-apples.
     - Timing uses on-device CUDA/hipEvents, so host-side scheduling jitter is
       excluded.
     Note: GPU clocks should also be locked (e.g. rocm-smi) to remove DVFS
@@ -608,20 +657,25 @@ def _measure_ms(fn: Any, warmup: int, iters: int) -> tuple[float, float]:
     """
     have_dist = dist.is_available() and dist.is_initialized()
 
+    def _align() -> None:
+        if not have_dist:
+            return
+        dist.barrier()
+        if device_barrier_group is not None:
+            dist.barrier(group=device_barrier_group)
+
     torch.cuda.synchronize()
     for _ in range(warmup):
         fn()
     torch.cuda.synchronize()
-    if have_dist:
-        dist.barrier()
+    _align()
 
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
     times: list[float] = []
     for _ in range(iters):
-        if have_dist:
-            # Align all ranks' starts; excluded from the timed region below.
-            dist.barrier()
+        # Align all ranks' starts; excluded from the timed region below.
+        _align()
         torch.cuda.synchronize()
         start_ev.record()
         fn()
@@ -1584,7 +1638,7 @@ def _benchmark_worker(
 #           call, vs the NCCL baseline run in parallel on each rank's A-rank
 #           sub-group.
 # The single-group scenario is benchmarked separately (see the parallel
-# independent-comm sweep, test_parallel_2rank_allreduce_sweep).
+# independent-comm sweep, test_parallel_collectives_msg_size_sweep).
 # Fixed at bf16. NCCL allreduce/reduce-scatter baselines use SUM + manual divide
 # (RCCL on MI350X lacks the AVG kernel); the relay path uses AVG in the kernel.
 # all-to-all / all-gather do no reduction. The swept nbytes is the per-active-rank
@@ -2154,9 +2208,6 @@ def _msg_sweep_relay_worker(
                     key = f"{collective}_a{active_ranks}"
                     results_dict[f"relay_{key}_fused_{i}"] = (best_f, std_f)
 
-    if rank == 0:
-        _print_msg_sweep_report(results_dict, dtype)
-
     dist.barrier()
     dist.destroy_process_group()
 
@@ -2174,50 +2225,682 @@ def _sweep_fmt_speedup(nccl: float, relay: float) -> str:
     return f"{nccl / relay:.2f}x" if nccl > 0 and relay > 0 else "N/A"
 
 
-def _print_sweep_table(
+def _emit_report(lines: list[str], default_basename: str) -> None:
+    """Write the assembled results tables to a dedicated file AND to stdout as a
+    single atomic write.
+
+    The sweep spawns up to N * NUM_GPUS worker processes, each emitting glog /
+    thrift / RCCLX C++ init logging to the shared stdout/stderr. Interleaving
+    that firehose with per-line print() mangles the tables (a stray token can
+    land mid-row). Assembling the whole report as one string and writing it once
+    — and also to an isolated file no other process touches — keeps the results
+    clean and diffable. BENCH_RESULTS_FILE overrides the file path.
+    """
+    report = "\n".join(lines) + "\n"
+    path = os.environ.get(
+        "BENCH_RESULTS_FILE",
+        os.path.join(tempfile.gettempdir(), default_basename),
+    )
+    try:
+        with open(path, "w") as f:
+            f.write(report)
+    except OSError:
+        path = ""
+    banner = "#" * 55
+    header = "# BENCH RESULTS" + (f" (also written to {path})" if path else "")
+    sys.stdout.write(f"\n{banner}\n{header}\n{banner}\n{report}{banner}\n")
+    sys.stdout.flush()
+
+
+def _format_sweep_table(
     results_dict: Any, dtype: torch.dtype, collective: str, active_ranks: int
-) -> None:
-    """Print one (collective, active-rank-count) FUSED message-size sweep table."""
+) -> list[str]:
+    """Build the lines for one (collective, A) FUSED message-size sweep table."""
     num_groups = NUM_GPUS // active_ranks
     key = f"{collective}_a{active_ranks}"
     title = collective.replace("_", "-").upper()
     width = 55
     line = "=" * width
-    print("\n" + line)
-    print(
+    out: list[str] = [
+        "",
+        line,
         f"Sharded Relay {title} — Message-Size Sweep "
-        f"(MI350X, {NUM_GPUS} GPUs, {dtype})"
-    )
-    print(
+        f"(MI350X, {NUM_GPUS} GPUs, {dtype})",
         f"  {active_ranks} active ranks/group; times = best-of-N (min), "
-        "barrier-aligned + hipEvent-timed"
-    )
-    print(
+        "barrier-aligned + hipEvent-timed",
         f"  FUSED = {num_groups}-group sharded relay  vs  "
-        f"NCCL baseline ({num_groups} concurrent {active_ranks}-rank groups)"
-    )
-    print(line)
-    print(f"{'':>10} | {f'FUSED ({num_groups} groups)':^33}")
-    print(f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} {'Speedup':>9}")
-    print("-" * width)
+        f"NCCL baseline ({num_groups} concurrent {active_ranks}-rank groups)",
+        line,
+        f"{'':>10} | {f'FUSED ({num_groups} groups)':^33}",
+        f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} {'Speedup':>9}",
+        "-" * width,
+    ]
     for i, (label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
         elements = nbytes // dtype.itemsize
         if elements % active_ranks != 0:
             continue
         nf = _sweep_get_ms(results_dict, f"nccl_{key}_fused_{i}")
         rf = _sweep_get_ms(results_dict, f"relay_{key}_fused_{i}")
-        print(
+        out.append(
             f"{label:>10} | {_sweep_fmt_ms(nf):>10} {_sweep_fmt_ms(rf):>10} "
             f"{_sweep_fmt_speedup(nf, rf):>9}"
         )
-    print(line)
+    out.append(line)
+    return out
 
 
 def _print_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> None:
-    """Print one FUSED message-size sweep table per (collective, active-rank-count)."""
+    """Emit one FUSED message-size sweep table per (collective, active-rank-count)
+    as a single clean, diffable block (file + atomic stdout write)."""
+    lines: list[str] = []
     for collective in _MSG_SWEEP_COLLECTIVES:
         for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
-            _print_sweep_table(results_dict, dtype, collective, active_ranks)
+            lines.extend(
+                _format_sweep_table(results_dict, dtype, collective, active_ranks)
+            )
+    _emit_report(lines, "bench_sharded_relay_fused_sweep_results.txt")
+
+
+# ---------------------------------------------------------------------------
+# Parallel independent-comm sweep workers (test_parallel_collectives_msg_size_sweep)
+#
+# Models N = NUM_GPUS // A independent workloads, each with its OWN 8-rank
+# communicator and a disjoint active rank group, all launching a SINGLE-GROUP
+# A-rank sharded relay collective IN PARALLEL (async, one per comm). Unlike the
+# fused multi-group kernel (which coordinates all groups in lockstep phases to
+# remove XGMI link contention), these calls cannot be fused — each workload owns
+# a separate communicator — so this measures single-group A-rank relay collective
+# performance under the link contention of several overlapping independent
+# relays. Covers all four collectives (allreduce, reduce-scatter, all-to-all,
+# all-gather) at both 2 and 4 active ranks → one table per (collective, A).
+#
+# Topology (8 GPUs, A active ranks/group); each comm spans ALL 8 ranks, e.g. A=2:
+#   comm 0: active [0,1], helpers [2,3,4,5,6,7]
+#   comm 1: active [2,3], helpers [0,1,4,5,6,7]  ... (N=4 comms)
+# Each rank is active in exactly one comm and a helper in the others.
+#
+# Fixed at bf16. NCCL baseline: N disjoint A-rank NCCL collectives running
+# concurrently (identical to the FUSED sweep's baseline; reuses _nccl_baseline_op).
+# NCCL allreduce/reduce-scatter use SUM + manual divide (RCCL on MI350X lacks the
+# AVG kernel); the relay path uses AVG in the RCCLX kernel.
+# ---------------------------------------------------------------------------
+
+
+def _build_per_job_nccl_group(total_procs: int, my_job: int) -> Any:
+    """Collectively build each job's NUM_GPUS-rank NCCL group (over global ranks
+    [j*NUM_GPUS .. j*NUM_GPUS+NUM_GPUS-1]); return this proc's own job group.
+
+    Called with a global (gloo) default PG so dist.barrier(group=...) on the
+    returned group is an on-device NCCL barrier that aligns the job's NUM_GPUS
+    participants — matching how the NCCL baseline aligns its participants."""
+    my_group = None
+    num_jobs = total_procs // NUM_GPUS
+    for j in range(num_jobs):
+        ranks = list(range(j * NUM_GPUS, (j + 1) * NUM_GPUS))
+        g = dist.new_group(ranks=ranks, backend="nccl")
+        if j == my_job:
+            my_group = g
+    return my_group
+
+
+def _build_per_job_active_subgroup(
+    total_procs: int, my_job: int, active_ranks: int
+) -> Any:
+    """Collectively build each job's A-rank NCCL sub-group used for the NCCL
+    baseline collective. Job j's active ranks are rank_in_job [j*A .. j*A+A-1]
+    (device j*A..), i.e. global ranks [j*NUM_GPUS + r]. Returns this proc's own
+    job sub-group (a non-member handle if this proc is a helper)."""
+    my_sub = None
+    num_jobs = total_procs // NUM_GPUS
+    for j in range(num_jobs):
+        active_in_job = range(j * active_ranks, (j + 1) * active_ranks)
+        ranks = [j * NUM_GPUS + r for r in active_in_job]
+        g = dist.new_group(ranks=ranks, backend="nccl")
+        if j == my_job:
+            my_sub = g
+    return my_sub
+
+
+def _noop_fn() -> None:
+    """Timed no-op for idle co-resident ranks in the parallel NCCL baseline."""
+    return None
+
+
+def _parallel_msg_sweep_nccl_worker(
+    p: int,
+    total_procs: int,
+    active_ranks: int,
+    results_dict: Any,
+    store_port: int,
+) -> None:
+    """NCCL baseline under the SAME topology/co-residency as the relay sweep.
+
+    To compare the collective ALGORITHMS apples-to-apples (not the deployment
+    topology), this mirrors the relay worker exactly: N = NUM_GPUS // A separate
+    8-rank jobs are spawned as N * NUM_GPUS processes (N per GPU); process p is
+    (job = p // NUM_GPUS, rank_in_job = p % NUM_GPUS) on cuda:rank_in_job. Each
+    job builds its OWN 8-rank NCCL world (per-job PrefixStore, 1 rank/GPU) and,
+    within it, an A-rank sub-group [job*A .. job*A+A-1]. The A active ranks run
+    the A-rank NCCL collective on that sub-group; the other ranks are idle
+    co-resident processes (exactly like the relay's helper ranks). Alignment uses
+    the same per-job 8-rank NCCL device barrier (_measure_ms's dist.barrier), so
+    both baselines pay identical co-residency and get identical device-side
+    alignment. Records per job's rank-0 (rank_in_job == job*A):
+      results_dict["nccl_parallel_{collective}_a{A}_{i}_job{job}"] = (best, std)
+    """
+    job = p // NUM_GPUS
+    rank_in_job = p % NUM_GPUS
+    device_idx = rank_in_job
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(store_port)
+    os.environ["RANK"] = str(p)
+    os.environ["WORLD_SIZE"] = str(total_procs)
+
+    store = dist.TCPStore(
+        host_name="localhost",
+        port=store_port,
+        world_size=total_procs,
+        is_master=(p == 0),
+        wait_for_workers=True,
+    )
+    torch.cuda.set_device(device_idx)
+    device = torch.device(f"cuda:{device_idx}")
+
+    # Global (gloo) default PG across ALL N * NUM_GPUS procs: its dist.barrier
+    # deterministically overlaps every co-resident job each iteration (identical
+    # worst-case contention for both baselines). A per-job NUM_GPUS-rank NCCL
+    # group provides the on-device within-job alignment (passed to _measure_ms).
+    dist.init_process_group(
+        backend="gloo",
+        rank=p,
+        world_size=total_procs,
+        store=dist.PrefixStore("parallel_global", store),
+    )
+    job_device_group = _build_per_job_nccl_group(total_procs, job)
+
+    dtype = _MSG_SWEEP_DTYPE
+    warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
+    bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
+
+    # A-rank sub-group (global ranks) for this job's NCCL collective.
+    active_group = list(range(job * active_ranks, (job + 1) * active_ranks))
+    subgroup = _build_per_job_active_subgroup(total_procs, job, active_ranks)
+    is_active = rank_in_job in active_group
+    is_job_rank0 = rank_in_job == active_group[0]
+
+    # SUM + manual divide (RCCL on MI350X lacks the AVG kernel).
+    _ar_opts = dist.AllreduceCoalescedOptions()
+    _ar_opts.reduceOp = dist.ReduceOp.SUM
+
+    # Warm up the sub-group communicator (active ranks only).
+    if is_active:
+        _wt = torch.ones(1, dtype=dtype, device=device)
+        dist.all_reduce(_wt, op=dist.ReduceOp.SUM, group=subgroup)
+        del _wt
+    torch.cuda.synchronize()
+
+    key = f"a{active_ranks}"
+    for collective in _MSG_SWEEP_COLLECTIVES:
+        for i, (_label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+            elements = nbytes // dtype.itemsize
+            if elements % active_ranks != 0:
+                continue
+            if is_active:
+                fn = _nccl_baseline_op(
+                    collective,
+                    active_ranks,
+                    elements,
+                    dtype,
+                    device,
+                    subgroup,
+                    _ar_opts,
+                )
+            else:
+                # Idle co-resident process (mirrors a relay helper rank); still
+                # participates in the alignment barriers.
+                fn = _noop_fn
+            best, std = _measure_ms(
+                fn, warmup, bench_iters, device_barrier_group=job_device_group
+            )
+            del fn
+            torch.cuda.empty_cache()
+            if is_job_rank0:
+                results_dict[f"nccl_parallel_{collective}_{key}_{i}_job{job}"] = (
+                    best,
+                    std,
+                )
+
+    # Match the relay worker: let every rank finish its collectives before any
+    # rank tears the process group down.
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _issue_relay_async(
+    collective: str,
+    comm: Any,
+    in_list: list[torch.Tensor],
+    out_list: list[torch.Tensor],
+    count_list: list[int],
+    all_active_ranks: list[list[int]],
+) -> Any:
+    """Issue ONE single-group (num_groups=1) sharded relay collective on a comm
+    with async_op=True; returns its work handle."""
+    if collective == "allreduce":
+        return comm.allreduce_multi_group(
+            tensors=in_list,
+            num_groups=1,
+            per_group_sizes=count_list,
+            all_active_ranks=all_active_ranks,
+            op=dist.ReduceOp.AVG,
+            skip_validation=True,
+            async_op=True,
+        )
+    if collective == "reduce_scatter":
+        return comm.reduce_scatter_multi_group(
+            input_tensors=in_list,
+            output_tensors=out_list,
+            num_groups=1,
+            per_group_recv_counts=count_list,
+            all_active_ranks=all_active_ranks,
+            op=dist.ReduceOp.AVG,
+            skip_validation=True,
+            async_op=True,
+        )
+    if collective == "all_to_all":
+        return comm.all_to_all_multi_group(
+            input_tensors=in_list,
+            output_tensors=out_list,
+            num_groups=1,
+            per_group_segment_counts=count_list,
+            all_active_ranks=all_active_ranks,
+            skip_validation=True,
+            async_op=True,
+        )
+    if collective == "all_gather":
+        return comm.all_gather_multi_group(
+            input_tensors=in_list,
+            output_tensors=out_list,
+            num_groups=1,
+            per_group_send_counts=count_list,
+            all_active_ranks=all_active_ranks,
+            skip_validation=True,
+            async_op=True,
+        )
+    raise ValueError(f"unknown collective {collective!r}")
+
+
+def _run_parallel_relay_once(
+    collective: str,
+    comms: list[Any],
+    in_tensors: list[list[torch.Tensor]],
+    out_tensors: list[list[torch.Tensor]],
+    count_list: list[int],
+    active_ranks_per_comm: list[list[list[int]]],
+    num_parallel: int,
+) -> None:
+    """Issue N single-group relay collectives (one per comm) in parallel.
+
+    Each call is async_op=True so it runs on its communicator's dedicated stream;
+    the N calls therefore overlap. The wait() calls only enqueue device-side
+    stream-waits on the current stream (non host-blocking), so the following
+    end-event captures the LAST (max) completion across the N comms — i.e. the
+    overlapped wall-time. Inputs are pre-filled with ones at buffer construction
+    and stay ones, so no per-call refill is done inside the timed region.
+    """
+    works: list[Any] = []
+    for k in range(num_parallel):
+        works.append(
+            _issue_relay_async(
+                collective,
+                comms[k],
+                in_tensors[k],
+                out_tensors[k],
+                count_list,
+                active_ranks_per_comm[k],
+            )
+        )
+    for work in works:
+        if work is not None:
+            work.wait()
+
+
+def _parallel_relay_single_call(
+    collective: str,
+    comm: Any,
+    active_group: list[int],
+    rank_in_job: int,
+    active_ranks: int,
+    elements: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> Any:
+    """Zero-arg closure that issues this process's ONE single-group relay call.
+
+    Active ranks (rank_in_job in active_group) pass real message buffers; helper
+    ranks pass a 1-element placeholder (the kernel stages helpers into its own
+    internal scratch and never reads the caller's buffer). Reuses
+    _run_parallel_relay_once with num_parallel=1 so exactly one async relay
+    collective is issued and waited on per call.
+    """
+    count_list = _relay_counts(collective, active_ranks, elements, 1)
+    if rank_in_job in active_group:
+        a_in, a_out = _active_io(collective, active_ranks, elements, dtype, device)
+        in_list = [a_in]
+        out_list = [a_out]
+    else:
+        # Helper slots are ignored by the kernel (it stages into internal
+        # scratch), so a 1-element placeholder suffices for every collective.
+        ph = torch.empty(1, dtype=dtype, device=device)
+        in_list = [ph]
+        out_list = [ph]
+    return partial(
+        _run_parallel_relay_once,
+        collective,
+        [comm],
+        [in_list],
+        [out_list],
+        count_list,
+        [[active_group]],
+        1,
+    )
+
+
+def _parallel_relay_warmup_single(
+    comm: Any,
+    active_group: list[int],
+    rank_in_job: int,
+    active_ranks: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> None:
+    """Tiny relay call per collective so each distinct single-group HIP kernel
+    config JIT-compiles before timing. warm_elems=2048 clears the A=2
+    reduce-scatter/all-to-all 2-active chunk floor (elements>=1792)."""
+    torch.cuda.synchronize()
+    dist.barrier()
+    warm_elems = 2048
+    for collective in _MSG_SWEEP_COLLECTIVES:
+        fn = _parallel_relay_single_call(
+            collective,
+            comm,
+            active_group,
+            rank_in_job,
+            active_ranks,
+            warm_elems,
+            dtype,
+            device,
+        )
+        for _ in range(3):
+            fn()
+    torch.cuda.synchronize()
+    torch.cuda.empty_cache()
+
+
+def _parallel_msg_sweep_relay_worker(
+    p: int,
+    total_procs: int,
+    active_ranks: int,
+    results_dict: Any,
+    store_port: int,
+) -> None:
+    """One production job's rank in the reconciled parallel relay sweep.
+
+    Models N = NUM_GPUS // A independent relay jobs co-resident on one 8-GPU
+    node (the production topology: N separate processes/jobs, each owning its own
+    full 8-rank communicator, each issuing exactly ONE relay call). This spawn
+    launches N * NUM_GPUS processes; process p maps to
+    (job = p // NUM_GPUS, rank_in_job = p % NUM_GPUS) and runs on
+    cuda:rank_in_job, so the N jobs are co-resident (N processes per GPU) with
+    per-process CUDA contexts and their own GPU_MAX_HW_QUEUES=2 budget.
+
+    Each process creates exactly ONE 8-rank RCCLX comm for its job (a per-job
+    PrefixStore namespace via node_idx=job) and issues exactly ONE single-group
+    A-rank relay call per timed iteration: active if rank_in_job is in the job's
+    A-rank group [job*A .. job*A+A-1], helper otherwise. A gloo process group
+    spanning all N * NUM_GPUS processes provides the cross-job barrier in
+    _measure_ms so every job's timed region overlaps (true inter-process XGMI
+    contention is the measurement target). Writes, per (collective, size index
+    i), for each job's rank-0 (rank_in_job == job*A):
+      results_dict["relay_parallel_{collective}_a{A}_{i}_job{job}"] = (best, std)
+    The parent reduces max across jobs (overlapped wall-time).
+    """
+    job = p // NUM_GPUS
+    rank_in_job = p % NUM_GPUS
+    device_idx = rank_in_job
+
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(store_port)
+    os.environ["RANK"] = str(p)
+    os.environ["WORLD_SIZE"] = str(total_procs)
+
+    store = dist.TCPStore(
+        host_name="localhost",
+        port=store_port,
+        world_size=total_procs,
+        is_master=(p == 0),
+        wait_for_workers=True,
+    )
+    torch.cuda.set_device(device_idx)
+    device = torch.device(f"cuda:{device_idx}")
+
+    # Global (gloo) default PG across ALL N * NUM_GPUS procs: its dist.barrier
+    # deterministically overlaps every co-resident job each iteration (same
+    # worst-case contention every iter). A per-job NUM_GPUS-rank NCCL group gives
+    # on-device within-job alignment (passed to _measure_ms as
+    # device_barrier_group) so the P2P partner skew that would otherwise inflate
+    # latency-bound small-size times is removed — identical treatment to the NCCL
+    # baseline. This exactly matches the NCCL baseline's alignment, so relay vs
+    # NCCL isolates the collective algorithm, not the harness.
+    dist.init_process_group(
+        backend="gloo",
+        rank=p,
+        world_size=total_procs,
+        store=dist.PrefixStore("parallel_global", store),
+    )
+    job_device_group = _build_per_job_nccl_group(total_procs, job)
+
+    dtype = _MSG_SWEEP_DTYPE
+    warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
+    bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
+
+    # This job owns ONE full 8-rank RCCLX comm in its own store namespace.
+    raw_comm = _setup_rcclx_comm(
+        rank_in_job,
+        NUM_GPUS,
+        job,
+        dist.PrefixStore("parallel_relay_rcclx", store),
+    )
+    if FusedShardedRelayMultiGroup is None or raw_comm is None:
+        if p == 0:
+            print("[bench] FusedShardedRelayMultiGroup not available. Exiting.")
+        dist.destroy_process_group()
+        return
+
+    # Job j's single active group is [j*A .. j*A+A-1], spreading the N jobs'
+    # active ranks evenly across the 8 GPUs (each GPU is active for one job and a
+    # helper for the other N-1) — matching production's balanced co-residency.
+    active_group = list(range(job * active_ranks, (job + 1) * active_ranks))
+    comm = FusedShardedRelayMultiGroup(
+        rcclx_comm=raw_comm,
+        world_size=NUM_GPUS,
+        rank=rank_in_job,
+        all_active_ranks=[active_group],
+    )
+
+    _parallel_relay_warmup_single(
+        comm, active_group, rank_in_job, active_ranks, dtype, device
+    )
+
+    is_job_rank0 = rank_in_job == active_group[0]
+    key = f"a{active_ranks}"
+    for collective in _MSG_SWEEP_COLLECTIVES:
+        for i, (_label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+            elements = nbytes // dtype.itemsize
+            if elements % active_ranks != 0:
+                continue
+            fn = _parallel_relay_single_call(
+                collective,
+                comm,
+                active_group,
+                rank_in_job,
+                active_ranks,
+                elements,
+                dtype,
+                device,
+            )
+            best, std = _measure_ms(
+                fn, warmup, bench_iters, device_barrier_group=job_device_group
+            )
+            del fn
+            torch.cuda.empty_cache()
+            if is_job_rank0:
+                results_dict[f"relay_parallel_{collective}_{key}_{i}_job{job}"] = (
+                    best,
+                    std,
+                )
+
+    dist.barrier()
+    dist.destroy_process_group()
+
+
+def _reduce_parallel_jobs_max(results_dict: Any) -> None:
+    """Collapse per-job parallel-sweep entries to the max across jobs.
+
+    Each job writes its own best-of-N under ..._job{j}; the overlapped wall-time
+    is the slowest (max) job, so reduce both the relay and NCCL per-job entries
+    into the base keys the print/report helpers read.
+    """
+    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+        num_jobs = NUM_GPUS // active_ranks
+        for collective in _MSG_SWEEP_COLLECTIVES:
+            key = f"{collective}_a{active_ranks}"
+            for i, (_label, _nbytes) in enumerate(_MSG_SWEEP_SIZES):
+                for prefix in ("relay_parallel", "nccl_parallel"):
+                    vals = [
+                        results_dict.get(f"{prefix}_{key}_{i}_job{j}")
+                        for j in range(num_jobs)
+                    ]
+                    present = [v for v in vals if v is not None]
+                    if present:
+                        results_dict[f"{prefix}_{key}_{i}"] = max(
+                            present, key=lambda v: v[0]
+                        )
+
+
+def _format_parallel_sweep_table(
+    results_dict: Any, dtype: torch.dtype, collective: str, active_ranks: int
+) -> list[str]:
+    """Build the lines for one (collective, A) parallel separate-job table."""
+    num_parallel = NUM_GPUS // active_ranks
+    key = f"{collective}_a{active_ranks}"
+    title = collective.replace("_", "-").upper()
+    width = 55
+    line = "=" * width
+    out: list[str] = [
+        "",
+        line,
+        f"Sharded Relay {title} — {num_parallel}x Parallel Separate-Job "
+        f"Sweep (MI350X, {NUM_GPUS} GPUs, {dtype})",
+        f"  {active_ranks} active ranks/group; times = best-of-N (min), "
+        "barrier-aligned + hipEvent-timed; max across jobs",
+        f"  PARALLEL = {num_parallel} co-resident jobs, each a separate 8-rank "
+        f"comm issuing one {active_ranks}-rank relay (max across jobs)",
+        f"  NCCL baseline = {num_parallel} concurrent {active_ranks}-rank NCCL "
+        "collectives as separate processes (max across jobs)",
+        line,
+        f"{'':>10} | {f'PARALLEL ({num_parallel} jobs)':^33}",
+        f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} {'Speedup':>9}",
+        "-" * width,
+    ]
+    for i, (label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+        elements = nbytes // dtype.itemsize
+        if elements % active_ranks != 0:
+            continue
+        n = _sweep_get_ms(results_dict, f"nccl_parallel_{key}_{i}")
+        r = _sweep_get_ms(results_dict, f"relay_parallel_{key}_{i}")
+        out.append(
+            f"{label:>10} | {_sweep_fmt_ms(n):>10} {_sweep_fmt_ms(r):>10} "
+            f"{_sweep_fmt_speedup(n, r):>9}"
+        )
+    out.append(line)
+    return out
+
+
+def _print_parallel_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> None:
+    """Emit one parallel separate-job table per (collective, active-rank-count) as
+    a single clean, diffable block (file + atomic stdout write)."""
+    lines: list[str] = []
+    for collective in _MSG_SWEEP_COLLECTIVES:
+        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+            lines.extend(
+                _format_parallel_sweep_table(
+                    results_dict, dtype, collective, active_ranks
+                )
+            )
+    _emit_report(lines, "bench_sharded_relay_parallel_sweep_results.txt")
+
+
+def _format_single_group_sweep_table(
+    results_dict: Any, dtype: torch.dtype, collective: str, active_ranks: int
+) -> list[str]:
+    """Build the lines for one (collective, A) SINGLE-GROUP best-case table.
+
+    Best case = exactly ONE A-rank relay group on the 8-GPU host with no other
+    co-resident job competing for XGMI bandwidth or HW queues (num_jobs == 1).
+    The relay still spans the full 8-rank comm (A active + 8-A helpers); the
+    NCCL baseline runs the A-rank collective with the remaining ranks idle. The
+    alignment (global barrier + per-job device barrier) matches the parallel
+    sweep, so this is that sweep's num_jobs=1 point — the contention-free upper
+    bound. Reads the same reduced base keys the parallel report reads.
+    """
+    key = f"{collective}_a{active_ranks}"
+    title = collective.replace("_", "-").upper()
+    width = 55
+    line = "=" * width
+    out: list[str] = [
+        "",
+        line,
+        f"Sharded Relay {title} — Single-Group Best-Case Sweep "
+        f"(MI350X, {NUM_GPUS} GPUs, {dtype})",
+        f"  {active_ranks} active ranks/group; times = best-of-N (min), "
+        "barrier-aligned + hipEvent-timed",
+        f"  SINGLE GROUP = one {active_ranks}-rank relay on a full "
+        f"{NUM_GPUS}-rank comm, no co-resident jobs (best case)",
+        f"  NCCL baseline = one {active_ranks}-rank NCCL collective, "
+        f"other {NUM_GPUS - active_ranks} ranks idle",
+        line,
+        f"{'':>10} | {'SINGLE GROUP (1 job)':^33}",
+        f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} {'Speedup':>9}",
+        "-" * width,
+    ]
+    for i, (label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+        elements = nbytes // dtype.itemsize
+        if elements % active_ranks != 0:
+            continue
+        n = _sweep_get_ms(results_dict, f"nccl_parallel_{key}_{i}")
+        r = _sweep_get_ms(results_dict, f"relay_parallel_{key}_{i}")
+        out.append(
+            f"{label:>10} | {_sweep_fmt_ms(n):>10} {_sweep_fmt_ms(r):>10} "
+            f"{_sweep_fmt_speedup(n, r):>9}"
+        )
+    out.append(line)
+    return out
+
+
+def _print_single_group_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> None:
+    """Emit one single-group best-case table per (collective, active-rank-count)
+    as a single clean, diffable block (file + atomic stdout write)."""
+    lines: list[str] = []
+    for collective in _MSG_SWEEP_COLLECTIVES:
+        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+            lines.extend(
+                _format_single_group_sweep_table(
+                    results_dict, dtype, collective, active_ranks
+                )
+            )
+    _emit_report(lines, "bench_sharded_relay_single_group_sweep_results.txt")
 
 
 # ---------------------------------------------------------------------------
@@ -2295,7 +2978,7 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
                   kernel call vs the matching NCCL baseline on each rank's A-rank
                   sub-group.
         The single-group scenario is benchmarked separately (see
-        test_parallel_2rank_allreduce_sweep).
+        test_parallel_collectives_msg_size_sweep).
 
         Run selectively (so the production test_benchmark does not also run).
         The buck2 test runner imports the module, so the selector must be the
@@ -2322,14 +3005,146 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
             join=True,
         )
 
-        # Phase 2: sharded relay FUSED per collective and A via RCCLX;
-        # rank 0 prints all 8 summary tables.
+        # Phase 2: sharded relay FUSED per collective and A via RCCLX; the
+        # parent emits all tables after the workers join (clean, un-interleaved).
         mp.spawn(
             _msg_sweep_relay_worker,
             args=(NUM_GPUS, results, 0),
             nprocs=NUM_GPUS,
             join=True,
         )
+
+        _print_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
+
+        manager.shutdown()
+
+    def test_parallel_collectives_msg_size_sweep(self) -> None:
+        """N independent single-group A-rank relay JOBS in parallel (bf16).
+
+        Production-faithful reconciliation: models N = NUM_GPUS // A independent
+        relay workloads as SEPARATE co-resident jobs on one 8-GPU node (not one
+        shared process issuing N calls). For each A, one mp.spawn launches
+        N * NUM_GPUS processes — process p is (job = p // NUM_GPUS,
+        rank_in_job = p % NUM_GPUS) on cuda:rank_in_job — so the N jobs are
+        co-resident (N processes per GPU). Each process owns exactly ONE 8-rank
+        RCCLX communicator for its job and issues exactly ONE single-group
+        A-rank relay call per iteration, with its own CUDA context and
+        GPU_MAX_HW_QUEUES=2 budget. A gloo PG spanning all N * NUM_GPUS
+        processes overlaps every job's timed region; the reported time is the max
+        across jobs (overlapped wall-time).
+
+        The NCCL baseline is N disjoint A-rank NCCL collectives run as separate
+        processes (A ranks/job → NUM_GPUS processes total, one per GPU),
+        overlapped under the same barrier, max across jobs. The relay's 8-rank
+        comm vs NCCL's A-rank comm asymmetry is exactly the production contrast.
+        Prints one table per (collective, active-rank-count).
+
+        Run selectively (so the production test_benchmark does not also run).
+        The buck2 test runner imports the module, so the selector must be the
+        fully-qualified module.Class.method path:
+            buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \\
+                //torchrec/distributed/tests:bench_sharded_relay_perf -- \\
+                torchrec.distributed.tests.bench_sharded_relay_perf.BenchShardedRelayPerfTest.test_parallel_collectives_msg_size_sweep
+        """
+        manager = mp.Manager()
+        results: Any = manager.dict()
+
+        # Production regime: BM-FM runs with GPU_MAX_HW_QUEUES=2. Each spawned
+        # process now inherits its OWN budget (N separate co-resident jobs), so
+        # this reproduces the per-process queue budget of production rather than
+        # one shared budget split across N calls. Set before mp.spawn so the
+        # workers inherit it before HIP init.
+        os.environ["GPU_MAX_HW_QUEUES"] = "2"
+
+        # Each process builds several co-resident NCCL groups (a per-job device
+        # group + the baseline's A-rank sub-group). The NCCL flight recorder /
+        # heartbeat monitor names its dump pipe /tmp/nccl_trace_<sec>_rank_<r>.pipe
+        # by (second, rank), so groups created in the same second with the same
+        # rank number collide ("File exists" -> SIGABRT). Disable the monitor /
+        # trace buffer for the benchmark (a debugging aid, not needed here).
+        os.environ["TORCH_NCCL_ENABLE_MONITORING"] = "0"
+        os.environ["TORCH_NCCL_TRACE_BUFFER_SIZE"] = "0"
+
+        # Both baselines use the SAME separate-job topology (N * NUM_GPUS procs
+        # per A, N co-resident jobs each a full 8-rank world) and the SAME
+        # alignment (global gloo cross-job barrier for deterministic overlap +
+        # per-job NCCL device barrier for on-device within-job alignment), so
+        # relay vs NCCL isolates the collective algorithm rather than the
+        # deployment topology or the measurement harness. Per A, run the NCCL
+        # baseline then the relay.
+        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+            num_jobs = NUM_GPUS // active_ranks
+            total_procs = num_jobs * NUM_GPUS
+            mp.spawn(
+                _parallel_msg_sweep_nccl_worker,
+                args=(total_procs, active_ranks, results, _find_free_port()),
+                nprocs=total_procs,
+                join=True,
+            )
+            mp.spawn(
+                _parallel_msg_sweep_relay_worker,
+                args=(total_procs, active_ranks, results, _find_free_port()),
+                nprocs=total_procs,
+                join=True,
+            )
+
+        # Reduce per-job entries to max-across-jobs, then print the tables.
+        _reduce_parallel_jobs_max(results)
+        _print_parallel_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
+
+        manager.shutdown()
+
+    def test_single_group_collectives_msg_size_sweep(self) -> None:
+        """Best-case SINGLE-GROUP A-rank relay sweep (bf16): exactly ONE group.
+
+        Uses the same workers and harness as
+        test_parallel_collectives_msg_size_sweep, but forces num_jobs == 1 for
+        every A (total_procs = NUM_GPUS), so only ONE A-rank relay group runs on
+        the 8-GPU host with no co-resident job competing for XGMI bandwidth or HW
+        queues. This is the parallel sweep's num_jobs=1 point — the
+        contention-free upper bound on both relay and NCCL. The relay still uses
+        the full 8-rank comm (A active ranks [0..A-1] + 8-A helpers); the NCCL
+        baseline runs the A-rank collective with the remaining ranks idle. Same
+        alignment (global gloo barrier + per-job NCCL device barrier) as the
+        parallel sweep. Prints one table per (collective, active-rank-count).
+
+        Run selectively (so the production test_benchmark does not also run).
+        The buck2 test runner imports the module, so the selector must be the
+        fully-qualified module.Class.method path:
+            buck2 run @mode/opt-amd-gpu -m rocm70 -m rcclx_dev \\
+                //torchrec/distributed/tests:bench_sharded_relay_perf -- \\
+                torchrec.distributed.tests.bench_sharded_relay_perf.BenchShardedRelayPerfTest.test_single_group_collectives_msg_size_sweep
+        """
+        manager = mp.Manager()
+        results: Any = manager.dict()
+
+        # Same production regime + NCCL flight-recorder disable as the parallel
+        # sweep (see test_parallel_collectives_msg_size_sweep for the rationale).
+        os.environ["GPU_MAX_HW_QUEUES"] = "2"
+        os.environ["TORCH_NCCL_ENABLE_MONITORING"] = "0"
+        os.environ["TORCH_NCCL_TRACE_BUFFER_SIZE"] = "0"
+
+        # One job only: total_procs = NUM_GPUS -> num_jobs = 1 in both workers,
+        # so the single A-rank group [0..A-1] is the only workload on the host
+        # (the other 8-A ranks are helpers/idle). Per A, run NCCL then relay.
+        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+            total_procs = NUM_GPUS
+            mp.spawn(
+                _parallel_msg_sweep_nccl_worker,
+                args=(total_procs, active_ranks, results, _find_free_port()),
+                nprocs=total_procs,
+                join=True,
+            )
+            mp.spawn(
+                _parallel_msg_sweep_relay_worker,
+                args=(total_procs, active_ranks, results, _find_free_port()),
+                nprocs=total_procs,
+                join=True,
+            )
+
+        # Collapse the single job's per-job entries to the base keys, then print.
+        _reduce_parallel_jobs_max(results)
+        _print_single_group_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
 
         manager.shutdown()
 
