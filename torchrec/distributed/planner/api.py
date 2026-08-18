@@ -17,6 +17,7 @@ import torch.distributed as dist
 from torchrec.distributed.planner.protocols import PlannerExecutor
 from torchrec.distributed.planner.reporter import DefaultPlanReporter, PlanReporter
 from torchrec.distributed.planner.types import (
+    PlannerErrorType,
     PlannerSessionContext,
     ShardingPlanRequest,
     ShardingPlanResult,
@@ -215,6 +216,10 @@ class ShardingPlannerAPI(abc.ABC):
             success=False,
             sharding_plan=None,
             planner_failure_reason=f"{type(error).__name__}: {error}",
+            # Classify these isolated non-PlannerError failures as OTHER instead of
+            # leaving planner_error_type NULL, so the failure taxonomy panel counts
+            # them rather than dropping them.
+            planner_error_type=PlannerErrorType.OTHER,
             estimated_max_hbm_bytes=0,
             estimated_max_ddr_bytes=0,
             request_hash=ctx.request.request_hash,
