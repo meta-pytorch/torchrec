@@ -1052,9 +1052,15 @@ def all_to_all_tensors_with_sharded_relay(
                     # count its kernel sees.) num_chunks matches the kernel's
                     # numHelpers + 1.
                     seg_g = per_group_segment_counts[g]
-                    helper_size_g = _passthrough_helper_size(
-                        seg_g, sparse_group_size, num_chunks
-                    )
+                    if sparse_group_size > 2:
+                        # Flat A>2 all-to-all is PURE-DIRECT (no helper relay),
+                        # so a helper rank does no work for this group. A tiny
+                        # placeholder satisfies the per-group tensor-list slot.
+                        helper_size_g = 1
+                    else:
+                        helper_size_g = _passthrough_helper_size(
+                            seg_g, sparse_group_size, num_chunks
+                        )
                     helper_buf = _get_helper_flat_buf(
                         state, g, helper_size_g, dtype, device
                     )
