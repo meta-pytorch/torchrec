@@ -1256,10 +1256,9 @@ def _benchmark_worker(
             a2a_helper_bufs.append(a2a_output)  # unused for the active group
         else:
             if sparse_group_size > 2:
-                # Flat A>2 all-to-all is pure-direct (no helper relay), so the
-                # helper does no work for this group -- a tiny placeholder is
-                # all the per-group tensor-list slot needs.
-                a2a_helper_size_g = 1
+                # Match production: one segment bounds the A=4 XOR path's
+                # three compact relay slots and is unused on direct routes.
+                a2a_helper_size_g = a2a_seg_counts[g]
             else:
                 a2a_helper_size_g = _passthrough_helper_size(
                     a2a_seg_counts[g], sparse_group_size, num_chunks
@@ -1704,7 +1703,7 @@ def _relay_helper_size(
         return _passthrough_helper_size(recv, active_ranks, num_chunks)
     if collective == "all_to_all":
         if active_ranks > 2:
-            return 1  # pure-direct A>2 all-to-all: helper does no relay work
+            return elements // active_ranks
         seg = elements // active_ranks
         return _passthrough_helper_size(seg, active_ranks, num_chunks)
     if collective == "all_gather":
