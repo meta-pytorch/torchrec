@@ -315,6 +315,17 @@ class RecMetricModule(nn.Module):
                 f"Removed key '{key}' from state_dict for backward compatibility"
             )
 
+    def _prepare_model_out_for_metrics(
+        self, model_out: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Prepare model outputs before task and required-input parsing.
+
+        Subclasses can override this hook when their model-output format needs
+        normalization. CPU-offloaded modules run it on the worker after transfer
+        to CPU, keeping preparation off the trainer critical path.
+        """
+        return model_out
+
     def _update_rec_metrics(
         self, model_out: Dict[str, torch.Tensor], **kwargs: Any
     ) -> None:
@@ -324,6 +335,7 @@ class RecMetricModule(nn.Module):
         """
         # pyrefly: ignore[not-callable]
         if self.rec_metrics and self.rec_tasks:
+            model_out = self._prepare_model_out_for_metrics(model_out)
             labels, predictions, weights, required_inputs = parse_task_model_outputs(
                 self.rec_tasks, model_out, self.get_required_inputs()
             )

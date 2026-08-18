@@ -10,6 +10,7 @@
 import abc
 import hashlib
 import logging
+import math
 import uuid
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -2173,6 +2174,13 @@ class PlannerConfig:
     # ignored by every other policy. (Appended last to preserve positional
     # construction of the pre-existing fields.)
     model_base_bytes: Optional[int] = None
+    # Dense-footprint multiplier for the Heuristical and SKU-aware reservations;
+    # None = the reservation's own default (6.0). Plan-affecting (it sizes the
+    # reserved dense HBM), so it is carried here to stay in request_hash -- a
+    # framework that overrides it (e.g. MVAI) must not silently fall back to 6.0.
+    # (Appended last, like model_base_bytes: this dataclass is not kw_only, so
+    # inserting mid-list would silently rebind existing positional arguments.)
+    parameter_multiplier: Optional[float] = None
 
     def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
         """Return package-specific planner config data for the request hash."""
@@ -2204,6 +2212,19 @@ class PlannerConfig:
             raise ValueError(
                 "bwd_compute_multiplier must be non-negative, got "
                 f"{self.bwd_compute_multiplier}"
+            )
+        # Validated here rather than in the provider: the provider resolves this
+        # per-SKU, so a bad value would otherwise surface N times mid-sweep (or as
+        # a nonsensical reservation) instead of once at config construction. NaN is
+        # rejected explicitly -- every comparison against it is False, so a bare
+        # "< 0" check would let it through and silently poison the reserved HBM.
+        if self.parameter_multiplier is not None and (
+            not math.isfinite(self.parameter_multiplier)
+            or self.parameter_multiplier < 0
+        ):
+            raise ValueError(
+                "parameter_multiplier must be a finite non-negative number, got "
+                f"{self.parameter_multiplier}"
             )
 
 
@@ -2375,6 +2396,7 @@ class ShardingPlanRequest:
                     self.planner_config.planner_variant.value,
                     self.planner_config.storage_reservation_policy.value,
                     self.planner_config.storage_reservation_percentage,
+                    self.planner_config.parameter_multiplier,
                     self.planner_config.proposer_type,
                     self.planner_config.partitioner_type,
                     self.planner_config.use_hardware_based_compute,
@@ -2744,6 +2766,13 @@ class ModelArch:
     sharders: Tuple[SharderArch, ...] = ()
 
 
+# Marker prefix on session warnings that record an external-dependency failure
+# (see PlannerSessionContext.record_external_failure). Kept as a constant so
+# consumers can separate "a dependency was down" from the ordinary planning
+# diagnostics that share the warnings list.
+_EXTERNAL_FAILURE_PREFIX = "external_failure"
+
+
 @dataclass
 class PlannerSessionContext:
     """Mutable context accumulating state during a planner session.
@@ -2800,8 +2829,11 @@ class PlannerSessionContext:
     # Caller-provided session metadata (e.g. training_framework, model_type,
     # entitlement). Populated by the caller/adapter at context construction.
     client_metadata: Dict[str, str] = field(default_factory=dict)
-    # Whether each SKU's result came from cache — per SKU (SKU -> hit). Scaffolding:
-    # empty until a plan-level cache exists (see ``cached_plans``).
+    # Whether each SKU's result came from cache — per SKU (SKU -> hit). Set by the
+    # planner when it consults its plan cache; left unset when that path did not
+    # run, so "did not attempt" stays distinct from a miss. Note this tracks the
+    # planner's own cache, not the request-keyed ``cached_plans`` scaffolding below,
+    # which is still unused.
     cache_hit: Dict[str, bool] = field(default_factory=dict)
     # Source of resolved hardware-capability data per SKU (SKU -> source label).
     # Populated by the provider's build_topology: OSS records "request_caps"; fb
@@ -2830,6 +2862,14 @@ class PlannerSessionContext:
     # capture_search_space is set (SKU -> url); surfaced as search_space_url on the
     # planner_runs Scuba row. Empty when capture is off.
     search_space_urls: Dict[str, str] = field(default_factory=dict)
+    # Planner-input context hash per SKU (SKU -> hash as str), recorded by the
+    # Manifold sink that computes it. This is the key the Manifold plan cache is
+    # addressed by ({job_name}-planner_input_context_hash_{hash}/...), so persisting
+    # it is what lets a later run find a reusable plan. Distinct from
+    # request_hash: it is computed post reserve()+enumerate() and covers the
+    # resolved topology + enumerated search space, not just the request params.
+    # Empty when the sink could not compute it (missing enumerator/reservation).
+    input_context_hash: Dict[str, str] = field(default_factory=dict)
     # External trace / job identifier (the MAST job name) this planning session
     # corresponds to. Links the request/session to the launching job for
     # cross-system correlation. Populated by the caller/adapter (None off-MAST,
@@ -2863,6 +2903,29 @@ class PlannerSessionContext:
     # Empty when persistence is disabled or upload failed; observability only, so
     # the caller/CLI can surface where the run's artifacts live.
     content_urls: Dict[str, str] = field(default_factory=dict)
+
+    def record_external_failure(
+        self, system: str, operation: str, exc: BaseException
+    ) -> None:
+        """Note that a best-effort call to an external system failed.
+
+        Blob upload and run persistence must never fail a plan, so those call
+        sites swallow their exceptions. Swallowing silently makes an outage
+        indistinguishable from "there was nothing to do" -- the artifact URL is
+        simply absent either way. Recording it here puts the failure on the
+        session warnings, where the reporter surfaces it, so a dependency being
+        down is a queryable fact rather than a log line.
+
+        Observability only, and itself best-effort: never raises, so a failure to
+        record a failure cannot escalate into a planning failure.
+        """
+        try:
+            self.warnings.append(
+                f"{_EXTERNAL_FAILURE_PREFIX} {system}:{operation}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            pass
 
 
 # ---- Types Utils ---- #
