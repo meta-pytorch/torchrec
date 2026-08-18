@@ -17,8 +17,9 @@ unittest.mock objects so tests are fast and hermetic.
 Test classes
 ============
 FlatCacheTest
-    Tests for the grow-only flat buffer caches (_active_flat_cache and
-    _helper_flat_cache) that replaced the old per-tensor scratch scheme.
+    Tests for the grow-only active flat buffer cache (_active_flat_cache) and
+    the shared helper placeholder cache (_placeholder_cache) that replaced the
+    old per-tensor scratch scheme.
 
 FlatAllreduceTest
     Tests for allreduce_tensors_with_sharded_relay with the flat-concat
@@ -41,8 +42,7 @@ import torch.distributed as dist
 from torchrec.distributed.sharded_relay_utils import (
     _get_active_flat_buf,
     _get_active_output_flat_buf,
-    _get_helper_flat_buf,
-    _passthrough_helper_size,
+    _get_placeholder_buf,
     all_gather_tensors_with_sharded_relay,
     all_to_all_tensors_with_sharded_relay,
     allreduce_tensors_with_sharded_relay,
@@ -96,7 +96,7 @@ def _make_state(
 
 
 class FlatCacheTest(unittest.TestCase):
-    """Tests for _get_active_flat_buf and _get_helper_flat_buf."""
+    """Tests for _get_active_flat_buf and _get_placeholder_buf."""
 
     # --- _get_active_flat_buf ---
 
@@ -136,33 +136,28 @@ class FlatCacheTest(unittest.TestCase):
         self.assertEqual(bf16.data_ptr(), bf16_again.data_ptr())
         self.assertNotEqual(bf16.data_ptr(), fp32.data_ptr())
 
-    # --- _get_helper_flat_buf ---
+    # --- _get_placeholder_buf ---
 
-    def test_helper_flat_buf_exact_size_on_first_call(self) -> None:
+    def test_placeholder_buf_is_single_element(self) -> None:
         state = _make_state()
-        buf = _get_helper_flat_buf(state, 1, 100, torch.float32, _DEVICE)
-        self.assertEqual(buf.numel(), 100)
+        buf = _get_placeholder_buf(state, torch.float32, _DEVICE)
+        self.assertEqual(buf.numel(), 1)
         self.assertEqual(buf.dtype, torch.float32)
 
-    def test_helper_flat_buf_reused_across_training_steps(self) -> None:
+    def test_placeholder_buf_shared_across_calls(self) -> None:
+        """The helper placeholder is ignored by the kernel, so one buffer is
+        reused across every helper group and both in/out slots."""
         state = _make_state()
-        buf1 = _get_helper_flat_buf(state, 1, 200, torch.float32, _DEVICE)
-        buf2 = _get_helper_flat_buf(state, 1, 200, torch.float32, _DEVICE)
+        buf1 = _get_placeholder_buf(state, torch.float32, _DEVICE)
+        buf2 = _get_placeholder_buf(state, torch.float32, _DEVICE)
         self.assertEqual(buf1.data_ptr(), buf2.data_ptr())
 
-    def test_helper_flat_buf_separate_per_group(self) -> None:
-        """With per-(group, dtype) keying, different group_idx values get separate buffers."""
+    def test_placeholder_buf_separate_per_dtype(self) -> None:
+        """fp16 (weights) and fp32 (optimizer states) get distinct placeholders."""
         state = _make_state()
-        buf0 = _get_helper_flat_buf(state, 1, 100, torch.float32, _DEVICE)
-        buf1 = _get_helper_flat_buf(state, 2, 100, torch.float32, _DEVICE)
-        self.assertNotEqual(buf0.data_ptr(), buf1.data_ptr())
-
-    def test_helper_flat_buf_separate_per_dtype(self) -> None:
-        """fp16 (weights) and fp32 (optimizer states) must not evict each other."""
-        state = _make_state()
-        fp16 = _get_helper_flat_buf(state, 1, 100, torch.float16, _DEVICE)
-        fp32 = _get_helper_flat_buf(state, 1, 100, torch.float32, _DEVICE)
-        fp16_again = _get_helper_flat_buf(state, 1, 100, torch.float16, _DEVICE)
+        fp16 = _get_placeholder_buf(state, torch.float16, _DEVICE)
+        fp32 = _get_placeholder_buf(state, torch.float32, _DEVICE)
+        fp16_again = _get_placeholder_buf(state, torch.float16, _DEVICE)
         self.assertEqual(fp16.data_ptr(), fp16_again.data_ptr())
         self.assertNotEqual(fp16.data_ptr(), fp32.data_ptr())
 
@@ -290,11 +285,11 @@ class FlatAllreduceTest(unittest.TestCase):
         active_size = call_kwargs["per_group_sizes"][state.my_sparse_group]
         self.assertEqual(active_size, sum(sizes))
 
-    def test_helper_flat_buffer_total_numel_matches_passthrough_size(self) -> None:
+    def test_helper_slots_use_shared_placeholder(self) -> None:
         """
-        With the passthrough kernel, helper buffers are sized to
-        nActiveRanks × chunkSize (much smaller than the full per-group total).
-        Each helper group has its own buffer (no aliasing).
+        With internal helper scratch, helper groups pass a shared 1-element
+        placeholder (the kernel ignores it), while per_group_sizes still carries
+        each group's full total for the kernel geometry.
         """
         state = _make_state(rank=0)
         sizes = [100, 500, 750]
@@ -317,13 +312,8 @@ class FlatAllreduceTest(unittest.TestCase):
             expected_total,
         )
 
-        # Helper groups: per_group_sizes has the full total_g, but tensor
-        # numel is the passthrough size (nActiveRanks × chunkSize).
-        # All helper groups have the same total_g (fallback: all equal my_total).
-        num_chunks = (state.local_size - state.sparse_group_size) + 1
-        expected_helper_numel = _passthrough_helper_size(
-            expected_total, state.sparse_group_size, num_chunks
-        )
+        # Helper groups: per_group_sizes still carries the full total_g, but the
+        # tensor is a shared 1-element placeholder aliased across all helpers.
         helper_ptrs = set()
         for g in range(state.num_sparse_groups):
             if g == state.my_sparse_group:
@@ -335,17 +325,16 @@ class FlatAllreduceTest(unittest.TestCase):
             )
             self.assertEqual(
                 iter_tensors[g].numel(),
-                expected_helper_numel,
-                f"group={g}: helper tensor numel should be passthrough size",
+                1,
+                f"group={g}: helper tensor should be a 1-element placeholder",
             )
             helper_ptrs.add(iter_tensors[g].data_ptr())
 
-        # Each helper group has its OWN buffer (no aliasing under phase-sync).
+        # All helper groups share ONE placeholder buffer (kernel ignores it).
         self.assertEqual(
             len(helper_ptrs),
-            state.num_sparse_groups - 1,
-            f"Expected {state.num_sparse_groups - 1} distinct helper buffers, "
-            f"got {len(helper_ptrs)}",
+            1,
+            f"Expected 1 shared helper placeholder, got {len(helper_ptrs)}",
         )
 
     # ------------------------------------------------------------------
@@ -478,8 +467,8 @@ class FlatAllreduceTest(unittest.TestCase):
         """
         Alternating between bf16 (weights sync) and fp32 (optimizer sync)
         must not trigger reallocation and must use separate buffers.
-        The helper buffer is keyed by (group_idx, dtype), so each (group, dtype)
-        pair has its own buffer.
+        The helper placeholder is keyed by (dtype, device), so each dtype has
+        its own placeholder that is reused across calls.
         """
         state = _make_state(rank=0)
         helper_g = 1
@@ -508,7 +497,7 @@ class FlatAllreduceTest(unittest.TestCase):
         )
 
     # ------------------------------------------------------------------
-    # Passthrough helper buffer tests (per-group keying, no aliasing)
+    # Helper placeholder tests (shared 1-element buffer, kernel ignores it)
     # ------------------------------------------------------------------
 
     def test_one_fused_call_per_dtype(self) -> None:
@@ -521,8 +510,8 @@ class FlatAllreduceTest(unittest.TestCase):
         call_kwargs = self._all_calls(state)[0].kwargs
         self.assertEqual(call_kwargs["num_groups"], state.num_sparse_groups)
 
-    def test_helper_buffers_separate_per_group(self) -> None:
-        """Each helper-group slot has its own data_ptr; active does NOT alias helpers."""
+    def test_helper_slots_share_one_placeholder(self) -> None:
+        """All helper-group slots alias ONE placeholder; active does NOT alias it."""
         state = _make_state(rank=0)
         allreduce_tensors_with_sharded_relay(
             state, {torch.float32: [torch.zeros(200)]}, "test"
@@ -538,17 +527,18 @@ class FlatAllreduceTest(unittest.TestCase):
 
         self.assertEqual(
             len(helper_ptrs),
-            state.num_sparse_groups - 1,
-            "Each helper group should have its own buffer",
+            1,
+            "All helper groups should share one placeholder buffer",
         )
         self.assertNotIn(
-            active_ptr, helper_ptrs, "Active buffer must not alias helpers"
+            active_ptr, helper_ptrs, "Active buffer must not alias the placeholder"
         )
 
-    def test_helper_buffer_sized_to_passthrough_minimum(self) -> None:
+    def test_helper_slots_are_placeholders_with_full_geometry(self) -> None:
         """
         Drive an allreduce with heterogeneous per-group totals via mocked
-        allgather; assert each helper buffer is passthrough-sized.
+        allgather; assert each helper slot is a 1-element placeholder while
+        per_group_sizes carries that group's full total for the kernel geometry.
         """
         state = _make_state(rank=0)
         state = dataclasses.replace(state, intra_node_pytorch_pg=MagicMock())
@@ -560,8 +550,6 @@ class FlatAllreduceTest(unittest.TestCase):
             for r, t in enumerate(tensor_list):
                 t.fill_(group_totals[r // state.sparse_group_size])
 
-        num_chunks = (state.local_size - state.sparse_group_size) + 1
-
         with patch("torchrec.distributed.sharded_relay_utils.dist") as mock_dist:
             mock_dist.all_gather.side_effect = _allgather_side_effect
             mock_dist.ReduceOp = dist.ReduceOp
@@ -571,16 +559,19 @@ class FlatAllreduceTest(unittest.TestCase):
 
         call_kwargs = self._all_calls(state)[0].kwargs
         iter_tensors = call_kwargs["tensors"]
+        iter_sizes = call_kwargs["per_group_sizes"]
         for g in range(state.num_sparse_groups):
             if g == state.my_sparse_group:
                 continue
-            expected_size = _passthrough_helper_size(
-                group_totals[g], state.sparse_group_size, num_chunks
-            )
             self.assertEqual(
                 iter_tensors[g].numel(),
-                expected_size,
-                f"group={g}: helper should be passthrough-sized",
+                1,
+                f"group={g}: helper should be a 1-element placeholder",
+            )
+            self.assertEqual(
+                iter_sizes[g],
+                group_totals[g],
+                f"group={g}: per_group_sizes should carry the full total",
             )
 
     def test_active_buffer_unchanged(self) -> None:
@@ -594,10 +585,11 @@ class FlatAllreduceTest(unittest.TestCase):
         active_tensor = call_kwargs["tensors"][state.my_sparse_group]
         self.assertEqual(active_tensor.numel(), 300)
 
-    def test_bm_fm_real_totals_per_group_helper_buffers(self) -> None:
+    def test_bm_fm_real_totals_use_placeholder_helpers(self) -> None:
         """
-        Using real BM-FM per-group totals, assert that each helper group has
-        its own passthrough-sized buffer.
+        Using real BM-FM per-group totals, assert helper slots are shared
+        1-element placeholders while per_group_sizes carries each group's full
+        total for the kernel geometry.
         """
         state = _make_state(rank=0, sparse_group_size=2, local_size=8)
         state = dataclasses.replace(state, intra_node_pytorch_pg=MagicMock())
@@ -613,26 +605,7 @@ class FlatAllreduceTest(unittest.TestCase):
             for r, t in enumerate(tensor_list):
                 t.fill_(bm_fm_fp16_totals[r // state.sparse_group_size])
 
-        num_chunks = (state.local_size - state.sparse_group_size) + 1
-
-        captured_helper_calls: list[tuple[int, int]] = []
-
-        def _fake_helper(_state, group_idx, total, _dtype, _device):
-            captured_helper_calls.append((group_idx, total))
-            return torch.empty(total, dtype=_dtype, device="meta")
-
-        def _fake_active(_state, total, _dtype, _device):
-            return torch.zeros(1, dtype=_dtype)
-
-        with patch(
-            "torchrec.distributed.sharded_relay_utils._get_active_flat_buf",
-            side_effect=_fake_active,
-        ), patch(
-            "torchrec.distributed.sharded_relay_utils._get_helper_flat_buf",
-            side_effect=_fake_helper,
-        ), patch(
-            "torchrec.distributed.sharded_relay_utils.dist"
-        ) as mock_dist:
+        with patch("torchrec.distributed.sharded_relay_utils.dist") as mock_dist:
             mock_dist.all_gather.side_effect = _allgather_side_effect
             mock_dist.ReduceOp = dist.ReduceOp
             tensors = [torch.zeros(1, dtype=torch.float16)]
@@ -640,22 +613,27 @@ class FlatAllreduceTest(unittest.TestCase):
                 state, {torch.float16: tensors}, "bm_fm_2d_weight_sync"
             )
 
-        # 3 calls to _get_helper_flat_buf (one per helper group, no aliasing)
-        self.assertEqual(
-            len(captured_helper_calls),
-            3,
-            f"Expected 3 helper buffer allocations, got {len(captured_helper_calls)}",
-        )
-        # Each helper buffer should be passthrough-sized
-        for group_idx, total in captured_helper_calls:
-            expected = _passthrough_helper_size(
-                bm_fm_fp16_totals[group_idx], state.sparse_group_size, num_chunks
+        call_kwargs = self._all_calls(state)[0].kwargs
+        iter_tensors = call_kwargs["tensors"]
+        iter_sizes = call_kwargs["per_group_sizes"]
+        helper_ptrs = set()
+        for g in range(state.num_sparse_groups):
+            if g == state.my_sparse_group:
+                continue
+            self.assertEqual(
+                iter_tensors[g].numel(),
+                1,
+                f"group={g}: helper should be a 1-element placeholder",
             )
             self.assertEqual(
-                total,
-                expected,
-                f"group={group_idx}: helper buffer should be passthrough-sized",
+                iter_sizes[g],
+                bm_fm_fp16_totals[g],
+                f"group={g}: per_group_sizes should carry the full total",
             )
+            helper_ptrs.add(iter_tensors[g].data_ptr())
+        self.assertEqual(
+            len(helper_ptrs), 1, "All helper groups should share one placeholder"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -682,20 +660,21 @@ class FusedShardedRelayValidationTest(unittest.TestCase):
             all_active_ranks=all_active_ranks,
         )
 
-    def test_raises_value_error_on_tensor_size_mismatch(self) -> None:
+    def test_raises_value_error_on_active_tensor_size_mismatch(self) -> None:
         """
-        allreduce_multi_group must raise ValueError when tensor.numel() does
-        not match per_group_sizes[g].  This is the validation that catches the
-        bug where a 640M-element scratch buffer was passed with count=10M.
+        allreduce_multi_group must raise ValueError when an ACTIVE group's
+        tensor.numel() does not match per_group_sizes[g].  Helper slots pass a
+        placeholder buffer and are intentionally NOT size-validated (the kernel
+        stages them into internal scratch).
         """
-        fused = self._make_fused(rank=0)
+        fused = self._make_fused(rank=0)  # active for group 0
         tensors = [
-            torch.zeros(1000),  # group 0 — matches
-            torch.zeros(640),  # group 1 — will mismatch (expected 500)
-            torch.zeros(750),  # group 2 — matches
-            torch.zeros(600),  # group 3 — matches
+            torch.zeros(640),  # group 0 (active) — mismatch (expected 500)
+            torch.zeros(1),  # group 1 — helper placeholder (not validated)
+            torch.zeros(1),  # group 2 — helper placeholder (not validated)
+            torch.zeros(1),  # group 3 — helper placeholder (not validated)
         ]
-        per_group_sizes = [1000, 500, 750, 600]  # group 1: 640 vs 500
+        per_group_sizes = [500, 500, 750, 600]  # group 0: 640 vs 500
 
         with self.assertRaises(ValueError) as cm:
             fused.allreduce_multi_group(
@@ -710,6 +689,33 @@ class FusedShardedRelayValidationTest(unittest.TestCase):
         err = str(cm.exception)
         self.assertIn("640", err)  # actual numel
         self.assertIn("500", err)  # expected size
+
+    def test_helper_slot_size_mismatch_is_ignored(self) -> None:
+        """
+        A helper slot's tensor numel need not match per_group_sizes: the kernel
+        stages helpers into internal scratch and never touches the placeholder.
+        Validation must skip non-active slots (RuntimeError from the missing
+        native API is expected, but never a ValueError).
+        """
+        fused = self._make_fused(rank=0)  # active for group 0 only
+        tensors = [
+            torch.zeros(500),  # group 0 (active) — matches
+            torch.zeros(1),  # group 1 (helper) — placeholder, size ignored
+            torch.zeros(1),  # group 2 (helper) — placeholder, size ignored
+            torch.zeros(1),  # group 3 (helper) — placeholder, size ignored
+        ]
+        per_group_sizes = [500, 500, 750, 600]
+
+        with self.assertRaises(RuntimeError) as cm:
+            fused.allreduce_multi_group(
+                tensors=tensors,
+                num_groups=4,
+                per_group_sizes=per_group_sizes,
+                all_active_ranks=[[0, 1], [2, 3], [4, 5], [6, 7]],
+                op=dist.ReduceOp.SUM,
+                skip_validation=False,
+            )
+        self.assertNotIsInstance(cm.exception, ValueError)
 
     def test_count_zero_group_skips_size_validation(self) -> None:
         """
@@ -755,72 +761,6 @@ class FusedShardedRelayValidationTest(unittest.TestCase):
                 op=dist.ReduceOp.SUM,
             )
         self.assertNotIsInstance(cm.exception, ValueError)
-
-
-class _PassthroughHelperSizePolicyTest(unittest.TestCase):
-    """Tests for _passthrough_helper_size — Python ↔ C++ formula parity."""
-
-    def test_passthrough_size_matches_2x_chunkSize_for_realistic_totals(self) -> None:
-        """BM-FM fp16: ~12B elements per group, 8 ranks, 2 active → numChunks=7."""
-        # Worked out by hand from the contract rather than re-derived with the
-        # implementation's own expression -- recomputing
-        # sparse_group_size * align_down(total_g // num_chunks, 128) here would
-        # move both sides of the assertion together and could never fail:
-        #
-        #   12_002_982_488 // 7 = 1_714_711_784   (remainder 0)
-        #   align_down(.., 128) = 1_714_711_680   (trims 104 elements)
-        #   2 * 1_714_711_680   = 3_429_423_360   (< total_g, so no clamp)
-        result = _passthrough_helper_size(12_002_982_488, 2, 7)
-        self.assertEqual(result, 3_429_423_360)
-        # Each of the 2 slots is a whole number of 128-element chunks, which is
-        # the property the alignment exists for.
-        self.assertEqual(result % (2 * 128), 0)
-
-    def test_passthrough_size_falls_back_to_total_for_tiny_counts(self) -> None:
-        """When total_g < num_chunks * CACHE_LINE_SIZE, chunkSize falls back to total_g."""
-        total_g = 100
-        sparse_group_size = 2
-        num_chunks = 7
-        result = _passthrough_helper_size(total_g, sparse_group_size, num_chunks)
-        # chunk = 100 // 7 = 14, chunk_aligned = (14 // 128) * 128 = 0
-        # fallback: chunk_aligned = total_g = 100
-        # result = min(100, 2 * 100) = 100
-        self.assertEqual(result, total_g)
-
-    def test_passthrough_size_capped_at_total_g(self) -> None:
-        """Result must never exceed total_g."""
-        total_g = 128
-        sparse_group_size = 2
-        num_chunks = 7
-        result = _passthrough_helper_size(total_g, sparse_group_size, num_chunks)
-        self.assertLessEqual(result, total_g)
-
-    def test_python_meets_cpp_min_required_at_alignment_boundary(self) -> None:
-        """At exact alignment boundaries, Python and C++ formulas agree."""
-        # total_g = 7 * 128 * 1000 = 896_000 divides evenly by num_chunks * 128,
-        # so nothing is lost to alignment: 896_000 // 7 = 128_000, which is
-        # already 128-aligned, and 2 * 128_000 = 256_000 stays under total_g.
-        self.assertEqual(_passthrough_helper_size(7 * 128 * 1000, 2, 7), 256_000)
-
-    def test_total_per_rank_helper_memory_is_6x_chunkSize(self) -> None:
-        """
-        For 4 groups / 2 active per group: each rank helps 3 groups.
-        Total helper memory = 3 × 2 × chunkSize = 6 × chunkSize.
-        """
-        total_g = 12_002_982_488  # BM-FM fp16 group 0
-        sparse_group_size = 2
-        num_chunks = 7
-        helper_per_group = _passthrough_helper_size(
-            total_g, sparse_group_size, num_chunks
-        )
-        # Literals rather than a re-derivation of the implementation's own
-        # expression, which would make these assertions unfalsifiable:
-        # align_down(12_002_982_488 // 7, 128) = 1_714_711_680, and the helper
-        # buffer holds 2 of those chunks.
-        self.assertEqual(helper_per_group, 3_429_423_360)
-        # 3 helper groups per rank, so 3 x 2 = 6 aligned chunks in total:
-        # 6 * 1_714_711_680.
-        self.assertEqual(3 * helper_per_group, 10_288_270_080)
 
 
 # ---------------------------------------------------------------------------
@@ -913,7 +853,7 @@ class FlatReduceScatterTest(unittest.TestCase):
                 "test",
             )
 
-    def test_helper_buffers_passthrough_sized_and_distinct(self) -> None:
+    def test_helper_slots_are_shared_placeholder(self) -> None:
         state = _make_state(rank=0)
         reduce_scatter_tensors_with_sharded_relay(
             state,
@@ -925,21 +865,19 @@ class FlatReduceScatterTest(unittest.TestCase):
         in_tensors = kwargs["input_tensors"]
         out_tensors = kwargs["output_tensors"]
         recv = kwargs["per_group_recv_counts"]
-        num_chunks = (state.local_size - state.sparse_group_size) + 1
 
         helper_ptrs = set()
         for g in range(state.num_sparse_groups):
             if g == state.my_sparse_group:
                 continue
-            expected = _passthrough_helper_size(
-                recv[g], state.sparse_group_size, num_chunks
-            )
-            self.assertEqual(in_tensors[g].numel(), expected)
-            # Helper uses one scratch buffer for both send and recv.
+            # Helper slot is a 1-element placeholder; recv count keeps geometry.
+            self.assertEqual(in_tensors[g].numel(), 1)
+            self.assertEqual(recv[g], recv[state.my_sparse_group])
+            # Helper in/out both alias the single shared placeholder.
             self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
             helper_ptrs.add(in_tensors[g].data_ptr())
 
-        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+        self.assertEqual(len(helper_ptrs), 1)
 
     def test_active_output_is_separate_flat_buffer(self) -> None:
         # Flat-concat scheme: the active group's output is a separate internal
@@ -1277,7 +1215,7 @@ class FlatAllToAllTest(unittest.TestCase):
                 "test",
             )
 
-    def test_helper_buffers_passthrough_sized_and_distinct(self) -> None:
+    def test_helper_slots_are_shared_placeholder(self) -> None:
         state = _make_state(rank=0)
         all_to_all_tensors_with_sharded_relay(
             state,
@@ -1289,21 +1227,19 @@ class FlatAllToAllTest(unittest.TestCase):
         in_tensors = kwargs["input_tensors"]
         out_tensors = kwargs["output_tensors"]
         seg = kwargs["per_group_segment_counts"]
-        num_chunks = (state.local_size - state.sparse_group_size) + 1
 
         helper_ptrs = set()
         for g in range(state.num_sparse_groups):
             if g == state.my_sparse_group:
                 continue
-            expected = _passthrough_helper_size(
-                seg[g], state.sparse_group_size, num_chunks
-            )
-            self.assertEqual(in_tensors[g].numel(), expected)
-            # Helper uses one scratch buffer for both send and recv.
+            # Helper slot is a 1-element placeholder; segment count keeps geometry.
+            self.assertEqual(in_tensors[g].numel(), 1)
+            self.assertEqual(seg[g], seg[state.my_sparse_group])
+            # Helper in/out both alias the single shared placeholder.
             self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
             helper_ptrs.add(in_tensors[g].data_ptr())
 
-        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+        self.assertEqual(len(helper_ptrs), 1)
 
     def test_output_flat_distinct_from_input_flat(self) -> None:
         """All-to-all is out-of-place: active output flat must differ from input."""
@@ -1602,7 +1538,7 @@ class FlatAllGatherTest(unittest.TestCase):
                 "test",
             )
 
-    def test_helper_buffers_passthrough_sized_and_distinct(self) -> None:
+    def test_helper_slots_are_shared_placeholder(self) -> None:
         state = _make_state(rank=0)
         all_gather_tensors_with_sharded_relay(
             state,
@@ -1614,20 +1550,18 @@ class FlatAllGatherTest(unittest.TestCase):
         in_tensors = kwargs["input_tensors"]
         out_tensors = kwargs["output_tensors"]
         send = kwargs["per_group_send_counts"]
-        num_chunks = (state.local_size - state.sparse_group_size) + 1
 
         helper_ptrs = set()
         for g in range(state.num_sparse_groups):
             if g == state.my_sparse_group:
                 continue
-            expected = _passthrough_helper_size(
-                send[g], state.sparse_group_size, num_chunks
-            )
-            self.assertEqual(in_tensors[g].numel(), expected)
+            # Helper slot is a 1-element placeholder; send count keeps geometry.
+            self.assertEqual(in_tensors[g].numel(), 1)
+            self.assertEqual(send[g], send[state.my_sparse_group])
             self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
             helper_ptrs.add(in_tensors[g].data_ptr())
 
-        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+        self.assertEqual(len(helper_ptrs), 1)
 
     def test_active_input_is_separate_flat_buffer(self) -> None:
         # Flat-concat scheme: the active group's input is a separate internal
@@ -1888,7 +1822,7 @@ class FlatAllreduce4ActiveTest(unittest.TestCase):
         self.assertEqual(kwargs["num_groups"], 2)
         self.assertEqual(kwargs["per_group_sizes"][state.my_sparse_group], 400)
 
-    def test_helper_buffers_passthrough_sized_4active(self) -> None:
+    def test_helper_slots_are_placeholder_4active(self) -> None:
         state = _make_state(rank=0, sparse_group_size=4, local_size=8)
         allreduce_tensors_with_sharded_relay(
             state, {torch.float32: [torch.zeros(800)]}, "test"
@@ -1902,14 +1836,14 @@ class FlatAllreduce4ActiveTest(unittest.TestCase):
             if g == state.my_sparse_group:
                 self.assertEqual(iter_tensors[g].numel(), 800)
                 continue
-            # Flat A>2 allreduce: the util sizes the helper 2*total_g
-            # ((A+1)*oChunk <= 1.25*total_g), not the recursive _passthrough.
-            expected = 2 * iter_sizes[g]
-            self.assertEqual(iter_tensors[g].numel(), expected)
+            # Helper slot is a 1-element placeholder; per_group_sizes keeps the
+            # full geometry for the kernel.
+            self.assertEqual(iter_tensors[g].numel(), 1)
+            self.assertEqual(iter_sizes[g], 800)
             helper_ptrs.add(iter_tensors[g].data_ptr())
 
-        # Each rank is helper for exactly num_sparse_groups - 1 == 1 group.
-        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+        # One shared placeholder across all helper groups.
+        self.assertEqual(len(helper_ptrs), 1)
 
     def test_active_group_is_group_zero_for_rank0(self) -> None:
         state = _make_state(rank=0, sparse_group_size=4, local_size=8)
@@ -1953,61 +1887,6 @@ class FusedAllreduce4ActiveValidationTest(unittest.TestCase):
         self.assertNotIsInstance(cm.exception, ValueError)
 
 
-class _PassthroughHelperSize4ActivePolicyTest(unittest.TestCase):
-    """_passthrough_helper_size against hand-computed sizes, not the formula.
-
-    Every expected value below is worked out by hand from the documented
-    contract and written in as a literal. Re-deriving it with the same
-    ``min(total_g, A * align_down(total_g // num_chunks, 128))`` expression the
-    implementation uses would make the assertion unfalsifiable: any change to
-    the formula would move both sides together and the test would still pass.
-    The three branches of that contract are covered -- ordinary alignment loss,
-    the ``min()`` clamp, and the ``chunk_aligned == 0`` fallback.
-    """
-
-    def test_passthrough_size_4active(self) -> None:
-        # 4-active on an 8-rank node: num_chunks = (8 - 4) + 1 = 5.
-        #
-        # 12_002_982_488 // 5      = 2_400_596_497   (remainder 3)
-        # align_down(.., 128)      = 2_400_596_480   (trims 17 elements)
-        # 4 * 2_400_596_480        = 9_602_385_920   (< total_g, so no clamp)
-        self.assertEqual(_passthrough_helper_size(12_002_982_488, 4, 5), 9_602_385_920)
-        # A total that is already a multiple of num_chunks * 128 loses nothing to
-        # alignment, and lands on the same size because the case above only had a
-        # sub-128 remainder to trim.
-        self.assertEqual(_passthrough_helper_size(12_002_982_400, 4, 5), 9_602_385_920)
-
-    def test_passthrough_size_per_slot_is_chunk_aligned(self) -> None:
-        # The buffer holds sparse_group_size slots, so whenever min() has not
-        # clamped, each slot must be a whole number of 128-element chunks. This
-        # is the property the 128-alignment exists for.
-        for total_g, sparse_group_size, num_chunks in (
-            (12_002_982_488, 4, 5),
-            (12_002_982_488, 2, 7),
-            (1_000_000, 4, 5),
-        ):
-            with self.subTest(total_g=total_g, A=sparse_group_size):
-                result = _passthrough_helper_size(
-                    total_g, sparse_group_size, num_chunks
-                )
-                self.assertLess(result, total_g, "expected no min() clamp here")
-                self.assertEqual(result % (sparse_group_size * 128), 0)
-
-    def test_passthrough_size_clamps_to_total(self) -> None:
-        # sparse_group_size >= num_chunks makes A * chunk_aligned exceed total_g,
-        # so min() clamps: 10_000 // 2 = 5_000 -> 4_992 -> 4 * 4_992 = 19_968,
-        # which is larger than total_g.
-        self.assertEqual(_passthrough_helper_size(10_000, 4, 2), 10_000)
-
-    def test_passthrough_size_falls_back_below_one_chunk(self) -> None:
-        # 500 // 5 = 100, and align_down(100, 128) == 0, so the fallback replaces
-        # chunk_aligned with total_g; min() then clamps the product back to 500.
-        self.assertEqual(_passthrough_helper_size(500, 4, 5), 500)
-        # 2-active production shape, for contrast: num_chunks = (8 - 2) + 1 = 7,
-        # 12_002_982_488 // 7 = 1_714_711_784 -> 1_714_711_680 -> x2.
-        self.assertEqual(_passthrough_helper_size(12_002_982_488, 2, 7), 3_429_423_360)
-
-
 class FlatReduceScatter4ActiveTest(unittest.TestCase):
     """reduce_scatter_tensors_with_sharded_relay with sparse_group_size=4.
 
@@ -2042,7 +1921,7 @@ class FlatReduceScatter4ActiveTest(unittest.TestCase):
             100,
         )
 
-    def test_helper_buffers_sized_to_2x_recv_count_4active(self) -> None:
+    def test_helper_slots_are_placeholder_4active(self) -> None:
         state = _make_state(rank=0, sparse_group_size=4, local_size=8)
         # input total 800 -> recv_count 200
         reduce_scatter_tensors_with_sharded_relay(
@@ -2062,16 +1941,14 @@ class FlatReduceScatter4ActiveTest(unittest.TestCase):
                 self.assertEqual(in_tensors[g].numel(), 800)
                 self.assertEqual(out_tensors[g].numel(), 200)
                 continue
-            # A>2 reduce-scatter reduces at the helper and retains the
-            # 2 * recvCount helper-buffer contract.
-            expected = 2 * recv[g]
-            self.assertEqual(in_tensors[g].numel(), expected)
-            # Helper uses one scratch buffer for both send and recv.
+            # Helper slot is a 1-element placeholder; recv count keeps geometry.
+            self.assertEqual(in_tensors[g].numel(), 1)
+            self.assertEqual(recv[g], recv[state.my_sparse_group])
+            # Helper in/out both alias the single shared placeholder.
             self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
             helper_ptrs.add(in_tensors[g].data_ptr())
 
-        # Each rank is helper for exactly num_sparse_groups - 1 == 1 group.
-        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+        self.assertEqual(len(helper_ptrs), 1)
 
     def test_in_place_output_aliases_input_owned_block(self) -> None:
         # 4-active in-place: the active output is an owned-block view into the
@@ -2191,7 +2068,7 @@ class FlatAllToAll4ActiveTest(unittest.TestCase):
             kwargs["output_tensors"][my_g].data_ptr(),
         )
 
-    def test_helper_buffers_one_segment_sized_4active(self) -> None:
+    def test_helper_slots_are_placeholder_4active(self) -> None:
         state = _make_state(rank=0, sparse_group_size=4, local_size=8)
         # input total 800 -> segment_count 200
         all_to_all_tensors_with_sharded_relay(
@@ -2203,6 +2080,7 @@ class FlatAllToAll4ActiveTest(unittest.TestCase):
         kwargs = self._all_calls(state)[0].kwargs
         in_tensors = kwargs["input_tensors"]
         out_tensors = kwargs["output_tensors"]
+        seg = kwargs["per_group_segment_counts"]
 
         helper_ptrs = set()
         for g in range(state.num_sparse_groups):
@@ -2210,14 +2088,14 @@ class FlatAllToAll4ActiveTest(unittest.TestCase):
                 self.assertEqual(in_tensors[g].numel(), 800)
                 self.assertEqual(out_tensors[g].numel(), 800)
                 continue
-            # One segment bounds the routed A=4 XOR helper scratch; direct
-            # routes keep the same production allocation unused.
-            self.assertEqual(in_tensors[g].numel(), 200)
-            # Helper uses one scratch buffer for both send and recv.
+            # Helper slot is a 1-element placeholder; segment count keeps geometry.
+            self.assertEqual(in_tensors[g].numel(), 1)
+            self.assertEqual(seg[g], seg[state.my_sparse_group])
+            # Helper in/out both alias the single shared placeholder.
             self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
             helper_ptrs.add(in_tensors[g].data_ptr())
 
-        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+        self.assertEqual(len(helper_ptrs), 1)
 
     def test_active_group_is_group_zero_for_rank0(self) -> None:
         state = _make_state(rank=0, sparse_group_size=4, local_size=8)
@@ -2318,7 +2196,7 @@ class FlatAllGather4ActiveTest(unittest.TestCase):
             400,
         )
 
-    def test_helper_buffers_passthrough_sized_4active(self) -> None:
+    def test_helper_slots_are_placeholder_4active(self) -> None:
         state = _make_state(rank=0, sparse_group_size=4, local_size=8)
         # send_count 200 -> output 800
         all_gather_tensors_with_sharded_relay(
@@ -2338,14 +2216,13 @@ class FlatAllGather4ActiveTest(unittest.TestCase):
                 self.assertEqual(in_tensors[g].numel(), 200)
                 self.assertEqual(out_tensors[g].numel(), 800)
                 continue
-            # Flat A>2 all-gather: the util sizes the helper A*send_count
-            # (matches the kernel's A*cs broadcast scratch), not _passthrough.
-            expected = state.sparse_group_size * send[g]
-            self.assertEqual(in_tensors[g].numel(), expected)
+            # Helper slot is a 1-element placeholder; send count keeps geometry.
+            self.assertEqual(in_tensors[g].numel(), 1)
+            self.assertEqual(send[g], send[state.my_sparse_group])
             self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
             helper_ptrs.add(in_tensors[g].data_ptr())
 
-        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+        self.assertEqual(len(helper_ptrs), 1)
 
     def test_active_input_is_separate_flat_buffer_4active(self) -> None:
         # Flat-concat scheme: the active group's input is a separate internal

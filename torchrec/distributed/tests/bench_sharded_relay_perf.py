@@ -326,7 +326,11 @@ def _make_fused(
     )
 
 
-from torchrec.distributed.sharded_relay_utils import _passthrough_helper_size
+def _helper_placeholder(dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """Helper group slots pass a shared 1-element placeholder: the C++ kernel
+    stages helpers into its own internal scratch and never touches this buffer,
+    so callers no longer allocate per-group helper buffers."""
+    return torch.empty(1, dtype=dtype, device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -349,9 +353,8 @@ def bench_fused_flat(
 ) -> None:
     """ONE fused call with all tensors concatenated per group.
 
-    Uses per-group passthrough-sized helper buffers (nActiveRanks × chunkSize).
-    Each helper group has its own buffer — no aliasing — because the
-    phase-sync kernel processes all groups simultaneously.
+    Helper groups pass a 1-element placeholder: the kernel stages helpers into
+    its own internal scratch and never touches the caller's buffer.
     """
     device = my_tensors[0].device
     dtype = my_tensors[0].dtype
@@ -384,9 +387,6 @@ def bench_fused_flat(
             meta_cache[meta_key] = [my_total] * num_sparse_groups
     per_group_totals = meta_cache[meta_key]
 
-    # Compute per-group passthrough helper sizes.
-    num_chunks = (local_size - sparse_group_size) + 1
-
     group_tensors: list[torch.Tensor] = []
     group_sizes: list[int] = []
     for g in range(num_sparse_groups):
@@ -394,26 +394,11 @@ def bench_fused_flat(
             group_tensors.append(active_flat)
             group_sizes.append(my_total)
         else:
-            total_g = per_group_totals[g]
-            if sparse_group_size > 2:
-                # Flat A>2 allreduce: helper holds A source chunks + 1 reduced
-                # chunk per offload slice = (A+1)*oChunk <= 1.25*total_g for any
-                # offload fraction f<=1; 2*total_g covers it with margin.
-                helper_size_g = 2 * total_g
-            else:
-                helper_size_g = _passthrough_helper_size(
-                    total_g, sparse_group_size, num_chunks
-                )
-            # Ensure the per-group helper buffer in flat_bufs is large enough.
-            if flat_bufs[g].numel() < helper_size_g:
-                flat_bufs[g] = torch.empty(helper_size_g, dtype=dtype, device=device)
-            helper_buf = flat_bufs[g]
-            group_tensors.append(
-                helper_buf
-                if helper_buf.numel() == helper_size_g
-                else helper_buf.narrow(0, 0, helper_size_g)
-            )
-            group_sizes.append(total_g)  # full count goes to the kernel
+            # Helper slot: the kernel stages into internal scratch and never
+            # touches this buffer, so pass a placeholder. The full count still
+            # drives the kernel geometry.
+            group_tensors.append(_helper_placeholder(dtype, device))
+            group_sizes.append(per_group_totals[g])
 
     fused.allreduce_multi_group(
         tensors=group_tensors,
@@ -1007,24 +992,14 @@ def _benchmark_worker(
 
     # Helper sizes for Bench B and C
     total_my = sum(sizes)
-    # With the passthrough kernel, each helper group gets its own buffer
-    # sized to nActiveRanks × chunkSize (passthrough minimum).
-    num_chunks = (world_size - sparse_group_size) + 1
 
-    # Benchmark B flat buffers: active = total_my, each helper = passthrough size.
+    # Benchmark B flat buffers: active = total_my, each helper = placeholder.
     flat_bufs: list[torch.Tensor] = []
     for g in range(num_sparse_groups):
         if g == my_sparse_group:
             flat_bufs.append(torch.zeros(total_my, dtype=dtype, device=device))
         else:
-            helper_total_g = sum(all_tensors_sizes[g])
-            if sparse_group_size > 2:
-                helper_size_g = 2 * helper_total_g
-            else:
-                helper_size_g = _passthrough_helper_size(
-                    helper_total_g, sparse_group_size, num_chunks
-                )
-            flat_bufs.append(torch.zeros(helper_size_g, dtype=dtype, device=device))
+            flat_bufs.append(_helper_placeholder(dtype, device))
     meta_cache_b: dict[str, list[int]] = {
         "bench"
         + str(dtype): [sum(all_tensors_sizes[g]) for g in range(num_sparse_groups)]
@@ -1045,22 +1020,13 @@ def _benchmark_worker(
         else [prod_totals[g] for g in range(num_sparse_groups)]
     )
     kernel_tensor = torch.ones(kernel_elements, dtype=dtype, device=device)
-    # For kernel bench, each helper group gets its own passthrough-sized buffer.
+    # For kernel bench, each helper group passes a placeholder buffer.
     kernel_scratch: list[torch.Tensor] = []
     for g in range(num_sparse_groups):
         if g == my_sparse_group:
             kernel_scratch.append(kernel_tensor)
         else:
-            declared_g = kernel_declared_sizes[g]
-            if sparse_group_size > 2:
-                helper_size_g = 2 * declared_g
-            else:
-                helper_size_g = _passthrough_helper_size(
-                    declared_g, sparse_group_size, num_chunks
-                )
-            kernel_scratch.append(
-                torch.empty(helper_size_g, dtype=dtype, device=device)
-            )
+            kernel_scratch.append(_helper_placeholder(dtype, device))
 
     # One barrier + kernel warmup to trigger HIP JIT compilation before timing.
     torch.cuda.synchronize()
@@ -1172,19 +1138,7 @@ def _benchmark_worker(
         if g == my_sparse_group:
             rs_helper_bufs.append(rs_output)  # unused for the active group
         else:
-            if sparse_group_size > 2:
-                # A>2 reduces at the helper and needs 2 x recv_count (mirrors
-                # the allreduce benches and _relay_helper_size's reduce_scatter
-                # case). The A=2 passthrough size under-allocates for A=4, so the
-                # kernel writes past the helper buffer -> GPU memory access fault.
-                rs_helper_size_g = 2 * rs_recv_counts[g]
-            else:
-                rs_helper_size_g = _passthrough_helper_size(
-                    rs_recv_counts[g], sparse_group_size, num_chunks
-                )
-            rs_helper_bufs.append(
-                torch.empty(rs_helper_size_g, dtype=dtype, device=device)
-            )
+            rs_helper_bufs.append(_helper_placeholder(dtype, device))
 
     def run_reduce_scatter() -> None:
         # Production path: pack the per-table model input into the contiguous
@@ -1262,17 +1216,7 @@ def _benchmark_worker(
         if g == my_sparse_group:
             a2a_helper_bufs.append(a2a_output)  # unused for the active group
         else:
-            if sparse_group_size > 2:
-                # Match production: one segment bounds the A=4 XOR path's
-                # three compact relay slots and is unused on direct routes.
-                a2a_helper_size_g = a2a_seg_counts[g]
-            else:
-                a2a_helper_size_g = _passthrough_helper_size(
-                    a2a_seg_counts[g], sparse_group_size, num_chunks
-                )
-            a2a_helper_bufs.append(
-                torch.empty(a2a_helper_size_g, dtype=dtype, device=device)
-            )
+            a2a_helper_bufs.append(_helper_placeholder(dtype, device))
 
     def run_all_to_all() -> None:
         # Production path: pack the per-table model input into the contiguous
@@ -1347,18 +1291,7 @@ def _benchmark_worker(
         if g == my_sparse_group:
             ag_helper_bufs.append(ag_output)  # unused for the active group
         else:
-            if sparse_group_size > 2:
-                # Flat A>2 path: each helper stores one offload chunk per active
-                # source (A*cs <= send_count). A*send_count safely covers that
-                # (and matches the C++ tests).
-                ag_helper_size_g = sparse_group_size * ag_send_counts[g]
-            else:
-                ag_helper_size_g = _passthrough_helper_size(
-                    ag_send_counts[g], sparse_group_size, num_chunks
-                )
-            ag_helper_bufs.append(
-                torch.empty(ag_helper_size_g, dtype=dtype, device=device)
-            )
+            ag_helper_bufs.append(_helper_placeholder(dtype, device))
 
     def run_all_gather() -> None:
         # Production path: pack the per-table model input into the contiguous
@@ -1694,30 +1627,12 @@ def _active_io(
 def _relay_helper_size(
     collective: str, active_ranks: int, elements: int, num_chunks: int
 ) -> int:
-    """Helper-buffer element count for a single helper group's relay tensor.
+    """Element count for a helper group's placeholder tensor.
 
-    Mirrors the per-collective helper sizing _benchmark_worker uses for A=2 vs A>2.
+    Helper slots are ignored by the kernel (it stages into internal scratch),
+    so a 1-element placeholder is sufficient for every collective.
     """
-    if collective == "allreduce":
-        if active_ranks > 2:
-            return 2 * elements
-        return _passthrough_helper_size(elements, active_ranks, num_chunks)
-    if collective == "reduce_scatter":
-        recv = elements // active_ranks
-        if active_ranks > 2:
-            # A>2 reduces at the helper: one chunk per (owner, source) pair.
-            return 2 * recv
-        return _passthrough_helper_size(recv, active_ranks, num_chunks)
-    if collective == "all_to_all":
-        if active_ranks > 2:
-            return elements // active_ranks
-        seg = elements // active_ranks
-        return _passthrough_helper_size(seg, active_ranks, num_chunks)
-    if collective == "all_gather":
-        if active_ranks > 2:
-            return active_ranks * elements
-        return _passthrough_helper_size(elements, active_ranks, num_chunks)
-    raise ValueError(f"unknown collective {collective!r}")
+    return 1
 
 
 def _relay_counts(
@@ -1766,7 +1681,7 @@ def _build_relay_group_lists(
 ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
     """Per-group (input, output) tensor lists for a FUSED relay call, built ONCE
     outside the timed loop: the active group slot holds this rank's real
-    tensors; every other (helper) slot holds that group's passthrough scratch.
+    tensors; every other (helper) slot holds a placeholder (unused by the kernel).
     For allreduce (in-place) out_list mirrors in_list and is otherwise unused."""
     in_list: list[torch.Tensor] = []
     out_list: list[torch.Tensor] = []
