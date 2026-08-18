@@ -90,6 +90,7 @@ _DRAIN_WAIT_WARN_INTERVAL_SEC: float = 60.0
 # an orphaned GLOO all_gather (a peer rank skipped the collective), an unbounded
 # join hangs the post_train_teardown lease and the whole job is StuckJob-killed.
 _COMPUTE_SHUTDOWN_JOIN_TIMEOUT_SEC: float = 300.0
+_JAGGED_LENGTHS_SUFFIX: str = "_lengths"
 
 
 def _format_thread_stack(thread: threading.Thread) -> str:
@@ -102,8 +103,24 @@ def _format_thread_stack(thread: threading.Thread) -> str:
     return "".join(traceback.format_stack(frame))
 
 
-def _job_batch_size(model_out: Dict[str, torch.Tensor]) -> int:
-    sizes = [t.shape[0] for t in model_out.values() if t.dim() >= 1]
+def _jagged_value_keys(
+    tensors: Mapping[str, torch.Tensor], candidate_keys: set[str]
+) -> set[str]:
+    return {
+        key
+        for key in candidate_keys
+        if key in tensors and key + _JAGGED_LENGTHS_SUFFIX in tensors
+    }
+
+
+def _job_batch_size(
+    model_out: Dict[str, torch.Tensor], jagged_value_keys: set[str]
+) -> int:
+    sizes = [
+        tensor.shape[0]
+        for key, tensor in model_out.items()
+        if key not in jagged_value_keys and tensor.dim() >= 1
+    ]
     return max(sizes) if sizes else 1
 
 
@@ -131,11 +148,58 @@ def _merge_tensors_across_jobs(
     )
 
 
-def _merge_update_jobs(jobs: list[MetricUpdateJob]) -> MetricUpdateJob:
+def _concatenate_variable_cardinality(
+    tensors: list[torch.Tensor],
+) -> torch.Tensor:
+    rank = tensors[0].dim()
+    trailing_shape = tensors[0].shape[1:]
+    if any(
+        tensor.dim() != rank or tensor.shape[1:] != trailing_shape
+        for tensor in tensors[1:]
+    ):
+        raise RecMetricException(
+            "cannot concatenate tensors with shapes "
+            f"{[tuple(tensor.shape) for tensor in tensors]}: dimensions after "
+            "dim 0 must match"
+        )
+    return torch.cat(tensors, dim=0)
+
+
+def _merge_tensor_mappings(
+    mappings: list[Mapping[str, torch.Tensor]],
+    batch_sizes: list[int],
+    mapping_name: str,
+    jagged_value_keys: set[str],
+) -> Dict[str, torch.Tensor]:
+    first = mappings[0]
+    jagged_value_keys = _jagged_value_keys(first, jagged_value_keys)
+    merged: Dict[str, torch.Tensor] = {}
+    for key in first:
+        tensors = [mapping[key] for mapping in mappings]
+        try:
+            if key in jagged_value_keys or all(
+                tensor.numel() == 0 for tensor in tensors
+            ):
+                merged[key] = _concatenate_variable_cardinality(tensors)
+            else:
+                merged[key] = _merge_tensors_across_jobs(tensors, batch_sizes)
+        except (RecMetricException, RuntimeError) as error:
+            raise RecMetricException(
+                f"failed to merge {mapping_name} key {key!r}: {error}"
+            ) from error
+    return merged
+
+
+def _merge_update_jobs(
+    jobs: list[MetricUpdateJob], jagged_value_keys: Optional[set[str]] = None
+) -> MetricUpdateJob:
     """
     Merge a list of MetricUpdateJobs into a single job by concatenating
     per-key tensors in `model_out` and any tensor entries in
     `kwargs['required_inputs']` along the batch dimension (dim=0).
+    Required input values listed in `jagged_value_keys` and paired with a
+    `<key>_lengths` tensor retain their jagged cardinality. Fields that are
+    empty in every job remain empty.
 
     Worker-side input batching: K mini-batches' worth of model outputs
     are passed as a single (concatenated) job, cutting the DtoH transfer,
@@ -151,21 +215,24 @@ def _merge_update_jobs(jobs: list[MetricUpdateJob]) -> MetricUpdateJob:
         return jobs[0]
 
     first = jobs[0]
-    batch_sizes = [_job_batch_size(j.model_out) for j in jobs]
-    merged_model_out: Dict[str, torch.Tensor] = {
-        key: _merge_tensors_across_jobs([j.model_out[key] for j in jobs], batch_sizes)
-        for key in first.model_out.keys()
-    }
+    jagged_value_keys = jagged_value_keys or set()
+    batch_sizes = [_job_batch_size(job.model_out, jagged_value_keys) for job in jobs]
+    merged_model_out = _merge_tensor_mappings(
+        [job.model_out for job in jobs],
+        batch_sizes,
+        "model_out",
+        jagged_value_keys,
+    )
 
     merged_kwargs: Dict[str, Any] = dict(first.kwargs)
     required_inputs_first = first.kwargs.get("required_inputs")
     if isinstance(required_inputs_first, dict) and required_inputs_first:
-        merged_required: Dict[str, torch.Tensor] = {
-            key: _merge_tensors_across_jobs(
-                [j.kwargs["required_inputs"][key] for j in jobs], batch_sizes
-            )
-            for key in required_inputs_first.keys()
-        }
+        merged_required = _merge_tensor_mappings(
+            [job.kwargs["required_inputs"] for job in jobs],
+            batch_sizes,
+            "required_inputs",
+            jagged_value_keys,
+        )
         merged_kwargs["required_inputs"] = merged_required
 
     return MetricUpdateJob(
@@ -517,6 +584,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             if transfer_completed_event is not None:
                 transfer_completed_event.synchronize()
 
+            cpu_model_out = self._prepare_model_out_for_metrics(cpu_model_out)
             labels, predictions, weights, required_inputs = parse_task_model_outputs(
                 self.rec_tasks,
                 cpu_model_out,
@@ -921,7 +989,12 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         try:
             try:
                 if pending_jobs:
-                    self._process_metric_update_job(_merge_update_jobs(pending_jobs))
+                    self._process_metric_update_job(
+                        _merge_update_jobs(
+                            pending_jobs,
+                            jagged_value_keys=set(self.get_required_inputs() or []),
+                        )
+                    )
             except Exception:
                 if pending_marker is not None and not pending_marker.future.done():
                     # pyrefly: ignore[implicit-import]
