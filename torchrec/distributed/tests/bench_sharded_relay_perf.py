@@ -1172,9 +1172,16 @@ def _benchmark_worker(
         if g == my_sparse_group:
             rs_helper_bufs.append(rs_output)  # unused for the active group
         else:
-            rs_helper_size_g = _passthrough_helper_size(
-                rs_recv_counts[g], sparse_group_size, num_chunks
-            )
+            if sparse_group_size > 2:
+                # A>2 reduces at the helper and needs 2 x recv_count (mirrors
+                # the allreduce benches and _relay_helper_size's reduce_scatter
+                # case). The A=2 passthrough size under-allocates for A=4, so the
+                # kernel writes past the helper buffer -> GPU memory access fault.
+                rs_helper_size_g = 2 * rs_recv_counts[g]
+            else:
+                rs_helper_size_g = _passthrough_helper_size(
+                    rs_recv_counts[g], sparse_group_size, num_chunks
+                )
             rs_helper_bufs.append(
                 torch.empty(rs_helper_size_g, dtype=dtype, device=device)
             )
