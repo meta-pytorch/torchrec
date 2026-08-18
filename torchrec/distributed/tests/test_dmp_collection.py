@@ -11,7 +11,9 @@ import unittest
 from unittest.mock import MagicMock
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+from torchrec.distributed.model_parallel import DMPCollection
 from torchrec.distributed.types import (
     DMPCollectionConfig,
     DMPCollectionContext,
@@ -255,6 +257,53 @@ class TestDMPCollectionContext(unittest.TestCase):
         self.assertNotIn("weights_by_dtype=", repr_str)
         self.assertNotIn("optimizer_tensors_by_dtype=", repr_str)
         self.assertNotIn("sharded_module=", repr_str)
+
+
+class TestDMPCollectionAllReduceHook(unittest.TestCase):
+    def _dmp(self) -> DMPCollection:
+        dmp = DMPCollection.__new__(DMPCollection)
+        dmp._custom_all_reduce = None
+        dmp._all_reduce_hook = None
+        dmp._use_sharded_relay = False
+        dmp._sharded_relay_state = None
+        return dmp
+
+    def test_set_hook_receives_process_group_and_tensors(self) -> None:
+        dmp = self._dmp()
+        process_group = MagicMock(spec=dist.ProcessGroup)
+        context = MagicMock(spec=DMPCollectionContext)
+        context.replica_pg = process_group
+        tensors = [torch.ones(2)]
+        hook = MagicMock()
+
+        dmp.set_all_reduce_hook(hook)
+        dmp._allreduce_tensors(
+            context,
+            {torch.float32: tensors},
+            "test_all_reduce",
+        )
+
+        hook.assert_called_once_with(process_group, tensors)
+
+    def test_set_hook_overrides_legacy_constructor_hook(self) -> None:
+        dmp = self._dmp()
+        legacy_hook = MagicMock()
+        setter_hook = MagicMock()
+        process_group = MagicMock(spec=dist.ProcessGroup)
+        context = MagicMock(spec=DMPCollectionContext)
+        context.replica_pg = process_group
+        tensors = [torch.ones(2)]
+        dmp._custom_all_reduce = legacy_hook
+
+        dmp.set_all_reduce_hook(setter_hook)
+        dmp._allreduce_tensors(
+            context,
+            {torch.float32: tensors},
+            "test_all_reduce",
+        )
+
+        legacy_hook.assert_not_called()
+        setter_hook.assert_called_once_with(process_group, tensors)
 
 
 class TestShardingStrategy(unittest.TestCase):
