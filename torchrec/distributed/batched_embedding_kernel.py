@@ -129,6 +129,9 @@ if TYPE_CHECKING:
     from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
         TritonTableBatchedEmbeddingBags,
     )
+    from torchrec.experimental.torch_tpu.modules.embedding_modules import (
+        TPUEmbeddingUnfused,
+    )
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -4713,3 +4716,82 @@ class BatchedDenseEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
         yield append_prefix(prefix, f"{combined_key}.weight"), cast(
             nn.Parameter, self._emb_module.weights
         )
+
+
+class BatchedTPUEmbedding(BaseBatchedEmbedding[torch.Tensor]):
+    """Non-pooled TPU compute kernel (`UNFUSED_TPU`).
+
+    Modeled after the CPU `BatchedDenseEmbedding` class.
+
+    Args:
+        config (GroupedEmbeddingConfig): grouped table config (one or more tables).
+        pg (Optional[dist.ProcessGroup]): process group (unused locally).
+        device (Optional[torch.device]): compute device.
+    """
+
+    def __init__(
+        self,
+        config: GroupedEmbeddingConfig,
+        pg: Optional[dist.ProcessGroup] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__(config, pg, device)
+        dtype = data_type_to_sparse_type(config.data_type).as_dtype()
+        # Lazy import to avoid pulling in experimental TPU code at module load time.
+        from torchrec.experimental.torch_tpu.modules.embedding_modules import (
+            TPUEmbeddingUnfused,
+        )
+
+        # One TPUEmbeddingUnfused per table in the group, built by looping over the
+        # base class's per-table _local_rows / _local_cols.
+        self._emb_modules: nn.ModuleList = nn.ModuleList()
+        for local_rows, local_cols in zip(self._local_rows, self._local_cols):
+            self._emb_modules.append(
+                TPUEmbeddingUnfused(
+                    num_embeddings=local_rows,
+                    embedding_dim=local_cols,
+                    device=device,
+                    dtype=dtype,
+                )
+            )
+        self.init_parameters()
+
+    @property
+    # pyrefly: ignore [bad-override]
+    def emb_module(self) -> "TPUEmbeddingUnfused":
+        # pyre-ignore[16]: ModuleList returns Module, pyre thinks Union
+        return self._emb_modules[0]
+
+    def split_embedding_weights(self) -> List[torch.Tensor]:
+        # pyre-ignore[16]
+        return [emb_module.weight for emb_module in self._emb_modules]
+
+    def named_split_embedding_weights(
+        self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+    ) -> Iterator[Tuple[str, torch.Tensor]]:
+        assert (
+            remove_duplicate
+        ), "remove_duplicate=False not supported in named_split_embedding_weights"
+        for table, emb_module in zip(self._config.embedding_tables, self._emb_modules):
+            # pyre-ignore[16]
+            yield append_prefix(prefix, f"{table.name}.weight"), emb_module.weight
+
+    def named_parameters(
+        self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+    ) -> Iterator[Tuple[str, nn.Parameter]]:
+        for table, emb_module in zip(self._config.embedding_tables, self._emb_modules):
+            # pyre-ignore[7]
+            yield append_prefix(prefix, f"{table.name}.weight"), emb_module.weight
+
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        length_per_key = features.length_per_key()
+        values = features.values().to(torch.int32)
+        per_feature_values = (
+            torch.split(values, length_per_key) if len(length_per_key) > 1 else [values]
+        )
+        outputs: List[torch.Tensor] = []
+        for feature_idx, feature_values in enumerate(per_feature_values):
+            outputs.append(
+                self._emb_modules[self._feature_table_map[feature_idx]](feature_values)
+            )
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
