@@ -81,6 +81,156 @@ def _validate(x: torch.Tensor, ctx: MultiProcessContext) -> torch.Tensor:
     return torch.all(checks)
 
 
+_GIB: int = 1024**3
+
+
+def _stats(device: torch.device) -> str:
+    """Allocated / reserved / driver-free, for a record_function label."""
+    free_hbm, _ = torch.cuda.mem_get_info(device)
+    return (
+        f"alloc {torch.cuda.memory_allocated(device) / _GIB:.0f}GiB, "
+        f"reserve {torch.cuda.memory_reserved(device) / _GIB:.0f}GiB, "
+        f"free {free_hbm / _GIB:.0f}GiB"
+    )
+
+
+def _fragment_hbm(
+    ctx: MultiProcessContext,  # used for device
+    sparse_size: int,  # stashed in B, restored in E; the hole everything turns on
+    dense_size: int,  # stays resident, so reserved never drops below it
+    fragment_size: int,  # one activation; must be < sparse_size to carve the hole
+    fragment_count: int,  # overfilling the hole is fine, the excess grows reserved
+    restore_at: int,  # activations still live at restore time; 0 = no fragmentation
+    size_in_byte: int = _GIB,
+    empty_cache: bool = False,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """
+    Reproduce what EMS (see ``torchrec/distributed/memory_stashing.py``) does to the
+    caching allocator over one training step, and the fragmentation the restore can
+    run into. Returns the block lists, which the caller must keep alive.
+
+    EMS frees HBM with ``storage.resize_(0)`` after copying the tensor to pinned
+    host memory, and takes it back with ``resize_(orig_size)``. To the allocator
+    those are an ordinary free and an ordinary allocation, so the stashed block goes
+    onto the pool's free list like any other. The D2H/H2D copies are left out here:
+    they move bytes, not the allocator state this is about.
+
+    The step:
+      A: sparse + dense weights resident, one segment each
+      B: stash the sparse weights -- a sparse_size hole opens in the pool
+      C: forward activations. The first sparse_size // fragment_size of them are
+         served from that hole, which is what the stash makes room for; once it is
+         used up the rest come from the driver and reserved grows
+      D: backward frees activations from the tail. The remaining ones,
+         activations[:restore_at], are the oldest -- so while restore_at is at most
+         sparse_size // fragment_size they are the ones the hole served, and they
+         sit inside what used to be the sparse segment
+      E: restore. Freed blocks inside that segment coalesce, but not across one that
+         is still live, so whether the sparse_size block fits depends on where the
+         remaining activations sit. When it does not fit the allocator takes a fresh
+         segment from the driver and the old region stays free but unused
+
+    So the cost is a property of the layout at restore time, not of stashing itself.
+    restore_at stands for how deep in the backward the restore hook sits: at 0
+    nothing is left in the region, it coalesces whole and the restore lands back in
+    it. At 2 with the sizes below it does not fit -- measured on a 96GiB card with
+    16 / 33 / 4 x 11, reserved ends at 93GiB against a peak allocated of 77GiB, one
+    sparse_size above the largest footprint the step needed.
+
+    empty_cache in D is one way to avoid that; an arena preallocated by the caller
+    (see hbm_fragmentation) is another. empty_cache releases every segment that is
+    entirely free, and whatever outgrew the hole in C is in a segment of its own, so
+    at the sizes above it recovers the full 16GiB. It cannot release a segment that
+    still holds a live activation. It costs a device sync plus re-mallocing what E and the
+    next cycle ask for.
+    """
+    device = ctx.device
+    assert restore_at <= fragment_count
+    sparse_bytes = sparse_size * size_in_byte
+
+    with record_function(f"## A: model weights (start: {_stats(device)}) ##"):
+        sparse_weights = torch.empty(sparse_bytes, dtype=torch.int8, device=device)
+        dense_weights = torch.empty(
+            dense_size * size_in_byte, dtype=torch.int8, device=device
+        )
+
+    with record_function(f"## B: stash the sparse weights ({_stats(device)}) ##"):
+        # resize_(0) frees the block back to the pool but keeps the tensor -- and
+        # its storage -- alive, which is what lets E restore into the same tensor
+        sparse_weights.untyped_storage().resize_(0)
+
+    with record_function(f"## C: forward activations ({_stats(device)}) ##"):
+        # each is smaller than the hole B just opened, so the allocator splits that
+        # free segment instead of going to the driver -- until the hole runs out and
+        # the remainder is cudaMalloc'd after all
+        activations = [
+            torch.empty(fragment_size * size_in_byte, dtype=torch.int8, device=device)
+            for _ in range(fragment_count)
+        ]
+
+    with record_function(f"## D: backward frees activations ({_stats(device)}) ##"):
+        # backward releases them newest-first, so what remains is the head of the
+        # list -- and that is what keeps the old sparse region from coalescing
+        activations = activations[:restore_at]
+
+        if empty_cache:
+            torch.cuda.empty_cache()
+
+    with record_function(f"## E: restore the sparse weights ({_stats(device)}) ##"):
+        reserved_before = torch.cuda.memory_reserved(device)
+        sparse_weights.untyped_storage().resize_(sparse_bytes)
+
+    with record_function(f"### exit memory ({_stats(device)}) ###"):
+        grown = torch.cuda.memory_reserved(device) - reserved_before
+        logger.warning(
+            f"[rank-{ctx.rank}] restore_at={restore_at}: the restore grew reserved "
+            f"by {grown / size_in_byte:.0f} units, stranding "
+            f"{(torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)) / size_in_byte:.0f} "
+            f"in the pool; {_stats(device)}"
+        )
+
+    return activations, [sparse_weights, dense_weights]
+
+
+def _bring_up_nccl_comms(ctx: MultiProcessContext, probes: list[torch.Tensor]) -> None:
+    """
+    Bring up one fresh NCCL communicator per probe, or die trying. Each
+    ``new_group`` is only bootstrapped over the store; the tiny collective after it
+    is what forces ncclCommInitRank, and with it the cudaMalloc of the ring buffers
+    -- outside the caching allocator, so out of reach of every byte the pool holds.
+
+    The failure is left to propagate: no group timeout, no recovery. Whatever the
+    starved ncclCommInitRank does -- throw, or wedge the ranks against each other
+    -- is the outcome being reproduced. Returning at all means it never OOM'd.
+    """
+    for i, probe in enumerate(probes):
+        try:
+            pg = dist.new_group(ranks=list(range(ctx.world_size)), backend="nccl")
+            # new_group returns the NON_GROUP_MEMBER sentinel for ranks left out of
+            # the group; every rank is in this one, so it is always a real pg
+            assert isinstance(pg, dist.ProcessGroup)
+            dist.all_reduce(probe, group=pg)
+            torch.cuda.synchronize(ctx.device)
+        except RuntimeError as e:
+            # NCCL surfaces the failed cudaMalloc as DistBackendError (unhandled
+            # cuda error / ncclSystemError); a torch-side allocation on the same
+            # path would raise OutOfMemoryError. Both are RuntimeError subclasses.
+            # Log the memory state and the error, then let the rank die on it --
+            # the message goes out at fatal level because the traceback that
+            # follows may be truncated, interleaved across ranks, or lost entirely
+            # if a peer wedges instead of throwing.
+            driver_free, total = torch.cuda.mem_get_info(ctx.device)
+            logger.fatal(
+                f"[rank-{ctx.rank}] NCCL could not allocate its buffers outside the "
+                f"torch pool for communicator {i}, with "
+                f"{torch.cuda.memory_allocated(ctx.device) / _GIB:.1f}GiB allocated / "
+                f"{torch.cuda.memory_reserved(ctx.device) / _GIB:.1f}GiB reserved of "
+                f"{total / _GIB:.1f}GiB and {driver_free / _GIB:.2f}GiB left on the "
+                f"driver: {type(e).__name__}: {e}"
+            )
+            raise
+
+
 ################################# framework components #################################
 @dataclass
 class DataCopyConfig(BenchFuncConfig):
@@ -1093,6 +1243,133 @@ def a2a_d2h_contention(
     with record_function("## assert ##"):
         assert checks_a2a.item()
         assert d2h_correct, f"D2H copy validation failed on rank {ctx.rank}"
+
+
+@dataclass
+class HbmFragmentationConfig(DataCopyConfig):
+    """
+    run commands:
+    1. default: one stash/restore cycle per iteration, no NCCL
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer hbm_fragmentation
+
+    2. preallocate an arena first, so every block is split out of one segment
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer hbm_fragmentation \
+        --name=preallocation \
+        --preallocation=77
+
+    3. release what the allocator can before the restore
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer hbm_fragmentation \
+        --name=empty_cache \
+        --empty_cache=True
+
+    4. probe the leftover with NCCL, which allocates outside the pool
+    > python -m torchrec.distributed.benchmark.benchmark_data_transfer hbm_fragmentation \
+        --name=nccl \
+        --run_nccl=True
+
+    use case:
+        measure what EMS-style stashing does to the caching allocator, and the
+        conditions under which the restore has to grow reserved. _fragment_hbm walks
+        one training step (see its A-E plan): the sparse weights are stashed with
+        resize_(0), the forward's activations are served from the hole that opens,
+        and the restore fits back into it only if nothing the forward allocated is
+        still in the way. When it does not fit, the allocator takes a fresh segment
+        and the old region stays free but unused, so reserved ends above allocated.
+        Block sizes are GiB-scale and few, to keep the layout readable in the memory
+        snapshot. --preallocation and --empty_cache are the two mitigations to
+        compare against the default.
+
+        Reserved is the number of interest: it is what the card is holding, whether
+        or not tensors are in it. --run_nccl=True exercises one consequence of that
+        -- NCCL allocates its buffers outside the caching allocator, so it sees only
+        the driver's free list and can fail to bring up a communicator while
+        torch.cuda.memory_allocated() still reports room. Anything else allocating
+        outside the pool (cuBLAS workspaces, profiler buffers) is in the same
+        position. It is off by default: the failure is unguarded, so the rank either
+        raises DistBackendError or hangs when the ranks fail at different points
+        inside the init, and neither outcome writes a trace or a memory snapshot.
+    """
+
+    # how many fresh communicators to try before declaring that NCCL survived
+    max_nccl_comms: int = 4
+    # stash/restore cycles per iteration; each one leaves reserved a little higher
+    num_concat: int = 10
+
+    # GiB allocated and dropped up front, leaving one arena for every later block to
+    # be split out of -- neighbours within a segment coalesce, so the restore fits
+    preallocation: int = 0
+    # release the fully-free segments in D, before the restore
+    empty_cache: bool = False
+    # true adds the NCCL probe, which is expected to kill the rank -- see the
+    # docstring above for why it is off by default
+    run_nccl: bool = False
+
+    world_size: int = 2
+    # each iteration re-fragments the whole card, so keep the iteration counts at 1;
+    # the profiled run doubles as the memory-snapshot capture
+    num_benchmarks: int = 0
+    num_profiles: int = 1
+
+    memory_snapshot: bool = True
+    expandable_segments: bool = True
+
+
+@register_benchmark(HbmFragmentationConfig)
+def hbm_fragmentation(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    max_nccl_comms: int,
+    preallocation: int,
+    empty_cache: bool,
+    run_nccl: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Fragment the caching allocator the way an EMS stash/restore cycle does, then
+    optionally probe what is left with NCCL, which allocates outside the pool.
+
+    When the probe reproduces, it ends the run: the NCCL failure propagates out of
+    this function and takes the rank down with it.
+    """
+    device = ctx.device
+    assert device.type == "cuda", "hbm_fragmentation requires a CUDA device"
+
+    with record_function("## setup ##"):
+        # Everything needed after the fragmentation has to exist before it: with the
+        # driver's free list empty, opening a new small-pool segment would fail its
+        # cudaMalloc, and the allocator's recovery (release cached segments, retry)
+        # would dissolve the fragmented pool this benchmark is built to hold.
+        probes = [torch.zeros(1, device=device) for _ in range(max_nccl_comms)]
+        # bring ctx.pg's own communicator up here so its NCCL buffers land in the
+        # baseline rather than looking like part of the fragmentation
+        dist.barrier(group=ctx.pg)
+        torch.cuda.synchronize(device)
+
+    if preallocation > 0:
+        torch.empty(preallocation * _GIB, dtype=torch.int8, device=ctx.device)
+
+    # each cycle leaves reserved a little higher than the last, so repeating one
+    # step's stash/restore is what walks the card towards full
+    for i in range(num_concat):
+        _fragment_hbm(
+            ctx,
+            sparse_size=16,
+            dense_size=33,
+            fragment_size=4,
+            fragment_count=11,
+            restore_at=2,
+            empty_cache=(empty_cache and (i == 0)),
+        )
+
+    if run_nccl:
+        with record_function("## NCCL communicator bring-up ##"):
+            # the expected exit point of this benchmark -- the starved
+            # ncclCommInitRank throws (or wedges the ranks) and the failure is left
+            # to propagate
+            _bring_up_nccl_comms(ctx, probes)
 
 
 if __name__ == "__main__":
