@@ -1954,5 +1954,141 @@ class _PassthroughHelperSize4ActivePolicyTest(unittest.TestCase):
         self.assertEqual(_passthrough_helper_size(12_002_982_488, 2, 7), 3_429_423_360)
 
 
+class FlatReduceScatter4ActiveTest(unittest.TestCase):
+    """reduce_scatter_tensors_with_sharded_relay with sparse_group_size=4.
+
+    8-rank node -> 2 groups of 4 active ranks; each rank is helper for the 1
+    other group. The active group's input holds nActiveRanks x recv_count
+    elements; the output holds recv_count. Verifies the flat-concat path is
+    generic over the active-rank count.
+    """
+
+    def _all_calls(self, state: ShardedRelayState):
+        return state.fused.reduce_scatter_multi_group.call_args_list
+
+    def test_single_call_two_groups(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        # input total 400 -> recv_count 100 (sparse_group_size=4)
+        reduce_scatter_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(400)]},
+            {torch.float32: [torch.zeros(100)]},
+            "test",
+        )
+        self.assertEqual(state.fused.reduce_scatter_multi_group.call_count, 1)
+        kwargs = self._all_calls(state)[0].kwargs
+        self.assertEqual(kwargs["num_groups"], 2)
+        self.assertEqual(kwargs["per_group_recv_counts"][state.my_sparse_group], 100)
+        self.assertEqual(
+            kwargs["input_tensors"][state.my_sparse_group].numel(),
+            400,
+        )
+        self.assertEqual(
+            kwargs["output_tensors"][state.my_sparse_group].numel(),
+            100,
+        )
+
+    def test_helper_buffers_passthrough_sized_4active(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        # input total 800 -> recv_count 200
+        reduce_scatter_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(800)]},
+            {torch.float32: [torch.zeros(200)]},
+            "test",
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        in_tensors = kwargs["input_tensors"]
+        out_tensors = kwargs["output_tensors"]
+        recv = kwargs["per_group_recv_counts"]
+        # num_chunks = local_size - sparse_group_size + 1 = 8 - 4 + 1 = 5
+        num_chunks = (state.local_size - state.sparse_group_size) + 1
+
+        helper_ptrs = set()
+        for g in range(state.num_sparse_groups):
+            if g == state.my_sparse_group:
+                self.assertEqual(in_tensors[g].numel(), 800)
+                self.assertEqual(out_tensors[g].numel(), 200)
+                continue
+            expected = _passthrough_helper_size(
+                recv[g], state.sparse_group_size, num_chunks
+            )
+            self.assertEqual(in_tensors[g].numel(), expected)
+            # Helper uses one scratch buffer for both send and recv.
+            self.assertEqual(in_tensors[g].data_ptr(), out_tensors[g].data_ptr())
+            helper_ptrs.add(in_tensors[g].data_ptr())
+
+        # Each rank is helper for exactly num_sparse_groups - 1 == 1 group.
+        self.assertEqual(len(helper_ptrs), state.num_sparse_groups - 1)
+
+    def test_in_place_output_aliases_input_owned_block(self) -> None:
+        # 4-active in-place: the active output is an owned-block view into the
+        # active input flat buffer at offset my_active_index * recv_count.
+        state = _make_state(rank=2, sparse_group_size=4, local_size=8)
+        recv_count = 100
+        inp = torch.zeros(4 * recv_count)  # nActiveRanks x recv_count
+        reduce_scatter_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [inp]},
+            {torch.float32: [torch.zeros(recv_count)]},
+            "test",
+            in_place=True,
+        )
+        kwargs = self._all_calls(state)[0].kwargs
+        my_g = state.my_sparse_group
+        in_flat = kwargs["input_tensors"][my_g]
+        out_seg = kwargs["output_tensors"][my_g]
+        self.assertEqual(out_seg.numel(), recv_count)
+        # rank=2 -> my_active_index = 2 within its group.
+        self.assertEqual(
+            out_seg.data_ptr(),
+            in_flat.data_ptr() + 2 * recv_count * in_flat.element_size(),
+        )
+
+    def test_active_group_is_group_zero_for_rank0(self) -> None:
+        state = _make_state(rank=0, sparse_group_size=4, local_size=8)
+        self.assertEqual(state.my_sparse_group, 0)
+        self.assertEqual(state.num_sparse_groups, 2)
+        self.assertEqual(state.precomputed_active_ranks, [[0, 1, 2, 3], [4, 5, 6, 7]])
+
+
+class FusedReduceScatter4ActiveValidationTest(unittest.TestCase):
+    def _make_fused(self, rank: int = 0):
+        try:
+            from caffe2.torch.distributed.fb.sharded_relay_process_group import (  # type: ignore[import]
+                FusedShardedRelayMultiGroup,
+            )
+        except ImportError:
+            self.skipTest("FusedShardedRelayMultiGroup not available")
+
+        all_active_ranks = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        return FusedShardedRelayMultiGroup(
+            rcclx_comm=None,
+            world_size=8,
+            rank=rank,
+            all_active_ranks=all_active_ranks,
+        )
+
+    def test_4active_validation_accepts(self) -> None:
+        """reduce_scatter_multi_group must accept 4 active ranks (no
+        ValueError); without a native comm it falls through to RuntimeError.
+        The active input holds nActiveRanks x recv_count = 4 x 100."""
+        fused = self._make_fused(rank=0)
+        input_tensors = [torch.zeros(400), torch.zeros(400)]
+        output_tensors = [torch.zeros(100), torch.zeros(100)]
+        per_group_recv_counts = [100, 100]
+
+        with self.assertRaises(RuntimeError) as cm:
+            fused.reduce_scatter_multi_group(
+                input_tensors=input_tensors,
+                output_tensors=output_tensors,
+                num_groups=2,
+                per_group_recv_counts=per_group_recv_counts,
+                all_active_ranks=[[0, 1, 2, 3], [4, 5, 6, 7]],
+                op=dist.ReduceOp.SUM,
+            )
+        self.assertNotIsInstance(cm.exception, ValueError)
+
+
 if __name__ == "__main__":
     unittest.main()
