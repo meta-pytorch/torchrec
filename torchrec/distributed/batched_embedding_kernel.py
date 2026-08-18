@@ -138,6 +138,10 @@ logger: logging.Logger = logging.getLogger(__name__)
 
 RES_ENABLED_TABLES_STR = "res_enabled_tables"
 RES_STORE_SHARDS_STR = "res_store_shards"
+RES_CHUNK_SIZE_STR = "res_chunk_size"
+RES_NUM_CONSUMERS_STR = "res_num_consumers"
+RES_NUM_UVM_HIT_COPY_THREADS_STR = "res_num_uvm_hit_copy_threads"
+RES_NUM_HBM_COPY_THREADS_STR = "res_num_hbm_copy_threads"
 ENABLE_RAW_EMBEDDING_STREAMING_STR = "enable_raw_embedding_streaming"
 
 
@@ -201,6 +205,28 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
         if res_store_shards_value is not None:
             res_params.res_store_shards = res_store_shards_value
         del fused_params[RES_STORE_SHARDS_STR]
+    if RES_CHUNK_SIZE_STR in fused_params:
+        res_chunk_size_value = fused_params.get(RES_CHUNK_SIZE_STR)
+        if res_chunk_size_value is not None:
+            res_params.res_chunk_size = res_chunk_size_value
+        del fused_params[RES_CHUNK_SIZE_STR]
+    if RES_NUM_CONSUMERS_STR in fused_params:
+        res_num_consumers_value = fused_params.get(RES_NUM_CONSUMERS_STR)
+        if res_num_consumers_value is not None:
+            res_params.res_num_consumers = res_num_consumers_value
+        del fused_params[RES_NUM_CONSUMERS_STR]
+    if RES_NUM_UVM_HIT_COPY_THREADS_STR in fused_params:
+        res_num_uvm_hit_copy_threads_value = fused_params.get(
+            RES_NUM_UVM_HIT_COPY_THREADS_STR
+        )
+        if res_num_uvm_hit_copy_threads_value is not None:
+            res_params.res_num_uvm_hit_copy_threads = res_num_uvm_hit_copy_threads_value
+        del fused_params[RES_NUM_UVM_HIT_COPY_THREADS_STR]
+    if RES_NUM_HBM_COPY_THREADS_STR in fused_params:
+        res_num_hbm_copy_threads_value = fused_params.get(RES_NUM_HBM_COPY_THREADS_STR)
+        if res_num_hbm_copy_threads_value is not None:
+            res_params.res_num_hbm_copy_threads = res_num_hbm_copy_threads_value
+        del fused_params[RES_NUM_HBM_COPY_THREADS_STR]
     res_enabled_tables: Optional[List[str]] = None
     if RES_ENABLED_TABLES_STR in fused_params:
         res_enabled_tables = (
