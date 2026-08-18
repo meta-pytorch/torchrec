@@ -1055,6 +1055,177 @@ def all_to_all_tensors_with_sharded_relay(
                 all_active_ranks=precomputed_active_ranks,
                 skip_validation=True,
             )
+            # --- Step 5: Unpack the active-group result into caller tensors ---
+            if unpack_flat is not None:
+                _unpack_from_flat(unpack_flat, my_output_list)
+
+
+def all_gather_tensors_with_sharded_relay(
+    state: ShardedRelayState,
+    input_tensors_dict: dict[torch.dtype, list[torch.Tensor]],
+    output_tensors_dict: dict[torch.dtype, list[torch.Tensor]],
+    annotation: str,
+    in_place: bool = False,
+) -> None:
+    """
+    Perform all-gather using the fused sharded relay algorithm.
+
+    All-gather analogue of reduce_scatter_tensors_with_sharded_relay (its dual).
+    For each dtype, the active group's input tensors are packed into a flat send
+    buffer (send_count elements: this rank's contribution), ONE fused call
+    all-gathers all groups simultaneously (phase-synchronized, no XGMI
+    contention), and the gathered output (nActiveRanks x send_count elements,
+    output[i x send_count] from active index i) is unpacked into the caller's
+    output tensors.
+
+    All-gather performs NO reduction (no op). ``in_place`` controls the internal
+    flat input buffer for the active group:
+
+    - ``in_place=True``: the input is packed into the active rank's own slot of
+      the flat output buffer (a view at myActiveIndex x send_count), exercising
+      the kernel's in-place path (sendbuff == recvbuff + rank x send_count).
+    - ``in_place=False``: a separate flat input buffer is used.
+
+    Either way, results are unpacked into ``output_tensors_dict``.
+
+    Args:
+        state: Sharded relay runtime state (pre-computed invariants + comms).
+        input_tensors_dict: Send tensors grouped by dtype. The active group's
+            tensors for a dtype must total send_count elements.
+        output_tensors_dict: Receive tensors grouped by dtype. The active
+            group's tensors for a dtype must total nActiveRanks x send_count
+            elements.
+        annotation: Profiling annotation string for record_function.
+        in_place: Select the internal input-buffer strategy / kernel path.
+    """
+    sparse_group_size = state.sparse_group_size
+    my_sparse_group = state.my_sparse_group
+    num_sparse_groups = state.num_sparse_groups
+    local_size = state.local_size
+    local_rank = state.local_rank
+    precomputed_active_ranks = state.precomputed_active_ranks
+
+    # This rank's index among its group's active ranks (0 or 1 for size-2).
+    my_active_index = local_rank % sparse_group_size
+
+    with record_function(f"{annotation}_fused_sharded_relay_all_gather"):
+        for dtype, my_input_list in input_tensors_dict.items():
+            if not my_input_list:
+                continue
+
+            my_send_count = sum(t.numel() for t in my_input_list)
+            if my_send_count == 0:
+                continue
+
+            my_output_list = output_tensors_dict.get(dtype, [])
+            my_output_total = sum(t.numel() for t in my_output_list)
+            if my_output_total != sparse_group_size * my_send_count:
+                raise ValueError(
+                    f"all_gather_tensors_with_sharded_relay: active output total "
+                    f"({my_output_total}) for dtype {dtype} must equal "
+                    f"sparse_group_size x send_count "
+                    f"({sparse_group_size} x {my_send_count})."
+                )
+
+            device = my_input_list[0].device
+
+            # --- Step 1: Metadata (allgather send counts once, cache) ---
+            meta_key = "ag_" + annotation + str(dtype)
+            per_group_send_counts: list[int]
+
+            if meta_key not in state._flat_metadata_cache:
+                if state.intra_node_pytorch_pg is not None:
+                    my_send_tensor = torch.tensor(
+                        [my_send_count], dtype=torch.int64, device=device
+                    )
+                    all_send_list = [
+                        torch.zeros(1, dtype=torch.int64, device=device)
+                        for _ in range(local_size)
+                    ]
+                    dist.all_gather(
+                        all_send_list,
+                        my_send_tensor,
+                        group=state.intra_node_pytorch_pg,
+                    )
+                    per_group_send_counts = [
+                        int(all_send_list[g * sparse_group_size].item())
+                        for g in range(num_sparse_groups)
+                    ]
+                else:
+                    logger.warning(
+                        "[TorchRec 2D Parallel] no intra_node_pytorch_pg! "
+                        "Assuming all groups have the same send count."
+                    )
+                    per_group_send_counts = [my_send_count] * num_sparse_groups
+
+                state._flat_metadata_cache[meta_key] = per_group_send_counts
+                logger.info(
+                    f"[TorchRec 2D Parallel] flat all-gather metadata cached: "
+                    f"annotation={annotation!r}, dtype={dtype}, "
+                    f"per_group_send_counts={per_group_send_counts}"
+                )
+            else:
+                per_group_send_counts = state._flat_metadata_cache[meta_key]
+
+            # --- Step 3: Build per-group tensors ---
+            # Each group contributes ONE contiguous tensor. The active group's
+            # per-table inputs are packed into a single flat send buffer and a
+            # single flat output buffer receives the gathered result
+            # (single-segment fast path); helper groups pass a single
+            # passthrough scratch buffer. Out-of-place packs the input into a
+            # separate flat send buffer; in-place packs the input into the
+            # active rank's own slot of the output flat. The gathered output is
+            # unpacked into my_output_list after the call.
+            input_group_tensors: list[torch.Tensor] = []
+            output_group_tensors: list[torch.Tensor] = []
+
+            unpack_flat: torch.Tensor | None = None
+
+            num_chunks = (local_size - sparse_group_size) + 1
+
+            for g in range(num_sparse_groups):
+                if g == my_sparse_group:
+                    out_flat = _get_active_output_flat_buf(
+                        state, my_output_total, dtype, device
+                    )
+                    if in_place:
+                        # In-place: input aliases the active rank's own output
+                        # slot (offset my_active_index * send_count), so
+                        # activeInSegPtr == activeOutSegPtr + m*sendCount.
+                        in_view = out_flat.narrow(
+                            0, my_active_index * my_send_count, my_send_count
+                        )
+                        _pack_into_flat(my_input_list, in_view)
+                        input_group_tensors.append(in_view)
+                    else:
+                        in_flat = _get_active_flat_buf(
+                            state, my_send_count, dtype, device
+                        )
+                        _pack_into_flat(my_input_list, in_flat)
+                        input_group_tensors.append(in_flat)
+                    output_group_tensors.append(out_flat)
+                    unpack_flat = out_flat
+                else:
+                    send_g = per_group_send_counts[g]
+                    helper_size_g = _passthrough_helper_size(
+                        send_g, sparse_group_size, num_chunks
+                    )
+                    helper_buf = _get_helper_flat_buf(
+                        state, g, helper_size_g, dtype, device
+                    )
+                    # Helper uses one two-slot scratch buffer for send and recv.
+                    input_group_tensors.append(helper_buf)
+                    output_group_tensors.append(helper_buf)
+
+            # --- Step 4: ONE fused call — all groups, phase-synchronized ---
+            state.fused.all_gather_multi_group(
+                input_tensors=input_group_tensors,
+                output_tensors=output_group_tensors,
+                num_groups=num_sparse_groups,
+                per_group_send_counts=per_group_send_counts,
+                all_active_ranks=precomputed_active_ranks,
+                skip_validation=True,
+            )
 
             # --- Step 5: Unpack the active-group result into caller tensors ---
             if unpack_flat is not None:
