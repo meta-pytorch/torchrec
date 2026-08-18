@@ -12,12 +12,18 @@ from typing import Any, Dict
 from unittest.mock import patch
 
 import torch
+from configerator.configerator_fake import ConfigeratorFake
 from torchrec.metrics.metrics_config import BatchSizeStage, DefaultTaskInfo, RecTaskInfo
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.mse import MSEMetric
 from torchrec.metrics.ne import NEMetric
 from torchrec.metrics.rec_metric import RecComputeMode, RecMetric, RecMetricList
 from torchrec.metrics.test_utils import gen_test_batch, gen_test_tasks
+
+# Install a process-wide Configerator fake so JustKnobs config reads resolve
+# locally instead of each blocking ~55s on the unreachable Configerator under RE
+# network isolation (tpx-no-network use case + test caching).
+_CONFIGERATOR_FAKE: ConfigeratorFake = ConfigeratorFake().create()
 
 
 _CUDA_UNAVAILABLE: bool = not torch.cuda.is_available()
