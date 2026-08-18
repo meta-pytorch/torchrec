@@ -78,6 +78,9 @@ _BYTES_PER_GB: int = 1024**3
 # Matches EmbeddingShardingPlanner's own heuristical default, so an unset
 # percentage reserves the same fraction the OSS planner would by default.
 _DEFAULT_RESERVATION_PERCENTAGE: float = 0.15
+# Mirrors HeuristicalStorageReservation's own default; used when the config leaves
+# parameter_multiplier unset so the reserved dense footprint is unchanged.
+_DEFAULT_PARAMETER_MULTIPLIER: float = 6.0
 
 # OSS proposer_type selectors -> factory (legacy simple selection path; the
 # richer proposer_config path is handled in _build_proposer).
@@ -209,6 +212,11 @@ class DefaultPlannerProvider(PlannerProvider):
         ):
             return HeuristicalStorageReservation(
                 percentage=percentage,
+                parameter_multiplier=(
+                    cfg.parameter_multiplier
+                    if cfg.parameter_multiplier is not None
+                    else _DEFAULT_PARAMETER_MULTIPLIER
+                ),
                 dense_tensor_estimate=cfg.dense_tensor_estimate,
             )
         if policy == StorageReservationPolicy.FIXED_PERCENTAGE:
