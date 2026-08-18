@@ -457,7 +457,11 @@ class AutoSharder(EmbeddingBagCollectionSharder):
         return [
             k.value
             for k in EmbeddingComputeKernel
-            if k is not EmbeddingComputeKernel.CUSTOMIZED_KERNEL
+            if k
+            not in (
+                EmbeddingComputeKernel.CUSTOMIZED_KERNEL,
+                EmbeddingComputeKernel.UNFUSED_TPU,
+            )
         ]
 
 
