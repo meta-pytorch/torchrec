@@ -2679,8 +2679,10 @@ class PlanReportMetadata:
     sinks — data our layer cannot derive from the plan/topology/request. It is
     observability-only and does NOT affect the plan, so it is deliberately kept
     off ``PlannerConfig`` and excluded from ``request_hash``. Optional; absent ->
-    the reporter falls back to console stats only. (``feature_stats_summary`` and
-    similar summary objects are not projected here yet — a follow-up.)
+    the reporter falls back to console stats only. Framework-specific summary
+    objects that the OSS layer cannot type (e.g. the feature-stats summary) are
+    carried as pre-projected scalars (``feature_stats_summary_str``,
+    ``resgen_config_json``) rather than as the objects themselves.
 
     One instance describes a single plan (one model), so model-specific fields
     such as ``proposer_types``, ``embedding_hash`` and the size fields vary across
@@ -2697,6 +2699,18 @@ class PlanReportMetadata:
     # would raise TypeError when an instance carrying proposer types is hashed.
     proposer_types: Optional[Tuple[str, ...]] = None
     num_parallel_worlds: Optional[int] = None
+    # UVM/embedding stats source path, surfaced as the Scuba column of the same
+    # name so downstream stats-attribution tooling sees it on this path too.
+    embedding_stats_source: Optional[str] = None
+    # str() projection of the framework's feature-stats summary. The OSS layer
+    # cannot carry the framework-specific summary object, so the fb caller projects
+    # it to a string; the reporter forwards it to the Scuba logger.
+    feature_stats_summary_str: Optional[str] = None
+    # JSON-encoded resgen config (``asdict`` of the tbe_input_multiplexer). Stored
+    # as a string, not a dict, so this frozen dataclass stays hashable -- a dict
+    # field would raise TypeError on hash, the same reason ``proposer_types`` is a
+    # Tuple. The reporter decodes it before handing the dict to the Scuba logger.
+    resgen_config_json: Optional[str] = None
     log_plan: bool = True
     # Optional override for the Manifold upload directory (relative to the
     # sharding_analysis bucket, e.g. "tree/sharding_plan/my_dry_run"). None ->
