@@ -413,7 +413,7 @@ class RecMetric(nn.Module, abc.ABC):
         compute_on_all_ranks: bool = False,
         should_validate_update: bool = False,
         process_group: Optional[dist.ProcessGroup] = None,
-        **kwargs: Dict[str, Any],
+        **kwargs: Any,
     ) -> None:
         torch._C._log_api_usage_once(
             f"torchrec.metrics.rec_metric.{self.__class__.__name__}"
