@@ -127,26 +127,7 @@ class CPUCommsRecMetricModule(RecMetricModule):
         cloned_metrics = []
         for metric in self.rec_metrics.rec_metrics:
             metric = cast(RecMetric, metric)
-            # pyrefly: ignore [bad-instantiation]
-            cloned_metric = type(metric)(
-                world_size=metric._world_size,
-                my_rank=metric._my_rank,
-                batch_size=metric._batch_size,
-                tasks=metric._tasks,
-                compute_mode=metric._compute_mode,
-                # Standard initialization passes in the global window size. A RecMetric's
-                # window size is set as the local window size.
-                window_size=metric._window_size * metric._world_size,
-                fused_update_limit=metric._fused_update_limit,
-                # pyrefly: ignore[bad-argument-type]
-                compute_on_all_ranks=metric._metrics_computations[
-                    0
-                ]._compute_on_all_ranks,
-                should_validate_update=metric._should_validate_update,
-                # Process group should be none to prevent unwanted distributed syncs.
-                # This is handled manually via RecMetricModule.get_pre_compute_states()
-                process_group=None,
-            )
+            cloned_metric = metric._new_like(process_group=None)
             cloned_metrics.append(cloned_metric)
 
         return RecMetricList(cloned_metrics)

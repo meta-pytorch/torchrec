@@ -8,6 +8,7 @@
 # pyre-strict
 
 import abc
+import copy
 import inspect
 import itertools
 import math
@@ -85,6 +86,48 @@ DefaultValueT = TypeVar("DefaultValueT")
 ComputeIterType = Iterator[
     Tuple[RecTaskInfo, MetricNameBase, torch.Tensor, MetricPrefix, str]
 ]
+
+
+def _snapshot_init_value(value: Any, memo: Optional[Dict[int, Any]] = None) -> Any:
+    if memo is None:
+        memo = {}
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
+    if isinstance(value, torch.Tensor):
+        snapshot = value.detach().clone()
+        memo[value_id] = snapshot
+        return snapshot
+    if type(value) is dict:
+        snapshot_dict: Dict[Any, Any] = {}
+        memo[value_id] = snapshot_dict
+        snapshot_dict.update(
+            {
+                _snapshot_init_value(key, memo): _snapshot_init_value(item, memo)
+                for key, item in value.items()
+            }
+        )
+        return snapshot_dict
+    if type(value) is list:
+        snapshot_list: List[Any] = []
+        memo[value_id] = snapshot_list
+        snapshot_list.extend(_snapshot_init_value(item, memo) for item in value)
+        return snapshot_list
+    if type(value) is tuple:
+        snapshot_tuple = tuple(_snapshot_init_value(item, memo) for item in value)
+        memo[value_id] = snapshot_tuple
+        return snapshot_tuple
+    if type(value) is set:
+        snapshot_set = {_snapshot_init_value(item, memo) for item in value}
+        memo[value_id] = snapshot_set
+        return snapshot_set
+    return copy.deepcopy(value, memo)
+
+
+def _snapshot_init_kwargs(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
+    memo: Dict[int, Any] = {}
+    return {key: _snapshot_init_value(value, memo) for key, value in kwargs.items()}
+
 
 MAX_BUFFER_COUNT = 1000
 _WINDOW_BUFFER_REGISTRY: weakref.WeakValueDictionary[int, Any] = (
@@ -413,7 +456,7 @@ class RecMetric(nn.Module, abc.ABC):
         compute_on_all_ranks: bool = False,
         should_validate_update: bool = False,
         process_group: Optional[dist.ProcessGroup] = None,
-        **kwargs: Dict[str, Any],
+        **kwargs: Any,
     ) -> None:
         torch._C._log_api_usage_once(
             f"torchrec.metrics.rec_metric.{self.__class__.__name__}"
@@ -441,6 +484,8 @@ class RecMetric(nn.Module, abc.ABC):
         self._compute_mode = compute_mode
         self._fused_update_limit = fused_update_limit
         self._should_validate_update = should_validate_update
+        self._global_window_size = window_size
+        self._compute_on_all_ranks = compute_on_all_ranks
         self._default_weights = {}
         self._required_inputs = set()
         self._update_buffers = {
@@ -449,25 +494,17 @@ class RecMetric(nn.Module, abc.ABC):
             self.WEIGHTS: [],
         }
         self._fused_update_log_tensors: List[bool] = []
-        #  Dict[str, Any]]`.
-        # pyrefly: ignore[bad-assignment]
-        self.enable_pt2_compile: bool = kwargs.get("enable_pt2_compile", False)
-        # we need to remove the enable_pt2_compile from kwargs to avoid Metric object being initialized with it
-        if "enable_pt2_compile" in kwargs:
-            del kwargs["enable_pt2_compile"]
-
-        #  Dict[str, Any]]`.
-        # pyrefly: ignore[bad-assignment]
-        self._should_clone_update_inputs: bool = kwargs.get(
+        self.enable_pt2_compile: bool = kwargs.pop("enable_pt2_compile", False)
+        self._should_clone_update_inputs: bool = kwargs.pop(
             "should_clone_update_inputs", False
         )
-        if "should_clone_update_inputs" in kwargs:
-            del kwargs["should_clone_update_inputs"]
-
-        # Pop batch_size_stages from kwargs so it doesn't cause type conflicts
-        # when subclasses pass **kwargs: Dict[str, Any] to super().__init__().
-        # TowerQPSMetric declares its own explicit batch_size_stages parameter.
         kwargs.pop("batch_size_stages", None)
+        metric_init_kwargs = _snapshot_init_kwargs(kwargs)
+        self._init_kwargs: Dict[str, Any] = {
+            **metric_init_kwargs,
+            "enable_pt2_compile": self.enable_pt2_compile,
+            "should_clone_update_inputs": self._should_clone_update_inputs,
+        }
 
         if self._window_size < self._batch_size:
             raise ValueError(
@@ -493,8 +530,6 @@ class RecMetric(nn.Module, abc.ABC):
             ]
             else self._tasks
         ):
-            # pyrefly: ignore[unsupported-operation]
-            kwargs["fused_update_limit"] = fused_update_limit
             # This Pyre error seems to be Pyre's bug as it can be inferred by mypy
             # according to https://github.com/python/mypy/issues/3048.
             metric_computation = self._computation_class(
@@ -506,9 +541,10 @@ class RecMetric(nn.Module, abc.ABC):
                 should_validate_update=self._should_validate_update,
                 compute_mode=compute_mode,
                 process_group=process_group,
+                fused_update_limit=fused_update_limit,
                 # pyrefly: ignore[bad-argument-type]
                 **{
-                    **kwargs,
+                    **metric_init_kwargs,
                     **self._get_task_kwargs(task_config),
                     "enable_pt2_compile": self.enable_pt2_compile,
                 },
@@ -517,6 +553,25 @@ class RecMetric(nn.Module, abc.ABC):
 
             self._metrics_computations.append(metric_computation)
             self._required_inputs.update(required_inputs)
+
+    def _get_new_like_kwargs(self) -> Dict[str, Any]:
+        """Return constructor kwargs for a new metric instance."""
+        return dict(self._init_kwargs)
+
+    def _new_like(self, process_group: Optional[dist.ProcessGroup]) -> "RecMetric":
+        return type(self)(
+            world_size=self._world_size,
+            my_rank=self._my_rank,
+            batch_size=self._batch_size,
+            tasks=self._tasks,
+            compute_mode=self._compute_mode,
+            window_size=self._global_window_size,
+            fused_update_limit=self._fused_update_limit,
+            compute_on_all_ranks=self._compute_on_all_ranks,
+            should_validate_update=self._should_validate_update,
+            process_group=process_group,
+            **self._get_new_like_kwargs(),
+        )
 
     def _get_task_kwargs(
         self, task_config: Union[RecTaskInfo, List[RecTaskInfo]]
