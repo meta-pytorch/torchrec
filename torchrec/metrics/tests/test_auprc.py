@@ -174,6 +174,280 @@ class AUPRCMetricValueTest(unittest.TestCase):
         actual_auprc = self.auprc.compute()["auprc-DefaultTask|window_auprc"]
         torch.allclose(expected_auprc, actual_auprc)
 
+    def test_lifetime_auprc_uses_binned_global_curve(self) -> None:
+        auprc = AUPRCMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=2,
+            tasks=[DefaultTaskInfo],
+            window_size=2,
+            num_bins=10,
+        )
+        batches = [
+            (torch.tensor([1.0, 0.0]), torch.tensor([0.95, 0.85])),
+            (torch.tensor([1.0, 0.0]), torch.tensor([0.25, 0.15])),
+        ]
+
+        for labels, predictions in batches:
+            auprc.update(
+                labels={"DefaultTask": labels},
+                predictions={"DefaultTask": predictions},
+                weights={"DefaultTask": torch.ones(2)},
+            )
+
+        metrics = auprc.compute()
+        torch.testing.assert_close(
+            metrics["auprc-DefaultTask|window_auprc"],
+            torch.tensor([1.0]),
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            metrics["auprc-DefaultTask|lifetime_auprc"],
+            torch.tensor([5.0 / 6.0]),
+            check_dtype=False,
+        )
+        repeated_metrics = auprc.compute()
+        torch.testing.assert_close(
+            repeated_metrics["auprc-DefaultTask|lifetime_auprc"],
+            metrics["auprc-DefaultTask|lifetime_auprc"],
+        )
+
+    def test_lifetime_auprc_is_independent_per_task(self) -> None:
+        tasks = [
+            RecTaskInfo(
+                name=name,
+                label_name="label",
+                prediction_name="prediction",
+                weight_name="weight",
+            )
+            for name in ["t1", "t2"]
+        ]
+        auprc = AUPRCMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=2,
+            tasks=tasks,
+            window_size=2,
+            num_bins=10,
+        )
+
+        for predictions in [torch.tensor([0.95, 0.85]), torch.tensor([0.25, 0.15])]:
+            auprc.update(
+                labels={
+                    "t1": torch.tensor([1.0, 0.0]),
+                    "t2": torch.tensor([0.0, 1.0]),
+                },
+                predictions={"t1": predictions, "t2": predictions},
+                weights={"t1": torch.ones(2), "t2": torch.ones(2)},
+            )
+
+        metrics = auprc.compute()
+        torch.testing.assert_close(
+            metrics["auprc-t1|lifetime_auprc"],
+            torch.tensor([5.0 / 6.0]),
+            check_dtype=False,
+        )
+        torch.testing.assert_close(
+            metrics["auprc-t2|lifetime_auprc"],
+            torch.tensor([0.5]),
+            check_dtype=False,
+        )
+
+    def test_lifetime_auprc_reset(self) -> None:
+        auprc = AUPRCMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=2,
+            tasks=[DefaultTaskInfo],
+            window_size=2,
+            num_bins=10,
+        )
+        auprc.update(
+            labels={"DefaultTask": torch.tensor([1.0, 0.0])},
+            predictions={"DefaultTask": torch.tensor([0.95, 0.85])},
+            weights={"DefaultTask": torch.ones(2)},
+        )
+        auprc.reset()
+        auprc.update(
+            labels={"DefaultTask": torch.tensor([0.0, 1.0])},
+            predictions={"DefaultTask": torch.tensor([0.95, 0.85])},
+            weights={"DefaultTask": torch.ones(2)},
+        )
+
+        metrics = auprc.compute()
+        torch.testing.assert_close(
+            metrics["auprc-DefaultTask|lifetime_auprc"],
+            torch.tensor([0.5]),
+            check_dtype=False,
+        )
+
+    def test_lifetime_auprc_respects_num_bins(self) -> None:
+        auprc = AUPRCMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=4,
+            tasks=[DefaultTaskInfo],
+            window_size=4,
+            num_bins=2,
+        )
+        auprc.update(
+            labels={"DefaultTask": torch.tensor([1.0, 0.0, 1.0, 0.0])},
+            predictions={"DefaultTask": torch.tensor([1.0, 0.5, 0.49, 0.0])},
+            weights={"DefaultTask": torch.ones(4)},
+        )
+
+        torch.testing.assert_close(
+            auprc.compute()["auprc-DefaultTask|lifetime_auprc"],
+            torch.tensor([0.5]),
+            check_dtype=False,
+        )
+
+    def test_lifetime_auprc_respects_prediction_bounds(self) -> None:
+        auprc = AUPRCMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=4,
+            tasks=[DefaultTaskInfo],
+            window_size=4,
+            num_bins=2,
+            min_prediction=-2.0,
+            max_prediction=2.0,
+        )
+        auprc.update(
+            labels={"DefaultTask": torch.tensor([1.0, 0.0, 1.0, 0.0])},
+            predictions={"DefaultTask": torch.tensor([2.0, 0.0, -0.04, -2.0])},
+            weights={"DefaultTask": torch.ones(4)},
+        )
+
+        torch.testing.assert_close(
+            auprc.compute()["auprc-DefaultTask|lifetime_auprc"],
+            torch.tensor([0.5]),
+            check_dtype=False,
+        )
+
+    def test_out_of_bounds_predictions_only_disable_lifetime_auprc(self) -> None:
+        tasks = [
+            RecTaskInfo(
+                name=name,
+                label_name="label",
+                prediction_name="prediction",
+                weight_name="weight",
+            )
+            for name in ["invalid", "valid"]
+        ]
+        auprc = AUPRCMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=2,
+            tasks=tasks,
+            window_size=2,
+            num_bins=10,
+        )
+        labels = {
+            "invalid": torch.tensor([1.0, 0.0]),
+            "valid": torch.tensor([1.0, 0.0]),
+        }
+        weights = {"invalid": torch.ones(2), "valid": torch.ones(2)}
+        auprc.update(
+            labels=labels,
+            predictions={
+                "invalid": torch.tensor([2.0, -1.0]),
+                "valid": torch.tensor([0.9, 0.1]),
+            },
+            weights=weights,
+        )
+
+        with self.assertLogs("torchrec.metrics.auprc", level="ERROR") as logs:
+            metrics = auprc.compute()
+            torch.testing.assert_close(
+                metrics["auprc-invalid|window_auprc"],
+                torch.tensor([1.0]),
+                check_dtype=False,
+            )
+            self.assertTrue(torch.isnan(metrics["auprc-invalid|lifetime_auprc"]).all())
+            torch.testing.assert_close(
+                metrics["auprc-valid|lifetime_auprc"],
+                torch.tensor([1.0]),
+                check_dtype=False,
+            )
+
+            valid_predictions = {
+                "invalid": torch.tensor([0.9, 0.1]),
+                "valid": torch.tensor([0.9, 0.1]),
+            }
+            auprc.update(
+                labels=labels,
+                predictions=valid_predictions,
+                weights=weights,
+            )
+            self.assertTrue(
+                torch.isnan(auprc.compute()["auprc-invalid|lifetime_auprc"]).all()
+            )
+
+            auprc.reset()
+            auprc.update(
+                labels=labels,
+                predictions=valid_predictions,
+                weights=weights,
+            )
+            torch.testing.assert_close(
+                auprc.compute()["auprc-invalid|lifetime_auprc"],
+                torch.tensor([1.0]),
+                check_dtype=False,
+            )
+
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("Out-of-bounds AUPRC prediction was discovered", logs.output[0])
+        self.assertIn("AUPRC metric `arguments`", logs.output[0])
+        self.assertIn("`min_prediction` and `max_prediction`", logs.output[0])
+
+    def test_lifetime_auprc_returns_no_signal_for_single_class(self) -> None:
+        for label in [0.0, 1.0]:
+            with self.subTest(label=label):
+                auprc = AUPRCMetric(
+                    world_size=1,
+                    my_rank=0,
+                    batch_size=2,
+                    tasks=[DefaultTaskInfo],
+                    window_size=2,
+                    num_bins=10,
+                )
+                auprc.update(
+                    labels={"DefaultTask": torch.full((2,), label)},
+                    predictions={"DefaultTask": torch.tensor([0.9, 0.1])},
+                    weights={"DefaultTask": torch.ones(2)},
+                )
+
+                torch.testing.assert_close(
+                    auprc.compute()["auprc-DefaultTask|lifetime_auprc"],
+                    torch.tensor([0.5]),
+                    check_dtype=False,
+                )
+
+    def test_invalid_num_bins(self) -> None:
+        with self.assertRaisesRegex(RecMetricException, "greater than zero"):
+            AUPRCMetric(
+                world_size=1,
+                my_rank=0,
+                batch_size=2,
+                tasks=[DefaultTaskInfo],
+                num_bins=0,
+            )
+
+    def test_invalid_prediction_bounds(self) -> None:
+        for min_prediction, max_prediction in [(1.0, 1.0), (2.0, 1.0)]:
+            with self.subTest(
+                min_prediction=min_prediction, max_prediction=max_prediction
+            ), self.assertRaisesRegex(RecMetricException, "must be less than"):
+                AUPRCMetric(
+                    world_size=1,
+                    my_rank=0,
+                    batch_size=2,
+                    tasks=[DefaultTaskInfo],
+                    min_prediction=min_prediction,
+                    max_prediction=max_prediction,
+                )
+
 
 def generate_model_outputs_cases() -> Iterable[Dict[str, torch._tensor.Tensor]]:
     return [
