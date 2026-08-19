@@ -296,6 +296,24 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.cpu_module.compute,
         )
 
+    def test_compute_throughput_waits_for_updates_without_full_compute(self) -> None:
+        model_out = {
+            "task1-prediction": torch.tensor([0.5]),
+            "task1-label": torch.tensor([0.7]),
+            "task1-weight": torch.tensor([1.0]),
+        }
+
+        for _ in range(3):
+            self.cpu_module.update(model_out)
+
+        result = self.cpu_module.compute_throughput().resolve()
+
+        self.assertEqual(result["throughput-throughput|total_examples"], 3)
+        self.assertEqual(self.cpu_module._total_updates_processed, 3)
+        self.assertEqual(self.cpu_module._total_computes_processed, 1)
+        self.assertEqual(self.cpu_module.compute_count, 0)
+        self.assertTrue(self.cpu_module.compute_queue.empty())
+
     def test_clone_model_out_false_skips_clone(self) -> None:
         """clone_model_out=False must not call the defensive _foreach_clone."""
         module = self._make_module(clone_model_out=False)
