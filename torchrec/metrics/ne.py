@@ -104,6 +104,8 @@ class NEMetricComputation(RecMetricComputation):
         include_logloss (bool): return vanilla logloss as one of metrics results, on top of NE.
     """
 
+    _use_fixed_shape_sync: bool = True
+
     def __init__(
         self,
         *args: Any,

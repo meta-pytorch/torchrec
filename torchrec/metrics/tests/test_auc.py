@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from typing import Dict, Iterable, List, Optional, Type, Union
+from typing import cast, Dict, Iterable, List, Optional, Type, Union
 from unittest.mock import patch
 
 import torch
@@ -18,6 +18,7 @@ from torchrec.metrics.metrics_config import DefaultTaskInfo
 from torchrec.metrics.rec_metric import (
     RecComputeMode,
     RecMetric,
+    RecMetricComputation,
     RecMetricException,
     RecTaskInfo,
 )
@@ -133,9 +134,10 @@ class AUCMetricCompileTest(unittest.TestCase):
         # module attributes as dynamic to isolate the AUC list-length recompiles,
         # then assert the recompile limit is never hit so this stays a regression
         # guard.
-        with patch.object(
-            torch._dynamo.config, "allow_unspec_int_on_nn_module", True
-        ), patch.object(torch._dynamo.config, "fail_on_recompile_limit_hit", True):
+        with (
+            patch.object(torch._dynamo.config, "allow_unspec_int_on_nn_module", True),
+            patch.object(torch._dynamo.config, "fail_on_recompile_limit_hit", True),
+        ):
             for _ in range(10):
                 compiled_update(
                     predictions={DefaultTaskInfo.name: model_output["predictions"][0]},
@@ -166,6 +168,25 @@ class AUCMetricCompileTest(unittest.TestCase):
 class AUCMetricTest(unittest.TestCase):
     clazz: Type[RecMetric] = AUCMetric
     task_name: str = "auc"
+
+    def test_variable_shape_sync_path(self) -> None:
+        auc = AUCMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=1,
+            tasks=[DefaultTaskInfo],
+        )
+        computation = cast(RecMetricComputation, auc._metrics_computations[0])
+
+        with (
+            patch.object(torch.distributed, "get_world_size", return_value=1),
+            patch.object(torch.distributed, "barrier") as barrier,
+            patch.object(torch.distributed, "all_gather"),
+        ):
+            computation.sync(distributed_available=lambda: True)
+
+        barrier.assert_called()
+        self.assertIn("variable_shape", computation._seen_dist_sync_paths)
 
     def test_unfused_auc(self) -> None:
         rec_metric_value_test_launcher(
