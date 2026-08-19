@@ -80,16 +80,19 @@ class SynchronizationMarker:
     accurately includes all of the metric jobs that were scheduled before it.
     """
 
-    __slots__ = "future"
+    __slots__ = ["future", "throughput_only"]
 
     def __init__(
         self,
         # pyrefly: ignore[implicit-import]
         future: concurrent.futures.Future[Dict[str, MetricValue]],
+        throughput_only: bool = False,
     ) -> None:
         """
         Args:
             future: future to set the result of the compute job. Passed to the MetricComputeJob.
+            throughput_only: whether to compute throughput without creating a MetricComputeJob.
         """
         # pyrefly: ignore[implicit-import]
         self.future: concurrent.futures.Future[Dict[str, MetricValue]] = future
+        self.throughput_only: bool = throughput_only

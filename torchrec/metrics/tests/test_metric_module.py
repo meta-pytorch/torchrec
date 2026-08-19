@@ -9,6 +9,7 @@
 
 import copy
 import dataclasses
+import faulthandler
 import logging
 import multiprocessing
 import os
@@ -231,6 +232,93 @@ class MetricModuleTest(unittest.TestCase):
                 raw_predictions,
                 cast(Dict[str, torch.Tensor], actual_predictions)["task"],
             )
+        )
+
+    def test_compute_throughput_excludes_other_metrics(self) -> None:
+        config = dataclasses.replace(
+            DefaultMetricsConfig,
+            throughput_metric=ThroughputDef(warmup_steps=1),
+            state_metrics=[StateMetricEnum.OPTIMIZERS],
+        )
+        with tempfile.NamedTemporaryFile(delete=True) as backend:
+            dist.init_process_group(
+                backend="gloo",
+                init_method=f"file://{backend.name}",
+                world_size=1,
+                rank=0,
+            )
+            try:
+                metric_module = generate_metric_module(
+                    TestMetricModule,
+                    metrics_config=config,
+                    batch_size=128,
+                    world_size=64,
+                    my_rank=0,
+                    state_metrics_mapping={StateMetricEnum.OPTIMIZERS: MockOptimizer()},
+                    device=torch.device("cpu"),
+                )
+                for _ in range(3):
+                    metric_module.update(gen_test_batch(128))
+
+                throughput_only = metric_module.compute_throughput().resolve()
+                full = metric_module.compute().resolve()
+
+                self.assertIn(
+                    "throughput-throughput|lifetime_throughput", throughput_only
+                )
+                self.assertIn(
+                    "throughput-throughput|window_throughput", throughput_only
+                )
+                self.assertEqual(
+                    set(throughput_only),
+                    {key for key in full if key.startswith("throughput-")},
+                )
+                ne_keys = {key for key in full if key.startswith("ne-")}
+                self.assertTrue(ne_keys)
+                self.assertIn("optimizers-optimizers|learning_rate", full)
+                self.assertTrue(ne_keys.isdisjoint(throughput_only))
+                self.assertNotIn("optimizers-optimizers|learning_rate", throughput_only)
+            finally:
+                dist.destroy_process_group()
+
+    @staticmethod
+    def _run_compute_throughput_collective_free(
+        rank: int, world_size: int, backend: str
+    ) -> None:
+        dist.init_process_group(
+            backend=backend,
+            world_size=world_size,
+            rank=rank,
+        )
+        try:
+            metric_module = generate_metric_module(
+                TestMetricModule,
+                metrics_config=DefaultMetricsConfig,
+                batch_size=128,
+                world_size=world_size,
+                my_rank=rank,
+                state_metrics_mapping={},
+                device=torch.device("cpu"),
+            )
+            metric_module.update(gen_test_batch(128))
+
+            if rank == 0:
+                faulthandler.dump_traceback_later(30, exit=True)
+                try:
+                    ret = metric_module.compute_throughput().resolve()
+                finally:
+                    faulthandler.cancel_dump_traceback_later()
+                assert "throughput-throughput|total_examples" in ret
+
+            dist.barrier()
+        finally:
+            dist.destroy_process_group()
+
+    def test_compute_throughput_is_collective_free(self) -> None:
+        self._run_multi_process_test(
+            world_size=self.WORLD_SIZE,
+            backend="gloo",
+            callable=self._run_compute_throughput_collective_free,
         )
 
     def test_rectask_info(self) -> None:
