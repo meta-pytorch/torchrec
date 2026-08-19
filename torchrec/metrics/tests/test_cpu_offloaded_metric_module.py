@@ -415,7 +415,7 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             self.cpu_module.compute_thread, "is_alive", return_value=True
         ), patch.object(
             self.cpu_module, "_log_event"
-        ), patch(
+        ) as mock_log_event, patch(
             "torchrec.metrics.cpu_offloaded_metric_module.logger"
         ) as mock_logger:
             self.cpu_module.shutdown()  # must not raise
@@ -431,6 +431,9 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             ),
             "expected a non-fatal 'did not shut down gracefully' warning",
         )
+        mock_log_event.assert_called_once()
+        self.assertEqual(mock_log_event.call_args.args[0], "shutdown")
+        self.assertEqual(mock_log_event.call_args.args[1], EventType.SUCCESS)
 
     def test_format_thread_stack(self) -> None:
         # Not-started thread: ident is None.
