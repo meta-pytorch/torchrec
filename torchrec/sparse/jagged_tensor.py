@@ -126,16 +126,13 @@ def _safe_tolist(tensor: torch.Tensor) -> List[int]:
     if tensor.numel() == 0:
         return []
 
-    # During PT2 compilation/export, skip the JK check and _cuda_to_cpu_safe
-    # and fall back to plain .tolist(). Non-strict export can present a
-    # FakeTensor whose reported device is CUDA even on a CPU-only host; calling
-    # torch.cuda.current_stream() for that tensor would initialize real CUDA.
-    # justknobs_check calls pyjk.check()
+    # During torch.compile tracing, skip the JK check and _cuda_to_cpu_safe
+    # and fall back to plain .tolist(). justknobs_check calls pyjk.check()
     # (a Cython function) which can raise SystemError in sandbox/RE
     # environments. The resulting exception captures a reference to the pyjk
     # module that cannot be pickled by the multiprocessing pool used in
     # distributed tests, masking the real error behind MaybeEncodingError.
-    if is_pt2_compiling() or not torch._utils_internal.justknobs_check(
+    if is_torchdynamo_compiling() or not torch._utils_internal.justknobs_check(
         "pytorch/torchrec:killswitch_safe_tolist"
     ):
         return tensor.tolist()
