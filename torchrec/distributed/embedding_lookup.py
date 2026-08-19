@@ -48,6 +48,7 @@ from torchrec.distributed.batched_embedding_kernel import (
     BatchedDenseEmbeddingBag,
     BatchedFusedEmbedding,
     BatchedFusedEmbeddingBag,
+    BatchedTPUEmbedding,
     KeyValueEmbedding,
     KeyValueEmbeddingBag,
     ShardedBatchedFusedEmbedding,
@@ -361,7 +362,12 @@ class GroupedEmbeddingsLookup(BaseEmbeddingLookup[KeyedJaggedTensor, torch.Tenso
                     "embedding table; it currently only supports the embedding cache "
                     "(enable_embedding_update=True)."
                 )
-
+        elif config.compute_kernel == EmbeddingComputeKernel.UNFUSED_TPU:
+            return BatchedTPUEmbedding(
+                config=config,
+                pg=pg,
+                device=device,
+            )
         else:
             raise ValueError(f"Compute kernel not supported {config.compute_kernel}")
 

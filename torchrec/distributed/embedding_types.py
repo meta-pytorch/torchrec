@@ -106,6 +106,7 @@ class EmbeddingComputeKernel(Enum):
         "dram_ssd_virtual_table"  # dram + ssd composite kv backend for virtual table
     )
     FUSED_TRITON = "fused_triton"
+    UNFUSED_TPU = "unfused_tpu"
 
 
 def compute_kernel_to_embedding_location(
@@ -119,6 +120,7 @@ def compute_kernel_to_embedding_location(
         EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,  # use hbm for cache
         EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,  # use hbm for cache
         EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE,  # use hbm for cache
+        EmbeddingComputeKernel.UNFUSED_TPU,
     ]:
         return EmbeddingLocation.DEVICE
     elif compute_kernel in [
@@ -556,7 +558,7 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
             ShardingType.COLUMN_WISE.value,
             ShardingType.TABLE_COLUMN_WISE.value,
         ]
-        if compute_device_type in {"cuda"}:
+        if compute_device_type in {"cuda", "tpu"}:
             types += [
                 ShardingType.ROW_WISE.value,
                 ShardingType.TABLE_ROW_WISE.value,
@@ -585,6 +587,8 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
                     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
                     EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
                 ]
+            if compute_device_type in {"tpu"}:
+                ret += [EmbeddingComputeKernel.UNFUSED_TPU.value]
         else:
             # TODO re-enable model parallel and dense
             ret += [

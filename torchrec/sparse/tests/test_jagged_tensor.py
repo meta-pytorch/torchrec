@@ -9,6 +9,7 @@
 
 
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.utils._pytree as pytree
@@ -1432,6 +1433,25 @@ class TestJaggedTensorTracing(unittest.TestCase):
     def test_cuda_tolist_cpu_tensor(self) -> None:
         tensor = torch.tensor([3, 5, 7, 2])
         result = _safe_tolist(tensor)
+        self.assertEqual(result, [3, 5, 7, 2])
+
+    def test_cuda_tolist_fake_cuda_tensor_during_pt2_export(self) -> None:
+        fake_mode = torch._subclasses.FakeTensorMode()
+        tensor = fake_mode.fake_tensor_converter.from_real_tensor(
+            fake_mode,
+            torch.tensor([3, 5, 7, 2]),
+            make_constant=True,
+        )
+        tensor.fake_device = torch.device("cuda")
+
+        with patch(
+            "torchrec.sparse.jagged_tensor.is_pt2_compiling", return_value=True
+        ), patch(
+            "torchrec.sparse.jagged_tensor._cuda_to_cpu_safe",
+            side_effect=AssertionError("fake tensors must not use a real CUDA stream"),
+        ):
+            result = _safe_tolist(tensor)
+
         self.assertEqual(result, [3, 5, 7, 2])
 
     @unittest.skipIf(
