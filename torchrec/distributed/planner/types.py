@@ -2181,6 +2181,12 @@ class PlannerConfig:
     # (Appended last, like model_base_bytes: this dataclass is not kw_only, so
     # inserting mid-list would silently rebind existing positional arguments.)
     parameter_multiplier: Optional[float] = None
+    # Fixed home SKU the SKU_AWARE margin is anchored to, as a raw string
+    # (e.g. "GRANDTETON", "GB200"). None (default) anchors to the fleet default
+    # home SKU. Consumed only by the SKU_AWARE reservation (mirrors the legacy
+    # APF planner-config field); ignored by every other policy. (Appended last
+    # to preserve positional construction of the pre-existing fields.)
+    home_sku: Optional[str] = None
 
     def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
         """Return package-specific planner config data for the request hash."""
