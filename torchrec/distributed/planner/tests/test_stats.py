@@ -9,11 +9,12 @@
 
 import math
 import unittest
-from typing import List
+from typing import cast, List
 
 import hypothesis.strategies as st
 import torch
 from hypothesis import given, settings
+from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.planners import EmbeddingShardingPlanner
@@ -21,6 +22,7 @@ from torchrec.distributed.planner.stats import (
     _calc_max_chi_sq_divergence,
     _calc_max_kl_divergence,
     _chi_sq_divergence,
+    _compute_storage,
     _kl_divergence,
     _normalize_float,
     _normalize_int,
@@ -29,9 +31,13 @@ from torchrec.distributed.planner.stats import (
     EmbeddingStats,
     NoopEmbeddingStats,
 )
-from torchrec.distributed.planner.types import Topology
+from torchrec.distributed.planner.storage_reservations import (
+    HeuristicalStorageReservation,
+    SKUAwareStorageReservation,
+)
+from torchrec.distributed.planner.types import StorageReservation, Topology
 from torchrec.distributed.test_utils.test_model import TestSparseNN
-from torchrec.distributed.types import ShardingType
+from torchrec.distributed.types import ModuleSharder, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 
@@ -190,3 +196,102 @@ class TestEmbeddingStats(unittest.TestCase):
                 abs_tol=1e-10,
             )
         )
+
+
+class TestComputeStorage(unittest.TestCase):
+    """`_compute_storage` must report SKUAware's reservation rather than zeroing it.
+
+    SKUAware reserves absolute bytes instead of a percentage of the device, so it
+    fell through to the catch-all branch and every stat derived from
+    `reserved_hbm_percent` -- reserved memory, planning memory, and the per-rank
+    utilization denominator -- reported a reservation of zero.
+    """
+
+    def setUp(self) -> None:
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=100,
+                embedding_dim=64,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(4)
+        ]
+        self.model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        self.sharders: List[ModuleSharder[nn.Module]] = cast(
+            List[ModuleSharder[nn.Module]], [EmbeddingBagCollectionSharder()]
+        )
+        self.hbm_cap = 8 * 1024 * 1024 * 1024
+
+    def _topology(self) -> Topology:
+        return Topology(world_size=2, compute_device="cuda", hbm_cap=self.hbm_cap)
+
+    def _reserve(self, reservation: StorageReservation) -> Topology:
+        topology = self._topology()
+        # reserve() works on a deep copy, so `topology` stays at full capacity and
+        # remains the correct denominator to hand to _compute_storage.
+        reservation.reserve(
+            topology=topology,
+            batch_size=10,
+            module=self.model,
+            sharders=self.sharders,
+        )
+        return topology
+
+    def test_sku_aware_reports_static_base(self) -> None:
+        margin = 2 * 1024 * 1024 * 1024
+        overhead = 512 * 1024 * 1024
+        reservation = SKUAwareStorageReservation(
+            margin_bytes=margin, runtime_overhead_bytes=overhead
+        )
+        topology = self._reserve(reservation)
+
+        reserved_hbm_percent, dense_storage, kjt_storage = _compute_storage(
+            reservation, topology
+        )
+
+        self.assertAlmostEqual(
+            reserved_hbm_percent * self.hbm_cap, margin + overhead, delta=1
+        )
+        self.assertGreater(dense_storage.hbm, 0)
+        self.assertGreater(kjt_storage.hbm, 0)
+
+    def test_sku_aware_model_base_bytes_replaces_margin_and_dense(self) -> None:
+        model_base_bytes = 3 * 1024 * 1024 * 1024
+        reservation = SKUAwareStorageReservation(
+            margin_bytes=2 * 1024 * 1024 * 1024,
+            model_base_bytes=model_base_bytes,
+        )
+        topology = self._reserve(reservation)
+
+        reserved_hbm_percent, dense_storage, kjt_storage = _compute_storage(
+            reservation, topology
+        )
+
+        self.assertAlmostEqual(
+            reserved_hbm_percent * self.hbm_cap, model_base_bytes, delta=1
+        )
+        # Dense is subsumed into the explicit base, so it is not reported twice.
+        self.assertEqual(dense_storage.hbm, 0)
+        self.assertGreater(kjt_storage.hbm, 0)
+
+    def test_sku_aware_matches_heuristical_on_home_sku(self) -> None:
+        # The stats-layer expression of SKUAware's documented no-op invariant: with
+        # overhead 0 and margin == percentage * hbm[home], the two policies report
+        # the same reservation on the home SKU.
+        percentage = 0.25
+        heuristical = HeuristicalStorageReservation(percentage=percentage)
+        sku_aware = SKUAwareStorageReservation(
+            margin_bytes=int(percentage * self.hbm_cap), runtime_overhead_bytes=0
+        )
+
+        heuristical_percent, heuristical_dense, heuristical_kjt = _compute_storage(
+            heuristical, self._reserve(heuristical)
+        )
+        sku_aware_percent, sku_aware_dense, sku_aware_kjt = _compute_storage(
+            sku_aware, self._reserve(sku_aware)
+        )
+
+        self.assertAlmostEqual(heuristical_percent, sku_aware_percent, places=6)
+        self.assertEqual(heuristical_dense.hbm, sku_aware_dense.hbm)
+        self.assertEqual(heuristical_kjt.hbm, sku_aware_kjt.hbm)
