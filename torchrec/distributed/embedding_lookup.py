@@ -49,6 +49,7 @@ from torchrec.distributed.batched_embedding_kernel import (
     BatchedFusedEmbedding,
     BatchedFusedEmbeddingBag,
     BatchedTPUEmbedding,
+    BatchedTPUEmbeddingBag,
     KeyValueEmbedding,
     KeyValueEmbeddingBag,
     ShardedBatchedFusedEmbedding,
@@ -730,6 +731,13 @@ class GroupedPooledEmbeddingsLookup(
                 config=config,
                 pg=pg,
                 device=device,
+            )
+        elif config.compute_kernel == EmbeddingComputeKernel.UNFUSED_TPU:
+            return BatchedTPUEmbeddingBag(
+                config=config,
+                pg=pg,
+                device=device,
+                sharding_type=sharding_type,
             )
         elif config.compute_kernel in {
             EmbeddingComputeKernel.KEY_VALUE,
