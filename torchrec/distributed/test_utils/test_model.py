@@ -3242,3 +3242,66 @@ class MaglevTestStage(nn.Module):
             assert prev_output is not None and self.scaled_add is not None
             x = self.scaled_add(prev_output, x)
         return torch.relu(self.block(x))
+
+
+class MaglevSplitStage(MaglevTestStage):
+    """:class:`MaglevTestStage` with the sparse/dense forward split exposed.
+
+    Inherits all submodules (``ebc``, ``input_proj``, ``dense``, ``scaled_add``,
+    ``block``) from :class:`MaglevTestStage`; the split methods carve which
+    submodules run in which schedule phase. Parameters and state are shared.
+
+    ``forward`` is overridden to compose the two halves, so this class works
+    both under a monolithic pipeline path (calls ``forward``) and a split path
+    (calls the two halves). Structurally this satisfies
+    ``torchrec.distributed.maglev.stage.MaglevStage``; the protocol is not
+    imported here so that this module stays free of a maglev dependency.
+
+    Contract: ``forward_sparse`` reads only ``stage_input`` -- never
+    ``prev_output``. If a stage's embedding lookup ever depends on the upstream
+    carrier, this split is invalid.
+
+    The cut is placed **right after** ``ebc``. The ``MaglevStage`` protocol
+    permits pushing it later (e.g. through ``input_proj``, which also depends
+    only on ``stage_input``), which does hoist more work into the
+    activation-wait window and moves the mirror ``input_proj`` gradient GEMM
+    off the latency-critical ``I`` phase on the backward -- worth ~5pp of QPS
+    on this synthetic bench. We keep the tight boundary because the priority
+    here is that *what the schedule does* is easy to describe (`sparse` = the
+    embedding lookup, full stop), and prod stages will need to draw the line
+    on their own dependency structure anyway.
+    """
+
+    def forward(
+        self,
+        stage_input: "ModelInput",
+        prev_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Derived; equals ``forward_dense(inp, forward_sparse(inp), prev)``."""
+        return self.forward_dense(
+            stage_input, self.forward_sparse(stage_input), prev_output
+        )
+
+    def forward_sparse(
+        self,
+        stage_input: "ModelInput",
+    ) -> torch.Tensor:
+        """The embedding lookup, and nothing else."""
+        kjt = stage_input.idlist_features
+        assert isinstance(kjt, KeyedJaggedTensor)
+        return self.ebc(kjt).values()  # (B, in_dim)
+
+    def forward_dense(
+        self,
+        stage_input: "ModelInput",
+        sparse_out: torch.Tensor,
+        prev_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Everything else: projection, dense features, upstream join, MLP."""
+        x = self.input_proj(sparse_out)  # (B, stage_dim)
+        if self.dense is not None:
+            x = x + self.dense(stage_input.float_features)
+        if not self.is_first:
+            assert prev_output is not None and self.scaled_add is not None
+            x = self.scaled_add(prev_output, x)
+        return torch.relu(self.block(x))
