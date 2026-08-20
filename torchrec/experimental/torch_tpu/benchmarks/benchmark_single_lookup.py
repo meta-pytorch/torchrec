@@ -17,6 +17,8 @@ import time
 from typing import List
 
 import torch
+
+# pyre-ignore[21]: torch_tpu ships in the TPU pod venv, not as a buck dep.
 from torch_tpu._internal import profiler, sync
 from torchrec.distributed.batched_embedding_kernel import BatchedTPUEmbedding
 from torchrec.distributed.embedding_types import (
@@ -135,6 +137,7 @@ def main() -> None:
     # Copy weights from reference into the TPU tables so outputs are comparable.
     # split_embedding_weights() returns one weight per table, in table order.
     for weight, config in zip(tpu_kernel.split_embedding_weights(), embedding_configs):
+        # pyre-ignore[6]: EmbeddingCollection.embeddings is a ModuleDict, so indexing it types as Module.
         weight.data.copy_(ref_module.embeddings[config.name].weight.data)
 
     # --- Accuracy test: compare outputs across different batch sizes ---
@@ -153,6 +156,7 @@ def main() -> None:
         )
         # CPU embedding needs int64 on torch 2.13
         kjt = model_input.idlist_features
+        assert isinstance(kjt, KeyedJaggedTensor)
         # Convert to int32/TPU outside the forward, before ref_module caches a CPU _jt_dict on kjt.
         kjt_tpu = KeyedJaggedTensor(
             keys=kjt.keys(),
@@ -180,6 +184,7 @@ def main() -> None:
         print("\nTRACE_DIR unset, skipping the profiled step")
     else:
         print(f"Profiler Start, traces printed to {traces_dir}")
+        tpu_output: torch.Tensor | None = None
         with profiler.profile(
             activities=[
                 profiler.ProfilerActivity.CPU,
@@ -199,6 +204,7 @@ def main() -> None:
                 )
                 # CPU embedding needs int64
                 kjt = model_input.idlist_features
+                assert isinstance(kjt, KeyedJaggedTensor)
 
                 # Convert to int32/TPU outside the forward.
                 kjt_tpu = KeyedJaggedTensor(
@@ -208,6 +214,9 @@ def main() -> None:
                 )
                 tpu_output = tpu_kernel(kjt_tpu)
 
+        assert (
+            tpu_output is not None
+        ), "profiled step never ran; PROFILE_NUMBER_TIMES must be > 0"
         print("Profiled TPU output shape:", tuple(tpu_output.shape))
 
     # --- Benchmark here -------
@@ -243,6 +252,7 @@ def main() -> None:
         )
         # CPU embedding needs int64
         kjt = model_input.idlist_features
+        assert isinstance(kjt, KeyedJaggedTensor)
         # Convert to int32/TPU
         kjt_tpu = KeyedJaggedTensor(
             keys=kjt.keys(),
@@ -267,6 +277,7 @@ def main() -> None:
             )
             # CPU embedding needs int64
             kjt = model_input.idlist_features
+            assert isinstance(kjt, KeyedJaggedTensor)
             # Convert to int32/TPU
             kjt_tpu = KeyedJaggedTensor(
                 keys=kjt.keys(),
