@@ -2565,6 +2565,9 @@ class BatchedFusedEmbedding(BaseBatchedEmbedding[torch.Tensor], FusedOptimizerMo
 
         enable_res, res_params = _populate_res_params(config)
         fused_params[ENABLE_RAW_EMBEDDING_STREAMING_STR] = enable_res
+        logger.info(
+            f"BatchedFusedEmbedding: uvm_host_mapped={fused_params.get('uvm_host_mapped', False)}"
+        )
 
         self._emb_module: SplitTableBatchedEmbeddingBagsCodegen = (
             SplitTableBatchedEmbeddingBagsCodegen(
@@ -3764,6 +3767,9 @@ class BatchedFusedEmbeddingBag(
 
         enable_res, res_params = _populate_res_params(config)
         fused_params[ENABLE_RAW_EMBEDDING_STREAMING_STR] = enable_res
+        logger.info(
+            f"BatchedFusedEmbeddingBag: uvm_host_mapped={fused_params.get('uvm_host_mapped', False)}"
+        )
 
         self._emb_module: SplitTableBatchedEmbeddingBagsCodegen = (
             SplitTableBatchedEmbeddingBagsCodegen(
