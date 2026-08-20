@@ -8,8 +8,9 @@
 # pyre-strict
 
 import logging
+import math
 from functools import partial
-from typing import Any, cast, Dict, List, Optional, Type
+from typing import Any, cast, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -31,6 +32,11 @@ LABELS = "labels"
 WEIGHTS = "weights"
 GROUPING_KEYS = "grouping_keys"
 REQUIRED_INPUTS = "required_inputs"
+DEFAULT_NUM_BINS = 1000
+DEFAULT_MIN_PREDICTION = 0.0
+DEFAULT_MAX_PREDICTION = 1.0
+LIFETIME_POSITIVE_HISTOGRAM = "lifetime_positive_histogram"
+LIFETIME_NEGATIVE_HISTOGRAM = "lifetime_negative_histogram"
 
 
 def _riemann_integral(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -102,6 +108,74 @@ def compute_auprc(
     return torch.cat(auprcs)
 
 
+def _get_binned_auprc_histograms(
+    predictions: torch.Tensor,
+    labels: torch.Tensor,
+    weights: torch.Tensor,
+    num_bins: int,
+    min_prediction: float = DEFAULT_MIN_PREDICTION,
+    max_prediction: float = DEFAULT_MAX_PREDICTION,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    valid_predictions = torch.all(
+        (predictions >= min_prediction) & (predictions <= max_prediction),
+        dim=-1,
+        keepdim=True,
+    )
+    normalized_predictions = (predictions - min_prediction) / (
+        max_prediction - min_prediction
+    )
+    bin_indices = torch.clamp(
+        (normalized_predictions * num_bins).long(),
+        min=0,
+        max=num_bins - 1,
+    )
+    histogram_shape = (predictions.size(0), num_bins)
+    # Citrine C3: create histogram state directly on the input device.
+    positive_histogram = torch.zeros(
+        histogram_shape, dtype=torch.double, device=predictions.device
+    )
+    negative_histogram = torch.zeros(
+        histogram_shape, dtype=torch.double, device=predictions.device
+    )
+    positive_histogram.scatter_add_(1, bin_indices, weights.double() * labels.double())
+    negative_histogram.scatter_add_(
+        1, bin_indices, weights.double() * (1.0 - labels.double())
+    )
+    invalid_histogram = torch.full_like(positive_histogram, float("nan"))
+    positive_histogram = torch.where(
+        valid_predictions, positive_histogram, invalid_histogram
+    )
+    negative_histogram = torch.where(
+        valid_predictions, negative_histogram, invalid_histogram
+    )
+    return positive_histogram, negative_histogram
+
+
+def _compute_binned_auprc(
+    positive_histogram: torch.Tensor,
+    negative_histogram: torch.Tensor,
+) -> torch.Tensor:
+    num_tp = torch.cumsum(positive_histogram.flip(-1), dim=-1)
+    num_fp = torch.cumsum(negative_histogram.flip(-1), dim=-1)
+
+    precision = (num_tp / (num_tp + num_fp)).flip(-1)
+    recall = (num_tp / num_tp[..., -1:]).flip(-1)
+    precision = torch.cat(
+        [precision, precision.new_ones((precision.size(0), 1))], dim=-1
+    )
+    recall = torch.cat([recall, recall.new_zeros((recall.size(0), 1))], dim=-1)
+    precision = torch.nan_to_num(precision, 1.0)
+    recall = torch.nan_to_num(recall, 0.0)
+
+    auprc = -torch.sum(
+        (recall[..., 1:] - recall[..., :-1]) * precision[..., :-1], dim=-1
+    )
+    total_positives = positive_histogram.sum(dim=-1)
+    total_negatives = negative_histogram.sum(dim=-1)
+    no_signal = (total_positives == 0) | (total_negatives == 0)
+    return torch.where(no_signal, 0.5, auprc)
+
+
 def compute_auprc_per_group(
     n_tasks: int,
     predictions: torch.Tensor,
@@ -164,10 +238,6 @@ def _state_reduction(state: List[torch.Tensor], dim: int = 1) -> List[torch.Tens
 _grouping_keys_state_reduction = partial(_state_reduction, dim=0)
 
 
-LIFETIME_WEIGHTED_AUPRC = "lifetime_weighted_auprc"
-LIFETIME_WEIGHT = "lifetime_weight"
-
-
 class AUPRCMetricComputation(RecMetricComputation):
     r"""
     This class implements the RecMetricComputation for AUPRC, i.e. Area Under the Curve.
@@ -178,22 +248,43 @@ class AUPRCMetricComputation(RecMetricComputation):
         grouped_auprc (bool): If True, computes AUPRC per group and returns average AUPRC across all groups.
             The `grouping_keys` is provided during state updates along with predictions, labels, weights.
             This feature is currently not enabled for `fused_update_limit`.
+        num_bins (int): Number of equal-width bins over the configured prediction
+            range used to approximate lifetime AUPRC.
+        min_prediction (float): Inclusive lower prediction bound for lifetime AUPRC.
+        max_prediction (float): Inclusive upper prediction bound for lifetime AUPRC.
     """
 
     def __init__(
         self,
         *args: Any,
         grouped_auprc: bool = False,
+        num_bins: int = DEFAULT_NUM_BINS,
+        min_prediction: float = DEFAULT_MIN_PREDICTION,
+        max_prediction: float = DEFAULT_MAX_PREDICTION,
         fused_update_limit: int = 0,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
+        if num_bins <= 0:
+            raise RecMetricException("`num_bins` must be greater than zero.")
+        if (
+            not math.isfinite(min_prediction)
+            or not math.isfinite(max_prediction)
+            or min_prediction >= max_prediction
+        ):
+            raise RecMetricException(
+                "Prediction bounds must be finite and `min_prediction` must be less than `max_prediction`."
+            )
         if grouped_auprc and fused_update_limit > 0:
             raise RecMetricException(
                 "Grouped AUPRC and Fused Update Limit cannot be enabled together yet."
             )
 
         self._grouped_auprc: bool = grouped_auprc
+        self._num_bins: int = num_bins
+        self._min_prediction: float = min_prediction
+        self._max_prediction: float = max_prediction
+        self._logged_out_of_bounds_prediction_error: bool = False
         self._add_state(
             PREDICTIONS,
             [],
@@ -223,11 +314,20 @@ class AUPRCMetricComputation(RecMetricComputation):
                 dist_reduce_fx=_grouping_keys_state_reduction,
                 persistent=False,
             )
-        # Lifetime accumulators for weighted averaging of window AUPRC values
-        self._lifetime_weighted_auprc: torch.Tensor = torch.tensor(
-            0.0, dtype=torch.float64
+        self._add_state(
+            LIFETIME_POSITIVE_HISTOGRAM,
+            torch.zeros((self._n_tasks, self._num_bins), dtype=torch.double),
+            add_window_state=False,
+            dist_reduce_fx="sum",
+            persistent=False,
         )
-        self._lifetime_weight: torch.Tensor = torch.tensor(0.0, dtype=torch.float64)
+        self._add_state(
+            LIFETIME_NEGATIVE_HISTOGRAM,
+            torch.zeros((self._n_tasks, self._num_bins), dtype=torch.double),
+            add_window_state=False,
+            dist_reduce_fx="sum",
+            persistent=False,
+        )
         self._init_states()
 
     # The states values are set to empty lists in __init__() and reset(), and then we
@@ -284,6 +384,20 @@ class AUPRCMetricComputation(RecMetricComputation):
         predictions = predictions.float()
         labels = labels.float()
         weights = weights.float()
+        positive_histogram, negative_histogram = _get_binned_auprc_histograms(
+            predictions,
+            labels,
+            weights,
+            self._num_bins,
+            self._min_prediction,
+            self._max_prediction,
+        )
+        cast(torch.Tensor, getattr(self, LIFETIME_POSITIVE_HISTOGRAM)).add_(
+            positive_histogram
+        )
+        cast(torch.Tensor, getattr(self, LIFETIME_NEGATIVE_HISTOGRAM)).add_(
+            negative_histogram
+        )
         num_samples = getattr(self, PREDICTIONS)[0].size(-1)
         batch_size = predictions.size(-1)
         start_index = max(num_samples + batch_size - self._window_size, 0)
@@ -319,38 +433,43 @@ class AUPRCMetricComputation(RecMetricComputation):
             )
 
     def _compute(self) -> List[MetricComputationReport]:
-        # Compute window AUPRC
         window_auprc = compute_auprc(
             self._n_tasks,
             cast(torch.Tensor, getattr(self, PREDICTIONS)[0]),
             cast(torch.Tensor, getattr(self, LABELS)[0]),
             cast(torch.Tensor, getattr(self, WEIGHTS)[0]),
         )
-
-        # Get total weight for this window
-        window_weight = cast(torch.Tensor, getattr(self, WEIGHTS)[0]).sum()
-
-        # Accumulate lifetime stats using weighted averaging
-        # Move tensors to same device if needed
-        device = window_auprc.device
-        self._lifetime_weighted_auprc = self._lifetime_weighted_auprc.to(device)
-        self._lifetime_weight = self._lifetime_weight.to(device)
-
-        # For multi-task, compute weighted average across tasks
-        weighted_auprc_sum = (window_auprc * window_weight).sum()
-        self._lifetime_weighted_auprc = (
-            self._lifetime_weighted_auprc + weighted_auprc_sum
+        lifetime_positive_histogram = cast(
+            torch.Tensor, getattr(self, LIFETIME_POSITIVE_HISTOGRAM)
         )
-        self._lifetime_weight = self._lifetime_weight + window_weight * self._n_tasks
-
-        # Compute lifetime AUPRC
+        lifetime_negative_histogram = cast(
+            torch.Tensor, getattr(self, LIFETIME_NEGATIVE_HISTOGRAM)
+        )
+        invalid_lifetime_auprc = torch.isnan(lifetime_positive_histogram).any(
+            dim=-1
+        ) | torch.isnan(lifetime_negative_histogram).any(dim=-1)
+        if (
+            self._my_rank == 0
+            and not self._logged_out_of_bounds_prediction_error
+            and bool(torch.any(invalid_lifetime_auprc))
+        ):
+            logger.error(
+                "Out-of-bounds AUPRC prediction was discovered outside the configured "
+                "range [%s, %s]. Lifetime AUPRC will be reported as NaN for affected "
+                "tasks. Adjust the bounds using the AUPRC metric `arguments`: `min_prediction` and `max_prediction`.",
+                self._min_prediction,
+                self._max_prediction,
+            )
+            self._logged_out_of_bounds_prediction_error = True
+        lifetime_auprc = _compute_binned_auprc(
+            torch.nan_to_num(lifetime_positive_histogram),
+            torch.nan_to_num(lifetime_negative_histogram),
+        )
         lifetime_auprc = torch.where(
-            self._lifetime_weight > 0,
-            self._lifetime_weighted_auprc / self._lifetime_weight,
-            torch.tensor(0.5, device=device, dtype=torch.float64),
+            invalid_lifetime_auprc,
+            torch.full_like(lifetime_auprc, float("nan")),
+            lifetime_auprc,
         )
-        # Expand to match n_tasks shape
-        lifetime_auprc_per_task = lifetime_auprc.expand(self._n_tasks)
 
         reports = [
             MetricComputationReport(
@@ -361,7 +480,7 @@ class AUPRCMetricComputation(RecMetricComputation):
             MetricComputationReport(
                 name=MetricName.AUPRC,
                 metric_prefix=MetricPrefix.LIFETIME,
-                value=lifetime_auprc_per_task,
+                value=lifetime_auprc,
             ),
         ]
         if self._grouped_auprc:
@@ -399,10 +518,13 @@ class AUPRCMetric(RecMetric):
         compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         window_size: int = 100,
         fused_update_limit: int = 0,
+        num_bins: int = DEFAULT_NUM_BINS,
+        min_prediction: float = DEFAULT_MIN_PREDICTION,
+        max_prediction: float = DEFAULT_MAX_PREDICTION,
         compute_on_all_ranks: bool = False,
         should_validate_update: bool = False,
         process_group: Optional[dist.ProcessGroup] = None,
-        **kwargs: Dict[str, Any],
+        **kwargs: Any,
     ) -> None:
         super().__init__(
             world_size=world_size,
@@ -415,6 +537,9 @@ class AUPRCMetric(RecMetric):
             compute_on_all_ranks=compute_on_all_ranks,
             should_validate_update=should_validate_update,
             process_group=process_group,
+            num_bins=num_bins,
+            min_prediction=min_prediction,
+            max_prediction=max_prediction,
             **kwargs,
         )
         if kwargs.get("grouped_auprc"):

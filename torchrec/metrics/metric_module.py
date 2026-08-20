@@ -443,6 +443,13 @@ class RecMetricModule(nn.Module):
                     )
         return DeferrableMetrics(ret)
 
+    def compute_throughput(self) -> DeferrableMetrics:
+        r"""Compute throughput metrics without cross-rank collectives."""
+        ret: MetricsResult = {}
+        if self.throughput_metric:
+            ret.update(self.throughput_metric.compute())
+        return DeferrableMetrics(ret)
+
     def local_compute(self) -> DeferrableMetrics:
         r"""local_compute() is called when per-trainer metrics are required. It's
         can be used for debugging. Currently only rec_metrics is supported.

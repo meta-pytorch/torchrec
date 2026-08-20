@@ -735,7 +735,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         )
 
     @override
-    def async_compute(self) -> DeferrableMetrics:
+    def async_compute(self, *, _throughput_only: bool = False) -> DeferrableMetrics:
         """
         Entry point for asynchronous metric compute. It enqueues a synchronization marker
         to the update queue.
@@ -756,7 +756,12 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             raise self._captured_exception
 
         try:
-            self.update_queue.put_nowait(SynchronizationMarker(metrics_future))
+            self.update_queue.put_nowait(
+                SynchronizationMarker(
+                    metrics_future,
+                    throughput_only=_throughput_only,
+                )
+            )
             self._total_computes_enqueued += 1
             self.update_queue_size_logger.add(self.update_queue.qsize())
         except queue.Full:
@@ -774,6 +779,10 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             )
         return DeferrableMetrics(metrics_future)
 
+    @override
+    def compute_throughput(self) -> DeferrableMetrics:
+        return self.async_compute(_throughput_only=True)
+
     def _process_synchronization_marker(
         self, synchronization_marker: SynchronizationMarker
     ) -> None:
@@ -786,15 +795,22 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         """
 
         with record_function("## CPUOffloadedRecMetricModule:sync_marker ##"):
-            if not self.rec_metrics:
-                raise RecMetricException("No metrics to compute.")
-
             if self._captured_exception_event.is_set():
                 synchronization_marker.future.set_exception(
                     self._captured_exception
                     or RecMetricException("compute thread is unavailable")
                 )
                 return
+
+            if synchronization_marker.throughput_only:
+                synchronization_marker.future.set_result(
+                    super().compute_throughput().resolve()
+                )
+                self._total_computes_processed += 1
+                return
+
+            if not self.rec_metrics:
+                raise RecMetricException("No metrics to compute.")
 
             metric_state_snapshot = MetricStateSnapshot.from_metrics(
                 self.rec_metrics,
