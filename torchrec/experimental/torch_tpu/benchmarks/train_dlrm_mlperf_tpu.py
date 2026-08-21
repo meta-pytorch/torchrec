@@ -347,6 +347,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dcn-num-layers", type=int, default=DCN_NUM_LAYERS)
     p.add_argument("--dcn-low-rank", type=int, default=DCN_LOW_RANK_DIM)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument(
+        "--recat-mode",
+        choices=["sc", "tc", "cpu"],
+        default="sc",
+        help="Post-a2a recat engine: sc (SparseCore), tc (TensorCore), "
+        "or cpu (FBGEMM CPU round-trip).",
+    )
     return p.parse_args()
 
 
@@ -378,6 +385,11 @@ def main() -> None:
     # first lookup; single_lookup._lookup_mode() reads LOOKUP_MODE at call time.
     # The unfused backward always runs on the TensorCore.
     os.environ["LOOKUP_MODE"] = "v1_sc"
+    # Recat (post-a2a KJT reconstruction) on-device instead of the CPU FBGEMM
+    # permute round-trip. --recat-mode sc|tc selects the engine (see dist_data
+    # _wait_impl); cpu leaves TPU_RECAT_MODE unset -> CPU fallback.
+    if args.recat_mode in ("sc", "tc"):
+        os.environ["TPU_RECAT_MODE"] = args.recat_mode
     dist.init_process_group(backend="tpu_dist")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
