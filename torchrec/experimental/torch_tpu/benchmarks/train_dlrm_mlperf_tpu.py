@@ -338,6 +338,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--warmup", type=int, default=10, help="Warmup steps (compile/autotune)."
     )
+    p.add_argument(
+        "--profile-dir",
+        type=str,
+        default="",
+        help="If set, capture an xprof xplane trace of the timed steps to this dir ",
+    )
     p.add_argument("--dcn-num-layers", type=int, default=DCN_NUM_LAYERS)
     p.add_argument("--dcn-low-rank", type=int, default=DCN_LOW_RANK_DIM)
     p.add_argument("--seed", type=int, default=0)
@@ -411,9 +417,24 @@ def main() -> None:
         run_step(w, timed=False)
     _materialize()
 
+    # Optional xprof capture of the timed steps. jax.profiler records the TPU device
+    # timeline (SC/TC ops) via libtpu regardless of framework; rank 0 captures.
+    profiling = bool(args.profile_dir) and rank == 0
+    if profiling:
+        import jax
+
+        os.makedirs(args.profile_dir, exist_ok=True)
+        jax.profiler.start_trace(args.profile_dir)
+
     step_ms: list[float] = []
     for s in range(args.steps):
         step_ms.append(run_step(args.warmup + s, timed=True) * 1e3)
+
+    if profiling:
+        _materialize()  # flush pending TPU work into the trace window
+        # pyre-ignore[18]: jax imported above under the same guard
+        jax.profiler.stop_trace()
+        print(f"xprof trace written to {args.profile_dir}", flush=True)
 
     # Aggregate across ranks: MAX = straggler-bound wall-clock, SUM/world = avg rank.
     local_mean = torch.tensor([sum(step_ms) / len(step_ms)], device=device)
