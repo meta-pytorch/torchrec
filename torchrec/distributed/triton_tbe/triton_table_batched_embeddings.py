@@ -266,6 +266,104 @@ def table_batched_embedding_bag_forward_weighted_kernel(
 
 
 @triton.jit
+# Triton TR001: BLOCK_SIZE is the required embedding-width bound, not a tuning choice.
+def table_batched_embedding_bag_grad_per_sample_weights_kernel(  # noqa: TR001
+    grad_per_sample_weights_ptr,
+    dout_ptr,
+    indices_ptr,
+    offsets_ptr,
+    weight_ptr,
+    table_offsets_ptr,
+    embedding_dims_ptr,
+    embedding_offsets_ptr,
+    feature_table_map_ptr,
+    row_output_offsets_ptr,
+    b_t_map_ptr,
+    total_embedding_dim: tl.constexpr,
+    B,
+    BLOCK_SIZE: tl.constexpr,
+    vbe: tl.constexpr = False,
+    info_B_num_bits=0,
+    info_B_mask=0,
+):
+    b_t = tl.program_id(0).to(tl.int64)
+    if vbe:
+        info = tl.load(b_t_map_ptr + b_t).to(tl.uint32)
+        t = (info >> info_B_num_bits).to(tl.int32)
+        b = (info & info_B_mask).to(tl.int32)
+    else:
+        t = b_t // B
+        b = b_t % B
+
+    table_idx = tl.load(feature_table_map_ptr + t)
+    table_offset = tl.load(table_offsets_ptr + table_idx)
+    embedding_dim = tl.load(embedding_dims_ptr + t)
+    embedding_offset = tl.load(embedding_offsets_ptr + t)
+    start = tl.load(offsets_ptr + b_t)
+    end = tl.load(offsets_ptr + b_t + 1)
+
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < embedding_dim
+    if vbe:
+        dout_row_start_ptr = dout_ptr + tl.load(row_output_offsets_ptr + b_t)
+    else:
+        dout_row_start_ptr = dout_ptr + b * total_embedding_dim + embedding_offset
+    dout_row = tl.load(
+        dout_row_start_ptr + col_offsets,
+        mask=mask,
+        other=0,
+    ).to(tl.float32)
+
+    step: tl.constexpr = 4
+    num_full_steps = (end - start) // step
+    full_end = start + step * num_full_steps
+    for idx in range(start, full_end, step):
+        row_idx_0 = tl.load(indices_ptr + idx)
+        row_idx_1 = tl.load(indices_ptr + idx + 1)
+        row_idx_2 = tl.load(indices_ptr + idx + 2)
+        row_idx_3 = tl.load(indices_ptr + idx + 3)
+        row_0 = tl.load(
+            weight_ptr + table_offset + row_idx_0 * embedding_dim + col_offsets,
+            mask=mask,
+            other=0,
+        )
+        row_1 = tl.load(
+            weight_ptr + table_offset + row_idx_1 * embedding_dim + col_offsets,
+            mask=mask,
+            other=0,
+        )
+        row_2 = tl.load(
+            weight_ptr + table_offset + row_idx_2 * embedding_dim + col_offsets,
+            mask=mask,
+            other=0,
+        )
+        row_3 = tl.load(
+            weight_ptr + table_offset + row_idx_3 * embedding_dim + col_offsets,
+            mask=mask,
+            other=0,
+        )
+        # Triton TR005: accumulate dot products in FP32.
+        grad_per_sample_weight_0 = tl.sum(row_0.to(tl.float32) * dout_row, axis=0)
+        grad_per_sample_weight_1 = tl.sum(row_1.to(tl.float32) * dout_row, axis=0)
+        grad_per_sample_weight_2 = tl.sum(row_2.to(tl.float32) * dout_row, axis=0)
+        grad_per_sample_weight_3 = tl.sum(row_3.to(tl.float32) * dout_row, axis=0)
+        tl.store(grad_per_sample_weights_ptr + idx, grad_per_sample_weight_0)
+        tl.store(grad_per_sample_weights_ptr + idx + 1, grad_per_sample_weight_1)
+        tl.store(grad_per_sample_weights_ptr + idx + 2, grad_per_sample_weight_2)
+        tl.store(grad_per_sample_weights_ptr + idx + 3, grad_per_sample_weight_3)
+
+    for idx in range(full_end, end):
+        row_idx = tl.load(indices_ptr + idx)
+        row = tl.load(
+            weight_ptr + table_offset + row_idx * embedding_dim + col_offsets,
+            mask=mask,
+            other=0,
+        )
+        grad_per_sample_weight = tl.sum(row.to(tl.float32) * dout_row, axis=0)
+        tl.store(grad_per_sample_weights_ptr + idx, grad_per_sample_weight)
+
+
+@triton.jit
 def table_batched_embedding_bag_forward_unweighted_kernel(
     output_ptr,
     indices_ptr,
@@ -1397,6 +1495,8 @@ def triton_tbe_backward_long_run_apply_unweighted(
 
 
 class TritonTBE(torch.autograd.Function):
+    _PER_SAMPLE_WEIGHTS_INPUT_INDEX = 17
+
     @staticmethod
     def forward(
         ctx,
@@ -1618,6 +1718,8 @@ class TritonTBE(torch.autograd.Function):
         ctx.feature_table_map = feature_table_map
         ctx.stochastic_rounding = stochastic_rounding
         ctx.vbe = vbe
+        ctx.info_B_num_bits = info_B_num_bits
+        ctx.info_B_mask = info_B_mask
         ctx.hoist_transpose_to_forward = hoist_transpose_to_forward
         ctx.saved_histogram_plans = active_saved_histogram_plans
 
@@ -1853,7 +1955,7 @@ class TritonTBE(torch.autograd.Function):
 
     @staticmethod
     #  inconsistently.
-    def backward(ctx, dout) -> Tuple[None, ...]:
+    def backward(ctx, dout) -> Tuple[Optional[torch.Tensor], ...]:
         # Ensure dout is contiguous for correct memory access in Triton kernels
         dout = dout.contiguous()
 
@@ -1896,6 +1998,35 @@ class TritonTBE(torch.autograd.Function):
         )
 
         weighted = per_sample_weights.numel() > 0
+
+        grad_inputs: List[Optional[torch.Tensor]] = [None] * len(ctx.needs_input_grad)
+        if weighted and ctx.needs_input_grad[TritonTBE._PER_SAMPLE_WEIGHTS_INPUT_INDEX]:
+            grad_per_sample_weights = torch.empty_like(per_sample_weights)
+            total_B = offsets.numel() - 1
+            if total_B > 0:
+                table_batched_embedding_bag_grad_per_sample_weights_kernel[(total_B,)](
+                    grad_per_sample_weights,
+                    dout,
+                    indices,
+                    offsets,
+                    weight,
+                    table_offsets,
+                    embedding_dims,
+                    embedding_offsets,
+                    ctx.feature_table_map,
+                    vbe_row_output_offsets,
+                    vbe_b_t_map,
+                    total_embedding_dim,
+                    B,
+                    BLOCK_SIZE=block_size,
+                    vbe=vbe,
+                    info_B_num_bits=ctx.info_B_num_bits,
+                    info_B_mask=ctx.info_B_mask,
+                    num_warps=1,
+                )
+            grad_inputs[TritonTBE._PER_SAMPLE_WEIGHTS_INPUT_INDEX] = (
+                grad_per_sample_weights
+            )
 
         feature_table_map = ctx.feature_table_map
         num_valid_histograms = 0
@@ -1964,7 +2095,7 @@ class TritonTBE(torch.autograd.Function):
             T -= num_valid_histograms
 
         if T == 0:
-            return (None,) * len(ctx.needs_input_grad)
+            return tuple(grad_inputs)
 
         if ctx.hoist_transpose_to_forward:
             # The index transpose (linearize + sort + run-length encode) was
@@ -2394,48 +2525,7 @@ class TritonTBE(torch.autograd.Function):
             )
             print("[TritonTBE backward] ===== BACKWARD PASS END =====")
 
-        return (
-            None,  # indices
-            None,  # offsets
-            None,  # weight
-            None,  # table_offsets
-            None,  # embedding_dims
-            None,  # embedding_offsets
-            None,  # feature_table_map
-            None,  # total_embedding_dim
-            None,  # T
-            None,  # hash_size_cumsum
-            None,  # total_hash_size_bits
-            None,  # learning_rate
-            None,  # block_size
-            None,  # eps
-            None,  # optimizer
-            None,  # momentum
-            None,  # rows_cumsum
-            None,  # per_sample_weights
-            None,  # forward_event_callback
-            None,  # output_dtype
-            None,  # stochastic_rounding
-            None,  # batch_size_per_feature_per_rank
-            None,  # cached_feature_dims_cpu
-            None,  # cached_D_offsets
-            None,  # cached_max_D
-            None,  # precomputed_vbe_metadata
-            None,  # precomputed_row_output_offsets
-            None,  # precomputed_b_t_map
-            None,  # precomputed_info_B_num_bits
-            None,  # precomputed_info_B_mask
-            None,  # precomputed_total_B
-            None,  # precomputed_max_B
-            None,  # hoist_transpose_to_forward
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        return tuple(grad_inputs)
 
 
 class TritonTableBatchedEmbeddingBags(torch.nn.Module):
