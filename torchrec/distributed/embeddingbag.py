@@ -1381,6 +1381,15 @@ class ShardedEmbeddingBagCollection(
                                 self._table_name_to_config[table_name].data_type
                             )
                         ),
+                        # Set grad-ness so ShardedTensor init does not reject an
+                        # unfused (autograd-trained) kernel whose shard is a
+                        # grad-requiring nn.Parameter.
+                        requires_grad=(
+                            _model_parallel_name_to_compute_kernel[table_name]
+                            in {
+                                EmbeddingComputeKernel.UNFUSED_TPU.value,
+                            }
+                        ),
                     )
 
                     sharded_tensor_metadata = sharding_spec.build_metadata(

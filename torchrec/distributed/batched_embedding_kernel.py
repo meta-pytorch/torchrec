@@ -4801,3 +4801,136 @@ class BatchedTPUEmbedding(BaseBatchedEmbedding[torch.Tensor]):
                 self._emb_modules[self._feature_table_map[feature_idx]](feature_values)
             )
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
+
+
+class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
+    """Pooled TPU compute kernel (`UNFUSED_TPU`).
+
+    Pooled sibling of `BatchedTPUEmbedding`, and a drop-in alongside
+    `BatchedDenseEmbeddingBag` in the pooled dispatch
+    (`GroupedPooledEmbeddingsLookup._create_embedding_kernel`). Backs the lookup with one
+    `TPUEmbeddingUnfused` table per table in the group; `forward` routes each feature to
+    its table, gathers its ids, and pools per sample (SUM or MEAN per `config.pooling`).
+
+    Pooling is done in torch (scatter-add over per-id sample indices) on top of the
+    unfused gather, so no dedicated pooled kernel is required and the backward flows
+    through the gather op's autograd.
+
+    Args:
+        config (GroupedEmbeddingConfig): grouped table config (one or more tables).
+        pg (Optional[dist.ProcessGroup]): process group (unused locally).
+        device (Optional[torch.device]): compute device (e.g. ``"tpu"``).
+        sharding_type (Optional[ShardingType]): sharding type (for the pooling mode).
+
+    Example::
+
+        kernel = BatchedTPUEmbeddingBag(grouped_config, device="tpu")
+        out = kernel(features)  # [batch, sum(embedding_dim over features)]
+    """
+
+    def __init__(
+        self,
+        config: GroupedEmbeddingConfig,
+        pg: Optional[dist.ProcessGroup] = None,
+        device: Optional[torch.device] = None,
+        sharding_type: Optional[ShardingType] = None,
+    ) -> None:
+        super().__init__(config, pg, device, sharding_type)
+        # Lazy import to avoid pulling in experimental TPU code at module load time.
+        from torchrec.experimental.torch_tpu.modules.embedding_modules import (
+            TPUEmbeddingUnfused,
+        )
+
+        dtype = data_type_to_sparse_type(config.data_type).as_dtype()
+        # One TPUEmbeddingUnfused per table in the group (mirrors BatchedTPUEmbedding);
+        # the base class fills _local_rows / _local_cols / _feature_table_map.
+        self._emb_modules: nn.ModuleList = nn.ModuleList()
+        for local_rows, local_cols in zip(self._local_rows, self._local_cols):
+            self._emb_modules.append(
+                TPUEmbeddingUnfused(
+                    num_embeddings=local_rows,
+                    embedding_dim=local_cols,
+                    device=device,
+                    dtype=dtype,
+                )
+            )
+        self.init_parameters()
+
+    @property
+    # pyrefly: ignore [bad-override]  # TPUEmbeddingUnfused is not one of the
+    # fbgemm codegen types the base class enumerates (same as the Triton kernel).
+    def emb_module(self) -> "TPUEmbeddingUnfused":  # noqa: F821
+        # pyre-ignore[16]: ModuleList returns Module, pyre thinks Union
+        return self._emb_modules[0]
+
+    def split_embedding_weights(self) -> List[torch.Tensor]:
+        # pyre-ignore[16]
+        return [emb_module.weight for emb_module in self._emb_modules]
+
+    def named_split_embedding_weights(
+        self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+    ) -> Iterator[Tuple[str, torch.Tensor]]:
+        assert (
+            remove_duplicate
+        ), "remove_duplicate=False not supported in named_split_embedding_weights"
+        for table, emb_module in zip(self._config.embedding_tables, self._emb_modules):
+            # pyre-ignore[16]
+            yield append_prefix(prefix, f"{table.name}.weight"), emb_module.weight
+
+    def named_parameters(
+        self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
+    ) -> Iterator[Tuple[str, nn.Parameter]]:
+        for table, emb_module in zip(self._config.embedding_tables, self._emb_modules):
+            # pyre-ignore[7]
+            yield append_prefix(prefix, f"{table.name}.weight"), emb_module.weight
+
+    def _pool(
+        self, gathered: torch.Tensor, lengths: torch.Tensor, batch_size: int
+    ) -> torch.Tensor:
+        """Pool a feature's per-id embeddings [L, dim] into [batch, dim].
+
+        Sum-pool by scatter-adding each id's row into its sample slot; MEAN divides by
+        the bag length. `lengths` are this feature's per-sample bag sizes (may be jagged
+        after the row-wise all2all), summing to L. Uses only arange / repeat_interleave /
+        index_add_ / div, so it lowers on TPU without a bespoke pooled kernel.
+        """
+        dim = gathered.shape[1]
+        device = gathered.device
+        pooled = torch.zeros(batch_size, dim, dtype=gathered.dtype, device=device)
+        # sample index for each gathered row: sample b repeated lengths[b] times.
+        sample_idx = torch.repeat_interleave(
+            torch.arange(batch_size, device=device), lengths
+        )
+        pooled.index_add_(0, sample_idx, gathered)
+        if self._pooling == PoolingMode.MEAN:
+            denom = lengths.clamp(min=1).unsqueeze(1).to(pooled.dtype)
+            pooled = pooled / denom
+        return pooled
+
+    # pyrefly: ignore [bad-override]  # same signature shape as the sequence kernel
+    def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
+        batch_size = features.stride()
+        length_per_key = features.length_per_key()
+        # KJT lengths are feature-major: feature i's per-sample bag sizes are the
+        # i-th block of batch_size entries.
+        all_lengths = features.lengths()
+        per_feature_values = (
+            torch.split(features.values(), length_per_key)
+            if len(length_per_key) > 1
+            else [features.values()]
+        )
+        outputs: List[torch.Tensor] = []
+        for feature_idx, feature_values in enumerate(per_feature_values):
+            emb_module = self._emb_modules[self._feature_table_map[feature_idx]]
+            # pyre-ignore[9, 16]: ModuleList returns Module, pyre thinks Union;
+            # the table's `weight` is a Tensor so `.device` is a torch.device.
+            device: torch.device = emb_module.weight.device
+            gathered = emb_module(
+                feature_values.to(device=device, dtype=torch.int32)
+            )  # [L_i, dim]
+            lengths_i = all_lengths[
+                feature_idx * batch_size : (feature_idx + 1) * batch_size
+            ].to(device)
+            outputs.append(self._pool(gathered, lengths_i, batch_size))
+        # Pooled features concatenate along the embedding dim -> [batch, sum(dim)].
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
