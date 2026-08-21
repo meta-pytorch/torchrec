@@ -1022,7 +1022,7 @@ class ShardedManagedCollisionCollection(
             1
             for feature_name in features.keys()
             # pyrefly: ignore[bad-argument-type]
-            if feature_name.lower().endswith(mcm.readable_suffix)
+            if feature_name.lower().endswith(mcm.read_only_suffix)
         )
 
         # When we turn on include_readonly_suffix_feature, those features will not contribute to the ZCH frequency counter, only non-readonly features will be consider for insert, eviction and stats logging

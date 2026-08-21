@@ -251,7 +251,7 @@ class ManagedCollisionModule(nn.Module):
         self.register_load_state_dict_post_hook(_load_state_dict_post_hook)
 
     @property
-    def readable_suffix(self) -> str:
+    def read_only_suffix(self) -> str:
         return self._read_only_suffix
 
     @abc.abstractmethod
