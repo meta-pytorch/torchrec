@@ -8,12 +8,15 @@
 # pyre-strict
 
 import unittest
-from typing import cast, List
+from collections import defaultdict
+from typing import cast, DefaultDict, List
 
 import torch
 from torchrec.metrics.auc import _state_reduction
 from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
+from torchrec.metrics.metrics_config import BatchSizeStage
+from torchrec.metrics.ne import NEMetric, NEMetricComputation
 from torchrec.metrics.rec_metric import RecComputeMode, RecMetric, RecMetricList
 from torchrec.metrics.test_utils import gen_test_tasks
 from torchrec.metrics.test_utils.mock_metrics import (
@@ -22,6 +25,7 @@ from torchrec.metrics.test_utils.mock_metrics import (
     create_tensor_states,
     MockRecMetric,
 )
+from torchrec.metrics.tower_qps import TowerQPSMetric
 
 
 class CPUCommsRecMetricModuleTest(unittest.TestCase):
@@ -86,6 +90,111 @@ class CPUCommsRecMetricModuleTest(unittest.TestCase):
             # Cloned metric should have torchmetric.Metric's sync() disabled to prevent
             # unwanted distributed syncs. All syncs will be called via cpu_comms_module.
             self.assertTrue(cloned_metric.verify_sync_disabled())
+
+    def test_clone_rec_metrics_preserves_metric_specific_kwargs(self) -> None:
+        ne_metric = NEMetric(
+            world_size=self.world_size,
+            my_rank=self.my_rank,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            allow_missing_label_with_zero_weight=True,
+            enable_pt2_compile=False,
+            should_clone_update_inputs=True,
+        )
+
+        cpu_comms_module = CPUCommsRecMetricModule(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([ne_metric]),
+        )
+
+        original_computation = cast(
+            NEMetricComputation, ne_metric._metrics_computations[0]
+        )
+        cloned_metric = cast(NEMetric, cpu_comms_module.rec_metrics.rec_metrics[0])
+        cloned_computation = cast(
+            NEMetricComputation, cloned_metric._metrics_computations[0]
+        )
+
+        self.assertTrue(original_computation._allow_missing_label_with_zero_weight)
+        self.assertTrue(cloned_computation._allow_missing_label_with_zero_weight)
+        self.assertTrue(cloned_metric._should_clone_update_inputs)
+        self.assertFalse(cloned_metric.enable_pt2_compile)
+        cloned_value = cloned_computation._compute()[0].value
+        self.assertTrue(torch.isfinite(cloned_value).all())
+        torch.testing.assert_close(
+            cloned_value,
+            original_computation._compute()[0].value,
+        )
+
+    def test_clone_rec_metrics_snapshots_subclass_init_kwargs(self) -> None:
+        batch_size_stages = [
+            BatchSizeStage(batch_size=4, max_iters=1),
+            BatchSizeStage(batch_size=8, max_iters=None),
+        ]
+        tower_qps_metric = TowerQPSMetric(
+            world_size=self.world_size,
+            my_rank=self.my_rank,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            batch_size_stages=batch_size_stages,
+        )
+        batch_size_stages.append(BatchSizeStage(batch_size=16, max_iters=None))
+
+        cpu_comms_module = CPUCommsRecMetricModule(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([tower_qps_metric]),
+        )
+
+        cloned_metric = cast(
+            TowerQPSMetric, cpu_comms_module.rec_metrics.rec_metrics[0]
+        )
+        cloned_metric.update(
+            predictions=None,
+            labels={"test_task": torch.ones(4)},
+            weights=None,
+        )
+        cloned_metric.update(
+            predictions=None,
+            labels={"test_task": torch.ones(8)},
+            weights=None,
+        )
+
+        self.assertEqual(
+            cloned_metric.compute()["qps-test_task|total_examples"],
+            12,
+        )
+
+    def test_clone_rec_metrics_snapshots_container_kwargs(self) -> None:
+        initial_states: DefaultDict[str, torch.Tensor] = defaultdict(
+            lambda: torch.tensor(0.0),
+            {"state": torch.tensor(1.0)},
+        )
+        metric = MockRecMetric(
+            world_size=self.world_size,
+            my_rank=self.my_rank,
+            batch_size=self.batch_size,
+            tasks=self.tasks,
+            initial_states=initial_states,
+        )
+        initial_states["late_state"] = torch.tensor(2.0)
+        initial_states["state"].add_(1.0)
+
+        cpu_comms_module = CPUCommsRecMetricModule(
+            batch_size=self.batch_size,
+            world_size=self.world_size,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([metric]),
+        )
+
+        cloned_metric = cpu_comms_module.rec_metrics.rec_metrics[0]
+        # pyrefly: ignore[not-callable]
+        cloned_states = cloned_metric.get_computation_states()
+        self.assertNotIn("late_state", cloned_states)
+        torch.testing.assert_close(cloned_states["state"], torch.tensor(1.0))
 
     def test_load_metric_states(self) -> None:
         """
@@ -209,6 +318,11 @@ class CPUCommsRecMetricModuleTest(unittest.TestCase):
         cloned_metric = cpu_comms_module.rec_metrics.rec_metrics[0]
         # pyrefly: ignore[bad-index]
         cloned_computation = cloned_metric._metrics_computations[0]
+        cloned_states_before_load = {
+            name: value.clone()
+            # pyrefly: ignore[not-callable]
+            for name, value in cloned_metric.get_computation_states().items()
+        }
 
         cpu_comms_module._load_metric_states(
             "test_prefix",
@@ -222,19 +336,15 @@ class CPUCommsRecMetricModuleTest(unittest.TestCase):
             cloned_metric.get_computation_states()["state_1"],
             torch.tensor(5.0),
         )
-        self.assertFalse(
-            torch.allclose(
-                # pyrefly: ignore[not-callable]
-                cloned_metric.get_computation_states()["state_2"],
-                torch.tensor(2.0),
-            )
+        torch.testing.assert_close(
+            # pyrefly: ignore[not-callable]
+            cloned_metric.get_computation_states()["state_2"],
+            cloned_states_before_load["state_2"],
         )
-        self.assertFalse(
-            torch.allclose(
-                # pyrefly: ignore[not-callable]
-                cloned_metric.get_computation_states()["state_2"],
-                torch.tensor(3.0),
-            )
+        torch.testing.assert_close(
+            # pyrefly: ignore[not-callable]
+            cloned_metric.get_computation_states()["state_3"],
+            cloned_states_before_load["state_3"],
         )
 
     def test_load_multiple_metrics_unfused(self) -> None:

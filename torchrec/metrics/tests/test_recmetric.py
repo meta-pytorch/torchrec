@@ -8,7 +8,8 @@
 # pyre-strict
 
 import unittest
-from typing import Any, Dict
+from dataclasses import dataclass
+from typing import Any, cast, Dict
 from unittest.mock import patch
 
 import torch
@@ -16,11 +17,21 @@ from torchrec.metrics.metrics_config import BatchSizeStage, DefaultTaskInfo, Rec
 from torchrec.metrics.model_utils import parse_task_model_outputs
 from torchrec.metrics.mse import MSEMetric
 from torchrec.metrics.ne import NEMetric
-from torchrec.metrics.rec_metric import RecComputeMode, RecMetric, RecMetricList
+from torchrec.metrics.rec_metric import (
+    _snapshot_init_kwargs,
+    RecComputeMode,
+    RecMetric,
+    RecMetricList,
+)
 from torchrec.metrics.test_utils import gen_test_batch, gen_test_tasks
 
 
 _CUDA_UNAVAILABLE: bool = not torch.cuda.is_available()
+
+
+@dataclass
+class _MutableInitConfig:
+    values: list[int]
 
 
 class RecMetricTest(unittest.TestCase):
@@ -30,6 +41,29 @@ class RecMetricTest(unittest.TestCase):
         self.labels, self.predictions, self.weights, _ = parse_task_model_outputs(
             [DefaultTaskInfo], model_output
         )
+
+    def test_init_kwargs_snapshot_isolates_nested_mutable_values(self) -> None:
+        tensor = torch.tensor([1.0], requires_grad=True)
+        custom = _MutableInitConfig(values=[1])
+
+        snapshot = _snapshot_init_kwargs(
+            {
+                "nested": [{"tensor": tensor}],
+                "custom": custom,
+            }
+        )
+        nested = cast(list[dict[str, Any]], snapshot["nested"])
+        snapshot_tensor = cast(torch.Tensor, nested[0]["tensor"])
+        snapshot_custom = cast(_MutableInitConfig, snapshot["custom"])
+
+        self.assertIsNot(snapshot_tensor, tensor)
+        self.assertFalse(snapshot_tensor.requires_grad)
+        self.assertIsNot(snapshot_custom, custom)
+        with torch.no_grad():
+            tensor.fill_(2.0)
+        custom.values.append(2)
+        torch.testing.assert_close(snapshot_tensor, torch.tensor([1.0]))
+        self.assertEqual(snapshot_custom.values, [1])
 
     def test_optional_weights(self) -> None:
         ne1 = NEMetric(
@@ -301,34 +335,25 @@ class RecMetricTest(unittest.TestCase):
         )
         self.assertEqual(required_inputs["session_id"].device, torch.device("cuda:0"))
 
-    def test_batch_size_stages_kwargs_stripped(self) -> None:
-        """Verify RecMetric.__init__ strips batch_size_stages from kwargs
-        so non-TowerQPS metrics can be constructed with it in kwargs."""
-        batch_size_stages = [
-            BatchSizeStage(256, 100),
-            BatchSizeStage(512, None),
-        ]
-        # NEMetric does NOT declare batch_size_stages as an explicit param.
-        # This should succeed because RecMetric.__init__ strips it from kwargs.
-        extra_kwargs: dict[str, Any] = {"batch_size_stages": batch_size_stages}
+    def test_batch_size_stages_kwargs_are_ignored(self) -> None:
         ne = NEMetric(
             world_size=1,
             my_rank=0,
             batch_size=64,
             tasks=[DefaultTaskInfo],
-            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-            window_size=100,
-            fused_update_limit=0,
-            **extra_kwargs,
+            window_size=128,
+            batch_size_stages=[
+                BatchSizeStage(batch_size=64, max_iters=None),
+            ],
         )
-        # Verify the metric initialized and can compute
+
         ne.update(
             predictions=self.predictions,
             labels=self.labels,
             weights=self.weights,
         )
-        res = ne.compute()
-        self.assertIn("ne-DefaultTask|lifetime_ne", res)
+
+        self.assertIn("ne-DefaultTask|lifetime_ne", ne.compute())
 
 
 class RecMetricTensorSizeLoggingTest(unittest.TestCase):
