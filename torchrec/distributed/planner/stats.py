@@ -40,6 +40,7 @@ from torchrec.distributed.planner.storage_reservations import (
     FixedPercentageStorageReservation,
     HeuristicalStorageReservation,
     InferenceStorageReservation,
+    SKUAwareStorageReservation,
 )
 from torchrec.distributed.planner.types import (
     CriticalPathEstimate,
@@ -691,6 +692,7 @@ class EmbeddingStats(Stats):
                 HeuristicalStorageReservation,
                 InferenceStorageReservation,
                 FixedPercentageStorageReservation,
+                SKUAwareStorageReservation,
             ),
         ):
             dense_hbm = round(bytes_to_gb(dense_storage.hbm), 3)
@@ -1074,6 +1076,23 @@ def _compute_storage(
         reserved_hbm_percent = (
             storage_reservation._hbm_reserved_bytes / topology.devices[0].storage.hbm
         )
+    elif (
+        isinstance(storage_reservation, SKUAwareStorageReservation)
+        and topology is not None
+        and topology.devices[0].storage.hbm > 0
+    ):
+        # SKUAware reserves absolute bytes anchored to a fixed home SKU, so there is
+        # no percentage to read off it. Report the STATIC base only: dense and kjt
+        # are rendered as their own blocks below, and folding them in here would
+        # count them twice.
+        static_base = (
+            storage_reservation._model_base_bytes
+            if storage_reservation._model_base_bytes is not None
+            else storage_reservation._margin_bytes
+        )
+        reserved_hbm_percent = (
+            static_base + storage_reservation._runtime_overhead_bytes
+        ) / topology.devices[0].storage.hbm
     elif isinstance(
         storage_reservation,
         (
@@ -1090,7 +1109,11 @@ def _compute_storage(
         storage_reservation._dense_storage
         if isinstance(
             storage_reservation,
-            (HeuristicalStorageReservation, InferenceStorageReservation),
+            (
+                HeuristicalStorageReservation,
+                InferenceStorageReservation,
+                SKUAwareStorageReservation,
+            ),
         )
         and storage_reservation._dense_storage is not None
         else Storage(0, 0, 0)
@@ -1104,6 +1127,7 @@ def _compute_storage(
                 HeuristicalStorageReservation,
                 InferenceStorageReservation,
                 FixedPercentageStorageReservation,
+                SKUAwareStorageReservation,
             ),
         )
         and storage_reservation._kjt_storage
