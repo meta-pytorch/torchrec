@@ -314,7 +314,7 @@ class ShardedManagedCollisionCollection(
         ],
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
         use_index_dedup: bool = False,
-        restore_dedup_feature_boundary: bool = False,
+        restore_dedup_feature_boundary: bool = True,
     ) -> None:
         # pyrefly: ignore[missing-attribute]
         super().__init__()
@@ -1242,7 +1242,7 @@ class ManagedCollisionCollectionSharder(
     def __init__(
         self,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
-        restore_dedup_feature_boundary: bool = False,
+        restore_dedup_feature_boundary: bool = True,
     ) -> None:
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
         # only has an effect when index dedup is on and a table binds more than one
