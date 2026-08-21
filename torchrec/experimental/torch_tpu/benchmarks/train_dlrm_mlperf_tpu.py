@@ -361,7 +361,7 @@ def _skip_ddp_shape_verify_on_tpu() -> None:
     unaffected (the check already passes there). The durable fix belongs in torch_tpu's
     device->CPU lowering; this unblocks the multi-host benchmark run.
     """
-    if not torch.tpu.is_available():
+    if not (hasattr(torch, "tpu") and torch.tpu.is_available()):
         return
     import torch.nn.parallel.distributed as _ddp
 
