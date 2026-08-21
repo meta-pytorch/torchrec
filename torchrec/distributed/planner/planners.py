@@ -40,6 +40,7 @@ from torchrec.distributed.planner.stats import EmbeddingStats
 from torchrec.distributed.planner.storage_reservations import (
     FixedAbsoluteStorageReservation,
     HeuristicalStorageReservation,
+    SKUAwareStorageReservation,
 )
 from torchrec.distributed.planner.types import (
     Enumerator,
@@ -1133,9 +1134,35 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
                 )
             elif isinstance(self._storage_reservation, FixedAbsoluteStorageReservation):
                 storage_reservation_solution = f"\n\t  Storage reservation: {round(bytes_to_gb(self._storage_reservation._hbm_reserved_bytes), 3)} GB per device, "
+            elif isinstance(self._storage_reservation, SKUAwareStorageReservation):
+                reservation = self._storage_reservation
+                # No percentage is reported: the static base is anchored to a fixed
+                # home SKU and does not scale with the device being planned, so a
+                # fraction of THIS device would differ per SKU for one unchanged
+                # config -- a plausible-looking value that no one configured.
+                # model_base_bytes REPLACES margin and dense when set, so naming it
+                # a margin would report a number the reservation never used.
+                static_base = (
+                    f"Measured model base: {round(bytes_to_gb(reservation._model_base_bytes), 3)} GB"
+                    if reservation._model_base_bytes is not None
+                    else f"Home-anchored margin: {round(bytes_to_gb(reservation._margin_bytes), 3)} GB"
+                )
+                storage_reservation_solution = (
+                    f"\n\t  {static_base}, "
+                    f"\n\t  Per rank reservation for dense storage: {storage_repr_in_gb(reservation._dense_storage)}, "
+                    f"\n\t  Per rank reservation for kjt storage: {storage_repr_in_gb(reservation._kjt_storage)}, "
+                    f"\n\t  Runtime overhead: {round(bytes_to_gb(reservation._runtime_overhead_bytes), 3)} GB"
+                )
             else:
-                # pyrefly: ignore[missing-attribute]
-                storage_reservation_solution = f"\n\t  Storage reservation percentage: {self._storage_reservation._percentage}, "
+                # Not every reservation is percentage-based, and the no-plan path
+                # must never fail: raising here replaces a real planner diagnostic
+                # with an unrelated AttributeError and hides the actual error type.
+                percentage = getattr(self._storage_reservation, "_percentage", None)
+                storage_reservation_solution = (
+                    f"\n\t  Storage reservation percentage: {percentage}, "
+                    if percentage is not None
+                    else f"\n\t  Storage reservation: {type(self._storage_reservation).__name__}, "
+                )
             no_plan_solution = (
                 f"Planner evaluated {self._num_proposals} proposals."
                 "\nPossible solutions:"

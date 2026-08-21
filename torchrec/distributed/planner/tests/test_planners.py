@@ -31,6 +31,7 @@ from torchrec.distributed.planner.stats import EmbeddingStats
 from torchrec.distributed.planner.storage_reservations import (
     FixedAbsoluteStorageReservation,
     HeuristicalStorageReservation,
+    SKUAwareStorageReservation,
 )
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
@@ -224,6 +225,45 @@ class TestEmbeddingShardingPlanner(unittest.TestCase):
         sharding_plan = self.planner.plan(module=model, sharders=[])
 
         self.assertEqual(sharding_plan, ShardingPlan({}))
+
+
+class TestNoPlanDiagnostic(unittest.TestCase):
+    """The no-plan diagnostic must never fail on a non-percentage reservation.
+
+    The message is built only when planning has ALREADY failed, so raising inside
+    it replaces a real PlannerError with an unrelated AttributeError and hides the
+    error type the caller needs. `SKUAwareStorageReservation` has no `_percentage`.
+    """
+
+    def test_sku_aware_reports_planner_error_not_attribute_error(self) -> None:
+        # The reservation must SUCCEED and planning must then fail, so execution
+        # reaches the no-plan diagnostic. Tables large enough to fail reserve()
+        # would raise INSUFFICIENT_STORAGE first and never exercise the branch --
+        # which is how the first version of this test passed against the bug.
+        tables = [
+            EmbeddingBagConfig(
+                num_embeddings=10000000,
+                embedding_dim=256,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(2)
+        ]
+        model = TestSparseNN(tables=tables, sparse_device=torch.device("meta"))
+        planner = EmbeddingShardingPlanner(
+            topology=Topology(
+                world_size=2, hbm_cap=1024 * 1024 * 1024, compute_device="cuda"
+            ),
+            storage_reservation=SKUAwareStorageReservation(margin_bytes=0),
+        )
+        with self.assertRaises(PlannerError) as context:
+            # pyrefly: ignore[bad-argument-type, missing-argument]
+            planner.plan(module=model, sharders=[TWvsRWSharder()])
+        # The specific type matters: an AttributeError escaping the diagnostic
+        # would surface as a non-PlannerError and mask the real cause.
+        self.assertEqual(
+            context.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
+        )
 
 
 class TestEmbeddingShardingPlannerWithConstraints(unittest.TestCase):
