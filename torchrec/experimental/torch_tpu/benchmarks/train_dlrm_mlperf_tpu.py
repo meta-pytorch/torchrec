@@ -350,6 +350,28 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _skip_ddp_shape_verify_on_tpu() -> None:
+    """No-op DDP's startup param-shape verification on TPU (multi-host workaround).
+
+    `DistributedDataParallel.__init__` calls `_verify_param_shape_across_processes`,
+    which does a device->CPU transfer whose StableHLO lowering fails on the torch_tpu
+    multi-host runtime (32 ranks): "transfer to 'cpu' device failed ... StableHLO
+    failed". The check is only a sanity guard, and DMP's dense arch is deterministically
+    replicated (identical shapes on every rank), so skipping it is safe. Single-host is
+    unaffected (the check already passes there). The durable fix belongs in torch_tpu's
+    device->CPU lowering; this unblocks the multi-host benchmark run.
+    """
+    if not torch.tpu.is_available():
+        return
+    import torch.nn.parallel.distributed as _ddp
+
+    def _noop(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    # DDP resolves the name in its own module namespace, so patch it there.
+    _ddp._verify_param_shape_across_processes = _noop
+
+
 def main() -> None:
     args = parse_args()
     # Run the embedding lookup (forward gather) on the SparseCore. Set before the
@@ -379,6 +401,10 @@ def main() -> None:
     table_rows = [t.num_embeddings for t in tables]
     features = [t.feature_names[0] for t in tables]
     per_chip_batch = args.per_chip_batch
+
+    # torch_tpu multi-host workaround: DDP's startup shape-verify can't lower its
+    # device->CPU transfer at 32 ranks; skip it (dense arch shapes are replicated).
+    _skip_ddp_shape_verify_on_tpu()
 
     sharded_model = _build_sharded(
         tables, device, pg, world_size, args.dcn_num_layers, args.dcn_low_rank
