@@ -16,18 +16,25 @@ value >4M capped at 4M) or `canonical` (sum 228M) sets, selectable via
 --cardinality. This is the third comparison point for the GPU<->TPU per-chip
 gap-closure work: B200 GPU (MAST) vs v7x jte (JAX) vs **v7x torch_tpu (here)**.
 
-The embeddings are ROW_WISE-sharded on the `UNFUSED_TPU` compute kernel under
+The embeddings are COLUMN_WISE-sharded on the `UNFUSED_TPU` compute kernel under
 `DistributedModelParallel` over the `tpu_dist` backend; the dense DCN/MLP path
-runs on TPU via torch_tpu. Reports steady-state ms/step and K samples/s/chip
+runs on TPU via torch_tpu. The embedding lookup (forward gather) runs on the
+SparseCore (`LOOKUP_MODE=v1_sc`, set in `main`); its unfused backward runs on the
+TensorCore. Reports steady-state ms/step and K samples/s/chip
 (per_chip_batch / step_time), the same metric as
 `mlperf_dlrm_tpu/EXPERIMENT_LOG.md`.
 
-NOTE (faithful-model caveat): the full MLPerf model uses POOLED, MULTI-HOT
-embeddings, which produce an UNEVEN row-wise all2all. The torch_tpu RW path was
-first brought up for `EmbeddingCollection`, 1-hot, EVEN splits only (see
-`dlrm_bench_rw_tpu.py`). Running this faithful config may require torch_tpu
-support for pooled multi-hot / uneven all2all that is still landing; that is an
-intentional choice (measure the real model, surface the gap).
+WHY COLUMN_WISE (not row_wise): the `tpu_dist` backend only implements EVEN
+`all_to_all_single`. Row-wise bucketizes ids across ranks by row, giving
+data-dependent, uneven per-partition counts -> uneven all2all (unsupported).
+Column-wise reuses the table-wise input dist (`KJTAllToAll`, no bucketization):
+each table's `embedding_dim` is split across all ranks, so every rank owns every
+feature and each destination receives exactly `per_chip_batch * sum(MULTI_HOT_SIZES)`
+ids -> an EVEN all2all, with no id-dropping. Requires `EMBEDDING_DIM % world_size
+== 0` AND `(EMBEDDING_DIM // world_size) % 4 == 0` -- CW rounds each shard's column
+width up to a multiple of 4, so a narrower split would place fewer, wider shards on a
+subset of ranks and the all2all would go uneven again. With dim=128 that caps the
+benchmark at world_size <= 32.
 
 Run on the TPU pod via run_pod.sh (pushes torchrec, launches via run_dist_file.sh):
 
@@ -37,6 +44,7 @@ Run on the TPU pod via run_pod.sh (pushes torchrec, launches via run_dist_file.s
 
 import argparse
 import logging
+import os
 import time
 
 import torch
@@ -45,12 +53,20 @@ import torch.nn.functional as F
 
 # pyre-ignore[21]: torch_tpu ships in the TPU pod venv, not as a buck dep.
 import torch_tpu  # noqa: F401  (registers the "tpu" device + "tpu_dist" backend)
+import torchrec.experimental.torch_tpu.pallas.dispatcher  # noqa: F401  registers fbgemm  TPU kernels
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.model_parallel import DistributedModelParallel
-from torchrec.distributed.sharding_plan import construct_module_sharding_plan, row_wise
+from torchrec.distributed.sharding_plan import (
+    column_wise,
+    construct_module_sharding_plan,
+)
 from torchrec.distributed.types import ShardingEnv, ShardingPlan
+
+# Registers the TPU (SparseCore) impls of torchrec::embedding_lookup{,_backward};
+# pallas/ops.py only registers the CPU ones, so the UNFUSED_TPU lookup needs this.
+from torchrec.experimental.torch_tpu.pallas import impl  # noqa: F401
 from torchrec.models.dlrm import DLRM_DCN
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
@@ -188,21 +204,17 @@ except Exception:  # noqa: BLE001
             tensor.detach().to("cpu")
 
 
-def _round_up_div(a: int, b: int) -> int:
-    return (a + b - 1) // b
-
-
-def _build_tables(nepf: list[int], world_size: int) -> list[EmbeddingBagConfig]:
-    """One EmbeddingBagConfig per sparse feature. num_embeddings is rounded up to a
-    multiple of world_size so the RW shards are even-sized."""
+def _build_tables(nepf: list[int]) -> list[EmbeddingBagConfig]:
+    """One EmbeddingBagConfig per sparse feature. Column-wise sharding keeps every
+    row on every rank (only the embedding_dim is split), so num_embeddings needs no
+    world_size padding (unlike row-wise)."""
     tables = []
     for i, rows in enumerate(nepf):
-        padded = _round_up_div(rows, world_size) * world_size
         tables.append(
             EmbeddingBagConfig(
                 name=f"table{i}",
                 embedding_dim=EMBEDDING_DIM,
-                num_embeddings=padded,
+                num_embeddings=rows,
                 feature_names=[f"feature{i}"],
             )
         )
@@ -217,7 +229,7 @@ def _build_sharded(
     dcn_num_layers: int,
     dcn_low_rank_dim: int,
 ) -> nn.Module:
-    """Faithful MLPerf DLRM_DCN with a RW / UNFUSED_TPU EmbeddingBagCollection under DMP."""
+    """Faithful MLPerf DLRM_DCN with a CW / UNFUSED_TPU EmbeddingBagCollection under DMP."""
     ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
     model = DLRM_DCN(
         embedding_bag_collection=ebc,
@@ -228,14 +240,18 @@ def _build_sharded(
         dcn_low_rank_dim=dcn_low_rank_dim,
         dense_device=device,
     )
+    # Split each table's embedding_dim across ALL ranks (one column shard per rank),
+    # so every rank owns every feature -> the sparse input all2all is EVEN.
+    ranks = list(range(world_size))
     plan = ShardingPlan(
         {
             # fqn of the EBC inside DLRM_DCN: sparse_arch.embedding_bag_collection
             "sparse_arch.embedding_bag_collection": construct_module_sharding_plan(
                 model.sparse_arch.embedding_bag_collection,
                 per_param_sharding={
-                    t.name: row_wise(
-                        compute_kernel=EmbeddingComputeKernel.UNFUSED_TPU.value
+                    t.name: column_wise(
+                        ranks=ranks,
+                        compute_kernel=EmbeddingComputeKernel.UNFUSED_TPU.value,
                     )
                     for t in tables
                 },
@@ -263,15 +279,17 @@ def make_multihot_kjt(
     nepf: list[int],
     per_chip_batch: int,
     generator: torch.Generator,
+    device: torch.device,
 ) -> KeyedJaggedTensor:
     """A realistic multi-hot KJT: feature i has MULTI_HOT_SIZES[i] random ids per sample.
 
-    Values span each table's full cardinality, so the RW bucketize routes them across
-    all ranks (an UNEVEN all2all -- the faithful MLPerf regime). Values vary per call
-    (seed per step) so the looked-up rows change every step.
+    Values span each table's full cardinality. Under column-wise sharding the KJT is
+    routed feature-wise (no bucketize) and, since every rank owns every feature, the
+    all2all is EVEN. Values vary per call (seed per step) so looked-up rows change
+    every step.
 
-    Citrine C3 exception (deliberate): these ids are built on CPU and moved to the TPU by
-    the caller, rather than created directly on device. `generator` is a CPU
+    Citrine C3 exception (deliberate): these ids are built on CPU and moved to the TPU
+    at the end of this function, rather than created directly on device. `generator` is a CPU
     `torch.Generator` -- passing it to a device-side `torch.randint` is not allowed, and
     the per-step reseeding is what makes each step look up different rows. This also
     mirrors a real input pipeline, where sparse ids arrive from the host. The resulting
@@ -291,7 +309,7 @@ def make_multihot_kjt(
         keys=features,
         values=torch.cat(values_list),
         lengths=torch.cat(lengths_list),
-    )
+    ).to(device)
 
 
 def _median(xs: list[float]) -> float:
@@ -328,20 +346,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    # Run the embedding lookup (forward gather) on the SparseCore. Set before the
+    # first lookup; single_lookup._lookup_mode() reads LOOKUP_MODE at call time.
+    # The unfused backward always runs on the TensorCore.
+    os.environ["LOOKUP_MODE"] = "v1_sc"
     dist.init_process_group(backend="tpu_dist")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     device = torch.device("tpu")
     pg = dist.group.WORLD
     assert pg is not None, "default process group missing after init_process_group"
-    assert world_size > 1, "benchmark needs WORLD_SIZE > 1 for RW sharding"
+    assert world_size > 1, "benchmark needs WORLD_SIZE > 1 for CW sharding"
+    # CW rounds each shard's column width up to a multiple of 4 (sharding_plan
+    # _find_base_dim); dim//world_size must be a multiple of 4 so CW places exactly
+    # one shard per rank (every rank owns every feature -> even input all2all).
+    assert EMBEDDING_DIM % world_size == 0 and (EMBEDDING_DIM // world_size) % 4 == 0, (
+        f"column_wise across all ranks needs EMBEDDING_DIM ({EMBEDDING_DIM}) "
+        f"// world_size ({world_size}) to be a multiple of 4"
+    )
     # Guard the timed loop: with --steps 0 the stats below divide by len(step_ms) == 0.
     assert args.steps > 0, "--steps must be > 0 to report timing statistics"
     assert args.warmup >= 0, "--warmup cannot be negative"
 
     nepf = NEPF_CANONICAL if args.cardinality == "canonical" else NEPF_SHRUNK
-    tables = _build_tables(nepf, world_size)
-    padded_nepf = [t.num_embeddings for t in tables]
+    tables = _build_tables(nepf)
+    table_rows = [t.num_embeddings for t in tables]
     features = [t.feature_names[0] for t in tables]
     per_chip_batch = args.per_chip_batch
 
@@ -363,13 +392,11 @@ def main() -> None:
     kjt_gen = torch.Generator()
 
     def run_step(step: int, timed: bool) -> float:
-        # The KJT must already be on the TPU: the sharded EBC input_dist bucketizes (RW)
-        # and all2alls it over the `tpu_dist` process group, which has no CPU backend
-        # ("No backend type associated with device type cpu" if the ids stay on host).
+        # KJT is built on host then moved to device; the sharded EBC input_dist
+        # all2alls it feature-wise (CW: even). It must already be on device -- the
+        # splits all2all inside KJTAllToAll runs on the KJT's device.
         kjt_gen.manual_seed(args.seed + 1 + step)
-        kjt = make_multihot_kjt(features, padded_nepf, per_chip_batch, kjt_gen).to(
-            device
-        )
+        kjt = make_multihot_kjt(features, table_rows, per_chip_batch, kjt_gen, device)
         opt.zero_grad()
         t0 = time.perf_counter()
         logits = sharded_model(dense_x, kjt)
