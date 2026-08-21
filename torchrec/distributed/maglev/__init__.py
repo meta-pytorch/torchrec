@@ -24,11 +24,17 @@ them to slot in later.
 """
 
 from torchrec.distributed.maglev.module import MaglevModuleList
-from torchrec.distributed.maglev.pipeline import MaglevPipeline, run_1f1b
+from torchrec.distributed.maglev.pipeline import (
+    MaglevPipeline,
+    run_1f1b,
+    run_1f1b_split,
+)
 from torchrec.distributed.maglev.stage import (
     build_stage_process_groups,
     EmbeddingShard,
+    MaglevStage,
     Replicated,
+    SplitForwardMixin,
     StageParallelizer,
     StageWrapper,
 )
@@ -36,7 +42,10 @@ from torchrec.distributed.maglev.stage import (
 __all__ = [
     "MaglevModuleList",
     "MaglevPipeline",
+    "MaglevStage",
+    "SplitForwardMixin",
     "run_1f1b",
+    "run_1f1b_split",
     "StageWrapper",
     "StageParallelizer",
     "Replicated",

@@ -8,7 +8,7 @@
 # pyre-strict
 
 import abc
-from typing import Any, cast, List, Optional, Tuple
+from typing import Any, cast, List, Optional, Protocol, Tuple
 
 import torch
 import torch.distributed as dist
@@ -23,6 +23,77 @@ from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingPlan
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizerWrapper
 from torchrec.optim.optimizers import in_backward_optimizer_filter
+
+
+class MaglevStage(Protocol):
+    """Typing contract for stages that opt into the sparse/dense forward split.
+
+    Structural (a stage need not inherit from this Protocol -- only match the
+    three methods). Used by pyre and by the split-aware pipeline hooks to
+    require the two halves alongside the derived ``forward``.
+
+    Invariant: ``forward_sparse`` depends only on ``stage_input`` -- never on
+    the upstream activation, never on this stage's own dense compute. Splitting
+    the forward is only valid when the embedding lookup carries no dependence
+    on the pipeline carrier.
+    """
+
+    def forward_sparse(self, stage_input: Any) -> torch.Tensor:
+        """Everything reachable from ``stage_input`` alone.
+
+        Every embedding lookup in the stage, plus any compute downstream of it
+        that needs neither the dense features nor the upstream activation.
+        Drawing the cut as late as this contract allows is deliberate: whatever
+        sits above it can be hoisted into the activation-wait window, so a later
+        cut means more bubble filled. The tradeoff is memory -- the seam tensor
+        is retained per hoisted microbatch.
+
+        May issue intra-HSD collectives (the sharded lookup all-to-all under
+        :class:`EmbeddingShard`); it must not issue cross-stage comm. Callers
+        that hoist it out of program order therefore have to keep the hoist
+        count identical across a stage's DP ranks, or the all-to-alls mismatch.
+        """
+        ...
+
+    def forward_dense(
+        self,
+        stage_input: Any,
+        sparse_out: torch.Tensor,
+        prev_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """The rest: anything needing the dense features or the upstream join."""
+        ...
+
+    def forward(
+        self,
+        stage_input: Any,
+        prev_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Derived; equals ``forward_dense(inp, forward_sparse(inp), prev)``."""
+        ...
+
+
+class SplitForwardMixin:
+    """Derives ``forward`` from ``forward_sparse`` + ``forward_dense``.
+
+    Mix in FIRST so the derived forward wins the MRO over any base class's
+    ``forward`` (e.g. ``MaglevTestStage.forward``)::
+
+        class MyStage(SplitForwardMixin, MaglevTestStage):
+            def forward_sparse(self, stage_input): ...
+            def forward_dense(self, stage_input, sparse_out, prev_output): ...
+            # forward is auto-derived by the mixin
+    """
+
+    def forward(
+        self,
+        stage_input: Any,
+        prev_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # pyre-ignore[16]: subclasses provide forward_sparse.
+        sparse_out = self.forward_sparse(stage_input)
+        # pyre-ignore[16]: subclasses provide forward_dense.
+        return self.forward_dense(stage_input, sparse_out, prev_output)
 
 
 def build_stage_process_groups(
@@ -188,6 +259,16 @@ class StageParallelizer(abc.ABC):
         """Complete the once-per-step DP gradient reduction over ``stage_pg``."""
         ...
 
+    def unwrap(self, module: nn.Module) -> nn.Module:
+        """The stage module underneath any wrapper :meth:`parallelize` added.
+
+        Wrappers such as DMP proxy ``forward`` but not other methods, so callers
+        that need the sparse/dense halves must reach through. Overriding is only
+        necessary for a parallelizer that actually wraps; the default returns
+        ``module`` unchanged.
+        """
+        return module
+
 
 class Replicated(StageParallelizer):
     """Full replica per rank; grads are DP-averaged over the HSD.
@@ -310,6 +391,12 @@ class EmbeddingShard(StageParallelizer):
         # handled locally by the fused (in-backward) optimizer.
         _all_reduce_dense(self._dense_params, stage_pg)
 
+    def unwrap(self, module: nn.Module) -> nn.Module:
+        # DMP shards submodules in place, so the module underneath is the same
+        # sharded one ``forward`` runs -- it just also exposes non-``forward``
+        # methods, which DMP does not proxy.
+        return cast(DistributedModelParallel, module).module
+
 
 class StageWrapper(nn.Module):
     """Binds a Maglev stage module to its HSD process group via a parallelizer.
@@ -368,6 +455,32 @@ class StageWrapper(nn.Module):
             torch.Tensor: this stage's output activation.
         """
         return self.module(stage_input, prev_output)
+
+    def _split_stage(self) -> MaglevStage:
+        """The wrapped stage, reached through any parallel wrapper.
+
+        Not held as an attribute: assigning the pre-parallelize module to a
+        field would register it a second time in ``_modules``, and while
+        ``parameters()`` de-duplicates, ``state_dict()`` does not -- every
+        tensor would be emitted twice.
+        """
+        return cast(MaglevStage, self._parallelizer.unwrap(self.module))
+
+    def forward_sparse(self, stage_input: Any) -> torch.Tensor:
+        """Run only the stage's sparse half (embedding lookup).
+
+        Requires the wrapped module to implement :class:`MaglevStage`.
+        """
+        return self._split_stage().forward_sparse(stage_input)
+
+    def forward_dense(
+        self,
+        stage_input: Any,
+        sparse_out: torch.Tensor,
+        prev_output: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Run only the stage's dense half. See :meth:`forward_sparse`."""
+        return self._split_stage().forward_dense(stage_input, sparse_out, prev_output)
 
     def configure_optimizer(self, lr: float) -> torch.optim.Optimizer:
         """Build the optimizer matching this stage's parallelizer."""

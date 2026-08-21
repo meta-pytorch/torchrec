@@ -127,8 +127,36 @@ def invert_permute(permute):
     return torch.ops.fbgemm.invert_permute(permute.to("cpu")).to("tpu")
 
 
+def permute_pooled_embs_auto_grad_split(
+    pooled_embs,
+    offset_dim_list,
+    permute_list,
+    inv_offset_dim_list,
+    inv_permute_list,
+):
+    """CPU fallback for the CW output-dist feature-order permute.
+
+    Restores feature order after the column-wise PooledEmbeddingsAllToAll. The fbgemm
+    kernel has no TPU implementation, so round-trip through CPU like the sparse-side
+    permutes above. Autograd flows through the `.to()` calls, so the op's backward runs
+    on CPU as well.
+    """
+    return torch.ops.fbgemm.permute_pooled_embs_auto_grad_split(
+        pooled_embs.to("cpu"),
+        offset_dim_list.to("cpu"),
+        permute_list.to("cpu"),
+        inv_offset_dim_list.to("cpu"),
+        inv_permute_list.to("cpu"),
+    ).to("tpu")
+
+
 # Register these functions to dispatcher with key 'TPU'
 lib.impl("permute_2D_sparse_data", permute_2D_sparse_data, "TPU")
 lib.impl("permute_1D_sparse_data", permute_1D_sparse_data, "TPU")
 lib.impl("block_bucketize_sparse_features", block_bucketize_sparse_features, "TPU")
 lib.impl("invert_permute", invert_permute, "TPU")
+lib.impl(
+    "permute_pooled_embs_auto_grad_split",
+    permute_pooled_embs_auto_grad_split,
+    "TPU",
+)
