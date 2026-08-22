@@ -11,7 +11,7 @@
 import unittest
 from collections import OrderedDict
 from functools import partial, update_wrapper
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type, Union
 from unittest.mock import Mock, patch
 
 import torch
@@ -32,7 +32,7 @@ from torchrec.metrics.test_utils import (
     rec_metric_value_test_launcher,
     TestMetric,
 )
-from torchrec.metrics.tower_qps import TowerQPSMetric
+from torchrec.metrics.tower_qps import TowerQPSMetric, TowerQPSMetricComputation
 
 WORLD_SIZE = 4
 WARMUP_STEPS = 100
@@ -176,6 +176,35 @@ class TowerQPSMetricTest(unittest.TestCase):
 
     target_clazz: Type[RecMetric] = TowerQPSMetric
     task_names: str = "qps"
+
+    def test_new_like_preserves_tower_qps_kwargs(self) -> None:
+        warmup_steps = 7
+        batch_size_stages = [
+            BatchSizeStage(256, 1),
+            BatchSizeStage(512, None),
+        ]
+        metric = TowerQPSMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=256,
+            tasks=[DefaultTaskInfo],
+            window_size=1000,
+            warmup_steps=warmup_steps,
+            batch_size_stages=batch_size_stages,
+        )
+
+        cloned = cast(TowerQPSMetric, metric._new_like(process_group=None))
+        cloned_computation = cast(
+            TowerQPSMetricComputation, cloned._metrics_computations[0]
+        )
+
+        self.assertEqual(cloned_computation._warmup_steps, warmup_steps)
+        self.assertEqual(cloned._batch_size_stages_config, batch_size_stages)
+        self.assertIsNot(
+            cloned._batch_size_stages_config, metric._batch_size_stages_config
+        )
+        metric._batch_size_stages_config = [BatchSizeStage(1024, None)]
+        self.assertEqual(cloned._batch_size_stages_config, batch_size_stages)
 
     def test_tower_qps_during_warmup_unfused(self) -> None:
         rec_metric_value_test_launcher(

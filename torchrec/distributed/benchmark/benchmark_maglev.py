@@ -60,11 +60,7 @@ from torchrec.distributed.benchmark.base import (
     GPUMemoryStats,
 )
 from torchrec.distributed.maglev.input_dist import input_dist
-from torchrec.distributed.maglev.pipeline import (
-    MaglevPipeline,
-    run_1f1b,
-    run_1f1b_split,
-)
+from torchrec.distributed.maglev.pipeline import MaglevPipeline, run_1f1b
 from torchrec.distributed.maglev.stage import (
     build_cascade_process_groups,
     build_handoff_process_groups,
@@ -79,7 +75,7 @@ from torchrec.distributed.test_utils.multi_process import (
     run_multi_process_func,
 )
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
-from torchrec.distributed.test_utils.test_model import MaglevSplitStage, MaglevTestStage
+from torchrec.distributed.test_utils.test_model import MaglevTestStage
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 # Weights are seeded per stage so an HSD's two DP ranks start identical (the
@@ -122,15 +118,6 @@ class RunOptions(BenchFuncConfig):
             embedding sharding; the lookup all-to-all stays local to the pg).
             Default is True. Requires ``device_type="cuda"`` (nccl) -- gloo cannot
             P2P the CUDA activations between stages.
-        schedule (str): Which 1F1B variant to run. ``"1f1b"`` (default)
-            calls :func:`~torchrec.distributed.maglev.pipeline.run_1f1b`;
-            ``"split"`` calls
-            :func:`~torchrec.distributed.maglev.pipeline.run_1f1b_split`, which
-            hoists every microbatch's sparse (embedding) forward before the
-            first backward so all lookups see pre-step weights (SGD-exact under
-            fused TBE). ``"split"`` builds :class:`MaglevSplitStage` instead of
-            :class:`MaglevTestStage`; the two have identical parameters and
-            submodules, so the arms are directly comparable.
         output_json (bool): Print the result as JSON instead of a table.
             Default is False.
         all_rank_traces (bool): Export a profiler trace from every rank (not just
@@ -161,9 +148,6 @@ class RunOptions(BenchFuncConfig):
     # Intra-HSD embedding sharding (DMP per stage), scoped to each stage's pg so
     # the lookup all-to-all stays local to the HSD. Requires nccl (cuda).
     shard_embeddings: bool = True
-    # "1f1b" (run_1f1b) or "split" (run_1f1b_split). The A/B knob for
-    # measuring what the sparse hoist costs in wall time and peak memory.
-    schedule: str = "1f1b"
     output_json: bool = False
     # Capture a trace from every rank so each stage's HSD shows up, not only
     # rank 0's stage (traces are emitted only when profile_dir is set on CUDA).
@@ -280,10 +264,6 @@ def runner(
         f"world_size ({world_size}) must equal num_stages ({num_stages}) * "
         f"ranks_per_stage ({ranks_per_stage})"
     )
-    assert run_option.schedule in (
-        "1f1b",
-        "split",
-    ), f"schedule must be '1f1b' or 'split', got {run_option.schedule!r}"
 
     # CUDA uses nccl for the cross-HSD P2P hand-off (falls back to gloo for the
     # CPU repro). The profiler path is CUDA-only, so traces require device_type=cuda.
@@ -325,14 +305,7 @@ def runner(
         # ranks start identical -> grad all-reduce keeps them in lock-step).
         tables = all_tables[my_stage_index]
         torch.manual_seed(_WEIGHT_SEED + my_stage_index)
-        # The split schedule needs a stage implementing MaglevStage
-        # (forward_sparse / forward_dense). MaglevSplitStage subclasses
-        # MaglevTestStage and adds only those two methods -- same parameters,
-        # same submodules, same seeded init, so the two arms are comparable.
-        stage_cls = (
-            MaglevSplitStage if run_option.schedule == "split" else MaglevTestStage
-        )
-        module = stage_cls(
+        module = MaglevTestStage(
             tables=tables,
             stage_dim=run_option.stage_dim,
             is_first=(my_stage_index == 0),
@@ -391,8 +364,6 @@ def runner(
                 for _ in range(run_option.num_microbatches)
             ]
 
-        schedule_fn = run_1f1b_split if run_option.schedule == "split" else run_1f1b
-
         def _func_to_benchmark(
             bench_inputs: List[ModelInput],
             pipeline: MaglevPipeline,
@@ -405,33 +376,15 @@ def runner(
             # One measured iteration = the input-dist all-to-all for this pass's
             # microbatches (refilling the queue as needed) + one full 1F1B pass
             # (warmup + steady 1F1B + cooldown), including the cross-HSD hand-off
-            # and the per-batch DP grad all-reduce + optimizer step. Both
-            # schedules take identical arguments, so the arms differ only in the
-            # order sparse/dense/backward work is issued.
+            # and the per-batch DP grad all-reduce + optimizer step.
             micro_inputs = driver.take(num_microbatches)
-            schedule_fn(
+            run_1f1b(
                 pipeline=pipeline,
                 microbatch_inputs=micro_inputs,
                 optimizer=optimizer,
                 labels=labels if pipeline.is_last else None,
                 criterion=criterion if pipeline.is_last else None,
             )
-            # Close the measurement window on *device* completion, not on the
-            # host finishing its launches. ``BenchmarkResult`` takes its wall
-            # timestamp (and therefore QPS) immediately after this function
-            # returns, with no sync of its own, so without this the reported
-            # wall time is "time to issue the schedule". That is badly
-            # misleading for the split schedule: its host thread stops blocking
-            # in ``dist.recv`` and races ahead, which reads as a ~4x QPS win
-            # while the GPU is still doing the same work.
-            #
-            # Draining every iteration also removes cross-iteration overlap, so
-            # this measures per-iteration latency rather than pipelined
-            # steady-state. That is the right basis for an A/B here (both arms
-            # are GPU-bound, so a host running ahead buys no throughput) and it
-            # penalizes both arms equally.
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
 
         result = benchmark_func(
             bench_inputs=[],
@@ -461,42 +414,20 @@ def run_maglev(run_option: RunOptions) -> BenchmarkResult:
         run_option=run_option,
     )
 
-    # Combine results from all ranks. Timing comes from the *slowest* rank, not
-    # rank 0: a pipeline iteration is only complete when every stage is, so the
-    # critical-path rank sets the achievable throughput. Reporting rank 0 would
-    # flatter any schedule that lets the early stages finish sooner while a
-    # later stage remains the bottleneck. Memory stays per-rank.
+    # Combine results from all ranks: timing from rank 0, memory stats per rank.
     world_size = run_option.world_size
-
-    def _median_wall_ms(res: BenchmarkResult) -> float:
-        t = res.wall_elapsed_time
-        return float(t.median().item()) if t.numel() > 0 else 0.0
-
-    critical = max(benchmark_res_per_rank, key=_median_wall_ms)
-    # print, not logger: this is the parent process, where logging has no stream
-    # handler configured (same reason ``main`` prints its result).
-    print(
-        f"critical-path rank {critical.rank} "
-        f"(median wall {_median_wall_ms(critical):.2f} ms); per-rank medians: "
-        + ", ".join(
-            f"r{r.rank}={_median_wall_ms(r):.1f}"
-            for r in sorted(benchmark_res_per_rank, key=lambda x: x.rank)
-        )
-    )
-
     total_benchmark_res = BenchmarkResult(
-        short_name=critical.short_name,
-        gpu_elapsed_time=critical.gpu_elapsed_time,
-        cpu_elapsed_time=critical.cpu_elapsed_time,
-        cpu_utilization=critical.cpu_utilization,
-        normalized_cpu_utilization=critical.normalized_cpu_utilization,
+        short_name=benchmark_res_per_rank[0].short_name,
+        gpu_elapsed_time=benchmark_res_per_rank[0].gpu_elapsed_time,
+        cpu_elapsed_time=benchmark_res_per_rank[0].cpu_elapsed_time,
+        cpu_utilization=benchmark_res_per_rank[0].cpu_utilization,
+        normalized_cpu_utilization=benchmark_res_per_rank[0].normalized_cpu_utilization,
         gpu_mem_stats=[
             GPUMemoryStats(rank, 0, 0, 0, 0, 0) for rank in range(world_size)
         ],
         cpu_mem_stats=[CPUMemoryStats(rank, 0) for rank in range(world_size)],
-        qps=critical.qps,
-        wall_elapsed_time=critical.wall_elapsed_time,
-        rank=critical.rank,
+        qps=benchmark_res_per_rank[0].qps,
+        rank=0,
     )
 
     for res in benchmark_res_per_rank:

@@ -95,6 +95,7 @@ class EmbeddingCollectionContext(Multistreamable):
         Union[InferSequenceShardingContext, SequenceShardingContext]
     ]
     input_features: List[KeyedJaggedTensor] = field(default_factory=list)
+    reverse_indices: List[torch.Tensor] = field(default_factory=list)
     # VBE-Attributes for EBC
     inverse_indices: Optional[Tuple[List[str], torch.Tensor]] = None
     variable_batch_per_feature: bool = False
@@ -106,6 +107,8 @@ class EmbeddingCollectionContext(Multistreamable):
         for f in self.input_features:
             # pyrefly: ignore[bad-argument-type]
             f.record_stream(stream)
+        for r in self.reverse_indices:
+            r.record_stream(stream)
         if self.inverse_indices is not None:
             self.inverse_indices[1].record_stream(stream)
 
@@ -205,6 +208,88 @@ def create_mc_sharding(
         raise ValueError(f"Sharding not supported {sharding_type}")
 
 
+def _restore_dedup_feature_boundary(
+    input_lengths: torch.Tensor,
+    num_features: int,
+    unique_indices: torch.Tensor,
+    reverse_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Puts back the per-feature boundary that ``fbgemm.jagged_unique_indices`` drops.
+
+    ``_create_dedup_indices`` gives every feature of a table the same hash range, so
+    the op dedups all of a table's features together. It cannot tell which feature a
+    surviving id came from, so it just splits the total evenly over the table's
+    (feature, batch) slots. With one feature per table that is fine. With two
+    features of very different lengths it is not: a 33-long feature and a 1280-long
+    feature both come back as roughly 656, so ids end up under the wrong feature.
+
+    That matters because ZCH decides whether to insert an id based on which feature
+    it arrived under - a feature whose name ends in the read-only suffix is looked up
+    but never written. Ids moved to the wrong feature get written when they should
+    not be. Per-feature TTL eviction reads the same lengths, so a wrong split also
+    hands ids the wrong feature's TTL.
+
+    This walks each surviving id back to the first feature it appeared in, regroups
+    the values so each feature is contiguous again, and recounts. Ids sent by both
+    features still collapse to one row, so we keep the dedup saving.
+
+    Returns the corrected ``(lengths, unique_indices, reverse_indices)``.
+    """
+    device = unique_indices.device
+    num_unique = unique_indices.numel()
+    # lengths are int64 to match what the op returns
+    if num_unique == 0:
+        return (
+            torch.zeros(input_lengths.numel(), dtype=torch.int64, device=device),
+            unique_indices,
+            reverse_indices,
+        )
+
+    stride = input_lengths.numel() // num_features
+    # KJT lengths are feature major, so segment -> feature is a plain repeat.
+    # output_size is known, and passing it keeps repeat_interleave from syncing.
+    feature_per_value = torch.repeat_interleave(
+        torch.arange(num_features, device=device).repeat_interleave(stride),
+        input_lengths.long(),
+        output_size=reverse_indices.numel(),
+    )
+    # include_self=False so the initial value is ignored wherever a row was actually
+    # referenced. Every unique row has at least one source position, but falling back
+    # to feature 0 keeps an unreferenced row in range for the scatter_add_ below
+    # rather than letting it index out of bounds.
+    #
+    # amin only ranges over the features that actually sent the id, so an id is
+    # attributed to a writable feature only if a writable feature sent it - ids only
+    # a read-only feature sent can never be written, whatever the feature order. For
+    # an id sent by both, the lowest feature index wins, which is model config order
+    # (EmbeddingConfig.feature_names).
+    feature_per_unique = torch.zeros(
+        num_unique, dtype=torch.int64, device=device
+    ).scatter_reduce_(
+        0, reverse_indices, feature_per_value, reduce="amin", include_self=False
+    )
+
+    permute = torch.argsort(feature_per_unique, stable=True)
+    inverse_permute = torch.empty_like(permute)
+    inverse_permute[permute] = torch.arange(num_unique, device=device)
+
+    # scatter_add rather than bincount, which would force a device to host sync
+    counts = torch.zeros(num_features, dtype=torch.int64, device=device).scatter_add_(
+        0, feature_per_unique, torch.ones_like(feature_per_unique)
+    )
+    # Only the per-feature totals need to be right; how a feature's ids are spread
+    # over its batch slots is undone later by reverse_indices. Spread them evenly,
+    # like the op does, because block_bucketize_sparse_features runs one thread per
+    # slot and slows down badly when one slot holds most of the ids. Attributing each
+    # id to the exact slot it came from is fewer lines but measured ~28x slower there.
+    lengths = counts.div(stride, rounding_mode="floor").repeat_interleave(stride) + (
+        torch.arange(stride, device=device).repeat(num_features)
+        < (counts % stride).repeat_interleave(stride)
+    )
+    return lengths, unique_indices[permute], inverse_permute[reverse_indices]
+
+
 class ShardedManagedCollisionCollection(
     ShardedModule[
         KJTList,
@@ -229,6 +314,7 @@ class ShardedManagedCollisionCollection(
         ],
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
         use_index_dedup: bool = False,
+        restore_dedup_feature_boundary: bool = True,
     ) -> None:
         # pyrefly: ignore[missing-attribute]
         super().__init__()
@@ -266,6 +352,11 @@ class ShardedManagedCollisionCollection(
         self._create_output_dists()
         self._use_index_dedup = use_index_dedup
         logger.info(f"MC EC index dedup enabled: {self._use_index_dedup}.")
+        self._restore_dedup_feature_boundary = restore_dedup_feature_boundary
+        logger.info(
+            f"MC dedup feature boundary restore enabled: "
+            f"{self._restore_dedup_feature_boundary}."
+        )
         self._initialize_torch_state()
         self.post_lookup_tracker_fn: Optional[
             Callable[
@@ -648,6 +739,14 @@ class ShardedManagedCollisionCollection(
             )[-1]
             <= torch.iinfo(torch.int64).max
         ), "EC Dedup requires the mc collection to have a cumuluative 'hash_input_size' kwarg to be less than max int64.  Please reduce values of individual tables to meet this constraint (ie. 2**54 is typically a good value)."
+        # per sharding group, true when the restore is turned on and any of the
+        # group's tables binds more than one feature, which is the case that loses
+        # its feature boundary - see _restore_dedup_feature_boundary
+        self._dedup_needs_boundary_restore: List[bool] = [
+            self._restore_dedup_feature_boundary
+            and any(feature_count > 1 for feature_count in feature_splits)
+            for feature_splits in self._sharding_per_table_feature_splits
+        ]
         for i, (feature_splits, input_splits) in enumerate(
             zip(
                 self._sharding_per_table_feature_splits,
@@ -688,6 +787,11 @@ class ShardedManagedCollisionCollection(
         features_by_sharding = []
 
         for i, kjt in enumerate(features):
+            # jagged_unique_indices derives the batch size as total_B / num_features,
+            # and the per-feature regrouping below relies on the same uniform stride
+            assert (
+                not kjt.variable_stride_per_key()
+            ), "EC Dedup does not support variable stride per key"
             hash_offsets = self.get_buffer(f"_dedup_hash_offsets_{i}")
             feature_offsets = self.get_buffer(f"_dedup_feature_offsets_{i}")
             (
@@ -701,6 +805,13 @@ class ShardedManagedCollisionCollection(
                 kjt.offsets().to(torch.int64),
                 kjt.values().to(torch.int64),
             )
+            if self._dedup_needs_boundary_restore[i]:
+                lengths, unique_indices, reverse_indices = (
+                    _restore_dedup_feature_boundary(
+                        kjt.lengths(), len(kjt.keys()), unique_indices, reverse_indices
+                    )
+                )
+                offsets = torch.ops.fbgemm.asynchronous_complete_cumsum(lengths)
             # Gather weights for unique indices if present.
             # Since unique_indices[reverse_indices[i]] == indices[i],
             # we can directly assign: dedup_weights[reverse_indices[i]] = weights[i]
@@ -723,7 +834,6 @@ class ShardedManagedCollisionCollection(
             )
 
             ctx.input_features.append(kjt)
-            # pyrefly: ignore[missing-attribute]
             ctx.reverse_indices.append(reverse_indices)
             features_by_sharding.append(dedup_features)
         return features_by_sharding
@@ -912,7 +1022,7 @@ class ShardedManagedCollisionCollection(
             1
             for feature_name in features.keys()
             # pyrefly: ignore[bad-argument-type]
-            if feature_name.lower().endswith(mcm.readable_suffix)
+            if feature_name.lower().endswith(mcm.read_only_suffix)
         )
 
         # When we turn on include_readonly_suffix_feature, those features will not contribute to the ZCH frequency counter, only non-readonly features will be consider for insert, eviction and stats logging
@@ -1132,8 +1242,12 @@ class ManagedCollisionCollectionSharder(
     def __init__(
         self,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
+        restore_dedup_feature_boundary: bool = True,
     ) -> None:
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
+        # only has an effect when index dedup is on and a table binds more than one
+        # feature, see _restore_dedup_feature_boundary
+        self._restore_dedup_feature_boundary = restore_dedup_feature_boundary
 
     # pyrefly: ignore[bad-override]
     def shard(
@@ -1163,6 +1277,7 @@ class ManagedCollisionCollectionSharder(
             device=device,
             embedding_shardings=embedding_shardings,
             use_index_dedup=use_index_dedup,
+            restore_dedup_feature_boundary=self._restore_dedup_feature_boundary,
         )
 
     def shardable_parameters(

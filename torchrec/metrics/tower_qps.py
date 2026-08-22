@@ -219,8 +219,11 @@ class TowerQPSMetric(RecMetric):
 
         self._batch_size = batch_size
         self._world_size = world_size
-        self._batch_size_stages: Optional[List[BatchSizeStage]] = copy.deepcopy(
+        self._batch_size_stages_config: Optional[List[BatchSizeStage]] = copy.deepcopy(
             batch_size_stages
+        )
+        self._batch_size_stages: Optional[List[BatchSizeStage]] = copy.deepcopy(
+            self._batch_size_stages_config
         )
 
         if self._batch_size_stages is not None:
@@ -228,6 +231,12 @@ class TowerQPSMetric(RecMetric):
 
         self._register_load_state_dict_pre_hook(self.load_state_dict_hook)
         self.register_state_dict_post_hook(self.state_dict_hook)
+
+    def _get_new_like_kwargs(self) -> Dict[str, Any]:
+        return {
+            **super()._get_new_like_kwargs(),
+            "batch_size_stages": self._batch_size_stages_config,
+        }
 
     def update(
         self,
