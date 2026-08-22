@@ -10,7 +10,7 @@
 import copy
 import logging
 import warnings
-from collections import defaultdict, deque, OrderedDict
+from collections import Counter, defaultdict, deque, OrderedDict
 from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import (
@@ -93,10 +93,12 @@ from torchrec.distributed.utils import (
     add_params_from_parameter_sharding,
     convert_to_fbgemm_types,
     create_global_tensor_shape_stride_from_metadata,
+    is_plan_leader,
     maybe_annotate_embedding_event,
     merge_fused_params,
     none_throws,
     optimizer_type_to_emb_opt_type,
+    sharding_plan_fingerprint,
 )
 from torchrec.modules.embedding_configs import (
     EmbeddingConfig,
@@ -438,6 +440,48 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         return jt_dict
 
 
+def _log_sharding_plan(
+    env: ShardingEnv,
+    embedding_configs: List[EmbeddingConfig],
+    table_name_to_parameter_sharding: Dict[str, ParameterSharding],
+) -> None:
+    """Log this module's sharding plan.
+
+    Every rank logs a small fingerprint, so a rank that sharded differently
+    shows up. One rank per sharding group also logs the full table map, which
+    is the same on every rank in that group.
+    """
+    table_shardings: List[Tuple[str, str]] = [
+        (config.name, table_name_to_parameter_sharding[config.name].sharding_type)
+        for config in embedding_configs
+    ]
+    EventLoggingHandler.log_event(
+        component=TorchrecComponent.SHARDER.value,
+        event_name="ShardedEmbeddingCollection.sharding_plan_fingerprint",
+        event_type=EventType.INFO,
+        metadata={
+            "num_tables": str(len(table_shardings)),
+            "sharding_type_counts": ",".join(
+                f"{sharding_type}:{count}"
+                for sharding_type, count in sorted(
+                    Counter(
+                        sharding_type for _, sharding_type in table_shardings
+                    ).items()
+                )
+            ),
+            "plan_fingerprint": sharding_plan_fingerprint(table_shardings),
+        },
+    )
+    if not is_plan_leader(env):
+        return
+    EventLoggingHandler.log_event(
+        component=TorchrecComponent.SHARDER.value,
+        event_name="ShardedEmbeddingCollection.table_names",
+        event_type=EventType.INFO,
+        metadata=dict(table_shardings),
+    )
+
+
 class ShardedEmbeddingCollection(
     ShardedEmbeddingModule[
         KJTList,
@@ -488,14 +532,8 @@ class ShardedEmbeddingCollection(
                 if table_name in self._table_names
             },
         )
-        EventLoggingHandler.log_event(
-            component=TorchrecComponent.SHARDER.value,
-            event_name="ShardedEmbeddingCollection.table_names",
-            event_type=EventType.INFO,
-            metadata={
-                config.name: table_name_to_parameter_sharding[config.name].sharding_type
-                for config in self._embedding_configs
-            },
+        _log_sharding_plan(
+            env, self._embedding_configs, table_name_to_parameter_sharding
         )
         self._env = env
         # output parameters as DTensor in state dict
