@@ -11,11 +11,13 @@ import abc
 import copy
 import inspect
 import itertools
+import logging
 import math
 import weakref
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from typing import (
     Any,
     Callable,
@@ -39,6 +41,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.profiler import record_function
 from torchmetrics import Metric
+from torchmetrics.utilities.distributed import gather_all_tensors
 
 try:
     from torchrec.distributed.logging_handlers import (
@@ -59,6 +62,7 @@ except Exception:
             pass
 
 
+from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.types import get_tensor_size_bytes
 from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
@@ -73,6 +77,8 @@ from torchrec.pt2.utils import pt2_compile_callable
 
 RecModelOutput = Union[torch.Tensor, Dict[str, torch.Tensor]]
 
+logger: logging.Logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class MetricComputationReport:
@@ -85,6 +91,15 @@ class MetricComputationReport:
 DefaultValueT = TypeVar("DefaultValueT")
 ComputeIterType = Iterator[
     Tuple[RecTaskInfo, MetricNameBase, torch.Tensor, MetricPrefix, str]
+]
+StateShapeContract = Tuple[
+    Tuple[
+        str,
+        Optional[Tuple[int, ...]],
+        Optional[Tuple[int, ...]],
+        Optional[str],
+    ],
+    ...,
 ]
 
 
@@ -130,6 +145,8 @@ def _snapshot_init_kwargs(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 MAX_BUFFER_COUNT = 1000
+_FIXED_SHAPE_SYNC_ENABLED = "pytorch/torchrec:enable_fixed_shape_metric_sync"
+_ORIGINAL_GATHER_ALL_TENSORS = gather_all_tensors
 _WINDOW_BUFFER_REGISTRY: weakref.WeakValueDictionary[int, Any] = (
     torch.__dict__.setdefault(
         "_torchrec_window_buffer_registry", weakref.WeakValueDictionary()
@@ -152,6 +169,51 @@ def _window_buffer_aggregate_state(
 ) -> None:
     _WINDOW_BUFFER_REGISTRY[buffer_handle]._aggregate_state_impl(
         window_state, curr_state, size
+    )
+
+
+@lru_cache(maxsize=16)
+def _supports_fixed_shape_sync(dist_sync_fn: Callable) -> bool:
+    try:
+        return "assume_same_shape" in inspect.signature(dist_sync_fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _default_sync_supports_fixed_shape() -> bool:
+    return _supports_fixed_shape_sync(gather_all_tensors)
+
+
+def _fixed_shape_gather(
+    result: torch.Tensor, group: Optional[Any] = None
+) -> List[torch.Tensor]:
+    return gather_all_tensors(result, group, assume_same_shape=True)
+
+
+def _resolve_fixed_shape_sync_on_leader(use_fixed_shape_sync: bool) -> bool:
+    if not use_fixed_shape_sync or not _default_sync_supports_fixed_shape():
+        return False
+    return torch._utils_internal.justknobs_check(
+        _FIXED_SHAPE_SYNC_ENABLED, default=False
+    )
+
+
+def _resolve_fixed_shape_sync(
+    process_group: Optional[dist.ProcessGroup],
+    use_fixed_shape_sync: bool,
+) -> bool:
+    if not use_fixed_shape_sync or not dist.is_available() or not dist.is_initialized():
+        return False
+    group: Optional[dist.ProcessGroup] = (
+        process_group if process_group is not None else dist.group.WORLD
+    )
+    if group is None:
+        return False
+    return invoke_on_rank_and_broadcast_result(
+        pg=group,
+        rank=0,
+        func=_resolve_fixed_shape_sync_on_leader,
+        use_fixed_shape_sync=use_fixed_shape_sync,
     )
 
 
@@ -217,8 +279,11 @@ class RecMetricComputation(Metric, abc.ABC):
             where all examples have 0 weights for a batch.
         process_group (Optional[ProcessGroup]): the process group used for the
             communication. Will use the default process group if not specified.
+            Fixed-shape sync requires the group to be initialized at construction.
+            Its rollout decision remains fixed for the lifetime of the computation.
     """
 
+    _use_fixed_shape_sync: bool = False
     _batch_window_buffers: Optional[Dict[str, WindowBuffer]]
 
     def __init__(
@@ -272,6 +337,165 @@ class RecMetricComputation(Metric, abc.ABC):
                 persistent=True,
             )
         self._compute_mode: RecComputeMode = compute_mode
+        self._seen_dist_sync_paths: Set[str] = set()
+        self._fixed_shape_sync_process_group: Optional[dist.ProcessGroup] = (
+            process_group if process_group is not None else dist.group.WORLD
+        )
+        self._fixed_shape_sync_contract_device: Optional[torch.device] = None
+        self._fixed_shape_sync_rank_contract_has_tensor_states: bool = False
+        self._fixed_shape_sync_has_rank_invariant_shapes: Optional[bool] = None
+        self._fixed_shape_sync_is_enabled: bool = _resolve_fixed_shape_sync(
+            self._fixed_shape_sync_process_group,
+            self._use_fixed_shape_sync,
+        )
+
+    def _has_fixed_shape_state_contract(self) -> bool:
+        defaults: Optional[Mapping[str, Any]] = getattr(self, "_defaults", None)
+        if not self._use_fixed_shape_sync or defaults is None:
+            return False
+        return all(
+            isinstance(default, torch.Tensor)
+            and isinstance(state := getattr(self, name, None), torch.Tensor)
+            and state.shape == default.shape
+            for name, default in defaults.items()
+        )
+
+    def _get_rank_invariant_state_shape_contract(
+        self, process_group: dist.ProcessGroup
+    ) -> Optional[StateShapeContract]:
+        defaults: Mapping[str, Any] = getattr(self, "_defaults", {})
+        local_contract: StateShapeContract = tuple(
+            (
+                name,
+                tuple(default.shape) if isinstance(default, torch.Tensor) else None,
+                (
+                    tuple(state.shape)
+                    if isinstance(state := getattr(self, name, None), torch.Tensor)
+                    else None
+                ),
+                state.device.type if isinstance(state, torch.Tensor) else None,
+            )
+            for name, default in defaults.items()
+        )
+        contracts: List[Optional[StateShapeContract]] = [None] * process_group.size()
+        dist.all_gather_object(contracts, local_contract, group=process_group)
+        first_contract = contracts[0]
+        if first_contract is None or not all(
+            contract == first_contract for contract in contracts
+        ):
+            return None
+        return first_contract
+
+    def _get_fixed_shape_sync_contract_device(self) -> Optional[torch.device]:
+        defaults: Mapping[str, Any] = getattr(self, "_defaults", {})
+        for name in defaults:
+            state = getattr(self, name, None)
+            if isinstance(state, torch.Tensor):
+                return state.device
+        return None
+
+    def _all_ranks_have_fixed_shape_state_contract(
+        self, process_group: dist.ProcessGroup, device: torch.device
+    ) -> bool:
+        local_contract = torch.tensor(
+            self._has_fixed_shape_state_contract(),
+            dtype=torch.uint8,
+            device=device,
+        )
+        dist.all_reduce(local_contract, op=dist.ReduceOp.MIN, group=process_group)
+        return bool(local_contract)
+
+    def _sync_dist(
+        self,
+        dist_sync_fn: Optional[Callable] = None,
+        process_group: Optional[Any] = None,
+    ) -> None:
+        if dist_sync_fn is None:
+            dist_sync_fn = gather_all_tensors
+        uses_default_sync = (
+            dist_sync_fn is gather_all_tensors
+            or dist_sync_fn is _ORIGINAL_GATHER_ALL_TENSORS
+        )
+        sync_process_group = (
+            process_group if process_group is not None else dist.group.WORLD
+        )
+        can_use_fixed_shape_sync = (
+            uses_default_sync
+            and self._fixed_shape_sync_is_enabled
+            and sync_process_group is self._fixed_shape_sync_process_group
+        )
+        has_fixed_shape_contract = False
+        has_rank_invariant_shapes = True
+        if can_use_fixed_shape_sync:
+            fixed_shape_process_group = cast(dist.ProcessGroup, sync_process_group)
+            if self._fixed_shape_sync_has_rank_invariant_shapes is None:
+                rank_invariant_contract = self._get_rank_invariant_state_shape_contract(
+                    fixed_shape_process_group
+                )
+                has_rank_invariant_shapes = rank_invariant_contract is not None
+                self._fixed_shape_sync_has_rank_invariant_shapes = (
+                    has_rank_invariant_shapes
+                )
+                self._fixed_shape_sync_rank_contract_has_tensor_states = (
+                    rank_invariant_contract is not None
+                    and any(
+                        device_type is not None
+                        for _, _, _, device_type in rank_invariant_contract
+                    )
+                )
+                self._fixed_shape_sync_contract_device = (
+                    self._get_fixed_shape_sync_contract_device()
+                )
+                has_fixed_shape_contract = (
+                    has_rank_invariant_shapes and self._has_fixed_shape_state_contract()
+                )
+            elif not self._fixed_shape_sync_has_rank_invariant_shapes:
+                has_rank_invariant_shapes = False
+            elif self._fixed_shape_sync_rank_contract_has_tensor_states:
+                has_fixed_shape_contract = (
+                    self._all_ranks_have_fixed_shape_state_contract(
+                        fixed_shape_process_group,
+                        cast(
+                            torch.device,
+                            self._fixed_shape_sync_contract_device,
+                        ),
+                    )
+                )
+                if not has_fixed_shape_contract:
+                    has_rank_invariant_shapes = (
+                        self._get_rank_invariant_state_shape_contract(
+                            fixed_shape_process_group
+                        )
+                        is not None
+                    )
+            else:
+                has_fixed_shape_contract = self._has_fixed_shape_state_contract()
+        if not has_rank_invariant_shapes:
+            raise RecMetricException(
+                f"{type(self).__name__} fixed-shape states differ across ranks"
+            )
+        uses_fixed_shape_sync = can_use_fixed_shape_sync and has_fixed_shape_contract
+        if uses_fixed_shape_sync:
+            dist_sync_fn = _fixed_shape_gather
+            sync_path = "fixed_shape"
+        elif uses_default_sync:
+            sync_path = "variable_shape"
+        else:
+            sync_path = "custom"
+        should_log_sync_path = (
+            self._my_rank == 0 and sync_path not in self._seen_dist_sync_paths
+        )
+
+        super()._sync_dist(dist_sync_fn, process_group)
+
+        if should_log_sync_path:
+            logger.info(
+                "RecMetric distributed sync path: metric=%s path=%s states=%d",
+                type(self).__name__,
+                sync_path,
+                len(getattr(self, "_defaults", {})),
+            )
+            self._seen_dist_sync_paths.add(sync_path)
 
     @staticmethod
     def get_window_state_name(state_name: str) -> str:
