@@ -9,37 +9,17 @@
 
 """Maglev: staged, HSD-aligned recommender execution for TorchRec (MVP).
 
-This package holds the systems skeleton of Maglev:
+A **layer** is the unit of compute; a **stage** is one or more consecutive layers
+and the unit of parallelism, one per hardware scale-up domain (HSD). A model is
+authored as a :class:`~torchrec.distributed.maglev.module.MaglevModuleList` of
+layers and runs either standalone in one process or pipeline-parallel: each rank
+hands the whole model to a
+:class:`~torchrec.distributed.maglev.stage.StageWrapper`, which keeps the one
+stage that rank owns, and a
+:class:`~torchrec.distributed.maglev.pipeline.MaglevPipelineBase` schedule drives
+it.
 
-* :class:`~torchrec.distributed.maglev.module.MaglevModuleList` -- the
-  ``ModuleList``-like API where each entry is a stage.
-* :class:`~torchrec.distributed.maglev.stage.StageWrapper` -- binds a stage to
-  its process group (one hardware scale-up domain, HSD).
-* :class:`~torchrec.distributed.maglev.pipeline.MaglevPipeline` -- hooks the
-  stages together across HSDs (forward activation + backward gradient hand-off).
-
-Modeling components (Maglev Indexers / Induct) and the zero-bubble Maglev Rail
-schedule are intentionally out of scope for the MVP; the API leaves room for
-them to slot in later.
+Import from the submodules directly (``maglev.module``, ``maglev.stage``,
+``maglev.pipeline``); nothing is re-exported here, so there is no second list of
+names to keep in step with the code.
 """
-
-from torchrec.distributed.maglev.module import MaglevModuleList
-from torchrec.distributed.maglev.pipeline import MaglevPipeline, run_1f1b
-from torchrec.distributed.maglev.stage import (
-    build_stage_process_groups,
-    EmbeddingShard,
-    Replicated,
-    StageParallelizer,
-    StageWrapper,
-)
-
-__all__ = [
-    "MaglevModuleList",
-    "MaglevPipeline",
-    "run_1f1b",
-    "StageWrapper",
-    "StageParallelizer",
-    "Replicated",
-    "EmbeddingShard",
-    "build_stage_process_groups",
-]
