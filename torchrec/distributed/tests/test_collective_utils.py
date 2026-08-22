@@ -150,6 +150,60 @@ class CollectiveUtilsTest(unittest.TestCase):
         )
 
     @classmethod
+    def _test_invoke_on_rank_and_broadcast_result_subgroup(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        if backend == "nccl":
+            torch.cuda.set_device(rank)
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        # Every rank has to call new_group, including the one left out of it.
+        pg = dist.new_group(ranks=[1, 2], backend=backend)
+        if rank != 0:
+            assert isinstance(pg, dist.ProcessGroup)
+            # Group-local rank 0 is global rank 1 for this group.
+            res = invoke_on_rank_and_broadcast_result(pg=pg, rank=0, func=lambda: 42)
+            assert res == 42, f"Expect res to be 42 (got {res})"
+        dist.destroy_process_group()
+
+    def test_invoke_on_rank_and_broadcast_result_subgroup(self) -> None:
+        self._run_multi_process_test(
+            world_size=3,
+            backend="gloo",
+            # pyrefly: ignore[bad-argument-type]
+            callable=self._test_invoke_on_rank_and_broadcast_result_subgroup,
+        )
+
+    @classmethod
+    def _test_invoke_on_rank_and_broadcast_result_unsorted_subgroup(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        if backend == "nccl":
+            torch.cuda.set_device(rank)
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        # sort_ranks=False leaves global rank 0 at group-local index 1, so the
+        # two rank spaces disagree for every member of the group.
+        pg = dist.new_group(ranks=[1, 0], backend=backend, sort_ranks=False)
+        assert isinstance(pg, dist.ProcessGroup)
+        # Group-local rank 0 is global rank 1, so it is the one that runs func.
+        res = invoke_on_rank_and_broadcast_result(pg=pg, rank=0, func=lambda: pg.rank())
+        assert res == 0, f"Expect res to be 0 (got {res})"
+        dist.destroy_process_group()
+
+    def test_invoke_on_rank_and_broadcast_result_unsorted_subgroup(self) -> None:
+        self._run_multi_process_test(
+            world_size=2,
+            backend="gloo",
+            # pyrefly: ignore[bad-argument-type]
+            callable=self._test_invoke_on_rank_and_broadcast_result_unsorted_subgroup,
+        )
+
+    @classmethod
     def _test_run_on_leader_decorator(
         cls,
         rank: int,
@@ -227,6 +281,42 @@ class CollectiveUtilsTest(unittest.TestCase):
             backend="gloo",
             # pyrefly: ignore[bad-argument-type]
             callable=self._test_create_on_rank_and_share_result_single_tensor,
+        )
+
+    @classmethod
+    def _test_create_on_rank_and_share_result_subgroup(
+        cls,
+        rank: int,
+        world_size: int,
+        backend: str,
+    ) -> None:
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+        # Every rank has to call new_group, including the one left out of it.
+        pg = dist.new_group(ranks=[1, 2], backend=backend)
+        if rank != 0:
+            assert isinstance(pg, dist.ProcessGroup)
+            shape = (8, 4)
+            fill_value = 7.0
+            # Group-local rank 0 is global rank 1 for this group.
+            result = create_on_rank_and_share_result(
+                pg,
+                0,
+                creator=lambda: torch.full(
+                    shape, fill_value=fill_value, dtype=torch.float32
+                ),
+                extractor=lambda t: [t],
+                constructor=lambda ts: ts[0],  # pyrefly: ignore[bad-argument-type]
+            )
+            assert result.shape == shape, f"Expected shape {shape}, got {result.shape}"
+            assert torch.all(result == fill_value).item(), "Shared tensor data mismatch"
+        dist.destroy_process_group()
+
+    def test_create_on_rank_and_share_result_subgroup(self) -> None:
+        self._run_multi_process_test(
+            world_size=3,
+            backend="gloo",
+            # pyrefly: ignore[bad-argument-type]
+            callable=self._test_create_on_rank_and_share_result_subgroup,
         )
 
     @classmethod
