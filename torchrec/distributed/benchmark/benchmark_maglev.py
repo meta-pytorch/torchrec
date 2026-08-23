@@ -10,22 +10,16 @@
 """
 Benchmark for the Maglev staged pipeline (MVP).
 
-Measures the microbatched 1F1B schedule
-(:func:`~torchrec.distributed.maglev.pipeline.run_1f1b`) of a K-stage Maglev
-model across per-stage process groups (one hardware scale-up domain, HSD, each),
-including the input distribution and the cross-HSD activation / gradient
-hand-off. Each stage is an ``EmbeddingBagCollection`` feature partition plus
-dense compute
-(:class:`~torchrec.distributed.test_utils.test_model.MaglevTestStage`, shared
-with the correctness test).
-
-Input distribution: every rank holds a full per-stage input set and all-to-alls
-it over its "cascade" (one rank per stage) via
-:func:`~torchrec.distributed.maglev.input_dist.input_dist`, so each rank ends up
-with ``num_stages`` microbatches for its own stage. A queue driver decouples the
-microbatch count from the stage count (more microbatches -> several rounds per
-pass; fewer -> drained a pass at a time). One measured iteration is this
-input-dist plus one full 1F1B pass over ``num_microbatches`` microbatches.
+Measures a microbatched 1F1B schedule, selected by ``--pipeline``:
+``1f1b-recv-ahead`` posts each receive a microbatch ahead of the compute it feeds
+(:class:`~torchrec.distributed.maglev.pipeline.Maglev1F1BRecvAhead`, the default)
+and ``1f1b`` posts it immediately before its wait
+(:class:`~torchrec.distributed.maglev.pipeline.Maglev1F1B`). The model is a
+``sum(layers_per_stage)``-layer model authored on ``meta`` and cut across
+per-stage process groups (one hardware scale-up domain, HSD, each). One measured
+iteration is the input-dist all-to-all plus one full 1F1B pass over
+``num_microbatches`` microbatches, including the cross-HSD activation / gradient
+hand-off and the DP grad all-reduce + optimizer step.
 
 Runs on GPU + nccl by default (the cross-HSD P2P hand-off and the profiler path
 are CUDA-only); `all_rank_traces` defaults on so every stage's HSD shows up in
@@ -41,16 +35,20 @@ OSS (external):
     python -m torchrec.distributed.benchmark.benchmark_maglev --profile_dir=/tmp/maglev_traces
 """
 
+import itertools
 import json
 import logging
-from dataclasses import dataclass
-from typing import List
+from dataclasses import dataclass, field
+from typing import cast, Dict, Iterator, List, Optional, Type
 
 logger: logging.Logger = logging.getLogger(__name__)
 
 import torch
 import torch.distributed as dist
-from torch import nn
+import torch.nn as nn
+from torch.distributed.optim import (
+    _apply_optimizer_in_backward as apply_optimizer_in_backward,
+)
 from torchrec.distributed.benchmark.base import (
     BenchFuncConfig,
     benchmark_func,
@@ -59,29 +57,113 @@ from torchrec.distributed.benchmark.base import (
     CPUMemoryStats,
     GPUMemoryStats,
 )
-from torchrec.distributed.maglev.input_dist import input_dist
-from torchrec.distributed.maglev.pipeline import MaglevPipeline, run_1f1b
-from torchrec.distributed.maglev.stage import (
-    build_cascade_process_groups,
-    build_handoff_process_groups,
-    build_stage_process_groups,
-    EmbeddingShard,
-    Replicated,
-    StageWrapper,
+from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.maglev.module import MaglevLayer
+from torchrec.distributed.maglev.pipeline import (
+    Maglev1F1B,
+    Maglev1F1BRecvAhead,
+    MaglevPipelineBase,
 )
+from torchrec.distributed.maglev.stage import remap_plan_to_process_group, StageWrapper
+from torchrec.distributed.model_parallel import (
+    DefaultDataParallelWrapper,
+    DistributedModelParallel,
+)
+from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     run_multi_process_func,
 )
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
-from torchrec.distributed.test_utils.test_model import MaglevTestStage
+from torchrec.distributed.test_utils.test_model import MaglevTestLayer, MaglevTestModel
+from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingPlan
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_modules import EmbeddingBagCollection
+from torchrec.optim.optimizers import in_backward_optimizer_filter
 
-# Weights are seeded per stage so an HSD's two DP ranks start identical (the
-# sharded path builds DMP with init_parameters=False, so it relies on this).
+# Weights are seeded per stage, just before the stage materializes, so an HSD's
+# DP ranks start identical -- nothing syncs them afterwards.
 # Inputs are left unseeded -- values don't affect a throughput benchmark.
 _WEIGHT_SEED = 100
+
+# Selectable schedules, by --pipeline. "base" runs one microbatch per pass and
+# so is the un-pipelined reference the 1F1B variants are worth measuring against;
+# the two 1F1B entries move identical data and differ only in where the receives
+# are posted. sample_count is taken from the pipeline's microbatches_per_pass, so
+# throughput stays comparable across all three.
+_PIPELINE_CLS: Dict[str, Type[MaglevPipelineBase]] = {
+    "base": MaglevPipelineBase,
+    "1f1b": Maglev1F1B,
+    "1f1b-recv-ahead": Maglev1F1BRecvAhead,
+}
+
+
+def _shard_embeddings_in_hsd(
+    module: nn.Module,
+    stage_pg: dist.ProcessGroup,
+    device: torch.device,
+    embedding_lr: float,
+) -> nn.Module:
+    """Shard a stage's ``EmbeddingBagCollection`` within its HSD, via DMP.
+
+    Plain TorchRec, scoped to a sub-process-group -- nothing here is Maglev's, and
+    a caller is free to use any other wrapper (FSDP, none) instead. It lives in
+    the benchmark rather than the library for exactly that reason.
+
+    The tables are sharded over ``stage_pg``, so the lookup all-to-all stays local
+    to the HSD with no global cross-HSD exchange, and the embedding optimizer is
+    fused into the TBE backward. Dense params are replicated in DDP over the same
+    group and reduced once per pass, the schedule having suppressed DDP's sync on
+    every backward but the last.
+    """
+    sharders: List[ModuleSharder[nn.Module]] = [
+        cast(ModuleSharder[nn.Module], EmbeddingBagCollectionSharder())
+    ]
+    # Fuse the embedding optimizer into the TBE backward *before* DMP so the
+    # sharder builds it into the kernel (sparse params train in backward).
+    emb_params = [
+        p
+        for m in module.modules()
+        if isinstance(m, EmbeddingBagCollection)
+        for p in m.parameters()
+    ]
+    apply_optimizer_in_backward(torch.optim.SGD, emb_params, {"lr": embedding_lr})
+
+    env = ShardingEnv.from_process_group(stage_pg)
+    planner = EmbeddingShardingPlanner(
+        topology=Topology(world_size=stage_pg.size(), compute_device=device.type)
+    )
+    # NOTE: not planner.collective_plan(): it broadcasts from group-local rank 0
+    # but passes it as a *global* broadcast src, which deadlocks for any stage
+    # whose pg does not contain global rank 0 (stages 1..N-1). Compute the plan on
+    # the pg's leader and broadcast with the correct global src.
+    if stage_pg.rank() == 0:
+        plan_holder: List[Optional[ShardingPlan]] = [planner.plan(module, sharders)]
+    else:
+        plan_holder = [None]
+    if stage_pg.size() > 1:
+        dist.broadcast_object_list(
+            plan_holder, src=dist.get_global_rank(stage_pg, 0), group=stage_pg
+        )
+    plan = plan_holder[0]
+    assert plan is not None
+    remap_plan_to_process_group(plan, stage_pg, device)
+    return DistributedModelParallel(
+        module=module,
+        env=env,
+        device=device,
+        plan=plan,
+        sharders=sharders,
+        # Dense params go into DDP over the stage pg; the schedule suppresses its
+        # sync around every forward but the pass's last, so one all-reduce lands
+        # per pass. static_graph is off: it requires the reducer to be armed on
+        # the first backward, which cannot hold when the first microbatch's
+        # forward is deliberately inside no_sync.
+        init_data_parallel=True,
+        data_parallel_wrapper=DefaultDataParallelWrapper(static_graph=False),
+        init_parameters=True,
+    )
 
 
 @dataclass
@@ -92,25 +174,40 @@ class RunOptions(BenchFuncConfig):
         name (str): Human-readable benchmark name. Default is "maglev".
         world_size (int): Total number of ranks. Must equal
             ``num_stages * ranks_per_stage``. Default is 8.
-        num_benchmarks (int): Number of measured iterations (each one full 1F1B
-            pass). Default is 12.
+        num_benchmarks (int): Number of measured iterations (each one full pass).
+            Default is 0 -- a plain run only profiles, emitting traces and no
+            timings. Pass e.g. ``--num_benchmarks=12`` to measure.
         num_profiles (int): Number of profiling iterations (CUDA only; unused on
             the CPU path). Default is 2.
-        num_stages (int): Number of Maglev stages (one HSD each). Default is 4.
+        layers_per_stage (List[int]): How the model's layers are cut across the
+            pipeline -- one entry per stage, so this also sets the stage count
+            (one HSD each) and the model depth (its sum). Default is
+            ``[2, 3, 4, 3]``: 12 layers over 4 stages, deliberately uneven, since
+            only stage boundaries cross the network and a real cut is rarely
+            uniform.
         ranks_per_stage (int): Ranks per stage's HSD (intra-HSD data
             parallelism). Default is 2.
         batch_size (int): Per-microbatch batch size ``B``. Default is 8192, which
-            with ``stage_dim`` gives a 128 MiB cross-stage activation (past NCCL's
+            with ``layer_dim`` gives a 128 MiB cross-stage activation (past NCCL's
             ~64 MiB P2P buffer cliff).
         num_microbatches (int): Number of microbatches per 1F1B pass.
             Default is 8.
-        num_tables (int): Embedding tables per stage (one feature each). Default is 8.
+        pipeline (str): Which schedule to measure. Options:
+            - "base": one microbatch per pass, no pipelining -- the reference the
+              1F1B variants are worth measuring against
+            - "1f1b": each receive posted immediately before its wait
+            - "1f1b-recv-ahead": each receive posted a microbatch ahead of the
+              compute it feeds
+            The two 1F1B variants move identical data; only the receive placement
+            differs. Default is "1f1b-recv-ahead".
+        num_tables (int): Embedding tables per layer (one feature each). Default is 8.
         num_embeddings (int): Rows per embedding table. Default is 1000000.
         emb_dim (int): Embedding dimension ``D``. Default is 256.
         num_float_features (int): Width of each stage's dense/float feature input.
             Default is 64.
-        stage_dim (int): Width of the activation carried between stages.
-            Default is 4096 (128 MiB activation with the default batch size).
+        layer_dim (int): Width of the activation carried between layers (and so
+            between stages). Default is 4096 (128 MiB activation with the default
+            batch size).
         lr (float): Learning rate for the per-stage SGD optimizer.
             Default is 0.05.
         shard_embeddings (bool): Shard each stage's embedding tables within its
@@ -120,6 +217,9 @@ class RunOptions(BenchFuncConfig):
             P2P the CUDA activations between stages.
         output_json (bool): Print the result as JSON instead of a table.
             Default is False.
+        debug_mode (bool): Attach a debugger before running. Every rank attaches,
+            so pair it with a small ``world_size`` unless you want eight
+            simultaneous sessions. Default is False.
         all_rank_traces (bool): Export a profiler trace from every rank (not just
             rank 0) so each stage's HSD is captured. Default is True. Traces are
             only emitted when ``profile_dir`` is set and ``device_type`` is
@@ -128,27 +228,32 @@ class RunOptions(BenchFuncConfig):
 
     name: str = "maglev"
     world_size: int = 8
-    num_benchmarks: int = 12
+    num_benchmarks: int = 1
     num_profiles: int = 2
-    num_stages: int = 4
+    layers_per_stage: List[int] = field(default_factory=lambda: [2, 3, 4, 3])
     ranks_per_stage: int = 2
-    # Heavy default: batch_size * stage_dim * 4B = 8192 * 4096 * 4 = 128 MiB
+    # Heavy default: batch_size * layer_dim * 4B = 8192 * 4096 * 4 = 128 MiB
     # cross-stage activation, past NCCL's ~64 MiB P2P buffer cliff, so the
     # hand-off exercises the large-payload (rendezvous) path -- see the parity
     # handoff pgs in stage.py and tech-docs/nccl_p2p_execution_order_buffer_size.md.
     batch_size: int = 8192
     num_microbatches: int = 8
-    # Heavier embedding tables: 1M rows * 256 dim * 8 tables per stage.
+    # Which schedule to measure; see _PIPELINE_CLS. The two move identical data
+    # and differ only in where the receives are posted, so this is the knob that
+    # isolates what running the receives ahead is worth.
+    pipeline: str = "1f1b-recv-ahead"
+    # Heavier embedding tables: 1M rows * 256 dim * 8 tables per layer.
     num_tables: int = 8
     num_embeddings: int = 1_000_000
     emb_dim: int = 256
     num_float_features: int = 64
-    stage_dim: int = 4096
+    layer_dim: int = 4096
     lr: float = 0.05
     # Intra-HSD embedding sharding (DMP per stage), scoped to each stage's pg so
     # the lookup all-to-all stays local to the HSD. Requires nccl (cuda).
     shard_embeddings: bool = True
     output_json: bool = False
+    debug_mode: bool = False
     # Capture a trace from every rank so each stage's HSD shows up, not only
     # rank 0's stage (traces are emitted only when profile_dir is set on CUDA).
     all_rank_traces: bool = True
@@ -158,24 +263,51 @@ class RunOptions(BenchFuncConfig):
     device_type: str = "cuda"
     profile_dir: str = "."
 
+    def generate_pipeline(
+        self, stage: StageWrapper, optimizer: torch.optim.Optimizer
+    ) -> MaglevPipelineBase:
+        """Build the schedule named by :attr:`pipeline`.
+
+        Raises:
+            ValueError: if :attr:`pipeline` is not a known schedule.
+        """
+        if self.pipeline not in _PIPELINE_CLS:
+            raise ValueError(
+                f"unknown pipeline {self.pipeline!r}; expected one of "
+                f"{sorted(_PIPELINE_CLS)}"
+            )
+        match self.pipeline:
+            case "base":
+                # One microbatch per pass; takes no microbatch count.
+                return MaglevPipelineBase(stage=stage, optimizer=optimizer)
+            case _:
+                # Every non-"base" entry is a Maglev1F1B subclass, which is what
+                # makes num_microbatches a valid argument.
+                Pipeline = cast(Type[Maglev1F1B], _PIPELINE_CLS[self.pipeline])
+                return Pipeline(
+                    stage=stage,
+                    optimizer=optimizer,
+                    num_microbatches=self.num_microbatches,
+                )
+
 
 def _make_tables(
-    stage_index: int,
+    layer_index: int,
     num_tables: int,
     num_embeddings: int,
     emb_dim: int,
 ) -> List[EmbeddingBagConfig]:
-    """This stage's feature partition: ``num_tables`` disjoint 1-feature tables.
+    """This layer's feature partition: ``num_tables`` disjoint 1-feature tables.
 
     Reuses the shared :class:`EmbeddingTablesConfig` generator, namespaced per
-    stage via ``name_prefix`` so each stage's tables/features are disjoint.
+    layer via ``name_prefix`` so each layer's tables/features are disjoint.
     """
     return EmbeddingTablesConfig(
         num_unweighted_features=num_tables,
         num_weighted_features=0,
         embedding_feature_dim=emb_dim,
         base_row_size=num_embeddings,
-    ).generate_tables(name_prefix=f"s{stage_index}_")[0]
+    ).generate_tables(name_prefix=f"l{layer_index}_")[0]
 
 
 def _make_input(
@@ -194,75 +326,29 @@ def _make_input(
     )
 
 
-class _InputDistDriver:
-    """Feeds the 1F1B schedule with microbatches produced by ``input_dist``.
-
-    Each rank holds a *full set* of inputs (one ``ModelInput`` per stage); one
-    :func:`input_dist` round over the rank's cascade all-to-alls that set so the
-    rank receives ``num_stages`` inputs for its own stage -- i.e. ``num_stages``
-    microbatches per round. :meth:`take` refills a FIFO queue with whole rounds
-    until it holds at least ``n`` microbatches, then hands back ``n`` and keeps
-    the remainder, decoupling the microbatch count from the stage count:
-
-    * more microbatches than stages (e.g. 8 wanted, 4 stages) -> 2 rounds/pass;
-    * fewer (e.g. 8 wanted, 16 stages) -> one round every other pass, drained
-      ``n`` at a time from the queue.
-
-    The refill count is a deterministic function of ``(queue length, n)`` and the
-    queue starts empty on every rank, so all ranks in a cascade call
-    :func:`input_dist` the same number of times and stay in lock-step.
-
-    Args:
-        send: this rank's full input set; ``send[s]`` is destined for stage ``s``.
-        example: template carrier for reconstruction (a local-stage ModelInput).
-        cascade_pg: the cascade process group (size == num stages) to exchange over.
-    """
-
-    def __init__(
-        self,
-        send: List[ModelInput],
-        example: ModelInput,
-        cascade_pg: dist.ProcessGroup,
-    ) -> None:
-        self._send = send
-        self._example = example
-        self._pg = cascade_pg
-        self._queue: List[ModelInput] = []
-        # Monotonic input-dist round counter, tags the profiler ranges.
-        self._batch_id = 0
-
-    def take(self, n: int) -> List[ModelInput]:
-        while len(self._queue) < n:
-            # Same handle drives both phases: CPU/gloo sizes, CUDA/nccl data.
-            # input_dist returns a LazyAwaitable; wait() completes the exchange.
-            self._queue.extend(
-                input_dist(
-                    self._send,
-                    self._example,
-                    pg_gloo=self._pg,
-                    pg_nccl=self._pg,
-                    batch_id=self._batch_id,
-                ).wait()
-            )
-            self._batch_id += 1
-        out = self._queue[:n]
-        self._queue = self._queue[n:]
-        return out
-
-
 # single-rank runner
 def runner(
     rank: int,
     world_size: int,
     run_option: RunOptions,
 ) -> BenchmarkResult:
+    # debug mode only works with vscode for now.
+    if run_option.debug_mode:
+        # pyrefly: ignore[missing-module-attribute]
+        from fbvscode import attach_debugger
+
+        attach_debugger()
+
     run_option.set_log_level()
 
-    num_stages = run_option.num_stages
+    # The cut is the source of truth: it fixes the stage count and the depth.
+    layers_per_stage = list(run_option.layers_per_stage)
+    num_stages = len(layers_per_stage)
+    num_layers = sum(layers_per_stage)
     ranks_per_stage = run_option.ranks_per_stage
     assert world_size == num_stages * ranks_per_stage, (
-        f"world_size ({world_size}) must equal num_stages ({num_stages}) * "
-        f"ranks_per_stage ({ranks_per_stage})"
+        f"world_size ({world_size}) must equal len(layers_per_stage) "
+        f"({num_stages}) * ranks_per_stage ({ranks_per_stage})"
     )
 
     # CUDA uses nccl for the cross-HSD P2P hand-off (falls back to gloo for the
@@ -270,121 +356,104 @@ def runner(
     backend = "cpu:gloo,cuda:nccl" if run_option.device_type == "cuda" else "gloo"
     with MultiProcessContext(rank=rank, world_size=world_size, backend=backend) as ctx:
         device = ctx.device
-        criterion = nn.MSELoss()
 
-        # HSD layout: contiguous rank groups, one stage per HSD.
-        stage_ranks: List[List[int]] = [
-            list(range(s * ranks_per_stage, (s + 1) * ranks_per_stage))
-            for s in range(num_stages)
-        ]
+        # HSD layout is implicit in stage_size: stage i is the contiguous rank
+        # block starting at i * ranks_per_stage. StageWrapper builds every process
+        # group (stage / hand-off / cascade) itself, before it shards.
+        my_stage_index, position = StageWrapper.locate_rank(ranks_per_stage, rank)
 
-        # Collective: every rank builds every stage's process group.
-        stage_pgs = build_stage_process_groups(stage_ranks)
-        # Build hand-off + cascade pgs up front (before any DMP sharding) so all
-        # new_group collectives stay contiguous and cannot deadlock against
-        # sharding comms. Cascade pgs (one rank per stage) carry the input-dist
-        # all-to-all; every rank builds all of them in the same order.
-        handoff_pgs = build_handoff_process_groups(stage_ranks)
-        cascade_pgs = build_cascade_process_groups(stage_ranks)
-        my_stage_index = rank // ranks_per_stage
-        position = rank - my_stage_index * ranks_per_stage
-        cascade_pg = cascade_pgs[position]
-
-        # All stages' table configs (identical on every rank) so each rank can
+        # All layers' table configs (identical on every rank) so each rank can
         # generate a full per-stage input set for the input-dist all-to-all.
         all_tables = [
             _make_tables(
-                s,
+                l,
                 run_option.num_tables,
                 run_option.num_embeddings,
                 run_option.emb_dim,
             )
-            for s in range(num_stages)
+            for l in range(num_layers)
         ]
-        # This rank's stage (weights seeded by stage index so an HSD's two DP
-        # ranks start identical -> grad all-reduce keeps them in lock-step).
-        tables = all_tables[my_stage_index]
+        # Every rank authors the whole model and lets StageWrapper keep its own
+        # stage. Layers this rank does not own are built on the ``meta`` device:
+        # StageWrapper drops them, and meta tensors have no storage, so they cost
+        # nothing -- which matters here because a materialized layer is 1M x 256 x
+        # 8 tables. Weights are seeded by layer index so an HSD's two DP ranks
+        # start identical -> the grad all-reduce keeps them in lock-step.
+        # Author the whole model on meta -- no storage, so holding every layer
+        # costs nothing -- then let StageWrapper keep this rank's stage and
+        # materialize only those layers on the device.
+        meta_device = torch.device("meta")
+        layers: List[MaglevLayer] = [
+            MaglevTestLayer(
+                tables=all_tables[layer_index],
+                layer_dim=run_option.layer_dim,
+                is_first=(layer_index == 0),
+                batch_size=run_option.batch_size,
+                num_float_features=run_option.num_float_features,
+                device=meta_device,
+            )
+            for layer_index in range(num_layers)
+        ]
+        model = MaglevTestModel(layers)
+        # Meta construction consumes no randomness, so the weights are drawn when
+        # the stage materializes: seed here, per stage, so an HSD's ranks start
+        # identical (the sharded path relies on that -- it does not sync weights).
         torch.manual_seed(_WEIGHT_SEED + my_stage_index)
-        module = MaglevTestStage(
-            tables=tables,
-            stage_dim=run_option.stage_dim,
-            is_first=(my_stage_index == 0),
-            num_float_features=run_option.num_float_features,
-            device=device,
-        )
-        parallelizer = (
-            EmbeddingShard(embedding_lr=run_option.lr)
-            if run_option.shard_embeddings
-            else Replicated()
-        )
         stage = StageWrapper(
-            module=module,
-            stage_pg=stage_pgs[my_stage_index],
-            stage_index=my_stage_index,
-            parallelizer=parallelizer,
+            model=model,
+            layers_per_stage=layers_per_stage,
+            stage_size=ranks_per_stage,
         )
-        pipeline = MaglevPipeline(
-            stage=stage,
-            stage_ranks=stage_ranks,
-            global_rank=rank,
-            activation_shape=torch.Size([run_option.batch_size, run_option.stage_dim]),
-            device=device,
-            handoff_pgs=handoff_pgs,
+        # Parallelism is the caller's: shard the embeddings within the HSD, then
+        # materialize. Wrapping before to() is what keeps a meta-authored stage
+        # from allocating full-size tables the sharder is about to cut up.
+        if run_option.shard_embeddings:
+            stage.module = _shard_embeddings_in_hsd(
+                stage.module, stage.stage_pg, device, run_option.lr
+            )
+        stage.to(device)
+        # Dense params only, as benchmark_train_pipeline does: when the stage is
+        # sharded the embeddings train in backward via the fused TBE optimizer, so
+        # they neither need nor belong in the outer step.
+        # (Citrine C2: foreach=True for multi-tensor execution.)
+        optimizer = torch.optim.SGD(
+            [
+                p
+                for _, p in in_backward_optimizer_filter(
+                    stage.module.named_parameters()
+                )
+            ],
+            lr=run_option.lr,
+            foreach=True,
         )
+        pipeline = run_option.generate_pipeline(stage=stage, optimizer=optimizer)
 
-        # Sharded: CombinedOptimizer(fused embedding + dense SGD). Replicated:
-        # a plain SGD. (Citrine C2: foreach=True in the dense/replicated SGD.)
-        optimizer = stage.configure_optimizer(run_option.lr)
-
-        # Full per-stage input set for this rank (send[s] is destined for stage
-        # s's rank in the cascade). Generated once, outside the measured region --
-        # data loading is not what we benchmark; the input-dist all-to-all itself
-        # runs inside _func_to_benchmark via the driver.
-        send_set: List[ModelInput] = [
+        # One batch, replayed forever: data loading is not what we benchmark, so
+        # the dataloader hands back the same pre-built batch every round and only
+        # the input-dist all-to-all inside progress() is measured. A batch here is
+        # one ModelInput per layer of the whole model, which is what the model's
+        # (passthrough) preproc consumes.
+        model_input = [
             _make_input(
-                all_tables[s],
+                all_tables[l],
                 run_option.batch_size,
                 run_option.num_float_features,
                 device,
             )
-            for s in range(num_stages)
+            for l in range(num_layers)
         ]
-        # Reconstruction template: a local-stage input (== the item this rank
-        # sends to itself at cascade index my_stage_index).
-        driver = _InputDistDriver(
-            send=send_set,
-            example=send_set[my_stage_index],
-            cascade_pg=cascade_pg,
-        )
-
-        labels: List[torch.Tensor] = []
-        if pipeline.is_last:
-            labels = [
-                torch.randn(run_option.batch_size, run_option.stage_dim, device=device)
-                for _ in range(run_option.num_microbatches)
-            ]
+        dataloader_iter: Iterator[List[ModelInput]] = itertools.repeat(model_input)
 
         def _func_to_benchmark(
             bench_inputs: List[ModelInput],
-            pipeline: MaglevPipeline,
-            optimizer: torch.optim.Optimizer,
-            driver: _InputDistDriver,
-            num_microbatches: int,
-            labels: List[torch.Tensor],
-            criterion: nn.Module,
+            pipeline: MaglevPipelineBase,
+            dataloader_iter: Iterator[List[ModelInput]],
         ) -> None:
             # One measured iteration = the input-dist all-to-all for this pass's
-            # microbatches (refilling the queue as needed) + one full 1F1B pass
-            # (warmup + steady 1F1B + cooldown), including the cross-HSD hand-off
-            # and the per-batch DP grad all-reduce + optimizer step.
-            micro_inputs = driver.take(num_microbatches)
-            run_1f1b(
-                pipeline=pipeline,
-                microbatch_inputs=micro_inputs,
-                optimizer=optimizer,
-                labels=labels if pipeline.is_last else None,
-                criterion=criterion if pipeline.is_last else None,
-            )
+            # microbatches (refilling the queue as needed) + one full pass,
+            # including the cross-HSD hand-off and the per-batch DP grad
+            # all-reduce + optimizer step.
+            pipeline.progress(dataloader_iter)
 
         result = benchmark_func(
             bench_inputs=[],
@@ -392,14 +461,12 @@ def runner(
             func_to_benchmark=_func_to_benchmark,
             benchmark_func_kwargs={
                 "pipeline": pipeline,
-                "optimizer": optimizer,
-                "driver": driver,
-                "num_microbatches": run_option.num_microbatches,
-                "labels": labels,
-                "criterion": criterion,
+                "dataloader_iter": dataloader_iter,
             },
-            # One 1F1B pass consumes num_microbatches per-rank batches.
-            sample_count=run_option.batch_size * run_option.num_microbatches,
+            # A pass consumes microbatches_per_pass per-rank batches -- which is
+            # num_microbatches for 1F1B but 1 for the base schedule, so this has
+            # to come from the pipeline, not the config.
+            sample_count=run_option.batch_size * pipeline.microbatches_per_pass,
             **run_option.benchmark_func_kwargs(rank=rank),
         )
 
@@ -443,6 +510,12 @@ def run_maglev(run_option: RunOptions) -> BenchmarkResult:
 # command-line interface
 @cmd_conf
 def main(run_option: RunOptions) -> None:
+    if run_option.debug_mode:
+        # pyrefly: ignore[missing-module-attribute]
+        from fbvscode import attach_debugger
+
+        attach_debugger()
+
     result = run_maglev(run_option=run_option)
 
     # Print from the parent process so the result is always visible (rank-0

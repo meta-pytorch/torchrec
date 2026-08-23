@@ -275,13 +275,57 @@ class InputDistInProcessTest(unittest.TestCase):
         torch.testing.assert_close(got.features.lengths(), send[0].features.lengths())
         self.assertEqual(got.tag, "from_example")
 
+    def test_ragged_carriers(self) -> None:
+        """A carrier may have more slots than the example, if its peer expects them.
+
+        The maglev case: with a non-uniform cut like ``[2, 3]``, the carrier a rank
+        sends to a 3-layer stage flattens to more tensors than the one it sends to a
+        2-layer stage. Only what this rank *receives* has to match its example.
+        """
+        pg = dist.group.WORLD
+        assert pg is not None
+        # world_size == 1, so this rank sends to itself: the carrier it sends must
+        # match its own example. Make both two carriers deep to prove the flat
+        # (rather than rectangular) size exchange round-trips a multi-slot carrier.
+        send = [[_make_carrier(src=0, dst=0), _make_carrier(src=0, dst=1)]]
+        example = [_make_carrier(src=0, dst=0), _make_carrier(src=0, dst=1)]
+
+        flat_send, recv_sizes = input_size_dist(send, example, pg).wait()
+        # Sizes come back reshaped to [source rank][slot], covering both carriers.
+        self.assertEqual(len(recv_sizes), 1)
+        self.assertEqual(len(recv_sizes[0]), len(flat_send[0]))
+        self.assertEqual(recv_sizes[0], [t.shape[0] for t in flat_send[0]])
+
+        recv = input_data_dist(flat_send, recv_sizes, example, pg).wait()
+        self.assertEqual(len(recv), 1)
+        self.assertEqual(len(recv[0]), 2)
+        for got, expected in zip(recv[0], send[0]):
+            torch.testing.assert_close(got.dense, expected.dense)
+            torch.testing.assert_close(got.ids, expected.ids)
+            torch.testing.assert_close(
+                got.features.values(), expected.features.values()
+            )
+
+    def test_send_dtype_absent_from_example_is_rejected(self) -> None:
+        """A carrier may differ from the example in slot count, not in dtypes."""
+        pg = dist.group.WORLD
+        assert pg is not None
+        send = [_make_carrier(src=0, dst=0)]
+        example = _make_carrier(src=0, dst=0)
+        # float64 appears in no bucket the example defines.
+        send[0].extras = [t.to(torch.float64) for t in send[0].extras]
+
+        flat_send, recv_sizes = input_size_dist(send, example, pg).wait()
+        with self.assertRaisesRegex(ValueError, "which the example does not have"):
+            input_data_dist(flat_send, recv_sizes, example, pg)
+
     def test_size_then_data_phase(self) -> None:
         pg = dist.group.WORLD
         assert pg is not None
         send = [_make_carrier(src=0, dst=0)]
         example = _make_carrier(src=0, dst=0)
 
-        flat_send, recv_sizes = input_size_dist(send, pg).wait()
+        flat_send, recv_sizes = input_size_dist(send, example, pg).wait()
         # One carrier -> one row; sizes match the flattened tensors' dim-0.
         self.assertEqual(len(recv_sizes), 1)
         self.assertEqual(recv_sizes[0], [t.shape[0] for t in flat_send[0]])
