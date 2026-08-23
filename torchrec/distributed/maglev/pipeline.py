@@ -7,371 +7,377 @@
 
 # pyre-strict
 
-from typing import Any, Callable, List, Optional, Tuple
+"""Schedules that drive a staged Maglev model across per-stage HSDs.
+
+A schedule reads raw batches from a dataloader and decides *when* to forward,
+backward, and hand off; the :class:`StageWrapper` it holds owns everything about
+how (the wire, the process groups, the input distribution).
+"""
+
+import contextlib
+from typing import Any, Callable, ContextManager, Iterator, List, Optional, Sequence
 
 import torch
-import torch.distributed as dist
-from torch.autograd.profiler import record_function
-from torchrec.distributed.maglev.stage import build_handoff_process_groups, StageWrapper
-
-LossFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel
+from torchrec.distributed.maglev.stage import StageWrapper
 
 
-class MaglevPipeline:
-    """Drives a staged Maglev model across per-stage HSDs.
+def _no_sync_modules(module: nn.Module) -> List[nn.Module]:
+    """The parallel wrappers in ``module``'s tree whose gradient sync to suppress.
 
-    This is the pipeline-parallel analogue of the sequential loop in
-    ``WukongMaglev.forward`` (legokit/backbones/maglev_prototype.py): instead of
-    iterating stages in one process, each stage lives on a disjoint set of ranks
-    (its HSD) and the activation is handed between HSDs over the network.
+    Two-tier, following ``GradientAccumulationWrapper._get_ddp_modules``: the root
+    counts if it merely *has* ``no_sync``, which covers DDP, FSDP and custom
+    wrappers alike, while descendants must be ``DistributedDataParallel``
+    instances. The asymmetry is deliberate -- the root is known to be the parallel
+    wrapper, whereas a descendant is an arbitrary submodule and a nested FSDP's
+    ``no_sync`` does not mean the same thing.
 
-    A rank owns exactly one stage. The hand-off is **by position**: the rank at
-    position ``p`` in HSD ``i`` exchanges with the rank at position ``p`` in HSD
-    ``i ± 1``. Forward activations flow ``i -> i+1``; backward gradients flow
-    ``i+1 -> i``. The two ranks of an HSD are data-parallel lanes; gradients are
-    averaged across them (:meth:`StageWrapper.reduce_gradients`).
+    Descendants matter because a sharded submodule can hold its own inner DDP for
+    data-parallel lookups; suppressing only the outer wrapper leaves those
+    all-reducing on every backward.
 
-    The hand-off runs over **two direction-split process groups** (``act_pg`` for
-    forward activations, ``grad_pg`` for backward gradients, built by
-    :func:`build_handoff_process_groups`) rather than P2P over the default (world)
-    group. A boundary's forward activation and backward gradient thus land on
-    *different* communicators (separate NCCL streams instead of serializing), and
-    each communicator carries a single flow direction (recv-then-send per rank,
-    never send-first). Both are separate from each stage's intra-HSD sharded
-    all-to-all; interleaving P2P with that on the world group deadlocks once the
-    stages are sharded with DMP. See
-    ``tech-docs/nccl_p2p_execution_order_buffer_size.md`` (sections 4-5).
+    ``DistributedModelParallel`` is unwrapped first: it defines no ``no_sync`` of
+    its own, so the wrapper worth entering is the module it holds.
+    """
+    found: List[nn.Module] = []
+    root = module
+    wrapped = getattr(module, "_dmp_wrapped_module", None)
+    if isinstance(wrapped, nn.Module):
+        root = wrapped
+    if hasattr(root, "no_sync"):
+        found.append(root)
+    found.extend(
+        m
+        for m in root.modules()
+        if m is not root and isinstance(m, DistributedDataParallel)
+    )
+    return found
 
-    Two drivers are provided:
 
-    * :meth:`step` -- a single-batch forward-then-backward pass (used by the
-      correctness test). Blocking send/recv form a matched wave; no deadlock.
-    * :meth:`forward_micro` / :meth:`backward_micro` + :func:`run_1f1b` -- a
-      microbatched 1F1B schedule (used by the benchmark). Activations are
-      received with blocking recv (strict dependency, forms a wave) and sent
-      with non-blocking isend whose completion is deferred to
-      :meth:`wait_sends`, which keeps the schedule deadlock-free.
+@contextlib.contextmanager
+def _no_sync(modules: Sequence[nn.Module]) -> Iterator[None]:
+    """Enter every wrapper's ``no_sync`` at once; a no-op when there are none."""
+    with contextlib.ExitStack() as stack:
+        for module in modules:
+            # pyre-ignore[16]: presence of no_sync is what put it in this list
+            stack.enter_context(module.no_sync())
+        yield
 
-    Every comm (activation/gradient send+recv) and the forward/backward compute
-    is wrapped in a ``record_function`` range tagged with the microbatch id
-    (``## recv_act mb3 ##`` etc.), so profiler traces show which microbatch each
-    operation belongs to.
+
+class MaglevPipelineBase:
+    """The trivial schedule -- one forward, one backward, one step -- and the base
+    every other schedule extends.
+
+    With a single microbatch every stage runs the same forward-then-backward
+    wave, so the sends drain before the gradients are reduced and no interleaving
+    is needed. Used directly by the correctness test. This is *not* 1F1B with
+    ``num_microbatches=1``: that schedule needs at least one microbatch per stage
+    to fill (see :class:`Maglev1F1B`).
+
+    Subclasses override :meth:`progress` with their own ordering; what they
+    inherit is the stage and optimizer, the boundary-contract check, and
+    :meth:`_forward_context`, which every schedule uses to place the single
+    gradient sync of a pass.
 
     Args:
-        stage: this rank's :class:`StageWrapper`.
-        stage_ranks: ``stage_ranks[i]`` is the global ranks of stage ``i``'s HSD.
-            Every stage must have the same number of ranks (same position layout).
-        global_rank: this process's global rank.
-        activation_shape: shape of the activation handed between stages.
-        device: device the stage runs on.
-        dtype: dtype of the activation / gradient tensors.
+        stage: this rank's :class:`StageWrapper`. Everything about where this
+            rank sits -- its stage, its position in that stage's HSD, the
+            neighbouring ranks, the hand-off process groups -- is read off the
+            wrapper rather than derived a second time here.
+        optimizer: the stage's optimizer. Gradients accumulate across a pass and
+            are applied with a single step.
+        no_sync: returns a context that suppresses the DP wrapper's gradient
+            sync, entered around every forward but the pass's last. Defaults to
+            suppressing whatever wrappers :func:`_no_sync_modules` finds on
+            ``stage.module``, so an unwrapped stage needs nothing and a
+            DDP/FSDP/DMP one works unconfigured. Pass your own only if that
+            derivation is wrong for your setup.
+
+    Raises:
+        ValueError: if a boundary stage declares an activation it cannot have (an
+            incoming one on the first stage, or none on any later stage).
     """
 
     def __init__(
         self,
         stage: StageWrapper,
-        stage_ranks: List[List[int]],
-        global_rank: int,
-        activation_shape: torch.Size,
-        device: torch.device,
-        dtype: torch.dtype = torch.float32,
-        handoff_pgs: Optional[Tuple[dist.ProcessGroup, dist.ProcessGroup]] = None,
+        optimizer: torch.optim.Optimizer,
+        no_sync: Optional[Callable[[], ContextManager[None]]] = None,
     ) -> None:
         self.stage = stage
-        self.stage_ranks = stage_ranks
-        self.global_rank = global_rank
-        self.num_stages: int = len(stage_ranks)
-        self.activation_shape = activation_shape
-        self.device = device
-        self.dtype = dtype
+        self.optimizer = optimizer
+        # Read once: the module tree is static after wrapping, and the
+        # pipeline is built after it.
+        modules = _no_sync_modules(stage.module)
+        self._no_sync: Callable[[], ContextManager[None]] = no_sync or (
+            lambda: _no_sync(modules)
+        )
 
-        # Locate this rank's stage and its position within that stage's HSD.
-        stage_index = -1
-        position = -1
-        for s_idx, ranks in enumerate(stage_ranks):
-            if global_rank in ranks:
-                stage_index = s_idx
-                position = ranks.index(global_rank)
-                break
-        if stage_index < 0:
+        in_specs = stage.in_activation_specs()
+        if stage.is_first and in_specs:
             raise ValueError(
-                f"rank {global_rank} not found in stage_ranks {stage_ranks}"
+                f"stage 0 declares an incoming activation {in_specs} but has "
+                "no previous stage to receive it from"
             )
-        if stage_index != stage.stage_index:
+        if not stage.is_first and not in_specs:
             raise ValueError(
-                f"rank {global_rank} owns stage {stage_index} but the StageWrapper "
-                f"is for stage {stage.stage_index}"
+                f"stage {stage.stage_index} declares no incoming activation; only "
+                "stage 0 may start the chain"
             )
-        self.stage_index: int = stage_index
-        self.position: int = position
-
-        # Two direction-split P2P communicators (see build_handoff_process_groups):
-        # forward activations go on ``act_pg``, backward gradients on ``grad_pg``,
-        # so a boundary's two directions land on different communicators (separate
-        # streams) and each carries a single flow direction (recv-then-send, never
-        # send-first). When sharding, pass ``handoff_pgs`` built *before* any DMP so
-        # the two ``new_group`` collectives stay contiguous; otherwise built here.
-        if handoff_pgs is None:
-            handoff_pgs = build_handoff_process_groups(stage_ranks)
-        self._act_pg, self._grad_pg = handoff_pgs
-
-        # Per-direction pg for this stage: activations on act_pg, gradients on
-        # grad_pg (None where this stage has no neighbor on that side).
-        self._recv_act_pg: Optional[dist.ProcessGroup] = (
-            None if self.is_first else self._act_pg
-        )
-        self._send_act_pg: Optional[dist.ProcessGroup] = (
-            None if self.is_last else self._act_pg
-        )
-        self._recv_grad_pg: Optional[dist.ProcessGroup] = (
-            None if self.is_last else self._grad_pg
-        )
-        self._send_grad_pg: Optional[dist.ProcessGroup] = (
-            None if self.is_first else self._grad_pg
-        )
-
-        # 1F1B state: FIFO of in-flight microbatches (with their microbatch id,
-        # for profiler labels) and deferred send handles.
-        self._pending: List[
-            Tuple[Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor], int]
-        ] = []
-        # pyre-ignore[4]: dist work handle has no public type
-        self._send_work: List[Tuple[Any, torch.Tensor]] = []
 
     @property
     def is_first(self) -> bool:
-        return self.stage_index == 0
+        return self.stage.is_first
 
     @property
     def is_last(self) -> bool:
-        return self.stage_index == self.num_stages - 1
+        return self.stage.is_last
 
-    def _prev_rank(self) -> int:
-        """Global rank at this position in the previous HSD."""
-        return self.stage_ranks[self.stage_index - 1][self.position]
+    @property
+    def microbatches_per_pass(self) -> int:
+        """Microbatches one :meth:`progress` call consumes.
 
-    def _next_rank(self) -> int:
-        """Global rank at this position in the next HSD."""
-        return self.stage_ranks[self.stage_index + 1][self.position]
-
-    def _recv(
-        self, src: int, pg: dist.ProcessGroup, requires_grad: bool
-    ) -> torch.Tensor:
-        tensor = torch.empty(
-            self.activation_shape, device=self.device, dtype=self.dtype
-        )
-        dist.recv(tensor, src=src, group=pg)
-        if requires_grad:
-            # Make it a leaf that requires grad so backward yields its grad to
-            # hand back to the previous stage.
-            tensor.requires_grad_(True)
-        return tensor
-
-    def _isend(self, tensor: torch.Tensor, dst: int, pg: dist.ProcessGroup) -> None:
-        # Non-blocking send; the buffer is kept alive until wait_sends().
-        buf = tensor.detach().contiguous()
-        work = dist.isend(buf, dst=dst, group=pg)
-        self._send_work.append((work, buf))
-
-    def wait_sends(self) -> None:
-        """Complete all deferred non-blocking sends."""
-        for work, _buf in self._send_work:
-            work.wait()
-        self._send_work.clear()
-
-    # ---- single-batch driver (correctness) ----
-
-    def step(
-        self,
-        stage_input: Any,
-        optimizer: torch.optim.Optimizer,
-        label: Optional[torch.Tensor] = None,
-        criterion: Optional[LossFn] = None,
-    ) -> Optional[torch.Tensor]:
-        """Run one forward + backward + optimizer step for a single batch.
-
-        Returns the loss on the last stage, ``None`` on every other stage.
-        ``label`` and ``criterion`` are required on (and only used by) the last
-        stage.
+        What a caller measuring throughput has to divide by; schedules differ.
         """
-        optimizer.zero_grad()
+        return 1
 
-        prev_output: Optional[torch.Tensor] = None
-        if not self.is_first:
-            assert self._recv_act_pg is not None
-            with record_function("## recv_act mb0 ##"):
-                prev_output = self._recv(
-                    self._prev_rank(), self._recv_act_pg, requires_grad=True
-                )
+    def progress(self, dataloader_iter: Iterator[Any]) -> Optional[torch.Tensor]:
+        """Run one microbatch and apply the gradients.
 
-        with record_function("## forward mb0 ##"):
-            output = self.stage(stage_input, prev_output)
+        Args:
+            dataloader_iter: yields raw batches -- whatever the model's
+                :meth:`~torchrec.distributed.maglev.module.MaglevModuleList.preproc`
+                consumes. The stage pulls from it, partitions each batch into
+                per-layer inputs, and all-to-alls them over its cascade, so a
+                rank never has to know which layers it owns to feed it.
 
-        if not self.is_last:
-            assert self._send_act_pg is not None
-            with record_function("## send_act mb0 ##"):
-                dist.send(
-                    output.detach().contiguous(),
-                    dst=self._next_rank(),
-                    group=self._send_act_pg,
-                )
+        Returns:
+            Optional[torch.Tensor]: the loss on the last stage, ``None`` on every
+            other stage. The last stage's model scored itself in ``postproc``, so
+            no label or criterion is passed in.
+        """
+        (stage_input,) = self.stage.take_inputs(dataloader_iter, 1)
 
-        loss: Optional[torch.Tensor] = None
-        if self.is_last:
-            if criterion is None or label is None:
-                raise ValueError("last stage requires both `criterion` and `label`")
-            with record_function("## backward mb0 ##"):
-                loss = criterion(output, label)
-                loss.backward()
-        else:
-            assert self._recv_grad_pg is not None
-            grad_output = torch.empty(
-                output.shape, device=self.device, dtype=self.dtype
-            )
-            with record_function("## recv_grad mb0 ##"):
-                dist.recv(grad_output, src=self._next_rank(), group=self._recv_grad_pg)
-            with record_function("## backward mb0 ##"):
-                output.backward(grad_output)
-
-        if not self.is_first:
-            assert prev_output is not None and prev_output.grad is not None
-            assert self._send_grad_pg is not None
-            with record_function("## send_grad mb0 ##"):
-                dist.send(
-                    prev_output.grad.contiguous(),
-                    dst=self._prev_rank(),
-                    group=self._send_grad_pg,
-                )
-
-        self.stage.reduce_gradients()
-        optimizer.step()
+        self.optimizer.zero_grad()
+        self.stage.start_recv_act()
+        self.stage.forward_micro(stage_input, microbatch_id=0)
+        # Immediately before the backward, never earlier -- see Maglev1F1B.
+        self.stage.start_recv_grad()
+        loss = self.stage.backward_micro()
+        self.stage.drain_sends()
+        self.optimizer.step()
         return loss
 
-    # ---- microbatched 1F1B driver (benchmark) ----
+    def _forward_context(self, fwd_idx: int, num_forwards: int) -> ContextManager[None]:
+        """Suppress gradient sync for every microbatch but the pass's last.
 
-    def forward_micro(
-        self,
-        stage_input: Any,
-        label: Optional[torch.Tensor] = None,
-        microbatch_id: int = 0,
-    ) -> None:
-        """One microbatch forward: recv activation, compute, send activation.
+        Wraps the **forward**, not the backward. ``DistributedDataParallel``
+        reads ``require_backward_grad_sync`` in ``_pre_forward`` /
+        ``_post_forward`` -- that is where the reducer is armed for the coming
+        backward -- so a ``no_sync`` placed around ``backward()`` alone has no
+        effect and every microbatch all-reduces. PyTorch documents the same:
+        "The forward pass should be included inside the context manager, or else
+        gradients will still be synchronized."
 
-        ``microbatch_id`` tags the profiler ranges (and is carried on the pending
-        FIFO to the matching backward) so a trace shows which microbatch each
-        comm/compute belongs to.
+        The last microbatch forwards outside the context, so its backward carries
+        the one reduction for the whole pass, over gradients every earlier
+        microbatch accumulated locally.
+
+        Args:
+            fwd_idx: index of this forward within the pass.
+            num_forwards: forwards this pass will run.
         """
-        prev_output: Optional[torch.Tensor] = None
-        if not self.is_first:
-            assert self._recv_act_pg is not None
-            with record_function(f"## recv_act mb{microbatch_id} ##"):
-                prev_output = self._recv(
-                    self._prev_rank(), self._recv_act_pg, requires_grad=True
-                )
-
-        with record_function(f"## forward mb{microbatch_id} ##"):
-            output = self.stage(stage_input, prev_output)
-
-        if not self.is_last:
-            assert self._send_act_pg is not None
-            with record_function(f"## send_act mb{microbatch_id} ##"):
-                self._isend(output, self._next_rank(), self._send_act_pg)
-
-        self._pending.append((prev_output, output, label, microbatch_id))
-
-    def backward_micro(
-        self, criterion: Optional[LossFn] = None
-    ) -> Optional[torch.Tensor]:
-        """One microbatch backward: recv grad, backward, send input grad.
-
-        Gradients accumulate across microbatches (no ``zero_grad`` here); the
-        caller runs the DP all-reduce and optimizer step once per batch. Profiler
-        ranges are tagged with the ``microbatch_id`` recorded at forward time.
-        """
-        prev_output, output, label, microbatch_id = self._pending.pop(0)
-
-        loss: Optional[torch.Tensor] = None
-        if self.is_last:
-            if criterion is None or label is None:
-                raise ValueError("last stage requires both `criterion` and `label`")
-            with record_function(f"## backward mb{microbatch_id} ##"):
-                loss = criterion(output, label)
-                loss.backward()
-        else:
-            assert self._recv_grad_pg is not None
-            grad_output = torch.empty(
-                output.shape, device=self.device, dtype=self.dtype
-            )
-            with record_function(f"## recv_grad mb{microbatch_id} ##"):
-                dist.recv(grad_output, src=self._next_rank(), group=self._recv_grad_pg)
-            with record_function(f"## backward mb{microbatch_id} ##"):
-                output.backward(grad_output)
-
-        if not self.is_first:
-            assert prev_output is not None and prev_output.grad is not None
-            assert self._send_grad_pg is not None
-            with record_function(f"## send_grad mb{microbatch_id} ##"):
-                self._isend(prev_output.grad, self._prev_rank(), self._send_grad_pg)
-
-        return loss
+        if fwd_idx == num_forwards - 1:
+            return contextlib.nullcontext()
+        return self._no_sync()
 
 
-def run_1f1b(
-    pipeline: MaglevPipeline,
-    microbatch_inputs: List[Any],
-    optimizer: torch.optim.Optimizer,
-    labels: Optional[List[torch.Tensor]] = None,
-    criterion: Optional[LossFn] = None,
-) -> List[float]:
-    """Run one 1F1B (one-forward-one-backward) pass over ``microbatch_inputs``.
+class Maglev1F1B(MaglevPipelineBase):
+    """The 1F1B (one-forward-one-backward) schedule, with plain P2P.
 
-    Standard PipeDream-flush schedule: each stage runs ``num_warmup`` forwards,
-    then interleaves 1 forward / 1 backward in steady state, then drains the
-    remaining backwards in cooldown. ``num_warmup = num_stages - stage_index - 1``
-    (clamped to the microbatch count), so deeper stages warm up less and the
-    send/recv pairs line up across ranks.
+    Standard PipeDream-flush: each stage runs ``num_warmup`` forwards, then
+    interleaves 1 forward / 1 backward in steady state, then drains the remaining
+    backwards in cooldown. ``num_warmup = num_stages - stage_index - 1`` (clamped
+    to the microbatch count), so deeper stages warm up less and the send/recv
+    pairs line up across ranks.
 
-    Returns the per-microbatch losses observed on the last stage (empty on
-    other stages). Gradients are accumulated across all microbatches, then
-    DP-averaged and applied with a single optimizer step.
+    Each receive is posted immediately before the operation that consumes it, so
+    a transfer is issued and then waited on with nothing in between: the stage
+    stalls for the whole latency of every hand-off. That is the straightforward
+    ordering, and the baseline that :class:`Maglev1F1BRecvAhead` is measured
+    against.
+
+    Sends are still asynchronous -- ``forward_micro`` / ``backward_micro`` start
+    one and finish it on the next call -- so only the receive side blocks.
+
+    Args:
+        stage: this rank's :class:`StageWrapper`.
+        optimizer: the stage's optimizer.
+        num_microbatches: microbatches per pass. Fixed for the pipeline's life,
+            so the schedule's shape is computed once here rather than per pass.
+
+    Raises:
+        ValueError: if there are fewer microbatches than stages. That leaves the
+            early stages with no steady phase at all, and it is the steady phase
+            that seeds the gradient receives -- so those ranks would fail in
+            cooldown while the later ones ran on, hanging the job
+            asymmetrically. It is also a pointless schedule: the pipeline never
+            fills, so it is all bubble.
     """
-    num_stages = pipeline.num_stages
-    num_micro = len(microbatch_inputs)
-    stage_index = pipeline.stage_index
-    num_warmup = min(num_stages - stage_index - 1, num_micro)
-    num_steady = num_micro - num_warmup
 
-    def _label(idx: int) -> Optional[torch.Tensor]:
-        return labels[idx] if labels is not None else None
+    def __init__(
+        self,
+        stage: StageWrapper,
+        optimizer: torch.optim.Optimizer,
+        num_microbatches: int,
+        no_sync: Optional[Callable[[], ContextManager[None]]] = None,
+    ) -> None:
+        super().__init__(stage, optimizer, no_sync)
+        if num_microbatches < stage.num_stages:
+            raise ValueError(
+                f"1F1B needs at least one microbatch per stage: got "
+                f"{num_microbatches} for {stage.num_stages} stages"
+            )
+        self.num_microbatches: int = num_microbatches
+        self.num_warmup: int = min(
+            stage.num_stages - stage.stage_index - 1, num_microbatches
+        )
+        self.num_steady: int = num_microbatches - self.num_warmup
 
-    optimizer.zero_grad()
-    losses: List[float] = []
+    @property
+    def microbatches_per_pass(self) -> int:
+        return self.num_microbatches
 
-    fwd_idx = 0
-    bwd_idx = 0
+    def progress(self, dataloader_iter: Iterator[Any]) -> Optional[torch.Tensor]:
+        """Run one 1F1B pass.
 
-    # Warmup: fill the pipeline.
-    for _ in range(num_warmup):
-        pipeline.forward_micro(microbatch_inputs[fwd_idx], _label(fwd_idx), fwd_idx)
-        fwd_idx += 1
+        Gradients are accumulated across all microbatches, then DP-averaged and
+        applied with a single optimizer step.
 
-    # Steady state: one forward, one backward.
-    for _ in range(num_steady):
-        pipeline.forward_micro(microbatch_inputs[fwd_idx], _label(fwd_idx), fwd_idx)
-        fwd_idx += 1
-        loss = pipeline.backward_micro(criterion)
-        bwd_idx += 1
-        if loss is not None:
-            losses.append(loss.item())
+        Args:
+            dataloader_iter: yields raw batches, as in
+                :meth:`MaglevPipelineBase.progress`. One pass consumes as many as
+                the input distribution needs to produce ``num_microbatches``.
 
-    # Cooldown: drain remaining backwards.
-    for _ in range(num_warmup):
-        loss = pipeline.backward_micro(criterion)
-        bwd_idx += 1
-        if loss is not None:
-            losses.append(loss.item())
+        Returns:
+            Optional[torch.Tensor]: always ``None``. Reading a per-microbatch
+            loss means ``loss.item()``, which is a device-to-host sync in the
+            middle of the schedule -- it would stall the pipeline it is meant to
+            be measuring. Use :class:`MaglevPipelineBase` when a value is
+            actually needed.
+        """
+        stage = self.stage
+        microbatch_inputs = stage.take_inputs(dataloader_iter, self.num_microbatches)
 
-    pipeline.wait_sends()
-    pipeline.stage.reduce_gradients()
-    optimizer.step()
-    return losses
+        self.optimizer.zero_grad()
+
+        fwd_idx = 0
+
+        def _forward() -> None:
+            nonlocal fwd_idx
+            stage.start_recv_act()
+            with self._forward_context(fwd_idx, self.num_microbatches):
+                stage.forward_micro(microbatch_inputs[fwd_idx], fwd_idx)
+            fwd_idx += 1
+
+        def _backward() -> None:
+            stage.start_recv_grad()
+            stage.backward_micro()
+
+        # Warmup: fill the pipeline.
+        for _ in range(self.num_warmup):
+            _forward()
+
+        # Steady state: one forward, one backward.
+        for _ in range(self.num_steady):
+            _forward()
+            _backward()
+
+        # Cooldown: drain remaining backwards.
+        for _ in range(self.num_warmup):
+            _backward()
+
+        stage.drain_sends()
+        self.optimizer.step()
+        return None
+
+
+class Maglev1F1BRecvAhead(Maglev1F1B):
+    """1F1B that posts each receive a microbatch ahead of the compute it feeds.
+
+    Same warmup / steady / cooldown structure and the same number of transfers as
+    :class:`Maglev1F1B`; only the *placement* of the receives differs. The
+    transfer for microbatch ``k+1`` is posted before ``k`` is computed, so it
+    lands during that compute instead of being waited on the moment it is issued.
+    That hides the hand-off latency behind the neighbouring stage's work, which is
+    the whole point of splitting the P2P into start/wait.
+
+    .. note::
+        Gradient receives cannot run as far ahead as activation receives. The
+        first one on a rank creates the pair's NCCL communicator and blocks until
+        the peer's matching send, and a peer only touches the gradient direction
+        in its own backward -- so posting one during the forward phase parks this
+        rank mid-wave and deadlocks the pipeline. The first gradient receive
+        therefore waits until warmup is over; from then on running a microbatch
+        ahead is free.
+    """
+
+    def progress(self, dataloader_iter: Iterator[Any]) -> Optional[torch.Tensor]:
+        """Run one 1F1B pass, keeping both receive directions one microbatch ahead.
+
+        Returns:
+            Optional[torch.Tensor]: always ``None``, as
+            :meth:`Maglev1F1B.progress`.
+        """
+        stage = self.stage
+        microbatch_inputs = stage.take_inputs(dataloader_iter, self.num_microbatches)
+
+        self.optimizer.zero_grad()
+
+        fwd_idx = 0
+
+        def _forward() -> None:
+            """Run one forward, consuming the activation receive posted before it."""
+            nonlocal fwd_idx
+            with self._forward_context(fwd_idx, self.num_microbatches):
+                stage.forward_micro(microbatch_inputs[fwd_idx], fwd_idx)
+            fwd_idx += 1
+
+        # Two receives outstanding before the first forward: this seed plus the
+        # one the first warmup iteration posts.
+        stage.start_recv_act()
+
+        # Warmup: fill the pipeline.
+        for _ in range(self.num_warmup):
+            stage.start_recv_act()
+            _forward()
+
+        def _backward() -> None:
+            """Run one backward."""
+            stage.backward_micro()
+
+        # Steady state: one forward, one backward.
+        for i in range(self.num_steady):
+            # Warmup is over by now, so the stages below have every activation
+            # they need to reach their own first backward -- see the note on the
+            # class about why this cannot move earlier.
+            stage.start_recv_grad()
+            _forward()
+            if i < self.num_steady - 1:
+                stage.start_recv_act()
+            else:
+                # No more forwards to run ahead for; keep the gradient side one
+                # ahead for cooldown instead.
+                stage.start_recv_grad()
+            _backward()
+
+        # Cooldown: drain remaining backwards.
+        for i in range(self.num_warmup):
+            if i < self.num_warmup - 1:
+                stage.start_recv_grad()
+            _backward()
+
+        stage.drain_sends()
+        self.optimizer.step()
+        return None

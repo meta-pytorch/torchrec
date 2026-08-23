@@ -9,29 +9,18 @@
 
 """Flatten structured data to a list of tensors, rebuild it, and all-to-all it.
 
-Used to move structured cross-stage "carriers" across HSD boundaries. A carrier
-(dataclass of tensors / ``KeyedJaggedTensor`` / nested containers) is flattened to
-a flat list of tensors on the sender and rebuilt on the receiver from a known
-*example* (template) instance. Only tensors cross the wire; every non-tensor part
--- dataclass field values that are scalars/strings, container shapes, dict keys,
-and a ``KeyedJaggedTensor``'s feature keys -- is supplied by the example.
-
-Supported structure: ``torch.Tensor``, ``KeyedJaggedTensor``, dataclasses, and
-nested ``list`` / ``tuple`` / ``dict``; any other value is a non-tensor leaf
-(carried by the example, not transferred).
-
-On top of flatten/unflatten this module provides a two-phase all-to-all of a list
-of carriers (:func:`input_dist`): :func:`input_size_dist` exchanges the small
-tensor-size metadata over a cheap CPU/gloo group, then :func:`input_data_dist`
-moves the bulk tensors over an nccl group with the sizes learned in phase one.
-Both phases issue their collectives with ``async_op=True`` and return a
-:class:`~torchrec.distributed.types.LazyAwaitable`, so the caller can overlap
-other work and ``wait()`` only when the result is needed.
+A "carrier" (dataclass of tensors / ``KeyedJaggedTensor`` / nested containers) is
+flattened on the sender and rebuilt on the receiver from a known *example*
+instance: only tensors cross the wire, and every non-tensor part comes from the
+example. :func:`input_dist` all-to-alls a list of carriers in two phases -- sizes
+over CPU/gloo, then bulk tensors over nccl -- both async, returning a
+:class:`~torchrec.distributed.types.LazyAwaitable`.
 """
 
 import math
+from collections import deque
 from dataclasses import fields, is_dataclass
-from typing import Any, Dict, Iterator, List, Tuple, TypeVar
+from typing import Any, Callable, Deque, Dict, Generic, Iterator, List, Tuple, TypeVar
 
 import torch
 import torch.distributed as dist
@@ -186,7 +175,8 @@ class _InputSizeAwaitable(
     ``wait()`` completes the async exchange and returns ``(flat_send, recv_sizes)``:
     the flattened send tensors (available immediately, threaded through so phase two
     need not re-flatten) and ``recv_sizes[i][k]`` -- the dim-0 size of slot ``k`` of
-    the carrier rank ``i`` is sending to this rank.
+    the carrier rank ``i`` is sending to this rank. The sizes arrive flat and are
+    reshaped to ``[world_size, recv_slots]`` here.
     """
 
     def __init__(
@@ -195,19 +185,22 @@ class _InputSizeAwaitable(
         work: Any,
         flat_send: List[List[torch.Tensor]],
         recv_sizes: torch.Tensor,
+        recv_slots: int,
         batch_id: int,
     ) -> None:
         super().__init__()
         self._work = work
         self._flat_send = flat_send
         self._recv_sizes = recv_sizes
+        self._recv_slots = recv_slots
         self._batch_id = batch_id
 
     def _wait_impl(self) -> Tuple[List[List[torch.Tensor]], List[List[int]]]:
         with record_function(f"## input_size_dist wait batch{self._batch_id} ##"):
             if self._work is not None:
                 self._work.wait()
-            return self._flat_send, self._recv_sizes.tolist()
+            # Flat on the wire, [source rank][slot] to the caller.
+            return self._flat_send, self._recv_sizes.view(-1, self._recv_slots).tolist()
 
 
 class _InputDataAwaitable(LazyAwaitable[List[T]]):
@@ -275,21 +268,32 @@ class _InputDataAwaitable(LazyAwaitable[List[T]]):
 
 def input_size_dist(
     send: List[T],
+    example: T,
     pg_gloo: dist.ProcessGroup,
     batch_id: int = 0,
 ) -> LazyAwaitable[Tuple[List[List[torch.Tensor]], List[List[int]]]]:
     """Phase one: flatten each carrier and async all-to-all the tensor-size metadata.
 
     ``send`` must have one carrier per rank in ``pg_gloo`` (``send[j]`` is destined
-    for rank ``j``). Each carrier is flattened to the same number ``K`` of tensors
-    (the homogeneity assumption), and only each tensor's dim-0 size varies between
-    carriers -- trailing dims and dtype are fixed per slot and recovered from the
-    example in phase two. This issues an async all-to-all of a small ``[W, K]``
-    integer matrix of dim-0 sizes over the (cheap, CPU) gloo group so every rank
-    learns the sizes of the tensors it is about to receive.
+    for rank ``j``), and each must have the structure *that destination* expects --
+    which is what ``example`` describes locally. Carriers may therefore differ in
+    tensor count between destinations: a rank sending a 2-slot carrier to one peer
+    and a 3-slot carrier to another is fine, as long as each peer's own example
+    agrees. What is *received* is always homogeneous, since every incoming carrier
+    is built for this rank.
+
+    Only each tensor's dim-0 size varies; trailing dims and dtype are fixed per
+    slot and recovered from the example in phase two. This issues an async
+    all-to-all of the dim-0 sizes over the (cheap, CPU) gloo group -- ragged on the
+    way out (``input_split_sizes`` is each carrier's tensor count) and rectangular
+    on the way back (every peer sends this rank ``K`` sizes, ``K`` taken from
+    ``example``) -- so every rank learns the sizes of the tensors it is about to
+    receive.
 
     Args:
         send: one carrier per destination rank; ``send[j]`` goes to rank ``j``.
+        example: template carrier for what this rank *receives*; its tensor count
+            fixes how many sizes to expect from each peer.
         pg_gloo: a gloo process group used only for the tiny size exchange.
         batch_id: identifier for this input batch, used only to tag the profiler
             ranges (``## input_size_dist batch{batch_id} ##``).
@@ -301,8 +305,7 @@ def input_size_dist(
         slot ``k`` of the carrier rank ``i`` is sending to this rank.
 
     Raises:
-        ValueError: if ``len(send)`` does not match the group size, or the carriers
-            do not all flatten to the same number of tensors.
+        ValueError: if ``len(send)`` does not match the group size.
     """
     world_size = dist.get_world_size(pg_gloo)
     if len(send) != world_size:
@@ -311,24 +314,28 @@ def input_size_dist(
             f"{world_size}"
         )
     flat_send: List[List[torch.Tensor]] = [flatten_to_tensors(item) for item in send]
-    num_tensors = len(flat_send[0])
-    for j, tensors in enumerate(flat_send):
-        if len(tensors) != num_tensors:
-            raise ValueError(
-                f"carriers must flatten to the same tensor count: send[0] has "
-                f"{num_tensors}, send[{j}] has {len(tensors)}"
-            )
+    # Every carrier this rank receives is built for this rank, so they all have the
+    # example's slot count -- the receive side stays rectangular even when the send
+    # side is ragged.
+    recv_slots = len(flatten_to_tensors(example))
 
     with record_function(f"## input_size_dist batch{batch_id} ##"):
         send_sizes = torch.tensor(
-            [[t.shape[0] for t in tensors] for tensors in flat_send],
+            [t.shape[0] for tensors in flat_send for t in tensors],
             dtype=torch.int64,
         )
-        recv_sizes = torch.empty_like(send_sizes)
+        in_splits = [len(tensors) for tensors in flat_send]
+        out_splits = [recv_slots] * world_size
+        recv_sizes = torch.empty(recv_slots * world_size, dtype=torch.int64)
         work = dist.all_to_all_single(
-            recv_sizes, send_sizes, group=pg_gloo, async_op=True
+            recv_sizes,
+            send_sizes,
+            out_splits,
+            in_splits,
+            group=pg_gloo,
+            async_op=True,
         )
-    return _InputSizeAwaitable(work, flat_send, recv_sizes, batch_id)
+    return _InputSizeAwaitable(work, flat_send, recv_sizes, recv_slots, batch_id)
 
 
 def input_data_dist(
@@ -363,10 +370,12 @@ def input_data_dist(
         the carrier received from rank ``i``.
     """
     world_size = len(flat_send)
-    num_tensors = len(flat_send[0])
     example_flat = flatten_to_tensors(example)
+    num_tensors = len(example_flat)
     # Per-slot layout from the example: elements per dim-0 row and the trailing shape
-    # (only dim-0 varies between carriers, so these are fixed per slot).
+    # (only dim-0 varies between carriers, so these are fixed per slot). This is the
+    # *receive* side, which is homogeneous -- every incoming carrier is built for
+    # this rank.
     row_elems = [math.prod(t.shape[1:]) for t in example_flat]
     trailing = [tuple(t.shape[1:]) for t in example_flat]
     # Bucket slots by dtype in first-seen order. The example is a shared template, so
@@ -374,6 +383,23 @@ def input_data_dist(
     buckets: Dict[torch.dtype, List[int]] = {}
     for k in range(num_tensors):
         buckets.setdefault(example_flat[k].dtype, []).append(k)
+
+    # The *send* side may be ragged: a carrier built for a destination with more
+    # layers has more slots than this rank's own example. So bucket each
+    # destination's slots by its own dtypes rather than reusing the example's slot
+    # indices, which describe a different carrier.
+    send_slots: List[Dict[torch.dtype, List[int]]] = []
+    for j in range(world_size):
+        by_dtype: Dict[torch.dtype, List[int]] = {}
+        for k, tensor in enumerate(flat_send[j]):
+            if tensor.dtype not in buckets:
+                raise ValueError(
+                    f"send[{j}] slot {k} has dtype {tensor.dtype}, which the example "
+                    "does not have; a carrier may differ from the example in slot "
+                    "count, not in the dtypes it carries"
+                )
+            by_dtype.setdefault(tensor.dtype, []).append(k)
+        send_slots.append(by_dtype)
 
     device = flat_send[0][0].device
     # pyre-ignore[33]: dist work handles have no public type
@@ -385,11 +411,22 @@ def input_data_dist(
         for dtype, slots in buckets.items():
             # Destination-major, then slot-major: chunk j (-> rank j) is this rank's
             # slots for j laid end to end; input_split_sizes marks the j boundaries.
+            # Each destination contributes its *own* slots of this dtype, in slot
+            # order -- which lines up with how that peer's example slices them out,
+            # since the carrier was built to its structure.
             in_splits = [
-                sum(flat_send[j][k].numel() for k in slots) for j in range(world_size)
+                sum(flat_send[j][k].numel() for k in send_slots[j].get(dtype, []))
+                for j in range(world_size)
             ]
-            in_buf = torch.cat(
-                [flat_send[j][k].reshape(-1) for j in range(world_size) for k in slots]
+            parts = [
+                flat_send[j][k].reshape(-1)
+                for j in range(world_size)
+                for k in send_slots[j].get(dtype, [])
+            ]
+            in_buf = (
+                torch.cat(parts)
+                if parts
+                else torch.empty(0, dtype=dtype, device=device)
             )
             out_splits = [
                 sum(recv_sizes[i][k] * row_elems[k] for k in slots)
@@ -450,5 +487,101 @@ def input_dist(
         A :class:`LazyAwaitable` whose ``wait()`` yields ``recv`` with ``recv[i]``
         the carrier received from rank ``i``.
     """
-    flat_send, recv_sizes = input_size_dist(send, pg_gloo, batch_id).wait()
+    flat_send, recv_sizes = input_size_dist(send, example, pg_gloo, batch_id).wait()
     return input_data_dist(flat_send, recv_sizes, example, pg_nccl, batch_id)
+
+
+class InputDistDriver(Generic[T]):
+    """Feeds a pipeline schedule with microbatches produced by :func:`input_dist`.
+
+    One :func:`input_dist` round over a cascade yields one carrier per stage --
+    i.e. as many microbatches as there are stages, all destined for the calling
+    rank. A schedule asks for ``n`` microbatches per pass, which need not match.
+    This buffers whole rounds in a FIFO and hands out ``n`` at a time,
+    decoupling the two:
+
+    * more microbatches than stages (8 wanted, 4 stages) -> 2 rounds per pass;
+    * fewer (8 wanted, 16 stages) -> one round every other pass, drained ``n``
+      at a time.
+
+    .. warning::
+        :func:`input_dist` is a collective over the cascade, so **every rank in
+        that cascade must run the same number of rounds**. The refill count here
+        is a deterministic function of ``(queue length, n)`` and the queue starts
+        empty everywhere, which is what keeps them in lock-step. Never make a
+        refill depend on rank-local data -- a stage that decides to fetch one
+        extra round hangs the whole cascade.
+
+    Args:
+        pg_gloo: group for the size-metadata exchange.
+        pg_nccl: group for the tensor-data exchange. Usually the same handle: a
+            group created on a ``cpu:gloo,cuda:nccl`` job dispatches by tensor
+            device, so one handle drives both phases.
+        self_index: this rank's own position in the cascade -- the entry it sends
+            to itself, used as the reconstruction template since everything it
+            receives has that same structure.
+
+    Example::
+
+        driver = InputDistDriver(pg, pg, self_index=stage_index)
+        microbatches = driver.take(lambda: send_set(next(dataloader_iter)), n=8)
+    """
+
+    def __init__(
+        self,
+        pg_gloo: dist.ProcessGroup,
+        pg_nccl: dist.ProcessGroup,
+        self_index: int,
+    ) -> None:
+        self._pg_gloo = pg_gloo
+        self._pg_nccl = pg_nccl
+        self._self_index = self_index
+        self._queue: Deque[T] = deque()
+        # Monotonic round counter, tagging the profiler ranges.
+        self._batch_id = 0
+
+    @property
+    def pending(self) -> int:
+        """Microbatches already received and not yet handed out."""
+        return len(self._queue)
+
+    def exchange(self, send: List[T]) -> LazyAwaitable[List[T]]:
+        """Run one all-to-all round, unwaited.
+
+        Args:
+            send: one carrier per rank of the cascade; ``send[j]`` goes to rank
+                ``j``.
+
+        Returns:
+            LazyAwaitable[List[T]]: ``wait()`` yields one carrier from each rank,
+            all destined here. Returned unwaited so the caller can overlap work.
+        """
+        batch_id = self._batch_id
+        self._batch_id += 1
+        return input_dist(
+            send,
+            send[self._self_index],
+            pg_gloo=self._pg_gloo,
+            pg_nccl=self._pg_nccl,
+            batch_id=batch_id,
+        )
+
+    def take(self, next_send: Callable[[], List[T]], n: int) -> List[T]:
+        """Hand out ``n`` microbatches, running whole rounds as needed.
+
+        Args:
+            next_send: produces one round's send set (one carrier per rank of the
+                cascade). Called once per round, and only when the queue runs
+                dry, so a caller reading a dataloader consumes exactly one batch
+                per round.
+            n: how many microbatches to return.
+
+        Returns:
+            List[T]: ``n`` carriers for this rank; the remainder of the last
+            round stays queued for the next call.
+        """
+        while len(self._queue) < n:
+            self._queue.extend(self.exchange(next_send()).wait())
+        # Oldest first: the remainder of the last round stays queued for the
+        # next call.
+        return [self._queue.popleft() for _ in range(n)]

@@ -16,6 +16,11 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torchrec.distributed.embedding_types import EmbeddingTableConfig
+from torchrec.distributed.maglev.module import (
+    ActivationSpec,
+    MaglevLayer,
+    MaglevModuleList,
+)
 from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.utils import CopyableMixin
 from torchrec.modules.activation import SwishLayerNorm
@@ -3122,8 +3127,8 @@ class MaglevScaledAdd(nn.Module):
     """Per-feature scaled residual sum ``a * (1 + alpha) + b * (1 + beta)``.
 
     Lightweight analogue of ``ScaledAdd`` in the Maglev reference
-    (legokit/backbones/maglev_prototype.py), used by :class:`MaglevTestStage` to
-    fold the previous stage's activation into the current stage.
+    (legokit/backbones/maglev_prototype.py), used by :class:`MaglevTestLayer` to
+    fold the previous layer's activation into the current layer.
 
     Args:
         dim: width of the per-element learned scales.
@@ -3153,32 +3158,37 @@ class MaglevScaledAdd(nn.Module):
         return a * (1 + self.alpha) + b * (1 + self.beta)
 
 
-class MaglevTestStage(nn.Module):
-    """One Maglev stage for tests and benchmarks.
+class MaglevTestLayer(MaglevLayer):
+    """One Maglev layer for tests and benchmarks.
 
-    A self-contained stage that owns its feature partition (sparse + dense) and
-    consumes a :class:`ModelInput`:
+    A self-contained :class:`~torchrec.distributed.maglev.module.MaglevLayer` that
+    owns its feature partition (sparse + dense) and consumes a
+    :class:`ModelInput`:
 
-    * ``ebc`` pools this stage's sparse features (``stage_input.idlist_features``)
-      into ``(B, sum(F_t * D_t))``; ``input_proj`` projects that to ``stage_dim``.
-      (Unsharded here; sharding within the HSD is a follow-up.)
-    * ``dense`` projects this stage's float features
-      (``stage_input.float_features``, ``(B, num_float_features)``) to
-      ``stage_dim`` and adds them in (disabled when ``num_float_features == 0``).
-    * non-first stages fold in the previous stage's activation via
+    * ``ebc`` pools this layer's sparse features (``layer_input.idlist_features``)
+      into ``(B, sum(F_t * D_t))``; ``input_proj`` projects that to ``layer_dim``.
+      (Unsharded here; sharding within the HSD is applied by
+      :class:`~torchrec.distributed.maglev.stage.EmbeddingShard`.)
+    * ``dense`` projects this layer's float features
+      (``layer_input.float_features``, ``(B, num_float_features)``) to
+      ``layer_dim`` and adds them in (disabled when ``num_float_features == 0``).
+    * non-first layers fold in the previous layer's activation via
       :class:`MaglevScaledAdd` (the Induct-style residual hand-off),
-    * ``block`` is the stage's dense compute.
+    * ``block`` is the layer's dense compute.
 
-    The first stage (``is_first=True``) takes no incoming activation. The output
-    is a ``(B, stage_dim)`` tensor -- the activation handed to the next stage.
+    The first layer (``is_first=True``) takes no incoming activation, i.e. its
+    :meth:`in_activation_specs` is empty. The output activation is a 1-tuple
+    holding a ``(batch_size, layer_dim)`` tensor.
 
     Args:
-        tables: this stage's embedding tables (its sparse feature partition).
-        stage_dim: width of the stage activation carried between stages.
-        is_first: whether this is the first stage (no incoming activation).
-        num_float_features: width of this stage's float feature input. 0 disables
+        tables: this layer's embedding tables (its sparse feature partition).
+        layer_dim: width of the activation carried between layers.
+        is_first: whether this is the first layer (no incoming activation).
+        batch_size: per-microbatch batch size ``B``; only used to declare the
+            activation specs.
+        num_float_features: width of this layer's float feature input. 0 disables
             the dense path.
-        device: device to build the stage on.
+        device: device to build the layer on.
 
     Example::
 
@@ -3186,59 +3196,114 @@ class MaglevTestStage(nn.Module):
 
         tables = [EmbeddingBagConfig(name="t", embedding_dim=8, num_embeddings=16,
                                      feature_names=["f"])]
-        stage = MaglevTestStage(tables, stage_dim=12, is_first=True, num_float_features=4)
+        layer = MaglevTestLayer(tables, layer_dim=12, is_first=True, batch_size=2,
+                                num_float_features=4)
         mi = ModelInput.generate(batch_size=2, tables=tables, weighted_tables=[],
                                  num_float_features=4)
-        out = stage(mi, None)
+        (out,) = layer(mi)
     """
 
     def __init__(
         self,
         tables: List[EmbeddingBagConfig],
-        stage_dim: int,
+        layer_dim: int,
         is_first: bool,
+        batch_size: int,
         num_float_features: int = 0,
         device: Optional[torch.device] = None,
     ) -> None:
         super().__init__()
         self.is_first = is_first
+        self._spec: ActivationSpec = ActivationSpec(
+            torch.Size([batch_size, layer_dim]), torch.float32
+        )
         self.ebc: EmbeddingBagCollection = EmbeddingBagCollection(
             tables=tables, device=device
         )
         in_dim = sum(t.embedding_dim * len(t.feature_names) for t in tables)
-        self.input_proj: nn.Linear = nn.Linear(in_dim, stage_dim, device=device)
+        self.input_proj: nn.Linear = nn.Linear(in_dim, layer_dim, device=device)
         self.dense: Optional[nn.Linear] = (
-            nn.Linear(num_float_features, stage_dim, device=device)
+            nn.Linear(num_float_features, layer_dim, device=device)
             if num_float_features > 0
             else None
         )
         self.scaled_add: Optional[MaglevScaledAdd] = (
-            None if is_first else MaglevScaledAdd(stage_dim, device=device)
+            None if is_first else MaglevScaledAdd(layer_dim, device=device)
         )
-        self.block: nn.Linear = nn.Linear(stage_dim, stage_dim, device=device)
+        self.block: nn.Linear = nn.Linear(layer_dim, layer_dim, device=device)
+
+    def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        """``()`` for the first layer, else the ``(B, layer_dim)`` residual input."""
+        return () if self.is_first else (self._spec,)
+
+    def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        """The ``(B, layer_dim)`` activation handed to the next layer."""
+        return (self._spec,)
 
     def forward(
         self,
-        stage_input: "ModelInput",
-        prev_output: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        """Run this stage over its ``ModelInput`` and the previous activation.
+        layer_input: "ModelInput",
+        in_activations: Tuple[torch.Tensor, ...] = (),
+    ) -> Tuple[torch.Tensor, ...]:
+        """Run this layer over its ``ModelInput`` and the previous activation.
 
         Args:
-            stage_input: this stage's ``ModelInput`` (float + sparse features).
-            prev_output: the previous stage's ``(B, stage_dim)`` activation, or
-                ``None`` for the first stage.
+            layer_input: this layer's ``ModelInput`` (float + sparse features).
+            in_activations: 1-tuple holding the previous layer's
+                ``(B, layer_dim)`` activation, or ``()`` for the first layer.
 
         Returns:
-            torch.Tensor: this stage's ``(B, stage_dim)`` output activation.
+            Tuple[torch.Tensor, ...]: 1-tuple holding this layer's
+            ``(B, layer_dim)`` output activation.
         """
-        kjt = stage_input.idlist_features
+        kjt = layer_input.idlist_features
         assert isinstance(kjt, KeyedJaggedTensor)
         pooled = self.ebc(kjt).values()  # (B, in_dim)
-        x = self.input_proj(pooled)  # (B, stage_dim)
+        x = self.input_proj(pooled)  # (B, layer_dim)
         if self.dense is not None:
-            x = x + self.dense(stage_input.float_features)  # add dense features
+            x = x + self.dense(layer_input.float_features)  # add dense features
         if not self.is_first:
-            assert prev_output is not None and self.scaled_add is not None
-            x = self.scaled_add(prev_output, x)
-        return torch.relu(self.block(x))
+            assert len(in_activations) == 1 and self.scaled_add is not None
+            x = self.scaled_add(in_activations[0], x)
+        return (torch.relu(self.block(x)),)
+
+
+class MaglevTestModel(MaglevModuleList):
+    """A Maglev model of :class:`MaglevTestLayer` s, closed with a head and loss.
+
+    Supplies the :meth:`~torchrec.distributed.maglev.module.MaglevModuleList.postproc`
+    the base class leaves abstract: the last layer's ``(B, layer_dim)`` activation
+    is summed to a ``(B,)`` prediction and scored against ``ModelInput.label``
+    with MSE, so the model returns the usual ``(losses, output)`` pair.
+
+    Shared by the Maglev correctness test and benchmark, which is what makes the
+    standalone and pipelined runs comparable: both end in this same head.
+
+    Args:
+        layers: the model's layers, in execution order.
+
+    Example::
+
+        model = MaglevTestModel([layer0, layer1])
+        losses, output = model([layer_input0, layer_input1])
+    """
+
+    def postproc(
+        self,
+        activations: Tuple[torch.Tensor, ...],
+        layer_input: "ModelInput",
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Score the final activation against the last layer's label.
+
+        Args:
+            activations: 1-tuple holding the last layer's ``(B, layer_dim)``
+                activation.
+            layer_input: the last layer's ``ModelInput``, carrying ``label``.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: ``(losses, output)`` -- a scalar
+            MSE and the ``(B,)`` prediction.
+        """
+        output = activations[0].sum(dim=1)  # (B, layer_dim) -> (B,)
+        losses = torch.nn.functional.mse_loss(output, layer_input.label)
+        return losses, output
