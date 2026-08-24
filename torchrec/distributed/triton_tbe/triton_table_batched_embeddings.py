@@ -38,17 +38,16 @@ try:
 except ImportError:
     has_tlx = False
 
+from torchrec.distributed.triton_tbe.triton_tbe_backward_config import (
+    resolve_backward_config,
+)
 from torchrec.distributed.triton_tbe.triton_tbe_backward_long_run_fused import (
     triton_tbe_backward_long_run_fused_unweighted,
     triton_tbe_backward_long_run_fused_weighted,
 )
 from torchrec.distributed.triton_tbe.triton_tbe_backward_utils import (
-    _CLC_FIXED_GRID,
     _expand_long_runs,
-    _FIXED_GRID,
-    _LONG_RUN_THRESHOLD,
     _stochastic_rounding_store,
-    get_grid_size,
     OPTIM_TYPE_TO_INT,
 )
 
@@ -815,10 +814,12 @@ def triton_tbe_backward_short_run_unweighted(
     STOCHASTIC_ROUNDING: tl.constexpr,
     stochastic_rounding_seed,
     vbe: tl.constexpr = False,
+    BUFFER_SIZE: tl.constexpr = 8,
 ) -> None:
     """Backward kernel for short runs only. Each program handles one short run."""
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    buffer_size: tl.constexpr = 8
+    # Gather width, tuned per target in TbeBackwardConfig.
+    buffer_size: tl.constexpr = BUFFER_SIZE
     buffer_offsets = tl.arange(0, buffer_size)
 
     if USE_CLC:
@@ -1005,10 +1006,12 @@ def triton_tbe_backward_short_run_weighted(
     STOCHASTIC_ROUNDING: tl.constexpr,
     stochastic_rounding_seed,
     vbe: tl.constexpr = False,
+    BUFFER_SIZE: tl.constexpr = 16,
 ) -> None:
     """Backward kernel for short runs only (weighted). Each program handles one short run."""
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    buffer_size: tl.constexpr = 16
+    # Gather width, tuned per target in TbeBackwardConfig.
+    buffer_size: tl.constexpr = BUFFER_SIZE
     buffer_offsets = tl.arange(0, buffer_size)
 
     if USE_CLC:
@@ -2152,34 +2155,26 @@ class TritonTBE(torch.autograd.Function):
         else:
             sorted_per_sample_weights = torch.empty(0, device=weight.device)
 
-        num_warps = 1
+        cfg = resolve_backward_config(weight.device)
+        num_warps = cfg.num_warps
 
-        use_clc = False
-        if has_tlx:
-            if torch.cuda.get_device_capability()[0] >= 10:
-                use_clc = True
+        # CLC is an additive Blackwell feature and is deliberately decoupled
+        # from grid sizing, so a target without it still gets the same grid
+        # rather than being silently penalised for lacking the add-on.
+        use_clc = has_tlx and cfg.allow_clc
 
         # Common setup for 2-tier dispatch (both weighted and unweighted)
         max_num_runs = indices.numel()
-        max_long_runs = max_num_runs // _LONG_RUN_THRESHOLD + 1
-        max_long_run_programs = 2 * max_num_runs // _LONG_RUN_THRESHOLD + 1
-        # Fixed grid sizes: work distribution while-loops handle
-        # any num_short_runs / num_long_run_programs value.
-        # Using 24576 matching the theoretical prediction (192 SMs * 32 warps/SM * 4 waves).
-        # Below 24576, performance drops because there aren't enough programs to keep all
-        # SMs busy. Above it, diminishing returns from scheduling overhead of excess programs.
-
-        # NVIDIA: 192 SMs * 32 warps/SM * 4 waves
-        # AMD: 256 CUs * 64 warps/CU * 4 waves
-        short_run_grid_size, long_accum_or_fused_grid_size, long_apply_grid_size = (
-            get_grid_size(
-                is_amd=is_amd(),
-                max_num_runs=max_num_runs,
-                max_long_runs=max_long_runs,
-                max_long_run_programs=max_long_run_programs,
-                use_clc=use_clc,
-            )
+        max_long_runs = max_num_runs // cfg.long_run_threshold + 1
+        max_long_run_programs = 2 * max_num_runs // cfg.long_run_threshold + 1
+        # The work-distribution while-loops handle any num_short_runs /
+        # num_long_run_programs value, so these grids are pure throughput knobs.
+        short_run_grid_size = min(cfg.short_run_programs, max_num_runs)
+        long_accum_or_fused_grid_size = min(
+            cfg.long_run_fused_programs if use_clc else cfg.long_run_accum_programs,
+            max_long_run_programs,
         )
+        long_apply_grid_size = max_long_runs
 
         if is_amd():
             (
@@ -2213,6 +2208,7 @@ class TritonTBE(torch.autograd.Function):
                 sorted_linear_indices_cumulative_run_lengths,
                 sorted_linear_indices_num_runs,
                 max_num_runs,
+                max_sl_per_program=cfg.long_run_threshold,
             )
 
         temp_grad_buffer = torch.zeros(
@@ -2263,9 +2259,11 @@ class TritonTBE(torch.autograd.Function):
                 STOCHASTIC_ROUNDING=stochastic_rounding,
                 stochastic_rounding_seed=stochastic_rounding_seed,
                 vbe=vbe,
+                BUFFER_SIZE=cfg.short_run_buffer_size_weighted,
             )
             use_fused_clc_long_run = (
-                use_clc and max_num_runs > _CLC_FIXED_GRID * _LONG_RUN_THRESHOLD
+                use_clc
+                and max_num_runs > cfg.long_run_fused_programs * cfg.long_run_threshold
             )
             if use_fused_clc_long_run:
                 # CLC path: fused long-run grad accumulation + optimizer apply
@@ -2311,10 +2309,8 @@ class TritonTBE(torch.autograd.Function):
             else:
                 # Non-CLC path: separate grad accumulation + apply kernels
                 # Kernel 2: long-run grad accumulation (weighted)
-                long_accum_grid_size = (
-                    min(_FIXED_GRID, max_long_run_programs)
-                    if use_clc
-                    else long_accum_or_fused_grid_size
+                long_accum_grid_size = min(
+                    cfg.long_run_accum_programs, max_long_run_programs
                 )
                 bwd_long_accum_w = (
                     _amd_bwd_long_accum_weighted
@@ -2409,9 +2405,11 @@ class TritonTBE(torch.autograd.Function):
                 STOCHASTIC_ROUNDING=stochastic_rounding,
                 stochastic_rounding_seed=stochastic_rounding_seed,
                 vbe=vbe,
+                BUFFER_SIZE=cfg.short_run_buffer_size_unweighted,
             )
             use_fused_clc_long_run = (
-                use_clc and max_num_runs > _CLC_FIXED_GRID * _LONG_RUN_THRESHOLD
+                use_clc
+                and max_num_runs > cfg.long_run_fused_programs * cfg.long_run_threshold
             )
             if use_fused_clc_long_run:
                 # CLC path: fused long-run grad accumulation + optimizer apply
@@ -2456,10 +2454,8 @@ class TritonTBE(torch.autograd.Function):
             else:
                 # Non-CLC path: separate grad accumulation + apply kernels
                 # Kernel 2: long-run grad accumulation
-                long_accum_grid_size = (
-                    min(_FIXED_GRID, max_long_run_programs)
-                    if use_clc
-                    else long_accum_or_fused_grid_size
+                long_accum_grid_size = min(
+                    cfg.long_run_accum_programs, max_long_run_programs
                 )
                 bwd_long_accum_uw = (
                     _amd_bwd_long_accum_unweighted
