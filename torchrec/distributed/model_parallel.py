@@ -1146,6 +1146,9 @@ class DMPCollection(DistributedModelParallel):
         self._pg: dist.ProcessGroup = global_pg
         self._global_rank: int = dist.get_rank(global_pg)
         self._custom_all_reduce = custom_all_reduce
+        self._all_reduce_hook: Optional[
+            Callable[[dist.ProcessGroup, List[torch.Tensor]], None]
+        ] = None
 
         if sharders is None:
             sharders = get_default_sharders()
@@ -1562,7 +1565,7 @@ class DMPCollection(DistributedModelParallel):
         self._restore_stashed_sync_tensors(ctx, include_optimizer_state)
 
         opts = None
-        if self._custom_all_reduce is None:
+        if self._custom_all_reduce is None and self._all_reduce_hook is None:
             opts = dist.AllreduceCoalescedOptions()
             opts.reduceOp = dist.ReduceOp.AVG
 
@@ -1614,8 +1617,15 @@ class DMPCollection(DistributedModelParallel):
             )
             return
 
+        all_reduce_hook = self._all_reduce_hook
         custom_all_reduce = self._custom_all_reduce
-        if custom_all_reduce is not None:
+        if all_reduce_hook is not None:
+
+            def _all_reduce(tensors: List[torch.Tensor]) -> None:
+                with record_function(f"{annotation}_custom_hook"):
+                    all_reduce_hook(ctx.replica_pg, tensors)
+
+        elif custom_all_reduce is not None:
             # Custom all reduce hook
             def _all_reduce(tensors: List[torch.Tensor]) -> None:
                 with record_function(f"{annotation}_custom_hook"):
@@ -1632,23 +1642,24 @@ class DMPCollection(DistributedModelParallel):
 
     def set_all_reduce_hook(
         self,
-        reduce_hook: Callable[[List[torch.Tensor]], None],
+        reduce_hook: Callable[[dist.ProcessGroup, List[torch.Tensor]], None],
     ) -> None:
         """
-        Replace default all reduce with custom callable. Users can alternatively
-        pass in the custom all reduce function through the constructor. The hook
-        expects the user to handle distributed communication call, associated
-        process group, and stream synchronization.
+        Replace the default all reduce with a process-group-aware callable.
+        The hook must handle the distributed communication call and stream
+        synchronization.
 
         Args:
-            reduce_hook (Callable[[List[torch.Tensor]], torch.Tensor]): The custom all reduce function to use for
-                embedding weights and optimizer states
+            reduce_hook: Custom all reduce function for embedding weights and
+                optimizer states. It receives the replication process group and
+                tensors for the current DMP collection context.
         """
-        if self._custom_all_reduce is not None:
+        if self._custom_all_reduce is not None or self._all_reduce_hook is not None:
             logger.warning(
                 "[TorchRec 2D Parallel] Custom all reduce function already defined, overriding with new callable"
             )
-        self._custom_all_reduce = reduce_hook
+        self._custom_all_reduce = None
+        self._all_reduce_hook = reduce_hook
 
     def ensure_reduce_scatter_complete(self) -> None:
         """
