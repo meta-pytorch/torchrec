@@ -16,12 +16,6 @@ OPTIM_TYPE_TO_INT: dict[OptimType, int] = {
     OptimType.EXACT_SGD: 0,
     OptimType.EXACT_ROWWISE_ADAGRAD: 1,
 }
-from ads_mkl.ops.triton.amd.triton_table_batched_embeddings import (
-    _FIXED_GRID as _AMD_FIXED_GRID,
-)
-
-_FIXED_GRID = 24576
-_CLC_FIXED_GRID = 32 * 24576
 
 
 @triton.jit
@@ -244,35 +238,4 @@ def _expand_long_runs(
         long_run_grad_buffer_ids,
         long_run_original_ids,
         programs_per_long_run.to(torch.int32),
-    )
-
-
-def get_grid_size(
-    is_amd: bool,
-    max_num_runs: int,
-    max_long_runs: int,
-    max_long_run_programs: int,
-    use_clc: bool,
-) -> Tuple[int, int, int]:
-    """
-    Get grid size for Triton TBE kernels.
-    """
-    if is_amd:
-        return (
-            min(_AMD_FIXED_GRID, max_num_runs),
-            min(_AMD_FIXED_GRID, max_long_run_programs),
-            max_long_runs,
-        )
-
-    if use_clc:
-        return (
-            min(_CLC_FIXED_GRID, max_num_runs),
-            min(_CLC_FIXED_GRID, max_long_run_programs),
-            max_long_runs,  # Will not be used.
-        )
-
-    return (
-        min(_FIXED_GRID, max_num_runs),
-        min(_FIXED_GRID, max_long_run_programs),
-        max_long_runs,
     )
