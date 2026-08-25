@@ -170,6 +170,8 @@ MODEL_METRIC_LABEL: str = "model"
 
 
 MetricValue = Union[torch.Tensor, float]
+MetricState = Union[torch.Tensor, List[torch.Tensor]]
+PreComputeStates = Dict[str, Dict[str, Dict[str, MetricState]]]
 MetricsResult = Dict[str, MetricValue]
 # pyrefly: ignore[implicit-import]
 MetricsFuture = concurrent.futures.Future[MetricsResult]
@@ -546,9 +548,37 @@ class RecMetricModule(nn.Module):
 
         return result
 
+    def _get_rec_metric_states(
+        self, pg: Optional[Union[dist.ProcessGroup, DeviceMesh]] = None
+    ) -> PreComputeStates:
+        pg = pg if pg is not None else dist.group.WORLD
+        process_group: dist.ProcessGroup = (
+            # pyrefly: ignore[bad-assignment]
+            pg.get_group(mesh_dim="shard")
+            if isinstance(pg, DeviceMesh)
+            else pg
+        )
+
+        aggregated_states: PreComputeStates = {}
+        world_size = dist.get_world_size(
+            process_group
+        )  # Under 2D parallel context, this should be sharding world size
+
+        for metric in self.rec_metrics.rec_metrics:
+            #  `value`.
+            # pyrefly: ignore[missing-attribute]
+            aggregated_states[metric._namespace.value] = self._get_metric_states(
+                # pyrefly: ignore[bad-argument-type]
+                metric,
+                world_size,
+                process_group,
+            )
+
+        return aggregated_states
+
     def get_pre_compute_states(
         self, pg: Optional[Union[dist.ProcessGroup, DeviceMesh]] = None
-    ) -> Dict[str, Dict[str, Dict[str, Union[torch.Tensor, List[torch.Tensor]]]]]:
+    ) -> PreComputeStates:
         """
         This function returns the states per rank for each metric to be saved. The states are are aggregated by the state defined reduction_function.
         This can be optionall disabled by setting ``reduce_metrics`` to False. The output on each rank is identical.
@@ -568,28 +598,7 @@ class RecMetricModule(nn.Module):
         Returns:
             Dict[str, Dict[str, Dict[str, torch.Tensor]]]: the states for each metric to be saved
         """
-        pg = pg if pg is not None else dist.group.WORLD
-        process_group: dist.ProcessGroup = (
-            # pyrefly: ignore[bad-assignment]
-            pg.get_group(mesh_dim="shard")
-            if isinstance(pg, DeviceMesh)
-            else pg
-        )
-
-        aggregated_states = {}
-        world_size = dist.get_world_size(
-            process_group
-        )  # Under 2D parallel context, this should be sharding world size
-
-        for metric in self.rec_metrics.rec_metrics:
-            #  `value`.
-            # pyrefly: ignore[missing-attribute]
-            aggregated_states[metric._namespace.value] = self._get_metric_states(
-                # pyrefly: ignore[bad-argument-type]
-                metric,
-                world_size,
-                process_group,
-            )
+        aggregated_states = self._get_rec_metric_states(pg)
 
         # throughput metric requires special handling, since it's not a RecMetric
         throughput_metric = self.throughput_metric
@@ -602,22 +611,7 @@ class RecMetricModule(nn.Module):
 
         return aggregated_states
 
-    def load_pre_compute_states(
-        self,
-        source: Dict[
-            str, Dict[str, Dict[str, Union[torch.Tensor, List[torch.Tensor]]]]
-        ],
-    ) -> None:
-        """
-        Load states from ``get_pre_compute_states``. This is called on every rank, no collectives are called in this function.
-
-        Args:
-            source (Dict[str, Dict[str, Union[torch.Tensor, List[torch.Tensor]]]]): the source states to load from. This
-                is the output of ``get_pre_compute_states``.
-
-        Returns:
-            None
-        """
+    def _load_rec_metric_states(self, source: PreComputeStates) -> None:
         for metric in self.rec_metrics.rec_metrics:
             #  `value`.
             # pyrefly: ignore[missing-attribute]
@@ -635,6 +629,18 @@ class RecMetricModule(nn.Module):
                 state = states[task.name]
                 for attr, tensor in state.items():
                     setattr(metric_computation, attr, tensor)
+
+    def load_pre_compute_states(self, source: PreComputeStates) -> None:
+        """
+        Load states from ``get_pre_compute_states``. This is called on every rank, no collectives are called in this function.
+
+        Args:
+            source (PreComputeStates): the source states to load from. This is the output of ``get_pre_compute_states``.
+
+        Returns:
+            None
+        """
+        self._load_rec_metric_states(source)
 
         if self.throughput_metric is not None:
             # pyrefly: ignore[bad-index]
