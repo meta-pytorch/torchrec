@@ -28,6 +28,7 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingTable,
 )
 from torchrec.distributed.test_utils.test_model import ModelInput
+from torchrec.experimental.torch_tpu.modules.embedding_modules import PooledLookupKernel
 from torchrec.modules.embedding_configs import (
     DataType,
     EmbeddingBagConfig,
@@ -110,7 +111,9 @@ def grouped_config(collection: str, configs: List[Any]) -> GroupedEmbeddingConfi
 
 
 def make_modules(
-    collection: str, configs: List[Any]
+    collection: str,
+    configs: List[Any],
+    pooled_kernel: PooledLookupKernel,
 ) -> Tuple[torch.nn.Module, torch.nn.Module]:
     config = grouped_config(collection, configs)
     if collection == "ec":
@@ -120,7 +123,11 @@ def make_modules(
         )
     return (
         EmbeddingBagCollection(tables=configs, device=torch.device("cpu")),
-        BatchedTPUEmbeddingBag(config=config, device=torch.device("tpu")),
+        BatchedTPUEmbeddingBag(
+            config=config,
+            device=torch.device("tpu"),
+            pooled_lookup_kernel=pooled_kernel,
+        ),
     )
 
 
@@ -181,9 +188,9 @@ def generate_input(configs: List[Any], batch_size: int) -> KeyedJaggedTensor:
     return kjt
 
 
-def run_accuracy(collection: str) -> None:
+def run_accuracy(collection: str, pooled_kernel: PooledLookupKernel) -> None:
     configs = make_configs(collection, 32)
-    cpu_collection, tpu_kernel = make_modules(collection, configs)
+    cpu_collection, tpu_kernel = make_modules(collection, configs, pooled_kernel)
     with torch.no_grad():
         copy_weights(collection, cpu_collection, tpu_kernel, configs)
         for batch_size in BATCH_SIZES:
@@ -196,18 +203,23 @@ def run_accuracy(collection: str) -> None:
             error = (expected - actual).abs()
             assert torch.allclose(expected, actual, atol=1e-5)
             print(
-                f"accuracy collection={collection} batch_size={batch_size}: "
-                f"shape={tuple(actual.shape)}, max_abs_diff={error.max().item():.3e}"
+                f"accuracy collection={collection} kernel={pooled_kernel.value} "
+                f"batch_size={batch_size}: shape={tuple(actual.shape)}, "
+                f"max_abs_diff={error.max().item():.3e}"
             )
 
 
-def run_profile(collection: str, traces_dir: Optional[str]) -> None:
+def run_profile(
+    collection: str,
+    pooled_kernel: PooledLookupKernel,
+    traces_dir: Optional[str],
+) -> None:
     if traces_dir is None:
         print("\nTRACE_DIR unset, skipping the profiled step")
         return
 
     configs = make_configs(collection, 32)
-    _, tpu_kernel = make_modules(collection, configs)
+    _, tpu_kernel = make_modules(collection, configs, pooled_kernel)
     print(f"Profiler start, traces written to {traces_dir}")
     tpu_result: torch.Tensor | None = None
     with torch.no_grad(), profiler.profile(
@@ -226,15 +238,20 @@ def run_profile(collection: str, traces_dir: Optional[str]) -> None:
     print("Profiled TPU output shape:", tuple(tpu_result.shape))
 
 
-def run_benchmark(collection: str, lookup_mode: str, embedding_dims: List[int]) -> None:
+def run_benchmark(
+    collection: str,
+    kernel_name: str,
+    embedding_dims: List[int],
+    pooled_kernel: PooledLookupKernel,
+) -> None:
     print(
-        f"\n========== Benchmark: collection={collection}, kernel={lookup_mode}, "
+        f"\n========== Benchmark: collection={collection}, kernel={kernel_name}, "
         f"iters={BENCHMARK_TIMES} =========="
     )
     results = []
     for dim in embedding_dims:
         configs = make_configs(collection, dim)
-        cpu_collection, tpu_kernel = make_modules(collection, configs)
+        cpu_collection, tpu_kernel = make_modules(collection, configs, pooled_kernel)
         kjt = generate_input(configs, BENCH_BATCH_SIZE)
         kjt_tpu = to_tpu(kjt)
 
@@ -260,12 +277,12 @@ def run_benchmark(collection: str, lookup_mode: str, embedding_dims: List[int]) 
         cpu_ms = sum(cpu_times) / len(cpu_times) * 1000
         results.append((dim, tpu_ms, cpu_ms))
         print(
-            f"  dim={dim}: TPU({lookup_mode})={tpu_ms:.2f} ms, "
+            f"  dim={dim}: TPU({kernel_name})={tpu_ms:.2f} ms, "
             f"CPU={cpu_ms:.2f} ms, speedup={cpu_ms / tpu_ms:.2f}x"
         )
 
     print(
-        f"\n=== Summary: collection={collection}, kernel={lookup_mode}, "
+        f"\n=== Summary: collection={collection}, kernel={kernel_name}, "
         f"iters={BENCHMARK_TIMES} ==="
     )
     print(f"{'dim':>6} {'TPU (ms)':>12} {'CPU (ms)':>12} {'speedup':>10}")
@@ -279,13 +296,19 @@ def main() -> None:
         "--lookup-mode",
         default=os.environ.get("LOOKUP_MODE", "v1_sc"),
         choices=["v1_tpu", "v1_sc"],
-        help="Embedding lookup kernel to use (default from $LOOKUP_MODE or v1_sc).",
+        help="Unpooled embedding kernel (default from $LOOKUP_MODE or v1_sc).",
     )
     parser.add_argument(
         "--collection",
         choices=["ec", "ebc"],
         default="ec",
         help="Benchmark EmbeddingCollection or EmbeddingBagCollection.",
+    )
+    parser.add_argument(
+        "--pooled-kernel",
+        choices=[kernel.value for kernel in PooledLookupKernel],
+        default=PooledLookupKernel.OFFSET.value,
+        help="Pooled EBC kernel to benchmark; ignored for EC.",
     )
     parser.add_argument(
         "--embedding-dim",
@@ -305,12 +328,14 @@ def main() -> None:
     embedding_dims = (
         [args.embedding_dim] if args.embedding_dim is not None else EMBEDDING_DIMS
     )
-    print(f"LOOKUP_MODE={lookup_mode}, collection={collection}")
+    pooled_kernel = PooledLookupKernel(args.pooled_kernel)
+    kernel_name = pooled_kernel.value if collection == "ebc" else lookup_mode
+    print(f"kernel={kernel_name}, collection={collection}")
     if not args.skip_accuracy:
-        run_accuracy(collection)
+        run_accuracy(collection, pooled_kernel)
     if not args.skip_profile:
-        run_profile(collection, os.environ.get("TRACE_DIR"))
-    run_benchmark(collection, lookup_mode, embedding_dims)
+        run_profile(collection, pooled_kernel, os.environ.get("TRACE_DIR"))
+    run_benchmark(collection, kernel_name, embedding_dims, pooled_kernel)
 
 
 if __name__ == "__main__":

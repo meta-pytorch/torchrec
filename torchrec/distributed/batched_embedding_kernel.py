@@ -130,6 +130,7 @@ if TYPE_CHECKING:
         TritonTableBatchedEmbeddingBags,
     )
     from torchrec.experimental.torch_tpu.modules.embedding_modules import (
+        PooledLookupKernel,
         TPUEmbeddingBagUnfused,
         TPUEmbeddingUnfused,
     )
@@ -4818,6 +4819,7 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
         pg (Optional[dist.ProcessGroup]): process group (unused locally).
         device (Optional[torch.device]): compute device (e.g. ``"tpu"``).
         sharding_type (Optional[ShardingType]): sharding type (for the pooling mode).
+        pooled_lookup_kernel: Pallas pooled lookup implementation.
 
     Example::
 
@@ -4831,11 +4833,16 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
         pg: Optional[dist.ProcessGroup] = None,
         device: Optional[torch.device] = None,
         sharding_type: Optional[ShardingType] = None,
+        pooled_lookup_kernel: Optional["PooledLookupKernel"] = None,
     ) -> None:
         # Lazy import to avoid pulling in experimental TPU code at module load time.
         from torchrec.experimental.torch_tpu.modules.embedding_modules import (
+            PooledLookupKernel,
             TPUEmbeddingBagUnfused,
         )
+
+        if pooled_lookup_kernel is None:
+            pooled_lookup_kernel = PooledLookupKernel.OFFSET
 
         super().__init__(config, pg, device, sharding_type)
         dtype = data_type_to_sparse_type(config.data_type).as_dtype()
@@ -4849,6 +4856,7 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
                     device=device,
                     dtype=dtype,
                     mode="mean" if self._pooling == PoolingMode.MEAN else "sum",
+                    kernel=pooled_lookup_kernel,
                 )
             )
         self.init_parameters()
