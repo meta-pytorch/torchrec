@@ -55,6 +55,8 @@ def invoke_on_rank_and_broadcast_result(
     Invokes a function on the designated rank and broadcasts the result to all
     members within the group.
 
+    ``rank`` is a rank within ``pg``, not a global rank.
+
     Example::
 
         id = invoke_on_rank_and_broadcast_result(pg, 0, allocate_id)
@@ -66,7 +68,10 @@ def invoke_on_rank_and_broadcast_result(
     else:
         object_list = [None]
     if pg.size() > 1:
-        dist.broadcast_object_list(object_list, rank, group=pg)
+        # broadcast_object_list's positional `src` is a global rank, while the
+        # leader above is picked with pg.rank(). Pass group_src so both halves
+        # use group-local numbering; they only coincide for the default group.
+        dist.broadcast_object_list(object_list, group_src=rank, group=pg)
     return cast(T, object_list[0])
 
 
@@ -180,7 +185,10 @@ def create_on_rank_and_share_result(
         object_list = [None]
 
     if pg.size() > 1:
-        dist.broadcast_object_list(object_list, rank, group=pg)
+        # group_src, not src: `rank` is group-local here too. This matters more
+        # for this helper, whose intended intra-node groups exclude global rank
+        # 0 on every host but the first.
+        dist.broadcast_object_list(object_list, group_src=rank, group=pg)
 
     if res is not None:
         return res
