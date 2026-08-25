@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import contextlib
 import itertools
 import random
 import unittest
@@ -22,12 +23,13 @@ from typing import (
     TypeVar,
     Union,
 )
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import hypothesis.strategies as st
 import torch
 import torch.distributed as dist
 import torchrec.distributed.collective_utils as cu
+import torchrec.distributed.embedding_sharding as embedding_sharding
 from hypothesis import given, settings
 from pyre_extensions import none_throws
 from torchrec.distributed._collective_tag import _collective_tag_from
@@ -58,7 +60,12 @@ from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
     MultiProcessTestBase,
 )
-from torchrec.distributed.types import Awaitable, NullShardingContext
+from torchrec.distributed.types import (
+    Awaitable,
+    EmbeddingEvent,
+    NoWait,
+    NullShardingContext,
+)
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
@@ -2440,3 +2447,127 @@ class CheckPgForNcclErrorTest(unittest.TestCase):
 
         self.assertIsNone(_check_pg_for_nccl_error(pg))
         pg._get_backend.assert_called_once()
+
+
+class FusedKJTListSplitsAwaitableAnnotationTest(unittest.TestCase):
+    def _meta(self, label: str) -> KJTSplitsAllToAllMeta:
+        kjt = KeyedJaggedTensor(
+            keys=["f0"],
+            values=torch.tensor([1, 2], dtype=torch.int64),
+            lengths=torch.tensor([1, 1], dtype=torch.int64),
+        )
+        return KJTSplitsAllToAllMeta(
+            pg=None,  # pyre-ignore[6] - not dispatched in this test
+            _input=kjt,
+            splits=[1],
+            splits_tensors=[torch.tensor([1], dtype=torch.int64)],
+            input_splits=[[1]],
+            input_tensors=[kjt.lengths()],
+            labels=[label],
+            keys=["f0"],
+            device=torch.device("cpu"),
+            stagger=1,
+        )
+
+    def _request(
+        self,
+        fqn: Optional[str],
+        sharding_types: Optional[List[str]],
+        nowait_first: bool = False,
+    ) -> KJTListSplitsAwaitable[NullShardingContext]:
+        count = len(sharding_types) if sharding_types else 1
+        entries: List[object] = [self._meta(f"t{i}") for i in range(count)]
+        if nowait_first:
+            entries[0] = NoWait("nowait")
+        return KJTListSplitsAwaitable(
+            awaitables=cast(
+                List[Awaitable[Awaitable[KeyedJaggedTensor]]],
+                entries,
+            ),
+            ctx=NullShardingContext(),
+            module_fqn=fqn,
+            sharding_types=sharding_types,
+        )
+
+    def _fuse(
+        self, *requests: KJTListSplitsAwaitable[NullShardingContext]
+    ) -> FusedKJTListSplitsAwaitable:
+        return FusedKJTListSplitsAwaitable(
+            requests=list(requests), contexts=[r.ctx for r in requests], pg=None
+        )
+
+    def test_labels_align_with_flattened_awaitables(self) -> None:
+        fused = self._fuse(
+            self._request("mod_a", ["row_wise", "table_row_wise"]),
+            self._request("mod_b", ["data_parallel"]),
+        )
+        self.assertEqual(len(fused._annotation_labels), len(fused._awaitables))
+        self.assertEqual(
+            fused._annotation_labels,
+            [
+                ("mod_a", "row_wise"),
+                ("mod_a", "table_row_wise"),
+                ("mod_b", "data_parallel"),
+            ],
+        )
+
+    def test_unlabelled_request_yields_none_so_annotation_is_skipped(self) -> None:
+        fused = self._fuse(self._request(None, None))
+        self.assertEqual(fused._annotation_labels, [(None, None)])
+
+    def test_module_fqn_without_sharding_types_still_skips_annotation(self) -> None:
+        self.assertEqual(
+            self._fuse(self._request("mod_a", None))._annotation_labels,
+            [("mod_a", None)],
+        )
+        self.assertEqual(
+            self._fuse(self._request(None, ["row_wise"]))._annotation_labels,
+            [(None, "row_wise")],
+        )
+
+    def test_no_requests(self) -> None:
+        self.assertEqual(self._fuse()._annotation_labels, [])
+
+    def test_wait_impl_annotates_each_awaitable_with_its_own_label(self) -> None:
+        fused = self._fuse(
+            self._request("mod_a", ["row_wise", "table_row_wise"], nowait_first=True),
+            self._request("mod_b", ["data_parallel"]),
+        )
+        # `pg=None` leaves this unset, so `_wait_impl` would take the no-splits path.
+        splits_awaitable = MagicMock()
+        splits_awaitable.wait.return_value = [[4], [4]]
+        fused._splits_awaitable = splits_awaitable
+
+        # Recording enter/construct/exit rather than just call args is what pins the
+        # AlltoAll as being *inside* the annotation; asserting on arguments alone still
+        # passes if the `with` is dropped.
+        events: List[Tuple[object, ...]] = []
+
+        @contextlib.contextmanager
+        def fake_annotate(
+            event: EmbeddingEvent, fqn: Optional[str], sharding_type: Optional[str]
+        ) -> Generator[None, None, None]:
+            events.append(("enter", event, fqn, sharding_type))
+            yield
+            events.append(("exit",))
+
+        with patch.object(
+            embedding_sharding,
+            "KJTAllToAllTensorsAwaitable",
+            side_effect=lambda **kwargs: events.append(("construct",)),
+        ), patch.object(
+            embedding_sharding, "maybe_annotate_embedding_event", fake_annotate
+        ):
+            fused._wait_impl()
+
+        self.assertEqual(
+            events,
+            [
+                ("enter", EmbeddingEvent.KJT_TENSORS_DIST, "mod_a", "table_row_wise"),
+                ("construct",),
+                ("exit",),
+                ("enter", EmbeddingEvent.KJT_TENSORS_DIST, "mod_b", "data_parallel"),
+                ("construct",),
+                ("exit",),
+            ],
+        )
