@@ -240,10 +240,11 @@ class MetricModuleTest(unittest.TestCase):
             throughput_metric=ThroughputDef(warmup_steps=1),
             state_metrics=[StateMetricEnum.OPTIMIZERS],
         )
-        with tempfile.NamedTemporaryFile(delete=True) as backend:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backend_path = os.path.join(temp_dir, "store")
             dist.init_process_group(
                 backend="gloo",
-                init_method=f"file://{backend.name}",
+                init_method=f"file://{backend_path}",
                 world_size=1,
                 rank=0,
             )
