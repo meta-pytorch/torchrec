@@ -39,6 +39,7 @@ import logging
 import multiprocessing
 import os
 import traceback
+from datetime import timedelta
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
@@ -47,6 +48,15 @@ from torchrec.distributed.comm import _CROSS_PG, _INTRA_PG
 from torchrec.test_utils import get_free_port
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+# Collective timeout for the benchmark process group. Torch's own default is 30
+# minutes, which is the interval a rank that dies mid-run costs every surviving
+# rank -- they sit in the next barrier holding the whole (multi-GPU, possibly
+# multi-host) allocation until it expires. Benchmarks barrier between iterations,
+# so real inter-collective gaps are orders of magnitude under this; raise it via
+# ``pg_timeout`` for a runner with genuinely long single-rank setup.
+DEFAULT_PG_TIMEOUT: timedelta = timedelta(minutes=10)
 
 
 # Env vars torchrun / torchelastic populate in every worker. RANK / WORLD_SIZE /
@@ -104,11 +114,13 @@ class SingleProcessContext:
         self,
         backend: Optional[str] = None,
         disable_cuda_tf_32: bool = True,
+        pg_timeout: Optional[timedelta] = None,
     ) -> None:
         self.rank: int = int(os.environ["RANK"])
         self.world_size: int = int(os.environ["WORLD_SIZE"])
         self.local_rank: int = int(os.environ["LOCAL_RANK"])
         self.disable_cuda_tf_32 = disable_cuda_tf_32
+        self.pg_timeout: timedelta = pg_timeout or DEFAULT_PG_TIMEOUT
         # Default to nccl on GPU hosts, gloo otherwise.
         self.backend: str = backend or ("nccl" if torch.cuda.is_available() else "gloo")
 
@@ -137,7 +149,7 @@ class SingleProcessContext:
         # Start from a clean slate in case a prior group was left initialized.
         if dist.is_initialized():
             dist.destroy_process_group()
-        dist.init_process_group(backend=self.backend)
+        dist.init_process_group(backend=self.backend, timeout=self.pg_timeout)
         self.pg = dist.group.WORLD
 
         # Handshake: make sure every rank has joined the group before the runner
@@ -176,6 +188,7 @@ def run_single_process_func(
     backend: Optional[str] = None,
     use_deterministic_algorithms: bool = False,
     disable_cuda_tf_32: bool = True,
+    pg_timeout: Optional[timedelta] = None,
     **kwargs: Any,
 ) -> Any:
     """Entry point: handshake this rank, then run ``func`` for it.
@@ -199,6 +212,9 @@ def run_single_process_func(
             backward) are significantly slower, so benchmarks must keep this off to
             measure representative QPS.
         disable_cuda_tf_32: disable TF32 matmul/cudnn during the run.
+        pg_timeout: collective timeout for the process group; defaults to
+            ``DEFAULT_PG_TIMEOUT``. Bounds how long the surviving ranks wait when
+            one rank dies mid-run.
         **kwargs: forwarded to ``func``.
 
     Returns:
@@ -216,6 +232,7 @@ def run_single_process_func(
         with SingleProcessContext(
             backend=backend,
             disable_cuda_tf_32=disable_cuda_tf_32,
+            pg_timeout=pg_timeout,
         ) as ctx:
             kwargs["ctx"] = ctx
             kwargs["rank"] = ctx.rank

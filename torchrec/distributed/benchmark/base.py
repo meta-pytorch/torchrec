@@ -1137,6 +1137,10 @@ def _run_cuda_profiling(
     profile_all_threads: bool = False,
 ) -> None:
     """Run optional CUDA profiling with chrome trace export and memory snapshot."""
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+    except OSError as e:
+        logger.warning(f"Failed to create profile dir {output_dir}: {e}")
 
     def _trace_handler(prof: torch.profiler.profile) -> None:
         if not all_rank_traces and rank > 0:
@@ -1144,15 +1148,23 @@ def _run_cuda_profiling(
             return
         trace_file = f"{output_dir}/{create_trace_file_name(name, rank)}"
         logger.info(f" PROFILE[{name}].chrome_trace:{trace_file}")
-        prof.export_chrome_trace(trace_file)
+        # Artifacts are diagnostics, not results. A rank that raises here stops
+        # participating in the collectives that follow, stranding every other rank
+        # in ``PerfWrapper.measure``'s barrier until the process group times out --
+        # so a failed write degrades to a warning, as it already does for the
+        # memory snapshot below and for ``dump_benchmark_result``.
+        try:
+            prof.export_chrome_trace(trace_file)
 
-        if export_stacks:
-            prof.export_stacks(
-                f"{output_dir}/stacks-cpu-{name}.stacks", "self_cpu_time_total"
-            )
-            prof.export_stacks(
-                f"{output_dir}/stacks-cuda-{name}.stacks", "self_cuda_time_total"
-            )
+            if export_stacks:
+                prof.export_stacks(
+                    f"{output_dir}/stacks-cpu-{name}.stacks", "self_cpu_time_total"
+                )
+                prof.export_stacks(
+                    f"{output_dir}/stacks-cuda-{name}.stacks", "self_cuda_time_total"
+                )
+        except OSError as e:
+            logger.warning(f"Failed to write profiler artifacts for {name}: {e}")
 
     _pre_gpu_load(pre_gpu_load, "cuda")
 
