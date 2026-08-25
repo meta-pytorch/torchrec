@@ -7,12 +7,18 @@
 
 # pyre-strict
 
+from enum import Enum
 from typing import List, Optional
 
 import torch
 
 # Imported is needed: defines torchrec::embedding_lookup
 from torchrec.experimental.torch_tpu.pallas import ops  # noqa: F401
+
+
+class PooledLookupKernel(Enum):
+    PADDED = "padded"
+    OFFSET = "offset"
 
 
 class TPUEmbeddingUnfused(torch.nn.Module):
@@ -98,6 +104,7 @@ class TPUEmbeddingBagUnfused(torch.nn.Module):
         device: device the table lives on (e.g. ``"tpu"``).
         dtype (torch.dtype): dtype of the embedding table.
         mode (str): Either `mean` or `sum`. Default is `mean`.
+        kernel (PooledLookupKernel): Pallas implementation used for pooled lookup.
 
     Example::
 
@@ -119,6 +126,8 @@ class TPUEmbeddingBagUnfused(torch.nn.Module):
         device: Optional[torch.device],
         dtype: torch.dtype,
         mode: str = "mean",
+        *,
+        kernel: PooledLookupKernel = PooledLookupKernel.OFFSET,
     ) -> None:
         super().__init__()
         if embedding_dim % 16 != 0:
@@ -134,6 +143,7 @@ class TPUEmbeddingBagUnfused(torch.nn.Module):
         )
         self.output_dtype = dtype
         self.mode = mode
+        self._kernel = kernel
 
     @property
     def weight(self) -> torch.nn.Parameter:
@@ -171,7 +181,7 @@ class TPUEmbeddingBagUnfused(torch.nn.Module):
             torch.tensor(sentinel, dtype=torch.int32, device=indices.device),
         ).reshape(-1)
 
-    def forward(
+    def _padded_lookup(
         self,
         input: torch.Tensor,
         offsets: torch.Tensor,
@@ -235,3 +245,46 @@ class TPUEmbeddingBagUnfused(torch.nn.Module):
             denom = lengths.clamp(min=1).unsqueeze(1).to(out.dtype)
             out = out / denom
         return out
+
+    def _offset_lookup(
+        self,
+        input: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        out = torch.ops.torchrec.embedding_pooled_lookup_offset(
+            input.to(dtype=torch.int32),
+            offsets.to(dtype=torch.int32),
+            self._weight,
+            self._embedding_dim,
+        )
+        if self.mode == "mean":
+            lengths = offsets[1:] - offsets[:-1]
+            denominator = lengths.clamp(min=1).unsqueeze(1).to(out.dtype)
+            out = out / denominator
+        return out
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        offsets: torch.Tensor,
+    ) -> torch.Tensor:
+        """Pool embedding rows using the configured Pallas kernel.
+
+        Args:
+            input (torch.Tensor): Row indices on the embedding table's device.
+            offsets (torch.Tensor): Bag boundaries on the embedding table's device.
+
+        Returns:
+            torch.Tensor: Pooled rows with shape
+                ``[offsets.numel() - 1, embedding_dim]``.
+        """
+        device = self._weight.device
+        if input.device != device or offsets.device != device:
+            raise ValueError(
+                "input and offsets must already be on the embedding table's device"
+            )
+        if offsets.numel() == 1:
+            return self._weight[:0]
+        if self._kernel is PooledLookupKernel.OFFSET:
+            return self._offset_lookup(input, offsets)
+        return self._padded_lookup(input, offsets)

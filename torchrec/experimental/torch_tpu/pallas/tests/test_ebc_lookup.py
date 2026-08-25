@@ -7,8 +7,8 @@
 
 # pyre-strict
 
-import unittest
 from typing import List
+from unittest import TestCase
 from unittest.mock import patch
 
 import torch
@@ -22,6 +22,7 @@ from torchrec.distributed.embedding_types import (
 )
 from torchrec.distributed.test_utils.test_model import ModelInput
 from torchrec.experimental.torch_tpu.modules.embedding_modules import (
+    PooledLookupKernel,
     TPUEmbeddingBagUnfused,
 )
 from torchrec.experimental.torch_tpu.pallas import ops  # noqa: F401
@@ -51,6 +52,12 @@ TABLES: List[EmbeddingBagConfig] = [
 # Exercised batch / pooling grid — mirrors single_pooled_lookup.py's
 # `if __name__ == "__main__"` sweep (BATCH_SIZES x {"sum","mean"}).
 BATCH_SIZES = [1, 8, 64, 512]
+
+DEVICE_KERNEL_CASES = [
+    (f"{device}_{kernel.value}", device, kernel)
+    for device in ("cpu", "tpu")
+    for kernel in PooledLookupKernel
+]
 
 
 def _tables_for_pooling(pooling: PoolingType) -> List[EmbeddingBagConfig]:
@@ -123,7 +130,7 @@ def _grouped_config(
     )
 
 
-class EBCLookupTest(unittest.TestCase):
+class EBCLookupTest(TestCase):
     def _setup_device(self, device: str) -> None:
         """Skip the TPU cases off-hardware; bind the Pallas kernels on it.
 
@@ -175,8 +182,10 @@ class EBCLookupTest(unittest.TestCase):
             )
         self.assertIsInstance(lookup._emb_modules[0], BatchedTPUEmbeddingBag)
 
-    @parameterized.expand([("cpu",), ("tpu",)])
-    def test_forward_matches_embedding_bag_collection(self, device: str) -> None:
+    @parameterized.expand(DEVICE_KERNEL_CASES)
+    def test_forward_matches_embedding_bag_collection(
+        self, _case_name: str, device: str, pooled_lookup_kernel: PooledLookupKernel
+    ) -> None:
         """Pooled forward matches `EmbeddingBagCollection` across both poolings and batch sizes.
 
         Mirrors `single_pooled_lookup.py`'s main correctness sweep (sum/mean x
@@ -197,7 +206,11 @@ class EBCLookupTest(unittest.TestCase):
             ref_ebc = EmbeddingBagCollection(
                 tables=tables_pooled, device=torch.device("cpu")
             )
-            kernel = BatchedTPUEmbeddingBag(config=config, device=torch.device(device))
+            kernel = BatchedTPUEmbeddingBag(
+                config=config,
+                device=torch.device(device),
+                pooled_lookup_kernel=pooled_lookup_kernel,
+            )
 
             # split_embedding_weights() returns one weight per table, in table order.
             for weight, table in zip(kernel.split_embedding_weights(), tables_pooled):
@@ -253,15 +266,21 @@ class EBCLookupTest(unittest.TestCase):
                     msg=lambda m, p=pooling, b=batch_size: f"pooling={p} B={b}: {m}",
                 )
 
-    @parameterized.expand([("cpu",), ("tpu",)])
-    def test_backward_populates_grads(self, device: str) -> None:
+    @parameterized.expand(DEVICE_KERNEL_CASES)
+    def test_backward_populates_grads(
+        self, _case_name: str, device: str, pooled_lookup_kernel: PooledLookupKernel
+    ) -> None:
         """`loss.backward()` populates every table's gradient for each pooling."""
         self._setup_device(device)
         for pooling in (PoolingType.SUM, PoolingType.MEAN):
             config = _grouped_config(
                 EmbeddingComputeKernel.UNFUSED_TPU, TABLES, pooling
             )
-            kernel = BatchedTPUEmbeddingBag(config=config, device=torch.device(device))
+            kernel = BatchedTPUEmbeddingBag(
+                config=config,
+                device=torch.device(device),
+                pooled_lookup_kernel=pooled_lookup_kernel,
+            )
 
             model_input, _ = ModelInput.generate(
                 batch_size=128,
@@ -297,7 +316,3 @@ class EBCLookupTest(unittest.TestCase):
                     0,
                     f"pooling={pooling}: all-zero gradient for table {table.name}",
                 )
-
-
-if __name__ == "__main__":
-    unittest.main()
