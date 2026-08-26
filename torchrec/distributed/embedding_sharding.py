@@ -920,10 +920,19 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
         self._contexts = contexts
         self._awaitables: List[
             Union[KJTSplitsAllToAllMeta, Awaitable[Awaitable[KeyedJaggedTensor]]]
-        ] = [awaitable for request in requests for awaitable in request.awaitables]
-        self._output_lengths: List[int] = [
-            len(request.awaitables) for request in requests
-        ]
+        ] = []
+        self._output_lengths: List[int] = []
+        self._annotation_labels: List[Tuple[Optional[str], Optional[str]]] = []
+        for request in requests:
+            self._output_lengths.append(len(request.awaitables))
+            for i, awaitable in enumerate(request.awaitables):
+                self._awaitables.append(awaitable)
+                self._annotation_labels.append(
+                    (
+                        request._module_fqn,
+                        request._sharding_types[i] if request._sharding_types else None,
+                    )
+                )
         self._lengths: List[int] = [
             (
                 len(awaitable.splits_tensors)
@@ -1018,7 +1027,9 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
         else:
             splits_per_awaitable = [[] for _ in range(len(self._lengths))]
         tensors_awaitables = []
-        for splits, awaitable in zip(splits_per_awaitable, self._awaitables):
+        for idx, (splits, awaitable) in enumerate(
+            zip(splits_per_awaitable, self._awaitables)
+        ):
             if not splits:  # NoWait
                 assert isinstance(awaitable, Awaitable)
                 tensors_awaitables.append(awaitable.wait())
@@ -1042,21 +1053,27 @@ class FusedKJTListSplitsAwaitable(Awaitable[List[KJTListAwaitable]]):
                     keys=awaitable.keys,
                 )
 
-            tensors_awaitables.append(
-                KJTAllToAllTensorsAwaitable(
-                    pg=awaitable.pg,
-                    input=awaitable._input,
-                    splits=awaitable.splits,
-                    input_splits=awaitable.input_splits,
-                    output_splits=output_splits,
-                    input_tensors=awaitable.input_tensors,
-                    labels=awaitable.labels,
-                    keys=awaitable.keys,
-                    device=awaitable.device,
-                    stagger=awaitable.stagger,
-                    stride_per_rank=stride_per_rank,
+            # The constructor issues the AlltoAll, so the annotation wraps it rather
+            # than a later `.wait()`.
+            module_fqn, sharding_type = self._annotation_labels[idx]
+            with maybe_annotate_embedding_event(
+                EmbeddingEvent.KJT_TENSORS_DIST, module_fqn, sharding_type
+            ):
+                tensors_awaitables.append(
+                    KJTAllToAllTensorsAwaitable(
+                        pg=awaitable.pg,
+                        input=awaitable._input,
+                        splits=awaitable.splits,
+                        input_splits=awaitable.input_splits,
+                        output_splits=output_splits,
+                        input_tensors=awaitable.input_tensors,
+                        labels=awaitable.labels,
+                        keys=awaitable.keys,
+                        device=awaitable.device,
+                        stagger=awaitable.stagger,
+                        stride_per_rank=stride_per_rank,
+                    )
                 )
-            )
         output = []
         awaitables_per_output = _split(tensors_awaitables, self._output_lengths)
         for awaitables, ctx in zip(awaitables_per_output, self._contexts):
