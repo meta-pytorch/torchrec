@@ -7,11 +7,13 @@
 
 # pyre-strict
 import logging
-from typing import Any, cast, Dict
+from typing import Any, cast, Dict, Optional, Union
 
+import torch.distributed as dist
 from torch import nn
+from torch.distributed.tensor import DeviceMesh
 from torch.profiler import record_function
-from torchrec.metrics.metric_module import RecMetricModule
+from torchrec.metrics.metric_module import PreComputeStates, RecMetricModule
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
 from torchrec.metrics.rec_metric import (
     RecComputeMode,
@@ -59,6 +61,15 @@ class CPUCommsRecMetricModule(RecMetricModule):
             for computation in metric._metrics_computations:
                 computation = cast(RecMetricComputation, computation)
                 computation._to_sync = False
+
+    # Throughput is already isolated in MetricStateSnapshot.
+    def get_pre_compute_states(
+        self, pg: Optional[Union[dist.ProcessGroup, DeviceMesh]] = None
+    ) -> PreComputeStates:
+        return self._get_rec_metric_states(pg)
+
+    def load_pre_compute_states(self, source: PreComputeStates) -> None:
+        self._load_rec_metric_states(source)
 
     def load_local_metric_state_snapshot(
         self, state_snapshot: MetricStateSnapshot

@@ -9,13 +9,15 @@
 
 import unittest
 from collections import defaultdict
-from typing import cast, DefaultDict, List
+from typing import Any, cast, DefaultDict, List
+from unittest.mock import MagicMock, patch
 
 import torch
 from torchrec.metrics.auc import _state_reduction
 from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
 from torchrec.metrics.metric_state_snapshot import MetricStateSnapshot
 from torchrec.metrics.metrics_config import BatchSizeStage
+from torchrec.metrics.metrics_namespace import MetricName, MetricNamespace
 from torchrec.metrics.ne import NEMetric, NEMetricComputation
 from torchrec.metrics.rec_metric import RecComputeMode, RecMetric, RecMetricList
 from torchrec.metrics.test_utils import gen_test_tasks
@@ -25,7 +27,13 @@ from torchrec.metrics.test_utils.mock_metrics import (
     create_tensor_states,
     MockRecMetric,
 )
+from torchrec.metrics.throughput import ThroughputMetric
 from torchrec.metrics.tower_qps import TowerQPSMetric
+
+
+class _QPSThroughputMetric(ThroughputMetric):
+    _namespace = MetricNamespace.TOWER_QPS
+    _metric_name = MetricName.TOWER_QPS
 
 
 class CPUCommsRecMetricModuleTest(unittest.TestCase):
@@ -466,6 +474,62 @@ class CPUCommsRecMetricModuleTest(unittest.TestCase):
         assert_tensor_dict_equals(
             metric.get_computation_states(),
             ne_states,
+        )
+
+    def test_qps_namespace_and_name_collision_preserves_states(self) -> None:
+        tasks = gen_test_tasks(["qps", "task2", "task3", "task4"])
+        tower_qps = TowerQPSMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=self.batch_size,
+            tasks=tasks,
+            compute_mode=RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION,
+        )
+        expected_warmup_examples = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        source_computation = cast(Any, tower_qps._metrics_computations[0])
+        source_computation.warmup_examples = expected_warmup_examples
+        throughput_metric = _QPSThroughputMetric(
+            batch_size=self.batch_size,
+            world_size=1,
+            window_seconds=100,
+        )
+        throughput_metric.get_buffer("warmup_examples").fill_(100)
+        cpu_comms_module = CPUCommsRecMetricModule(
+            batch_size=self.batch_size,
+            world_size=1,
+            rec_tasks=tasks,
+            rec_metrics=RecMetricList([tower_qps]),
+            throughput_metric=throughput_metric,
+        )
+        cpu_comms_module.load_local_metric_state_snapshot(
+            MetricStateSnapshot.from_metrics(
+                RecMetricList([tower_qps]), throughput_metric
+            )
+        )
+
+        with patch(
+            "torchrec.metrics.metric_module.dist.get_world_size", return_value=1
+        ), patch(
+            "torchrec.metrics.metric_module._all_gather_tensor",
+            side_effect=lambda tensor, *_: [tensor],
+        ):
+            states = cpu_comms_module.get_pre_compute_states(MagicMock())
+        cpu_comms_module.load_pre_compute_states(states)
+
+        restored_tower_qps = cast(
+            TowerQPSMetric, cpu_comms_module.rec_metrics.rec_metrics[0]
+        )
+        computation = cast(Any, restored_tower_qps._metrics_computations[0])
+        torch.testing.assert_close(
+            computation.warmup_examples,
+            expected_warmup_examples,
+        )
+        restored_throughput_metric = cpu_comms_module.throughput_metric
+        self.assertIsNotNone(restored_throughput_metric)
+        assert restored_throughput_metric is not None
+        torch.testing.assert_close(
+            restored_throughput_metric.get_buffer("warmup_examples"),
+            torch.tensor(100, dtype=torch.long),
         )
 
 
