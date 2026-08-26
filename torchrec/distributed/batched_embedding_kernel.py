@@ -145,6 +145,9 @@ RES_NUM_CONSUMERS_STR = "res_num_consumers"
 RES_NUM_UVM_HIT_COPY_THREADS_STR = "res_num_uvm_hit_copy_threads"
 RES_NUM_HBM_COPY_THREADS_STR = "res_num_hbm_copy_threads"
 ENABLE_RAW_EMBEDDING_STREAMING_STR = "enable_raw_embedding_streaming"
+ENABLE_HBM_STREAMING_STR = "enable_hbm_streaming"
+RES_HBM_DRAIN_INTERVAL_STR = "res_hbm_drain_interval"
+RES_USE_COPY_DONE_TOKEN_STR = "res_use_copy_done_token"
 
 
 class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
@@ -244,6 +247,15 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
             ENABLE_RAW_EMBEDDING_STREAMING_STR
         )
 
+    enable_hbm_streaming = fused_params.pop(ENABLE_HBM_STREAMING_STR, None)
+    if enable_hbm_streaming is not None:
+        res_params.enable_hbm_streaming = enable_hbm_streaming
+    res_hbm_drain_interval = fused_params.pop(RES_HBM_DRAIN_INTERVAL_STR, None)
+    if res_hbm_drain_interval is not None:
+        res_params.res_hbm_drain_interval = res_hbm_drain_interval
+    res_use_copy_done_token = fused_params.pop(RES_USE_COPY_DONE_TOKEN_STR, None)
+    if res_use_copy_done_token is not None:
+        res_params.res_use_copy_done_token = res_use_copy_done_token
     if (
         enable_raw_embedding_streaming is None
         or enable_raw_embedding_streaming is False
