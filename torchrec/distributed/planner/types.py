@@ -2923,6 +2923,41 @@ class PlannerSessionContext:
     # Empty when persistence is disabled or upload failed; observability only, so
     # the caller/CLI can surface where the run's artifacts live.
     content_urls: Dict[str, str] = field(default_factory=dict)
+    # Plan-persistence failures recorded this session, keyed by operation (e.g.
+    # "plan_upload:<sku>", "planner_debug:<key>") -> "<ExcType>: <message>".
+    # Typed counterpart to the free-text `warnings` entries the same failures also
+    # produce: a detector can key off the presence of an entry here instead of
+    # substring-matching a warning string. Observability only.
+    plan_persist_failures: Dict[str, str] = field(default_factory=dict)
+
+    def record_plan_persist_failure(self, operation: str, exc: BaseException) -> None:
+        """Note that persisting the sharding plan (or its debug bundle) failed.
+
+        These uploads are best-effort, so their call sites swallow the exception
+        and the run continues without the artifact. That makes an outage look
+        exactly like "there was nothing to upload". This records the failure both
+        as a session warning (via ``record_external_failure``, so anything already
+        reading ``warnings`` keeps working) and as typed state, which is what the
+        planner_runs row turns into a clean ``plan_persist_failed`` boolean.
+
+        Observability only, and itself best-effort: never raises, so a failure to
+        record a failure cannot escalate into a planning failure.
+        """
+        # Two independent guards, typed entry first. Independent so neither signal can
+        # suppress the other; typed first because the alertable ``plan_persist_failed``
+        # column is derived from ``plan_persist_failures``, so it must survive even if
+        # ``record_external_failure`` raises (otherwise the flag would stay 0 despite a
+        # real failure). Each uses ``except BaseException`` because ``exc`` is a
+        # ``BaseException`` (e.g. a ``__str__`` that raises a non-``Exception``) and
+        # recording a failure must never escalate into a planning failure.
+        try:
+            self.plan_persist_failures[operation] = f"{type(exc).__name__}: {exc}"
+        except BaseException:  # noqa: B036 -- best-effort: must never propagate
+            pass
+        try:
+            self.record_external_failure("manifold", operation, exc)
+        except BaseException:  # noqa: B036 -- best-effort: must never propagate
+            pass
 
     def record_external_failure(
         self, system: str, operation: str, exc: BaseException
