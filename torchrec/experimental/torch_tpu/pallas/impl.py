@@ -34,6 +34,14 @@ _pooled_offset_bwd = pallas.jax_op(
     "torchrec_pallas::embedding_pooled_lookup_offset_bwd",
     pooled_lookup_offset.embedding_pooled_lookup_bwd_jax,
 )
+_pooled_batched_offset_fwd = pallas.jax_op(
+    "torchrec_pallas::embedding_pooled_batched_lookup_offset",
+    pooled_lookup_offset.embedding_pooled_batched_lookup_jax,
+)
+_pooled_batched_offset_bwd = pallas.jax_op(
+    "torchrec_pallas::embedding_pooled_batched_lookup_offset_bwd",
+    pooled_lookup_offset.embedding_pooled_batched_lookup_bwd_jax,
+)
 
 
 def embedding_lookup_tpu(indices, weights, emb_dim):
@@ -81,6 +89,31 @@ def embedding_pooled_lookup_offset_backward_tpu(
     )
 
 
+def embedding_pooled_batched_lookup_offset_tpu(
+    indices, offsets, weights, row_offsets, emb_dim
+):
+    return _pooled_batched_offset_fwd(
+        indices=indices,
+        offsets=offsets,
+        dev_weights=weights,
+        row_offsets=row_offsets,
+        emb_dim=emb_dim,
+    )
+
+
+def embedding_pooled_batched_lookup_offset_backward_tpu(
+    grad_out, indices, offsets, row_offsets, num_rows, emb_dim
+):
+    return _pooled_batched_offset_bwd(
+        grad_out=grad_out,
+        indices=indices,
+        offsets=offsets,
+        row_offsets=row_offsets,
+        num_rows=num_rows,
+        emb_dim=emb_dim,
+    )
+
+
 lib: torch.library.Library = torch.library.Library("torchrec", "IMPL")
 lib.impl("embedding_lookup", embedding_lookup_tpu, "TPU")
 lib.impl("embedding_lookup_backward", embedding_lookup_backward_tpu, "TPU")
@@ -94,5 +127,16 @@ lib.impl(
     embedding_pooled_lookup_offset_backward_tpu,
     "TPU",
 )
+lib.impl(
+    "embedding_pooled_batched_lookup_offset",
+    embedding_pooled_batched_lookup_offset_tpu,
+    "TPU",
+)
+lib.impl(
+    "embedding_pooled_batched_lookup_offset_backward",
+    embedding_pooled_batched_lookup_offset_backward_tpu,
+    "TPU",
+)
+
 
 _ = ops

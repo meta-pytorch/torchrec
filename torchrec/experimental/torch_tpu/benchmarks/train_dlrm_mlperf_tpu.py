@@ -66,6 +66,9 @@ from torchrec.distributed.types import ShardingEnv, ShardingPlan
 
 # Registers the TPU (SparseCore) impls of torchrec::embedding_lookup{,_backward};
 # pallas/ops.py only registers the CPU ones, so the UNFUSED_TPU lookup needs this.
+from torchrec.experimental.torch_tpu.modules.embedding_modules import (  # noqa: F401
+    PooledLookupKernel,
+)
 from torchrec.experimental.torch_tpu.pallas import impl  # noqa: F401
 from torchrec.models.dlrm import DLRM_DCN
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
@@ -230,6 +233,9 @@ def _build_sharded(
     dcn_low_rank_dim: int,
 ) -> nn.Module:
     """Faithful MLPerf DLRM_DCN with a CW / UNFUSED_TPU EmbeddingBagCollection under DMP."""
+    sharder = EmbeddingBagCollectionSharder(
+        fused_params={"pooled_lookup_kernel": PooledLookupKernel.BATCHED_OFFSET}
+    )
     ebc = EmbeddingBagCollection(tables=tables, device=torch.device("meta"))
     model = DLRM_DCN(
         embedding_bag_collection=ebc,
@@ -257,20 +263,22 @@ def _build_sharded(
                 },
                 # pyre-ignore[6]: ModuleSharder is invariant; the EBC sharder is
                 # the correct sharder for this module type.
-                sharder=EmbeddingBagCollectionSharder(),
+                sharder=sharder,
                 local_size=1,
                 world_size=world_size,
                 device_type="tpu",
             )
         }
     )
+    if dist.get_rank(pg) == 0:
+        print(f"Sharding plan:\n{plan}", flush=True)
     return DistributedModelParallel(
         module=model,
         env=ShardingEnv.from_process_group(pg),
         device=device,
         plan=plan,
         # pyre-ignore[6]: see note above on ModuleSharder invariance.
-        sharders=[EmbeddingBagCollectionSharder()],
+        sharders=[sharder],
     )
 
 
@@ -316,6 +324,11 @@ def _median(xs: list[float]) -> float:
     s = sorted(xs)
     n = len(s)
     return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _cache_misses() -> int:
+    # pyre-ignore[16]: registered at runtime by torch_tpu.
+    return int(torch.tpu._get_cache_misses())
 
 
 def parse_args() -> argparse.Namespace:
@@ -410,6 +423,7 @@ def main() -> None:
     assert args.warmup >= 0, "--warmup cannot be negative"
 
     nepf = NEPF_CANONICAL if args.cardinality == "canonical" else NEPF_SHRUNK
+
     tables = _build_tables(nepf)
     table_rows = [t.num_embeddings for t in tables]
     features = [t.feature_names[0] for t in tables]
@@ -436,7 +450,7 @@ def main() -> None:
 
     kjt_gen = torch.Generator()
 
-    def run_step(step: int, timed: bool) -> float:
+    def run_step(step: int) -> float:
         # KJT is built on host then moved to device; the sharded EBC input_dist
         # all2alls it feature-wise (CW: even). It must already be on device -- the
         # splits all2all inside KJTAllToAll runs on the KJT's device.
@@ -445,16 +459,29 @@ def main() -> None:
         opt.zero_grad()
         t0 = time.perf_counter()
         logits = sharded_model(dense_x, kjt)
+
         loss = F.binary_cross_entropy_with_logits(logits, labels)
         loss.backward()
         opt.step()
-        if timed:
-            _materialize()  # flush fwd+bwd+opt for this step
+        _materialize()
         return time.perf_counter() - t0
 
+    cache_misses_before_warmup = _cache_misses()
     for w in range(args.warmup):
-        run_step(w, timed=False)
+        step_cache_misses_before = _cache_misses()
+        duration = run_step(w)
+        step_cache_misses_after = _cache_misses()
+        if rank == 0:
+            print(
+                f"Warmup step {w}: {duration:.3f}s, "
+                f"cache misses +{step_cache_misses_after - step_cache_misses_before} "
+                f"(total={step_cache_misses_after})",
+                flush=True,
+            )
     _materialize()
+
+    cache_misses_after_warmup = _cache_misses()
+    warmup_compiles = cache_misses_after_warmup - cache_misses_before_warmup
 
     # Optional xprof capture of the timed steps. jax.profiler records the TPU device
     # timeline (SC/TC ops) via libtpu regardless of framework; rank 0 captures.
@@ -465,9 +492,22 @@ def main() -> None:
         os.makedirs(args.profile_dir, exist_ok=True)
         jax.profiler.start_trace(args.profile_dir)
 
+    cache_misses_before_timed = _cache_misses()
     step_ms: list[float] = []
     for s in range(args.steps):
-        step_ms.append(run_step(args.warmup + s, timed=True) * 1e3)
+        step_cache_misses_before = _cache_misses()
+        step_ms.append(run_step(args.warmup + s) * 1e3)
+        step_cache_misses_after = _cache_misses()
+        if rank == 0:
+            print(
+                f"Timed iter {s}: {step_ms[-1]:.3f}ms, "
+                f"cache misses +{step_cache_misses_after - step_cache_misses_before} "
+                f"(total={step_cache_misses_after})",
+                flush=True,
+            )
+
+    cache_misses_after_timed = _cache_misses()
+    timed_compiles = cache_misses_after_timed - cache_misses_before_timed
 
     if profiling:
         _materialize()  # flush pending TPU work into the trace window
@@ -483,6 +523,20 @@ def main() -> None:
     dist.all_reduce(xsum, op=dist.ReduceOp.SUM)
     xrank_max = xmax.cpu().item()
     xrank_mean = (xsum / world_size).cpu().item()
+
+    local_compile_counts = torch.tensor(
+        [warmup_compiles, timed_compiles], dtype=torch.float32, device=device
+    )
+    compile_sum = local_compile_counts.clone()
+    dist.all_reduce(compile_sum, op=dist.ReduceOp.SUM)
+    compile_max = local_compile_counts.clone()
+    dist.all_reduce(compile_max, op=dist.ReduceOp.MAX)
+    warmup_compile_sum, timed_compile_sum = [
+        int(value) for value in compile_sum.cpu().tolist()
+    ]
+    warmup_compile_max, timed_compile_max = [
+        int(value) for value in compile_max.cpu().tolist()
+    ]
 
     if rank == 0:
         # K samples/s/chip = per_chip_batch / step_time_s / 1000 (straggler-bound).
@@ -506,6 +560,18 @@ def main() -> None:
             flush=True,
         )
         print(f"  K samples/s/chip (straggler-bound) = {kspc:.1f}", flush=True)
+        print(
+            "  compilation cache misses: "
+            f"warmup total={warmup_compile_sum} max/rank={warmup_compile_max}; "
+            f"timed total={timed_compile_sum} max/rank={timed_compile_max}",
+            flush=True,
+        )
+        if timed_compile_sum != 0:
+            print(
+                "  WARNING: timed compilation cache misses make this throughput "
+                "result invalid for steady-state comparison.",
+                flush=True,
+            )
 
     dist.barrier()
     dist.destroy_process_group()

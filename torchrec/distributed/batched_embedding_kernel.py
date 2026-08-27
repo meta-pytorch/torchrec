@@ -130,6 +130,7 @@ if TYPE_CHECKING:
         TritonTableBatchedEmbeddingBags,
     )
     from torchrec.experimental.torch_tpu.modules.embedding_modules import (
+        PallasTableBatchedEmbeddingBags,
         PooledLookupKernel,
         TPUEmbeddingBagUnfused,
         TPUEmbeddingUnfused,
@@ -4847,10 +4848,13 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
     """Pooled TPU compute kernel (`UNFUSED_TPU`).
 
     TPU specific `BatchedDenseEmbeddingBag` in the pooled dispatch
-    (`GroupedPooledEmbeddingsLookup._create_embedding_kernel`). Uses one
+    (`GroupedPooledEmbeddingsLookup._create_embedding_kernel`).
+
+
+    If pooled_lookup_kernel is "offset" or "padded" then uses one
     `TPUEmbeddingUnfused` table per table in the group; `forward` routes
     each feature to its table, gathers its ids, and pools per sample (SUM or MEAN
-    per `config.pooling`).
+    per `config.pooling`). Otherwise it is batched lookup across all tables/features.
 
     Args:
         config (GroupedEmbeddingConfig): grouped table config (one or more tables).
@@ -4875,37 +4879,60 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
     ) -> None:
         # Lazy import to avoid pulling in experimental TPU code at module load time.
         from torchrec.experimental.torch_tpu.modules.embedding_modules import (
+            PallasTableBatchedEmbeddingBags,
             PooledLookupKernel,
             TPUEmbeddingBagUnfused,
         )
 
         if pooled_lookup_kernel is None:
             pooled_lookup_kernel = PooledLookupKernel.OFFSET
+        self.pooled_lookup_kernel = pooled_lookup_kernel
+        self._use_batched_lookup = (
+            pooled_lookup_kernel == PooledLookupKernel.BATCHED_OFFSET
+        )
 
         super().__init__(config, pg, device, sharding_type)
         dtype = data_type_to_sparse_type(config.data_type).as_dtype()
 
         self._emb_modules: nn.ModuleList = nn.ModuleList()
-        for local_rows, local_cols in zip(self._local_rows, self._local_cols):
-            self._emb_modules.append(
-                TPUEmbeddingBagUnfused(
-                    num_embeddings=local_rows,
-                    embedding_dim=local_cols,
-                    device=device,
-                    dtype=dtype,
-                    mode="mean" if self._pooling == PoolingMode.MEAN else "sum",
-                    kernel=pooled_lookup_kernel,
-                )
+        if self._use_batched_lookup:
+            self._emb_module = PallasTableBatchedEmbeddingBags(
+                embedding_specs=list(zip(self._local_rows, self._local_cols)),
+                feature_table_map=self._feature_table_map,
+                weights_precision=dtype,
+                mode="mean" if self._pooling == PoolingMode.MEAN else "sum",
+                device=device,
             )
+        else:
+            for local_rows, local_cols in zip(self._local_rows, self._local_cols):
+                self._emb_modules.append(
+                    TPUEmbeddingBagUnfused(
+                        num_embeddings=local_rows,
+                        embedding_dim=local_cols,
+                        device=device,
+                        dtype=dtype,
+                        mode="mean" if self._pooling == PoolingMode.MEAN else "sum",
+                        kernel=pooled_lookup_kernel,
+                    )
+                )
         self.init_parameters()
 
     @property
     # pyrefly: ignore [bad-override]
-    def emb_module(self) -> "TPUEmbeddingBagUnfused":
+    def emb_module(
+        self,
+    ) -> Union["TPUEmbeddingBagUnfused", "PallasTableBatchedEmbeddingBags"]:
+        if self._use_batched_lookup:
+            return self._emb_module
         # pyre-ignore[16]: ModuleList returns Module, pyre thinks Union
         return self._emb_modules[0]
 
     def split_embedding_weights(self) -> List[torch.Tensor]:
+        if self._use_batched_lookup:
+            split_weights = self._emb_module.split_embedding_weights()
+            for weight in split_weights:
+                weight.requires_grad_(self._emb_module.weights.requires_grad)
+            return split_weights
         # pyre-ignore[16]
         return [emb_module.weight for emb_module in self._emb_modules]
 
@@ -4915,6 +4942,13 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
         assert (
             remove_duplicate
         ), "remove_duplicate=False not supported in named_split_embedding_weights"
+        if self._use_batched_lookup:
+            for table, weight in zip(
+                self._config.embedding_tables,
+                self._emb_module.split_embedding_weights(),
+            ):
+                yield append_prefix(prefix, f"{table.name}.weight"), weight
+            return
         for table, emb_module in zip(self._config.embedding_tables, self._emb_modules):
             # pyre-ignore[16]
             yield append_prefix(prefix, f"{table.name}.weight"), emb_module.weight
@@ -4922,6 +4956,14 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
     def named_parameters(
         self, prefix: str = "", recurse: bool = True, remove_duplicate: bool = True
     ) -> Iterator[Tuple[str, nn.Parameter]]:
+        if self._use_batched_lookup:
+            combined_key = "/".join(
+                table.name for table in self._config.embedding_tables
+            )
+            yield append_prefix(
+                prefix, f"{combined_key}.weight"
+            ), self._emb_module.weights
+            return
         for name, tensor in self.named_split_embedding_weights(
             prefix, recurse, remove_duplicate
         ):
@@ -4933,6 +4975,34 @@ class BatchedTPUEmbeddingBag(BaseBatchedEmbeddingBag[torch.Tensor]):
         vbe_output: Optional[torch.Tensor] = None,
         vbe_output_offsets: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self._use_batched_lookup:
+            if features.variable_stride_per_key():
+                raise NotImplementedError("VBE on Pallas Batched EBC is not supported.")
+
+            offsets = features.offsets_or_none()
+            if offsets is None:
+                lengths = features.lengths()
+                # KJT's fallback uses an FBGEMM op without a TPU implementation.
+                # Scan batches independently, then add the much shorter feature-prefix
+                # scan to produce the same global offsets as a flat cumulative sum.
+                num_features = len(features.keys())
+                lengths_2d = lengths.view(num_features, -1)
+                local_ends = torch.cumsum(lengths_2d, dim=1).to(lengths.dtype)
+                zero = lengths.new_zeros(1)
+                feature_bases = torch.cat(
+                    [
+                        zero,
+                        torch.cumsum(local_ends[:, -1], dim=0).to(lengths.dtype)[:-1],
+                    ]
+                )
+                global_ends = local_ends + feature_bases.unsqueeze(1)
+                offsets = torch.cat([zero, global_ends.reshape(-1)])
+
+            return self.emb_module(
+                indices=features.values(),
+                offsets=offsets,
+            )
+
         jt_dict = features.to_dict()
         outputs = []
         for feature_idx, key in enumerate(features.keys()):
