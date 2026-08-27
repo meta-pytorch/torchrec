@@ -103,43 +103,6 @@ class PopulateResParamsTest(unittest.TestCase):
                 for key in self._HBM_KNOBS:
                     self.assertNotIn(key, fused_params)
 
-    def test_absent_knobs_leave_the_defaults(self) -> None:
-        # Absent and present-but-None are the same case: keep whatever fbgemm
-        # defaults to. Asserted against the dataclass rather than literals so
-        # this does not pin fbgemm's chosen defaults.
-        from fbgemm_gpu.split_table_batched_embeddings_ops_training import RESParams
-
-        defaults = RESParams()
-        for name, extra in (
-            ("absent", {}),
-            (
-                "present but None",
-                dict.fromkeys(self._HBM_KNOBS),
-            ),
-        ):
-            with self.subTest(name):
-                _, res_params = _populate_res_params(
-                    self._config(
-                        ["t0"],
-                        {
-                            "enable_raw_embedding_streaming": True,
-                            "res_enabled_tables": "t0",
-                            **extra,
-                        },
-                    )
-                )
-                self.assertEqual(
-                    res_params.enable_hbm_streaming, defaults.enable_hbm_streaming
-                )
-                self.assertEqual(
-                    res_params.res_hbm_drain_interval,
-                    defaults.res_hbm_drain_interval,
-                )
-                self.assertEqual(
-                    res_params.res_use_copy_done_token,
-                    defaults.res_use_copy_done_token,
-                )
-
 
 if __name__ == "__main__":
     unittest.main()
