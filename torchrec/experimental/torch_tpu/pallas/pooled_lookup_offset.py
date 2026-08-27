@@ -17,6 +17,7 @@ ids such reads gather are masked out in the reduction.
 """
 
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
@@ -185,6 +186,27 @@ def embedding_pooled_lookup_jax(
     return run_sc_pooled_lookup(indices, offsets, dev_weights, emb_dim)
 
 
+# Which derivation the backward uses for the per-id bag ids. "searchsorted" is the
+# default because it is unconditionally correct: it reads the bag boundaries out of
+# `offsets` and needs no relationship between `offsets` and the id count. "repeat" is
+# markedly faster (see `embedding_pooled_lookup_segments_jax`) but requires
+# `offsets[-1] == indices.shape[0]`; `jnp.repeat`'s `total_repeat_length` pads or
+# truncates silently rather than raising, so a caller that builds a mismatched
+# offsets/indices pair would get a wrong `seg` and a silently wrong gradient. Opt in
+# with TPU_POOLED_BWD_MODE=repeat once the caller is known to hold that invariant.
+POOLED_BWD_MODE_ENV = "TPU_POOLED_BWD_MODE"
+POOLED_BWD_MODE_DEFAULT = "searchsorted"
+
+
+def _pooled_bwd_mode() -> str:
+    """Read at trace time, so the choice is baked into each compiled backward.
+
+    Changing the variable after a shape has been compiled will not retrace it; set it
+    before the first backward of a run.
+    """
+    return os.environ.get(POOLED_BWD_MODE_ENV, POOLED_BWD_MODE_DEFAULT)
+
+
 def embedding_pooled_lookup_bwd_jax(
     grad_out: jax.Array,
     indices: jax.Array,
@@ -194,14 +216,84 @@ def embedding_pooled_lookup_bwd_jax(
 ) -> jax.Array:
     """Dense full-table gradient on the TensorCore (mirrors single_lookup's backward).
 
-    sum-pool backward is `grad_weight[indices[i]] += grad_out[bag(i)]`. Each flat id's bag is
-    found from `offsets` with a searchsorted (no host `repeat_interleave`), the per-bag grad is
-    expanded to per-id, then scatter-added into a zero `[num_rows, emb_dim]` table gradient.
+    sum-pool backward is `grad_weight[indices[i]] += grad_out[bag(i)]`. Each flat id's bag
+    comes from `offsets` (no host `repeat_interleave`), the per-bag grad is expanded to
+    per-id, then scatter-added into a zero `[num_rows, emb_dim]` table gradient.
+
+    The bag ids are derived per `TPU_POOLED_BWD_MODE`: "searchsorted" (default, no
+    precondition) or "repeat" (faster, requires `offsets[-1] == indices.shape[0]`). Both
+    produce bit-identical gradients when that invariant holds.
     """
     total_ids = indices.shape[0]
-    # bag(i) = # of offset boundaries <= i; side="right" puts a bag's first id in that bag.
-    seg = jnp.searchsorted(
+    mode = _pooled_bwd_mode()
+    if mode == "repeat":
+        seg = embedding_pooled_lookup_segments_jax(offsets, total_ids)
+    else:
+        seg = embedding_pooled_lookup_segments_searchsorted_jax(offsets, total_ids)
+    return embedding_pooled_lookup_bwd_seg_jax(
+        grad_out, indices, seg, num_rows, emb_dim
+    )
+
+
+def embedding_pooled_lookup_segments_searchsorted_jax(
+    offsets: jax.Array,
+    total_ids: int,
+) -> jax.Array:
+    """Per-id bag ids via a binary search over `offsets`. The default derivation.
+
+    `bag(i)` is the number of offset boundaries <= i; `side="right"` puts a bag's first
+    id in that bag. O(total_ids * log num_bags) and materializes an `arange(total_ids)`
+    to search with, so it is slower than the repeat form -- but it reads the boundaries
+    straight out of `offsets` and so cannot silently mis-segment a mismatched pair.
+    """
+    return jnp.searchsorted(
         offsets[1:], jnp.arange(total_ids, dtype=offsets.dtype), side="right"
     )
+
+
+def embedding_pooled_lookup_segments_jax(
+    offsets: jax.Array,
+    total_ids: int,
+) -> jax.Array:
+    """Per-id bag ids: `seg[i]` is the bag that flat id `i` belongs to.
+
+    Built from the lengths in one `jnp.repeat`. Used by the backward only when
+    `TPU_POOLED_BWD_MODE=repeat`; see the flag comment above for why it is opt-in.
+    `jnp.repeat` needs a statically known output length under jit, hence `total_ids`.
+
+    Requires `offsets[-1] == total_ids`, i.e. the offsets must cover exactly the flat ids
+    being scattered. `total_repeat_length` pads or truncates silently rather than raising,
+    so a mismatched pair would yield a wrong `seg` and hence a silently wrong gradient.
+    Both are derived from the same lookup (`offsets` and `indices.shape[0]`), so the
+    invariant holds by construction on the autograd path; the assert guards callers that
+    build the pair themselves.
+    """
+    num_bags = offsets.shape[0] - 1
+    lengths = offsets[1:] - offsets[:-1]
+    # Static-shape check only: `offsets` values are traced, so this cannot compare
+    # offsets[-1] to total_ids under jit. It does catch a caller passing a `total_ids`
+    # that disagrees with the shapes it derived the offsets from.
+    assert num_bags >= 0, f"offsets must have at least one entry, got {offsets.shape}"
+    return jnp.repeat(
+        jnp.arange(num_bags, dtype=offsets.dtype),
+        lengths,
+        total_repeat_length=total_ids,
+    )
+
+
+def embedding_pooled_lookup_bwd_seg_jax(
+    grad_out: jax.Array,
+    indices: jax.Array,
+    seg: jax.Array,
+    num_rows: int,
+    emb_dim: int,
+) -> jax.Array:
+    """Dense full-table gradient from precomputed per-id bag ids.
+
+    The shared body of the backward: with `seg` already built by
+    `embedding_pooled_lookup_segments_jax`, this is just the per-id gather plus the
+    dense scatter-add. Split out so a caller holding a precomputed `seg` can skip
+    rebuilding it.
+    """
     grad_per_id = grad_out[seg]  # [total_ids, emb_dim]
     return jnp.zeros((num_rows, emb_dim), grad_out.dtype).at[indices].add(grad_per_id)

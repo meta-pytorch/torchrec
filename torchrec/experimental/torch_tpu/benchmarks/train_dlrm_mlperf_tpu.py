@@ -344,6 +344,13 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="If set, capture an xprof xplane trace of the timed steps to this dir ",
     )
+    p.add_argument(
+        "--pooled-bwd-mode",
+        choices=["searchsorted", "repeat"],
+        default="searchsorted",
+        help="Pooled backward segment derivation: searchsorted (default, no "
+        "precondition) or repeat (faster, requires offsets[-1] == len(indices)).",
+    )
     p.add_argument("--dcn-num-layers", type=int, default=DCN_NUM_LAYERS)
     p.add_argument("--dcn-low-rank", type=int, default=DCN_LOW_RANK_DIM)
     p.add_argument("--seed", type=int, default=0)
@@ -361,6 +368,8 @@ def _skip_ddp_shape_verify_on_tpu() -> None:
     unaffected (the check already passes there). The durable fix belongs in torch_tpu's
     device->CPU lowering; this unblocks the multi-host benchmark run.
     """
+    # pyre-ignore[16]: torch.tpu is registered at runtime by torch_tpu, which is a
+    # pod-only dependency and so is invisible to the type checker.
     if not (hasattr(torch, "tpu") and torch.tpu.is_available()):
         return
     import torch.nn.parallel.distributed as _ddp
@@ -378,6 +387,10 @@ def main() -> None:
     # first lookup; single_lookup._lookup_mode() reads LOOKUP_MODE at call time.
     # The unfused backward always runs on the TensorCore.
     os.environ["LOOKUP_MODE"] = "v1_sc"
+    # How the pooled backward derives each id's bag. pooled_lookup_offset reads this at
+    # trace time, so it must be set before the first backward compiles. Defaults to
+    # searchsorted, matching the kernel's own default.
+    os.environ["TPU_POOLED_BWD_MODE"] = args.pooled_bwd_mode
     dist.init_process_group(backend="tpu_dist")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
