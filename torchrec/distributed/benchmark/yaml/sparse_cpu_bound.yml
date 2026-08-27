@@ -1,0 +1,50 @@
+# CPU-bound variant of sparse_data_dist_base.
+#
+# Purpose: reproduce the low-world-size / comms-light regime (e.g. the customer's
+# 64-trainer job) where the H2D copy DISPATCH is EXPOSED on the compute stream,
+# so async_inplace_copy has real idle to recover. Achieved with:
+#   - many input tensors (num_dummy_tensor: 2000) -> long per-batch CPU copy loop
+#   - small batch + tiny dense/over arch          -> little compute to hide behind
+#   - few small tables, world_size 2, table_wise  -> light comms to hide behind
+#
+# Compare sync vs async (inplace on for both):
+#   ... --yaml_config=.../sparse_cpu_bound.yml --name=cpu_bound_sync
+#   ... --yaml_config=.../sparse_cpu_bound.yml --async_inplace_copy=True --name=cpu_bound_async
+# then run analyze_exposed_copy_idle.py on each trace and compare EXPOSED idle.
+RunOptions:
+  world_size: 2
+  batch_size: 4096
+  num_batches: 20
+  num_benchmarks: 5
+  num_profiles: 1
+  sharding_type: table_wise
+  profile_dir: "."
+  name: "sparse_cpu_bound"
+  memory_snapshot: False
+  loglevel: "info"
+PipelineConfig:
+  pipeline: "sparse"
+  enable_inplace_copy_batch: true
+  kwargs:
+    site_fqn: "sparse.weighted_ebc"
+    sharding_type: "table_wise"
+ModelInputConfig:
+  num_float_features: 100
+  feature_pooling_avg: 20
+  num_dummy_tensor: 2000
+ModelSelectionConfig:
+  model_name: "test_sparse_nn"
+  model_config:
+    num_float_features: 100
+    submodule_kwargs:
+      dense_arch_out_size: 16
+      over_arch_out_size: 64
+      over_arch_hidden_layers: 1
+      dense_arch_hidden_sizes: [16]
+      skip_regroup: true
+EmbeddingTablesConfig:
+  num_unweighted_features: 20
+  num_weighted_features: 10
+  embedding_feature_dim: 64
+PlannerConfig:
+  pooling_factors: [20.0]  # Must match ModelInputConfig.feature_pooling_avg
