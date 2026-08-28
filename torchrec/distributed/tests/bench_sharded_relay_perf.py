@@ -2738,12 +2738,20 @@ def _reduce_parallel_jobs_max(results_dict: Any) -> None:
     Each job writes its own best-of-N under ..._job{j}; the overlapped wall-time
     is the slowest (max) job, so reduce both the relay and NCCL per-job entries
     into the base keys the print/report helpers read.
+
+    BENCH_SWEEP_PER_JOB=1 also prints every job's own best-of-N next to the
+    reduced max. Because each entry is already a min over BENCH_BENCH_ITERS, a
+    slow entry means that job was slow for EVERY iteration, so the per-job
+    spread separates a single persistently-slow job (communicator-level state:
+    channel assignment, HW queues) from a slow size across all jobs (buffer-level
+    state: placement, registration).
     """
+    per_job = _env_int("BENCH_SWEEP_PER_JOB", 0) != 0
     for active_ranks in _sweep_active_ranks():
         num_jobs = NUM_GPUS // active_ranks
         for collective in _sweep_collectives():
             key = f"{collective}_a{active_ranks}"
-            for i, (_label, _nbytes) in enumerate(_sweep_sizes()):
+            for i, (label, _nbytes) in enumerate(_sweep_sizes()):
                 for prefix in ("relay_parallel", "nccl_parallel"):
                     vals = [
                         results_dict.get(f"{prefix}_{key}_{i}_job{j}")
@@ -2754,6 +2762,11 @@ def _reduce_parallel_jobs_max(results_dict: Any) -> None:
                         results_dict[f"{prefix}_{key}_{i}"] = max(
                             present, key=lambda v: v[0]
                         )
+                    if per_job and present:
+                        spread = " ".join(
+                            "--" if v is None else f"{v[0]:8.3f}" for v in vals
+                        )
+                        print(f"[per-job] {prefix} {key} {label:>8} | {spread}")
 
 
 def _format_parallel_sweep_table(
