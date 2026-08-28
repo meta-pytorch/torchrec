@@ -294,6 +294,19 @@ def _sweep_collectives() -> tuple[str, ...]:
     return tuple(c for c in _MSG_SWEEP_COLLECTIVES_ALL if c in keep)
 
 
+def _sweep_reps() -> int:
+    """How many times each sweep measurement is repeated.
+
+    Each rep is a full warmup-free timed block whose min-over-iterations is one
+    sample; the reported number is the median across reps (see _measure_ms). The
+    parallel sweep needs this because it settles into one of two run-scoped states
+    that differ by ~20-30%, so a single rep reports whichever it happened to land
+    in. BENCH_SWEEP_REPS=1 restores the original single-rep, min-over-iterations
+    behaviour.
+    """
+    return max(1, _env_int("BENCH_SWEEP_REPS", 10))
+
+
 def _sweep_sizes() -> list[tuple[str, int]]:
     """Message sizes the sweeps cover.
 
@@ -658,14 +671,26 @@ def _measure_ms(
     warmup: int,
     iters: int,
     device_barrier_group: Any = None,
+    reps: int = 1,
 ) -> tuple[float, float]:
-    """Time fn() over 'iters' runs after 'warmup' warmups.
+    """Time fn() over 'iters' runs after 'warmup' warmups, 'reps' times.
 
-    Returns (best_ms, std_ms). The BEST (min) is the headline metric: collective
-    microbenchmarks are noise-dominated, so the mean is skewed by stray slow
-    iterations (OS jitter, DVFS, cross-rank skew). The min is the steady-state,
-    reproducible time — the same convention nccl-tests / rccl-tests use. std is
-    returned only to show the spread.
+    Returns (headline_ms, spread). With reps == 1 the headline is the BEST (min)
+    over iters and spread is the std over them, which is the original behaviour.
+    With reps > 1 each rep contributes its own min-over-iters and the headline
+    becomes the MEDIAN of those, with spread the max/min ratio across reps.
+
+    Why min within a rep but median across reps: collective microbenchmarks are
+    noise-dominated, so within a rep the min is the steady-state, reproducible
+    time and the mean is skewed by stray slow iterations (OS jitter, DVFS,
+    cross-rank skew) -- the same convention nccl-tests / rccl-tests use. ACROSS
+    reps the variation is different in kind: the parallel sweep settles into one
+    of two run-scoped states that differ by ~20-30% and stay put for a whole
+    measurement, so taking a min there would just report whichever state is
+    luckiest rather than what a job typically sees. The median is the typical
+    state, and unlike the mean it is not dragged by the rare 4-6x tail. The
+    spread is what says whether a small delta is meaningful: near 1.0 the
+    headline is solid, well above 1.0 and the two states are being mixed.
 
     Methodology for a stable, fair measurement:
     - A full-world barrier precedes each timed iteration so all ranks start the
@@ -700,21 +725,42 @@ def _measure_ms(
 
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
-    times: list[float] = []
-    for _ in range(iters):
-        # Align all ranks' starts; excluded from the timed region below.
-        _align()
-        torch.cuda.synchronize()
-        start_ev.record()
-        fn()
-        end_ev.record()
-        end_ev.synchronize()
-        times.append(start_ev.elapsed_time(end_ev))
+    n_reps = max(1, reps)
+    rep_bests: list[float] = []
+    last_std = 0.0
+    for _ in range(n_reps):
+        times: list[float] = []
+        for _ in range(iters):
+            # Align all ranks' starts; excluded from the timed region below.
+            _align()
+            torch.cuda.synchronize()
+            start_ev.record()
+            fn()
+            end_ev.record()
+            end_ev.synchronize()
+            times.append(start_ev.elapsed_time(end_ev))
+        rep_bests.append(min(times))
+        mean = sum(times) / len(times)
+        last_std = (sum((x - mean) ** 2 for x in times) / len(times)) ** 0.5
 
-    best = min(times)
-    mean = sum(times) / len(times)
-    std = (sum((x - mean) ** 2 for x in times) / len(times)) ** 0.5
-    return best, std
+    if n_reps == 1:
+        return rep_bests[0], last_std
+
+    ordered = sorted(rep_bests)
+    mid = len(ordered) // 2
+    median = (
+        ordered[mid]
+        if len(ordered) % 2 == 1
+        else 0.5 * (ordered[mid - 1] + ordered[mid])
+    )
+    spread = (ordered[-1] / ordered[0]) if ordered[0] > 0 else 0.0
+    if _env_int("BENCH_SWEEP_PER_REP", 0) != 0:
+        print(
+            "[per-rep] "
+            + " ".join(f"{v:.3f}" for v in rep_bests)
+            + f" | median {median:.3f} spread {spread:.2f}"
+        )
+    return median, spread
 
 
 # ---------------------------------------------------------------------------
@@ -1967,7 +2013,9 @@ def _msg_sweep_nccl_worker(
                     fused_pg,
                     _ar_opts,
                 )
-                best_f, std_f = _measure_ms(run_fused_base, warmup, bench_iters)
+                best_f, std_f = _measure_ms(
+                    run_fused_base, warmup, bench_iters, reps=_sweep_reps()
+                )
                 # Drop the per-size tensors held by the closure before the next
                 # (larger) size.
                 del run_fused_base
@@ -2035,6 +2083,7 @@ def _measure_relay_for(
         ),
         warmup,
         bench_iters,
+        reps=_sweep_reps(),
     )
     del active_in, active_out, bufs, in_list, out_list
     torch.cuda.empty_cache()
@@ -2428,7 +2477,11 @@ def _parallel_msg_sweep_nccl_worker(
                 # participates in the alignment barriers.
                 fn = _noop_fn
             best, std = _measure_ms(
-                fn, warmup, bench_iters, device_barrier_group=job_device_group
+                fn,
+                warmup,
+                bench_iters,
+                device_barrier_group=job_device_group,
+                reps=_sweep_reps(),
             )
             del fn
             torch.cuda.empty_cache()
@@ -2718,7 +2771,11 @@ def _parallel_msg_sweep_relay_worker(
                 device,
             )
             best, std = _measure_ms(
-                fn, warmup, bench_iters, device_barrier_group=job_device_group
+                fn,
+                warmup,
+                bench_iters,
+                device_barrier_group=job_device_group,
+                reps=_sweep_reps(),
             )
             del fn
             torch.cuda.empty_cache()
