@@ -1236,6 +1236,53 @@ class TrainPipelineSparseDist2DShardingTest(unittest.TestCase):
         dmp.assert_called_once()
 
 
+class TrainPipelineRecordStreamGateTest(unittest.TestCase):
+    """`_wait_for_batch` gates its per-leaf `record_stream` on
+    `enable_inplace_copy_batch`.
+
+    The gate is load-bearing in BOTH directions, which is why this pins both:
+      - flag on: the batch is allocated on the caller's current stream, which is
+        also the stream consuming it here, so the allocator ignores the
+        registration. Skipping it is safe and drops one call per leaf tensor.
+      - flag off: the destination is allocated on the memcpy stream instead, so
+        the batch really is consumed cross-stream and the registration is
+        REQUIRED. Turning this into an unconditional skip would be a silent
+        use-after-free, not a test failure -- hence the guard.
+    """
+
+    def _pipeline(self, enable_inplace_copy_batch: bool) -> TrainPipelineSparseDist:
+        dmp = MagicMock(spec=DMPCollection)
+        dmp.training = True
+        pipeline = TrainPipelineSparseDist(
+            dmp,
+            MagicMock(spec=torch.optim.Optimizer),
+            device=torch.device("cpu"),
+            enable_inplace_copy_batch=enable_inplace_copy_batch,
+        )
+        context = TrainPipelineContext()
+        context.index = 0
+        pipeline.batches.append(MagicMock(spec=Pipelineable))
+        pipeline.contexts.append(context)
+        return pipeline
+
+    def test_record_stream_gated_on_inplace_copy(self) -> None:
+        for enable_inplace_copy_batch, expected_record_stream in (
+            (True, False),
+            (False, True),
+        ):
+            with self.subTest(enable_inplace_copy_batch=enable_inplace_copy_batch):
+                pipeline = self._pipeline(enable_inplace_copy_batch)
+                with patch(
+                    "torchrec.distributed.train_pipeline.train_pipelines._wait_for_batch"
+                ) as mock_wait_for_batch:
+                    pipeline._wait_for_batch()
+                mock_wait_for_batch.assert_called_once()
+                self.assertEqual(
+                    mock_wait_for_batch.call_args.kwargs["record_stream"],
+                    expected_record_stream,
+                )
+
+
 class TrainPipelineAttachDetachTest(TrainPipelineSparseDistTestBase):
     @unittest.skipIf(
         not torch.cuda.is_available(),
