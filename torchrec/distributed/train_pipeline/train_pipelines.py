@@ -1342,6 +1342,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
         enable_inplace_copy_batch: bool = False,
         free_features_storage_early: bool = False,
         clear_data_dist_inputs: bool = False,
+        async_inplace_copy: bool = False,
     ) -> None:
         super().__init__(
             model=model,
@@ -1357,6 +1358,7 @@ class TrainPipelineSparseDistLite(TrainPipelineSparseDist[In, Out]):
             enable_inplace_copy_batch=enable_inplace_copy_batch,
             free_features_storage_early=free_features_storage_early,
             clear_data_dist_inputs=clear_data_dist_inputs,
+            async_inplace_copy=async_inplace_copy,
         )
 
         # SDD Lite only uses memcpy stream for H2D copy.
