@@ -26,6 +26,11 @@ from torchrec.sparse.jagged_tensor import (
 from torchrec.sparse.tests.utils import build_groups, build_kts
 from torchrec.test_utils import skip_if_asan_class
 
+if torch.cuda.is_available():
+    from torchrec.sparse.triton_permute_multi_embedding import (
+        triton_permute_multi_embedding,
+    )
+
 torch.fx.wrap("len")
 
 
@@ -1070,3 +1075,154 @@ class TestKeyedTensorGPU(unittest.TestCase):
 
         torch.allclose(actual_kt_0_grad, expected_kt_0_grad)
         torch.allclose(actual_kt_1_grad, expected_kt_1_grad)
+
+
+class TritonPermuteMultiEmbeddingTest(unittest.TestCase):
+    def _inputs(
+        self,
+        dtype: torch.dtype,
+        noncontiguous: bool = False,
+    ) -> tuple[
+        list[torch.Tensor],
+        list[torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        list[int],
+    ]:
+        batch_size = 16
+        keys = [["f1", "f2"], ["f3", "f4", "f5"], ["f6"]]
+        lengths = [[3, 4], [5, 6, 7], [8]]
+        groups = [["f1", "f3"], ["f4", "f1", "f2"], ["f6"], ["f1", "f5"]]
+        values = []
+        for tensor_lengths in lengths:
+            width = sum(tensor_lengths)
+            if noncontiguous:
+                value = torch.randn(width, batch_size, device="cuda", dtype=dtype).t()
+            else:
+                value = torch.randn(batch_size, width, device="cuda", dtype=dtype)
+            values.append(value.detach().requires_grad_())
+        references = [value.detach().clone().requires_grad_() for value in values]
+        permutes, in_shapes, out_shapes, out_lengths = _kt_regroup_arguments(
+            values[0], keys, lengths, groups
+        )
+        return values, references, permutes, in_shapes, out_shapes, out_lengths
+
+    def _reference(
+        self,
+        values: list[torch.Tensor],
+        permutes: torch.Tensor,
+        output_count: int,
+    ) -> list[torch.Tensor]:
+        groups: list[list[torch.Tensor]] = [[] for _ in range(output_count)]
+        for in_tensor, out_tensor, in_offset, _, length, _ in permutes.tolist():
+            groups[out_tensor].append(
+                values[in_tensor][:, in_offset : in_offset + length]
+            )
+        return [torch.cat(group, dim=1) for group in groups]
+
+    def _assert_gradients_close(
+        self,
+        actual_grads: tuple[torch.Tensor, ...],
+        expected_grads: tuple[torch.Tensor, ...],
+        dtype: torch.dtype,
+    ) -> None:
+        atol = 4 * torch.finfo(dtype).eps
+        for actual, expected in zip(actual_grads, expected_grads):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=atol)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_forward_and_backward(self) -> None:
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            with self.subTest(dtype=dtype):
+                values, references, permutes, in_shapes, out_shapes, out_lengths = (
+                    self._inputs(dtype)
+                )
+                outputs = triton_permute_multi_embedding(
+                    values, permutes, in_shapes, out_shapes, out_lengths
+                )
+                expected = self._reference(references, permutes, len(out_lengths))
+                for output, reference in zip(outputs, expected):
+                    self.assertEqual(output.dtype, dtype)
+                    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+                grad_outputs = [torch.randn_like(output) for output in outputs]
+                actual_grads = torch.autograd.grad(outputs, values, grad_outputs)
+                expected_grads = torch.autograd.grad(expected, references, grad_outputs)
+                self._assert_gradients_close(actual_grads, expected_grads, dtype)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_two_input_two_output_fast_path(self) -> None:
+        batch_size = 16
+        keys = [["f1", "f2"], ["f3"]]
+        lengths = [[3, 4], [5]]
+        groups = [["f1", "f3"], ["f2", "f1"]]
+        values = [
+            torch.randn(
+                batch_size,
+                sum(tensor_lengths),
+                device="cuda",
+                requires_grad=True,
+            )
+            for tensor_lengths in lengths
+        ]
+        references = [value.detach().clone().requires_grad_() for value in values]
+        permutes, in_shapes, out_shapes, out_lengths = _kt_regroup_arguments(
+            values[0], keys, lengths, groups
+        )
+
+        outputs = triton_permute_multi_embedding(
+            values, permutes, in_shapes, out_shapes, out_lengths
+        )
+        expected = self._reference(references, permutes, len(out_lengths))
+        grad_outputs = [torch.randn_like(output) for output in outputs]
+        actual_grads = torch.autograd.grad(outputs, values, grad_outputs)
+        expected_grads = torch.autograd.grad(expected, references, grad_outputs)
+
+        for output, reference in zip(outputs, expected):
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        self._assert_gradients_close(actual_grads, expected_grads, torch.float32)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_noncontiguous_inputs(self) -> None:
+        values, references, permutes, in_shapes, out_shapes, out_lengths = self._inputs(
+            torch.float32, noncontiguous=True
+        )
+        for value in values:
+            self.assertFalse(value.is_contiguous())
+
+        outputs = triton_permute_multi_embedding(
+            values, permutes, in_shapes, out_shapes, out_lengths
+        )
+        expected = self._reference(references, permutes, len(out_lengths))
+        grad_outputs = [torch.randn_like(output) for output in outputs]
+        actual_grads = torch.autograd.grad(outputs, values, grad_outputs)
+        expected_grads = torch.autograd.grad(expected, references, grad_outputs)
+
+        for output, reference in zip(outputs, expected):
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        self._assert_gradients_close(actual_grads, expected_grads, torch.float32)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_compile_forward_and_backward(self) -> None:
+        values, references, permutes, in_shapes, out_shapes, out_lengths = self._inputs(
+            torch.float32
+        )
+        for value in values:
+            torch._dynamo.mark_dynamic(value, 0)
+            torch._dynamo.mark_dynamic(value, 1)
+
+        compiled = torch.compile(
+            triton_permute_multi_embedding,
+            backend="aot_eager",
+            fullgraph=True,
+        )
+        outputs = compiled(values, permutes, in_shapes, out_shapes, out_lengths)
+        expected = self._reference(references, permutes, len(out_lengths))
+        grad_outputs = [torch.randn_like(output) for output in outputs]
+        actual_grads = torch.autograd.grad(outputs, values, grad_outputs)
+        expected_grads = torch.autograd.grad(expected, references, grad_outputs)
+
+        for output, reference in zip(outputs, expected):
+            torch.testing.assert_close(output, reference, rtol=0, atol=0)
+        self._assert_gradients_close(actual_grads, expected_grads, torch.float32)

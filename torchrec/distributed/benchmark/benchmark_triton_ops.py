@@ -49,10 +49,14 @@ from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
     _bounds_check_offsets_kernel,
     _repair_offsets_kernel,
 )
+from torchrec.sparse.jagged_tensor import _kt_regroup_arguments
 from torchrec.sparse.triton_permute_2d import (
     MIN_SEGMENTS,
     PERSEG_MIN_MEAN,
     triton_permute_2d_sparse_data,
+)
+from torchrec.sparse.triton_permute_multi_embedding import (
+    triton_permute_multi_embedding,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -112,6 +116,15 @@ class TritonOpConfig(BenchFuncConfig):
         return {}
 
 
+def _make_benchmark_kwargs(arg: TritonOpConfig, device: torch.device) -> Dict[str, Any]:
+    new_keys = {f.name for f in fields(type(arg))} - {
+        f.name for f in fields(TritonOpConfig)
+    }
+    kwargs: Dict[str, Any] = {key: getattr(arg, key) for key in new_keys}
+    kwargs |= arg.make_inputs(device)
+    return kwargs
+
+
 # single-rank runner
 def single_rank_runner(
     arg: TritonOpConfig,
@@ -132,19 +145,16 @@ def single_rank_runner(
     torch.manual_seed(arg.seed)
     device = torch.device(arg.device_type)
 
-    # Config fields the concrete subclass added are forwarded to the benchmark, the
-    # same way benchmark_comms does; the tensors from make_inputs join them.
-    new_keys = {f.name for f in fields(type(arg))} - {
-        f.name for f in fields(TritonOpConfig)
-    }
-    kwargs: Dict[str, Any] = {k: getattr(arg, k) for k in new_keys}
-    kwargs |= arg.make_inputs(device)
-
     func_name = getattr(bench_func, "__name__", arg.name)
     name: str = f"{func_name}_{arg.name}" if arg.name else func_name
 
-    # Warm up outside the measurement: first call pays Triton JIT compilation.
-    bench_func([], **kwargs)
+    # Warm up outside the measurement, then reconstruct inputs so mutating ops do not
+    # turn a requested dirty-path measurement into a clean-path measurement.
+    warmup_kwargs = _make_benchmark_kwargs(arg, device)
+    bench_func([], **warmup_kwargs)
+    del warmup_kwargs
+    torch.manual_seed(arg.seed)
+    kwargs = _make_benchmark_kwargs(arg, device)
 
     result = benchmark_func(
         bench_inputs=[],
@@ -534,6 +544,141 @@ def permute_2d_fbgemm(
         torch.ops.fbgemm.permute_2D_sparse_data(
             permute, lengths, values, weights, permuted_lengths_sum
         )
+
+
+############################ pooled regroup configs ###################################
+@dataclass
+class RegroupConfig(TritonOpConfig):
+    """Inputs for cached-metadata multi-tensor pooled-embedding regroup."""
+
+    batch_size: int = 1024
+    num_dense_features: int = 20
+    num_sparse_features: int = 1000
+    dense_dim: int = 64
+    sparse_dim: int = 128
+    num_groups: int = 2
+    skipped_features: int = 0
+    duplicate_features: int = 0
+    run_backward: bool = False
+    dtype: str = "float32"
+
+    def make_inputs(self, device: torch.device) -> Dict[str, Any]:
+        dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(self.dtype)
+        if dtype is None:
+            raise ValueError("dtype must be float32, float16, or bfloat16")
+        if self.run_backward and self.skipped_features > 0:
+            raise ValueError(
+                "backward with skipped features has unspecified gradients in the "
+                "FBGEMM-compatible contract"
+            )
+        keys = [
+            [f"dense_{i}" for i in range(self.num_dense_features)],
+            [f"sparse_{i}" for i in range(self.num_sparse_features)],
+        ]
+        lengths = [
+            [self.dense_dim] * self.num_dense_features,
+            [self.sparse_dim] * self.num_sparse_features,
+        ]
+        values = [
+            torch.randn(
+                self.batch_size,
+                sum(tensor_lengths),
+                device=device,
+                dtype=dtype,
+                requires_grad=self.run_backward,
+            )
+            for tensor_lengths in lengths
+        ]
+
+        all_keys = keys[0] + keys[1]
+        if self.skipped_features >= len(all_keys):
+            raise ValueError("skipped_features must leave at least one feature")
+        selected_keys = all_keys[self.skipped_features :]
+        groups: List[List[str]] = [[] for _ in range(self.num_groups)]
+        for index, key in enumerate(selected_keys):
+            groups[index % self.num_groups].append(key)
+        for index in range(self.duplicate_features):
+            groups[index % self.num_groups].append(
+                selected_keys[index % len(selected_keys)]
+            )
+
+        permutes, in_shapes, out_shapes, out_lengths = _kt_regroup_arguments(
+            values[0], keys, lengths, groups
+        )
+        grad_outputs = [
+            torch.randn(self.batch_size, length, device=device, dtype=dtype)
+            for length in out_lengths
+        ]
+        return {
+            "values": values,
+            "permutes": permutes,
+            "in_shapes": in_shapes,
+            "out_shapes": out_shapes,
+            "out_lengths": out_lengths,
+            "grad_outputs": grad_outputs,
+        }
+
+
+def _run_backward(
+    outputs: List[torch.Tensor],
+    values: List[torch.Tensor],
+    grad_outputs: List[torch.Tensor],
+    run_backward: bool,
+) -> None:
+    if run_backward:
+        torch.autograd.grad(outputs, values, grad_outputs)
+
+
+@dataclass
+class RegroupTritonConfig(RegroupConfig):
+    """Benchmark the Triton multi-tensor pooled-embedding regroup."""
+
+
+@register_benchmark(RegroupTritonConfig)
+def regroup_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    values: List[torch.Tensor],
+    permutes: torch.Tensor,
+    in_shapes: torch.Tensor,
+    out_shapes: torch.Tensor,
+    out_lengths: List[int],
+    grad_outputs: List[torch.Tensor],
+    run_backward: bool = False,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_permute_multi_embedding ##"):
+        outputs = triton_permute_multi_embedding(
+            values, permutes, in_shapes, out_shapes, out_lengths
+        )
+        _run_backward(outputs, values, grad_outputs, run_backward)
+
+
+@dataclass
+class RegroupFbgemmConfig(RegroupConfig):
+    """Benchmark the FBGEMM multi-tensor pooled-embedding regroup."""
+
+
+@register_benchmark(RegroupFbgemmConfig)
+def regroup_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    values: List[torch.Tensor],
+    permutes: torch.Tensor,
+    in_shapes: torch.Tensor,
+    out_shapes: torch.Tensor,
+    out_lengths: List[int],
+    grad_outputs: List[torch.Tensor],
+    run_backward: bool = False,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## fbgemm_permute_multi_embedding ##"):
+        outputs = torch.ops.fbgemm.permute_multi_embedding(
+            values, permutes, in_shapes, out_shapes, out_lengths
+        )
+        _run_backward(outputs, values, grad_outputs, run_backward)
 
 
 if __name__ == "__main__":

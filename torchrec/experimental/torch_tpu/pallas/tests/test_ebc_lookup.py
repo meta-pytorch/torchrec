@@ -7,7 +7,7 @@
 
 # pyre-strict
 
-from typing import List
+from typing import Any, Dict, List, Optional
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -103,6 +103,7 @@ def _grouped_config(
     compute_kernel: EmbeddingComputeKernel,
     tables: List[EmbeddingBagConfig],
     pooling: PoolingType,
+    fused_params: Optional[Dict[str, Any]] = None,
 ) -> GroupedEmbeddingConfig:
     sharded = [
         ShardedEmbeddingTable(
@@ -127,6 +128,7 @@ def _grouped_config(
         has_feature_processor=False,
         compute_kernel=compute_kernel,
         embedding_tables=sharded,
+        fused_params=fused_params,
     )
 
 
@@ -176,11 +178,19 @@ class EBCLookupTest(TestCase):
                         EmbeddingComputeKernel.UNFUSED_TPU,
                         TABLES,
                         PoolingType.SUM,
+                        fused_params={
+                            "pooled_lookup_kernel": PooledLookupKernel.BATCHED_OFFSET
+                        },
                     )
                 ],
                 device=torch.device(device),
             )
-        self.assertIsInstance(lookup._emb_modules[0], BatchedTPUEmbeddingBag)
+        kernel = lookup._emb_modules[0]
+        self.assertIsInstance(kernel, BatchedTPUEmbeddingBag)
+        self.assertEqual(kernel.pooled_lookup_kernel, PooledLookupKernel.BATCHED_OFFSET)
+        self.assertTrue(
+            all(weight.requires_grad for weight in kernel.split_embedding_weights())
+        )
 
     @parameterized.expand(DEVICE_KERNEL_CASES)
     def test_forward_matches_embedding_bag_collection(

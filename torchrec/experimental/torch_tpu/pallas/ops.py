@@ -30,6 +30,16 @@ lib.define(
     "Tensor grad_out, Tensor indices, Tensor offsets, "
     "int num_rows, int emb_dim) -> Tensor"
 )
+lib.define(
+    "embedding_pooled_batched_lookup_offset("
+    "Tensor indices, Tensor offsets, Tensor weights, Tensor row_offsets, "
+    "int emb_dim) -> Tensor"
+)
+lib.define(
+    "embedding_pooled_batched_lookup_offset_backward("
+    "Tensor grad_out, Tensor indices, Tensor offsets, Tensor row_offsets, "
+    "int num_rows, int emb_dim) -> Tensor"
+)
 
 
 def embedding_lookup_cpu(
@@ -106,6 +116,41 @@ def embedding_pooled_lookup_offset_backward_cpu(
     )
 
 
+def embedding_pooled_batched_lookup_offset_cpu(
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    weights: torch.Tensor,
+    row_offsets: torch.Tensor,
+    emb_dim: int,
+) -> torch.Tensor:
+    bag_indices = _bag_indices(offsets)
+    active_indices = indices[: bag_indices.numel()]
+    weight_indices = active_indices.long() + row_offsets[bag_indices].long()
+    return weights.new_zeros((offsets.numel() - 1, emb_dim)).index_add_(
+        0,
+        bag_indices,
+        weights[weight_indices],
+    )
+
+
+def embedding_pooled_batched_lookup_offset_backward_cpu(
+    grad_out: torch.Tensor,
+    indices: torch.Tensor,
+    offsets: torch.Tensor,
+    row_offsets: torch.Tensor,
+    num_rows: int,
+    emb_dim: int,
+) -> torch.Tensor:
+    bag_indices = _bag_indices(offsets)
+    active_indices = indices[: bag_indices.numel()]
+    weight_indices = active_indices.long() + row_offsets[bag_indices].long()
+    return grad_out.new_zeros((num_rows, emb_dim)).index_add_(
+        0,
+        weight_indices,
+        grad_out[bag_indices],
+    )
+
+
 lib.impl("embedding_pooled_lookup", embedding_pooled_lookup_cpu, "CPU")
 lib.impl(
     "embedding_pooled_lookup_backward", embedding_pooled_lookup_backward_cpu, "CPU"
@@ -114,6 +159,16 @@ lib.impl("embedding_pooled_lookup_offset", embedding_pooled_lookup_offset_cpu, "
 lib.impl(
     "embedding_pooled_lookup_offset_backward",
     embedding_pooled_lookup_offset_backward_cpu,
+    "CPU",
+)
+lib.impl(
+    "embedding_pooled_batched_lookup_offset",
+    embedding_pooled_batched_lookup_offset_cpu,
+    "CPU",
+)
+lib.impl(
+    "embedding_pooled_batched_lookup_offset_backward",
+    embedding_pooled_batched_lookup_offset_backward_cpu,
     "CPU",
 )
 
@@ -169,6 +224,26 @@ def _pooled_offset_backward(ctx, grad_out: torch.Tensor):  # pyre-ignore[2,3]
     return None, None, grad_weights, None
 
 
+def _setup_pooled_batched_offset_context(ctx, inputs, output) -> None:  # pyre-ignore[2]
+    indices, offsets, weights, row_offsets, emb_dim = inputs
+    ctx.save_for_backward(indices, offsets, row_offsets)
+    ctx.num_rows = weights.shape[0]
+    ctx.emb_dim = emb_dim
+
+
+def _pooled_batched_offset_backward(ctx, grad_out: torch.Tensor):  # pyre-ignore[2,3]
+    indices, offsets, row_offsets = ctx.saved_tensors
+    grad_weights = torch.ops.torchrec.embedding_pooled_batched_lookup_offset_backward(
+        grad_out.contiguous(),
+        indices,
+        offsets,
+        row_offsets,
+        ctx.num_rows,
+        ctx.emb_dim,
+    )
+    return None, None, grad_weights, None, None
+
+
 torch.library.register_autograd(
     "torchrec::embedding_pooled_lookup",
     _pooled_backward,
@@ -178,4 +253,9 @@ torch.library.register_autograd(
     "torchrec::embedding_pooled_lookup_offset",
     _pooled_offset_backward,
     setup_context=_setup_pooled_offset_context,
+)
+torch.library.register_autograd(
+    "torchrec::embedding_pooled_batched_lookup_offset",
+    _pooled_batched_offset_backward,
+    setup_context=_setup_pooled_batched_offset_context,
 )

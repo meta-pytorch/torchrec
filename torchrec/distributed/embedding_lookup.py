@@ -738,6 +738,11 @@ class GroupedPooledEmbeddingsLookup(
                 pg=pg,
                 device=device,
                 sharding_type=sharding_type,
+                pooled_lookup_kernel=(
+                    config.fused_params.get("pooled_lookup_kernel")
+                    if config.fused_params is not None
+                    else None
+                ),
             )
         elif config.compute_kernel in {
             EmbeddingComputeKernel.KEY_VALUE,
