@@ -232,7 +232,7 @@ _MIB: int = 1024 * 1024
 # (human label, bytes) for each swept allreduce message size. Each value is the
 # byte size of the input tensor a single active rank contributes to the
 # allreduce; element count = bytes // dtype.itemsize.
-_MSG_SWEEP_SIZES: list[tuple[str, int]] = [
+_MSG_SWEEP_SIZES_ALL: list[tuple[str, int]] = [
     ("4 KB", 4 * _KIB),
     ("9 KB", 9 * _KIB),
     ("18 KB", 18 * _KIB),
@@ -259,13 +259,56 @@ _MSG_SWEEP_SIZES: list[tuple[str, int]] = [
 
 # Active-rank counts and collectives swept by test_collectives_msg_size_sweep.
 # The sweep prints one table per (collective, active-rank-count) = 8 tables.
-_MSG_SWEEP_ACTIVE_RANKS: tuple[int, ...] = (2, 4)
-_MSG_SWEEP_COLLECTIVES: tuple[str, ...] = (
+_MSG_SWEEP_ACTIVE_RANKS_ALL: tuple[int, ...] = (2, 4)
+_MSG_SWEEP_COLLECTIVES_ALL: tuple[str, ...] = (
     "allreduce",
     "reduce_scatter",
     "all_to_all",
     "all_gather",
 )
+
+
+def _sweep_active_ranks() -> tuple[int, ...]:
+    """Active-rank counts the sweeps cover.
+
+    BENCH_SWEEP_ACTIVE narrows it to a comma-separated subset (e.g. "4") so
+    tuning one variant does not pay for the other seven tables.
+    """
+    want = _env_str("BENCH_SWEEP_ACTIVE", "")
+    if not want:
+        return _MSG_SWEEP_ACTIVE_RANKS_ALL
+    keep = {int(tok) for tok in want.split(",") if tok.strip()}
+    return tuple(a for a in _MSG_SWEEP_ACTIVE_RANKS_ALL if a in keep)
+
+
+def _sweep_collectives() -> tuple[str, ...]:
+    """Collectives the sweeps cover.
+
+    BENCH_SWEEP_ONLY narrows it to a comma-separated subset (e.g.
+    "all_to_all,all_gather"); it is the sweep counterpart of BENCH_ONLY.
+    """
+    want = _env_str("BENCH_SWEEP_ONLY", "")
+    if not want:
+        return _MSG_SWEEP_COLLECTIVES_ALL
+    keep = {tok.strip() for tok in want.split(",") if tok.strip()}
+    return tuple(c for c in _MSG_SWEEP_COLLECTIVES_ALL if c in keep)
+
+
+def _sweep_sizes() -> list[tuple[str, int]]:
+    """Message sizes the sweeps cover.
+
+    BENCH_SWEEP_MIN_MB / BENCH_SWEEP_MAX_MB clip the size axis so a tuning run
+    can spend its time in the regime being tuned. Every worker and every report
+    formatter enumerates this same list, so the per-size result keys stay
+    consistent when it is clipped.
+    """
+    lo = int(_env_float("BENCH_SWEEP_MIN_MB", 0.0) * _MIB)
+    hi = int(_env_float("BENCH_SWEEP_MAX_MB", 0.0) * _MIB)
+    return [
+        entry
+        for entry in _MSG_SWEEP_SIZES_ALL
+        if entry[1] >= lo and (hi == 0 or entry[1] <= hi)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -1888,7 +1931,7 @@ def _msg_sweep_nccl_worker(
     # every group collectively). pgs_by_a[A][rank // A] is this rank's FUSED
     # sub-group.
     pgs_by_a: dict[int, list[dist.ProcessGroup]] = {}
-    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+    for active_ranks in _sweep_active_ranks():
         num_groups = world_size // active_ranks
         groups = [
             list(range(g * active_ranks, (g + 1) * active_ranks))
@@ -1907,11 +1950,11 @@ def _msg_sweep_nccl_worker(
     torch.cuda.synchronize()
     del _wt
 
-    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+    for active_ranks in _sweep_active_ranks():
         pgs = pgs_by_a[active_ranks]
         fused_pg = pgs[rank // active_ranks]
-        for collective in _MSG_SWEEP_COLLECTIVES:
-            for i, (_label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+        for collective in _sweep_collectives():
+            for i, (_label, nbytes) in enumerate(_sweep_sizes()):
                 elements = nbytes // dtype.itemsize
                 if elements % active_ranks != 0:
                     continue
@@ -2015,7 +2058,7 @@ def _msg_sweep_relay_warmup(
     # every (collective, A) warmup config clears the floor (the real sweep starts
     # at 4 KB = 2048 elements, so it is always valid too).
     warm_elems = 2048
-    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+    for active_ranks in _sweep_active_ranks():
         num_chunks = (world_size - active_ranks) + 1
         num_groups = world_size // active_ranks
         my_sparse_group = rank // active_ranks
@@ -2023,7 +2066,7 @@ def _msg_sweep_relay_warmup(
             list(range(g * active_ranks, (g + 1) * active_ranks))
             for g in range(num_groups)
         ]
-        for collective in _MSG_SWEEP_COLLECTIVES:
+        for collective in _sweep_collectives():
             a_in, a_out, bufs = _build_relay_bufs(
                 collective,
                 active_ranks,
@@ -2099,7 +2142,7 @@ def _msg_sweep_relay_worker(
     # collectively.
     rcclx_comm = _setup_rcclx_comm(local_rank, world_size, 0, store)
     fused_by_a: dict[int, Any] = {}
-    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+    for active_ranks in _sweep_active_ranks():
         fused_by_a[active_ranks] = _make_fused(
             rcclx_comm, local_rank, world_size, active_ranks
         )
@@ -2112,10 +2155,10 @@ def _msg_sweep_relay_worker(
     # Pre-compile every distinct HIP kernel config before timing.
     _msg_sweep_relay_warmup(fused_by_a, rank, world_size, dtype, device)
 
-    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+    for active_ranks in _sweep_active_ranks():
         relay_fused = fused_by_a[active_ranks]
-        for collective in _MSG_SWEEP_COLLECTIVES:
-            for i, (_label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+        for collective in _sweep_collectives():
+            for i, (_label, nbytes) in enumerate(_sweep_sizes()):
                 best_f, std_f = _measure_relay_for(
                     collective=collective,
                     active_ranks=active_ranks,
@@ -2199,7 +2242,7 @@ def _format_sweep_table(
         f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} {'Speedup':>9}",
         "-" * width,
     ]
-    for i, (label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+    for i, (label, nbytes) in enumerate(_sweep_sizes()):
         elements = nbytes // dtype.itemsize
         if elements % active_ranks != 0:
             continue
@@ -2217,8 +2260,8 @@ def _print_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> None:
     """Emit one FUSED message-size sweep table per (collective, active-rank-count)
     as a single clean, diffable block (file + atomic stdout write)."""
     lines: list[str] = []
-    for collective in _MSG_SWEEP_COLLECTIVES:
-        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+    for collective in _sweep_collectives():
+        for active_ranks in _sweep_active_ranks():
             lines.extend(
                 _format_sweep_table(results_dict, dtype, collective, active_ranks)
             )
@@ -2365,8 +2408,8 @@ def _parallel_msg_sweep_nccl_worker(
     torch.cuda.synchronize()
 
     key = f"a{active_ranks}"
-    for collective in _MSG_SWEEP_COLLECTIVES:
-        for i, (_label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+    for collective in _sweep_collectives():
+        for i, (_label, nbytes) in enumerate(_sweep_sizes()):
             elements = nbytes // dtype.itemsize
             if elements % active_ranks != 0:
                 continue
@@ -2545,7 +2588,7 @@ def _parallel_relay_warmup_single(
     torch.cuda.synchronize()
     dist.barrier()
     warm_elems = 2048
-    for collective in _MSG_SWEEP_COLLECTIVES:
+    for collective in _sweep_collectives():
         fn = _parallel_relay_single_call(
             collective,
             comm,
@@ -2659,8 +2702,8 @@ def _parallel_msg_sweep_relay_worker(
 
     is_job_rank0 = rank_in_job == active_group[0]
     key = f"a{active_ranks}"
-    for collective in _MSG_SWEEP_COLLECTIVES:
-        for i, (_label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+    for collective in _sweep_collectives():
+        for i, (_label, nbytes) in enumerate(_sweep_sizes()):
             elements = nbytes // dtype.itemsize
             if elements % active_ranks != 0:
                 continue
@@ -2696,11 +2739,11 @@ def _reduce_parallel_jobs_max(results_dict: Any) -> None:
     is the slowest (max) job, so reduce both the relay and NCCL per-job entries
     into the base keys the print/report helpers read.
     """
-    for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+    for active_ranks in _sweep_active_ranks():
         num_jobs = NUM_GPUS // active_ranks
-        for collective in _MSG_SWEEP_COLLECTIVES:
+        for collective in _sweep_collectives():
             key = f"{collective}_a{active_ranks}"
-            for i, (_label, _nbytes) in enumerate(_MSG_SWEEP_SIZES):
+            for i, (_label, _nbytes) in enumerate(_sweep_sizes()):
                 for prefix in ("relay_parallel", "nccl_parallel"):
                     vals = [
                         results_dict.get(f"{prefix}_{key}_{i}_job{j}")
@@ -2738,7 +2781,7 @@ def _format_parallel_sweep_table(
         f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} {'Speedup':>9}",
         "-" * width,
     ]
-    for i, (label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+    for i, (label, nbytes) in enumerate(_sweep_sizes()):
         elements = nbytes // dtype.itemsize
         if elements % active_ranks != 0:
             continue
@@ -2756,8 +2799,8 @@ def _print_parallel_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> N
     """Emit one parallel separate-job table per (collective, active-rank-count) as
     a single clean, diffable block (file + atomic stdout write)."""
     lines: list[str] = []
-    for collective in _MSG_SWEEP_COLLECTIVES:
-        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+    for collective in _sweep_collectives():
+        for active_ranks in _sweep_active_ranks():
             lines.extend(
                 _format_parallel_sweep_table(
                     results_dict, dtype, collective, active_ranks
@@ -2799,7 +2842,7 @@ def _format_single_group_sweep_table(
         f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} {'Speedup':>9}",
         "-" * width,
     ]
-    for i, (label, nbytes) in enumerate(_MSG_SWEEP_SIZES):
+    for i, (label, nbytes) in enumerate(_sweep_sizes()):
         elements = nbytes // dtype.itemsize
         if elements % active_ranks != 0:
             continue
@@ -2817,8 +2860,8 @@ def _print_single_group_msg_sweep_report(results_dict: Any, dtype: torch.dtype) 
     """Emit one single-group best-case table per (collective, active-rank-count)
     as a single clean, diffable block (file + atomic stdout write)."""
     lines: list[str] = []
-    for collective in _MSG_SWEEP_COLLECTIVES:
-        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+    for collective in _sweep_collectives():
+        for active_ranks in _sweep_active_ranks():
             lines.extend(
                 _format_single_group_sweep_table(
                     results_dict, dtype, collective, active_ranks
@@ -2894,7 +2937,7 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
     def test_collectives_msg_size_sweep(self) -> None:
         """All-collective, 2- & 4-rank sharded relay message-size sweep (bf16).
 
-        Sweeps the fixed message sizes in _MSG_SWEEP_SIZES for every collective
+        Sweeps the fixed message sizes in _MSG_SWEEP_SIZES_ALL for every collective
         (allreduce, reduce-scatter, all-to-all, all-gather) at both 2 and 4
         active ranks and, per size, reports the sharded-relay FUSED speedup over
         NCCL (one table per (collective, active-rank-count)):
@@ -2996,7 +3039,7 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
         # relay vs NCCL isolates the collective algorithm rather than the
         # deployment topology or the measurement harness. Per A, run the NCCL
         # baseline then the relay.
-        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+        for active_ranks in _sweep_active_ranks():
             num_jobs = NUM_GPUS // active_ranks
             total_procs = num_jobs * NUM_GPUS
             mp.spawn(
@@ -3051,7 +3094,7 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
         # One job only: total_procs = NUM_GPUS -> num_jobs = 1 in both workers,
         # so the single A-rank group [0..A-1] is the only workload on the host
         # (the other 8-A ranks are helpers/idle). Per A, run NCCL then relay.
-        for active_ranks in _MSG_SWEEP_ACTIVE_RANKS:
+        for active_ranks in _sweep_active_ranks():
             total_procs = NUM_GPUS
             mp.spawn(
                 _parallel_msg_sweep_nccl_worker,
