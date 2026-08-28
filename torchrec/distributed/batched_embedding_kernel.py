@@ -11,6 +11,7 @@ import abc
 import copy
 import inspect
 import itertools
+import json
 import logging
 import tempfile
 from dataclasses import dataclass
@@ -200,6 +201,39 @@ class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
         return self._shard_buf
 
 
+def _decode_res_enabled_tables(encoded: Optional[str]) -> Optional[List[str]]:
+    """Decode the ``res_enabled_tables`` fused param.
+
+    Two encodings are accepted, because the producer opts in to the second one
+    per model and this has to stay backward compatible with the first:
+
+    - Comma-joined, e.g. ``'a,b'`` -- the original encoding, still the default.
+    - JSON list, e.g. ``'["a", "b"]'`` -- needed because some table names are
+      feature-store derived and contain a comma, which comma-joining splits
+      into two names that match nothing.
+
+    A JSON list always starts with ``[``. Table names are feature-store
+    identifiers and never do, so the prefix discriminates the two without a
+    second fused param -- an unrecognised key would survive into the TBE
+    constructor and raise TypeError there.
+    """
+    if encoded is None:
+        return None
+    if not encoded.startswith("["):
+        return encoded.split(",")
+    decoded = json.loads(encoded)
+    # Fail loudly on a malformed list. Non-string elements would compare unequal
+    # to every table name and disable streaming silently, which is the failure
+    # this decoding exists to remove.
+    if not isinstance(decoded, list) or not all(
+        isinstance(name, str) for name in decoded
+    ):
+        raise ValueError(
+            f"{RES_ENABLED_TABLES_STR} must be a JSON list of strings, got {encoded!r}"
+        )
+    return decoded
+
+
 def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParams]:
     # populate res_params, which is used for raw embedding streaming
     # here only populates the params available in fused_params and TBE configs
@@ -235,11 +269,8 @@ def _populate_res_params(config: GroupedEmbeddingConfig) -> Tuple[bool, RESParam
         del fused_params[RES_NUM_HBM_COPY_THREADS_STR]
     res_enabled_tables: Optional[List[str]] = None
     if RES_ENABLED_TABLES_STR in fused_params:
-        res_enabled_tables = (
-            # pyrefly: ignore [missing-attribute]
-            fused_params.get(RES_ENABLED_TABLES_STR).split(",")
-            if fused_params.get(RES_ENABLED_TABLES_STR) is not None
-            else None
+        res_enabled_tables = _decode_res_enabled_tables(
+            fused_params.get(RES_ENABLED_TABLES_STR)
         )
         del fused_params[RES_ENABLED_TABLES_STR]
     enable_raw_embedding_streaming: Optional[bool] = None
