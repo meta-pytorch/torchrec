@@ -836,7 +836,18 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out], AsyncInplaceCopyMixin[In])
     def _wait_for_batch(self) -> None:
         batch_id = self.contexts[0].index if len(self.contexts) > 0 else "?"
         with record_function(f"## wait_for_batch {batch_id} ##"):
-            _wait_for_batch(cast(In, self.batches[0]), self._data_dist_stream)
+            _wait_for_batch(
+                cast(In, self.batches[0]),
+                self._data_dist_stream,
+                # Under in-place copy the batch is allocated on the caller's current
+                # stream, which is the same stream consuming it here -- so the
+                # allocator ignores this record_stream anyway (it early-returns for
+                # uses on a block's own allocation stream). Skipping it drops ~780
+                # no-op calls per leaf tensor per step. Mirrors TrainPipelineBase.
+                # The gate is load-bearing: without in-place copy the destination is
+                # allocated on the memcpy stream and the registration IS required.
+                record_stream=not self._enable_inplace_copy_batch,
+            )
 
     def _backward(self, losses: torch.Tensor) -> None:
         batch_id = self.contexts[0].index if len(self.contexts) > 0 else "?"
