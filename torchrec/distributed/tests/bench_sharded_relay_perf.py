@@ -69,6 +69,14 @@ Environment variables (all optional):
     BENCH_WARMUP_ITERS   int              (default: 10)
     BENCH_BENCH_ITERS    int              (default: 20)
     BENCH_LOG_SIZES      1                (print sizes and exit; for calibration)
+    BENCH_SWEEP_CONTEND  1                (stream GEMMs alongside each timed
+                                          collective and report the throughput
+                                          they achieve, so a comms change can be
+                                          judged on its effect on the compute it
+                                          is meant to overlap with, not just on
+                                          collective time)
+    BENCH_CONTEND_DIM    int              (default: 4096; GEMM size for the above)
+    BENCH_CONTEND_GEMMS  int              (default: 8; GEMMs per timed iteration)
 
 The benchmark automatically sweeps BOTH 2-active and 4-active sharded relay
 groups and prints a full report for each. The 4-active sweep covers all four
@@ -666,6 +674,71 @@ def bench_nccl_baseline(
 # ---------------------------------------------------------------------------
 
 
+class _ComputeProbe:
+    """Keeps a GEMM stream busy so a collective is timed under compute load.
+
+    An isolated collective benchmark cannot see the cost that matters most in a
+    real job: whether a comms optimization steals CUs or hardware queues from
+    the compute it is supposed to be overlapping with. This probe streams GEMMs
+    on a separate stream across each timed iteration and reports the throughput
+    they achieved, so a change can be judged on BOTH numbers -- collective time
+    and contending compute rate -- instead of only the first.
+
+    Enable with BENCH_SWEEP_CONTEND=1. BENCH_CONTEND_DIM and BENCH_CONTEND_GEMMS
+    size the load. Compare arms with identical settings; the absolute TFLOP/s is
+    not a peak-throughput claim, it is a relative yardstick between arms.
+    """
+
+    def __init__(self, device: torch.device, dim: int, gemms: int) -> None:
+        self.stream: torch.cuda.Stream = torch.cuda.Stream()
+        self.gemms = gemms
+        self.a: torch.Tensor = torch.randn(
+            dim, dim, device=device, dtype=torch.bfloat16
+        )
+        self.b: torch.Tensor = torch.randn(
+            dim, dim, device=device, dtype=torch.bfloat16
+        )
+        self.c: torch.Tensor = torch.empty(
+            dim, dim, device=device, dtype=torch.bfloat16
+        )
+        self.flops_per_iter: float = 2.0 * float(dim) ** 3 * float(gemms)
+        self._start: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
+        self._end: torch.cuda.Event = torch.cuda.Event(enable_timing=True)
+        self._ms: list[float] = []
+
+    @classmethod
+    def maybe_create(cls) -> _ComputeProbe | None:
+        if _env_int("BENCH_SWEEP_CONTEND", 0) == 0:
+            return None
+        if not torch.cuda.is_available():
+            return None
+        return cls(
+            torch.device("cuda", torch.cuda.current_device()),
+            _env_int("BENCH_CONTEND_DIM", 4096),
+            _env_int("BENCH_CONTEND_GEMMS", 8),
+        )
+
+    def begin(self) -> None:
+        """Launch the contending load; returns without waiting for it."""
+        with torch.cuda.stream(self.stream):
+            self._start.record()
+            for _ in range(self.gemms):
+                torch.mm(self.a, self.b, out=self.c)
+            self._end.record()
+
+    def end(self) -> None:
+        """Wait for the contending load and record what it achieved."""
+        self._end.synchronize()
+        self._ms.append(self._start.elapsed_time(self._end))
+
+    def report(self) -> str:
+        if not self._ms:
+            return ""
+        best = min(self._ms)
+        tflops = self.flops_per_iter / (best * 1e-3) / 1e12
+        return f"[contend] compute {best:.3f} ms/iter  {tflops:.1f} TFLOP/s"
+
+
 def _measure_ms(
     fn: Any,
     warmup: int,
@@ -725,6 +798,7 @@ def _measure_ms(
 
     start_ev = torch.cuda.Event(enable_timing=True)
     end_ev = torch.cuda.Event(enable_timing=True)
+    probe = _ComputeProbe.maybe_create()
     n_reps = max(1, reps)
     rep_bests: list[float] = []
     last_std = 0.0
@@ -734,14 +808,25 @@ def _measure_ms(
             # Align all ranks' starts; excluded from the timed region below.
             _align()
             torch.cuda.synchronize()
+            # Started after the sync so the load overlaps the timed region
+            # rather than being waited on before it.
+            if probe is not None:
+                probe.begin()
             start_ev.record()
             fn()
             end_ev.record()
             end_ev.synchronize()
             times.append(start_ev.elapsed_time(end_ev))
+            if probe is not None:
+                probe.end()
         rep_bests.append(min(times))
         mean = sum(times) / len(times)
         last_std = (sum((x - mean) ** 2 for x in times) / len(times)) ** 0.5
+
+    if probe is not None:
+        line = probe.report()
+        if line:
+            print(line, flush=True)
 
     if n_reps == 1:
         return rep_bests[0], last_std
