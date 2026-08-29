@@ -176,6 +176,16 @@ class ShardedQuantEmbeddingModuleState(
                 # end of weight shards section
 
                 # weight_qscale & weight_qbias section:
+                if (tbe_split_qscale is None) != (tbe_split_qbias is None):
+                    raise RuntimeError(
+                        "Quantized table must provide both qscale and qbias: "
+                        f"table={table.name}, data_type={table.data_type}, "
+                        f"qscale_is_none={tbe_split_qscale is None}, "
+                        f"qbias_is_none={tbe_split_qbias is None}"
+                    )
+                if tbe_split_qscale is None:
+                    continue
+
                 # For RW - ShardedTensorBase
                 # For CW - List[Tensor] that logically corresponds to the same unsharded Tensor, but present on each sharded rank
                 for (
