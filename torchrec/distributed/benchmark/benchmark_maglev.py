@@ -323,6 +323,8 @@ def _make_input(
         weighted_tables=[],
         num_float_features=num_float_features,
         device=device,
+        # Citrine C0: pin host input memory for efficient CPU-to-GPU transfer.
+        pin_memory=True,
     )
 
 
@@ -428,17 +430,18 @@ def runner(
         )
         pipeline = run_option.generate_pipeline(stage=stage, optimizer=optimizer)
 
-        # One batch, replayed forever: data loading is not what we benchmark, so
-        # the dataloader hands back the same pre-built batch every round and only
-        # the input-dist all-to-all inside progress() is measured. A batch here is
-        # one ModelInput per layer of the whole model, which is what the model's
-        # (passthrough) preproc consumes.
+        # One CPU batch, replayed forever: data loading is not what we benchmark,
+        # so the dataloader hands back the same pre-built batch every round. A
+        # batch here is one ModelInput per layer of the whole model, which is what
+        # the model's (passthrough) preproc consumes. Input distribution owns the
+        # H2D copy, as it does for a real dataloader.
+        cpu_device = torch.device("cpu")
         model_input = [
             _make_input(
                 all_tables[l],
                 run_option.batch_size,
                 run_option.num_float_features,
-                device,
+                cpu_device,
             )
             for l in range(num_layers)
         ]

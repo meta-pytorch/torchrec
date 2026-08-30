@@ -16,7 +16,6 @@ wire between stages. The authoring side is in
 :mod:`torchrec.distributed.maglev.module`.
 """
 
-import abc
 from collections import deque
 from typing import Any, Callable, cast, Deque, Iterator, List, Optional, Sequence, Tuple
 
@@ -589,6 +588,7 @@ class StageWrapper(nn.Module):
         """
         init_parameters(self.module, device)
         self.device = device
+        self._input_driver.set_device(device)
         return self
 
     @property
