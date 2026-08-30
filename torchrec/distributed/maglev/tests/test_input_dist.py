@@ -9,20 +9,16 @@
 
 import unittest
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
 from torchrec.distributed.maglev.input_dist import (
     flatten_to_tensors,
     input_data_dist,
-    input_dist,
     input_size_dist,
     unflatten_from_tensors,
-)
-from torchrec.distributed.test_utils.multi_process import (
-    MultiProcessContext,
-    MultiProcessTestBase,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -190,61 +186,8 @@ def _make_carrier(src: int, dst: int) -> _Batch:
     )
 
 
-def _run_all_to_all(rank: int, world_size: int) -> None:
-    with MultiProcessContext(rank=rank, world_size=world_size, backend="gloo") as ctx:
-        pg = ctx.pg
-        assert pg is not None
-
-        send = [_make_carrier(src=rank, dst=dst) for dst in range(world_size)]
-        # Structure/dtype template; its sizes and content are irrelevant.
-        example = _make_carrier(src=0, dst=0)
-        example.tag = "from_example"
-
-        # gloo stands in for nccl here: all_to_all_single is backend-agnostic, so
-        # the same group drives both the size and the data phase in the test.
-        recv = input_dist(send, example, pg_gloo=pg, pg_nccl=pg).wait()
-
-        assert (
-            len(recv) == world_size
-        ), f"expected {world_size} carriers, got {len(recv)}"
-        for src in range(world_size):
-            expected = _make_carrier(src=src, dst=rank)
-            got = recv[src]
-            torch.testing.assert_close(got.dense, expected.dense)
-            torch.testing.assert_close(got.label, expected.label)
-            torch.testing.assert_close(got.ids, expected.ids)
-            assert got.ids.dtype == torch.int32
-            assert len(got.extras) == 2
-            for g_t, e_t in zip(got.extras, expected.extras):
-                torch.testing.assert_close(g_t, e_t)
-            torch.testing.assert_close(got.meta["m"], expected.meta["m"])
-            assert got.features.keys() == ["f1", "f2"]
-            torch.testing.assert_close(
-                got.features.values(), expected.features.values()
-            )
-            torch.testing.assert_close(
-                got.features.lengths(), expected.features.lengths()
-            )
-            # non-tensor leaf comes from the example, not the sender.
-            assert got.tag == "from_example", got.tag
-
-
-class InputAllToAllTest(MultiProcessTestBase):
-    def test_all_to_all_roundtrip(self) -> None:
-        self._run_multi_process_test(
-            callable=_run_all_to_all,
-            world_size=4,
-        )
-
-
 class InputDistInProcessTest(unittest.TestCase):
-    """In-process (single-rank, gloo) coverage of the dist entry points.
-
-    A ``world_size == 1`` all-to-all is the identity (``send[0]`` -> self), so this
-    exercises ``input_size_dist`` / ``input_data_dist`` / ``input_dist`` and their
-    awaitables in the test process (unlike the multi-process test, whose spawned
-    workers run outside coverage) without needing more than one rank.
-    """
+    """Single-rank coverage for size exchange and CUDA data distribution."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -256,80 +199,85 @@ class InputDistInProcessTest(unittest.TestCase):
         dist.destroy_process_group()
         super().tearDown()
 
-    def test_input_dist_single_rank(self) -> None:
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_input_size_dist_copies_into_fused_gpu_buffers(self) -> None:
         pg = dist.group.WORLD
         assert pg is not None
+        device = torch.device("cuda")
+        memcpy_stream = torch.cuda.Stream(device=device)
         send = [_make_carrier(src=0, dst=0)]
         example = _make_carrier(src=0, dst=0)
-        example.tag = "from_example"
+        source_tensors = flatten_to_tensors(send[0])
 
-        recv = input_dist(send, example, pg_gloo=pg, pg_nccl=pg).wait()
+        (
+            in_bufs,
+            in_splits_by_bucket,
+            size_awaitable,
+            example_flat,
+            copy_done_event,
+        ) = input_size_dist(send, example, pg, device, memcpy_stream)
+        recv_sizes = size_awaitable.wait()
+        copy_done_event.synchronize()
 
-        self.assertEqual(len(recv), 1)
-        got = recv[0]
-        torch.testing.assert_close(got.dense, send[0].dense)
-        torch.testing.assert_close(got.label, send[0].label)
-        torch.testing.assert_close(got.ids, send[0].ids)
-        self.assertEqual(got.ids.dtype, torch.int32)
-        torch.testing.assert_close(got.features.values(), send[0].features.values())
-        torch.testing.assert_close(got.features.lengths(), send[0].features.lengths())
-        self.assertEqual(got.tag, "from_example")
+        self.assertEqual(recv_sizes[0], [tensor.shape[0] for tensor in source_tensors])
+        self.assertEqual(len(example_flat), len(source_tensors))
+        expected_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = {}
+        for tensor in source_tensors:
+            expected_by_dtype.setdefault(tensor.dtype, []).append(tensor.reshape(-1))
+        self.assertEqual(len(in_bufs), len(expected_by_dtype))
+        for in_buf, in_splits, parts in zip(
+            in_bufs,
+            in_splits_by_bucket,
+            expected_by_dtype.values(),
+        ):
+            self.assertEqual(in_buf.device.type, "cuda")
+            self.assertEqual(in_splits, [sum(part.numel() for part in parts)])
+            torch.testing.assert_close(in_buf.cpu(), torch.cat(parts))
 
-    def test_ragged_carriers(self) -> None:
-        """A carrier may have more slots than the example, if its peer expects them.
-
-        The maglev case: with a non-uniform cut like ``[2, 3]``, the carrier a rank
-        sends to a 3-layer stage flattens to more tensors than the one it sends to a
-        2-layer stage. Only what this rank *receives* has to match its example.
-        """
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    @patch("torchrec.distributed.maglev.input_dist.dist.all_to_all_single")
+    def test_input_data_dist_uses_pp_stream(self, all_to_all_single: Any) -> None:
         pg = dist.group.WORLD
         assert pg is not None
-        # world_size == 1, so this rank sends to itself: the carrier it sends must
-        # match its own example. Make both two carriers deep to prove the flat
-        # (rather than rectangular) size exchange round-trips a multi-slot carrier.
-        send = [[_make_carrier(src=0, dst=0), _make_carrier(src=0, dst=1)]]
-        example = [_make_carrier(src=0, dst=0), _make_carrier(src=0, dst=1)]
+        device = torch.device("cuda")
+        pp_data_dist_stream = torch.cuda.Stream(device=device)
+        source = _make_carrier(src=0, dst=0)
+        source_tensors = flatten_to_tensors(source)
+        tensors_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = {}
+        for tensor in source_tensors:
+            tensors_by_dtype.setdefault(tensor.dtype, []).append(tensor.reshape(-1))
+        in_bufs = [torch.cat(parts).to(device) for parts in tensors_by_dtype.values()]
+        in_splits_by_bucket = [[in_buf.numel()] for in_buf in in_bufs]
+        recv_sizes = [[tensor.shape[0] for tensor in source_tensors]]
 
-        flat_send, recv_sizes = input_size_dist(send, example, pg).wait()
-        # Sizes come back reshaped to [source rank][slot], covering both carriers.
-        self.assertEqual(len(recv_sizes), 1)
-        self.assertEqual(len(recv_sizes[0]), len(flat_send[0]))
-        self.assertEqual(recv_sizes[0], [t.shape[0] for t in flat_send[0]])
+        copy_done_event = torch.cuda.Event()
+        copy_done_event.record(torch.cuda.current_stream(device))
 
-        recv = input_data_dist(flat_send, recv_sizes, example, pg).wait()
-        self.assertEqual(len(recv), 1)
-        self.assertEqual(len(recv[0]), 2)
-        for got, expected in zip(recv[0], send[0]):
-            torch.testing.assert_close(got.dense, expected.dense)
-            torch.testing.assert_close(got.ids, expected.ids)
-            torch.testing.assert_close(
-                got.features.values(), expected.features.values()
-            )
+        def _all_to_all(
+            out_buf: torch.Tensor,
+            in_buf: torch.Tensor,
+            out_splits: List[int],
+            in_splits: List[int],
+            group: dist.ProcessGroup,
+            async_op: bool,
+        ) -> None:
+            self.assertFalse(async_op)
+            self.assertEqual(torch.cuda.current_stream(device), pp_data_dist_stream)
+            self.assertEqual(out_splits, in_splits)
+            out_buf.copy_(in_buf)
 
-    def test_send_dtype_absent_from_example_is_rejected(self) -> None:
-        """A carrier may differ from the example in slot count, not in dtypes."""
-        pg = dist.group.WORLD
-        assert pg is not None
-        send = [_make_carrier(src=0, dst=0)]
-        example = _make_carrier(src=0, dst=0)
-        # float64 appears in no bucket the example defines.
-        send[0].extras = [t.to(torch.float64) for t in send[0].extras]
+        all_to_all_single.side_effect = _all_to_all
 
-        flat_send, recv_sizes = input_size_dist(send, example, pg).wait()
-        with self.assertRaisesRegex(ValueError, "which the example does not have"):
-            input_data_dist(flat_send, recv_sizes, example, pg)
+        (received,) = input_data_dist(
+            in_bufs,
+            in_splits_by_bucket,
+            recv_sizes,
+            source,
+            source_tensors,
+            pg,
+            pp_data_dist_stream=pp_data_dist_stream,
+            copy_done_event=copy_done_event,
+        ).wait()
 
-    def test_size_then_data_phase(self) -> None:
-        pg = dist.group.WORLD
-        assert pg is not None
-        send = [_make_carrier(src=0, dst=0)]
-        example = _make_carrier(src=0, dst=0)
-
-        flat_send, recv_sizes = input_size_dist(send, example, pg).wait()
-        # One carrier -> one row; sizes match the flattened tensors' dim-0.
-        self.assertEqual(len(recv_sizes), 1)
-        self.assertEqual(recv_sizes[0], [t.shape[0] for t in flat_send[0]])
-
-        recv = input_data_dist(flat_send, recv_sizes, example, pg).wait()
-        self.assertEqual(len(recv), 1)
-        torch.testing.assert_close(recv[0].dense, send[0].dense)
+        for expected, actual in zip(source_tensors, flatten_to_tensors(received)):
+            torch.testing.assert_close(actual.cpu(), expected)

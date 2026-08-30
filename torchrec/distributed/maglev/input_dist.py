@@ -20,7 +20,18 @@ over CPU/gloo, then bulk tensors over nccl -- both async, returning a
 import math
 from collections import deque
 from dataclasses import fields, is_dataclass
-from typing import Any, Callable, Deque, Dict, Generic, Iterator, List, Tuple, TypeVar
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    Generic,
+    Iterator,
+    List,
+    Optional,
+    Tuple,
+    TypeVar,
+)
 
 import torch
 import torch.distributed as dist
@@ -167,56 +178,87 @@ def _next(it: Iterator[torch.Tensor]) -> torch.Tensor:
         ) from None
 
 
-class _InputSizeAwaitable(
-    LazyAwaitable[Tuple[List[List[torch.Tensor]], List[List[int]]]]
-):
+def inplace_copy_to_gpu(
+    source_tensors: List[torch.Tensor],
+    destination_tensors: List[torch.Tensor],
+    memcpy_stream: torch.Stream,
+) -> None:
+    """Copy flattened CPU tensors into preallocated GPU tensors.
+
+    The dedicated memcpy stream waits for the current stream, which allocated the
+    destination storage, before issuing the nonblocking ``copy_`` operations.
+
+    The caller is responsible for making the consuming stream wait for
+    ``memcpy_stream`` before reading the destination tensors.
+    """
+    device = destination_tensors[0].device
+    device_module = torch.get_device_module(device)
+    current_stream = device_module.current_stream(device)
+    with record_function("## inplace_copy_to_gpu ##"):
+        with device_module.stream(memcpy_stream):
+            memcpy_stream.wait_stream(current_stream)
+            for destination, source in zip(destination_tensors, source_tensors):
+                destination.copy_(source, non_blocking=True)
+
+
+class _InputSizeAwaitable(LazyAwaitable[List[List[int]]]):
     """Awaitable for the size-metadata all-to-all (:func:`input_size_dist`).
 
-    ``wait()`` completes the async exchange and returns ``(flat_send, recv_sizes)``:
-    the flattened send tensors (available immediately, threaded through so phase two
-    need not re-flatten) and ``recv_sizes[i][k]`` -- the dim-0 size of slot ``k`` of
-    the carrier rank ``i`` is sending to this rank. The sizes arrive flat and are
-    reshaped to ``[world_size, recv_slots]`` here.
+    ``wait()`` completes the async size exchange and returns ``recv_sizes``, where
+    ``recv_sizes[i][k]`` is the dim-0 size of slot ``k`` of the carrier rank ``i``
+    is sending to this rank.
     """
 
     def __init__(
         self,
-        # pyre-ignore[2]: dist work handle has no public type
-        work: Any,
         flat_send: List[List[torch.Tensor]],
-        recv_sizes: torch.Tensor,
         recv_slots: int,
+        world_size: int,
+        pg_gloo: dist.ProcessGroup,
         batch_id: int,
     ) -> None:
         super().__init__()
-        self._work = work
-        self._flat_send = flat_send
-        self._recv_sizes = recv_sizes
         self._recv_slots = recv_slots
         self._batch_id = batch_id
+        send_sizes = torch.tensor(
+            [tensor.shape[0] for tensors in flat_send for tensor in tensors],
+            dtype=torch.int64,
+        )
+        in_splits = [len(tensors) for tensors in flat_send]
+        out_splits = [recv_slots] * world_size
+        self._recv_sizes = torch.empty(recv_slots * world_size, dtype=torch.int64)
+        with record_function(f"## input_size_dist batch{batch_id} ##"):
+            self._work = dist.all_to_all_single(
+                self._recv_sizes,
+                send_sizes,
+                out_splits,
+                in_splits,
+                group=pg_gloo,
+                async_op=True,
+            )
 
-    def _wait_impl(self) -> Tuple[List[List[torch.Tensor]], List[List[int]]]:
+    def _wait_impl(self) -> List[List[int]]:
         with record_function(f"## input_size_dist wait batch{self._batch_id} ##"):
             if self._work is not None:
                 self._work.wait()
             # Flat on the wire, [source rank][slot] to the caller.
-            return self._flat_send, self._recv_sizes.view(-1, self._recv_slots).tolist()
+            return self._recv_sizes.view(-1, self._recv_slots).tolist()
 
 
 class _InputDataAwaitable(LazyAwaitable[List[T]]):
     """Awaitable for the bulk tensor all-to-all (:func:`input_data_dist`).
 
-    ``wait()`` completes the per-dtype async exchanges, slices each fused receive
-    buffer back into its tensor slots, then regroups them per source rank and
-    reconstructs each carrier from ``example``.
+    ``wait()`` orders the caller's current stream after ``pp_data_dist_stream``,
+    slices each fused receive buffer back into its tensor slots, then regroups
+    them per source rank and reconstructs each carrier from ``example``.
     """
 
     def __init__(
         self,
-        # pyre-ignore[2]: dist work handles have no public type
-        works: List[Any],
         out_bufs: List[torch.Tensor],
         in_bufs: List[torch.Tensor],
+        out_splits_by_bucket: List[List[int]],
+        in_splits_by_bucket: List[List[int]],
         bucket_slots: List[List[int]],
         recv_sizes: List[List[int]],
         row_elems: List[int],
@@ -224,10 +266,34 @@ class _InputDataAwaitable(LazyAwaitable[List[T]]):
         example: T,
         world_size: int,
         num_tensors: int,
+        device: torch.device,
+        pg_nccl: dist.ProcessGroup,
+        pp_data_dist_stream: torch.Stream,
         batch_id: int,
     ) -> None:
         super().__init__()
-        self._works = works
+        device_module = torch.get_device_module(device)
+        data_done_event = device_module.Event()
+        with device_module.stream(pp_data_dist_stream):
+            for out_buf, in_buf, out_splits, in_splits in zip(
+                out_bufs,
+                in_bufs,
+                out_splits_by_bucket,
+                in_splits_by_bucket,
+            ):
+                with record_function(
+                    f"## input_data_dist batch{batch_id} {out_buf.dtype} ##"
+                ):
+                    dist.all_to_all_single(
+                        out_buf,
+                        in_buf,
+                        out_splits,
+                        in_splits,
+                        group=pg_nccl,
+                        async_op=False,
+                    )
+            data_done_event.record(pp_data_dist_stream)
+
         self._out_bufs = out_bufs
         # Held only to keep the send buffers alive until the collectives complete.
         self._in_bufs = in_bufs
@@ -239,12 +305,15 @@ class _InputDataAwaitable(LazyAwaitable[List[T]]):
         self._world_size = world_size
         self._num_tensors = num_tensors
         self._batch_id = batch_id
+        self._device = device
+        self._data_done_event = data_done_event
 
     def _wait_impl(self) -> List[T]:
         with record_function(f"## input_data_dist wait batch{self._batch_id} ##"):
-            for work in self._works:
-                if work is not None:
-                    work.wait()
+            current_stream = torch.get_device_module(self._device).current_stream(
+                self._device
+            )
+            current_stream.wait_event(self._data_done_event)
             # recv_slot[(k, i)] = slot k of the carrier received from rank i. Each
             # fused buffer is laid out source-major then slot-major, matching the
             # destination-major / slot-major send layout in input_data_dist.
@@ -270,182 +339,220 @@ def input_size_dist(
     send: List[T],
     example: T,
     pg_gloo: dist.ProcessGroup,
+    device: torch.device,
+    memcpy_stream: torch.Stream,
     batch_id: int = 0,
-) -> LazyAwaitable[Tuple[List[List[torch.Tensor]], List[List[int]]]]:
-    """Phase one: flatten each carrier and async all-to-all the tensor-size metadata.
+) -> Tuple[
+    List[torch.Tensor],
+    List[List[int]],
+    _InputSizeAwaitable,
+    List[torch.Tensor],
+    Any,
+]:
+    """Flatten and copy the input, then exchange tensor-size metadata.
 
-    ``send`` must have one carrier per rank in ``pg_gloo`` (``send[j]`` is destined
-    for rank ``j``), and each must have the structure *that destination* expects --
-    which is what ``example`` describes locally. Carriers may therefore differ in
-    tensor count between destinations: a rank sending a 2-slot carrier to one peer
-    and a 3-slot carrier to another is fine, as long as each peer's own example
-    agrees. What is *received* is always homogeneous, since every incoming carrier
-    is built for this rank.
+    ``send`` must have one carrier per rank in ``pg_gloo``. Each carrier is
+    flattened and grouped by dtype. One fused GPU input buffer is allocated per
+    dtype, and the CPU tensors are copied directly into views of those buffers on
+    ``memcpy_stream``. The CPU dim-0 sizes are exchanged asynchronously over gloo
+    while that copy is in flight.
 
     Only each tensor's dim-0 size varies; trailing dims and dtype are fixed per
-    slot and recovered from the example in phase two. This issues an async
-    all-to-all of the dim-0 sizes over the (cheap, CPU) gloo group -- ragged on the
-    way out (``input_split_sizes`` is each carrier's tensor count) and rectangular
-    on the way back (every peer sends this rank ``K`` sizes, ``K`` taken from
-    ``example``) -- so every rank learns the sizes of the tensors it is about to
-    receive.
+    slot and recovered from ``example`` in :func:`input_data_dist`.
 
     Args:
         send: one carrier per destination rank; ``send[j]`` goes to rank ``j``.
-        example: template carrier for what this rank *receives*; its tensor count
-            fixes how many sizes to expect from each peer.
+        example: template carrier defining the received structure and tensor slots.
         pg_gloo: a gloo process group used only for the tiny size exchange.
+        device: CUDA device for the copied input tensors.
+        memcpy_stream: dedicated stream for the CPU-to-GPU copy.
         batch_id: identifier for this input batch, used only to tag the profiler
             ranges (``## input_size_dist batch{batch_id} ##``).
 
     Returns:
-        A :class:`LazyAwaitable` whose ``wait()`` yields ``(flat_send, recv_sizes)``:
-        ``flat_send[j]`` is the flattened tensors of ``send[j]`` (threaded through so
-        phase two need not re-flatten), and ``recv_sizes[i][k]`` is the dim-0 size of
-        slot ``k`` of the carrier rank ``i`` is sending to this rank.
+        The fused GPU input buffers, their per-destination split sizes, the size-
+        exchange awaitable, flattened example tensors, and copy-completion event
+        consumed by :func:`input_data_dist`.
 
     Raises:
-        ValueError: if ``len(send)`` does not match the group size.
+        ValueError: if ``device`` is not CUDA or ``len(send)`` does not match the
+            group size.
     """
+    if device.type != "cuda":
+        raise ValueError(f"input_size_dist requires a CUDA device, got {device}")
+
     world_size = dist.get_world_size(pg_gloo)
     if len(send) != world_size:
         raise ValueError(
             f"expected one carrier per rank: got {len(send)} for world size "
             f"{world_size}"
         )
-    flat_send: List[List[torch.Tensor]] = [flatten_to_tensors(item) for item in send]
-    # Every carrier this rank receives is built for this rank, so they all have the
-    # example's slot count -- the receive side stays rectangular even when the send
-    # side is ragged.
-    recv_slots = len(flatten_to_tensors(example))
 
-    with record_function(f"## input_size_dist batch{batch_id} ##"):
-        send_sizes = torch.tensor(
-            [t.shape[0] for tensors in flat_send for t in tensors],
-            dtype=torch.int64,
-        )
-        in_splits = [len(tensors) for tensors in flat_send]
-        out_splits = [recv_slots] * world_size
-        recv_sizes = torch.empty(recv_slots * world_size, dtype=torch.int64)
-        work = dist.all_to_all_single(
-            recv_sizes,
-            send_sizes,
-            out_splits,
-            in_splits,
-            group=pg_gloo,
-            async_op=True,
-        )
-    return _InputSizeAwaitable(work, flat_send, recv_sizes, recv_slots, batch_id)
-
-
-def input_data_dist(
-    flat_send: List[List[torch.Tensor]],
-    recv_sizes: List[List[int]],
-    example: T,
-    pg_nccl: dist.ProcessGroup,
-    batch_id: int = 0,
-) -> LazyAwaitable[List[T]]:
-    """Phase two: async all-to-all the bulk tensors and rebuild the carriers.
-
-    Issues one async :func:`torch.distributed.all_to_all_single` per *dtype*: the
-    tensor slots are bucketed by dtype (read from ``example``), and within a bucket
-    every slot is flattened to 1-D and concatenated into one fused buffer, so a
-    single collective moves all same-dtype slots at once. This mirrors TorchRec's
-    ``KJTAllToAll``, which keeps native dtypes (never byte-packs) but fuses what it
-    can -- here a mixed-dtype carrier collapses to one collective per distinct dtype
-    rather than one per slot. The returned awaitable's ``wait()`` completes the
-    collectives, slices each fused buffer back into its slots, regroups per source
-    rank, and reconstructs each carrier with :func:`unflatten_from_tensors`.
-
-    Args:
-        flat_send: per-destination flattened tensors, from :func:`input_size_dist`.
-        recv_sizes: per-source dim-0 sizes, from :func:`input_size_dist`.
-        example: template carrier defining structure, dtypes, and non-tensor parts.
-        pg_nccl: an nccl process group carrying the (CUDA) tensor data.
-        batch_id: identifier for this input batch, used only to tag the profiler
-            ranges (``## input_data_dist batch{batch_id} ##``).
-
-    Returns:
-        A :class:`LazyAwaitable` whose ``wait()`` yields ``recv`` with ``recv[i]``
-        the carrier received from rank ``i``.
-    """
-    world_size = len(flat_send)
+    source_flat_send = [flatten_to_tensors(item) for item in send]
     example_flat = flatten_to_tensors(example)
-    num_tensors = len(example_flat)
-    # Per-slot layout from the example: elements per dim-0 row and the trailing shape
-    # (only dim-0 varies between carriers, so these are fixed per slot). This is the
-    # *receive* side, which is homogeneous -- every incoming carrier is built for
-    # this rank.
-    row_elems = [math.prod(t.shape[1:]) for t in example_flat]
-    trailing = [tuple(t.shape[1:]) for t in example_flat]
-    # Bucket slots by dtype in first-seen order. The example is a shared template, so
-    # every rank derives the same buckets and the per-dtype collectives line up.
-    buckets: Dict[torch.dtype, List[int]] = {}
-    for k in range(num_tensors):
-        buckets.setdefault(example_flat[k].dtype, []).append(k)
+    (
+        in_bufs,
+        in_splits_by_bucket,
+        source_tensors,
+        destination_tensors,
+    ) = prepare_input_buffers(source_flat_send, example_flat, device)
+    inplace_copy_to_gpu(
+        source_tensors,
+        destination_tensors,
+        memcpy_stream,
+    )
+    device_module = torch.get_device_module(device)
+    copy_done_event = device_module.Event()
+    copy_done_event.record(memcpy_stream)
 
-    # The *send* side may be ragged: a carrier built for a destination with more
-    # layers has more slots than this rank's own example. So bucket each
-    # destination's slots by its own dtypes rather than reusing the example's slot
-    # indices, which describe a different carrier.
+    return (
+        in_bufs,
+        in_splits_by_bucket,
+        _InputSizeAwaitable(
+            source_flat_send,
+            len(example_flat),
+            world_size,
+            pg_gloo,
+            batch_id,
+        ),
+        example_flat,
+        copy_done_event,
+    )
+
+
+def prepare_input_buffers(
+    source_flat_send: List[List[torch.Tensor]],
+    example_flat: List[torch.Tensor],
+    device: torch.device,
+) -> Tuple[
+    List[torch.Tensor],
+    List[List[int]],
+    List[torch.Tensor],
+    List[torch.Tensor],
+]:
+    """Allocate fused GPU input buffers and views for direct CPU-to-GPU copy.
+
+    Returns the fused buffers, their per-destination split sizes, CPU source
+    tensors, and matching GPU destination views.
+    """
+    slots_by_dtype: Dict[torch.dtype, List[int]] = {}
+    for k, tensor in enumerate(example_flat):
+        slots_by_dtype.setdefault(tensor.dtype, []).append(k)
+
     send_slots: List[Dict[torch.dtype, List[int]]] = []
-    for j in range(world_size):
+    for j, tensors in enumerate(source_flat_send):
         by_dtype: Dict[torch.dtype, List[int]] = {}
-        for k, tensor in enumerate(flat_send[j]):
-            if tensor.dtype not in buckets:
+        for k, tensor in enumerate(tensors):
+            if tensor.dtype not in slots_by_dtype:
                 raise ValueError(
-                    f"send[{j}] slot {k} has dtype {tensor.dtype}, which the example "
-                    "does not have; a carrier may differ from the example in slot "
-                    "count, not in the dtypes it carries"
+                    f"send[{j}] slot {k} has dtype {tensor.dtype}, which the "
+                    "example does not have; a carrier may differ from the "
+                    "example in slot count, not in the dtypes it carries"
                 )
             by_dtype.setdefault(tensor.dtype, []).append(k)
         send_slots.append(by_dtype)
 
-    device = flat_send[0][0].device
-    # pyre-ignore[33]: dist work handles have no public type
-    works: List[Any] = []
-    out_bufs: List[torch.Tensor] = []
     in_bufs: List[torch.Tensor] = []
-    bucket_slots: List[List[int]] = []
+    in_splits_by_bucket: List[List[int]] = []
+    source_tensors: List[torch.Tensor] = []
+    destination_tensors: List[torch.Tensor] = []
+    for dtype in slots_by_dtype:
+        in_splits = [
+            sum(source_flat_send[j][k].numel() for k in send_slots[j].get(dtype, []))
+            for j in range(len(source_flat_send))
+        ]
+        in_buf = torch.empty(sum(in_splits), dtype=dtype, device=device)
+        pos = 0
+        for j, tensors in enumerate(source_flat_send):
+            for k in send_slots[j].get(dtype, []):
+                source = tensors[k]
+                next_pos = pos + source.numel()
+                source_tensors.append(source)
+                destination_tensors.append(in_buf[pos:next_pos].view(source.shape))
+                pos = next_pos
+        in_bufs.append(in_buf)
+        in_splits_by_bucket.append(in_splits)
+
+    return in_bufs, in_splits_by_bucket, source_tensors, destination_tensors
+
+
+def prepare_output_buffers(
+    recv_sizes: List[List[int]],
+    example_flat: List[torch.Tensor],
+    device: torch.device,
+) -> Tuple[
+    Dict[torch.dtype, List[int]],
+    List[torch.Tensor],
+    List[List[int]],
+    List[int],
+]:
+    """Allocate fused receive buffers and their per-source split sizes."""
+    world_size = len(recv_sizes)
+    row_elems = [math.prod(tensor.shape[1:]) for tensor in example_flat]
+    slots_by_dtype: Dict[torch.dtype, List[int]] = {}
+    for k, tensor in enumerate(example_flat):
+        slots_by_dtype.setdefault(tensor.dtype, []).append(k)
+
+    out_bufs: List[torch.Tensor] = []
+    out_splits_by_bucket: List[List[int]] = []
+    for dtype, slots in slots_by_dtype.items():
+        out_splits = [
+            sum(recv_sizes[i][k] * row_elems[k] for k in slots)
+            for i in range(world_size)
+        ]
+        out_bufs.append(torch.empty(sum(out_splits), dtype=dtype, device=device))
+        out_splits_by_bucket.append(out_splits)
+
+    return (
+        slots_by_dtype,
+        out_bufs,
+        out_splits_by_bucket,
+        row_elems,
+    )
+
+
+def input_data_dist(
+    in_bufs: List[torch.Tensor],
+    in_splits_by_bucket: List[List[int]],
+    recv_sizes: List[List[int]],
+    example: T,
+    example_flat: List[torch.Tensor],
+    pg_nccl: dist.ProcessGroup,
+    pp_data_dist_stream: torch.Stream,
+    copy_done_event: Any,
+    batch_id: int = 0,
+) -> LazyAwaitable[List[T]]:
+    """Launch CUDA input-data distribution and return its awaitable.
+
+    Receive buffers are allocated from the exchanged sizes. The collectives use
+    the fused input buffers prepared by :func:`input_size_dist` and are enqueued on
+    ``pp_data_dist_stream`` after the CPU-to-GPU copy.
+    """
+    device = in_bufs[0].device
+    device_module = torch.get_device_module(device)
+    current_stream = device_module.current_stream(device)
+    world_size = len(recv_sizes)
+    num_tensors = len(example_flat)
+    trailing = [tuple(tensor.shape[1:]) for tensor in example_flat]
+
     with record_function(f"## input_data_dist batch{batch_id} ##"):
-        for dtype, slots in buckets.items():
-            # Destination-major, then slot-major: chunk j (-> rank j) is this rank's
-            # slots for j laid end to end; input_split_sizes marks the j boundaries.
-            # Each destination contributes its *own* slots of this dtype, in slot
-            # order -- which lines up with how that peer's example slices them out,
-            # since the carrier was built to its structure.
-            in_splits = [
-                sum(flat_send[j][k].numel() for k in send_slots[j].get(dtype, []))
-                for j in range(world_size)
-            ]
-            parts = [
-                flat_send[j][k].reshape(-1)
-                for j in range(world_size)
-                for k in send_slots[j].get(dtype, [])
-            ]
-            in_buf = (
-                torch.cat(parts)
-                if parts
-                else torch.empty(0, dtype=dtype, device=device)
-            )
-            out_splits = [
-                sum(recv_sizes[i][k] * row_elems[k] for k in slots)
-                for i in range(world_size)
-            ]
-            out_buf = torch.empty(sum(out_splits), dtype=dtype, device=device)
-            with record_function(f"## input_data_dist batch{batch_id} {dtype} ##"):
-                work = dist.all_to_all_single(
-                    out_buf, in_buf, out_splits, in_splits, group=pg_nccl, async_op=True
-                )
-            works.append(work)
-            out_bufs.append(out_buf)
-            in_bufs.append(in_buf)
-            bucket_slots.append(slots)
+        (
+            buckets,
+            out_bufs,
+            out_splits_by_bucket,
+            row_elems,
+        ) = prepare_output_buffers(recv_sizes, example_flat, device)
+
+    bucket_slots = list(buckets.values())
+
+    pp_data_dist_stream.wait_event(copy_done_event)
+    pp_data_dist_stream.wait_stream(current_stream)
 
     return _InputDataAwaitable(
-        works,
         out_bufs,
         in_bufs,
+        out_splits_by_bucket,
+        in_splits_by_bucket,
         bucket_slots,
         recv_sizes,
         row_elems,
@@ -453,6 +560,9 @@ def input_data_dist(
         example,
         world_size,
         num_tensors,
+        device,
+        pg_nccl,
+        pp_data_dist_stream,
         batch_id,
     )
 
@@ -462,6 +572,9 @@ def input_dist(
     example: T,
     pg_gloo: dist.ProcessGroup,
     pg_nccl: dist.ProcessGroup,
+    device: torch.device,
+    memcpy_stream: torch.Stream,
+    pp_data_dist_stream: torch.Stream,
     batch_id: int = 0,
 ) -> LazyAwaitable[List[T]]:
     """All-to-all a list of structured carriers: one per rank in, one per rank out.
@@ -471,9 +584,10 @@ def input_dist(
     to rank ``j``; the returned awaitable's ``wait()`` yields ``recv[i]`` -- the
     carrier from rank ``i``.
 
-    The size exchange is awaited here (its result is needed to lay out the data
-    collectives), then the data all-to-alls are launched async and returned as a
-    :class:`LazyAwaitable` so the caller can overlap work before ``wait()``.
+    The size exchange is awaited here because its result lays out the data
+    collectives. The data all-to-alls are then enqueued on ``pp_data_dist_stream``
+    and returned as a :class:`LazyAwaitable` so the caller can overlap work before
+    ``wait()`` establishes the stream dependency.
 
     Args:
         send: one carrier per destination rank; ``send[j]`` goes to rank ``j``.
@@ -482,13 +596,32 @@ def input_dist(
         pg_nccl: nccl group for the tensor-data exchange.
         batch_id: identifier for this input batch, threaded to both phases to tag
             the profiler ranges.
+        device: CUDA device for the input and data collectives.
+        memcpy_stream: dedicated stream for the CPU-to-GPU copy.
+        pp_data_dist_stream: dedicated stream for the tensor-data all-to-alls.
 
     Returns:
         A :class:`LazyAwaitable` whose ``wait()`` yields ``recv`` with ``recv[i]``
         the carrier received from rank ``i``.
     """
-    flat_send, recv_sizes = input_size_dist(send, example, pg_gloo, batch_id).wait()
-    return input_data_dist(flat_send, recv_sizes, example, pg_nccl, batch_id)
+    (
+        in_bufs,
+        in_splits_by_bucket,
+        size_awaitable,
+        example_flat,
+        copy_done_event,
+    ) = input_size_dist(send, example, pg_gloo, device, memcpy_stream, batch_id)
+    return input_data_dist(
+        in_bufs,
+        in_splits_by_bucket,
+        size_awaitable.wait(),
+        example,
+        example_flat,
+        pg_nccl,
+        pp_data_dist_stream,
+        copy_done_event,
+        batch_id,
+    )
 
 
 class InputDistDriver(Generic[T]):
@@ -537,8 +670,19 @@ class InputDistDriver(Generic[T]):
         self._pg_nccl = pg_nccl
         self._self_index = self_index
         self._queue: Deque[T] = deque()
+        self._device: Optional[torch.device] = None
+        self._memcpy_stream: Optional[torch.Stream] = None
+        self._pp_data_dist_stream: Optional[torch.Stream] = None
         # Monotonic round counter, tagging the profiler ranges.
         self._batch_id = 0
+
+    def set_device(self, device: torch.device) -> None:
+        """Create the copy and data-distribution streams for future exchanges."""
+        if device.type != "cuda":
+            raise ValueError(f"InputDistDriver requires a CUDA device, got {device}")
+        self._device = device
+        self._memcpy_stream = torch.get_device_module(device).Stream()
+        self._pp_data_dist_stream = torch.get_device_module(device).Stream()
 
     @property
     def pending(self) -> int:
@@ -558,12 +702,22 @@ class InputDistDriver(Generic[T]):
         """
         batch_id = self._batch_id
         self._batch_id += 1
+        device = self._device
+        if device is None:
+            raise ValueError("call set_device() before input distribution")
+        memcpy_stream = self._memcpy_stream
+        pp_data_dist_stream = self._pp_data_dist_stream
+        if memcpy_stream is None or pp_data_dist_stream is None:
+            raise ValueError("CUDA input distribution streams are not initialized")
         return input_dist(
             send,
             send[self._self_index],
             pg_gloo=self._pg_gloo,
             pg_nccl=self._pg_nccl,
             batch_id=batch_id,
+            device=device,
+            memcpy_stream=memcpy_stream,
+            pp_data_dist_stream=pp_data_dist_stream,
         )
 
     def take(self, next_send: Callable[[], List[T]], n: int) -> List[T]:
