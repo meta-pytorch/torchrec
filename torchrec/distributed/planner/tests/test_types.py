@@ -2545,6 +2545,21 @@ class ShardingPlanRequestTest(unittest.TestCase):
         self.assertNotEqual(first.request_id, second.request_id)
         self.assertEqual(first.request_hash, second.request_hash)
 
+    def test_model_id_defaults_to_none(self) -> None:
+        self.assertIsNone(self._create_request().model_id)
+
+    def test_model_id_pass_through(self) -> None:
+        request = self._create_request(model_id="mtml_ctr_ig_stories_model")
+        self.assertEqual(request.model_id, "mtml_ctr_ig_stories_model")
+
+    def test_model_id_excluded_from_request_hash(self) -> None:
+        # model_id is a rollout-bucketing hint (JK hashval), not a plan-affecting
+        # parameter -- two otherwise-identical requests with different model_id
+        # must share a request_hash so the cache/dedup key is stable.
+        base = self._create_request().request_hash
+        self.assertEqual(base, self._create_request(model_id="model_a").request_hash)
+        self.assertEqual(base, self._create_request(model_id="model_b").request_hash)
+
 
 class PlannerConfigTest(unittest.TestCase):
     def test_defaults(self) -> None:
