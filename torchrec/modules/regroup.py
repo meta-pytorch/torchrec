@@ -109,7 +109,12 @@ class PermuteMultiEmbedding(torch.nn.Module):
 
         out_lengths = self._out_lengths
         if out_lengths is None:
-            return values
+            if torch.jit.is_scripting():
+                out_lengths = torch.jit.annotate(List[int], [])
+            else:
+                if not is_fx_tracing():
+                    return values
+                out_lengths = torch.jit.annotate(List[int], [])
         return torch.ops.fbgemm.permute_multi_embedding(
             values,
             permutes,
