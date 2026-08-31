@@ -9,6 +9,7 @@
 
 import unittest
 from typing import cast, Dict, List, Optional
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -36,6 +37,7 @@ from torchrec.distributed.planner.storage_reservations import (
 from torchrec.distributed.planner.types import (
     ParameterConstraints,
     PlanLoader,
+    PlannerContextFingerprintError,
     PlannerError,
     PlannerErrorType,
     Shard,
@@ -1149,6 +1151,35 @@ class TestPlanLoaderIntegration(unittest.TestCase):
         # Verify a plan was generated
         self.assertIsNotNone(loaded_plan)
         self.assertGreater(len(loaded_plan.plan), 0)
+
+    def test_plan_loader_skips_unverifiable_stored_plan(self) -> None:
+        mock_loader = MockPlanLoader(
+            loaded_sharding_options={},
+            context_hash="unused",
+        )
+        planner = EmbeddingShardingPlanner(
+            topology=self.topology,
+            constraints=self.constraints,
+            plan_loader=mock_loader,
+        )
+
+        with (
+            patch.object(
+                planner,
+                "hash_planner_context_inputs_str",
+                side_effect=PlannerContextFingerprintError("unsupported fingerprint"),
+            ),
+            patch.object(
+                mock_loader, "plan_context_hash", wraps=mock_loader.plan_context_hash
+            ) as mock_context_hash,
+            patch.object(mock_loader, "load", wraps=mock_loader.load) as mock_load,
+        ):
+            # pyrefly: ignore[missing-argument]
+            plan = planner.plan(module=self.model, sharders=get_default_sharders())
+
+        self.assertGreater(len(plan.plan), 0)
+        mock_context_hash.assert_not_called()
+        mock_load.assert_not_called()
 
 
 class TestExtractPlan(unittest.TestCase):

@@ -1582,6 +1582,29 @@ class SharderData:
 SharderDataMap = Dict[str, SharderData]
 
 
+class _CacheParamsFingerprintMemo:
+    """Memoizes by identity and retains objects so their ids cannot be reused."""
+
+    def __init__(self) -> None:
+        self._fingerprints: Dict[int, Tuple[CacheParams, Tuple[object, ...]]] = {}
+
+    def get(self, cache_params: Optional[CacheParams]) -> Optional[Tuple[object, ...]]:
+        if cache_params is None:
+            return None
+        cache_params_id = id(cache_params)
+        cached = self._fingerprints.get(cache_params_id)
+        if cached is None:
+            try:
+                fingerprint = cache_params.stable_fingerprint()
+            except Exception as error:
+                raise PlannerContextFingerprintError(
+                    "Unable to fingerprint cache parameters"
+                ) from error
+            self._fingerprints[cache_params_id] = (cache_params, fingerprint)
+            return fingerprint
+        return cached[1]
+
+
 @dataclass
 class ParameterConstraints:
     """
@@ -1652,8 +1675,10 @@ class ParameterConstraints:
     key_value_params: Optional[KeyValueParams] = None
     use_virtual_table: bool = False
 
-    def __hash__(self) -> int:
-        hashable_list = [
+    def _hashable_values(
+        self, cache_params: object, key_value_params: object
+    ) -> Tuple[Any, ...]:
+        return (
             tuple(self.sharding_types) if self.sharding_types else None,
             tuple(self.compute_kernels) if self.compute_kernels else None,
             self.min_partition,
@@ -1661,18 +1686,39 @@ class ParameterConstraints:
             tuple(self.num_poolings) if self.num_poolings else None,
             tuple(self.batch_sizes) if self.batch_sizes else None,
             self.is_weighted,
-            self.cache_params,
+            cache_params,
             self.enforce_hbm,
             self.stochastic_rounding,
             self.bounds_check_mode,
             tuple(self.feature_names) if self.feature_names else None,
             self.output_dtype,
             self.device_group,
-            self.key_value_params,
+            key_value_params,
             self.use_virtual_table,
-        ]
+        )
 
-        return hash_sha256_to_int(hashable_list)
+    def _persistent_hash(
+        self,
+        cache_params_memo: _CacheParamsFingerprintMemo,
+    ) -> int:
+        return hash_sha256_to_int(
+            list(
+                self._hashable_values(
+                    cache_params_memo.get(self.cache_params),
+                    self.key_value_params,
+                )
+            )
+        )
+
+    def __hash__(self) -> int:
+        return hash_sha256_to_int(
+            list(
+                self._hashable_values(
+                    self.cache_params,
+                    self.key_value_params,
+                )
+            )
+        )
 
 
 class PlannerErrorType(Enum):
@@ -3093,6 +3139,7 @@ def _build_hashable_list(
 
     search_space = enumerator.last_stored_search_space
     storage_reservation_policy = type(storage_reservation).__name__
+    cache_params_memo = _CacheParamsFingerprintMemo()
 
     # Hash topology components with storage rounding applied uniformly.
     # Previously _last_reserved_topology was included as a raw Topology
@@ -3112,18 +3159,28 @@ def _build_hashable_list(
                 shard_option.sharding_type,
                 shard_option.compute_kernel,
                 tuple(_shard_hash_components(shard) for shard in shard_option.shards),
-                shard_option.cache_params,
+                cache_params_memo.get(shard_option.cache_params),
             ]
             for shard_option in search_space
         ],
         storage_reservation_policy,
         hashed_reserved_topology,
         (
-            tuple((k, v.__hash__()) for k, v in sorted(constraints.items()))
+            tuple(
+                (
+                    k,
+                    v._persistent_hash(cache_params_memo),
+                )
+                for k, v in sorted(constraints.items())
+            )
             if constraints
             else None
         ),
     ]
+
+
+class PlannerContextFingerprintError(RuntimeError):
+    pass
 
 
 def hash_planner_context_inputs(

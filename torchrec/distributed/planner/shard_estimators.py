@@ -7,8 +7,10 @@
 
 # pyre-strict
 
+import hashlib
 import logging
 import math
+import sys
 from typing import cast, Dict, List, Optional, Sequence, Tuple, Type
 
 import torch
@@ -1012,6 +1014,53 @@ class EmbeddingOffloadStats(CacheStatistics):
     @property
     def cacheability(self) -> float:
         return self._cacheability
+
+    def stable_fingerprint(self) -> Tuple[object, ...]:
+        self._validate_fingerprint_contract()
+        return (
+            "embedding_offload_stats",
+            1,
+            self._cacheability,
+            self._expected_lookups,
+            self.height,
+            str(self.hist.dtype),
+            tuple(self.hist.shape),
+            self._compute_tensor_digest(self.hist),
+            str(self.bins.dtype),
+            tuple(self.bins.shape),
+            self._compute_tensor_digest(self.bins),
+        )
+
+    def _validate_fingerprint_contract(self) -> None:
+        stats_type = type(self)
+        inherits_fingerprint = (
+            stats_type is not EmbeddingOffloadStats
+            and stats_type.stable_fingerprint
+            is EmbeddingOffloadStats.stable_fingerprint
+        )
+        inherits_curve_behavior = (
+            stats_type.expected_lookups is EmbeddingOffloadStats.expected_lookups
+            and stats_type.expected_miss_rate
+            is EmbeddingOffloadStats.expected_miss_rate
+            and stats_type.estimate_cache_miss_rate
+            is EmbeddingOffloadStats.estimate_cache_miss_rate
+            and stats_type.cacheability is EmbeddingOffloadStats.cacheability
+        )
+        if inherits_fingerprint and not inherits_curve_behavior:
+            raise RuntimeError(
+                f"{type(self).__qualname__} must override stable_fingerprint()"
+            )
+
+    @staticmethod
+    def _compute_tensor_digest(tensor: torch.Tensor) -> str:
+        canonical_bytes = (
+            tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8)
+        )
+        if sys.byteorder == "big" and tensor.element_size() > 1:
+            canonical_bytes = (
+                canonical_bytes.reshape(-1, tensor.element_size()).flip(1).reshape(-1)
+            )
+        return hashlib.sha256(canonical_bytes.numpy().tobytes(order="C")).hexdigest()
 
     @staticmethod
     def estimate_cache_miss_rate(

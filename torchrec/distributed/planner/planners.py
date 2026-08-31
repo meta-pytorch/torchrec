@@ -51,6 +51,7 @@ from torchrec.distributed.planner.types import (
     PerfModel,
     PlanDebugStats,
     PlanLoader,
+    PlannerContextFingerprintError,
     PlannerError,
     PlannerErrorType,
     Proposer,
@@ -905,18 +906,26 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         loaded_best_plan: List[ShardingOption] = []
 
         if self.plan_loader is not None:
-            # validate plan before loading
-            self._loader_plan_validation(
-                current_planner_hash=self.hash_planner_context_inputs_str(),
-                loaded_plan_hash=self.plan_loader.plan_context_hash(),
-            )
-            loaded_sharding_options = self.plan_loader.load()
-            if loaded_sharding_options is not None:
-                # Merging sharding options from loaded plan with enumerated search space
-                loaded_best_plan = extract_plan(
-                    search_space=search_space,
-                    loaded_sharding_options=loaded_sharding_options,
+            try:
+                current_planner_hash = self.hash_planner_context_inputs_str()
+            except PlannerContextFingerprintError:
+                logger.warning(
+                    "Unable to validate the stored plan without a stable planner "
+                    "context fingerprint; generating a fresh plan",
+                    exc_info=True,
                 )
+            else:
+                self._loader_plan_validation(
+                    current_planner_hash=current_planner_hash,
+                    loaded_plan_hash=self.plan_loader.plan_context_hash(),
+                )
+                loaded_sharding_options = self.plan_loader.load()
+                if loaded_sharding_options is not None:
+                    # Merging sharding options from loaded plan with enumerated search space
+                    loaded_best_plan = extract_plan(
+                        search_space=search_space,
+                        loaded_sharding_options=loaded_sharding_options,
+                    )
 
         # Loaded plan is validated successfully and can be used for generate the sharding plan, skipping new plan generation.
         if loaded_best_plan:
