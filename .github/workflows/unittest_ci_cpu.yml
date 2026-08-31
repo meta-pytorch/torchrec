@@ -102,6 +102,10 @@ jobs:
           index_url=https://download.pytorch.org/whl/${{ inputs.channel }}/cpu
         fi
         echo "index_url: $index_url"
+        if [[ "${{ matrix.python.version }}" = "3.14" ]]; then
+          # temporary workaround for torch package issue in python 3.14
+          conda run -n build_binary pip install packaging
+        fi
         conda run -n build_binary \
           pip install torch --index-url $index_url
         conda run -n build_binary \
