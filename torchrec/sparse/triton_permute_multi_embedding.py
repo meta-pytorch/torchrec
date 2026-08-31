@@ -19,12 +19,15 @@ import triton.language as tl
 _PERMUTE_PARAM_SIZE = 6
 
 
-# Triton TR001: tune batch and copy tiles across workloads and GPU generations.
+# Triton TR001: decouple batch tiling from warp count so 16-bit types keep
+# enough copy work per thread to amortize indexing and memory instructions.
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_BATCH": 1, "BLOCK_SIZE": 128}, num_warps=1),
         triton.Config({"BLOCK_BATCH": 2, "BLOCK_SIZE": 128}, num_warps=2),
+        triton.Config({"BLOCK_BATCH": 4, "BLOCK_SIZE": 128}, num_warps=2),
         triton.Config({"BLOCK_BATCH": 4, "BLOCK_SIZE": 128}, num_warps=4),
+        triton.Config({"BLOCK_BATCH": 8, "BLOCK_SIZE": 128}, num_warps=2),
         triton.Config({"BLOCK_BATCH": 8, "BLOCK_SIZE": 128}, num_warps=8),
     ],
     key=["batch_size", "num_permutes"],
@@ -87,12 +90,15 @@ def _permute_multi_embedding_kernel(
         )
 
 
-# Triton TR001: tune batch and copy tiles across workloads and GPU generations.
+# Triton TR001: decouple batch tiling from warp count so 16-bit types keep
+# enough copy work per thread to amortize indexing and memory instructions.
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_BATCH": 1, "BLOCK_SIZE": 128}, num_warps=1),
         triton.Config({"BLOCK_BATCH": 2, "BLOCK_SIZE": 128}, num_warps=2),
+        triton.Config({"BLOCK_BATCH": 4, "BLOCK_SIZE": 128}, num_warps=2),
         triton.Config({"BLOCK_BATCH": 4, "BLOCK_SIZE": 128}, num_warps=4),
+        triton.Config({"BLOCK_BATCH": 8, "BLOCK_SIZE": 128}, num_warps=2),
         triton.Config({"BLOCK_BATCH": 8, "BLOCK_SIZE": 128}, num_warps=8),
     ],
     key=["batch_size", "num_permutes"],
