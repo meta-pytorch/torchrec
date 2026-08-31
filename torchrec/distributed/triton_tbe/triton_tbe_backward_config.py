@@ -54,34 +54,49 @@ class TbeBackwardConfig:
 
     num_warps: int
 
+    # Split the short-run tier into one launch per next_pow2(D) bucket so each
+    # launch sizes BLOCK_SIZE to its own rows instead of the global max.
+    # Portable: plain Triton, no hardware feature needed.
+    enable_dim_bucketing: bool
+
     # Cluster Launch Control: Blackwell-only work stealing. Purely additive on
     # top of the portable path; also requires TLX to be importable.
     allow_clc: bool
 
 
-# Blackwell (B200 / GB200). Grid matches the value the CLC path already used.
+# Blackwell (B200 / GB200). Measured on GB200 (triton-beta) against the
+# heavy-table-sharing GEM-v6 shape. The short-run grid saturates at 32x the base
+# grid -- 0.97x CUDA TBE on the portable path, 1.01x with CLC layered on -- and
+# the buffer sizes sit at a true interior optimum: narrower starves memory-level
+# parallelism, wider spills occupancy (width 8 costs 184 registers/thread and
+# 12.5% occupancy, versus 64 and 49.9% at width 2).
 _BLACKWELL = TbeBackwardConfig(
     name="blackwell",
     short_run_programs=32 * _CUDA_BASE_GRID,
     long_run_fused_programs=32 * _CUDA_BASE_GRID,
     long_run_accum_programs=_CUDA_BASE_GRID,
     long_run_threshold=256,
-    short_run_buffer_size_unweighted=8,
-    short_run_buffer_size_weighted=16,
+    short_run_buffer_size_unweighted=2,
+    short_run_buffer_size_weighted=4,
     num_warps=1,
+    enable_dim_bucketing=True,
     allow_clc=True,
 )
 
-# Hopper (H100). UNTUNED: retains the historical grid.
+# Hopper (H100). UNTUNED: retains the historical grid. The Blackwell sweep found
+# the base grid badly undersized for large run counts (1.66x slower than 32x on
+# the portable path), so `short_run_programs` is the most likely win from a
+# tuning pass here.
 _HOPPER = TbeBackwardConfig(
     name="hopper",
     short_run_programs=_CUDA_BASE_GRID,
     long_run_fused_programs=_CUDA_BASE_GRID,
     long_run_accum_programs=_CUDA_BASE_GRID,
     long_run_threshold=256,
-    short_run_buffer_size_unweighted=8,
-    short_run_buffer_size_weighted=16,
+    short_run_buffer_size_unweighted=2,
+    short_run_buffer_size_weighted=4,
     num_warps=1,
+    enable_dim_bucketing=True,
     allow_clc=False,
 )
 
@@ -92,9 +107,10 @@ _MI300X = TbeBackwardConfig(
     long_run_fused_programs=_AMD_BASE_GRID,
     long_run_accum_programs=_AMD_BASE_GRID,
     long_run_threshold=256,
-    short_run_buffer_size_unweighted=8,
-    short_run_buffer_size_weighted=16,
+    short_run_buffer_size_unweighted=2,
+    short_run_buffer_size_weighted=4,
     num_warps=1,
+    enable_dim_bucketing=True,
     allow_clc=False,
 )
 
@@ -105,9 +121,10 @@ _MI350X = TbeBackwardConfig(
     long_run_fused_programs=_AMD_BASE_GRID,
     long_run_accum_programs=_AMD_BASE_GRID,
     long_run_threshold=256,
-    short_run_buffer_size_unweighted=8,
-    short_run_buffer_size_weighted=16,
+    short_run_buffer_size_unweighted=2,
+    short_run_buffer_size_weighted=4,
     num_warps=1,
+    enable_dim_bucketing=True,
     allow_clc=False,
 )
 
@@ -118,9 +135,10 @@ _PORTABLE_DEFAULT = TbeBackwardConfig(
     long_run_fused_programs=_CUDA_BASE_GRID,
     long_run_accum_programs=_CUDA_BASE_GRID,
     long_run_threshold=256,
-    short_run_buffer_size_unweighted=8,
-    short_run_buffer_size_weighted=16,
+    short_run_buffer_size_unweighted=2,
+    short_run_buffer_size_weighted=4,
     num_warps=1,
+    enable_dim_bucketing=True,
     allow_clc=False,
 )
 

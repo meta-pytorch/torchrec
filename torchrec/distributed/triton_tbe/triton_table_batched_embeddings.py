@@ -814,11 +814,13 @@ def triton_tbe_backward_short_run_unweighted(
     STOCHASTIC_ROUNDING: tl.constexpr,
     stochastic_rounding_seed,
     vbe: tl.constexpr = False,
-    BUFFER_SIZE: tl.constexpr = 8,
+    BUFFER_SIZE: tl.constexpr = 2,
 ) -> None:
     """Backward kernel for short runs only. Each program handles one short run."""
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    # Gather width, tuned per target in TbeBackwardConfig.
+    # Gather width, tuned per target in TbeBackwardConfig. Each buffered row
+    # keeps BLOCK_SIZE 64-bit addresses live, so it trades memory-level
+    # parallelism against register footprint and hence occupancy.
     buffer_size: tl.constexpr = BUFFER_SIZE
     buffer_offsets = tl.arange(0, buffer_size)
 
@@ -1006,7 +1008,7 @@ def triton_tbe_backward_short_run_weighted(
     STOCHASTIC_ROUNDING: tl.constexpr,
     stochastic_rounding_seed,
     vbe: tl.constexpr = False,
-    BUFFER_SIZE: tl.constexpr = 16,
+    BUFFER_SIZE: tl.constexpr = 4,
 ) -> None:
     """Backward kernel for short runs only (weighted). Each program handles one short run."""
     col_offsets = tl.arange(0, BLOCK_SIZE)
@@ -1547,6 +1549,9 @@ class TritonTBE(torch.autograd.Function):
         saved_histogram_plans: Tuple[_SavedHistogramPlan, ...] = (),
         bounds_check_warning: Optional[torch.Tensor] = None,
         fused_bounds_check: bool = False,
+        bwd_bucket_block_sizes: Tuple[int, ...] = (),
+        bwd_feature_bucket_id: Optional[torch.Tensor] = None,
+        bwd_bucket_rows: Tuple[int, ...] = (),
     ) -> torch.Tensor:
         # VBE support: use pre-computed metadata if available, otherwise compute
         vbe = batch_size_per_feature_per_rank is not None
@@ -1725,6 +1730,9 @@ class TritonTBE(torch.autograd.Function):
         ctx.info_B_mask = info_B_mask
         ctx.hoist_transpose_to_forward = hoist_transpose_to_forward
         ctx.saved_histogram_plans = active_saved_histogram_plans
+        ctx.bwd_bucket_block_sizes = bwd_bucket_block_sizes
+        ctx.bwd_feature_bucket_id = bwd_feature_bucket_id
+        ctx.bwd_bucket_rows = bwd_bucket_rows
 
         if hoist_transpose_to_forward:
             # Hoist the backward index transpose (linearize + sort + run-length
@@ -2176,6 +2184,40 @@ class TritonTBE(torch.autograd.Function):
         )
         long_apply_grid_size = max_long_runs
 
+        # Per-dimension bucketing: only worth splitting when the tables actually
+        # span more than one BLOCK_SIZE, and only on the portable CUDA path
+        # (the AMD tier has its own expansion helper).
+        bucket_block_sizes: Tuple[int, ...] = getattr(ctx, "bwd_bucket_block_sizes", ())
+        feature_bucket_id = getattr(ctx, "bwd_feature_bucket_id", None)
+        bucket_rows: Tuple[int, ...] = getattr(ctx, "bwd_bucket_rows", ())
+        use_dim_buckets = (
+            cfg.enable_dim_bucketing
+            and not is_amd()
+            and len(bucket_block_sizes) > 1
+            and feature_bucket_id is not None
+            # The histogram tier strips leading features and rebases
+            # feature_table_map, which would misalign the per-feature bucket ids.
+            and num_valid_histograms == 0
+        )
+        if use_dim_buckets:
+            bucket_caps = [min(r, max_num_runs) for r in bucket_rows]
+            bucket_bases = [0] * len(bucket_caps)
+            running = 0
+            for b, cap in enumerate(bucket_caps):
+                bucket_bases[b] = running
+                running += cap
+            short_run_capacity = running
+            bucket_base_t = torch.tensor(
+                bucket_bases, dtype=torch.int64, device=weight.device
+            )
+            num_buckets = len(bucket_caps)
+        else:
+            bucket_caps = [max_num_runs]
+            bucket_bases = [0]
+            short_run_capacity = max_num_runs
+            bucket_base_t = None
+            num_buckets = 1
+
         if is_amd():
             (
                 short_run_ids,
@@ -2209,6 +2251,12 @@ class TritonTBE(torch.autograd.Function):
                 sorted_linear_indices_num_runs,
                 max_num_runs,
                 max_sl_per_program=cfg.long_run_threshold,
+                infos_sorted=infos_sorted,
+                feature_bucket_id=feature_bucket_id,
+                bucket_base=bucket_base_t,
+                short_run_capacity=short_run_capacity,
+                num_buckets=num_buckets,
+                info_B_num_bits=info_B_num_bits,
             )
 
         temp_grad_buffer = torch.zeros(
@@ -2228,39 +2276,53 @@ class TritonTBE(torch.autograd.Function):
                 if _use_amd
                 else triton_tbe_backward_short_run_weighted
             )
-            bwd_short_w[(short_run_grid_size,)](
-                dout,
-                weight,
-                infos_sorted,
-                sorted_linear_indices_run,
-                sorted_linear_indices_cumulative_run_lengths,
-                short_run_ids,
-                table_offsets,
-                embedding_dims,
-                embedding_offsets,
-                feature_table_map,
-                hash_size_cumsum,
-                momentum,
-                rows_cumsum,
-                sorted_per_sample_weights,
-                num_short_runs_t,
-                vbe_row_output_offsets,
-                vbe_B_offsets,
-                total_embedding_dim,
-                B,
-                learning_rate,
-                eps,
-                OPTIM_TYPE_TO_INT[optimizer],
-                BLOCK_SIZE=block_size,
-                info_B_num_bits=info_B_num_bits,
-                info_B_mask=info_B_mask,
-                num_warps=num_warps,
-                USE_CLC=use_clc,
-                STOCHASTIC_ROUNDING=stochastic_rounding,
-                stochastic_rounding_seed=stochastic_rounding_seed,
-                vbe=vbe,
-                BUFFER_SIZE=cfg.short_run_buffer_size_weighted,
-            )
+            for _b, _bucket_bs in enumerate(
+                bucket_block_sizes if use_dim_buckets else (block_size,)
+            ):
+                _bucket_run_ids = (
+                    short_run_ids[bucket_bases[_b] :]
+                    if use_dim_buckets
+                    else short_run_ids
+                )
+                _bucket_num_short = (
+                    num_short_runs_t[_b : _b + 1]
+                    if use_dim_buckets
+                    else num_short_runs_t
+                )
+                _bucket_grid = min(short_run_grid_size, max(bucket_caps[_b], 1))
+                bwd_short_w[(_bucket_grid,)](
+                    dout,
+                    weight,
+                    infos_sorted,
+                    sorted_linear_indices_run,
+                    sorted_linear_indices_cumulative_run_lengths,
+                    _bucket_run_ids,
+                    table_offsets,
+                    embedding_dims,
+                    embedding_offsets,
+                    feature_table_map,
+                    hash_size_cumsum,
+                    momentum,
+                    rows_cumsum,
+                    sorted_per_sample_weights,
+                    _bucket_num_short,
+                    vbe_row_output_offsets,
+                    vbe_B_offsets,
+                    total_embedding_dim,
+                    B,
+                    learning_rate,
+                    eps,
+                    OPTIM_TYPE_TO_INT[optimizer],
+                    BLOCK_SIZE=_bucket_bs,
+                    info_B_num_bits=info_B_num_bits,
+                    info_B_mask=info_B_mask,
+                    num_warps=num_warps,
+                    USE_CLC=use_clc,
+                    STOCHASTIC_ROUNDING=stochastic_rounding,
+                    stochastic_rounding_seed=stochastic_rounding_seed,
+                    vbe=vbe,
+                    BUFFER_SIZE=cfg.short_run_buffer_size_weighted,
+                )
             use_fused_clc_long_run = (
                 use_clc
                 and max_num_runs > cfg.long_run_fused_programs * cfg.long_run_threshold
@@ -2375,38 +2437,52 @@ class TritonTBE(torch.autograd.Function):
                 if _use_amd
                 else triton_tbe_backward_short_run_unweighted
             )
-            bwd_short_uw[(short_run_grid_size,)](
-                dout,
-                weight,
-                infos_sorted,
-                sorted_linear_indices_run,
-                sorted_linear_indices_cumulative_run_lengths,
-                short_run_ids,
-                table_offsets,
-                embedding_dims,
-                embedding_offsets,
-                feature_table_map,
-                hash_size_cumsum,
-                momentum,
-                rows_cumsum,
-                num_short_runs_t,
-                vbe_row_output_offsets,
-                vbe_B_offsets,
-                total_embedding_dim,
-                B,
-                learning_rate,
-                eps,
-                OPTIM_TYPE_TO_INT[optimizer],
-                BLOCK_SIZE=block_size,
-                info_B_num_bits=info_B_num_bits,
-                info_B_mask=info_B_mask,
-                num_warps=num_warps,
-                USE_CLC=use_clc,
-                STOCHASTIC_ROUNDING=stochastic_rounding,
-                stochastic_rounding_seed=stochastic_rounding_seed,
-                vbe=vbe,
-                BUFFER_SIZE=cfg.short_run_buffer_size_unweighted,
-            )
+            for _b, _bucket_bs in enumerate(
+                bucket_block_sizes if use_dim_buckets else (block_size,)
+            ):
+                _bucket_run_ids = (
+                    short_run_ids[bucket_bases[_b] :]
+                    if use_dim_buckets
+                    else short_run_ids
+                )
+                _bucket_num_short = (
+                    num_short_runs_t[_b : _b + 1]
+                    if use_dim_buckets
+                    else num_short_runs_t
+                )
+                _bucket_grid = min(short_run_grid_size, max(bucket_caps[_b], 1))
+                bwd_short_uw[(_bucket_grid,)](
+                    dout,
+                    weight,
+                    infos_sorted,
+                    sorted_linear_indices_run,
+                    sorted_linear_indices_cumulative_run_lengths,
+                    _bucket_run_ids,
+                    table_offsets,
+                    embedding_dims,
+                    embedding_offsets,
+                    feature_table_map,
+                    hash_size_cumsum,
+                    momentum,
+                    rows_cumsum,
+                    _bucket_num_short,
+                    vbe_row_output_offsets,
+                    vbe_B_offsets,
+                    total_embedding_dim,
+                    B,
+                    learning_rate,
+                    eps,
+                    OPTIM_TYPE_TO_INT[optimizer],
+                    BLOCK_SIZE=_bucket_bs,
+                    info_B_num_bits=info_B_num_bits,
+                    info_B_mask=info_B_mask,
+                    num_warps=num_warps,
+                    USE_CLC=use_clc,
+                    STOCHASTIC_ROUNDING=stochastic_rounding,
+                    stochastic_rounding_seed=stochastic_rounding_seed,
+                    vbe=vbe,
+                    BUFFER_SIZE=cfg.short_run_buffer_size_unweighted,
+                )
             use_fused_clc_long_run = (
                 use_clc
                 and max_num_runs > cfg.long_run_fused_programs * cfg.long_run_threshold
@@ -2611,6 +2687,30 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         self._max_D = self.max_embedding_dim
 
         self.block_size = triton.next_power_of_2(self.max_embedding_dim)
+
+        # Per-dimension launch buckets for the short-run backward tier.
+        # BLOCK_SIZE is a constexpr, so a single launch has to pad every row to
+        # next_pow2(max_D over all tables). When dims are mixed that wastes
+        # lanes and registers on the narrow tables, which are often the ones
+        # carrying most of the lookups. Routing runs to a bucket per
+        # next_pow2(D) lets each launch size BLOCK_SIZE to its own rows.
+        # Floored at one warp: a BLOCK_SIZE below 32 would idle lanes instead of
+        # saving anything.
+        feature_block_sizes = [max(32, triton.next_power_of_2(d)) for d in feature_dims]
+        bucket_sizes: List[int] = sorted(set(feature_block_sizes))
+        bucket_index: Dict[int, int] = {bs: i for i, bs in enumerate(bucket_sizes)}
+        self._bwd_bucket_block_sizes: Tuple[int, ...] = tuple(bucket_sizes)
+        self._bwd_feature_bucket_id: torch.Tensor = torch.tensor(
+            [bucket_index[bs] for bs in feature_block_sizes],
+            dtype=torch.int32,
+            device=device,
+        )
+        # A run is one distinct row, so a table contributes at most its row
+        # count to its bucket. Used to size each bucket's slice of short_run_ids.
+        bucket_rows: List[int] = [0] * len(bucket_sizes)
+        for rows, dim in embedding_specs:
+            bucket_rows[bucket_index[max(32, triton.next_power_of_2(dim))]] += rows
+        self._bwd_bucket_rows: Tuple[int, ...] = tuple(bucket_rows)
         total_weight_size = sum(table_sizes)
         self.weight = torch.empty(
             [total_weight_size],
@@ -2939,6 +3039,9 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             self._saved_histogram_plans,
             self.bounds_check_warning,
             use_fused_bounds_check,
+            self._bwd_bucket_block_sizes,
+            self._bwd_feature_bucket_id,
+            self._bwd_bucket_rows,
         )
 
     def split_embedding_weights(self) -> List[torch.Tensor]:
