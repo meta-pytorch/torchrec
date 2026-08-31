@@ -8,10 +8,16 @@
 # pyre-strict
 
 import unittest
-from typing import Dict, Iterable, Optional, Type, Union
+from typing import cast, Dict, Iterable, Optional, Type, Union
 
 import torch
-from torchrec.metrics.rec_metric import RecComputeMode, RecMetric, RecTaskInfo
+from torchrec.metrics.rec_metric import (
+    RecComputeMode,
+    RecMetric,
+    RecMetricComputation,
+    RecTaskInfo,
+    WindowBuffer,
+)
 from torchrec.metrics.test_utils import (
     metric_test_helper,
     rec_metric_value_test_launcher,
@@ -220,3 +226,111 @@ class WeightedAvgValueTest(unittest.TestCase):
             except AssertionError:
                 print("Assertion error caught with data set ", inputs)
                 raise
+
+
+def _window_buffer(metric: RecMetric, state_name: str) -> WindowBuffer:
+    """The `WindowBuffer` backing one window state. No public accessor exists."""
+    computation = cast(RecMetricComputation, metric._metrics_computations[0])
+    buffers = computation._batch_window_buffers
+    assert buffers is not None, "window metrics are disabled on this metric"
+    return buffers[state_name]
+
+
+class WindowSampleAccountingTest(unittest.TestCase):
+    """Window eviction must count SAMPLES, not `update()` calls.
+
+    ``RecMetricComputation._aggregate_window_state`` passes ``num_samples`` to
+    ``WindowBuffer`` as the entry's ``size``, and the buffer evicts while
+    ``_window_used_size > window_size``. In unfused mode ``labels`` is
+    ``(n_tasks, n_samples)`` with ``n_tasks == 1``, so reading ``shape[0]``
+    reports 1 sample per update regardless of batch size: a window whose
+    ``window_size`` exceeds the update count then never evicts, and
+    ``window_*`` covers an unbounded span of samples.
+
+    Sibling metrics (``ne.py``, ``gauc.py``) already read ``shape[-1]``.
+    """
+
+    _BATCH = 100
+    _WINDOW = 250  # 2 batches fit, the 3rd forces an eviction
+    _UPDATES = 5
+
+    def _run(
+        self,
+        compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+        n_tasks: int = 1,
+        actual_batch: Optional[int] = None,
+    ) -> tuple[RecMetric, int, int]:
+        """Drive `_UPDATES` updates and return (metric, buffer entries, used samples).
+
+        ``actual_batch`` decouples the tensor length actually fed from the ``batch_size``
+        the metric is CONSTRUCTED with -- the divergence that `fused_update_limit` and
+        batch-size stages produce in production.
+        """
+        tasks = [
+            RecTaskInfo(
+                name=f"t{i}",
+                label_name=f"label{i}",
+                prediction_name=f"prediction{i}",
+                weight_name=f"weight{i}",
+            )
+            for i in range(n_tasks)
+        ]
+        metric = WeightedAvgMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=self._BATCH,
+            tasks=tasks,
+            compute_mode=compute_mode,
+            window_size=self._WINDOW,
+        )
+        fed = actual_batch if actual_batch is not None else self._BATCH
+        for _ in range(self._UPDATES):
+            metric.update(
+                predictions={t.name: torch.rand(1, fed) for t in tasks},
+                labels={t.name: torch.rand(1, fed) for t in tasks},
+                weights={t.name: torch.ones(1, fed) for t in tasks},
+            )
+        buf = _window_buffer(metric, "window_weighted_sum")
+        return metric, len(buf.buffers), buf._window_used_size
+
+    def test_window_evicts_on_sample_count_not_update_count(self) -> None:
+        _, n_entries, used = self._run()
+        # samples: 5 x 100 = 500 > 250, so the window holds the newest 2 batches.
+        # Reading shape[0] would report 1 sample/update -> used=5 <= 250 -> all 5 kept.
+        self.assertEqual(n_entries, 2)
+        self.assertEqual(used, 2 * self._BATCH)
+
+    def test_window_evicts_on_sample_count_fused(self) -> None:
+        """FUSED mode: `shape[0]` is n_tasks, not 1 -- still not the sample count.
+
+        The unfused test alone cannot distinguish "reads shape[-1]" from "reads 1", since
+        shape[0] happens to BE 1 there. Here shape[0] == 3, so a regression to shape[0]
+        reports 3 samples/update -> used=15 <= 250 -> all 5 entries kept.
+        """
+        _, n_entries, used = self._run(
+            compute_mode=RecComputeMode.FUSED_TASKS_COMPUTATION, n_tasks=3
+        )
+        self.assertEqual(n_entries, 2)
+        self.assertEqual(used, 2 * self._BATCH)
+
+    def test_oversized_update_keeps_one_entry_instead_of_emptying_window(self) -> None:
+        """An update larger than the whole window must not empty the window.
+
+        `WindowBuffer._aggregate_state_impl` evicts while `_window_used_size > _max_size`.
+        Without the `len(self._buffers) > 1` guard the entry evicts itself, leaving
+        `window_state == 0` and publishing `window_weighted_avg = 0/0 = NaN`.
+
+        `RecMetric.__init__` rejects `window_size_local < batch_size`, but that check uses
+        the CONFIGURED batch size while the buffer sizes by the ACTUAL tensor length; the
+        two diverge under `fused_update_limit` (F concatenated batches) and under
+        batch-size stages (which `RecMetric` discards). Reproduced here by feeding a
+        longer tensor than the metric was constructed with.
+        """
+        metric, n_entries, used = self._run(actual_batch=self._WINDOW + 50)
+        self.assertEqual(n_entries, 1)
+        self.assertEqual(used, self._WINDOW + 50)
+        window_value = metric.compute()["weighted_avg-t0|window_weighted_avg"]
+        self.assertFalse(
+            torch.isnan(window_value).any(),
+            f"window_weighted_avg went NaN on an oversized update: {window_value}",
+        )

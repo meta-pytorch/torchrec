@@ -48,7 +48,12 @@ class WeightedAvgMetricComputation(RecMetricComputation):
         weights: Optional[torch.Tensor],
         **kwargs: Dict[str, Any],
     ) -> None:
-        num_samples = labels.shape[0]
+        # shape[-1] is the sample count. shape[0] is n_tasks (1 in unfused mode), which
+        # made window eviction count UPDATES, not samples -- so a window whose
+        # window_size_local exceeded the update count never evicted. Matches ne.py:163 and
+        # gauc.py:184. Fixed alongside scalar.py and tensor_weighted_avg.py, which carried
+        # the identical bug; leaving this one would have made three sibling metrics disagree.
+        num_samples = labels.shape[-1]
         predictions = cast(torch.Tensor, predictions)
         weights = cast(torch.Tensor, weights)
         states = {
