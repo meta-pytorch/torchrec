@@ -870,6 +870,14 @@ class TestEmbeddingPerfEstimator(unittest.TestCase):
             def cacheability(self) -> float:
                 return self._cacheability
 
+            def stable_fingerprint(self) -> Tuple[object, ...]:
+                return (
+                    "my_cache_statistics",
+                    1,
+                    self._expected_lookups,
+                    self._cacheability,
+                )
+
         tables = [
             EmbeddingBagConfig(
                 num_embeddings=100,
