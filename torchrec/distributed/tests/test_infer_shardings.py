@@ -147,6 +147,42 @@ class InferShardingsTest(unittest.TestCase):
         super().setUp()
         set_propogate_device(True)
 
+    def test_tw_mixed_float_and_int8_split_scale_bias_cpu(self) -> None:
+        device = torch.device("cpu")
+        mi = create_test_model(
+            num_embeddings=16,
+            emb_dim=8,
+            world_size=1,
+            batch_size=2,
+            dense_device=device,
+            sparse_device=device,
+            num_features=2,
+            num_weighted_features=0,
+        )
+        mi.quant_model = quantize(
+            module=mi.model,
+            inplace=False,
+            quant_state_dict_split_scale_bias=True,
+            per_table_weight_dtypes={
+                "table_0": torch.float,
+                "table_1": torch.quint8,
+            },
+        )
+
+        sharded_model = shard_qebc(
+            mi,
+            sharding_type=ShardingType.TABLE_WISE,
+            device=device,
+        )
+        state_keys = sharded_model.state_dict().keys()
+
+        self.assertTrue(any(key.endswith("table_0.weight") for key in state_keys))
+        self.assertFalse(any("table_0.weight_q" in key for key in state_keys))
+        self.assertTrue(
+            any(key.endswith("table_1.weight_qscale") for key in state_keys)
+        )
+        self.assertTrue(any(key.endswith("table_1.weight_qbias") for key in state_keys))
+
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
         "Not enough GPUs available",
