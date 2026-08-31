@@ -338,6 +338,8 @@ std::unordered_map<std::string, c10::IValue> combineEmbedding(
   return {{featureName, std::move(listFeatureBatches)}};
 }
 
+namespace {
+
 class FloatBatchingFunc : public BatchingFunc {
  public:
   std::unordered_map<std::string, c10::IValue> batch(
@@ -391,6 +393,8 @@ class EmbeddingBatchingFunc : public BatchingFunc {
     return moveToDevice(combineEmbedding(featureName, requests), device);
   }
 };
+
+} // anonymous namespace
 
 REGISTER_TORCHREC_BATCHING_FUNC(dense, FloatBatchingFunc);
 REGISTER_TORCHREC_BATCHING_FUNC(sparse, SparseBatchingFunc);
