@@ -255,6 +255,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         no_bag: bool = False,
         write_runtime_meta_dim: int = 0,
         persist_hash_zch_bucket: bool = True,
+        percent_fresh_region: float = 0,
+        write_to_fresh_region: bool = False,
     ) -> None:
         if output_segments is None:
             assert (
@@ -398,6 +400,19 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self._enable_per_feature_lookups: bool = enable_per_feature_lookups
         self._no_bag = no_bag
 
+        self._percent_fresh_region: float = percent_fresh_region
+        self._main_size: Optional[int] = None
+        self._fresh_size: Optional[int] = None
+        if self._percent_fresh_region != 0:
+            self._main_size, self._fresh_size = self._compute_region_split(
+                size_per_rank
+            )
+
+        self._write_to_fresh_region: bool = write_to_fresh_region
+        assert not (
+            self._write_to_fresh_region and self._percent_fresh_region == 0
+        ), "write_to_fresh_region=True requires a Fresh region (percent_fresh_region != 0)"
+
         logger.info(
             f"HashZchManagedCollisionModule: {self._name=}, {self.device=}, "
             f"{self._zch_size=}, {self._input_hash_size=}, {self._max_probe=}, "
@@ -409,7 +424,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, "
             f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
             f"{self._no_bag=}, {self._write_runtime_meta_dim=}, "
-            f"{self._persist_hash_zch_bucket=}"
+            f"{self._persist_hash_zch_bucket=}, {self._percent_fresh_region=}, "
+            f"{self._main_size=}, {self._fresh_size=}, {self._write_to_fresh_region=}"
         )
 
     def _create_zch_buffer(
@@ -506,6 +522,102 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
     def is_sharded(self) -> bool:
         # For sharded hash mc module, the buckets are split across multiple ranks.
         return (self._end_bucket - self._start_bucket) < self._buckets
+
+    def _compute_region_split(self, size_per_rank: torch.Tensor) -> Tuple[int, int]:
+        assert (
+            0 <= self._percent_fresh_region < 100
+        ), f"percent_fresh_region must be in [0, 100), got {self._percent_fresh_region}"
+        assert (
+            self._disable_fallback
+        ), "percent_fresh_region requires disable_fallback=True; otherwise a full Main region falls back into the Fresh tail"
+        assert (
+            self._opt_in_prob == -1
+        ), "percent_fresh_region is incompatible with opt-in; opt_in_prob must be -1"
+        unique = torch.unique(size_per_rank[self._start_bucket : self._end_bucket])
+        assert (
+            unique.numel() == 1
+        ), "cannot split non-uniform buckets into main/fresh regions"
+        bucket_size = int(unique.item())
+        fresh_size = math.floor(bucket_size * self._percent_fresh_region / 100)
+        main_size = bucket_size - fresh_size
+        assert not (
+            self._percent_fresh_region > 0 and (fresh_size <= 0 or main_size <= 0)
+        ), (
+            f"percent_fresh_region={self._percent_fresh_region} with bucket_size={bucket_size} "
+            f"yields ({main_size}, {fresh_size}); both regions must be non-empty"
+        )
+        return main_size, fresh_size
+
+    def _region_window(
+        self,
+        local_sizes: Optional[torch.Tensor],
+        offsets: Optional[torch.Tensor],
+        is_fresh: bool,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # Restrict placement to the target Main or Fresh region within each bucket.
+        main_size = self._main_size
+        fresh_size = self._fresh_size
+        assert main_size is not None and fresh_size is not None
+        assert local_sizes is not None and offsets is not None
+        region_size = fresh_size if is_fresh else main_size
+        region_offset = main_size if is_fresh else 0
+        return torch.full_like(local_sizes, region_size), offsets + region_offset
+
+    def _region_read(
+        self,
+        values: torch.Tensor,
+        local_sizes: torch.Tensor,
+        offsets: torch.Tensor,
+        is_fresh: bool,
+    ) -> torch.Tensor:
+        # Read-only probe confined to one (Main or Fresh) region window via
+        # local_sizes/offsets; write-side kernel args are unused, passed as
+        # neutral values.
+        region_sizes, region_offsets = self._region_window(
+            local_sizes, offsets, is_fresh=is_fresh
+        )
+        remapped_ids, _ = self._zero_collision_hash(
+            input=values,
+            identities=self._hash_zch_identities,
+            max_probe=self._max_probe,
+            circular_probe=True,
+            exp_hours=-1,  # deprecated, always -1
+            readonly=True,
+            local_sizes=region_sizes,
+            offsets=region_offsets,
+            metadata=None,
+            output_on_uvm=False,
+            disable_fallback=self._disable_fallback,
+            _modulo_identity_DPRECATED=False,  # deprecated, always False
+            input_metadata=None,
+            eviction_threshold=-1,
+            eviction_policy=0,
+            opt_in_prob=-1,
+            num_reserved_slots=-1,
+            opt_in_rands=None,
+            runtime_meta=None,
+        )
+        return remapped_ids
+
+    def _fresh_wins_read(
+        self,
+        values: torch.Tensor,
+        local_sizes: Optional[torch.Tensor],
+        offsets: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        # With Fresh empty every id misses, so this reduces to a Main-only read.
+        assert local_sizes is not None and offsets is not None
+        fresh_ids = self._region_read(values, local_sizes, offsets, is_fresh=True)
+        fresh_miss = fresh_ids == -1
+        main_ids = self._region_read(
+            values[fresh_miss],
+            local_sizes[fresh_miss],
+            offsets[fresh_miss],
+            is_fresh=False,
+        )
+        remapped_ids = fresh_ids.clone()
+        remapped_ids[fresh_miss] = main_ids
+        return remapped_ids
 
     # TODO: This is hacky as we are using parameters to go through publishing.
     # Can remove once working out buffer solution.
@@ -681,37 +793,48 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     output_offset=self._output_global_offset_tensor,
                 )
 
+                # Region-aware insert
+                if self._percent_fresh_region > 0 and not overwrite_readonly:
+                    local_sizes, offsets = self._region_window(
+                        local_sizes, offsets, is_fresh=self._write_to_fresh_region
+                    )
+
                 num_reserved_slots: int = self.get_reserved_slots_per_bucket()
-                remapped_ids, evictions = self._zero_collision_hash(
-                    input=values,
-                    identities=self._hash_zch_identities,
-                    max_probe=self._max_probe,
-                    circular_probe=True,
-                    exp_hours=-1,  # deprecated, always -1
-                    readonly=overwrite_readonly,
-                    local_sizes=local_sizes,
-                    offsets=offsets,
-                    metadata=overwrite_metadata,
-                    # Use self._is_inference to turn on writing to pinned
-                    # CPU memory directly. But may not have perf benefit.
-                    output_on_uvm=False,  # self._is_inference,
-                    disable_fallback=self._disable_fallback,
-                    _modulo_identity_DPRECATED=False,  # deprecated, always False
-                    input_metadata=input_metadata,
-                    eviction_threshold=eviction_threshold,
-                    eviction_policy=self.eviction_flag,
-                    opt_in_prob=self._opt_in_prob,
-                    num_reserved_slots=num_reserved_slots,
-                    opt_in_rands=opt_in_rands,
-                    # When we use _hash_zch_runtime_meta to save custom metadata, don't pass _hash_zch_runtime_meta to the kernel.
-                    # runtime_meta is managed externally via update_runtime_meta()
-                    # and should not be incremented by the kernel.
-                    runtime_meta=(
-                        None
-                        if self._write_runtime_meta_dim > 0
-                        else self._hash_zch_runtime_meta
-                    ),
-                )
+                if overwrite_readonly and self._percent_fresh_region > 0:
+                    # No eviction on the read path, so evictions is None.
+                    remapped_ids = self._fresh_wins_read(values, local_sizes, offsets)
+                    evictions = None
+                else:
+                    remapped_ids, evictions = self._zero_collision_hash(
+                        input=values,
+                        identities=self._hash_zch_identities,
+                        max_probe=self._max_probe,
+                        circular_probe=True,
+                        exp_hours=-1,  # deprecated, always -1
+                        readonly=overwrite_readonly,
+                        local_sizes=local_sizes,
+                        offsets=offsets,
+                        metadata=overwrite_metadata,
+                        # Use self._is_inference to turn on writing to pinned
+                        # CPU memory directly. But may not have perf benefit.
+                        output_on_uvm=False,  # self._is_inference,
+                        disable_fallback=self._disable_fallback,
+                        _modulo_identity_DPRECATED=False,  # deprecated, always False
+                        input_metadata=input_metadata,
+                        eviction_threshold=eviction_threshold,
+                        eviction_policy=self.eviction_flag,
+                        opt_in_prob=self._opt_in_prob,
+                        num_reserved_slots=num_reserved_slots,
+                        opt_in_rands=opt_in_rands,
+                        # When we use _hash_zch_runtime_meta to save custom metadata, don't pass _hash_zch_runtime_meta to the kernel.
+                        # runtime_meta is managed externally via update_runtime_meta()
+                        # and should not be incremented by the kernel.
+                        runtime_meta=(
+                            None
+                            if self._write_runtime_meta_dim > 0
+                            else self._hash_zch_runtime_meta
+                        ),
+                    )
                 # Zero out runtime_meta at evicted slots so it follows
                 # the same eviction behavior as the identity tensor.
                 if (
@@ -845,6 +968,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             no_bag=self._no_bag,
             write_runtime_meta_dim=self._write_runtime_meta_dim,
             persist_hash_zch_bucket=self._persist_hash_zch_bucket,
+            percent_fresh_region=self._percent_fresh_region,
+            write_to_fresh_region=self._write_to_fresh_region,
         )
 
     def lookup_runtime_meta(
