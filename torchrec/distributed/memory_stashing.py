@@ -37,9 +37,12 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 logger: logging.Logger = logging.getLogger(__name__)
 
-# Trunk size for the bulk stash (D2H) / restore (H2D) copies. ~32 MiB trunks
-# keep the copy engine yielding often enough for the main stream's small copies
-# to interleave, at a negligible bandwidth cost (see chunked copy design).
+# Default trunk size for the bulk stash (D2H) / restore (H2D) copies. ~32 MiB
+# trunks keep the copy engine yielding often enough for the main stream's small
+# copies to interleave, at a negligible bandwidth cost (see chunked copy
+# design). Each use case (embedding / optimizer) and each direction (stash /
+# restore) overrides this independently -- see ``set_embedding_trunk_size`` /
+# ``set_optimizer_trunk_size``, driven from ``MemoryBouncerConfig``.
 _STASH_CHUNK_SIZE_BYTES: int = 32 * 1024**2
 
 
@@ -179,10 +182,17 @@ class MemoryStashingManager:
     # sites run on every batch; without this guard they would flood the event
     # logger. Intentionally NOT cleared in reset() to avoid re-flooding.
     _logged_event_keys: set[str] = set()
-    # Trunk size (bytes) for the bulk D2H stash / H2D restore copies, used as
-    # ``chunked_copy_``'s ``chunk_size_bytes``. Defaults to
-    # ``_STASH_CHUNK_SIZE_BYTES``; override via ``set_trunk_size``.
-    _stash_chunk_size_bytes: int = _STASH_CHUNK_SIZE_BYTES
+    # Trunk sizes (bytes) for the bulk copies, used as ``chunked_copy_``'s
+    # ``chunk_size_bytes``. Embedding and optimizer stashing each get their own
+    # pair, and within a use case the D2H stash and H2D restore are independent:
+    # the two directions contend with different main-stream traffic (stash
+    # overlaps forward, restore overlaps backward), so their optimal trunk sizes
+    # differ. All default to ``_STASH_CHUNK_SIZE_BYTES``; override via
+    # ``set_embedding_trunk_size`` / ``set_optimizer_trunk_size``.
+    _embedding_stash_chunk_size_bytes: int = _STASH_CHUNK_SIZE_BYTES
+    _embedding_restore_chunk_size_bytes: int = _STASH_CHUNK_SIZE_BYTES
+    _optimizer_stash_chunk_size_bytes: int = _STASH_CHUNK_SIZE_BYTES
+    _optimizer_restore_chunk_size_bytes: int = _STASH_CHUNK_SIZE_BYTES
     _stashed_tables: Optional[Set[str]] = None
 
     @classmethod
@@ -284,14 +294,64 @@ class MemoryStashingManager:
 
     @classmethod
     def set_trunk_size(cls, size_bytes: int) -> None:
-        """Set the trunk size (in bytes) for bulk stash/restore copies.
+        """Set every trunk size (in bytes) for bulk stash/restore copies.
+
+        Convenience shortcut that applies ``size_bytes`` to all four knobs
+        (embedding stash/restore and optimizer stash/restore). Use
+        ``set_embedding_trunk_size`` / ``set_optimizer_trunk_size`` to tune a
+        single use case or direction.
 
         Controls how ``_stash_tensors`` splits each bulk D2H stash and H2D
         restore via ``chunked_copy_``. Smaller trunks let the copy engine yield
         to the main stream's small copies more often, at a small bandwidth cost;
         values <= 0 disable chunking and fall back to a single ``copy_``.
         """
-        cls._stash_chunk_size_bytes = size_bytes
+        cls.set_embedding_trunk_size(size_bytes, size_bytes)
+        cls.set_optimizer_trunk_size(size_bytes, size_bytes)
+
+    @classmethod
+    def set_embedding_trunk_size(
+        cls,
+        stash_size_bytes: Optional[int] = None,
+        restore_size_bytes: Optional[int] = None,
+    ) -> None:
+        """Set the embedding-weight trunk sizes (in bytes).
+
+        Only the arguments that are not ``None`` are applied, so a caller can
+        tune one direction without disturbing the other. Values <= 0 disable
+        chunking for that direction and fall back to a single ``copy_``.
+
+        Args:
+            stash_size_bytes: Trunk size for the D2H stash (forward pass).
+            restore_size_bytes: Trunk size for the H2D restore (backward pass).
+        """
+        if stash_size_bytes is not None:
+            cls._embedding_stash_chunk_size_bytes = stash_size_bytes
+        if restore_size_bytes is not None:
+            cls._embedding_restore_chunk_size_bytes = restore_size_bytes
+
+    @classmethod
+    def set_optimizer_trunk_size(
+        cls,
+        stash_size_bytes: Optional[int] = None,
+        restore_size_bytes: Optional[int] = None,
+    ) -> None:
+        """Set the optimizer-state trunk sizes (in bytes).
+
+        Only the arguments that are not ``None`` are applied, so a caller can
+        tune one direction without disturbing the other. Values <= 0 disable
+        chunking for that direction and fall back to a single ``copy_``. When
+        the state is stashed in slices (``num_slices > 1``) every slice uses
+        these same sizes.
+
+        Args:
+            stash_size_bytes: Trunk size for the D2H stash (after the step).
+            restore_size_bytes: Trunk size for the H2D restore (backward pass).
+        """
+        if stash_size_bytes is not None:
+            cls._optimizer_stash_chunk_size_bytes = stash_size_bytes
+        if restore_size_bytes is not None:
+            cls._optimizer_restore_chunk_size_bytes = restore_size_bytes
 
     @classmethod
     def set_delay_stash(cls, delay: bool) -> None:
@@ -328,7 +388,10 @@ class MemoryStashingManager:
         cls._optimizer_scratch_buffer_restore_callbacks.clear()
         cls._emo_cache_restore_callbacks.clear()
         cls._delay_stash = False
-        cls._stash_chunk_size_bytes = _STASH_CHUNK_SIZE_BYTES
+        cls._embedding_stash_chunk_size_bytes = _STASH_CHUNK_SIZE_BYTES
+        cls._embedding_restore_chunk_size_bytes = _STASH_CHUNK_SIZE_BYTES
+        cls._optimizer_stash_chunk_size_bytes = _STASH_CHUNK_SIZE_BYTES
+        cls._optimizer_restore_chunk_size_bytes = _STASH_CHUNK_SIZE_BYTES
         cls._pending_stash_callbacks.clear()
         cls._staged_storage_buffers.clear()
         cls._stashed_tables = None
@@ -459,6 +522,8 @@ class MemoryStashingManager:
         label: str = "tensor",
         sync_event: Optional[torch.cuda.Event] = None,
         delay: bool = False,
+        stash_chunk_size_bytes: Optional[int] = None,
+        restore_chunk_size_bytes: Optional[int] = None,
     ) -> Tuple[
         Callable[[Optional[torch.Tensor]], None],
         Callable[..., None],
@@ -488,6 +553,12 @@ class MemoryStashingManager:
                 to perform the actual D2H copy and free HBM.  A sync event
                 is recorded automatically so that the deferred execution
                 waits for the correct GPU work.
+            stash_chunk_size_bytes: Trunk size for the D2H copy, passed to
+                ``chunked_copy_``.  ``None`` falls back to
+                ``_STASH_CHUNK_SIZE_BYTES``; the public ``stash_*`` entry
+                points always pass their use case's configured value.
+            restore_chunk_size_bytes: Trunk size for the H2D copy in the
+                returned ``restore`` callback.  Same fallback as above.
 
         Returns:
             A tuple of three callback functions:
@@ -498,6 +569,21 @@ class MemoryStashingManager:
               hook.  In non-delayed mode it has already been called and is
               safe to call again (no-op on empty tensor list).
         """
+        # Resolve the trunk sizes once, up front, so a stash and the ``restore``
+        # it hands back always use a matched pair -- a later
+        # ``set_*_trunk_size`` or ``reset`` cannot re-point an in-flight cycle's
+        # restore at a different trunk size than its stash.
+        stash_chunk_bytes: int = (
+            _STASH_CHUNK_SIZE_BYTES
+            if stash_chunk_size_bytes is None
+            else stash_chunk_size_bytes
+        )
+        restore_chunk_bytes: int = (
+            _STASH_CHUNK_SIZE_BYTES
+            if restore_chunk_size_bytes is None
+            else restore_chunk_size_bytes
+        )
+
         # (hbm_tensor ref, cpu_buffer, original_storage_size)
         stash_data: List[Tuple[torch.Tensor, torch.Tensor, int]] = []
         # Original CUDA storages saved before .data= so restore can
@@ -558,7 +644,7 @@ class MemoryStashingManager:
                         chunked_copy_(
                             cpu_buffer,
                             tensor,
-                            chunk_size_bytes=cls._stash_chunk_size_bytes,
+                            chunk_size_bytes=stash_chunk_bytes,
                         )
                         # Tell the caching allocator this tensor is in use on
                         # d2h_stream so the bytes are not reused by default-
@@ -707,7 +793,7 @@ class MemoryStashingManager:
                             chunked_copy_(
                                 tmp,
                                 cpu_buf,
-                                chunk_size_bytes=cls._stash_chunk_size_bytes,
+                                chunk_size_bytes=restore_chunk_bytes,
                             )
                         # Tell the caching allocator this storage is in use on
                         # h2d_stream so the bytes cannot be reused by main-stream
@@ -839,7 +925,11 @@ class MemoryStashingManager:
 
         if cls._delay_stash:
             await_restore, restore, execute_stash = cls._stash_tensors(
-                tensors, label="embedding", delay=True
+                tensors,
+                label="embedding",
+                delay=True,
+                stash_chunk_size_bytes=cls._embedding_stash_chunk_size_bytes,
+                restore_chunk_size_bytes=cls._embedding_restore_chunk_size_bytes,
             )
 
             # Wrap execute_stash to also register the restore callback,
@@ -852,7 +942,10 @@ class MemoryStashingManager:
             return await_restore, restore, _deferred_stash
 
         await_restore, restore, execute_stash = cls._stash_tensors(
-            tensors, label="embedding"
+            tensors,
+            label="embedding",
+            stash_chunk_size_bytes=cls._embedding_stash_chunk_size_bytes,
+            restore_chunk_size_bytes=cls._embedding_restore_chunk_size_bytes,
         )
         cls._embedding_weight_restore_callbacks.append(restore)
         return await_restore, restore, execute_stash
@@ -1172,7 +1265,11 @@ class MemoryStashingManager:
 
         if num_slices <= 1:
             await_restore, tensor_restore, _execute_stash = cls._stash_tensors(
-                tensors, label="optimizer state", sync_event=sync_event
+                tensors,
+                label="optimizer state",
+                sync_event=sync_event,
+                stash_chunk_size_bytes=cls._optimizer_stash_chunk_size_bytes,
+                restore_chunk_size_bytes=cls._optimizer_restore_chunk_size_bytes,
             )
             cls._optimizer_state_restore_callbacks.append(tensor_restore)
             scratch_buffer_restore = cls._release_optimizer_scratch_buffers(
@@ -1215,6 +1312,8 @@ class MemoryStashingManager:
                 slice_tensors,
                 label=f"optimizer state slice {k + 1}/{len(slices)}",
                 sync_event=sync_event,
+                stash_chunk_size_bytes=cls._optimizer_stash_chunk_size_bytes,
+                restore_chunk_size_bytes=cls._optimizer_restore_chunk_size_bytes,
             )
             slice_awaits.append(await_restore_k)
             slice_restores.append(restore_k)

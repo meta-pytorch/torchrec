@@ -29,6 +29,7 @@ from torchrec.distributed.embedding_types import (
 from torchrec.distributed.memory_stashing import (
     _collect_cuda_tensors_from_value,
     _partition_tensors_into_slices,
+    _STASH_CHUNK_SIZE_BYTES,
     chunked_copy_,
     MemoryStashingManager,
 )
@@ -1190,6 +1191,247 @@ class ChunkedCopyTest(unittest.TestCase):
         # A dummy op sits between consecutive chunks: one fewer than chunk count.
         self.assertEqual(len(add_calls), expected_chunks - 1)
         self.assertTrue(torch.equal(dst.cpu(), src.cpu()))
+
+
+class TestTrunkSizeConfiguration(unittest.TestCase):
+    """Tests for the four independent trunk-size knobs (no GPU required)."""
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+
+    def test_defaults_are_the_shared_default(self) -> None:
+        """All four knobs start at _STASH_CHUNK_SIZE_BYTES (32 MiB)."""
+        self.assertEqual(_STASH_CHUNK_SIZE_BYTES, 32 * 1024**2)
+        self.assertEqual(
+            MemoryStashingManager._embedding_stash_chunk_size_bytes,
+            _STASH_CHUNK_SIZE_BYTES,
+        )
+        self.assertEqual(
+            MemoryStashingManager._embedding_restore_chunk_size_bytes,
+            _STASH_CHUNK_SIZE_BYTES,
+        )
+        self.assertEqual(
+            MemoryStashingManager._optimizer_stash_chunk_size_bytes,
+            _STASH_CHUNK_SIZE_BYTES,
+        )
+        self.assertEqual(
+            MemoryStashingManager._optimizer_restore_chunk_size_bytes,
+            _STASH_CHUNK_SIZE_BYTES,
+        )
+
+    def test_embedding_and_optimizer_are_independent(self) -> None:
+        """Setting one use case must not disturb the other."""
+        MemoryStashingManager.set_embedding_trunk_size(64 * 1024**2, 64 * 1024**2)
+        MemoryStashingManager.set_optimizer_trunk_size(128 * 1024**2, 128 * 1024**2)
+
+        self.assertEqual(
+            MemoryStashingManager._embedding_stash_chunk_size_bytes, 64 * 1024**2
+        )
+        self.assertEqual(
+            MemoryStashingManager._embedding_restore_chunk_size_bytes, 64 * 1024**2
+        )
+        self.assertEqual(
+            MemoryStashingManager._optimizer_stash_chunk_size_bytes, 128 * 1024**2
+        )
+        self.assertEqual(
+            MemoryStashingManager._optimizer_restore_chunk_size_bytes, 128 * 1024**2
+        )
+
+    def test_stash_and_restore_directions_are_independent(self) -> None:
+        """Within a use case, each direction is set separately."""
+        MemoryStashingManager.set_embedding_trunk_size(
+            stash_size_bytes=8 * 1024**2, restore_size_bytes=64 * 1024**2
+        )
+        self.assertEqual(
+            MemoryStashingManager._embedding_stash_chunk_size_bytes, 8 * 1024**2
+        )
+        self.assertEqual(
+            MemoryStashingManager._embedding_restore_chunk_size_bytes, 64 * 1024**2
+        )
+
+    def test_omitted_direction_is_left_untouched(self) -> None:
+        """``None`` means 'leave as is', so one direction can be tuned alone."""
+        MemoryStashingManager.set_optimizer_trunk_size(4 * 1024**2, 4 * 1024**2)
+        MemoryStashingManager.set_optimizer_trunk_size(stash_size_bytes=16 * 1024**2)
+
+        self.assertEqual(
+            MemoryStashingManager._optimizer_stash_chunk_size_bytes, 16 * 1024**2
+        )
+        self.assertEqual(
+            MemoryStashingManager._optimizer_restore_chunk_size_bytes, 4 * 1024**2
+        )
+
+    def test_set_trunk_size_sets_every_knob(self) -> None:
+        """The set-both shortcut still applies to all four."""
+        MemoryStashingManager.set_trunk_size(7 * 1024**2)
+        self.assertEqual(
+            MemoryStashingManager._embedding_stash_chunk_size_bytes, 7 * 1024**2
+        )
+        self.assertEqual(
+            MemoryStashingManager._embedding_restore_chunk_size_bytes, 7 * 1024**2
+        )
+        self.assertEqual(
+            MemoryStashingManager._optimizer_stash_chunk_size_bytes, 7 * 1024**2
+        )
+        self.assertEqual(
+            MemoryStashingManager._optimizer_restore_chunk_size_bytes, 7 * 1024**2
+        )
+
+    def test_reset_restores_all_defaults(self) -> None:
+        """reset() must clear every knob, not just one."""
+        MemoryStashingManager.set_embedding_trunk_size(1, 2)
+        MemoryStashingManager.set_optimizer_trunk_size(3, 4)
+
+        MemoryStashingManager.reset()
+
+        self.assertEqual(
+            MemoryStashingManager._embedding_stash_chunk_size_bytes,
+            _STASH_CHUNK_SIZE_BYTES,
+        )
+        self.assertEqual(
+            MemoryStashingManager._embedding_restore_chunk_size_bytes,
+            _STASH_CHUNK_SIZE_BYTES,
+        )
+        self.assertEqual(
+            MemoryStashingManager._optimizer_stash_chunk_size_bytes,
+            _STASH_CHUNK_SIZE_BYTES,
+        )
+        self.assertEqual(
+            MemoryStashingManager._optimizer_restore_chunk_size_bytes,
+            _STASH_CHUNK_SIZE_BYTES,
+        )
+
+
+class TestTrunkSizeWiring(unittest.TestCase):
+    """Each stash path must reach chunked_copy_ with its own trunk size.
+
+    Guards the wiring that makes the four knobs actually independent: embedding
+    and optimizer stashing share ``_stash_tensors``, so a regression there would
+    silently collapse all four back onto one value.
+    """
+
+    def setUp(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available")
+        self.device = torch.device("cuda:0")
+        MemoryStashingManager.set_streams(torch.cuda.Stream(device=self.device))
+        # Distinct, deliberately small values so each call is attributable and
+        # the chunk loop actually runs (rather than falling back to one copy_).
+        self.emb_stash_bytes = 64 * 1024
+        self.emb_restore_bytes = 16 * 1024
+        self.opt_stash_bytes = 128 * 1024
+        self.opt_restore_bytes = 8 * 1024
+        MemoryStashingManager.set_embedding_trunk_size(
+            stash_size_bytes=self.emb_stash_bytes,
+            restore_size_bytes=self.emb_restore_bytes,
+        )
+        MemoryStashingManager.set_optimizer_trunk_size(
+            stash_size_bytes=self.opt_stash_bytes,
+            restore_size_bytes=self.opt_restore_bytes,
+        )
+
+    def tearDown(self) -> None:
+        MemoryStashingManager.reset()
+
+    def _record_chunked_copy(self, calls: List[Tuple[str, int]]) -> Any:
+        """Patch chunked_copy_ to record (direction, chunk_size) and call through.
+
+        Direction is read off the destination: a CPU dst is the D2H stash, a
+        CUDA dst is the H2D restore.
+        """
+        real = chunked_copy_
+
+        def recording(
+            dst: torch.Tensor,
+            src: torch.Tensor,
+            chunk_size_bytes: int = 512 * 1024**2,
+            *args: Any,
+            **kwargs: Any,
+        ) -> None:
+            calls.append(("h2d" if dst.is_cuda else "d2h", chunk_size_bytes))
+            real(dst, src, chunk_size_bytes, *args, **kwargs)
+
+        return patch(
+            "torchrec.distributed.memory_stashing.chunked_copy_", new=recording
+        )
+
+    def test_embedding_stash_and_restore_use_the_embedding_sizes(self) -> None:
+        weights = torch.randn(512, 512, device=self.device)  # 1 MiB
+        original = weights.clone()
+        inner = Mock()
+        inner.weights_dev = weights
+        emb_module = Mock()
+        emb_module._emb_module = inner
+        lookup = Mock(spec=["_emb_modules"])
+        lookup._emb_modules = [emb_module]
+
+        calls: List[Tuple[str, int]] = []
+        with self._record_chunked_copy(calls):
+            result = MemoryStashingManager.stash_embedding_weights(lookup)
+            self.assertIsNotNone(result)
+            assert result is not None
+            await_restore, restore, _execute_stash = result
+            restore(None)
+            await_restore(None)
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            calls, [("d2h", self.emb_stash_bytes), ("h2d", self.emb_restore_bytes)]
+        )
+        torch.testing.assert_close(weights, original, rtol=1e-05, atol=1e-08)
+
+    def test_optimizer_stash_and_restore_use_the_optimizer_sizes(self) -> None:
+        model = nn.Linear(4, 4).to(self.device)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        param = next(model.parameters())
+        state = torch.randn(512, 512, device=self.device)  # 1 MiB, over the threshold
+        original = state.clone()
+        optimizer.state[param] = {"exp_avg": state}
+
+        calls: List[Tuple[str, int]] = []
+        with self._record_chunked_copy(calls):
+            await_restore, restore = MemoryStashingManager.stash_optimizer_state(
+                optimizer
+            )
+            restore(None)
+            await_restore(None)
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            calls, [("d2h", self.opt_stash_bytes), ("h2d", self.opt_restore_bytes)]
+        )
+        torch.testing.assert_close(state, original, rtol=1e-05, atol=1e-08)
+
+    def test_optimizer_slices_all_use_the_optimizer_sizes(self) -> None:
+        """A multi-slice restore must not fall back to the shared default."""
+        model = nn.Linear(4, 4).to(self.device)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, foreach=True)
+        params = list(model.parameters())
+        for param in params[:2]:
+            optimizer.state[param] = {
+                "exp_avg": torch.randn(512, 512, device=self.device)
+            }
+
+        calls: List[Tuple[str, int]] = []
+        with self._record_chunked_copy(calls):
+            await_restore, restore = MemoryStashingManager.stash_optimizer_state(
+                optimizer, num_slices=2
+            )
+            restore(None)
+            await_restore(None)
+        torch.cuda.synchronize()
+
+        self.assertEqual(
+            sorted(calls),
+            sorted(
+                [
+                    ("d2h", self.opt_stash_bytes),
+                    ("d2h", self.opt_stash_bytes),
+                    ("h2d", self.opt_restore_bytes),
+                    ("h2d", self.opt_restore_bytes),
+                ]
+            ),
+        )
 
 
 class TestCollectCudaTensorsSharded(unittest.TestCase):
