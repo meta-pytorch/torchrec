@@ -255,6 +255,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         no_bag: bool = False,
         write_runtime_meta_dim: int = 0,
         persist_hash_zch_bucket: bool = True,
+        percent_fresh_region: float = 0,
     ) -> None:
         if output_segments is None:
             assert (
@@ -398,6 +399,14 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         self._enable_per_feature_lookups: bool = enable_per_feature_lookups
         self._no_bag = no_bag
 
+        self._percent_fresh_region: float = percent_fresh_region
+        self._main_size: Optional[int] = None
+        self._fresh_size: Optional[int] = None
+        if self._percent_fresh_region != 0:
+            self._main_size, self._fresh_size = self._compute_region_split(
+                size_per_rank
+            )
+
         logger.info(
             f"HashZchManagedCollisionModule: {self._name=}, {self.device=}, "
             f"{self._zch_size=}, {self._input_hash_size=}, {self._max_probe=}, "
@@ -409,7 +418,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, "
             f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
             f"{self._no_bag=}, {self._write_runtime_meta_dim=}, "
-            f"{self._persist_hash_zch_bucket=}"
+            f"{self._persist_hash_zch_bucket=}, {self._percent_fresh_region=}, "
+            f"{self._main_size=}, {self._fresh_size=}"
         )
 
     def _create_zch_buffer(
@@ -506,6 +516,31 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
     def is_sharded(self) -> bool:
         # For sharded hash mc module, the buckets are split across multiple ranks.
         return (self._end_bucket - self._start_bucket) < self._buckets
+
+    def _compute_region_split(self, size_per_rank: torch.Tensor) -> Tuple[int, int]:
+        assert (
+            0 <= self._percent_fresh_region < 100
+        ), f"percent_fresh_region must be in [0, 100), got {self._percent_fresh_region}"
+        assert (
+            self._disable_fallback
+        ), "percent_fresh_region requires disable_fallback=True; otherwise a full Main region falls back into the Fresh tail"
+        assert (
+            self._opt_in_prob == -1
+        ), "percent_fresh_region is incompatible with opt-in; opt_in_prob must be -1"
+        unique = torch.unique(size_per_rank[self._start_bucket : self._end_bucket])
+        assert (
+            unique.numel() == 1
+        ), "cannot split non-uniform buckets into main/fresh regions"
+        bucket_size = int(unique.item())
+        fresh_size = math.floor(bucket_size * self._percent_fresh_region / 100)
+        main_size = bucket_size - fresh_size
+        assert not (
+            self._percent_fresh_region > 0 and (fresh_size <= 0 or main_size <= 0)
+        ), (
+            f"percent_fresh_region={self._percent_fresh_region} with bucket_size={bucket_size} "
+            f"yields ({main_size}, {fresh_size}); both regions must be non-empty"
+        )
+        return main_size, fresh_size
 
     # TODO: This is hacky as we are using parameters to go through publishing.
     # Can remove once working out buffer solution.
@@ -845,6 +880,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             no_bag=self._no_bag,
             write_runtime_meta_dim=self._write_runtime_meta_dim,
             persist_hash_zch_bucket=self._persist_hash_zch_bucket,
+            percent_fresh_region=self._percent_fresh_region,
         )
 
     def lookup_runtime_meta(
