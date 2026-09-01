@@ -572,6 +572,34 @@ def alltoall_pooled(
         codecs=codecs,
     )
 
+    # Keep the experimental dependency out of non-TPU import and execution paths.
+    if getattr(torch, "tpu", None) is not None and torch.tpu.is_available():
+        from torchrec.experimental.torch_tpu.uneven_all_to_all import (
+            maybe_all2all_pooled_uneven_tpu,
+        )
+
+        def even_all_to_all(input_tensor: Tensor, split_size: int) -> Tensor:
+            split_sizes = [split_size] * group.size()
+            return AllToAllSingle.apply(
+                input_tensor,
+                split_sizes,
+                split_sizes,
+                pg_name(group),
+                group.size(),
+                get_gradient_division(),
+            )
+
+        uneven = maybe_all2all_pooled_uneven_tpu(
+            group,
+            a2a_pooled_embs_tensor,
+            batch_size_per_rank,
+            dim_sum_per_rank,
+            has_codecs=codecs is not None,
+            even_all_to_all=even_all_to_all,
+        )
+        if uneven is not None:
+            return NoWait(uneven)
+
     if get_use_sync_collectives():
         return NoWait(all2all_pooled_sync(group, a2ai, a2a_pooled_embs_tensor))
 
