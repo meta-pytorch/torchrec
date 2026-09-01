@@ -2468,7 +2468,11 @@ class WindowOverEvictionMergeTest(unittest.TestCase):
         if dist.is_initialized():
             dist.destroy_process_group()
 
-    def _build_config(self, metric_enum: RecMetricEnum) -> MetricsConfig:
+    def _build_config(
+        self,
+        metric_enum: RecMetricEnum,
+        compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+    ) -> MetricsConfig:
         return MetricsConfig(
             rec_tasks=self.tasks,
             rec_metrics={
@@ -2476,18 +2480,21 @@ class WindowOverEvictionMergeTest(unittest.TestCase):
                     rec_tasks=self.tasks, window_size=self.WINDOW_SIZE
                 )
             },
-            rec_compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            rec_compute_mode=compute_mode,
             compute_interval_steps=1,
         )
 
     def _build_offloaded_module(
-        self, metric_enum: RecMetricEnum, update_batch_size: int
+        self,
+        metric_enum: RecMetricEnum,
+        update_batch_size: int,
+        compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
     ) -> CPUOffloadedRecMetricModule:
         module = cast(
             CPUOffloadedRecMetricModule,
             generate_metric_module(
                 metric_class=CPUOffloadedRecMetricModule,
-                metrics_config=self._build_config(metric_enum),
+                metrics_config=self._build_config(metric_enum, compute_mode),
                 batch_size=self.BATCH_SIZE,
                 world_size=1,
                 my_rank=0,
@@ -2530,6 +2537,20 @@ class WindowOverEvictionMergeTest(unittest.TestCase):
             k: cast(torch.Tensor, v)
             for k, v in result.items()
             if "window" in k.lower() and isinstance(v, torch.Tensor)
+        }
+
+    def _run_tower_qps(self, update_batch_size: int) -> dict[str, torch.Tensor]:
+        module = self._build_offloaded_module(
+            RecMetricEnum.TOWER_QPS,
+            update_batch_size,
+            RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION,
+        )
+        for batch in self._gen_batches():
+            module.update(batch)
+        return {
+            key: cast(torch.Tensor, value)
+            for key, value in module.async_compute().resolve().items()
+            if isinstance(value, torch.Tensor)
         }
 
     @staticmethod
@@ -2594,6 +2615,16 @@ class WindowOverEvictionMergeTest(unittest.TestCase):
             f"Metrics with broken window under K-merge over-eviction: {bad}. "
             "cap-K must keep every metric's window within tolerance of K=1.",
         )
+
+    def test_fused_tower_qps_counts_all_examples_under_kmerge(self) -> None:
+        reference = self._run_tower_qps(update_batch_size=1)
+        merged = self._run_tower_qps(update_batch_size=self.K)
+        expected_examples = self.K * self.BATCH_SIZE
+
+        for task in self.tasks:
+            key = f"qps-{task.name}|total_examples"
+            self.assertEqual(reference[key].item(), expected_examples)
+            self.assertEqual(merged[key].item(), expected_examples)
 
 
 class CapUpdateBatchSizeTest(unittest.TestCase):
