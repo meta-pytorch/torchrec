@@ -191,7 +191,21 @@ class WindowBuffer:
         window_state += curr_state
         self._window_used_size += size
 
-        while self._window_used_size > self._max_size:
+        # `len(self._buffers) > 1`: an update whose own size exceeds the entire window
+        # would otherwise evict itself, leaving an EMPTY window -- window_state == 0, so
+        # every window_* metric that divides by a window state publishes 0/0 = NaN.
+        # Keeping the newest entry degrades to "the window is the last update", which is
+        # the closest well-defined answer.
+        #
+        # This is NOT introduced by the shape[-1] fix in this commit: the ~29 metrics that
+        # already sized by shape[-1] (ne, ctr, calibration, ...) could always reach it.
+        # RecMetric guards it at construction (`_window_size < _batch_size` raises), but
+        # that check uses the CONFIGURED batch size, while `size` here is the actual tensor
+        # length -- and the two diverge under `fused_update_limit` (which concatenates F
+        # batches) and under batch-size stages (which RecMetric discards). This commit
+        # extends the reachable surface to three more metrics, so the degenerate case is
+        # closed here rather than left to be found in production.
+        while self._window_used_size > self._max_size and len(self._buffers) > 1:
             remove(window_state)
 
     @property

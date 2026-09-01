@@ -15,7 +15,7 @@ from unittest.mock import Mock, patch
 
 import torch
 from torchrec.metrics.metrics_config import BatchSizeStage
-from torchrec.metrics.throughput import ThroughputMetric
+from torchrec.metrics.throughput import MAX_WINDOW_TS, ThroughputMetric
 
 
 THROUGHPUT_PATH = "torchrec.metrics.throughput"
@@ -493,3 +493,80 @@ class ThroughputMetricTest(unittest.TestCase):
 
         # Expecting 0
         self.assertEqual(curr_job_throughput_metric._num_batch, 0)
+
+
+class ThroughputWindowDequeAccountingTest(unittest.TestCase):
+    """`_window_time_lapse` must stay equal to the sum of the deque.
+
+    `_window_time_lapse_buffer` is a bounded deque. A plain `append()` on a full deque
+    silently drops the leftmost entry, so without a matching subtraction the running
+    total permanently over-counts by everything ever evicted. `_check_window()` then
+    over-pops, shrinking `len(buffer)`, and
+    `window_throughput = len(buffer) * batch_examples / _window_time_lapse` is wrong in
+    BOTH numerator and denominator -- it under-reports twice over.
+
+    Saturation -- and therefore the bug -- needs more than MAX_WINDOW_TS updates inside
+    the window, i.e. `MAX_WINDOW_TS / min(window_seconds, MAX_WINDOW_TS)` `update()`/sec.
+    At the default window_seconds=100 that is 72/sec and looks unreachable, but
+    `window_seconds` is CLAMPED to MAX_WINDOW_TS, so any job asking for a larger window
+    runs at the clamp, where the threshold is ~1 `update()`/sec -- routine. That is the
+    regime this test pins. Gradient accumulation compounds it: `update()` fires once per
+    micro-batch, so the K>1 arm can saturate while the K=1 arm does not, corrupting
+    `window_throughput` on one arm of a K=1-vs-K>1 comparison only.
+    """
+
+    def _make_metric(self) -> ThroughputMetric:
+        # window_seconds at the MAX_WINDOW_TS cap, paired with a sub-second lapse per
+        # update below, so the deque reaches its maxlen BEFORE the summed lapse exceeds
+        # the window. Otherwise _check_window() pops first and the deque never saturates,
+        # which is exactly the regime that hides this bug.
+        return ThroughputMetric(
+            batch_size=32, world_size=4, window_seconds=MAX_WINDOW_TS
+        )
+
+    def test_window_time_lapse_matches_buffer_sum_after_forced_eviction(self) -> None:
+        metric = self._make_metric()
+        maxlen = metric._window_time_lapse_buffer.maxlen
+        assert maxlen is not None
+
+        # 0.5s per update: maxlen entries sum to maxlen/2 < window_seconds, so the deque
+        # saturates and append() starts evicting while _check_window() stays quiet.
+        step_seconds = 0.5
+        total_updates = metric._warmup_steps + maxlen + 50
+        with patch(f"{THROUGHPUT_PATH}.time.monotonic") as mock_time:
+            for step in range(total_updates):
+                mock_time.return_value = step * step_seconds
+                metric.update()
+
+        self.assertEqual(len(metric._window_time_lapse_buffer), maxlen)
+        self.assertAlmostEqual(
+            metric._window_time_lapse,
+            sum(metric._window_time_lapse_buffer),
+            places=6,
+        )
+        self.assertAlmostEqual(
+            metric._window_time_lapse, maxlen * step_seconds, places=6
+        )
+        # Assert the PUBLISHED value, not just internal state: the whole point is that
+        # `window_throughput = len(buffer) * batch_examples / _window_time_lapse` reports
+        # the true steady-state rate. With the drift present, _window_time_lapse is
+        # inflated by every silently-dropped entry and this under-reports.
+        published = metric.compute()
+        self.assertAlmostEqual(
+            published[metric._window_throughput_key].item(),
+            metric._batch_examples() / step_seconds,
+            places=4,
+        )
+
+    def test_window_time_lapse_matches_buffer_sum_before_saturation(self) -> None:
+        """The invariant also holds on the un-saturated path (no regression)."""
+        metric = self._make_metric()
+        with patch(f"{THROUGHPUT_PATH}.time.monotonic") as mock_time:
+            for step in range(metric._warmup_steps + 10):
+                mock_time.return_value = step * 0.5
+                metric.update()
+        self.assertAlmostEqual(
+            metric._window_time_lapse,
+            sum(metric._window_time_lapse_buffer),
+            places=6,
+        )

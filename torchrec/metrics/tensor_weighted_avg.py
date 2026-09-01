@@ -110,7 +110,10 @@ class TensorWeightedAvgMetricComputation(RecMetricComputation):
                         kwargs["required_inputs"][tensor_name],
                     )
 
-        num_samples = labels.shape[0]
+        # shape[-1] is the sample count. shape[0] is n_tasks (1 in unfused mode), which
+        # made window retention scale with the number of update() CALLS rather than with
+        # samples. Matches ne.py / gauc.py / ndcg.py.
+        num_samples = labels.shape[-1]
         weights = cast(torch.Tensor, weights)
         # pyrefly: ignore[unbound-name]
         self.weighted_mask = self.weighted_mask.to(target_tensor.device)

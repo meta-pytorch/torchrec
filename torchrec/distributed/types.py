@@ -615,6 +615,19 @@ class ModuleShardingPlan:
 
 
 class CacheStatistics(abc.ABC):
+    def stable_fingerprint(self) -> Tuple[object, ...]:
+        """Return a versioned representation for persistent cache keys.
+
+        Subclasses must override this method. The fingerprint must include every
+        input that governs
+        ``expected_miss_rate`` and its version must change when those semantics
+        change. Returned values must not contain process-local object identity.
+        """
+        raise RuntimeError(
+            f"{type(self).__qualname__} must override stable_fingerprint() "
+            "before it can be used in a persistent planner cache key"
+        )
+
     @property
     @abc.abstractmethod
     def expected_lookups(self) -> float:
@@ -667,6 +680,28 @@ class CacheParams:
     prefetch_pipeline: Optional[bool] = None
     stats: Optional[CacheStatistics] = None
     multipass_prefetch_config: Optional[MultiPassPrefetchConfig] = None
+
+    def stable_fingerprint(self) -> Tuple[object, ...]:
+        return (
+            "cache_params",
+            1,
+            self.algorithm.name if self.algorithm is not None else None,
+            self.load_factor,
+            self.reserved_memory,
+            self.precision.value if self.precision is not None else None,
+            self.prefetch_pipeline,
+            self.stats.stable_fingerprint() if self.stats is not None else None,
+            (
+                (
+                    "multi_pass_prefetch_config",
+                    1,
+                    self.multipass_prefetch_config.num_passes,
+                    self.multipass_prefetch_config.min_splitable_pass_size,
+                )
+                if self.multipass_prefetch_config is not None
+                else None
+            ),
+        )
 
     def __hash__(self) -> int:
         return hash(

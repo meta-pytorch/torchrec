@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from typing import cast, List, Optional, Type
+from typing import cast, List, Optional, Tuple, Type
 from unittest.mock import MagicMock
 
 import torch
@@ -87,6 +87,14 @@ class MockCacheStatistics(CacheStatistics):
     @property
     def cacheability(self) -> float:
         return self._cacheability
+
+    def stable_fingerprint(self) -> Tuple[object, ...]:
+        return (
+            "mock_cache_statistics",
+            1,
+            self._expected_lookups,
+            self._cacheability,
+        )
 
 
 # Mocking _calculate_storage_specific_sizes to skip cache aux state accounting for

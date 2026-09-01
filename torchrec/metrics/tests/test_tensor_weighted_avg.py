@@ -9,11 +9,17 @@
 
 
 import unittest
-from typing import Dict, Iterable, Optional, Type, Union
+from typing import cast, Dict, Iterable, Optional, Type, Union
 
 import torch
 from torchrec.metrics.metrics_config import RecTaskInfo
-from torchrec.metrics.rec_metric import RecComputeMode, RecMetric, RecMetricException
+from torchrec.metrics.rec_metric import (
+    RecComputeMode,
+    RecMetric,
+    RecMetricComputation,
+    RecMetricException,
+    WindowBuffer,
+)
 from torchrec.metrics.tensor_weighted_avg import get_mean, TensorWeightedAvgMetric
 from torchrec.metrics.test_utils import (
     metric_test_helper,
@@ -670,3 +676,60 @@ class TensorWeightedAvgValueTest(unittest.TestCase):
             check_dtype=False,
             msg=f"Actual: {unweighted_value}, Expected: {expected_unweighted_avg}",
         )
+
+
+def _window_buffer(metric: RecMetric, state_name: str) -> WindowBuffer:
+    """The `WindowBuffer` backing one window state. No public accessor exists."""
+    computation = cast(RecMetricComputation, metric._metrics_computations[0])
+    buffers = computation._batch_window_buffers
+    assert buffers is not None, "window metrics are disabled on this metric"
+    return buffers[state_name]
+
+
+class WindowSampleAccountingTest(unittest.TestCase):
+    """Window eviction must count SAMPLES, not `update()` calls.
+
+    `TensorWeightedAvgMetricComputation.update` passes `num_samples` to `WindowBuffer` as
+    the entry's `size`, and the buffer evicts while `_window_used_size > window_size`. In
+    unfused mode `labels` is `(n_tasks, n_samples)` with `n_tasks == 1`, so reading
+    `shape[0]` reports 1 sample per update regardless of batch size, and
+    `window_weighted_avg` covers an unbounded span.
+
+    Sibling of the identical test in `test_weighted_avg.py` -- the three metrics that
+    carried this bug are fixed atomically, so each one is pinned separately. Without a
+    test here, `tensor_weighted_avg.py` could silently regress to `shape[0]`.
+    """
+
+    _BATCH = 100
+    _WINDOW = 250  # 2 batches fit, the 3rd forces an eviction
+    _UPDATES = 5
+
+    def test_window_evicts_on_sample_count_not_update_count(self) -> None:
+        task = RecTaskInfo(
+            name="t1",
+            label_name="label",
+            prediction_name="prediction",
+            weight_name="weight",
+            tensor_name="test_tensor",
+            weighted=True,
+        )
+        metric = TensorWeightedAvgMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=self._BATCH,
+            tasks=[task],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=self._WINDOW,
+        )
+        for _ in range(self._UPDATES):
+            metric.update(
+                predictions={task.name: torch.rand(1, self._BATCH)},
+                labels={task.name: torch.rand(1, self._BATCH)},
+                weights={task.name: torch.ones(1, self._BATCH)},
+                required_inputs={"test_tensor": torch.rand(1, self._BATCH)},
+            )
+        buf = _window_buffer(metric, "window_weighted_sum")
+        # samples: 5 x 100 = 500 > 250, so the window holds the newest 2 batches.
+        # Reading shape[0] would report 1 sample/update -> used=5 <= 250 -> all 5 kept.
+        self.assertEqual(len(buf.buffers), 2)
+        self.assertEqual(buf._window_used_size, 2 * self._BATCH)

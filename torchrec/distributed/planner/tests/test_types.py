@@ -21,6 +21,7 @@ from torchrec.distributed.logger import static_logger
 from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.perf_models import NoopPerfModel
+from torchrec.distributed.planner.shard_estimators import EmbeddingOffloadStats
 from torchrec.distributed.planner.storage_reservations import (
     HeuristicalStorageReservation,
 )
@@ -35,6 +36,7 @@ from torchrec.distributed.planner.types import (
     ParameterConstraints,
     Perf,
     PlannerConfig,
+    PlannerContextFingerprintError,
     PlannerVariant,
     PlanReportMetadata,
     ProposerConfig,
@@ -59,8 +61,10 @@ from torchrec.distributed.types import (
     BoundsCheckMode,
     CacheAlgorithm,
     CacheParams,
+    CacheStatistics,
     DataType,
     KeyValueParams,
+    MultiPassPrefetchConfig,
     ShardingType,
 )
 from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
@@ -556,8 +560,7 @@ def _test_hashing_consistency(
             constraints=constraints,
         )
 
-        h = planner1.hash_planner_context_inputs()
-        return_hash_dict[str(rank)] = h
+        return_hash_dict[str(rank)] = planner1.hash_planner_context_inputs()
 
 
 class TestHashPlannerContextInputsRounding(unittest.TestCase):
@@ -742,7 +745,9 @@ class TestHashPlannerContextInputsRounding(unittest.TestCase):
 class TestHashPlannerContextInputsWithConstraints(unittest.TestCase):
     """Tests for hash_planner_context_inputs with ParameterConstraints."""
 
-    def _create_mock_enumerator(self) -> MagicMock:
+    def _create_mock_enumerator(
+        self, cache_params: Optional[CacheParams] = None
+    ) -> MagicMock:
         """Create a mock enumerator with search space."""
         enumerator = MagicMock()
         enumerator.last_stored_search_space = [
@@ -751,7 +756,7 @@ class TestHashPlannerContextInputsWithConstraints(unittest.TestCase):
                 sharding_type=ShardingType.TABLE_WISE.value,
                 compute_kernel=EmbeddingComputeKernel.FUSED.value,
                 shards=(),
-                cache_params=None,
+                cache_params=cache_params,
                 key_value_params=None,
             )
         ]
@@ -839,6 +844,401 @@ class TestHashPlannerContextInputsWithConstraints(unittest.TestCase):
             hash1,
             hash2,
             "Hashes should be equal for identical constraints with cache_params and key_value_params",
+        )
+
+    def test_hash_stability_with_equivalent_cache_statistics(self) -> None:
+        stats1 = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+        stats2 = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+        cache_params1 = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            stats=stats1,
+        )
+        cache_params2 = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            stats=stats2,
+        )
+        constraints1 = {"table_0": ParameterConstraints(cache_params=cache_params1)}
+        constraints2 = {"table_0": ParameterConstraints(cache_params=cache_params2)}
+        topology = self._create_topology()
+        storage_reservation = self._create_mock_storage_reservation()
+
+        hash1 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=128,
+            enumerator=self._create_mock_enumerator(cache_params1),
+            storage_reservation=storage_reservation,
+            constraints=constraints1,
+        )
+        hash2 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=128,
+            enumerator=self._create_mock_enumerator(cache_params2),
+            storage_reservation=storage_reservation,
+            constraints=constraints2,
+        )
+
+        self.assertEqual(hash1, hash2)
+
+    def test_hash_changes_with_cache_statistics_content(self) -> None:
+        stats1 = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+        stats2 = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 0]),
+            height=1024,
+        )
+        cache_params1 = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            stats=stats1,
+        )
+        cache_params2 = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            stats=stats2,
+        )
+        constraints1 = {"table_0": ParameterConstraints(cache_params=cache_params1)}
+        constraints2 = {"table_0": ParameterConstraints(cache_params=cache_params2)}
+        topology = self._create_topology()
+        storage_reservation = self._create_mock_storage_reservation()
+
+        hash1 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=128,
+            enumerator=self._create_mock_enumerator(cache_params1),
+            storage_reservation=storage_reservation,
+            constraints=constraints1,
+        )
+        hash2 = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=128,
+            enumerator=self._create_mock_enumerator(cache_params2),
+            storage_reservation=storage_reservation,
+            constraints=constraints2,
+        )
+
+        self.assertNotEqual(hash1, hash2)
+
+    def test_hash_supports_bfloat16_cache_statistics(self) -> None:
+        stats1 = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1], dtype=torch.bfloat16),
+            height=1024,
+        )
+        stats2 = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1], dtype=torch.bfloat16),
+            height=1024,
+        )
+
+        self.assertEqual(stats1.stable_fingerprint(), stats2.stable_fingerprint())
+
+    def test_cache_statistics_fingerprint_tracks_histogram_mutation(self) -> None:
+        stats = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+
+        fingerprint = stats.stable_fingerprint()
+        stats.hist[0] = 5
+
+        self.assertNotEqual(fingerprint, stats.stable_fingerprint())
+
+    def test_cache_statistics_fingerprint_tracks_numpy_alias_mutation(self) -> None:
+        stats = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+
+        fingerprint = stats.stable_fingerprint()
+        stats.hist.numpy()[0] = 5
+
+        self.assertNotEqual(fingerprint, stats.stable_fingerprint())
+
+        fingerprint = stats.stable_fingerprint()
+        stats.bins.numpy()[1] = 400
+
+        self.assertNotEqual(fingerprint, stats.stable_fingerprint())
+
+    def test_cache_statistics_fingerprint_tracks_bins_content(self) -> None:
+        current_stats = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+        restored_stats = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+        self.assertEqual(
+            current_stats.stable_fingerprint(), restored_stats.stable_fingerprint()
+        )
+
+        restored_stats.bins[1] = torch.nextafter(
+            restored_stats.bins[1], torch.tensor(float("inf"))
+        )
+        self.assertNotEqual(
+            current_stats.stable_fingerprint(), restored_stats.stable_fingerprint()
+        )
+
+        restored_stats.bins[1] = 400
+        self.assertNotEqual(
+            current_stats.stable_fingerprint(), restored_stats.stable_fingerprint()
+        )
+
+        restored_stats.bins = torch.linspace(
+            0, restored_stats.height, len(restored_stats.hist) + 1, dtype=torch.float16
+        )
+        self.assertNotEqual(
+            current_stats.stable_fingerprint(), restored_stats.stable_fingerprint()
+        )
+
+        restored_stats.bins = torch.linspace(
+            0, restored_stats.height, len(restored_stats.hist) + 1, dtype=torch.float64
+        )
+        self.assertNotEqual(
+            current_stats.stable_fingerprint(), restored_stats.stable_fingerprint()
+        )
+
+    def test_tensor_digest_supports_scalar_tensors(self) -> None:
+        digest = EmbeddingOffloadStats._compute_tensor_digest(torch.tensor(1))
+
+        self.assertEqual(64, len(digest))
+        self.assertNotEqual(
+            digest,
+            EmbeddingOffloadStats._compute_tensor_digest(torch.tensor(2)),
+        )
+
+    def test_cache_statistics_without_fingerprint_fails_loudly(self) -> None:
+        class CacheStatisticsWithoutFingerprint(CacheStatistics):
+            @property
+            def expected_lookups(self) -> float:
+                return 128
+
+            def expected_miss_rate(self, clf: float) -> float:
+                return clf
+
+            @property
+            def cacheability(self) -> float:
+                return 0.25
+
+        cache_params = CacheParams(stats=CacheStatisticsWithoutFingerprint())
+
+        hash(cache_params)
+        hash(ParameterConstraints(cache_params=cache_params))
+        with self.assertRaisesRegex(RuntimeError, "must override stable_fingerprint"):
+            cache_params.stable_fingerprint()
+
+    def test_embedding_offload_stats_subclass_fingerprint_contract(self) -> None:
+        class TrivialEmbeddingOffloadStats(EmbeddingOffloadStats):
+            pass
+
+        class StatefulEmbeddingOffloadStats(EmbeddingOffloadStats):
+            def __init__(self, *args: Any, curve_scale: float, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.additional_curve_state = curve_scale
+
+        class ModifiedCurveEmbeddingOffloadStats(StatefulEmbeddingOffloadStats):
+            def expected_miss_rate(self, clf: float) -> float:
+                return super().expected_miss_rate(clf) * self.additional_curve_state
+
+        class ModifiedEstimatorEmbeddingOffloadStats(EmbeddingOffloadStats):
+            @staticmethod
+            def estimate_cache_miss_rate(
+                cache_sizes: torch.Tensor,
+                hist: torch.Tensor,
+                bins: torch.Tensor,
+            ) -> torch.Tensor:
+                return torch.zeros_like(cache_sizes)
+
+        stats = TrivialEmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+        equivalent_stats = TrivialEmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+        base_stats = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+
+        self.assertEqual(
+            stats.stable_fingerprint(), equivalent_stats.stable_fingerprint()
+        )
+        self.assertEqual(stats.stable_fingerprint(), base_stats.stable_fingerprint())
+
+        stateful_stats = StatefulEmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+            curve_scale=0.5,
+        )
+        stateful_stats.stable_fingerprint()
+
+        modified_curve_stats = ModifiedCurveEmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+            curve_scale=0.5,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "must override stable_fingerprint"):
+            modified_curve_stats.stable_fingerprint()
+
+        modified_estimator_stats = ModifiedEstimatorEmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+        with self.assertRaisesRegex(RuntimeError, "must override stable_fingerprint"):
+            modified_estimator_stats.stable_fingerprint()
+
+    def test_planner_hash_translates_custom_fingerprint_exception(self) -> None:
+        class CacheStatisticsWithBrokenFingerprint(CacheStatistics):
+            @property
+            def expected_lookups(self) -> float:
+                return 128
+
+            def expected_miss_rate(self, clf: float) -> float:
+                return clf
+
+            @property
+            def cacheability(self) -> float:
+                return 0.25
+
+            def stable_fingerprint(self) -> tuple[object, ...]:
+                raise KeyError("missing fingerprint state")
+
+        cache_params = CacheParams(stats=CacheStatisticsWithBrokenFingerprint())
+
+        with self.assertRaisesRegex(
+            PlannerContextFingerprintError,
+            "Unable to fingerprint cache parameters",
+        ) as context:
+            hash_planner_context_inputs(
+                topology=self._create_topology(),
+                batch_size=128,
+                enumerator=self._create_mock_enumerator(cache_params),
+                storage_reservation=self._create_mock_storage_reservation(),
+                constraints={
+                    "table_0": ParameterConstraints(cache_params=cache_params)
+                },
+            )
+        self.assertIsInstance(context.exception.__cause__, KeyError)
+
+    def test_planner_hash_reuses_shared_cache_statistics_fingerprint(self) -> None:
+        class CountingCacheStatistics(CacheStatistics):
+            def __init__(self) -> None:
+                self.call_count = 0
+
+            @property
+            def expected_lookups(self) -> float:
+                return 128
+
+            def expected_miss_rate(self, clf: float) -> float:
+                return clf
+
+            @property
+            def cacheability(self) -> float:
+                return 0.25
+
+            def stable_fingerprint(self) -> tuple[object, ...]:
+                self.call_count += 1
+                return ("counting_cache_statistics", 1, 128, 0.25)
+
+        stats = CountingCacheStatistics()
+        cache_params = CacheParams(stats=stats)
+        enumerator = self._create_mock_enumerator(cache_params)
+        enumerator.last_stored_search_space *= 2
+
+        hash_planner_context_inputs(
+            topology=self._create_topology(),
+            batch_size=128,
+            enumerator=enumerator,
+            storage_reservation=self._create_mock_storage_reservation(),
+            constraints={"table_0": ParameterConstraints(cache_params=cache_params)},
+        )
+
+        self.assertEqual(1, stats.call_count)
+
+    def test_cache_statistics_fingerprint_tracks_modified_miss_rate_bins(self) -> None:
+        stats = EmbeddingOffloadStats(
+            cacheability=0.25,
+            expected_lookups=128,
+            mrc_hist_counts=torch.tensor([4, 3, 2, 1]),
+            height=1024,
+        )
+
+        fingerprint = stats.stable_fingerprint()
+        miss_rate = stats.expected_miss_rate(0.3)
+        stats.bins[1] = 400
+
+        self.assertNotEqual(miss_rate, stats.expected_miss_rate(0.3))
+        self.assertNotEqual(fingerprint, stats.stable_fingerprint())
+
+    def test_cache_params_fingerprint_uses_semantic_fields(self) -> None:
+        cache_params = CacheParams(
+            algorithm=CacheAlgorithm.LRU,
+            load_factor=0.5,
+            reserved_memory=1024.0,
+            precision=DataType.FP16,
+            prefetch_pipeline=True,
+            multipass_prefetch_config=MultiPassPrefetchConfig(
+                num_passes=2,
+                min_splitable_pass_size=1024,
+            ),
+        )
+
+        self.assertEqual(
+            (
+                "cache_params",
+                1,
+                "LRU",
+                0.5,
+                1024.0,
+                "FP16",
+                True,
+                None,
+                ("multi_pass_prefetch_config", 1, 2, 1024),
+            ),
+            cache_params.stable_fingerprint(),
         )
 
     def test_hash_inequality_with_different_constraints_cache_params(self) -> None:

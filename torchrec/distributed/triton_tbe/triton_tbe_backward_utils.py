@@ -5,7 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton  # @manual
@@ -75,12 +75,22 @@ def _classify_runs_kernel(
     num_short_ptr,
     long_run_ids_ptr,
     num_long_ptr,
+    infos_sorted_ptr,
+    feature_bucket_id_ptr,
+    bucket_base_ptr,
+    info_B_num_bits,
     threshold: tl.constexpr,
     CLASSIFY_BLOCK: tl.constexpr,
+    NUM_BUCKETS: tl.constexpr = 1,
 ) -> None:
     """
     Classify runs as short or long and compact into output arrays.
     Uses atomic counters for sync-free stream compaction.
+
+    With NUM_BUCKETS > 1 the short runs are additionally split by the embedding
+    dimension bucket of their feature, so each bucket can be launched with a
+    BLOCK_SIZE that matches its rows instead of the global max. Bucket b's ids
+    live at short_run_ids[bucket_base[b] : bucket_base[b] + num_short[b]].
     """
     pid = tl.program_id(0)
     num_runs = tl.load(num_runs_ptr)
@@ -95,20 +105,31 @@ def _classify_runs_kernel(
     is_long = (run_len >= threshold) & mask
     is_short = (~is_long) & mask
 
-    num_short_block = tl.sum(is_short.to(tl.int32))
     num_long_block = tl.sum(is_long.to(tl.int32))
-
-    short_base = tl.atomic_add(num_short_ptr, num_short_block)
     long_base = tl.atomic_add(num_long_ptr, num_long_block)
-
-    short_local = tl.cumsum(is_short.to(tl.int32), axis=0) - 1
     long_local = tl.cumsum(is_long.to(tl.int32), axis=0) - 1
-
-    short_pos = (short_base + short_local).to(tl.int64)
-    tl.store(short_run_ids_ptr + short_pos, offsets.to(tl.int32), mask=is_short)
-
     long_pos = (long_base + long_local).to(tl.int64)
     tl.store(long_run_ids_ptr + long_pos, offsets.to(tl.int32), mask=is_long)
+
+    if NUM_BUCKETS == 1:
+        num_short_block = tl.sum(is_short.to(tl.int32))
+        short_base = tl.atomic_add(num_short_ptr, num_short_block)
+        short_local = tl.cumsum(is_short.to(tl.int32), axis=0) - 1
+        short_pos = (short_base + short_local).to(tl.int64)
+        tl.store(short_run_ids_ptr + short_pos, offsets.to(tl.int32), mask=is_short)
+    else:
+        # A run maps to exactly one feature, so one info load per run resolves
+        # its dimension bucket.
+        info = tl.load(infos_sorted_ptr + cum_start, mask=mask, other=0).to(tl.uint32)
+        t = (info >> info_B_num_bits).to(tl.int32)
+        bucket_id = tl.load(feature_bucket_id_ptr + t, mask=mask, other=0)
+        for b in tl.static_range(NUM_BUCKETS):
+            sel = is_short & (bucket_id == b)
+            cnt = tl.sum(sel.to(tl.int32))
+            base = tl.atomic_add(num_short_ptr + b, cnt)
+            local = tl.cumsum(sel.to(tl.int32), axis=0) - 1
+            pos = (tl.load(bucket_base_ptr + b) + base + local).to(tl.int64)
+            tl.store(short_run_ids_ptr + pos, offsets.to(tl.int32), mask=sel)
 
 
 @triton.jit
@@ -158,9 +179,15 @@ def _expand_long_runs(
     sorted_linear_indices_num_runs: torch.Tensor,
     max_num_runs: int,
     max_sl_per_program: int = _LONG_RUN_THRESHOLD,
+    infos_sorted: Optional[torch.Tensor] = None,
+    feature_bucket_id: Optional[torch.Tensor] = None,
+    bucket_base: Optional[torch.Tensor] = None,
+    short_run_capacity: Optional[int] = None,
+    num_buckets: int = 1,
+    info_B_num_bits: int = 0,
 ) -> Tuple[
     torch.Tensor,  # short_run_ids
-    torch.Tensor,  # num_short_runs (1-element GPU int32 tensor)
+    torch.Tensor,  # num_short_runs (num_buckets-element GPU int64 tensor)
     torch.Tensor,  # (unused)
     torch.Tensor,  # long_run_program_seg_starts
     torch.Tensor,  # long_run_program_seg_ends
@@ -181,8 +208,12 @@ def _expand_long_runs(
     max_long_run_programs = 2 * max_num_runs // max_sl_per_program + 1
 
     # Allocate output tensors
-    short_run_ids = torch.empty(max_num_runs, dtype=torch.int32, device=device)
-    num_short_runs_t = torch.zeros(1, dtype=torch.int64, device=device)
+    short_run_ids = torch.empty(
+        short_run_capacity if short_run_capacity is not None else max_num_runs,
+        dtype=torch.int32,
+        device=device,
+    )
+    num_short_runs_t = torch.zeros(num_buckets, dtype=torch.int64, device=device)
 
     long_run_original_ids = torch.empty(max_long_runs, dtype=torch.int32, device=device)
     num_long_runs_t = torch.zeros(1, dtype=torch.int64, device=device)
@@ -197,8 +228,13 @@ def _expand_long_runs(
         num_short_runs_t,
         long_run_original_ids,
         num_long_runs_t,
+        infos_sorted,
+        feature_bucket_id,
+        bucket_base,
+        info_B_num_bits,
         threshold=max_sl_per_program,
         CLASSIFY_BLOCK=CLASSIFY_BLOCK,
+        NUM_BUCKETS=num_buckets,
     )
 
     # Allocate expansion output tensors
