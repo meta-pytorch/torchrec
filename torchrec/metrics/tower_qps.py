@@ -263,7 +263,7 @@ class TowerQPSMetric(RecMetric):
                         raise RecMetricException(
                             f"Failed to convert labels to tensor for fused computation: {e}"
                         )
-                labels = labels.view(-1, self._batch_size)
+                labels = labels.reshape(len(self._tasks), -1)
                 if self._should_validate_update:
                     # Set the default value to be all True. When weights is None, it's considered
                     # to be a valid input, and we'll use the default value
@@ -285,7 +285,7 @@ class TowerQPSMetric(RecMetric):
                                 )
                         has_valid_weights = torch.gt(
                             torch.count_nonzero(
-                                weights.view(-1, self._batch_size), dim=-1
+                                weights.reshape(len(self._tasks), -1), dim=-1
                             ),
                             0,
                         )
