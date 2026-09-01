@@ -240,8 +240,27 @@ class ThroughputMetric(nn.Module):
             self.time_lapse_after_warmup += time_lapse
             # pyrefly: ignore [bad-argument-type, unsupported-operation]
             self.attempt_time_lapse_after_warmup += time_lapse
+            # Subtract before the deque's implicit evict, mirroring
+            # WindowBuffer._aggregate_state_impl. append() on a full deque(maxlen=...)
+            # silently drops the leftmost entry, so without this the invariant
+            # `_window_time_lapse == sum(buffer)` breaks permanently and _check_window()
+            # then over-pops -- window_throughput is wrong in both numerator and
+            # denominator.
+            #
+            # Reachability. The deque saturates at
+            # `MAX_WINDOW_TS / min(window_seconds, MAX_WINDOW_TS)` update()/sec, because
+            # MAX_WINDOW_TS is used BOTH as the seconds cap above and as this deque's
+            # maxlen. At the default window_seconds=100 that is 72/sec, which is why this
+            # looks like a corner case -- but any job requesting a window above the cap is
+            # clamped to window_seconds == MAX_WINDOW_TS, where the threshold collapses to
+            # ~1 update()/sec and the corruption is routine. Under gradient accumulation
+            # update() fires once per micro-batch, so the rate is K x the logical step rate
+            # and the K>1 arm can saturate while the K=1 arm does not.
+            buf = self._window_time_lapse_buffer
+            if buf.maxlen is not None and len(buf) == buf.maxlen:
+                self._window_time_lapse -= buf.popleft()
             self._window_time_lapse += time_lapse
-            self._window_time_lapse_buffer.append(time_lapse)
+            buf.append(time_lapse)
             self._check_window()
             self._previous_ts = ts
 
