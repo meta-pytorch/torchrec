@@ -747,6 +747,23 @@ class KJTAllToAllTensorsAwaitable(Awaitable[KeyedJaggedTensor]):
         self._world_size: int = self._pg.size()
         rank = dist.get_rank(self._pg)
 
+        # Keep the experimental dependency out of non-TPU import and execution paths.
+        if getattr(torch, "tpu", None) is not None and torch.tpu.is_available():
+            from torchrec.experimental.torch_tpu.uneven_all_to_all import (
+                maybe_kjt_a2a_uneven_tpu,
+            )
+
+            padded_outputs = maybe_kjt_a2a_uneven_tpu(
+                self._pg,
+                input_tensors,
+                input_splits,
+                output_splits,
+                self._device,
+            )
+            if padded_outputs is not None:
+                self._output_tensors = padded_outputs
+                return
+
         for input_split, output_split, input_tensor, label in zip(
             input_splits,
             output_splits,
