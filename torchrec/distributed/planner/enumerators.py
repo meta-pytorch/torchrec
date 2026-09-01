@@ -449,9 +449,14 @@ class EmbeddingEnumerator(Enumerator):
             return filtered
         constrained_sharding_types: List[str] = constraints.sharding_types
 
-        filtered_sharding_types = list(
-            set(constrained_sharding_types) & set(allowed_sharding_types)
-        )
+        # Filter in ``allowed_sharding_types`` order rather than iterating a set:
+        # set-of-str iteration order is PYTHONHASHSEED-dependent, which makes the
+        # search space -- and the planner context hash keyed off it -- differ
+        # between processes.
+        constrained_sharding_type_set = set(constrained_sharding_types)
+        filtered_sharding_types = [
+            t for t in allowed_sharding_types if t in constrained_sharding_type_set
+        ]
         if not filtered_sharding_types:
             logger.warning(
                 "No available sharding types after applying user provided "
@@ -488,9 +493,14 @@ class EmbeddingEnumerator(Enumerator):
             ]
 
         # setup filtered_compute_kernels
-        filtered_compute_kernels = list(
-            set(constrained_compute_kernels) & set(allowed_compute_kernels)
-        )
+        # Filter in ``allowed_compute_kernels`` order rather than iterating a set:
+        # set-of-str iteration order is PYTHONHASHSEED-dependent, which makes the
+        # search space -- and the planner context hash keyed off it -- differ
+        # between processes.
+        constrained_compute_kernel_set = set(constrained_compute_kernels)
+        filtered_compute_kernels = [
+            k for k in allowed_compute_kernels if k in constrained_compute_kernel_set
+        ]
 
         # Remove KEY_VALUE if no device has SSD capacity — avoids expanding
         # the search space with infeasible options that fits_in() would reject.
