@@ -28,7 +28,6 @@ _PERMUTE_PARAM_SIZE = 6
         triton.Config({"BLOCK_BATCH": 4, "BLOCK_SIZE": 128}, num_warps=2),
         triton.Config({"BLOCK_BATCH": 4, "BLOCK_SIZE": 128}, num_warps=4),
         triton.Config({"BLOCK_BATCH": 8, "BLOCK_SIZE": 128}, num_warps=2),
-        triton.Config({"BLOCK_BATCH": 8, "BLOCK_SIZE": 128}, num_warps=8),
     ],
     key=["batch_size", "num_permutes"],
 )
@@ -99,7 +98,6 @@ def _permute_multi_embedding_kernel(
         triton.Config({"BLOCK_BATCH": 4, "BLOCK_SIZE": 128}, num_warps=2),
         triton.Config({"BLOCK_BATCH": 4, "BLOCK_SIZE": 128}, num_warps=4),
         triton.Config({"BLOCK_BATCH": 8, "BLOCK_SIZE": 128}, num_warps=2),
-        triton.Config({"BLOCK_BATCH": 8, "BLOCK_SIZE": 128}, num_warps=8),
     ],
     key=["batch_size", "num_permutes"],
 )
