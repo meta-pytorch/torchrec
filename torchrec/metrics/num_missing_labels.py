@@ -15,6 +15,7 @@ from torchrec.metrics.rec_metric import (
     MetricComputationReport,
     RecMetric,
     RecMetricComputation,
+    RecMetricInputPolicy,
 )
 
 
@@ -90,6 +91,7 @@ class NumMissingLabelsMetricComputation(RecMetricComputation):
 
 
 class NumMissingLabelsMetric(RecMetric):
+    input_policy: RecMetricInputPolicy = RecMetricInputPolicy(allow_nan_labels=True)
     # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.NUM_MISSING_LABELS
     _computation_class: Type[RecMetricComputation] = NumMissingLabelsMetricComputation

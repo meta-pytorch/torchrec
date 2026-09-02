@@ -14,7 +14,8 @@ import concurrent
 import logging
 import time
 from collections import defaultdict, OrderedDict
-from typing import Any, Dict, List, Optional, Type, TypeVar, Union
+from dataclasses import dataclass
+from typing import Any, cast, Dict, List, Optional, Type, TypeVar, Union
 
 import torch
 import torch.distributed as dist
@@ -104,7 +105,13 @@ from torchrec.metrics.output import OutputMetric
 from torchrec.metrics.precision import PrecisionMetric
 from torchrec.metrics.precision_session import PrecisionSessionMetric
 from torchrec.metrics.rauc import RAUCMetric
-from torchrec.metrics.rec_metric import RecMetric, RecMetricException, RecMetricList
+from torchrec.metrics.rec_metric import (
+    RecMetric,
+    RecMetricException,
+    RecMetricInputPolicy,
+    RecMetricList,
+    RecMetricValidationError,
+)
 from torchrec.metrics.recall import RecallMetric
 from torchrec.metrics.recall_session import RecallSessionMetric
 from torchrec.metrics.scalar import ScalarMetric
@@ -121,6 +128,226 @@ from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetr
 from torchrec.metrics.xauc import XAUCMetric
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+_DEBUG_PROTOCOL_VERSION: int = 1
+_DEBUG_METADATA_PREFIX_WIDTH: int = 8
+_DEBUG_DTYPE_NAMES: tuple[str, ...] = (
+    "torch.bool",
+    "torch.uint8",
+    "torch.int8",
+    "torch.int16",
+    "torch.int32",
+    "torch.int64",
+    "torch.float16",
+    "torch.bfloat16",
+    "torch.float32",
+    "torch.float64",
+    "torch.complex64",
+    "torch.complex128",
+)
+
+
+@dataclass(frozen=True)
+class _DebugHeader:
+    protocol_version: int
+    record_count: int
+    metric_count: int
+    task_count: int
+    trained_batches: int
+    error_bits: int
+    max_ndim: int
+
+    @property
+    def configuration(self) -> tuple[int, int, int, int]:
+        return (
+            self.protocol_version,
+            self.record_count,
+            self.metric_count,
+            self.task_count,
+        )
+
+    def to_tensor(self) -> torch.Tensor:
+        return torch.tensor(
+            [
+                self.protocol_version,
+                self.record_count,
+                self.metric_count,
+                self.task_count,
+                self.trained_batches,
+                self.error_bits,
+                self.max_ndim,
+            ],
+            dtype=torch.int64,
+        )
+
+    @classmethod
+    def from_tensor(cls, tensor: torch.Tensor) -> "_DebugHeader":
+        (
+            protocol_version,
+            record_count,
+            metric_count,
+            task_count,
+            trained_batches,
+            error_bits,
+            max_ndim,
+        ) = (int(value) for value in tensor.tolist())
+        return cls(
+            protocol_version=protocol_version,
+            record_count=record_count,
+            metric_count=metric_count,
+            task_count=task_count,
+            trained_batches=trained_batches,
+            error_bits=error_bits,
+            max_ndim=max_ndim,
+        )
+
+
+@dataclass(frozen=True)
+class _InputTensorSummary:
+    dtype_code: int
+    shape: tuple[int, ...]
+    numel: int
+    nan_count: int
+    positive_infinity_count: int
+    negative_infinity_count: int
+
+
+@dataclass(frozen=True)
+class _InputValidationRecord:
+    metric_name: str
+    namespace: str
+    task_name: str
+    tensor_kind: str
+    policy: RecMetricInputPolicy
+    summary: Optional[_InputTensorSummary]
+    violation_bits: int
+
+
+def _summarize_input_tensor(tensor: torch.Tensor) -> _InputTensorSummary:
+    nan_count = 0
+    positive_infinity_count = 0
+    negative_infinity_count = 0
+    if tensor.is_floating_point():
+        nan_count = int(torch.isnan(tensor).sum().item())
+        positive_infinity_count = int(torch.isposinf(tensor).sum().item())
+        negative_infinity_count = int(torch.isneginf(tensor).sum().item())
+    elif tensor.is_complex():
+        nan_count = int(torch.isnan(tensor).sum().item())
+        positive_infinity_count = int(torch.isinf(tensor).sum().item())
+
+    dtype_name = str(tensor.dtype)
+    dtype_code = (
+        _DEBUG_DTYPE_NAMES.index(dtype_name)
+        if dtype_name in _DEBUG_DTYPE_NAMES
+        else len(_DEBUG_DTYPE_NAMES)
+    )
+    return _InputTensorSummary(
+        dtype_code=dtype_code,
+        shape=tuple(tensor.shape),
+        numel=tensor.numel(),
+        nan_count=nan_count,
+        positive_infinity_count=positive_infinity_count,
+        negative_infinity_count=negative_infinity_count,
+    )
+
+
+def _input_violation_bits(
+    tensor_kind: str,
+    summary: _InputTensorSummary,
+    policy: RecMetricInputPolicy,
+) -> int:
+    offset = {
+        RecMetric.LABELS: 0,
+        RecMetric.PREDICTIONS: 3,
+        RecMetric.WEIGHTS: 6,
+    }[tensor_kind]
+    bits = 0
+    if summary.nan_count > 0 and not (
+        tensor_kind == RecMetric.LABELS and policy.allow_nan_labels
+    ):
+        bits |= 1 << offset
+    if summary.positive_infinity_count > 0:
+        bits |= 1 << (offset + 1)
+    if summary.negative_infinity_count > 0:
+        bits |= 1 << (offset + 2)
+    return bits
+
+
+def _input_policy_description(tensor_kind: str, policy: RecMetricInputPolicy) -> str:
+    if tensor_kind == RecMetric.LABELS and policy.allow_nan_labels:
+        return "NaN labels allowed; label infinities rejected"
+    return f"finite {tensor_kind} required"
+
+
+def _encode_input_metadata(
+    record: _InputValidationRecord,
+    max_ndim: int,
+) -> torch.Tensor:
+    summary = record.summary
+    if summary is None:
+        values = [0, -1, 0, 0, 0, 0, 0, 0]
+    else:
+        values = [
+            1,
+            summary.dtype_code,
+            len(summary.shape),
+            summary.numel,
+            summary.nan_count,
+            summary.positive_infinity_count,
+            summary.negative_infinity_count,
+            record.violation_bits,
+            *summary.shape,
+        ]
+    width = _DEBUG_METADATA_PREFIX_WIDTH + max_ndim
+    return torch.tensor(values + [-1] * (width - len(values)), dtype=torch.int64)
+
+
+def _decode_input_metadata(
+    row: torch.Tensor,
+) -> tuple[Optional[_InputTensorSummary], int]:
+    (
+        present,
+        dtype_code,
+        ndim,
+        numel,
+        nan_count,
+        positive_infinity_count,
+        negative_infinity_count,
+        violation_bits,
+        *shape,
+    ) = (int(value) for value in row.tolist())
+    if present != 1:
+        return None, violation_bits
+    return (
+        _InputTensorSummary(
+            dtype_code=dtype_code,
+            shape=tuple(shape[:ndim]),
+            numel=numel,
+            nan_count=nan_count,
+            positive_infinity_count=positive_infinity_count,
+            negative_infinity_count=negative_infinity_count,
+        ),
+        violation_bits,
+    )
+
+
+def _format_input_summary(
+    rank: int,
+    record: _InputValidationRecord,
+    summary: _InputTensorSummary,
+) -> str:
+    dtype = (
+        _DEBUG_DTYPE_NAMES[summary.dtype_code]
+        if 0 <= summary.dtype_code < len(_DEBUG_DTYPE_NAMES)
+        else f"unknown({summary.dtype_code})"
+    )
+    return (
+        f"rank={rank} {record.tensor_kind} shape={list(summary.shape)} dtype={dtype} "
+        f"numel={summary.numel} nan={summary.nan_count} "
+        f"+inf={summary.positive_infinity_count} "
+        f"-inf={summary.negative_infinity_count}"
+    )
+
 
 REC_METRICS_MAPPING: Dict[RecMetricEnumBase, Type[RecMetric]] = {
     RecMetricEnum.NE: NEMetric,
@@ -276,6 +503,9 @@ class RecMetricModule(nn.Module):
         self.world_size = world_size
         self.oom_count = 0
         self.compute_count = 0
+        self._debug_mode: bool = False
+        self._debug_process_group: Optional[dist.ProcessGroup] = None
+        self._debug_group_ranks: List[int] = []
 
         self.compute_interval_steps = compute_interval_steps
         self.min_compute_interval = min_compute_interval
@@ -298,6 +528,200 @@ class RecMetricModule(nn.Module):
         self.last_compute_time = -1.0
 
         self._register_load_state_dict_pre_hook(self.load_state_dict_hook)
+
+    def _configure_debug_mode(
+        self,
+        debug_mode: bool,
+        my_rank: int,
+        metric_process_group: Optional[dist.ProcessGroup],
+    ) -> None:
+        """All metric ranks must pass the same debug_mode value."""
+        self._debug_mode = debug_mode
+        self._debug_group_ranks = [my_rank]
+        if not debug_mode or self.world_size == 1:
+            return
+        if not dist.is_initialized():
+            raise RecMetricException(
+                "RecMetrics debug_mode with world_size > 1 requires an initialized process group"
+            )
+
+        ranks = (
+            list(range(dist.get_world_size()))
+            if metric_process_group is None
+            else dist.get_process_group_ranks(metric_process_group)
+        )
+        if len(ranks) != self.world_size:
+            raise RecMetricException(
+                f"RecMetrics debug_mode expected {self.world_size} metric ranks, got {len(ranks)}"
+            )
+        debug_process_group = dist.new_group(ranks=ranks, backend="gloo")
+        if not isinstance(debug_process_group, dist.ProcessGroup):
+            raise RecMetricException(
+                f"Rank {my_rank} is not a member of the RecMetrics process group"
+            )
+        self._debug_process_group = debug_process_group
+        self._debug_group_ranks = ranks
+
+    def _gather_debug_tensor(self, tensor: torch.Tensor) -> List[torch.Tensor]:
+        if self._debug_process_group is None:
+            return [tensor]
+        gathered = [torch.empty_like(tensor) for _ in self._debug_group_ranks]
+        dist.all_gather(gathered, tensor, group=self._debug_process_group)
+        return gathered
+
+    def _build_input_validation_records(
+        self,
+        labels: Dict[str, torch.Tensor],
+        predictions: Dict[str, torch.Tensor],
+        weights: Dict[str, torch.Tensor],
+    ) -> List[_InputValidationRecord]:
+        records: List[_InputValidationRecord] = []
+        summaries: Dict[tuple[str, str], Optional[_InputTensorSummary]] = {}
+        inputs = (
+            (RecMetric.LABELS, labels),
+            (RecMetric.PREDICTIONS, predictions),
+            (RecMetric.WEIGHTS, weights),
+        )
+        for metric_module in self.rec_metrics.rec_metrics:
+            metric = cast(RecMetric, metric_module)
+            namespace = str(metric._namespace.value)
+            for task in metric._tasks:
+                for tensor_kind, task_tensors in inputs:
+                    key = (task.name, tensor_kind)
+                    if key not in summaries:
+                        tensor = task_tensors.get(task.name)
+                        summaries[key] = (
+                            _summarize_input_tensor(tensor)
+                            if tensor is not None
+                            else None
+                        )
+                    summary = summaries[key]
+                    violation_bits = (
+                        _input_violation_bits(tensor_kind, summary, metric.input_policy)
+                        if summary is not None
+                        else 0
+                    )
+                    records.append(
+                        _InputValidationRecord(
+                            metric_name=type(metric).__name__,
+                            namespace=namespace,
+                            task_name=task.name,
+                            tensor_kind=tensor_kind,
+                            policy=metric.input_policy,
+                            summary=summary,
+                            violation_bits=violation_bits,
+                        )
+                    )
+        return records
+
+    def _gather_input_validation_metadata(
+        self,
+        records: List[_InputValidationRecord],
+        max_ndim: int,
+    ) -> List[torch.Tensor]:
+        width = _DEBUG_METADATA_PREFIX_WIDTH + max_ndim
+        metadata = (
+            torch.stack(
+                [_encode_input_metadata(record, max_ndim) for record in records]
+            )
+            if records
+            else torch.empty((0, width), dtype=torch.int64)
+        )
+        return self._gather_debug_tensor(metadata)
+
+    def _format_input_validation_error(
+        self,
+        records: List[_InputValidationRecord],
+        headers: List[_DebugHeader],
+        metadata_by_rank: List[torch.Tensor],
+    ) -> str:
+        update_sequences = {
+            rank: headers[index].trained_batches
+            for index, rank in enumerate(self._debug_group_ranks)
+        }
+        lines = [
+            f"RecMetric validation failed at input: update_sequences={update_sequences}"
+        ]
+        for record_index, record in enumerate(records):
+            offending: List[tuple[int, _InputTensorSummary]] = []
+            for index, metadata in enumerate(metadata_by_rank):
+                summary, violation_bits = _decode_input_metadata(metadata[record_index])
+                if violation_bits != 0:
+                    assert summary is not None
+                    offending.append((index, summary))
+            if not offending:
+                continue
+            offending_ranks = [self._debug_group_ranks[index] for index, _ in offending]
+            lines.append(
+                f"metric={record.metric_name} namespace={record.namespace} "
+                f"task={record.task_name} ranks={offending_ranks}"
+            )
+            for index, summary in offending:
+                lines.append(
+                    _format_input_summary(
+                        self._debug_group_ranks[index],
+                        record,
+                        summary,
+                    )
+                )
+            lines.append(
+                f"policy={_input_policy_description(record.tensor_kind, record.policy)}"
+            )
+        return "\n".join(lines)
+
+    def _validate_rec_metric_inputs(
+        self,
+        labels: Dict[str, torch.Tensor],
+        predictions: Dict[str, torch.Tensor],
+        weights: Dict[str, torch.Tensor],
+    ) -> None:
+        if not self._debug_mode:
+            return
+        records = self._build_input_validation_records(labels, predictions, weights)
+        local_error_bits = 0
+        for record in records:
+            local_error_bits |= record.violation_bits
+        local_max_ndim = max(
+            (len(record.summary.shape) for record in records if record.summary),
+            default=0,
+        )
+        header = _DebugHeader(
+            protocol_version=_DEBUG_PROTOCOL_VERSION,
+            record_count=len(records),
+            metric_count=len(self.rec_metrics),
+            task_count=len(self.rec_tasks),
+            trained_batches=self.trained_batches,
+            error_bits=local_error_bits,
+            max_ndim=local_max_ndim,
+        )
+        headers = [
+            _DebugHeader.from_tensor(gathered)
+            for gathered in self._gather_debug_tensor(header.to_tensor())
+        ]
+        expected_configuration = headers[0].configuration
+        if any(
+            gathered.configuration != expected_configuration for gathered in headers[1:]
+        ):
+            details = [
+                f"rank={rank} protocol={gathered.protocol_version} "
+                f"records={gathered.record_count} metrics={gathered.metric_count} "
+                f"tasks={gathered.task_count}"
+                for rank, gathered in zip(self._debug_group_ranks, headers)
+            ]
+            raise RecMetricValidationError(
+                "RecMetric validation failed at input: configuration mismatch; "
+                + "; ".join(details)
+            )
+        if not any(gathered.error_bits != 0 for gathered in headers):
+            return
+        max_ndim = max(gathered.max_ndim for gathered in headers)
+        metadata_by_rank = self._gather_input_validation_metadata(
+            records,
+            max_ndim,
+        )
+        raise RecMetricValidationError(
+            self._format_input_validation_error(records, headers, metadata_by_rank)
+        )
 
     def load_state_dict_hook(
         self,
@@ -341,6 +765,8 @@ class RecMetricModule(nn.Module):
             labels, predictions, weights, required_inputs = parse_task_model_outputs(
                 self.rec_tasks, model_out, self.get_required_inputs()
             )
+            if self._debug_mode:
+                self._validate_rec_metric_inputs(labels, predictions, weights)
             if required_inputs:
                 kwargs["required_inputs"] = required_inputs
 
@@ -749,6 +1175,7 @@ def generate_metric_module(
     process_group: Optional[dist.ProcessGroup] = None,
     batch_size_stages: Optional[List[BatchSizeStage]] = None,
     module_kwargs: Optional[Dict[str, Any]] = None,
+    debug_mode: bool = False,
 ) -> RecMetricModule:
     rec_metrics = _generate_rec_metrics(
         metrics_config,
@@ -782,6 +1209,11 @@ def generate_metric_module(
         min_compute_interval=metrics_config.min_compute_interval,
         max_compute_interval=metrics_config.max_compute_interval,
         **(module_kwargs if module_kwargs else {}),
+    )
+    metrics._configure_debug_mode(
+        debug_mode,
+        my_rank,
+        process_group,
     )
     metrics.to(device)
     return metrics

@@ -39,8 +39,12 @@ from torchrec.metrics.metrics_config import (
     RecMetricDef,
     RecMetricEnum,
 )
-from torchrec.metrics.rec_metric import RecMetricException, RecMetricList
-from torchrec.metrics.test_utils import gen_test_tasks
+from torchrec.metrics.rec_metric import (
+    RecMetricException,
+    RecMetricList,
+    RecMetricValidationError,
+)
+from torchrec.metrics.test_utils import gen_test_batch, gen_test_tasks
 from torchrec.metrics.test_utils.mock_metrics import (
     assert_tensor_dict_equals,
     create_tensor_states,
@@ -121,6 +125,58 @@ class CPUOffloadedRecMetricModulePreparationTest(unittest.TestCase):
         torch.testing.assert_close(
             cast(dict[str, torch.Tensor], weights)["task1"], raw_weight
         )
+
+
+class CPUOffloadedRecMetricDebugModeTest(unittest.TestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Test needs a GPU")
+    def test_debug_validation_fails_before_enqueue(self) -> None:
+        tasks = gen_test_tasks(["task1"])
+        config = MetricsConfig(
+            rec_tasks=tasks,
+            rec_metrics={
+                RecMetricEnum.NE: RecMetricDef(
+                    rec_tasks=tasks,
+                    window_size=100,
+                )
+            },
+        )
+        metric_module = cast(
+            CPUOffloadedRecMetricModule,
+            generate_metric_module(
+                CPUOffloadedRecMetricModule,
+                metrics_config=config,
+                batch_size=1,
+                world_size=1,
+                my_rank=0,
+                state_metrics_mapping={},
+                device=torch.device("cpu"),
+                module_kwargs={
+                    "model_out_device": torch.device("cuda"),
+                    "update_batch_size": 1,
+                },
+                debug_mode=True,
+            ),
+        )
+        try:
+            batch = gen_test_batch(
+                1,
+                label_name=tasks[0].label_name,
+                prediction_name=tasks[0].prediction_name,
+                weight_name=tasks[0].weight_name,
+                label_value=torch.tensor([float("nan")], device="cuda"),
+                device="cuda",
+            )
+
+            with self.assertRaises(RecMetricValidationError):
+                metric_module.update(batch)
+
+            self.assertTrue(metric_module.update_queue.empty())
+            self.assertEqual(0, metric_module.trained_batches)
+        finally:
+            with patch.object(
+                metric_module, "_process_metric_compute_job", return_value={}
+            ):
+                metric_module.shutdown()
 
 
 class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
@@ -204,10 +260,11 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
     def test_transfer_to_cpu(self) -> None:
         """Test non-blocking tensor output transfer from GPU to CPU."""
 
+        # Citrine C3: create tensors directly on the target GPU.
         output = {
-            "task1-prediction": torch.tensor([1.0, 2.0, 3.0]).to("cuda:0"),
-            "task1-label": torch.tensor([0.0, 1.0, 0.0]).to("cuda:0"),
-            "task1-weight": torch.tensor([5.0, 1.0, 0.0]).to("cuda:0"),
+            "task1-prediction": torch.tensor([1.0, 2.0, 3.0], device="cuda:0"),
+            "task1-label": torch.tensor([0.0, 1.0, 0.0], device="cuda:0"),
+            "task1-weight": torch.tensor([5.0, 1.0, 0.0], device="cuda:0"),
         }
 
         cpu_output, transfer_event = transfer_tensors_to_cpu(output)
@@ -826,11 +883,11 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             model_out_device=torch.device("cuda:1"),
         )
 
-        # Create tensors on cuda:1
+        # Citrine C3: create tensors directly on cuda:1.
         output = {
-            "task1-prediction": torch.tensor([1.0, 2.0, 3.0]).to("cuda:1"),
-            "task1-label": torch.tensor([0.0, 1.0, 0.0]).to("cuda:1"),
-            "task1-weight": torch.tensor([5.0, 1.0, 0.0]).to("cuda:1"),
+            "task1-prediction": torch.tensor([1.0, 2.0, 3.0], device="cuda:1"),
+            "task1-label": torch.tensor([0.0, 1.0, 0.0], device="cuda:1"),
+            "task1-weight": torch.tensor([5.0, 1.0, 0.0], device="cuda:1"),
         }
 
         # Update with the tensors - this should trigger transfer to CPU
@@ -1496,13 +1553,14 @@ def _compare_metric_results_worker(
 
     model_outputs = []
     for _ in range(num_batches):
+        # Citrine C3: create tensors directly on the target GPU.
         model_out = {
-            "task1-prediction": torch.rand(batch_size).to(device),
-            "task1-label": torch.randint(0, 2, (batch_size,)).float().to(device),
-            "task1-weight": torch.ones(batch_size).to(device),
-            "task2-prediction": torch.rand(batch_size).to(device),
-            "task2-label": torch.randint(0, 2, (batch_size,)).float().to(device),
-            "task2-weight": torch.ones(batch_size).to(device),
+            "task1-prediction": torch.rand(batch_size, device=device),
+            "task1-label": torch.randint(0, 2, (batch_size,), device=device).float(),
+            "task1-weight": torch.ones(batch_size, device=device),
+            "task2-prediction": torch.rand(batch_size, device=device),
+            "task2-label": torch.randint(0, 2, (batch_size,), device=device).float(),
+            "task2-weight": torch.ones(batch_size, device=device),
         }
         model_outputs.append(model_out)
 
