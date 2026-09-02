@@ -14,7 +14,9 @@ from unittest.mock import MagicMock, patch
 import torch
 import torchrec.distributed.quant_embedding_kernel as qek
 from torchrec.distributed.fused_params import (
+    FUSED_PARAM_CPU_OFFLOAD,
     FUSED_PARAM_IS_DEVICE_RO,
+    FUSED_PARAM_SHARED_MEMORY,
     is_fused_param_device_ro,
     tbe_fused_params,
 )
@@ -100,6 +102,8 @@ class QuantBatchedEmbeddingBagDeviceRoTest(unittest.TestCase):
     def test_device_ro_fused_param_is_internal_to_torchrec(self) -> None:
         fused_params: Dict[str, Any] = {
             FUSED_PARAM_IS_DEVICE_RO: True,
+            FUSED_PARAM_CPU_OFFLOAD: True,
+            FUSED_PARAM_SHARED_MEMORY: False,
             "output_dtype": object(),
         }
 
@@ -108,4 +112,6 @@ class QuantBatchedEmbeddingBagDeviceRoTest(unittest.TestCase):
         filtered_params = tbe_fused_params(fused_params)
         self.assertIsNotNone(filtered_params)
         self.assertNotIn(FUSED_PARAM_IS_DEVICE_RO, filtered_params)
+        self.assertNotIn(FUSED_PARAM_CPU_OFFLOAD, filtered_params)
+        self.assertNotIn(FUSED_PARAM_SHARED_MEMORY, filtered_params)
         self.assertIn("output_dtype", filtered_params)

@@ -1342,6 +1342,12 @@ class ShardingOption:
             table's weights GPU->CPU during the dense forward/backward. Set on the
             table config before planning; the planner reflects the HBM that stashing
             frees in its storage estimates.
+        fused_params (Optional[Dict[str, Any]]): per-table metadata copied from
+            the matching parameter constraints. Keys must be strings. Values
+            may be None, bool, int, str, float, bytes, Enum, torch.dtype,
+            torch.device, type, or nested dict/list/tuple/set/frozenset values
+            composed from those types. This metadata is for planner output and
+            must not be forwarded as runtime TBE constructor arguments.
     """
 
     def __init__(
@@ -1366,6 +1372,7 @@ class ShardingOption:
         key_value_params: Optional[KeyValueParams] = None,
         num_poolings: Optional[List[float]] = None,
         stash_weights: bool = False,
+        fused_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.name = name
         self._tensor = tensor
@@ -1394,6 +1401,10 @@ class ShardingOption:
         self.key_value_params: Optional[KeyValueParams] = key_value_params
         self.num_poolings: Optional[List[float]] = num_poolings
         self.stash_weights: bool = stash_weights
+        _validate_fused_params(fused_params)
+        self.fused_params: Optional[Dict[str, Any]] = (
+            deepcopy(fused_params) if fused_params else None
+        )
 
         child_module = module[1]
         self._module_type_key: str = (
@@ -1605,6 +1616,62 @@ class _CacheParamsFingerprintMemo:
         return cached[1]
 
 
+def _canonicalize_fused_param_collection_for_hash(value: Any) -> Any:
+    value_type = type(value)
+    if value_type is dict:
+        if not all(isinstance(key, str) for key in value):
+            raise TypeError("fused_params keys must be strings")
+        return (
+            "dict",
+            tuple(
+                (key, _canonicalize_fused_param_for_hash(value[key]))
+                for key in sorted(value)
+            ),
+        )
+    items = tuple(_canonicalize_fused_param_for_hash(item) for item in value)
+    if value_type in (set, frozenset):
+        items = tuple(sorted(items, key=repr))
+    return (value_type.__name__, items)
+
+
+def _canonicalize_fused_param_for_hash(value: Any) -> Any:
+    if isinstance(value, Enum):
+        cls = type(value)
+        return (
+            "enum",
+            f"{cls.__module__}.{cls.__qualname__}",
+            _canonicalize_fused_param_for_hash(value.value),
+        )
+    if isinstance(value, torch.dtype):
+        return ("torch.dtype", str(value))
+    if isinstance(value, torch.device):
+        return ("torch.device", str(value))
+    if isinstance(value, type):
+        return ("type", value.__module__, value.__qualname__)
+    if value is None or type(value) in (bool, int, str):
+        return value
+    if type(value) is float:
+        return ("float", (value + 0.0).hex())
+    if type(value) is bytes:
+        return ("bytes", value.hex())
+    if type(value) in (dict, list, tuple, set, frozenset):
+        return _canonicalize_fused_param_collection_for_hash(value)
+    value_type = type(value)
+    raise TypeError(
+        "Unsupported fused_params value type: "
+        f"{value_type.__module__}.{value_type.__qualname__}"
+    )
+
+
+def _validate_fused_params(fused_params: Optional[Dict[str, Any]]) -> None:
+    if fused_params is None:
+        return
+    if type(fused_params) is not dict:
+        raise TypeError("fused_params must be a dict")
+    if fused_params:
+        _canonicalize_fused_param_for_hash(fused_params)
+
+
 @dataclass
 class ParameterConstraints:
     """
@@ -1654,6 +1721,14 @@ class ParameterConstraints:
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE, either for
             SSD or PS.
         use_virtual_table (bool): is virtual table enabled for this table.
+        fused_params (Dict[str, Any]): per-table metadata propagated into the
+            selected plan. An empty mapping means the constraint contains no
+            metadata. Keys must be strings. Values may be None, bool, int, str,
+            float, bytes, Enum, torch.dtype, torch.device, type, or nested
+            dict/list/tuple/set/frozenset values composed from those types.
+            The selected `ShardingOption` or `ParameterSharding` may use None
+            when this metadata is unavailable. This metadata is for planner
+            output and must not be forwarded as runtime TBE constructor arguments.
     """
 
     sharding_types: Optional[List[str]] = None
@@ -1674,11 +1749,15 @@ class ParameterConstraints:
     device_group: Optional[str] = None
     key_value_params: Optional[KeyValueParams] = None
     use_virtual_table: bool = False
+    fused_params: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _validate_fused_params(self.fused_params)
 
     def _hashable_values(
         self, cache_params: object, key_value_params: object
     ) -> Tuple[Any, ...]:
-        return (
+        hashable_values = (
             tuple(self.sharding_types) if self.sharding_types else None,
             tuple(self.compute_kernels) if self.compute_kernels else None,
             self.min_partition,
@@ -1696,6 +1775,14 @@ class ParameterConstraints:
             key_value_params,
             self.use_virtual_table,
         )
+        if self.fused_params:
+            return hashable_values + (
+                (
+                    "fused_params",
+                    _canonicalize_fused_param_for_hash(self.fused_params),
+                ),
+            )
+        return hashable_values
 
     def _persistent_hash(
         self,
@@ -1714,7 +1801,7 @@ class ParameterConstraints:
         return hash_sha256_to_int(
             list(
                 self._hashable_values(
-                    self.cache_params,
+                    _cache_params_hash_components(self.cache_params),
                     self.key_value_params,
                 )
             )
@@ -2436,12 +2523,14 @@ class ShardingPlanRequest:
                     self.training_framework.value,
                     self.launcher_hardware,
                     self.compute_device,
-                    # Hash constraints order-independently: a dict's repr follows
-                    # insertion order, so sort by key for a stable hash across
-                    # semantically-equal requests built in different orders. Sort
-                    # by key only (ParameterConstraints is not rich-comparable).
+                    # Sort table names and use each constraint's canonical digest.
+                    # Serializing the dataclass directly would expose insertion
+                    # order from nested fused_params dicts and sets through repr.
                     (
-                        [(k, self.constraints[k]) for k in sorted(self.constraints)]
+                        [
+                            (key, self.constraints[key].__hash__())
+                            for key in sorted(self.constraints)
+                        ]
                         if self.constraints is not None
                         else None
                     ),
@@ -3112,6 +3201,73 @@ def _shard_hash_components(shard: "Shard") -> tuple:
     )
 
 
+def _cache_params_hash_components(
+    cache_params: Optional[CacheParams],
+) -> Optional[tuple]:
+    if cache_params is None:
+        return None
+
+    multipass_prefetch_config = cache_params.multipass_prefetch_config
+    # CacheParams.__hash__ deliberately omits runtime cache statistics. Preserve
+    # that contract without relying on Python's process-randomized Enum hashes or
+    # the stats object's identity-bearing repr.
+    return (
+        _canonicalize_fused_param_for_hash(cache_params.algorithm),
+        _canonicalize_fused_param_for_hash(cache_params.load_factor),
+        _canonicalize_fused_param_for_hash(cache_params.reserved_memory),
+        _canonicalize_fused_param_for_hash(cache_params.precision),
+        _canonicalize_fused_param_for_hash(cache_params.prefetch_pipeline),
+        _canonicalize_fused_param_for_hash(
+            tuple(multipass_prefetch_config)
+            if multipass_prefetch_config is not None
+            else None
+        ),
+    )
+
+
+def _planner_context_hash_inputs(
+    enumerator: Enumerator,
+    storage_reservation: StorageReservation,
+) -> Tuple[List[ShardingOption], str, Topology]:
+    assert hasattr(
+        enumerator, "last_stored_search_space"
+    ), "This enumerator is not compatible with hashing"
+    assert (
+        enumerator.last_stored_search_space is not None
+    ), "Unable to hash planner context without an enumerator that has a precomputed search space"
+
+    reserved_topology = storage_reservation.last_reserved_topology
+    assert (
+        reserved_topology is not None
+    ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
+    return (
+        enumerator.last_stored_search_space,
+        type(storage_reservation).__name__,
+        reserved_topology,
+    )
+
+
+def _hashable_search_space(
+    search_space: List[ShardingOption],
+    cache_params_memo: _CacheParamsFingerprintMemo,
+    *,
+    canonical: bool,
+) -> List[List[Any]]:
+    result = [
+        [
+            shard_option.fqn,
+            shard_option.sharding_type,
+            shard_option.compute_kernel,
+            tuple(_shard_hash_components(shard) for shard in shard_option.shards),
+            cache_params_memo.get(shard_option.cache_params),
+        ]
+        for shard_option in search_space
+    ]
+    if canonical:
+        result.sort(key=lambda option: hash_sha256_str([option]))
+    return result
+
+
 def _build_hashable_list(
     topology: Topology,
     batch_size: int,
@@ -3125,20 +3281,9 @@ def _build_hashable_list(
     ``hash_planner_context_inputs_str`` (str hash) so the two can never
     drift apart.
     """
-    assert hasattr(
-        enumerator, "last_stored_search_space"
-    ), "This enumerator is not compatible with hashing"
-    assert (
-        enumerator.last_stored_search_space is not None
-    ), "Unable to hash planner context without an enumerator that has a precomputed search space"
-
-    reserved_topology = storage_reservation.last_reserved_topology
-    assert (
-        reserved_topology is not None
-    ), "Unable to hash planner context without a storage reservation that has a precomputed topology"
-
-    search_space = enumerator.last_stored_search_space
-    storage_reservation_policy = type(storage_reservation).__name__
+    search_space, storage_reservation_policy, reserved_topology = (
+        _planner_context_hash_inputs(enumerator, storage_reservation)
+    )
     cache_params_memo = _CacheParamsFingerprintMemo()
 
     # Hash topology components with storage rounding applied uniformly.
@@ -3149,20 +3294,14 @@ def _build_hashable_list(
     hashed_reserved_topology = hash_sha256_to_int(
         _topology_hash_components(reserved_topology)
     )
+    hashable_search_space = _hashable_search_space(
+        search_space, cache_params_memo, canonical=True
+    )
 
     return [
         hashed_topology,
         batch_size,
-        [
-            [
-                shard_option.fqn,
-                shard_option.sharding_type,
-                shard_option.compute_kernel,
-                tuple(_shard_hash_components(shard) for shard in shard_option.shards),
-                cache_params_memo.get(shard_option.cache_params),
-            ]
-            for shard_option in search_space
-        ],
+        hashable_search_space,
         storage_reservation_policy,
         hashed_reserved_topology,
         (
@@ -3172,6 +3311,39 @@ def _build_hashable_list(
                     v._persistent_hash(cache_params_memo),
                 )
                 for k, v in sorted(constraints.items())
+            )
+            if constraints
+            else None
+        ),
+    ]
+
+
+def _build_legacy_hashable_list(
+    topology: Topology,
+    batch_size: int,
+    enumerator: Enumerator,
+    storage_reservation: StorageReservation,
+    constraints: Optional[Dict[str, ParameterConstraints]],
+) -> Optional[List[Any]]:
+    if constraints and any(
+        constraint.fused_params for constraint in constraints.values()
+    ):
+        return None
+
+    search_space, storage_reservation_policy, reserved_topology = (
+        _planner_context_hash_inputs(enumerator, storage_reservation)
+    )
+    cache_params_memo = _CacheParamsFingerprintMemo()
+    return [
+        hash_sha256_to_int(_topology_hash_components(topology)),
+        batch_size,
+        _hashable_search_space(search_space, cache_params_memo, canonical=False),
+        storage_reservation_policy,
+        hash_sha256_to_int(_topology_hash_components(reserved_topology)),
+        (
+            tuple(
+                (key, constraints[key]._persistent_hash(cache_params_memo))
+                for key in sorted(constraints)
             )
             if constraints
             else None
@@ -3209,6 +3381,43 @@ def hash_planner_context_inputs_str(
         topology, batch_size, enumerator, storage_reservation, constraints
     )
     return hash_function(hashable_list)
+
+
+def hash_planner_context_inputs_legacy(
+    topology: Topology,
+    batch_size: int,
+    enumerator: Enumerator,
+    storage_reservation: StorageReservation,
+    constraints: Optional[Dict[str, ParameterConstraints]],
+    hash_function: Callable[[List[Any]], int] = hash_sha256_to_int,
+) -> Optional[int]:
+    """Return the pre-canonicalization hash for validating existing stored plans.
+
+    New plans must use ``hash_planner_context_inputs``. Returns None when the
+    current context contains fused metadata that the legacy format could not encode.
+    """
+    hashable_list = _build_legacy_hashable_list(
+        topology, batch_size, enumerator, storage_reservation, constraints
+    )
+    return hash_function(hashable_list) if hashable_list is not None else None
+
+
+def hash_planner_context_inputs_legacy_str(
+    topology: Topology,
+    batch_size: int,
+    enumerator: Enumerator,
+    storage_reservation: StorageReservation,
+    constraints: Optional[Dict[str, ParameterConstraints]],
+    hash_function: Callable[[List[Any]], str] = hash_sha256_str,
+) -> Optional[str]:
+    """Return the legacy string hash when the old format can represent the inputs.
+
+    New plans must use ``hash_planner_context_inputs_str``.
+    """
+    hashable_list = _build_legacy_hashable_list(
+        topology, batch_size, enumerator, storage_reservation, constraints
+    )
+    return hash_function(hashable_list) if hashable_list is not None else None
 
 
 def round_to_nearest(x: int, unit: int) -> int:

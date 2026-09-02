@@ -17,6 +17,7 @@ import torch.nn as nn
 from torch import multiprocessing
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.fused_params import FUSED_PARAM_CPU_OFFLOAD
 from torchrec.distributed.logger import static_logger
 from torchrec.distributed.planner import EmbeddingShardingPlanner
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
@@ -29,9 +30,9 @@ from torchrec.distributed.planner.types import (
     BasicCommsBandwidths,
     CustomTopologyData,
     DeviceHardware,
-    EmoConfig,
     HardwareConfig,
     hash_planner_context_inputs,
+    hash_planner_context_inputs_legacy,
     KernelConfig,
     ParameterConstraints,
     Perf,
@@ -330,6 +331,143 @@ class TestParameterConstraintsHash(unittest.TestCase):
             hash(pc1), hash(pc2), "Hashes should be equal for identical instances"
         )
 
+    def test_cache_stats_identity_does_not_change_hash(self) -> None:
+        first = ParameterConstraints(
+            cache_params=CacheParams(
+                algorithm=CacheAlgorithm.LFU,
+                load_factor=0.2,
+                stats=cast(Any, object()),
+            )
+        )
+        second = ParameterConstraints(
+            cache_params=CacheParams(
+                algorithm=CacheAlgorithm.LFU,
+                load_factor=0.2,
+                stats=cast(Any, object()),
+            )
+        )
+        changed = ParameterConstraints(
+            cache_params=CacheParams(
+                algorithm=CacheAlgorithm.LFU,
+                load_factor=0.3,
+                stats=cast(Any, object()),
+            )
+        )
+
+        self.assertEqual(first.__hash__(), second.__hash__())
+        self.assertNotEqual(first.__hash__(), changed.__hash__())
+
+    def test_fused_params_hash_is_order_independent(self) -> None:
+        pc1 = ParameterConstraints(
+            fused_params={
+                "nested": {
+                    "enabled": True,
+                    "ranks": {
+                        "atlas",
+                        "binary",
+                        "cinder",
+                        "delta",
+                        "ember",
+                        "fjord",
+                        "glyph",
+                        "harbor",
+                    },
+                },
+                "dtype": torch.float16,
+            }
+        )
+        pc2 = ParameterConstraints(
+            fused_params={
+                "dtype": torch.float16,
+                "nested": {
+                    "ranks": {
+                        "harbor",
+                        "glyph",
+                        "fjord",
+                        "ember",
+                        "delta",
+                        "cinder",
+                        "binary",
+                        "atlas",
+                    },
+                    "enabled": True,
+                },
+            }
+        )
+
+        self.assertEqual(pc1.__hash__(), pc2.__hash__())
+
+    def test_fused_params_hash_normalizes_signed_zero(self) -> None:
+        negative_zero = ParameterConstraints(fused_params={"value": -0.0})
+        positive_zero = ParameterConstraints(fused_params={"value": 0.0})
+
+        self.assertEqual(negative_zero.__hash__(), positive_zero.__hash__())
+
+    def test_fused_params_hash_has_stable_golden_digest(self) -> None:
+        constraints = ParameterConstraints(
+            fused_params={
+                "bytes": b"\x00\xff",
+                "device": torch.device("cuda", 3),
+                "dtype": torch.float16,
+                "enum": BoundsCheckMode.WARNING,
+                "float": 0.125,
+                "set": {"beta", "alpha"},
+                "tuple": ("alpha", 7),
+                "type": EmbeddingBagConfig,
+            }
+        )
+
+        self.assertEqual(
+            constraints.__hash__(),
+            29005728459676059197881125826882851714441125356464612838557641460225338301529,
+        )
+
+    def test_empty_fused_params_preserve_legacy_hash(self) -> None:
+        legacy_hash = 87402189562645569893241693142733106025831414106284310119099070476335611002833
+
+        self.assertEqual(ParameterConstraints().__hash__(), legacy_hash)
+        self.assertEqual(ParameterConstraints(fused_params={}).__hash__(), legacy_hash)
+
+    def test_fused_params_change_hash(self) -> None:
+        disabled = ParameterConstraints(
+            fused_params={FUSED_PARAM_CPU_OFFLOAD: False},
+        )
+        enabled = ParameterConstraints(
+            fused_params={FUSED_PARAM_CPU_OFFLOAD: True},
+        )
+
+        self.assertNotEqual(hash(disabled), hash(enabled))
+
+    def test_fused_params_hash_rejects_unstable_values(self) -> None:
+        with self.assertRaises(TypeError):
+            ParameterConstraints(fused_params={"value": object()})
+
+    def test_fused_params_rejects_non_string_keys(self) -> None:
+        with self.assertRaisesRegex(TypeError, "keys must be strings"):
+            ParameterConstraints(fused_params=cast(Dict[str, Any], {1: True}))
+
+    def test_fused_params_rejects_non_dict(self) -> None:
+        with self.assertRaisesRegex(TypeError, "must be a dict"):
+            ParameterConstraints(fused_params=cast(Dict[str, Any], []))
+
+    def test_sharding_option_rejects_mutated_unstable_fused_params(self) -> None:
+        constraints = ParameterConstraints()
+        constraints.fused_params["value"] = object()
+
+        with self.assertRaises(TypeError):
+            ShardingOption(
+                name="table_0",
+                tensor=torch.empty((10, 4), device=torch.device("meta")),
+                module=("ebc", nn.Module()),
+                input_lengths=[1.0],
+                batch_size=1,
+                sharding_type=ShardingType.TABLE_WISE.value,
+                partition_by="device",
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                shards=[Shard(size=[10, 4], offset=[0, 0])],
+                fused_params=constraints.fused_params,
+            )
+
     def test_hash_inequality(self) -> None:
         # Create two different instances
         pc1 = ParameterConstraints(
@@ -513,7 +651,7 @@ def _test_hashing_consistency(
     return_hash_dict: Dict[str, int],
     local_size: Optional[int] = None,
 ) -> None:
-    with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
+    with MultiProcessContext(rank, world_size, backend, local_size):
         topology = Topology(
             local_world_size=8,
             world_size=1,
@@ -595,6 +733,130 @@ class TestHashPlannerContextInputsRounding(unittest.TestCase):
             )
         storage_reservation.last_reserved_topology = topology
         return storage_reservation
+
+    def test_search_space_order_does_not_change_hash(self) -> None:
+        first_option = MagicMock(
+            fqn="table_0",
+            sharding_type=ShardingType.TABLE_WISE.value,
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=(),
+            cache_params=None,
+        )
+        second_option = MagicMock(
+            fqn="table_1",
+            sharding_type=ShardingType.ROW_WISE.value,
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=(),
+            cache_params=None,
+        )
+        extra_option = MagicMock(
+            fqn="table_2",
+            sharding_type=ShardingType.COLUMN_WISE.value,
+            compute_kernel=EmbeddingComputeKernel.FUSED.value,
+            shards=(),
+            cache_params=None,
+        )
+        first_enumerator = MagicMock(
+            last_stored_search_space=[first_option, second_option]
+        )
+        reordered_enumerator = MagicMock(
+            last_stored_search_space=[second_option, first_option]
+        )
+        expanded_enumerator = MagicMock(
+            last_stored_search_space=[first_option, second_option, extra_option]
+        )
+        topology = Topology(
+            world_size=2,
+            compute_device="cuda",
+            hbm_cap=1024 * 1024 * 1024,
+            local_world_size=2,
+        )
+        storage_reservation = self._create_mock_storage_reservation(topology)
+
+        first_hash = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=128,
+            enumerator=first_enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+        reordered_hash = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=128,
+            enumerator=reordered_enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+        expanded_hash = hash_planner_context_inputs(
+            topology=topology,
+            batch_size=128,
+            enumerator=expanded_enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+        first_legacy_hash = hash_planner_context_inputs_legacy(
+            topology=topology,
+            batch_size=128,
+            enumerator=first_enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+        reordered_legacy_hash = hash_planner_context_inputs_legacy(
+            topology=topology,
+            batch_size=128,
+            enumerator=reordered_enumerator,
+            storage_reservation=storage_reservation,
+            constraints=None,
+        )
+
+        self.assertEqual(first_hash, reordered_hash)
+        self.assertNotEqual(first_hash, expanded_hash)
+        self.assertNotEqual(first_legacy_hash, reordered_legacy_hash)
+
+    def test_legacy_hash_is_unavailable_for_new_fused_params(self) -> None:
+        topology = Topology(
+            world_size=2,
+            compute_device="cuda",
+            hbm_cap=1024 * 1024 * 1024,
+            local_world_size=2,
+        )
+
+        legacy_hash = hash_planner_context_inputs_legacy(
+            topology=topology,
+            batch_size=128,
+            enumerator=self._create_mock_enumerator(),
+            storage_reservation=self._create_mock_storage_reservation(topology),
+            constraints={
+                "table_0": ParameterConstraints(
+                    fused_params={FUSED_PARAM_CPU_OFFLOAD: True}
+                )
+            },
+        )
+
+        self.assertIsNone(legacy_hash)
+
+    def test_legacy_hash_matches_pre_fused_params_golden(self) -> None:
+        topology = Topology(
+            world_size=2,
+            compute_device="cuda",
+            hbm_cap=1024 * 1024 * 1024,
+            local_world_size=2,
+        )
+
+        legacy_hash = hash_planner_context_inputs_legacy(
+            topology=topology,
+            batch_size=128,
+            enumerator=self._create_mock_enumerator(),
+            storage_reservation=self._create_mock_storage_reservation(topology),
+            constraints={
+                "table_0": ParameterConstraints(feature_names=["feature_0"]),
+            },
+        )
+
+        self.assertEqual(
+            legacy_hash,
+            75184719878038004224584076775524679795974697178544017033259565161339910990358,
+        )
 
     def test_rounding_produces_same_hash_for_small_memory_differences(self) -> None:
         """Test that small memory differences (within 1% tolerance) produce the same hash."""
@@ -2381,6 +2643,62 @@ class ShardingPlanRequestTest(unittest.TestCase):
             self._create_request().request_hash,
             self._create_request().request_hash,
         )
+
+    def test_request_hash_is_order_independent_for_fused_params(self) -> None:
+        first = self._create_request(
+            constraints={
+                "table_b": ParameterConstraints(
+                    fused_params={
+                        "nested": {
+                            "enabled": True,
+                            "ranks": {"atlas", "binary", "cinder", "delta"},
+                        },
+                        "dtype": torch.float16,
+                    }
+                ),
+                "table_a": ParameterConstraints(
+                    fused_params={FUSED_PARAM_CPU_OFFLOAD: True}
+                ),
+            }
+        )
+        reordered = self._create_request(
+            constraints={
+                "table_a": ParameterConstraints(
+                    fused_params={FUSED_PARAM_CPU_OFFLOAD: True}
+                ),
+                "table_b": ParameterConstraints(
+                    fused_params={
+                        "dtype": torch.float16,
+                        "nested": {
+                            "ranks": {"delta", "cinder", "binary", "atlas"},
+                            "enabled": True,
+                        },
+                    }
+                ),
+            }
+        )
+
+        self.assertEqual(first.request_hash, reordered.request_hash)
+
+    def test_request_hash_with_fused_params_has_stable_golden_digest(self) -> None:
+        request = self._create_request(
+            constraints={
+                "table": ParameterConstraints(
+                    fused_params={
+                        "bytes": b"\x00\xff",
+                        "device": torch.device("cuda", 3),
+                        "dtype": torch.float16,
+                        "enum": BoundsCheckMode.WARNING,
+                        "float": 0.125,
+                        "set": {"beta", "alpha"},
+                        "tuple": ("alpha", 7),
+                        "type": EmbeddingBagConfig,
+                    }
+                )
+            }
+        )
+
+        self.assertEqual(request.request_hash, "2dff82ae7a27ae65")
 
     def test_request_hash_differs_for_different_params(self) -> None:
         base = self._create_request().request_hash

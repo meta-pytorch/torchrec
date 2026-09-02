@@ -17,6 +17,7 @@ from torchrec import EmbeddingBagCollection, EmbeddingConfig
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.fused_params import FUSED_PARAM_CPU_OFFLOAD
 from torchrec.distributed.planner.constants import BATCH_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
 from torchrec.distributed.planner.perf_models import NoopPerfModel
@@ -290,6 +291,10 @@ class TestEmbeddingShardingPlannerWithConstraints(unittest.TestCase):
                     algorithm=CacheAlgorithm.LFU,
                 ),
                 feature_names=self.tables[0].feature_names,
+                fused_params={
+                    FUSED_PARAM_CPU_OFFLOAD: True,
+                    "nested": {"ranks": [0, 1]},
+                },
             ),
             "table_1": ParameterConstraints(
                 enforce_hbm=False,
@@ -386,6 +391,39 @@ class TestEmbeddingShardingPlannerWithConstraints(unittest.TestCase):
                 constraint.bounds_check_mode, sharding_option.bounds_check_mode
             )
             self.assertEqual(constraint.is_weighted, sharding_option.is_weighted)
+            self.assertEqual(
+                constraint.fused_params or None,
+                sharding_option.fused_params,
+            )
+
+    def test_fused_params_are_copied_into_the_final_plan(self) -> None:
+        model = TestSparseNN(tables=self.tables, sparse_device=torch.device("meta"))
+        # pyrefly: ignore[missing-argument]
+        sharding_plan = self.planner.plan(module=model, sharders=get_default_sharders())
+        parameter_sharding = cast(
+            EmbeddingModuleShardingPlan, sharding_plan.plan["sparse.ebc"]
+        )["table_0"]
+        best_plan = none_throws(self.planner._best_plan)
+        sharding_option = next(
+            option for option in best_plan if option.name == "table_0"
+        )
+
+        self.constraints["table_0"].fused_params["nested"]["ranks"].append(2)
+
+        expected = {
+            FUSED_PARAM_CPU_OFFLOAD: True,
+            "nested": {"ranks": [0, 1]},
+        }
+        self.assertEqual(expected, sharding_option.fused_params)
+        self.assertEqual(expected, parameter_sharding.fused_params)
+        self.assertIsNot(
+            self.constraints["table_0"].fused_params,
+            parameter_sharding.fused_params,
+        )
+        unmarked_parameter_sharding = cast(
+            EmbeddingModuleShardingPlan, sharding_plan.plan["sparse.ebc"]
+        )["table_1"]
+        self.assertEqual(unmarked_parameter_sharding.fused_params, {})
 
 
 class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):
@@ -997,6 +1035,7 @@ class TestPlanLoaderIntegration(unittest.TestCase):
                     algorithm=CacheAlgorithm.LFU,
                 ),
                 feature_names=self.tables[0].feature_names,
+                fused_params={"planner_marker": {"backend": "host"}},
             ),
             "table_1": ParameterConstraints(
                 enforce_hbm=False,
@@ -1092,6 +1131,11 @@ class TestPlanLoaderIntegration(unittest.TestCase):
                 )[param_name]
                 # The ranks should be different (flipped) from baseline
                 self.assertNotEqual(param_sharding.ranks, baseline_param_sharding.ranks)
+                if param_name == "table_0":
+                    self.assertEqual(
+                        param_sharding.fused_params,
+                        {"planner_marker": {"backend": "host"}},
+                    )
 
     def test_plan_loader_with_context_mismatch(self) -> None:
         """Test EmbeddingShardingPlanner with PlanLoader that has mismatched context hash."""
@@ -1118,6 +1162,50 @@ class TestPlanLoaderIntegration(unittest.TestCase):
             PlannerErrorType.PLANNER_INPUT_CONTEXT_MISMATCH,
         )
         self.assertIn("planner input mismatch", str(context.exception))
+
+    def test_plan_loader_accepts_legacy_context_hash(self) -> None:
+        constraints = {
+            "table_0": ParameterConstraints(
+                feature_names=self.tables[0].feature_names,
+            ),
+            "table_1": ParameterConstraints(
+                feature_names=self.tables[1].feature_names,
+            ),
+        }
+        baseline_planner = EmbeddingShardingPlanner(
+            topology=self.topology,
+            constraints=constraints,
+        )
+        # pyrefly: ignore[missing-argument]
+        baseline_planner.plan(module=self.model, sharders=get_default_sharders())
+        legacy_context_hash = baseline_planner.hash_planner_context_inputs_legacy_str()
+        self.assertIsNotNone(legacy_context_hash)
+        self.assertNotEqual(
+            baseline_planner.hash_planner_context_inputs_str(),
+            legacy_context_hash,
+        )
+
+        planner_with_loader = EmbeddingShardingPlanner(
+            topology=self.topology,
+            constraints=constraints,
+            plan_loader=MockPlanLoader(
+                loaded_sharding_options={},
+                context_hash=legacy_context_hash,
+            ),
+        )
+        with self.assertLogs(
+            "torchrec.distributed.planner.planners", level="WARNING"
+        ) as logs:
+            # pyrefly: ignore[missing-argument]
+            loaded_plan = planner_with_loader.plan(
+                module=self.model,
+                sharders=get_default_sharders(),
+            )
+
+        self.assertGreater(len(loaded_plan.plan), 0)
+        self.assertTrue(
+            any("legacy order-sensitive" in message for message in logs.output)
+        )
 
     def test_plan_loader_with_no_loaded_options(self) -> None:
         """Test EmbeddingShardingPlanner with PlanLoader that returns no loaded options."""
@@ -1204,6 +1292,7 @@ class TestExtractPlan(unittest.TestCase):
                     algorithm=CacheAlgorithm.LFU,
                 ),
                 feature_names=self.tables[0].feature_names,
+                fused_params={"planner_marker": {"backend": "host"}},
             ),
             "table_1": ParameterConstraints(
                 enforce_hbm=False,
@@ -1287,6 +1376,9 @@ class TestExtractPlan(unittest.TestCase):
             self.assertEqual(result_so.is_pooled, expected_so.is_pooled)
             self.assertEqual(result_so.feature_names, expected_so.feature_names)
             self.assertEqual(result_so.cache_params, expected_so.cache_params)
+            self.assertEqual(result_so.fused_params, expected_so.fused_params)
+            if expected_so.fused_params is not None:
+                self.assertIsNot(result_so.fused_params, expected_so.fused_params)
 
     def test_extract_plan_duplicate_storage_hash_error(self) -> None:
         """Test extract_plan failure when duplicate storage hashes exist."""
@@ -1387,6 +1479,7 @@ class TestExtractPlan(unittest.TestCase):
             self.assertEqual(result_so.sharding_type, search_so.sharding_type)
             self.assertEqual(result_so.batch_size, search_so.batch_size)
             self.assertEqual(result_so.feature_names, search_so.feature_names)
+            self.assertEqual(result_so.fused_params, search_so.fused_params)
 
             # Shards should come from loaded options
             self.assertEqual(result_so.shards, loaded_so.shards)

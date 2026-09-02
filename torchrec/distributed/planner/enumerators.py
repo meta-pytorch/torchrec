@@ -216,6 +216,7 @@ class EmbeddingEnumerator(Enumerator):
                     output_dtype,
                     device_group,
                     key_value_params,
+                    fused_params,
                 ) = _extract_constraints_for_param(self._constraints, name)
 
                 # skip for other device groups
@@ -290,6 +291,7 @@ class EmbeddingEnumerator(Enumerator):
                                 stash_weights=self._get_stash_weights(
                                     name, child_module
                                 ),
+                                fused_params=fused_params,
                             )
                         )
                 if not sharding_options_per_table:
@@ -543,6 +545,7 @@ def _extract_constraints_for_param(
     Optional[DataType],
     Optional[str],
     Optional[KeyValueParams],
+    Optional[Dict[str, Any]],
 ]:
     input_lengths = [POOLING_FACTOR]
     col_wise_shard_dim = None
@@ -554,6 +557,7 @@ def _extract_constraints_for_param(
     output_dtype = None
     device_group = None
     key_value_params = None
+    fused_params = None
 
     if constraints and constraints.get(name):
         # For nested fields return a deep copy instead
@@ -567,6 +571,8 @@ def _extract_constraints_for_param(
         output_dtype = constraints[name].output_dtype
         device_group = constraints[name].device_group
         key_value_params = copy.deepcopy(constraints[name].key_value_params)
+        if constraints[name].fused_params:
+            fused_params = copy.deepcopy(constraints[name].fused_params)
 
     return (
         input_lengths,
@@ -579,6 +585,7 @@ def _extract_constraints_for_param(
         output_dtype,
         device_group,
         key_value_params,
+        fused_params,
     )
 
 

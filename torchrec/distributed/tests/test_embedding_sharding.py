@@ -55,6 +55,10 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
+from torchrec.distributed.fused_params import (
+    FUSED_PARAM_CPU_OFFLOAD,
+    FUSED_PARAM_SHARED_MEMORY,
+)
 from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
 from torchrec.distributed.types import ShardedTensorMetadata, ShardMetadata
 from torchrec.modules.embedding_configs import DataType, NoEvictionPolicy, PoolingType
@@ -149,6 +153,101 @@ class TestGetGroupingFusedParams(unittest.TestCase):
 
 
 class TestPerTBECacheLoadFactor(unittest.TestCase):
+    def test_nested_fused_params_use_canonical_grouping_key(self) -> None:
+        tables = [
+            ShardedEmbeddingTable(
+                name="table_0",
+                data_type=DataType.FP32,
+                pooling=PoolingType.SUM,
+                has_feature_processor=False,
+                fused_params={
+                    "planner_metadata": {
+                        "backend": "host",
+                        "ranks": [0, 1],
+                        "tags": {"primary", "replica"},
+                    }
+                },
+                compute_kernel=EmbeddingComputeKernel.FUSED,
+                embedding_dim=64,
+                num_embeddings=100,
+            ),
+            ShardedEmbeddingTable(
+                name="table_1",
+                data_type=DataType.FP32,
+                pooling=PoolingType.SUM,
+                has_feature_processor=False,
+                fused_params={
+                    "planner_metadata": {
+                        "tags": {"replica", "primary"},
+                        "ranks": [0, 1],
+                        "backend": "host",
+                    }
+                },
+                compute_kernel=EmbeddingComputeKernel.FUSED,
+                embedding_dim=64,
+                num_embeddings=100,
+            ),
+            ShardedEmbeddingTable(
+                name="table_2",
+                data_type=DataType.FP32,
+                pooling=PoolingType.SUM,
+                has_feature_processor=False,
+                fused_params={
+                    "planner_metadata": {
+                        "backend": "host",
+                        "ranks": [1, 0],
+                        "tags": {"primary", "replica"},
+                    }
+                },
+                compute_kernel=EmbeddingComputeKernel.FUSED,
+                embedding_dim=64,
+                num_embeddings=100,
+            ),
+        ]
+
+        table_groups = group_tables([tables])[0]
+
+        self.assertEqual(
+            [
+                [table.name for table in group.embedding_tables]
+                for group in table_groups
+            ],
+            [["table_0", "table_1"], ["table_2"]],
+        )
+        self.assertEqual(table_groups[0].fused_params, tables[0].fused_params)
+
+    def test_planner_markers_separate_groups_without_reaching_tbe(self) -> None:
+        tables = [
+            ShardedEmbeddingTable(
+                name="cpu_table",
+                data_type=DataType.FP32,
+                pooling=PoolingType.SUM,
+                has_feature_processor=False,
+                fused_params={FUSED_PARAM_CPU_OFFLOAD: True},
+                compute_kernel=EmbeddingComputeKernel.FUSED,
+                embedding_dim=64,
+                num_embeddings=100,
+            ),
+            ShardedEmbeddingTable(
+                name="shared_memory_table",
+                data_type=DataType.FP32,
+                pooling=PoolingType.SUM,
+                has_feature_processor=False,
+                fused_params={FUSED_PARAM_SHARED_MEMORY: True},
+                compute_kernel=EmbeddingComputeKernel.FUSED,
+                embedding_dim=64,
+                num_embeddings=100,
+            ),
+        ]
+
+        table_groups = group_tables([tables])[0]
+
+        self.assertEqual(len(table_groups), 2)
+        for table_group in table_groups:
+            fused_params = table_group.fused_params or {}
+            self.assertNotIn(FUSED_PARAM_CPU_OFFLOAD, fused_params)
+            self.assertNotIn(FUSED_PARAM_SHARED_MEMORY, fused_params)
+
     @given(
         data_type=st.sampled_from([DataType.FP16, DataType.FP32]),
         has_feature_processor=st.sampled_from([False, True]),
