@@ -275,6 +275,28 @@ class SequenceModelParallelTest(MultiProcessTestBase):
         torch.cuda.device_count() <= 1,
         "Not enough GPUs, this test requires at least two GPUs",
     )
+    def test_sharding_deduplicated_output_variable_batch(self) -> None:
+        self._test_sharding(
+            sharders=[
+                TestEmbeddingCollectionSharder(
+                    sharding_type=ShardingType.ROW_WISE.value,
+                    kernel_type=EmbeddingComputeKernel.FUSED.value,
+                    use_index_dedup=True,
+                    use_packed_jagged_tensor=True,
+                )
+            ],
+            backend="nccl",
+            constraints={
+                table.name: ParameterConstraints(min_partition=4)
+                for table in self.tables
+            },
+            variable_batch_per_feature=True,
+        )
+
+    @unittest.skipIf(
+        torch.cuda.device_count() <= 1,
+        "Not enough GPUs, this test requires at least two GPUs",
+    )
     def test_sharding_empty_rank(self) -> None:
         table = self.tables[0]
         embedding_groups = {"group_0": table.feature_names}
@@ -517,6 +539,10 @@ class DedupIndicesWeightAccumulationTest(unittest.TestCase):
 class TDSequenceModelParallelTest(SequenceModelParallelTest):
 
     def test_sharding_variable_batch(self) -> None:
+        # TensorDict doesn't support variable batch size yet
+        pass
+
+    def test_sharding_deduplicated_output_variable_batch(self) -> None:
         # TensorDict doesn't support variable batch size yet
         pass
 
