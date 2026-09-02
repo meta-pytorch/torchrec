@@ -66,7 +66,9 @@ class TestSequenceSparseArch(nn.Module):
         if device is None:
             device = torch.device("cpu")
         self.ec: EmbeddingCollection = EmbeddingCollection(
-            tables=tables, device=device, need_indices=True
+            tables=tables,
+            device=device,
+            need_indices=True,
         )
         self.embedding_names = embedding_names
         self.embedding_dim: int = self.ec.embedding_dim()
@@ -77,14 +79,16 @@ class TestSequenceSparseArch(nn.Module):
         batch_size: Optional[int] = None,
     ) -> torch.Tensor:
         jt_dict = self.ec(id_list_features)
-        padded_embeddings = [
-            torch.ops.fbgemm.jagged_2d_to_dense(
-                values=jt_dict[e].values(),
-                offsets=jt_dict[e].offsets(),
-                max_sequence_length=20,
-            ).view(-1, 20 * self.embedding_dim)
-            for e in self.embedding_names
-        ]
+        padded_embeddings = []
+        for embedding_name in self.embedding_names:
+            embedding = jt_dict[embedding_name]
+            padded_embeddings.append(
+                torch.ops.fbgemm.jagged_2d_to_dense(
+                    values=embedding.materialize().values(),
+                    offsets=embedding.offsets(),
+                    max_sequence_length=20,
+                ).view(-1, 20 * self.embedding_dim)
+            )
 
         return _post_sparsenn_forward(padded_embeddings, batch_size)
 
@@ -116,7 +120,7 @@ class TestSequenceTowerInteraction(nn.Module):
     ) -> torch.Tensor:
         padded_embeddings = [
             torch.ops.fbgemm.jagged_2d_to_dense(
-                values=sequence_emb[e].values(),
+                values=sequence_emb[e].materialize().values(),
                 offsets=sequence_emb[e].offsets(),
                 max_sequence_length=self.max_sequence_length,
             ).view(-1, self.max_sequence_length * self.embedding_dim)
@@ -310,6 +314,7 @@ class TestEmbeddingCollectionSharder(EmbeddingCollectionSharder):
         qcomms_config: Optional[QCommsConfig] = None,
         fused_params: Optional[Dict[str, Any]] = None,
         use_index_dedup: bool = False,
+        use_packed_jagged_tensor: bool = False,
     ) -> None:
         self._sharding_type = sharding_type
         self._kernel_type = kernel_type
@@ -327,6 +332,7 @@ class TestEmbeddingCollectionSharder(EmbeddingCollectionSharder):
             fused_params=fused_params,
             qcomm_codecs_registry=qcomm_codecs_registry,
             use_index_dedup=use_index_dedup,
+            use_packed_jagged_tensor=use_packed_jagged_tensor,
         )
 
     """

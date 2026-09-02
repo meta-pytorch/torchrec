@@ -292,11 +292,24 @@ def construct_jagged_tensors(
     seq_vbe_ctx: Optional[SequenceVBEContext] = None,
     use_gather_select: bool = False,
     use_sorted_select: bool = False,
+    use_packed_jagged_tensor: bool = False,
 ) -> Dict[str, JaggedTensor]:
+    """Construct per-feature JaggedTensors, optionally preserving packed values."""
     with record_function("## construct_jagged_tensors ##"):
         if original_features is not None:
             features = original_features
-        if reverse_indices is not None:
+
+        if use_packed_jagged_tensor:
+            # Duplicate names represent column-wise shards. The regular path splits
+            # them by logical length before concatenating columns, but those lengths
+            # do not define boundaries in the deduplicated embedding buffer.
+            if len(set(embedding_names)) != len(embedding_names):
+                raise ValueError(
+                    "Packed JaggedTensor output does not support column-wise sharding"
+                )
+            if reverse_indices is None:
+                raise ValueError("Packed JaggedTensor output requires reverse indices")
+        elif reverse_indices is not None:
             if use_sorted_select:
                 # sorted segment-reduce backward (fp32, atomic-light): faster and
                 # more accurate than index_add on AMD. Forward is the same gather.
@@ -313,25 +326,44 @@ def construct_jagged_tensors(
                 embeddings = torch.gather(embeddings, 0, expanded_indices)
             else:
                 embeddings = torch.index_select(embeddings, 0, reverse_indices)
-        ret: Dict[str, JaggedTensor] = {}
-
-        if seq_vbe_ctx is not None:
+        if seq_vbe_ctx is not None and not use_packed_jagged_tensor:
             embeddings, lengths, length_per_key, values = _vbe_reindex(
                 embeddings=embeddings, seq_vbe_ctx=seq_vbe_ctx
             )
+        elif seq_vbe_ctx is not None and use_packed_jagged_tensor:
+            # Keep embeddings packed and apply the VBE permutation to the reverse
+            # indices in _packed_values_and_indices.
+            lengths = seq_vbe_ctx.reindexed_lengths
+            length_per_key = seq_vbe_ctx.reindexed_length_per_key
+            values = seq_vbe_ctx.reindexed_values
         else:
             lengths = features.lengths().view(-1, features.stride())
             length_per_key = features.length_per_key()
             values = features.values()
 
         lengths_tuple = torch.unbind(lengths, dim=0)
-        embeddings_list = torch.split(embeddings, length_per_key, dim=0)
         values_list = (
-            torch.split(values, length_per_key)
+            list(torch.split(values, length_per_key))
             if need_indices and values is not None
             else None
         )
+        if use_packed_jagged_tensor:
+            assert reverse_indices is not None
+            packed_values, packed_indices = _packed_values_and_indices(
+                embeddings, length_per_key, reverse_indices, seq_vbe_ctx
+            )
+            return {
+                name: JaggedTensor.from_packed_values(
+                    packed_values=packed_values[i],
+                    reverse_indices=packed_indices[i],
+                    lengths=lengths_tuple[i],
+                    weights=values_list[i] if values_list is not None else None,
+                )
+                for i, name in enumerate(embedding_names)
+            }
 
+        ret: Dict[str, JaggedTensor] = {}
+        embeddings_list = torch.split(embeddings, length_per_key, dim=0)
         key_indices = defaultdict(list)
         for i, key in enumerate(embedding_names):
             key_indices[key].append(i)
@@ -356,6 +388,26 @@ def construct_jagged_tensors(
                 ),
             )
         return ret
+
+
+def _packed_values_and_indices(
+    embeddings: torch.Tensor,
+    length_per_key: List[int],
+    reverse_indices: torch.Tensor,
+    seq_vbe_ctx: Optional[SequenceVBEContext],
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    if seq_vbe_ctx is not None:
+        reverse_indices, _ = _permute_tensor_by_segments(
+            tensor=reverse_indices,
+            segment_sizes=seq_vbe_ctx.unpadded_lengths,
+            recat=seq_vbe_ctx.recat,
+            output_size=sum(length_per_key),
+        )
+
+    return (
+        [embeddings] * len(length_per_key),
+        list(torch.split(reverse_indices, length_per_key)),
+    )
 
 
 def construct_jagged_tensors_inference(
