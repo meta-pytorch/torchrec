@@ -133,9 +133,10 @@ class AUCMetricCompileTest(unittest.TestCase):
         # module attributes as dynamic to isolate the AUC list-length recompiles,
         # then assert the recompile limit is never hit so this stays a regression
         # guard.
-        with patch.object(
-            torch._dynamo.config, "allow_unspec_int_on_nn_module", True
-        ), patch.object(torch._dynamo.config, "fail_on_recompile_limit_hit", True):
+        with (
+            patch.object(torch._dynamo.config, "allow_unspec_int_on_nn_module", True),
+            patch.object(torch._dynamo.config, "fail_on_recompile_limit_hit", True),
+        ):
             for _ in range(10):
                 compiled_update(
                     predictions={DefaultTaskInfo.name: model_output["predictions"][0]},

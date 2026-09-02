@@ -11,11 +11,13 @@ import abc
 import copy
 import inspect
 import itertools
+import logging
 import math
 import weakref
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from typing import (
     Any,
     Callable,
@@ -39,6 +41,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.profiler import record_function
 from torchmetrics import Metric
+from torchmetrics.utilities.distributed import gather_all_tensors
 
 try:
     from torchrec.distributed.logging_handlers import (
@@ -59,6 +62,7 @@ except Exception:
             pass
 
 
+from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.logging_utils import EventType
 from torchrec.distributed.types import get_tensor_size_bytes
 from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
@@ -72,6 +76,8 @@ from torchrec.pt2.utils import pt2_compile_callable
 
 
 RecModelOutput = Union[torch.Tensor, Dict[str, torch.Tensor]]
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -130,6 +136,7 @@ def _snapshot_init_kwargs(kwargs: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 MAX_BUFFER_COUNT = 1000
+_FIXED_SHAPE_SYNC_ENABLED = "pytorch/torchrec:enable_fixed_shape_metric_sync"
 _WINDOW_BUFFER_REGISTRY: weakref.WeakValueDictionary[int, Any] = (
     torch.__dict__.setdefault(
         "_torchrec_window_buffer_registry", weakref.WeakValueDictionary()
@@ -152,6 +159,51 @@ def _window_buffer_aggregate_state(
 ) -> None:
     _WINDOW_BUFFER_REGISTRY[buffer_handle]._aggregate_state_impl(
         window_state, curr_state, size
+    )
+
+
+@lru_cache(maxsize=16)
+def _supports_fixed_shape_sync(dist_sync_fn: Callable) -> bool:
+    try:
+        return "assume_same_shape" in inspect.signature(dist_sync_fn).parameters
+    except (TypeError, ValueError):
+        return False
+
+
+def _default_sync_supports_fixed_shape() -> bool:
+    return _supports_fixed_shape_sync(gather_all_tensors)
+
+
+def _fixed_shape_gather(
+    result: torch.Tensor, group: Optional[Any] = None
+) -> List[torch.Tensor]:
+    return gather_all_tensors(result, group, assume_same_shape=True)
+
+
+def _resolve_fixed_shape_sync_on_leader(use_fixed_shape_sync: bool) -> bool:
+    if not use_fixed_shape_sync or not _default_sync_supports_fixed_shape():
+        return False
+    return torch._utils_internal.justknobs_check(
+        _FIXED_SHAPE_SYNC_ENABLED, default=False
+    )
+
+
+def _resolve_fixed_shape_sync(
+    process_group: Optional[dist.ProcessGroup],
+    use_fixed_shape_sync: bool,
+) -> bool:
+    if not dist.is_available() or not dist.is_initialized():
+        return False
+    group: Optional[dist.ProcessGroup] = (
+        process_group if process_group is not None else dist.group.WORLD
+    )
+    if group is None:
+        return False
+    return invoke_on_rank_and_broadcast_result(
+        pg=group,
+        rank=0,
+        func=_resolve_fixed_shape_sync_on_leader,
+        use_fixed_shape_sync=use_fixed_shape_sync,
     )
 
 
@@ -231,8 +283,11 @@ class RecMetricComputation(Metric, abc.ABC):
             where all examples have 0 weights for a batch.
         process_group (Optional[ProcessGroup]): the process group used for the
             communication. Will use the default process group if not specified.
+            Fixed-shape sync resolves its rollout decision across the group on the
+            first distributed synchronization for each process group and caches it.
     """
 
+    _use_fixed_shape_sync: bool = False
     _batch_window_buffers: Optional[Dict[str, WindowBuffer]]
 
     def __init__(
@@ -286,6 +341,67 @@ class RecMetricComputation(Metric, abc.ABC):
                 persistent=True,
             )
         self._compute_mode: RecComputeMode = compute_mode
+        self._seen_dist_sync_paths: Set[str] = set()
+        self._fixed_shape_sync_enablement: Dict[dist.ProcessGroup, bool] = {}
+
+    def _has_fixed_shape_state_contract(self) -> bool:
+        defaults: Optional[Mapping[str, Any]] = getattr(self, "_defaults", None)
+        return (
+            self._use_fixed_shape_sync
+            and defaults is not None
+            and all(isinstance(default, torch.Tensor) for default in defaults.values())
+        )
+
+    def _should_use_fixed_shape_sync(
+        self, process_group: Optional[dist.ProcessGroup]
+    ) -> bool:
+        if not self._use_fixed_shape_sync or process_group is None:
+            return False
+        if process_group not in self._fixed_shape_sync_enablement:
+            self._fixed_shape_sync_enablement[process_group] = (
+                _resolve_fixed_shape_sync(
+                    process_group,
+                    self._has_fixed_shape_state_contract(),
+                )
+            )
+        return self._fixed_shape_sync_enablement[process_group]
+
+    def _sync_dist(
+        self,
+        dist_sync_fn: Optional[Callable] = None,
+        process_group: Optional[Any] = None,
+    ) -> None:
+        if dist_sync_fn is None:
+            dist_sync_fn = gather_all_tensors
+        uses_default_sync = dist_sync_fn is gather_all_tensors
+        sync_process_group = cast(
+            Optional[dist.ProcessGroup],
+            process_group or self.process_group or dist.group.WORLD,
+        )
+        uses_fixed_shape_sync = uses_default_sync and self._should_use_fixed_shape_sync(
+            sync_process_group
+        )
+        if uses_fixed_shape_sync:
+            dist_sync_fn = _fixed_shape_gather
+            sync_path = "fixed_shape"
+        elif uses_default_sync:
+            sync_path = "variable_shape"
+        else:
+            sync_path = "custom"
+        should_log_sync_path = (
+            self._my_rank == 0 and sync_path not in self._seen_dist_sync_paths
+        )
+
+        super()._sync_dist(dist_sync_fn, sync_process_group)
+
+        if should_log_sync_path:
+            logger.info(
+                "RecMetric distributed sync path: metric=%s path=%s states=%d",
+                type(self).__name__,
+                sync_path,
+                len(getattr(self, "_defaults", {})),
+            )
+            self._seen_dist_sync_paths.add(sync_path)
 
     @staticmethod
     def get_window_state_name(state_name: str) -> str:
