@@ -1192,13 +1192,14 @@ def triton_tbe_backward_long_run_grad_accum_weighted(
     info_B_num_bits,
     info_B_mask,
     vbe: tl.constexpr = False,
+    BUFFER_SIZE: tl.constexpr = 16,
 ) -> None:
     """
     Weighted version: each program accumulates weighted gradients for a
     sub-range of a long run and atomically adds into a temp gradient buffer.
     """
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    buffer_size: tl.constexpr = 16
+    buffer_size: tl.constexpr = BUFFER_SIZE
     buffer_offsets = tl.arange(0, buffer_size)
 
     pid = tl.program_id(0)
@@ -1313,13 +1314,14 @@ def triton_tbe_backward_long_run_grad_accum_unweighted(
     info_B_num_bits,
     info_B_mask,
     vbe: tl.constexpr = False,
+    BUFFER_SIZE: tl.constexpr = 8,
 ) -> None:
     """
     Each program accumulates gradients for a sub-range of a long run
     and atomically adds the partial result into a temp gradient buffer.
     """
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    buffer_size: tl.constexpr = 8
+    buffer_size: tl.constexpr = BUFFER_SIZE
     buffer_offsets = tl.arange(0, buffer_size)
 
     pid = tl.program_id(0)
@@ -2398,6 +2400,13 @@ class TritonTBE(torch.autograd.Function):
                     info_B_mask=info_B_mask,
                     num_warps=num_warps,
                     vbe=vbe,
+                    # The AMD variant hardcodes its gather width and does not
+                    # take this constexpr, so only pass it on the CUDA path.
+                    **(
+                        {}
+                        if _use_amd
+                        else {"BUFFER_SIZE": cfg.long_run_accum_buffer_size_weighted}
+                    ),
                 )
                 # Kernel 3: apply optimizer (reuse unweighted — weight-independent)
                 bwd_long_apply = (
@@ -2556,6 +2565,13 @@ class TritonTBE(torch.autograd.Function):
                     info_B_mask=info_B_mask,
                     num_warps=num_warps,
                     vbe=vbe,
+                    # The AMD variant hardcodes its gather width and does not
+                    # take this constexpr, so only pass it on the CUDA path.
+                    **(
+                        {}
+                        if _use_amd
+                        else {"BUFFER_SIZE": cfg.long_run_accum_buffer_size_unweighted}
+                    ),
                 )
 
                 # Kernel 3: apply optimizer (direct mapping, no while-loop)
