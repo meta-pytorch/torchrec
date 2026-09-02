@@ -45,6 +45,8 @@ from torchrec.distributed.planner.storage_reservations import (
 from torchrec.distributed.planner.types import (
     Enumerator,
     hash_planner_context_inputs,
+    hash_planner_context_inputs_legacy,
+    hash_planner_context_inputs_legacy_str,
     hash_planner_context_inputs_str,
     ParameterConstraints,
     Partitioner,
@@ -204,6 +206,15 @@ def to_sharding_plan(
             bounds_check_mode=sharding_option.bounds_check_mode,
             output_dtype=sharding_option.output_dtype,
             key_value_params=sharding_option.key_value_params,
+            # ``None`` is reserved for plans whose per-table metadata could not
+            # be recovered (for example, an unvalidated structural cache hit).
+            # A freshly selected option always knows that an absent marker is
+            # false, so preserve that knowledge as an empty mapping.
+            fused_params=copy.deepcopy(
+                sharding_option.fused_params
+                if sharding_option.fused_params is not None
+                else {}
+            ),
         )
         plan[sharding_option.path] = module_plan
     # pyrefly: ignore[bad-argument-type]
@@ -481,6 +492,7 @@ def extract_plan(
                     feature_names=so.feature_names,
                     output_dtype=so.output_dtype,
                     key_value_params=so.key_value_params,
+                    fused_params=so.fused_params,
                 )
             )
 
@@ -631,6 +643,26 @@ class EmbeddingPlannerBase(ShardingPlanner):
             Generates a hash capturing topology, batch size, enumerator, storage reservation, stats and constraints.
         """
         return hash_planner_context_inputs_str(
+            self._topology,
+            self._batch_size,
+            self._enumerator,
+            self._storage_reservation,
+            self._constraints,
+        )
+
+    def hash_planner_context_inputs_legacy(self) -> Optional[int]:
+        """Generate the pre-canonicalization hash for stored-plan compatibility."""
+        return hash_planner_context_inputs_legacy(
+            self._topology,
+            self._batch_size,
+            self._enumerator,
+            self._storage_reservation,
+            self._constraints,
+        )
+
+    def hash_planner_context_inputs_legacy_str(self) -> Optional[str]:
+        """Generate the legacy string hash when old inputs can represent context."""
+        return hash_planner_context_inputs_legacy_str(
             self._topology,
             self._batch_size,
             self._enumerator,
@@ -1280,7 +1312,7 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         self, current_planner_hash: str, loaded_plan_hash: Optional[str]
     ) -> None:
         """
-        Validates that the current planner context hash matches the loaded plan context hash.
+        Validate the loaded hash against the canonical or legacy planner context.
 
         Args:
             current_planner_hash (str): Hash from current planner context
@@ -1289,15 +1321,28 @@ class EmbeddingShardingPlanner(EmbeddingPlannerBase):
         Raises:
             PlannerError: If hashes don't match
         """
-        if loaded_plan_hash is not None and current_planner_hash != loaded_plan_hash:
+        if loaded_plan_hash is None or current_planner_hash == loaded_plan_hash:
+            return
+
+        legacy_planner_hash = self.hash_planner_context_inputs_legacy_str()
+        if legacy_planner_hash == loaded_plan_hash:
             # pyrefly: ignore[missing-attribute]
             plan_id = self.plan_loader.get_plan_id() if self.plan_loader else None
-            error_msg = (
-                f"Planner input context mismatch detected for {plan_id} and current planner set up:"
-                f"\nCurrent planner hash: {current_planner_hash}, Loaded plan hash: {loaded_plan_hash}"
+            logger.warning(
+                "Plan %s uses the legacy order-sensitive planner context hash; "
+                "regenerate it to store the canonical hash",
+                plan_id,
             )
-            raise PlannerError(
-                error_type=PlannerErrorType.PLANNER_INPUT_CONTEXT_MISMATCH,
-                message="Unable to load, because of planner input mismatch - cannot validate this plan is the best plan for current context.. \n"
-                + error_msg,
-            )
+            return
+
+        # pyrefly: ignore[missing-attribute]
+        plan_id = self.plan_loader.get_plan_id() if self.plan_loader else None
+        error_msg = (
+            f"Planner input context mismatch detected for {plan_id} and current planner set up:"
+            f"\nCurrent planner hash: {current_planner_hash}, Loaded plan hash: {loaded_plan_hash}"
+        )
+        raise PlannerError(
+            error_type=PlannerErrorType.PLANNER_INPUT_CONTEXT_MISMATCH,
+            message="Unable to load, because of planner input mismatch - cannot validate this plan is the best plan for current context.. \n"
+            + error_msg,
+        )

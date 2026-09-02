@@ -816,6 +816,9 @@ class ParameterSharding:
         bounds_check_mode (Optional[BoundsCheckMode]): bounds check mode.
         output_dtype (Optional[DataType]): output dtype.
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE or PS.
+        fused_params (Optional[Dict[str, Any]]): per-table metadata from the
+            selected planner option. The planner does not interpret it, but
+            values must support deterministic hash canonicalization.
 
     NOTE:
       ShardingType.TABLE_WISE - rank where this embedding is placed
@@ -835,6 +838,7 @@ class ParameterSharding:
     bounds_check_mode: Optional[BoundsCheckMode] = None
     output_dtype: Optional[DataType] = None
     key_value_params: Optional[KeyValueParams] = None
+    fused_params: Optional[Dict[str, Any]] = None
 
 
 class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterSharding]):

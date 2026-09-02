@@ -71,7 +71,10 @@ from torchrec.distributed.embedding_types import (
     ListOfKJTList,
     ShardedEmbeddingTable,
 )
-from torchrec.distributed.fused_params import FUSED_PARAM_SSD_TABLE_LIST
+from torchrec.distributed.fused_params import (
+    FUSED_PARAM_SSD_TABLE_LIST,
+    FUSED_PARAM_TORCHREC_ROUTING_KEYS,
+)
 from torchrec.distributed.types import (
     Awaitable,
     EmbeddingEvent,
@@ -496,6 +499,33 @@ def _get_grouping_fused_params(
     return grouping_fused_params
 
 
+def _canonicalize_fused_param_for_grouping(value: Any) -> Any:
+    """Convert nested containers into hashable, order-independent group keys."""
+    value_type = type(value)
+    if value_type is dict:
+        return (
+            value_type,
+            frozenset(
+                (
+                    _canonicalize_fused_param_for_grouping(key),
+                    _canonicalize_fused_param_for_grouping(nested_value),
+                )
+                for key, nested_value in value.items()
+            ),
+        )
+    if value_type in (list, tuple):
+        return (
+            value_type,
+            tuple(_canonicalize_fused_param_for_grouping(item) for item in value),
+        )
+    if value_type in (set, frozenset):
+        return (
+            value_type,
+            frozenset(_canonicalize_fused_param_for_grouping(item) for item in value),
+        )
+    return value
+
+
 def _get_compute_kernel_type(
     compute_kernel: EmbeddingComputeKernel,
 ) -> EmbeddingComputeKernel:
@@ -610,7 +640,7 @@ def group_tables(
                 table.data_type if not is_inference else None,
                 table.pooling,
                 table.has_feature_processor,
-                tuple(sorted(group_fused_params.items())),
+                _canonicalize_fused_param_for_grouping(group_fused_params),
                 _get_compute_kernel_type(table.compute_kernel),
                 # TODO: Unit test to check if table.data_type affects table grouping
                 bucketer.get_bucket(
@@ -632,7 +662,7 @@ def group_tables(
                 data_type,
                 pooling,
                 has_feature_processor,
-                fused_params_tuple,
+                _,
                 compute_kernel_type,
                 _,
                 _,
@@ -641,11 +671,20 @@ def group_tables(
                 _,
             ) = grouping_key
             grouped_tables = groups[grouping_key]
+            representative_table = grouped_tables[0]
+            group_fused_params = (
+                _get_grouping_fused_params(
+                    representative_table.fused_params,
+                    representative_table.name,
+                )
+                or {}
+            )
             # remove non-native fused params
             per_tbe_fused_params = {
-                k: v
-                for k, v in fused_params_tuple
+                k: group_fused_params[k]
+                for k in sorted(group_fused_params)
                 if k not in ["_batch_key", USE_ONE_TBE_PER_TABLE]
+                and k not in FUSED_PARAM_TORCHREC_ROUTING_KEYS
             }
             cache_load_factor = _get_weighted_avg_cache_load_factor(grouped_tables)
             if cache_load_factor is not None:

@@ -7,7 +7,7 @@
 
 # pyre-strict
 
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, FrozenSet, Iterable, Optional
 
 import torch
 from fbgemm_gpu.split_table_batched_embeddings_ops_inference import (
@@ -33,6 +33,17 @@ FUSED_PARAM_IS_DEVICE_RO: str = "__register_is_device_ro"
 FUSED_PARAM_SSD_TABLE_LIST: str = "__register_ssd_table_list"
 # Bool fused param per table to check if the table is offloaded to SSD
 FUSED_PARAM_IS_SSD_TABLE: str = "__register_is_ssd_table"
+
+# Per-table planner markers for CPU-backed embedding implementations. These are
+# TorchRec routing metadata and must not be forwarded to FBGEMM constructors.
+FUSED_PARAM_SHARED_MEMORY: str = "__shared_memory"
+FUSED_PARAM_CPU_OFFLOAD: str = "__cpu_offload"
+FUSED_PARAM_TORCHREC_ROUTING_KEYS: FrozenSet[str] = frozenset(
+    {
+        FUSED_PARAM_SHARED_MEMORY,
+        FUSED_PARAM_CPU_OFFLOAD,
+    }
+)
 
 # Embedding table index type for int32 support. Defaults to torch.int64 if not specified.
 FUSED_PARAM_EMBEDDING_TABLE_INDEX_TYPE: str = "embedding_table_index_type"
@@ -138,6 +149,8 @@ def tbe_fused_params(
         fused_params_for_tbe.pop(FUSED_PARAM_IS_DEVICE_RO)
     if FUSED_PARAM_SSD_TABLE_LIST in fused_params_for_tbe:
         fused_params_for_tbe.pop(FUSED_PARAM_SSD_TABLE_LIST)
+    for key in FUSED_PARAM_TORCHREC_ROUTING_KEYS:
+        fused_params_for_tbe.pop(key, None)
 
     return fused_params_for_tbe
 
