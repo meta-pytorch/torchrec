@@ -121,6 +121,8 @@ class CaliFreeNEMetricComputation(RecMetricComputation):
         allow_missing_label_with_zero_weight (bool): allow missing label to have weight 0, instead of throwing exception.
     """
 
+    _use_fixed_shape_sync: bool = True
+
     def __init__(
         self,
         *args: Any,
