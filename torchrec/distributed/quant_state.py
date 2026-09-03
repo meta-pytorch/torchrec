@@ -417,13 +417,17 @@ def get_bucket_offsets_per_virtual_table(
     }
 
 
-def get_param_id_from_type(is_sqebc: bool, is_sqmcec: bool, is_sfpebc: bool) -> str:
+def get_param_id_from_type(
+    is_sqebc: bool, is_sqmcec: bool, is_sfpebc: bool, is_sqpea: bool = False
+) -> str:
     if is_sqebc:
         return "embedding_bags"
     elif is_sqmcec:
         return "_embedding_module.embeddings"
     elif is_sfpebc:
         return "_embedding_bag_collection.embedding_bags"
+    elif is_sqpea:
+        return "embedding_modules"
     return "embeddings"
 
 
@@ -468,26 +472,40 @@ def sharded_tbes_weights_spec(
         is_sqmcebc: bool = (
             "ShardedQuantManagedCollisionEmbeddingBagCollection" in type_name
         )
+        is_sqpea: bool = "ShardedQuantPooledEmbeddingArch" in type_name
 
-        if is_sqebc or is_sqec or is_sqmcec or is_sqebc or is_sqmcebc:
+        if is_sqebc or is_sqec or is_sqmcec or is_sfpebc or is_sqmcebc or is_sqpea:
             assert (
-                is_sqec + is_sqebc + is_sqmcec + is_sfpebc + is_sqmcebc == 1
-            ), "Cannot have any two of ShardedQuantEmbeddingBagCollection, ShardedQuantEmbeddingCollection, ShardedQuantManagedCollisionEmbeddingCollection, ShardedQuantFeatureProcessedEmbeddingBagCollection and ShardedQuantManagedCollisionEmbeddingBagCollection are true"
+                is_sqec + is_sqebc + is_sqmcec + is_sfpebc + is_sqmcebc + is_sqpea == 1
+            ), "Cannot have any two of ShardedQuantEmbeddingBagCollection, ShardedQuantEmbeddingCollection, ShardedQuantManagedCollisionEmbeddingCollection, ShardedQuantFeatureProcessedEmbeddingBagCollection, ShardedQuantManagedCollisionEmbeddingBagCollection and ShardedQuantPooledEmbeddingArch are true"
             tbes_configs: Dict[
                 IntNBitTableBatchedEmbeddingBagsCodegen, GroupedEmbeddingConfig
             ] = module.tbes_configs()  # pyrefly: ignore
             table_shardings: Dict[str, str] = {}
 
-            sharding_type_device_group_to_sharding_infos: Dict[
-                Tuple[str, str], List[EmbeddingShardingInfo]
-            ] = module.sharding_type_device_group_to_sharding_infos()  # pyrefly: ignore
+            if is_sqpea:
+                for (
+                    sharding_type_to_sharding_infos
+                ) in module.sharding_type_to_sharding_infos():  # pyrefly: ignore
+                    for (
+                        sharding_type,
+                        sharding_infos,
+                    ) in sharding_type_to_sharding_infos.items():
+                        for info in sharding_infos:
+                            table_shardings[info.embedding_config.name] = sharding_type
+            else:
+                sharding_type_device_group_to_sharding_infos: Dict[
+                    Tuple[str, str], List[EmbeddingShardingInfo]
+                ] = (
+                    module.sharding_type_device_group_to_sharding_infos()  # pyrefly: ignore
+                )
 
-            for (
-                (sharding_type, _),
-                sharding_infos,
-            ) in sharding_type_device_group_to_sharding_infos.items():
-                for info in sharding_infos:
-                    table_shardings[info.embedding_config.name] = sharding_type
+                for (
+                    (sharding_type, _),
+                    sharding_infos,
+                ) in sharding_type_device_group_to_sharding_infos.items():
+                    for info in sharding_infos:
+                        table_shardings[info.embedding_config.name] = sharding_type
 
             # mapping to compute shard offsets based on bucket length tensor
             # for bucket wise sharding of virtual embedding tables
@@ -579,7 +597,9 @@ def sharded_tbes_weights_spec(
                         row_offsets,
                         table_metadata.shard_offsets[1],
                     ]
-                    s: str = get_param_id_from_type(is_sqebc, is_sqmcec, is_sfpebc)
+                    s: str = get_param_id_from_type(
+                        is_sqebc, is_sqmcec, is_sfpebc, is_sqpea
+                    )
                     unsharded_fqn_weight_prefix: str = f"{module_fqn}.{s}.{table_name}"
                     unsharded_fqn_weight: str = unsharded_fqn_weight_prefix + ".weight"
 

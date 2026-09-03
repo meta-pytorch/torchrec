@@ -315,8 +315,10 @@ class TestKeyedJaggedTensor(unittest.TestCase):
     def test_empty_to_dict(self) -> None:
         keys = ["index_0", "index_1"]
         values = torch.tensor([])
-        lengths = torch.tensor([[], []])
+        lengths = torch.zeros((2, 0), dtype=torch.int32)
         length_per_key = [0, 0]
+        empty_lengths = torch.tensor([], dtype=torch.int32)
+        expected_offsets = torch.tensor([0], dtype=torch.int32)
 
         jag_tensor = KeyedJaggedTensor(
             keys=keys, values=values, lengths=lengths, length_per_key=length_per_key
@@ -326,12 +328,12 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         j1 = jag_tensor_dict["index_1"]
 
         self.assertTrue(isinstance(j0, JaggedTensor))
-        torch.testing.assert_close(j0.lengths(), torch.Tensor([]), rtol=0, atol=0)
-        torch.testing.assert_close(j0.offsets(), torch.Tensor([]), rtol=0, atol=0)
+        torch.testing.assert_close(j0.lengths(), empty_lengths, rtol=0, atol=0)
+        torch.testing.assert_close(j0.offsets(), expected_offsets, rtol=0, atol=0)
         torch.testing.assert_close(j0.values(), torch.Tensor([]), rtol=0, atol=0)
         self.assertTrue(isinstance(j1, JaggedTensor))
-        torch.testing.assert_close(j1.lengths(), torch.Tensor([]), rtol=0, atol=0)
-        torch.testing.assert_close(j1.offsets(), torch.Tensor([]), rtol=0, atol=0)
+        torch.testing.assert_close(j1.lengths(), empty_lengths, rtol=0, atol=0)
+        torch.testing.assert_close(j1.offsets(), expected_offsets, rtol=0, atol=0)
         torch.testing.assert_close(j1.values(), torch.Tensor([]), rtol=0, atol=0)
 
         jag_tensor = KeyedJaggedTensor.from_lengths_sync(
@@ -342,13 +344,40 @@ class TestKeyedJaggedTensor(unittest.TestCase):
         j1 = jag_tensor_dict["index_1"]
 
         self.assertTrue(isinstance(j0, JaggedTensor))
-        torch.testing.assert_close(j0.lengths(), torch.Tensor([]), rtol=0, atol=0)
-        torch.testing.assert_close(j0.offsets(), torch.Tensor([]), rtol=0, atol=0)
+        torch.testing.assert_close(j0.lengths(), empty_lengths, rtol=0, atol=0)
+        torch.testing.assert_close(j0.offsets(), expected_offsets, rtol=0, atol=0)
         torch.testing.assert_close(j0.values(), torch.Tensor([]), rtol=0, atol=0)
         self.assertTrue(isinstance(j1, JaggedTensor))
-        torch.testing.assert_close(j1.lengths(), torch.Tensor([]), rtol=0, atol=0)
-        torch.testing.assert_close(j1.offsets(), torch.Tensor([]), rtol=0, atol=0)
+        torch.testing.assert_close(j1.lengths(), empty_lengths, rtol=0, atol=0)
+        torch.testing.assert_close(j1.offsets(), expected_offsets, rtol=0, atol=0)
         torch.testing.assert_close(j1.values(), torch.Tensor([]), rtol=0, atol=0)
+
+    def test_empty_to_dict_1d_lengths(self) -> None:
+        # Regression: a 1D empty lengths must yield one empty JaggedTensor per key.
+        keys = ["index_0", "index_1"]
+        jag_tensor = KeyedJaggedTensor(
+            keys=keys,
+            values=torch.tensor([]),
+            lengths=torch.zeros(0, dtype=torch.int32),
+            length_per_key=[0, 0],
+        )
+        self.assertFalse(jag_tensor.variable_stride_per_key())
+        self.assertEqual(jag_tensor.lengths().dim(), 1)
+
+        jag_tensor_dict = jag_tensor.to_dict()
+        self.assertEqual(set(jag_tensor_dict.keys()), set(keys))
+        for key in keys:
+            jt = jag_tensor_dict[key]
+            self.assertTrue(isinstance(jt, JaggedTensor))
+            torch.testing.assert_close(
+                jt.lengths(), torch.tensor([], dtype=torch.int32), rtol=0, atol=0
+            )
+            torch.testing.assert_close(jt.values(), torch.Tensor([]), rtol=0, atol=0)
+            # offsets must be [0], never empty: the TBE bounds check reads
+            # offsets.size(0) - 1.
+            torch.testing.assert_close(
+                jt.offsets(), torch.tensor([0], dtype=torch.int32), rtol=0, atol=0
+            )
 
     def test_split(self) -> None:
         values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
