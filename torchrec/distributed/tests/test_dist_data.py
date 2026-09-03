@@ -1485,38 +1485,38 @@ class TestJaggedTensorAllToAll(MultiProcessTestBase):
                 input_splits = torch.tensor([2, 1], dtype=torch.int32, device=device)
                 output_splits = torch.tensor([1, 1], dtype=torch.int32, device=device)
 
-        jt_all_to_all = JaggedTensorAllToAll(
-            jt,
-            num_items_to_send=input_splits,
-            num_items_to_receive=output_splits,
-            #  `Optional[ProcessGroup]`.
-            # pyrefly: ignore[bad-argument-type]
-            pg=ctx.pg,
-        )
+            jt_all_to_all = JaggedTensorAllToAll(
+                jt,
+                num_items_to_send=input_splits,
+                num_items_to_receive=output_splits,
+                #  `Optional[ProcessGroup]`.
+                # pyrefly: ignore[bad-argument-type]
+                pg=ctx.pg,
+            )
 
-        jt_out = jt_all_to_all.wait()
+            jt_out = jt_all_to_all.wait()
 
-        torch.testing.assert_close(
-            jt_out.values(),
-            torch.tensor(
-                (
-                    [1, 2, 2, 3, 3, 3, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6]
-                    if ctx.rank == 0
-                    else [4, 4, 4, 4, 7, 7, 7, 7, 7, 7, 7]
+            torch.testing.assert_close(
+                jt_out.values(),
+                torch.tensor(
+                    (
+                        [1, 2, 2, 3, 3, 3, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6]
+                        if ctx.rank == 0
+                        else [4, 4, 4, 4, 7, 7, 7, 7, 7, 7, 7]
+                    ),
+                    dtype=torch.int,
+                    device=device,
                 ),
-                dtype=torch.int,
-                device=device,
-            ),
-        )
+            )
 
-        torch.testing.assert_close(
-            jt_out.lengths(),
-            torch.tensor(
-                [1, 2, 3, 5, 6] if ctx.rank == 0 else [4, 7],
-                dtype=torch.int,
-                device=device,
-            ),
-        )
+            torch.testing.assert_close(
+                jt_out.lengths(),
+                torch.tensor(
+                    [1, 2, 3, 5, 6] if ctx.rank == 0 else [4, 7],
+                    dtype=torch.int,
+                    device=device,
+                ),
+            )
 
     @unittest.skipIf(
         torch.cuda.device_count() <= 1,
