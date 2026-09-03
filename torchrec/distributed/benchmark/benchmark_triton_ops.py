@@ -32,6 +32,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 import torch
 import triton
+import triton.language as tl
 from torch.autograd.profiler import record_function
 
 try:
@@ -49,7 +50,7 @@ from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
     _bounds_check_offsets_kernel,
     _repair_offsets_kernel,
 )
-from torchrec.sparse.jagged_tensor import _kt_regroup_arguments
+from torchrec.sparse.jagged_tensor import _kt_regroup_arguments, JaggedTensor
 from torchrec.sparse.triton_permute_2d import (
     MIN_SEGMENTS,
     PERSEG_MIN_MEAN,
@@ -195,6 +196,238 @@ def register_benchmark(
         return func
 
     return decorator
+
+
+############################ autotune demonstration ##################################
+def _power_of_two_bucket(value: int) -> int:
+    if value <= 0:
+        raise ValueError("autotune dimensions must be positive")
+    return 1 << (value - 1).bit_length()
+
+
+def _autotune_jagged_copy_repr(specialization: Any) -> str:
+    constants = specialization.constants
+    return (
+        "_autotune_jagged_copy_kernel"
+        f"_KB{constants['batch_size_bucket']}"
+        f"_KL{constants['length_bucket']}"
+        f"_KD{constants['dim_bucket']}"
+        f"_BB{constants['BLOCK_BATCH']}"
+        f"_BL{constants['BLOCK_LENGTH']}"
+        f"_BD{constants['BLOCK_DIM']}"
+    )
+
+
+# Triton TR001: autotune independent jagged batch, length, and dimension tiles.
+@triton.autotune(
+    configs=[
+        triton.Config(
+            {"BLOCK_BATCH": 1, "BLOCK_LENGTH": 1, "BLOCK_DIM": 32},
+            num_warps=1,
+        ),
+        triton.Config(
+            {"BLOCK_BATCH": 1, "BLOCK_LENGTH": 2, "BLOCK_DIM": 64},
+            num_warps=2,
+        ),
+        triton.Config(
+            {"BLOCK_BATCH": 2, "BLOCK_LENGTH": 2, "BLOCK_DIM": 64},
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_BATCH": 2, "BLOCK_LENGTH": 4, "BLOCK_DIM": 128},
+            num_warps=4,
+        ),
+        triton.Config(
+            {"BLOCK_BATCH": 4, "BLOCK_LENGTH": 4, "BLOCK_DIM": 128},
+            num_warps=8,
+        ),
+    ],
+    key=["batch_size_bucket", "length_bucket", "dim_bucket"],
+)
+@triton.jit(repr=_autotune_jagged_copy_repr)
+def _autotune_jagged_copy_kernel(
+    values_ptr,
+    offsets_ptr,
+    output_ptr,
+    batch_size,
+    dim,
+    batch_size_bucket: tl.constexpr,
+    length_bucket: tl.constexpr,
+    dim_bucket: tl.constexpr,
+    BLOCK_BATCH: tl.constexpr,
+    BLOCK_LENGTH: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+) -> None:
+    batch_ids = tl.program_id(0) * BLOCK_BATCH + tl.arange(0, BLOCK_BATCH)
+    length_ids = tl.program_id(1) * BLOCK_LENGTH + tl.arange(0, BLOCK_LENGTH)
+    dim_ids = tl.program_id(2) * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+
+    batch_mask = batch_ids < batch_size
+    starts = tl.load(offsets_ptr + batch_ids, mask=batch_mask, other=0)
+    ends = tl.load(offsets_ptr + batch_ids + 1, mask=batch_mask, other=0)
+    value_rows = starts[:, None, None] + length_ids[None, :, None]
+    value_offsets = value_rows * dim + dim_ids[None, None, :]
+    mask = (
+        batch_mask[:, None, None]
+        & (value_rows < ends[:, None, None])
+        & (dim_ids[None, None, :] < dim)
+    )
+    values = tl.load(values_ptr + value_offsets, mask=mask)
+    tl.store(output_ptr + value_offsets, values, mask=mask)
+
+
+@dataclass
+class AutotuneWorkload:
+    name: str
+    batch_size: int
+    max_length: int
+    dim: int
+    dtype: str
+    batch_size_bucket: int
+    length_bucket: int
+    dim_bucket: int
+    input: JaggedTensor
+    output: torch.Tensor
+    grid: Callable[[Dict[str, Any]], tuple[Any, ...]]
+
+
+@dataclass
+class AutotuneTritonConfig(TritonOpConfig):
+    """Trace bucket- and dtype-dependent choices made by Triton autotuning.
+
+    The record_function range identifies both the exact jagged shape and its bucketed
+    autotune key. The GPU kernel symbol independently contains the key buckets and the
+    selected tile sizes, while its CUDA block dimension divided by 32 gives num_warps.
+
+    run command:
+    > python -m torchrec.distributed.benchmark.benchmark_triton_ops \
+        autotune_triton --name=h100
+    """
+
+    small_batch_size: int = 3
+    small_max_length: int = 17
+    small_dim: int = 48
+    same_bucket_batch_size: int = 4
+    same_bucket_max_length: int = 31
+    same_bucket_dim: int = 63
+    large_batch_size: int = 1000
+    large_max_length: int = 100
+    large_dim: int = 96
+    base_dtype: str = "float32"
+    comparison_dtype: str = "bfloat16"
+
+    def make_inputs(self, device: torch.device) -> Dict[str, Any]:
+        workloads: List[AutotuneWorkload] = []
+        cases = (
+            (
+                "small_base_dtype",
+                self.small_batch_size,
+                self.small_max_length,
+                self.small_dim,
+                self.base_dtype,
+            ),
+            (
+                "same_bucket_base_dtype",
+                self.same_bucket_batch_size,
+                self.same_bucket_max_length,
+                self.same_bucket_dim,
+                self.base_dtype,
+            ),
+            (
+                "large_base_dtype",
+                self.large_batch_size,
+                self.large_max_length,
+                self.large_dim,
+                self.base_dtype,
+            ),
+            (
+                "large_comparison_dtype",
+                self.large_batch_size,
+                self.large_max_length,
+                self.large_dim,
+                self.comparison_dtype,
+            ),
+        )
+        for name, batch_size, max_length, dim, dtype_name in cases:
+            dtype = {
+                "float32": torch.float32,
+                "float16": torch.float16,
+                "bfloat16": torch.bfloat16,
+            }.get(dtype_name)
+            if dtype is None:
+                raise ValueError(
+                    "base_dtype and comparison_dtype must be float32, float16, "
+                    "or bfloat16"
+                )
+            length_values = [
+                max_length if index == 0 else 1 + (index * 37) % max_length
+                for index in range(batch_size)
+            ]
+            lengths = torch.tensor(length_values, device=device, dtype=torch.int64)
+            offsets = torch.zeros(batch_size + 1, device=device, dtype=torch.int64)
+            torch.cumsum(lengths, dim=0, out=offsets[1:])
+            values = torch.randn(sum(length_values), dim, device=device, dtype=dtype)
+            jagged_input = JaggedTensor(values=values, lengths=lengths, offsets=offsets)
+            batch_size_bucket = _power_of_two_bucket(batch_size)
+            length_bucket = _power_of_two_bucket(max_length)
+            dim_bucket = _power_of_two_bucket(dim)
+
+            def grid(
+                meta: Dict[str, Any],
+                grid_batch_size: int = batch_size,
+                grid_max_length: int = max_length,
+                grid_dim: int = dim,
+            ) -> tuple[Any, ...]:
+                return (
+                    triton.cdiv(grid_batch_size, meta["BLOCK_BATCH"]),
+                    triton.cdiv(grid_max_length, meta["BLOCK_LENGTH"]),
+                    triton.cdiv(grid_dim, meta["BLOCK_DIM"]),
+                )
+
+            workloads.append(
+                AutotuneWorkload(
+                    name=name,
+                    batch_size=batch_size,
+                    max_length=max_length,
+                    dim=dim,
+                    dtype=dtype_name,
+                    batch_size_bucket=batch_size_bucket,
+                    length_bucket=length_bucket,
+                    dim_bucket=dim_bucket,
+                    input=jagged_input,
+                    output=torch.empty_like(values),
+                    grid=grid,
+                )
+            )
+        return {"workloads": workloads}
+
+
+@register_benchmark(AutotuneTritonConfig)
+def autotune_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    workloads: List[AutotuneWorkload],
+    **_kwargs: Dict[str, Any],
+) -> None:
+    for workload in workloads:
+        with record_function(
+            "## autotune_triton "
+            f"case={workload.name} "
+            f"shape[batch_size={workload.batch_size},"
+            f"max_length={workload.max_length},dim={workload.dim},"
+            f"dtype={workload.dtype}] "
+            f"bucket[batch_size={workload.batch_size_bucket},"
+            f"length={workload.length_bucket},dim={workload.dim_bucket}] ##"
+        ):
+            _autotune_jagged_copy_kernel[workload.grid](
+                workload.input.values(),
+                workload.input.offsets(),
+                workload.output,
+                workload.batch_size,
+                workload.dim,
+                workload.batch_size_bucket,
+                workload.length_bucket,
+                workload.dim_bucket,
+            )
 
 
 ############################### TBE bounds check configs ###############################
