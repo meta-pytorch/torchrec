@@ -13,7 +13,6 @@ from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
-from torchmetrics.utilities.distributed import gather_all_tensors
 from torchrec.metrics.metrics_config import RecComputeMode, RecTaskInfo
 from torchrec.metrics.metrics_namespace import MetricName, MetricNamespace, MetricPrefix
 from torchrec.metrics.rec_metric import (
@@ -404,7 +403,7 @@ class RAUCMetricComputation(RecMetricComputation):
 
     def _sync_dist(
         self,
-        dist_sync_fn: Callable = gather_all_tensors,
+        dist_sync_fn: Optional[Callable] = None,
         process_group: Optional[Any] = None,
     ) -> None:
         """
