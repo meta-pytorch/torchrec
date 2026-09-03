@@ -1630,10 +1630,16 @@ def _maybe_compute_kjt_to_jt_dict(
                 _batched_lengths_to_offsets(strided_lengths), dim=0
             )
     else:
-        split_lengths = torch.unbind(lengths, dim=0)
+        # Empty lengths: emit empty lengths and [0] offsets per key.
+        split_lengths = [
+            torch.zeros(0, dtype=lengths.dtype, device=lengths.device)
+            for _ in range(len(keys))
+        ]
         if compute_offsets:
-            # pyrefly: ignore[bad-assignment]
-            split_offsets = split_lengths
+            split_offsets = [
+                torch.zeros(1, dtype=lengths.dtype, device=lengths.device)
+                for _ in range(len(keys))
+            ]
 
     if weights is not None:
         weights_list = torch.split(weights, length_per_key)
