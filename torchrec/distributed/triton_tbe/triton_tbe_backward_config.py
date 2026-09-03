@@ -52,6 +52,16 @@ class TbeBackwardConfig:
     short_run_buffer_size_unweighted: int
     short_run_buffer_size_weighted: int
 
+    # Same knob, same trade-off, for the long-run grad-accumulation kernels.
+    # These kept the historical 8/16 when the short-run widths were tuned down,
+    # and paid the same register cliff: on Blackwell the unweighted long-run
+    # kernel sat at 158 registers/thread and 17.6% occupancy at width 8, versus
+    # 62 registers and 44.7% at width 2 -- with byte-identical memory traffic
+    # and an identical global-load request count, so the entire delta is
+    # latency hiding.
+    long_run_accum_buffer_size_unweighted: int
+    long_run_accum_buffer_size_weighted: int
+
     num_warps: int
 
     # Split the short-run tier into one launch per next_pow2(D) bucket so each
@@ -78,6 +88,8 @@ _BLACKWELL = TbeBackwardConfig(
     long_run_threshold=256,
     short_run_buffer_size_unweighted=2,
     short_run_buffer_size_weighted=4,
+    long_run_accum_buffer_size_unweighted=2,
+    long_run_accum_buffer_size_weighted=4,
     num_warps=1,
     enable_dim_bucketing=True,
     allow_clc=True,
@@ -95,6 +107,8 @@ _HOPPER = TbeBackwardConfig(
     long_run_threshold=256,
     short_run_buffer_size_unweighted=2,
     short_run_buffer_size_weighted=4,
+    long_run_accum_buffer_size_unweighted=2,
+    long_run_accum_buffer_size_weighted=4,
     num_warps=1,
     enable_dim_bucketing=True,
     allow_clc=False,
@@ -109,6 +123,8 @@ _MI300X = TbeBackwardConfig(
     long_run_threshold=256,
     short_run_buffer_size_unweighted=2,
     short_run_buffer_size_weighted=4,
+    long_run_accum_buffer_size_unweighted=2,
+    long_run_accum_buffer_size_weighted=4,
     num_warps=1,
     enable_dim_bucketing=True,
     allow_clc=False,
@@ -123,6 +139,8 @@ _MI350X = TbeBackwardConfig(
     long_run_threshold=256,
     short_run_buffer_size_unweighted=2,
     short_run_buffer_size_weighted=4,
+    long_run_accum_buffer_size_unweighted=2,
+    long_run_accum_buffer_size_weighted=4,
     num_warps=1,
     enable_dim_bucketing=True,
     allow_clc=False,
@@ -137,6 +155,8 @@ _PORTABLE_DEFAULT = TbeBackwardConfig(
     long_run_threshold=256,
     short_run_buffer_size_unweighted=2,
     short_run_buffer_size_weighted=4,
+    long_run_accum_buffer_size_unweighted=2,
+    long_run_accum_buffer_size_weighted=4,
     num_warps=1,
     enable_dim_bucketing=True,
     allow_clc=False,

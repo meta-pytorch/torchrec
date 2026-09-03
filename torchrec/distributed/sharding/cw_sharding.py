@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+from itertools import accumulate
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 import torch
@@ -56,6 +57,25 @@ C = TypeVar("C", bound=Multistreamable)
 F = TypeVar("F", bound=Multistreamable)
 T = TypeVar("T")
 W = TypeVar("W")
+
+
+def _build_tpu_permute(
+    embedding_dims: List[int],
+    embedding_order: List[int],
+    device: Optional[torch.device],
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    """CW output_dist pooled-embedding permute on the TPU, entirely on-device."""
+
+    # precompute the permute metadata as on-device tensors, prevents host-sync
+    offset_t = torch.tensor(
+        [0] + list(accumulate(embedding_dims)), dtype=torch.int32, device=device
+    )
+    permute_t = torch.tensor(embedding_order, dtype=torch.int32, device=device)
+
+    def _permute_on_device(embs: torch.Tensor) -> torch.Tensor:
+        return torch.ops.torchrec.permute_pooled_embs(embs, offset_t, permute_t)
+
+    return _permute_on_device
 
 
 class BaseCwEmbeddingSharding(BaseTwEmbeddingSharding[C, F, T, W]):
@@ -302,10 +322,22 @@ class CwPooledEmbeddingSharding(
             range(len(self._embedding_order))
         ):
             assert len(self._embedding_order) == len(self._embedding_dims)
-            embedding_permute_op = PermutePooledEmbeddingsSplit(
-                self._embedding_dims, self._embedding_order, device=device
-            )
-            callbacks = [embedding_permute_op]
+            if (
+                hasattr(torch, "tpu")
+                and device is not None
+                and device.type == "tpu"
+                and torch.tpu.is_available()
+            ):
+                callbacks = [
+                    _build_tpu_permute(
+                        self._embedding_dims, self._embedding_order, device
+                    )
+                ]
+            else:
+                embedding_permute_op = PermutePooledEmbeddingsSplit(
+                    self._embedding_dims, self._embedding_order, device=device
+                )
+                callbacks = [embedding_permute_op]
         assert self._pg is not None
         return TwPooledEmbeddingDist(
             pg=self._pg,
