@@ -212,6 +212,15 @@ def _unwrap_kjt_for_cpu(
         return indices, offsets, None
 
 
+# Keep DeviceRo CPU unwrap behavior identical to _unwrap_kjt_for_cpu, but give
+# FX tracing a taggable target for host-placed DeviceRo lookups.
+@torch.fx.wrap
+def _unwrap_ro_kjt_for_cpu(
+    features: KeyedJaggedTensor, weighted: bool
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    return _unwrap_kjt_for_cpu(features, weighted)
+
+
 @torch.fx.wrap
 def _unwrap_kjt_lengths(
     features: KeyedJaggedTensor,
@@ -439,7 +448,12 @@ class QuantBatchedEmbeddingBag(
             if self.lengths_to_tbe:
                 indices, lengths, per_sample_weights = _unwrap_kjt_lengths(features)
             else:
-                indices, offsets, per_sample_weights = _unwrap_kjt_for_cpu(
+                unwrap_kjt_for_cpu = (
+                    _unwrap_ro_kjt_for_cpu
+                    if self._is_device_ro
+                    else _unwrap_kjt_for_cpu
+                )
+                indices, offsets, per_sample_weights = unwrap_kjt_for_cpu(
                     features, self._config.is_weighted
                 )
         else:
