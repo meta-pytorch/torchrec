@@ -15,7 +15,7 @@ import logging
 import os
 import pickle
 import platform
-from typing import Any
+from typing import Any, Optional
 
 import torch
 
@@ -249,6 +249,7 @@ def dump_benchmark_result(
     output_dir: str,
     world_size: int,
     test_name: str = "",
+    gpu_type: Optional[str] = None,
 ) -> None:
     """Write benchmark result to a JSON file in *output_dir*.
 
@@ -261,12 +262,16 @@ def dump_benchmark_result(
         output_dir: Directory where the JSON file is written.
         world_size: Number of ranks in the distributed run.
         test_name: Test name to associate with the benchmark result.
+        gpu_type: Accelerator name to record. Defaults to ``get_gpu_type()``, which
+            detects CUDA devices and otherwise reports ``"N/A"``. Pass an explicit
+            value on accelerators it cannot detect, so the field is not left as
+            ``"N/A"`` for a run that did use one.
     """
     data: dict[str, object] = {
         "short_name": result.short_name,
         "rank": result.rank,
         "world_size": world_size,
-        "gpu_type": get_gpu_type(),
+        "gpu_type": gpu_type if gpu_type is not None else get_gpu_type(),
         "cpu_type": get_cpu_type(),
         "test_name": test_name,
         "metrics": result.to_dict(),
