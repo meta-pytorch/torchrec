@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import torch
 import torch._dynamo
+from torch._dynamo import is_dynamo_supported
 from torchrec.metrics.metrics_config import DefaultTaskInfo
 from torchrec.metrics.xauc import XAUCMetric
 
@@ -65,6 +66,7 @@ class XAUCMetricTest(unittest.TestCase):
             msg=f"Actual: {actual_metric}, Expected: {expected_metric}",
         )
 
+    @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
     @unittest.skipIf(
         _is_free_threaded(),
         "torch.compile segfaults on free-threaded Python, "

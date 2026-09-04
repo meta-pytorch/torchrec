@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import torch
 from torch import no_grad
+from torch._dynamo import is_dynamo_supported
 from torchrec.metrics.auc import AUCMetric
 from torchrec.metrics.metrics_config import DefaultTaskInfo
 from torchrec.metrics.rec_metric import (
@@ -99,6 +100,7 @@ def generate_compile_model_output() -> Dict[str, torch.Tensor]:
     }
 
 
+@unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
 class AUCMetricCompileTest(unittest.TestCase):
     def test_auc_compile(self) -> None:
         # AUCMetricComputation.update windows the raw inputs as a growing list of
