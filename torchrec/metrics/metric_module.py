@@ -111,6 +111,7 @@ from torchrec.metrics.scalar import ScalarMetric
 from torchrec.metrics.segmented_ne import SegmentedNEMetric
 from torchrec.metrics.serving_calibration import ServingCalibrationMetric
 from torchrec.metrics.serving_ne import ServingNEMetric
+from torchrec.metrics.session_pairwise_auc import SessionPairwiseAUCMetric
 from torchrec.metrics.sum_weights import SumWeightsMetric
 from torchrec.metrics.tensor_weighted_avg import TensorWeightedAvgMetric
 from torchrec.metrics.throughput import ThroughputMetric
@@ -133,6 +134,7 @@ REC_METRICS_MAPPING: Dict[RecMetricEnumBase, Type[RecMetric]] = {
     RecMetricEnum.AUC: AUCMetric,
     RecMetricEnum.AUPRC: AUPRCMetric,
     RecMetricEnum.RAUC: RAUCMetric,
+    RecMetricEnum.SESSION_PAIRWISE_AUC: SessionPairwiseAUCMetric,
     RecMetricEnum.MSE: MSEMetric,
     RecMetricEnum.MAE: MAEMetric,
     RecMetricEnum.MULTICLASS_RECALL: MulticlassRecallMetric,
