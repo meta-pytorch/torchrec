@@ -318,6 +318,29 @@ def _sweep_reps() -> int:
     return max(1, _env_int("BENCH_SWEEP_REPS", 10))
 
 
+def _apply_lp_min_kb_env() -> None:
+    """Export BENCH_LP_MIN_KB as NCCL_SHARDED_RELAY_LP_MIN_KB, if set.
+
+    OPT-IN, and the default matters. Left unset, low precision uses the crossover
+    that SHIPS, so the checked-in snapshots show what a caller actually gets --
+    including 1.00x rows below the crossover, which is an honest record of where
+    the gate declines rather than a gap in the data.
+
+    Set it (BENCH_LP_MIN_KB=1) for a TUNING run: the built-in threshold refuses
+    small messages before anything is timed, so the crossover is the one number a
+    default run cannot measure. A tuning run makes the whole size axis eligible,
+    reads the crossover off the LP-vs-Relay column, and that measured value is what
+    then goes into lpMinBytes().
+
+    Must be exported before the communicator exists: NCCL_PARAM caches on first
+    read. Called at the top of each relay worker, which is a fresh process per
+    mp.spawn, so the export is always ahead of the first relay call.
+    """
+    min_kb = os.environ.get("BENCH_LP_MIN_KB")
+    if min_kb:
+        os.environ["NCCL_SHARDED_RELAY_LP_MIN_KB"] = min_kb
+
+
 def _sweep_sizes() -> list[tuple[str, int]]:
     """Message sizes the sweeps cover.
 
@@ -1881,6 +1904,7 @@ def _run_relay_once(
     num_groups: int,
     my_sparse_group: int,
     all_active_ranks: list[list[int]],
+    low_precision: bool = False,
 ) -> None:
     """One sharded-relay collective call with PRE-BUILT per-group tensor lists.
 
@@ -1896,6 +1920,7 @@ def _run_relay_once(
             all_active_ranks=all_active_ranks,
             op=dist.ReduceOp.AVG,
             skip_validation=True,
+            low_precision=low_precision,
         )
     elif collective == "reduce_scatter":
         relay.reduce_scatter_multi_group(
@@ -1906,6 +1931,7 @@ def _run_relay_once(
             all_active_ranks=all_active_ranks,
             op=dist.ReduceOp.AVG,
             skip_validation=True,
+            low_precision=low_precision,
         )
     elif collective == "all_to_all":
         relay.all_to_all_multi_group(
@@ -1915,6 +1941,7 @@ def _run_relay_once(
             per_group_segment_counts=counts,
             all_active_ranks=all_active_ranks,
             skip_validation=True,
+            low_precision=low_precision,
         )
     elif collective == "all_gather":
         relay.all_gather_multi_group(
@@ -1924,6 +1951,7 @@ def _run_relay_once(
             per_group_send_counts=counts,
             all_active_ranks=all_active_ranks,
             skip_validation=True,
+            low_precision=low_precision,
         )
     else:
         raise ValueError(f"unknown collective {collective!r}")
@@ -2130,6 +2158,7 @@ def _measure_relay_for(
     world_size: int,
     warmup: int,
     bench_iters: int,
+    low_precision: bool = False,
 ) -> tuple[float, float]:
     """Time the FUSED (num_groups = world // A) relay collective for one message
     size. Returns (best_ms, std_ms)."""
@@ -2168,6 +2197,7 @@ def _measure_relay_for(
             num_groups,
             my_sparse_group,
             fused_active_ranks,
+            low_precision,
         ),
         warmup,
         bench_iters,
@@ -2218,6 +2248,13 @@ def _msg_sweep_relay_warmup(
             in_list, out_list = _build_relay_group_lists(
                 a_in, a_out, bufs, num_groups, my_sparse_group
             )
+            # FULL PRECISION ONLY, deliberately. warm_elems is 2048, which is
+            # below every relay-route crossover, so a low-precision call here
+            # DECLINES on route: it would compile none of the low-precision
+            # kernels and would only fill the log with declines. Low precision is
+            # warmed instead by _measure_ms's own untimed warmup iterations, which
+            # run at the measured size -- where it actually engages, and which is
+            # also where the one-time arena bootstrap belongs.
             for _ in range(3):
                 _run_relay_once(
                     collective,
@@ -2252,6 +2289,8 @@ def _msg_sweep_relay_worker(
     os.environ["MASTER_PORT"] = str(_NCCL_PORT + 300 + port_offset)
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
+
+    _apply_lp_min_kb_env()
 
     local_rank = rank
     is_master = rank == 0
@@ -2292,25 +2331,34 @@ def _msg_sweep_relay_worker(
     # Pre-compile every distinct HIP kernel config before timing.
     _msg_sweep_relay_warmup(fused_by_a, rank, world_size, dtype, device)
 
+    # Full precision and low precision measured BACK TO BACK in the same worker on
+    # the same communicator. That is only possible because low precision is a
+    # per-call argument, and it is what makes the LP-vs-FP ratio meaningful: a
+    # second process would carry its own placement, channel assignment and clock
+    # state, so the ratio would mix the wire format with process-to-process
+    # variance. Same buffers, same comm, adjacent in time.
     for active_ranks in _sweep_active_ranks():
         relay_fused = fused_by_a[active_ranks]
         for collective in _sweep_collectives():
             for i, (_label, nbytes) in enumerate(_sweep_sizes()):
-                best_f, std_f = _measure_relay_for(
-                    collective=collective,
-                    active_ranks=active_ranks,
-                    relay_fused=relay_fused,
-                    nbytes=nbytes,
-                    dtype=dtype,
-                    device=device,
-                    rank=rank,
-                    world_size=world_size,
-                    warmup=warmup,
-                    bench_iters=bench_iters,
-                )
-                if rank == 0:
-                    key = f"{collective}_a{active_ranks}"
-                    results_dict[f"relay_{key}_fused_{i}"] = (best_f, std_f)
+                for lp in (False, True):
+                    best_f, std_f = _measure_relay_for(
+                        collective=collective,
+                        active_ranks=active_ranks,
+                        relay_fused=relay_fused,
+                        nbytes=nbytes,
+                        dtype=dtype,
+                        device=device,
+                        rank=rank,
+                        world_size=world_size,
+                        warmup=warmup,
+                        bench_iters=bench_iters,
+                        low_precision=lp,
+                    )
+                    if rank == 0:
+                        key = f"{collective}_a{active_ranks}"
+                        prefix = "relay_lp" if lp else "relay"
+                        results_dict[f"{prefix}_{key}_fused_{i}"] = (best_f, std_f)
 
     dist.barrier()
     dist.destroy_process_group()
@@ -2627,6 +2675,7 @@ def _issue_relay_async(
     out_list: list[torch.Tensor],
     count_list: list[int],
     all_active_ranks: list[list[int]],
+    low_precision: bool = False,
 ) -> Any:
     """Issue ONE single-group (num_groups=1) sharded relay collective on a comm
     with async_op=True; returns its work handle."""
@@ -2639,6 +2688,7 @@ def _issue_relay_async(
             op=dist.ReduceOp.AVG,
             skip_validation=True,
             async_op=True,
+            low_precision=low_precision,
         )
     if collective == "reduce_scatter":
         return comm.reduce_scatter_multi_group(
@@ -2650,6 +2700,7 @@ def _issue_relay_async(
             op=dist.ReduceOp.AVG,
             skip_validation=True,
             async_op=True,
+            low_precision=low_precision,
         )
     if collective == "all_to_all":
         return comm.all_to_all_multi_group(
@@ -2660,6 +2711,7 @@ def _issue_relay_async(
             all_active_ranks=all_active_ranks,
             skip_validation=True,
             async_op=True,
+            low_precision=low_precision,
         )
     if collective == "all_gather":
         return comm.all_gather_multi_group(
@@ -2670,6 +2722,7 @@ def _issue_relay_async(
             all_active_ranks=all_active_ranks,
             skip_validation=True,
             async_op=True,
+            low_precision=low_precision,
         )
     raise ValueError(f"unknown collective {collective!r}")
 
@@ -2682,6 +2735,7 @@ def _run_parallel_relay_once(
     count_list: list[int],
     active_ranks_per_comm: list[list[list[int]]],
     num_parallel: int,
+    low_precision: bool = False,
 ) -> None:
     """Issue N single-group relay collectives (one per comm) in parallel.
 
@@ -2702,6 +2756,7 @@ def _run_parallel_relay_once(
                 out_tensors[k],
                 count_list,
                 active_ranks_per_comm[k],
+                low_precision,
             )
         )
     for work in works:
@@ -2718,6 +2773,7 @@ def _parallel_relay_single_call(
     elements: int,
     dtype: torch.dtype,
     device: torch.device,
+    low_precision: bool = False,
 ) -> Any:
     """Zero-arg closure that issues this process's ONE single-group relay call.
 
@@ -2747,6 +2803,7 @@ def _parallel_relay_single_call(
         count_list,
         [[active_group]],
         1,
+        low_precision,
     )
 
 
@@ -2765,6 +2822,10 @@ def _parallel_relay_warmup_single(
     dist.barrier()
     warm_elems = 2048
     for collective in _sweep_collectives():
+        # FULL PRECISION ONLY: 2048 elements is below every relay-route crossover,
+        # so a low-precision call here declines on route and compiles nothing. Low
+        # precision is warmed by _measure_ms's untimed iterations at the measured
+        # size instead, which is also where the one-time arena bootstrap belongs.
         fn = _parallel_relay_single_call(
             collective,
             comm,
@@ -2817,6 +2878,8 @@ def _parallel_msg_sweep_relay_worker(
     os.environ["MASTER_PORT"] = str(store_port)
     os.environ["RANK"] = str(p)
     os.environ["WORLD_SIZE"] = str(total_procs)
+
+    _apply_lp_min_kb_env()
 
     store = dist.TCPStore(
         host_name="localhost",
@@ -2883,30 +2946,35 @@ def _parallel_msg_sweep_relay_worker(
             elements = nbytes // dtype.itemsize
             if elements % active_ranks != 0:
                 continue
-            fn = _parallel_relay_single_call(
-                collective,
-                comm,
-                active_group,
-                rank_in_job,
-                active_ranks,
-                elements,
-                dtype,
-                device,
-            )
-            best, std = _measure_ms(
-                fn,
-                warmup,
-                bench_iters,
-                device_barrier_group=job_device_group,
-                reps=_sweep_reps(),
-            )
-            del fn
-            torch.cuda.empty_cache()
-            if is_job_rank0:
-                results_dict[f"relay_parallel_{collective}_{key}_{i}_job{job}"] = (
-                    best,
-                    std,
+            # FP then LP back to back on the same comm; see the fused worker for
+            # why the ratio is only meaningful measured this way.
+            for lp in (False, True):
+                fn = _parallel_relay_single_call(
+                    collective,
+                    comm,
+                    active_group,
+                    rank_in_job,
+                    active_ranks,
+                    elements,
+                    dtype,
+                    device,
+                    lp,
                 )
+                best, std = _measure_ms(
+                    fn,
+                    warmup,
+                    bench_iters,
+                    device_barrier_group=job_device_group,
+                    reps=_sweep_reps(),
+                )
+                del fn
+                torch.cuda.empty_cache()
+                if is_job_rank0:
+                    prefix = "relay_parallel_lp" if lp else "relay_parallel"
+                    results_dict[f"{prefix}_{collective}_{key}_{i}_job{job}"] = (
+                        best,
+                        std,
+                    )
 
     dist.barrier()
     dist.destroy_process_group()
@@ -2932,7 +3000,11 @@ def _reduce_parallel_jobs_max(results_dict: Any) -> None:
         for collective in _sweep_collectives():
             key = f"{collective}_a{active_ranks}"
             for i, (label, _nbytes) in enumerate(_sweep_sizes()):
-                for prefix in ("relay_parallel", "nccl_parallel"):
+                for prefix in (
+                    "relay_parallel",
+                    "relay_parallel_lp",
+                    "nccl_parallel",
+                ):
                     vals = [
                         results_dict.get(f"{prefix}_{key}_{i}_job{j}")
                         for j in range(num_jobs)
@@ -3067,6 +3139,167 @@ def _print_single_group_msg_sweep_report(results_dict: Any, dtype: torch.dtype) 
 # TestCase — works with both "buck2 test" and "buck2 run" (same as the old
 # test_sharded_relay_2d_integration.py pattern).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Low-precision comparison reports
+#
+# Three more files rather than three more columns in the existing ones. The
+# full-precision reports are checked-in snapshots that get diffed across
+# revisions, so widening them would churn every row of every snapshot for a
+# column most readers of those files are not asking about. The LP tables carry
+# the full-precision numbers alongside instead, so each file still stands alone.
+# ---------------------------------------------------------------------------
+
+
+def _format_lp_sweep_table(
+    results_dict: Any,
+    dtype: torch.dtype,
+    collective: str,
+    active_ranks: int,
+    heading: str,
+    subheadings: list[str],
+    band: str,
+    nccl_key: str,
+    relay_key: str,
+    relay_lp_key: str,
+) -> list[str]:
+    """One (collective, A) low-precision comparison table.
+
+    Five data columns rather than three: NCCL, Relay, Relay-LP and BOTH ratios.
+    LP-vs-NCCL is what a caller choosing between NCCL and the relay-with-LP cares
+    about; LP-vs-Relay is the one this table exists for, because it isolates the
+    wire format from everything else the relay does.
+
+    WHERE LP-vs-Relay READS 1.00x, LOW PRECISION DECLINED. The gate is size-only
+    and silent, so below the crossover Relay-LP runs the identical code path as
+    Relay and the ratio is 1 by construction rather than by measurement. That is
+    the signal these tables are for: the size at which the ratio leaves 1.00x IS
+    the crossover. It is also why NCCL_SHARDED_RELAY_LP_MIN_KB exists -- with the
+    built-in threshold the small end of the axis is refused before it is timed, so
+    the crossover is the one number the sweep could not otherwise see.
+    """
+    width = 78
+    line = "=" * width
+    out: list[str] = ["", line, heading, *subheadings, line]
+    out.append(f"{'':>10} | {band:^65}")
+    out.append(
+        f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} "
+        f"{'RelayLP(ms)':>12} {'LP vs NCCL':>11} {'LP vs Relay':>12}"
+    )
+    out.append("-" * width)
+    for i, (label, nbytes) in enumerate(_sweep_sizes()):
+        elements = nbytes // dtype.itemsize
+        if elements % active_ranks != 0:
+            continue
+        n = _sweep_get_ms(results_dict, nccl_key.format(i=i))
+        r = _sweep_get_ms(results_dict, relay_key.format(i=i))
+        rl = _sweep_get_ms(results_dict, relay_lp_key.format(i=i))
+        out.append(
+            f"{label:>10} | {_sweep_fmt_ms(n):>10} {_sweep_fmt_ms(r):>10} "
+            f"{_sweep_fmt_ms(rl):>12} {_sweep_fmt_speedup(n, rl):>11} "
+            f"{_sweep_fmt_speedup(r, rl):>12}"
+        )
+    out.append(line)
+    return out
+
+
+def _print_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -> None:
+    """FUSED sweep, full precision vs low precision."""
+    lines: list[str] = []
+    for collective in _sweep_collectives():
+        for active_ranks in _sweep_active_ranks():
+            num_groups = NUM_GPUS // active_ranks
+            key = f"{collective}_a{active_ranks}"
+            title = collective.replace("_", "-").upper()
+            lines.extend(
+                _format_lp_sweep_table(
+                    results_dict,
+                    dtype,
+                    collective,
+                    active_ranks,
+                    f"Sharded Relay {title} — Low-Precision Message-Size Sweep "
+                    f"(MI350X, {NUM_GPUS} GPUs, {dtype})",
+                    [
+                        f"  {active_ranks} active ranks/group; times = "
+                        "best-of-N (min), barrier-aligned + hipEvent-timed",
+                        f"  FUSED = {num_groups}-group sharded relay; "
+                        "Relay and Relay-LP measured back to back on the SAME comm",
+                    ],
+                    f"FUSED ({num_groups} groups)",
+                    f"nccl_{key}_fused_{{i}}",
+                    f"relay_{key}_fused_{{i}}",
+                    f"relay_lp_{key}_fused_{{i}}",
+                )
+            )
+    _emit_report(lines, "bench_sharded_relay_fused_lp_sweep_results.txt")
+
+
+def _print_parallel_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -> None:
+    """Parallel separate-job sweep, full precision vs low precision."""
+    lines: list[str] = []
+    for collective in _sweep_collectives():
+        for active_ranks in _sweep_active_ranks():
+            num_parallel = NUM_GPUS // active_ranks
+            key = f"{collective}_a{active_ranks}"
+            title = collective.replace("_", "-").upper()
+            lines.extend(
+                _format_lp_sweep_table(
+                    results_dict,
+                    dtype,
+                    collective,
+                    active_ranks,
+                    f"Sharded Relay {title} — Low-Precision {num_parallel}x "
+                    f"Parallel Sweep (MI350X, {NUM_GPUS} GPUs, {dtype})",
+                    [
+                        f"  {active_ranks} active ranks/group; times = "
+                        "best-of-N (min), max across jobs",
+                        f"  PARALLEL = {num_parallel} co-resident jobs; Relay and "
+                        "Relay-LP measured back to back on the SAME comm",
+                    ],
+                    f"PARALLEL ({num_parallel} jobs)",
+                    f"nccl_parallel_{key}_{{i}}",
+                    f"relay_parallel_{key}_{{i}}",
+                    f"relay_parallel_lp_{key}_{{i}}",
+                )
+            )
+    _emit_report(lines, "bench_sharded_relay_parallel_lp_sweep_results.txt")
+
+
+def _print_single_group_msg_sweep_lp_report(
+    results_dict: Any, dtype: torch.dtype
+) -> None:
+    """Single-group best case, full precision vs low precision.
+
+    Reads the same reduced base keys the parallel LP report reads -- this sweep is
+    the parallel sweep's num_jobs == 1 point.
+    """
+    lines: list[str] = []
+    for collective in _sweep_collectives():
+        for active_ranks in _sweep_active_ranks():
+            key = f"{collective}_a{active_ranks}"
+            title = collective.replace("_", "-").upper()
+            lines.extend(
+                _format_lp_sweep_table(
+                    results_dict,
+                    dtype,
+                    collective,
+                    active_ranks,
+                    f"Sharded Relay {title} — Low-Precision Single-Group "
+                    f"Best-Case Sweep (MI350X, {NUM_GPUS} GPUs, {dtype})",
+                    [
+                        f"  {active_ranks} active ranks/group; times = "
+                        "best-of-N (min), no co-resident jobs",
+                        "  Relay and Relay-LP measured back to back on the SAME "
+                        "comm",
+                    ],
+                    "SINGLE GROUP (1 job)",
+                    f"nccl_parallel_{key}_{{i}}",
+                    f"relay_parallel_{key}_{{i}}",
+                    f"relay_parallel_lp_{key}_{{i}}",
+                )
+            )
+    _emit_report(lines, "bench_sharded_relay_single_group_lp_sweep_results.txt")
 
 
 class EmitReportTest(unittest.TestCase):
@@ -3247,6 +3480,7 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
         )
 
         _print_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
+        _print_msg_sweep_lp_report(results, _MSG_SWEEP_DTYPE)
 
         manager.shutdown()
 
@@ -3323,6 +3557,7 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
         # Reduce per-job entries to max-across-jobs, then print the tables.
         _reduce_parallel_jobs_max(results)
         _print_parallel_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
+        _print_parallel_msg_sweep_lp_report(results, _MSG_SWEEP_DTYPE)
 
         manager.shutdown()
 
@@ -3377,6 +3612,7 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
         # Collapse the single job's per-job entries to the base keys, then print.
         _reduce_parallel_jobs_max(results)
         _print_single_group_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
+        _print_single_group_msg_sweep_lp_report(results, _MSG_SWEEP_DTYPE)
 
         manager.shutdown()
 
