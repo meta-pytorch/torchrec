@@ -149,13 +149,22 @@ def cuda_device_count() -> int:
 
 
 def init_distributed_single_host(
-    rank: int, world_size: int, backend: str, local_size: Optional[int] = None
+    rank: int,
+    world_size: int,
+    backend: str,
+    local_size: Optional[int] = None,
+    device_id: Optional[torch.device] = None,
 ) -> dist.ProcessGroup:
     os.environ["LOCAL_WORLD_SIZE"] = str(local_size if local_size else world_size)
     os.environ["LOCAL_RANK"] = str(rank % local_size if local_size else rank)
     if dist.is_initialized():
         dist.destroy_process_group()
-    dist.init_process_group(rank=rank, world_size=world_size, backend=backend)
+    dist.init_process_group(
+        rank=rank,
+        world_size=world_size,
+        backend=backend,
+        device_id=device_id,
+    )
     #  `Optional[_distributed_c10d.ProcessGroup]`.
     # pyrefly: ignore[bad-return]
     return dist.group.WORLD

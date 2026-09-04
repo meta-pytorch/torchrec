@@ -149,7 +149,15 @@ class SingleProcessContext:
         # Start from a clean slate in case a prior group was left initialized.
         if dist.is_initialized():
             dist.destroy_process_group()
-        dist.init_process_group(backend=self.backend, timeout=self.pg_timeout)
+        dist.init_process_group(
+            backend=self.backend,
+            timeout=self.pg_timeout,
+            device_id=(
+                self.device
+                if self.device.type == "cuda" and "nccl" in self.backend
+                else None
+            ),
+        )
         self.pg = dist.group.WORLD
 
         # Handshake: make sure every rank has joined the group before the runner
