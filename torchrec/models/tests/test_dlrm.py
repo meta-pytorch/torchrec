@@ -14,6 +14,7 @@ from typing import List
 import torch
 from parameterized import parameterized
 from torch import nn
+from torch._dynamo import is_dynamo_supported
 from torch.testing import FileCheck  # @manual
 from torchrec.datasets.utils import Batch
 from torchrec.distributed.test_utils.model_input import ModelInput
@@ -415,6 +416,7 @@ class DLRMTest(unittest.TestCase):
             )
         )
 
+    @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
     def test_compile_dense_path(self) -> None:
         # compile_dense_path() wraps the dense compute path (dense_arch,
         # inter_arch, over_arch) with torch.compile. Wrapping is lazy -- no graph

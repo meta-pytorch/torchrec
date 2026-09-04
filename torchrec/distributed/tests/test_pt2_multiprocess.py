@@ -25,6 +25,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
 )
 from hypothesis import given, settings, strategies as st, Verbosity
 from torch import distributed as dist
+from torch._dynamo import is_dynamo_supported
 from torch._dynamo.testing import reduce_to_scalar_loss
 from torch.distributed import ProcessGroup
 from torch.testing._internal.distributed.fake_pg import FakeStore
@@ -708,6 +709,7 @@ def _test_compile_fake_pg_fn(
     ##### COMPILE END #####
 
 
+@unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
 class TestPt2Train(MultiProcessTestBase):
     def disable_cuda_tf32(self) -> bool:
         return True
