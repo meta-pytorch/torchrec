@@ -540,6 +540,7 @@ def reduce_scatter_tensors_with_sharded_relay(
     annotation: str,
     op: dist.ReduceOp = dist.ReduceOp.SUM,
     in_place: bool = False,
+    low_precision: bool = False,
 ) -> None:
     """
     Perform reduce-scatter using the fused sharded relay algorithm.
@@ -577,6 +578,15 @@ def reduce_scatter_tensors_with_sharded_relay(
         annotation: Profiling annotation string for record_function.
         op: Reduction op (ReduceOp.SUM or ReduceOp.AVG).
         in_place: Select the internal output-buffer strategy / kernel path.
+        low_precision: Request the fp8e4m3 wire format where it pays. An
+            internal size-only gate decides -- an unsupported dtype, per-group
+            counts that are not a multiple of 128, or a message below the
+            measured crossover all decline to full precision SILENTLY, so a
+            caller that cares must assert engagement rather than assume it.
+            COLLECTIVE: every rank of the call must pass the same value, exactly
+            like the dtype and the counts. Ranks that disagree disagree on how
+            many bytes cross each link, so the call hangs or corrupts rather
+            than degrading.
     """
     sparse_group_size = state.sparse_group_size
     my_sparse_group = state.my_sparse_group
@@ -702,6 +712,7 @@ def reduce_scatter_tensors_with_sharded_relay(
                 all_active_ranks=precomputed_active_ranks,
                 op=op,
                 skip_validation=True,
+                low_precision=low_precision,
             )
 
             # --- Step 5: Unpack the active-group result into caller tensors ---
@@ -715,6 +726,7 @@ def allreduce_tensors_with_sharded_relay(
     annotation: str,
     op: dist.ReduceOp | dist.ReduceOp.RedOpType = dist.ReduceOp.AVG,
     output_tensors_dict: dict[torch.dtype, list[torch.Tensor]] | None = None,
+    low_precision: bool = False,
 ) -> None:
     """
     Perform allreduce using the fused sharded relay algorithm.
@@ -759,6 +771,9 @@ def allreduce_tensors_with_sharded_relay(
             preserved; per dtype, ``output_tensors_dict[dtype]`` must mirror
             ``tensors_dict[dtype]`` in per-tensor shapes and total element
             count.
+        low_precision: Request the fp8e4m3 wire format where it pays. Same
+            silently-declining gate and same COLLECTIVE contract as
+            ``reduce_scatter_tensors_with_sharded_relay``.
     """
     sparse_group_size = state.sparse_group_size
     my_sparse_group = state.my_sparse_group
@@ -873,6 +888,7 @@ def allreduce_tensors_with_sharded_relay(
                 output_tensors=(
                     output_group_tensors if output_tensors_dict is not None else None
                 ),
+                low_precision=low_precision,
             )
 
             # --- Step 5: Unpack the active-group result into caller tensors ---
@@ -885,6 +901,7 @@ def all_to_all_tensors_with_sharded_relay(
     input_tensors_dict: dict[torch.dtype, list[torch.Tensor]],
     output_tensors_dict: dict[torch.dtype, list[torch.Tensor]],
     annotation: str,
+    low_precision: bool = False,
 ) -> None:
     """
     Perform all-to-all using the fused sharded relay algorithm.
@@ -908,6 +925,9 @@ def all_to_all_tensors_with_sharded_relay(
             tensors for a dtype must total the same number of elements as the
             input (nActiveRanks x segment_count).
         annotation: Profiling annotation string for record_function.
+        low_precision: Request the fp8e4m3 wire format where it pays. Same
+            silently-declining gate and same COLLECTIVE contract as
+            ``reduce_scatter_tensors_with_sharded_relay``.
     """
     sparse_group_size = state.sparse_group_size
     my_sparse_group = state.my_sparse_group
@@ -1018,6 +1038,7 @@ def all_to_all_tensors_with_sharded_relay(
                 per_group_segment_counts=per_group_segment_counts,
                 all_active_ranks=precomputed_active_ranks,
                 skip_validation=True,
+                low_precision=low_precision,
             )
             # --- Step 5: Unpack the active-group result into caller tensors ---
             if unpack_flat is not None:
@@ -1030,6 +1051,7 @@ def all_gather_tensors_with_sharded_relay(
     output_tensors_dict: dict[torch.dtype, list[torch.Tensor]],
     annotation: str,
     in_place: bool = False,
+    low_precision: bool = False,
 ) -> None:
     """
     Perform all-gather using the fused sharded relay algorithm.
@@ -1061,6 +1083,9 @@ def all_gather_tensors_with_sharded_relay(
             elements.
         annotation: Profiling annotation string for record_function.
         in_place: Select the internal input-buffer strategy / kernel path.
+        low_precision: Request the fp8e4m3 wire format where it pays. Same
+            silently-declining gate and same COLLECTIVE contract as
+            ``reduce_scatter_tensors_with_sharded_relay``.
     """
     sparse_group_size = state.sparse_group_size
     my_sparse_group = state.my_sparse_group
@@ -1182,6 +1207,7 @@ def all_gather_tensors_with_sharded_relay(
                 per_group_send_counts=per_group_send_counts,
                 all_active_ranks=precomputed_active_ranks,
                 skip_validation=True,
+                low_precision=low_precision,
             )
 
             # --- Step 5: Unpack the active-group result into caller tensors ---
