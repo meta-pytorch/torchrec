@@ -109,6 +109,11 @@ class MultiProcessContext:
             world_size=self.world_size,
             backend=self.backend,
             local_size=self.local_size,
+            device_id=(
+                self.device
+                if self.device.type == "cuda" and "nccl" in self.backend
+                else None
+            ),
         )
         return self
 
@@ -160,6 +165,7 @@ class MultiProcessTestBase(unittest.TestCase):
         os.environ["MASTER_ADDR"] = str("localhost")
         os.environ["MASTER_PORT"] = str(get_free_port())
         os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+        os.environ["NCCL_NET"] = "Socket"
         os.environ["NCCL_SOCKET_IFNAME"] = "lo"
         os.environ["NCCL_DEBUG"] = "WARN"
 
@@ -172,6 +178,7 @@ class MultiProcessTestBase(unittest.TestCase):
     def tearDown(self) -> None:
         torch.use_deterministic_algorithms(False)
         del os.environ["GLOO_DEVICE_TRANSPORT"]
+        del os.environ["NCCL_NET"]
         del os.environ["NCCL_SOCKET_IFNAME"]
         if torch.cuda.is_available():
             os.unsetenv("CUBLAS_WORKSPACE_CONFIG")
@@ -280,6 +287,7 @@ def run_multi_process_func(
     os.environ["MASTER_ADDR"] = str("localhost")
     os.environ["MASTER_PORT"] = str(get_free_port())
     os.environ["GLOO_DEVICE_TRANSPORT"] = "TCP"
+    os.environ["NCCL_NET"] = "Socket"
     os.environ["NCCL_SOCKET_IFNAME"] = "lo"
 
     torch.use_deterministic_algorithms(use_deterministic_algorithms)
