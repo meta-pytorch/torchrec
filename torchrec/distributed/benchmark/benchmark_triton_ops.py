@@ -647,6 +647,7 @@ class Permute2dConfig(TritonOpConfig):
     permute_batch_size: int = 1024
     mean_pooling_factor: int = 1
     has_weight: bool = False
+    gpu_backlog_ms: float = 5.0
 
     def make_inputs(self, device: torch.device) -> Dict[str, Any]:
         """Build (permute, lengths, values, weights, permuted_lengths_sum).
