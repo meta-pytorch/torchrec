@@ -341,6 +341,63 @@ def _apply_lp_min_kb_env() -> None:
         os.environ["NCCL_SHARDED_RELAY_LP_MIN_KB"] = min_kb
 
 
+# Data type for the message-size sweep comparison. See _sweep_dtype().
+_MSG_SWEEP_DTYPE_DEFAULT: torch.dtype = torch.bfloat16
+_MSG_SWEEP_DTYPES: dict[str, torch.dtype] = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp32": torch.float32,
+    "float32": torch.float32,
+}
+
+
+def _sweep_dtype() -> torch.dtype:
+    """Element type the sweeps run in.
+
+    BENCH_SWEEP_DTYPE picks bf16 (default) or fp32. It exists because the two
+    are different tuning problems for low precision, not one problem measured
+    twice: fp32 sends twice the wire bytes per element, so quantizing to fp8
+    saves twice as much, and its crossover lands at a smaller message. A
+    threshold read off a bf16 sweep is therefore conservative for fp32, and the
+    only way to know by how much is to sweep fp32 with the same harness.
+    """
+    want = _env_str("BENCH_SWEEP_DTYPE", "")
+    if not want:
+        return _MSG_SWEEP_DTYPE_DEFAULT
+    dtype = _MSG_SWEEP_DTYPES.get(want.strip().lower())
+    if dtype is None:
+        raise ValueError(
+            f"BENCH_SWEEP_DTYPE={want!r} is not one of {sorted(_MSG_SWEEP_DTYPES)}"
+        )
+    return dtype
+
+
+def _dtype_tag(dtype: torch.dtype) -> str:
+    """Short filename token for a sweep dtype ("bf16" / "fp32")."""
+    for tag, candidate in (("bf16", torch.bfloat16), ("fp32", torch.float32)):
+        if dtype == candidate:
+            return tag
+    return str(dtype).replace("torch.", "")
+
+
+def _report_basename(scope: str, lp: bool) -> str:
+    """Snapshot filename for one report, with the sweep dtype in it.
+
+    The dtype is in the NAME and not only in the table header because the
+    element type is a tuning axis, not a formatting detail: bf16 and fp32 have
+    different low-precision crossovers, so their snapshots are different
+    results. Without the tag an fp32 run writes over the bf16 snapshot it was
+    supposed to be compared against, and the file still looks plausible --
+    exactly the stale-data failure that has already invalidated conclusions on
+    this workstream once.
+    """
+    lp_part = "lp_" if lp else ""
+    return (
+        f"bench_sharded_relay_{scope}_{_dtype_tag(_sweep_dtype())}_"
+        f"{lp_part}sweep_results.txt"
+    )
+
+
 def _sweep_sizes() -> list[tuple[str, int]]:
     """Message sizes the sweeps cover.
 
@@ -1778,15 +1835,12 @@ def _benchmark_worker(
 #           sub-group.
 # The single-group scenario is benchmarked separately (see the parallel
 # independent-comm sweep, test_parallel_collectives_msg_size_sweep).
-# Fixed at bf16. NCCL allreduce/reduce-scatter baselines use SUM + manual divide
+# bf16 by default, fp32 via BENCH_SWEEP_DTYPE.
+# NCCL allreduce/reduce-scatter baselines use SUM + manual divide
 # (RCCL on MI350X lacks the AVG kernel); the relay path uses AVG in the kernel.
 # all-to-all / all-gather do no reduction. The swept nbytes is the per-active-rank
 # input tensor byte size, so sizes stay comparable across collectives.
 # ---------------------------------------------------------------------------
-
-# Data type for the message-size sweep comparison.
-_MSG_SWEEP_DTYPE: torch.dtype = torch.bfloat16
-
 
 # ----- Per-collective buffer/shape helpers (shared by NCCL + relay) ---------
 
@@ -2085,7 +2139,7 @@ def _msg_sweep_nccl_worker(
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
-    dtype = _MSG_SWEEP_DTYPE
+    dtype = _sweep_dtype()
     warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
     bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
 
@@ -2309,7 +2363,7 @@ def _msg_sweep_relay_worker(
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
-    dtype = _MSG_SWEEP_DTYPE
+    dtype = _sweep_dtype()
     warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
     bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
 
@@ -2485,7 +2539,7 @@ def _print_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> None:
             lines.extend(
                 _format_sweep_table(results_dict, dtype, collective, active_ranks)
             )
-    _emit_report(lines, "bench_sharded_relay_fused_sweep_results.txt")
+    _emit_report(lines, _report_basename("fused", lp=False))
 
 
 # ---------------------------------------------------------------------------
@@ -2506,7 +2560,8 @@ def _print_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> None:
 #   comm 1: active [2,3], helpers [0,1,4,5,6,7]  ... (N=4 comms)
 # Each rank is active in exactly one comm and a helper in the others.
 #
-# Fixed at bf16. NCCL baseline: N disjoint A-rank NCCL collectives running
+# bf16 by default, fp32 via BENCH_SWEEP_DTYPE.
+# NCCL baseline: N disjoint A-rank NCCL collectives running
 # concurrently (identical to the FUSED sweep's baseline; reuses _nccl_baseline_op).
 # NCCL allreduce/reduce-scatter use SUM + manual divide (RCCL on MI350X lacks the
 # AVG kernel); the relay path uses AVG in the RCCLX kernel.
@@ -2606,7 +2661,7 @@ def _parallel_msg_sweep_nccl_worker(
     )
     job_device_group = _build_per_job_nccl_group(total_procs, job)
 
-    dtype = _MSG_SWEEP_DTYPE
+    dtype = _sweep_dtype()
     warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
     bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
 
@@ -2907,7 +2962,7 @@ def _parallel_msg_sweep_relay_worker(
     )
     job_device_group = _build_per_job_nccl_group(total_procs, job)
 
-    dtype = _MSG_SWEEP_DTYPE
+    dtype = _sweep_dtype()
     warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
     bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
 
@@ -3071,7 +3126,7 @@ def _print_parallel_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> N
                     results_dict, dtype, collective, active_ranks
                 )
             )
-    _emit_report(lines, "bench_sharded_relay_parallel_sweep_results.txt")
+    _emit_report(lines, _report_basename("parallel", lp=False))
 
 
 def _format_single_group_sweep_table(
@@ -3132,7 +3187,7 @@ def _print_single_group_msg_sweep_report(results_dict: Any, dtype: torch.dtype) 
                     results_dict, dtype, collective, active_ranks
                 )
             )
-    _emit_report(lines, "bench_sharded_relay_single_group_sweep_results.txt")
+    _emit_report(lines, _report_basename("single_group", lp=False))
 
 
 # ---------------------------------------------------------------------------
@@ -3232,7 +3287,7 @@ def _print_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -> None:
                     f"relay_lp_{key}_fused_{{i}}",
                 )
             )
-    _emit_report(lines, "bench_sharded_relay_fused_lp_sweep_results.txt")
+    _emit_report(lines, _report_basename("fused", lp=True))
 
 
 def _print_parallel_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -> None:
@@ -3263,7 +3318,7 @@ def _print_parallel_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -
                     f"relay_parallel_lp_{key}_{{i}}",
                 )
             )
-    _emit_report(lines, "bench_sharded_relay_parallel_lp_sweep_results.txt")
+    _emit_report(lines, _report_basename("parallel", lp=True))
 
 
 def _print_single_group_msg_sweep_lp_report(
@@ -3299,7 +3354,7 @@ def _print_single_group_msg_sweep_lp_report(
                     f"relay_parallel_lp_{key}_{{i}}",
                 )
             )
-    _emit_report(lines, "bench_sharded_relay_single_group_lp_sweep_results.txt")
+    _emit_report(lines, _report_basename("single_group", lp=True))
 
 
 class EmitReportTest(unittest.TestCase):
@@ -3334,6 +3389,24 @@ class EmitReportTest(unittest.TestCase):
         self.assertEqual(len(set(written)), len(basenames))
         for path, basename in zip(written, basenames):
             self.assertEqual(os.path.basename(path), basename)
+
+    def test_report_basenames_separate_the_dtypes(self) -> None:
+        """The two dtypes are different results, so they must not share a path.
+
+        This is the case that motivated putting the dtype in the name: an fp32
+        run used to write over the bf16 snapshot it was meant to be compared
+        against, and the file still looked plausible afterwards.
+        """
+        scopes = ("fused", "parallel", "single_group")
+        names = set()
+        for dtype in ("bf16", "fp32"):
+            with mock.patch.dict(os.environ, {"BENCH_SWEEP_DTYPE": dtype}, clear=False):
+                for scope in scopes:
+                    for lp in (False, True):
+                        name = _report_basename(scope, lp=lp)
+                        self.assertIn(dtype, name)
+                        names.add(name)
+        self.assertEqual(len(names), len(scopes) * 2 * 2)
 
     def test_results_file_accepts_a_single_report(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -3479,8 +3552,8 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
             join=True,
         )
 
-        _print_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
-        _print_msg_sweep_lp_report(results, _MSG_SWEEP_DTYPE)
+        _print_msg_sweep_report(results, _sweep_dtype())
+        _print_msg_sweep_lp_report(results, _sweep_dtype())
 
         manager.shutdown()
 
@@ -3556,8 +3629,8 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
 
         # Reduce per-job entries to max-across-jobs, then print the tables.
         _reduce_parallel_jobs_max(results)
-        _print_parallel_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
-        _print_parallel_msg_sweep_lp_report(results, _MSG_SWEEP_DTYPE)
+        _print_parallel_msg_sweep_report(results, _sweep_dtype())
+        _print_parallel_msg_sweep_lp_report(results, _sweep_dtype())
 
         manager.shutdown()
 
@@ -3611,8 +3684,8 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
 
         # Collapse the single job's per-job entries to the base keys, then print.
         _reduce_parallel_jobs_max(results)
-        _print_single_group_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
-        _print_single_group_msg_sweep_lp_report(results, _MSG_SWEEP_DTYPE)
+        _print_single_group_msg_sweep_report(results, _sweep_dtype())
+        _print_single_group_msg_sweep_lp_report(results, _sweep_dtype())
 
         manager.shutdown()
 
