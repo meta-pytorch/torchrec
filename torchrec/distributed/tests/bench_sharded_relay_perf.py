@@ -130,6 +130,7 @@ import tempfile
 import unittest
 from functools import partial
 from typing import Any
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -2328,31 +2329,66 @@ def _sweep_fmt_speedup(nccl: float, relay: float) -> str:
     return f"{nccl / relay:.2f}x" if nccl > 0 and relay > 0 else "N/A"
 
 
-def _emit_report(lines: list[str], default_basename: str) -> None:
+_EMITTED_BASENAMES: list[str] = []
+
+
+def _emit_report(lines: list[str], default_basename: str) -> str:
     """Write the assembled results tables to a dedicated file AND to stdout as a
-    single atomic write.
+    single atomic write. Returns the path written, or "" if the write failed.
 
     The sweep spawns up to N * NUM_GPUS worker processes, each emitting glog /
     thrift / RCCLX C++ init logging to the shared stdout/stderr. Interleaving
     that firehose with per-line print() mangles the tables (a stray token can
     land mid-row). Assembling the whole report as one string and writing it once
     — and also to an isolated file no other process touches — keeps the results
-    clean and diffable. BENCH_RESULTS_FILE overrides the file path.
+    clean and diffable.
+
+    TWO env vars, and the distinction only started to matter once a run emitted
+    more than one report:
+
+      BENCH_RESULTS_DIR   directory; every report keeps its own basename. Use
+                          this. It is the only one that works for a run emitting
+                          several reports, which is now every full run.
+      BENCH_RESULTS_FILE  an exact path for ONE report. Kept because it is what
+                          existing callers pass, but it now RAISES on the second
+                          distinct report instead of silently collapsing them all
+                          onto one path and leaving only the last -- which is what
+                          it used to do, and which looked like the earlier reports
+                          had never been produced.
+
+    Re-emitting the SAME basename is allowed and overwrites, because that is a
+    re-run of one report rather than two reports colliding.
     """
     report = "\n".join(lines) + "\n"
-    path = os.environ.get(
-        "BENCH_RESULTS_FILE",
-        os.path.join(tempfile.gettempdir(), default_basename),
-    )
+    explicit = os.environ.get("BENCH_RESULTS_FILE")
+    if explicit:
+        collided = [b for b in _EMITTED_BASENAMES if b != default_basename]
+        if collided:
+            raise RuntimeError(
+                f"BENCH_RESULTS_FILE={explicit!r} names a single path, but this "
+                f"run already wrote {collided} and is now emitting "
+                f"{default_basename!r}. Every report would land on that one path "
+                f"and only the last would survive. Set BENCH_RESULTS_DIR instead "
+                f"to get one file per report."
+            )
+        path = explicit
+    else:
+        path = os.path.join(
+            os.environ.get("BENCH_RESULTS_DIR", tempfile.gettempdir()),
+            default_basename,
+        )
     try:
         with open(path, "w") as f:
             f.write(report)
     except OSError:
         path = ""
+    if default_basename not in _EMITTED_BASENAMES:
+        _EMITTED_BASENAMES.append(default_basename)
     banner = "#" * 55
     header = "# BENCH RESULTS" + (f" (also written to {path})" if path else "")
     sys.stdout.write(f"\n{banner}\n{header}\n{banner}\n{report}{banner}\n")
     sys.stdout.flush()
+    return path
 
 
 def _format_sweep_table(
@@ -3031,6 +3067,78 @@ def _print_single_group_msg_sweep_report(results_dict: Any, dtype: torch.dtype) 
 # TestCase — works with both "buck2 test" and "buck2 run" (same as the old
 # test_sharded_relay_2d_integration.py pattern).
 # ---------------------------------------------------------------------------
+
+
+class EmitReportTest(unittest.TestCase):
+    """CPU-only cover for the report writer.
+
+    Deliberately its own TestCase: BenchShardedRelayPerfTest skips without 8 GPUs,
+    and this is the one part of the bench that is pure Python and can go wrong
+    without any GPU at all -- which is exactly what happened. With three reports
+    per run BENCH_RESULTS_FILE silently kept only the last, and nothing failed.
+    """
+
+    def setUp(self) -> None:
+        _EMITTED_BASENAMES.clear()
+
+    def tearDown(self) -> None:
+        _EMITTED_BASENAMES.clear()
+
+    def test_results_dir_gives_one_file_per_report(self) -> None:
+        """The case the run actually needs: six reports, six files."""
+        basenames = [
+            "bench_sharded_relay_fused_sweep_results.txt",
+            "bench_sharded_relay_parallel_sweep_results.txt",
+            "bench_sharded_relay_single_group_sweep_results.txt",
+            "bench_sharded_relay_fused_lp_sweep_results.txt",
+            "bench_sharded_relay_parallel_lp_sweep_results.txt",
+            "bench_sharded_relay_single_group_lp_sweep_results.txt",
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"BENCH_RESULTS_DIR": d}, clear=False):
+                os.environ.pop("BENCH_RESULTS_FILE", None)
+                written = [_emit_report([f"body {b}"], b) for b in basenames]
+        self.assertEqual(len(set(written)), len(basenames))
+        for path, basename in zip(written, basenames):
+            self.assertEqual(os.path.basename(path), basename)
+
+    def test_results_file_accepts_a_single_report(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "only.txt")
+            with mock.patch.dict(
+                os.environ, {"BENCH_RESULTS_FILE": target}, clear=False
+            ):
+                path = _emit_report(["body"], "whatever.txt")
+                self.assertEqual(path, target)
+                with open(target) as f:
+                    self.assertIn("body", f.read())
+
+    def test_results_file_rejects_a_second_distinct_report(self) -> None:
+        """The regression. It used to overwrite and report success."""
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "only.txt")
+            with mock.patch.dict(
+                os.environ, {"BENCH_RESULTS_FILE": target}, clear=False
+            ):
+                _emit_report(["first"], "first.txt")
+                with self.assertRaises(RuntimeError) as cm:
+                    _emit_report(["second"], "second.txt")
+        msg = str(cm.exception)
+        self.assertIn("BENCH_RESULTS_DIR", msg)  # names the fix
+        self.assertIn("first.txt", msg)  # names what would have been lost
+        self.assertIn("second.txt", msg)
+
+    def test_results_file_allows_re_emitting_the_same_report(self) -> None:
+        """A re-run of one report is not two reports colliding."""
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "only.txt")
+            with mock.patch.dict(
+                os.environ, {"BENCH_RESULTS_FILE": target}, clear=False
+            ):
+                _emit_report(["first"], "same.txt")
+                _emit_report(["second"], "same.txt")
+                with open(target) as f:
+                    self.assertIn("second", f.read())
 
 
 class BenchShardedRelayPerfTest(unittest.TestCase):
