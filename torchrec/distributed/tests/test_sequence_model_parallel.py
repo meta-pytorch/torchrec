@@ -8,6 +8,7 @@
 # pyre-strict
 
 
+import sys
 import unittest
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -514,6 +515,10 @@ class DedupIndicesWeightAccumulationTest(unittest.TestCase):
 
 
 @skip_if_asan_class
+@unittest.skipIf(
+    sys.version_info >= (3, 15),
+    "TensorDict is not supported on Python 3.15+",
+)
 class TDSequenceModelParallelTest(SequenceModelParallelTest):
 
     def test_sharding_variable_batch(self) -> None:

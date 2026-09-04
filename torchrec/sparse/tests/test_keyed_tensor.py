@@ -8,12 +8,14 @@
 # pyre-strict
 
 
+import sys
 import unittest
 from typing import Callable, Dict, List, Tuple
 
 import torch
 import torch.utils._pytree as pytree
 from hypothesis import assume, given, settings, strategies as st, Verbosity
+from torch._dynamo import is_dynamo_supported
 from torch.fx._pytree import tree_flatten_spec
 from torchrec.sparse.jagged_tensor import (
     _fbgemm_permute_pooled_embs,
@@ -26,7 +28,7 @@ from torchrec.sparse.jagged_tensor import (
 from torchrec.sparse.tests.utils import build_groups, build_kts
 from torchrec.test_utils import skip_if_asan_class
 
-if torch.cuda.is_available():
+if torch.cuda.is_available() and sys.version_info < (3, 15):
     from torchrec.sparse.triton_permute_multi_embedding import (
         triton_permute_multi_embedding,
     )
@@ -1077,6 +1079,10 @@ class TestKeyedTensorGPU(unittest.TestCase):
         torch.allclose(actual_kt_1_grad, expected_kt_1_grad)
 
 
+@unittest.skipIf(
+    sys.version_info >= (3, 15),
+    "Triton is not installed with PyTorch on Python 3.15+",
+)
 class TritonPermuteMultiEmbeddingTest(unittest.TestCase):
     def _inputs(
         self,
@@ -1203,6 +1209,7 @@ class TritonPermuteMultiEmbeddingTest(unittest.TestCase):
             torch.testing.assert_close(output, reference, rtol=0, atol=0)
         self._assert_gradients_close(actual_grads, expected_grads, torch.float32)
 
+    @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
     def test_compile_forward_and_backward(self) -> None:
         values, references, permutes, in_shapes, out_shapes, out_lengths = self._inputs(

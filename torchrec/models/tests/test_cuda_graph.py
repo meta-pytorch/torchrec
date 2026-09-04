@@ -26,6 +26,7 @@ import time
 import unittest
 
 import torch
+from torch._dynamo import is_dynamo_supported
 from torchrec.models.cuda_graph_utils import build_dlrm, collect_outputs, generate_batch
 from torchrec.models.dlrm import DLRM
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -63,6 +64,7 @@ def _gen_batch(device: torch.device) -> tuple[torch.Tensor, KeyedJaggedTensor]:
     )
 
 
+@unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA Graphs require a GPU")
 class DLRMCudaGraphTest(unittest.TestCase):
     @torch.inference_mode()
