@@ -61,6 +61,8 @@ class MetricName(MetricNameBase):
     GROUPED_AUPRC = "grouped_auprc"
     GROUPED_RAUC = "grouped_rauc"
     SESSION_PAIRWISE_AUC = "session_pairwise_auc"
+    VALID_PAIRS_PER_BATCH = "valid_pairs_per_batch"
+    EFFECTIVE_TRAINING_EXAMPLES_PER_BATCH = "effective_training_examples_per_batch"
     RECALL_SESSION_LEVEL = "recall_session_level"
     PRECISION_SESSION_LEVEL = "precision_session_level"
     MULTICLASS_RECALL = "multiclass_recall"
