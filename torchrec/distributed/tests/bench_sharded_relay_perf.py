@@ -2527,8 +2527,25 @@ def _emit_report(lines: list[str], default_basename: str) -> str:
 
     Re-emitting the SAME basename is allowed and overwrites, because that is a
     re-run of one report rather than two reports colliding.
+
+    The bytes are NORMALIZED here, in the one place that decides them, rather
+    than in each table formatter. Two artefacts are produced by construction and
+    not by accident: the band headers are centered (`f"{band:^33}"` in three
+    places, `:^65` in a fourth), which pads on BOTH sides and so leaves trailing
+    spaces, and every table leads with "" to separate itself from the previous
+    one, which puts a blank line at the start of the file. Both tripped TXT6 and
+    TXT8 on all twelve checked-in snapshots.
+
+    That mattered for a reason beyond tidiness: `arc f` will silently rewrite the
+    snapshots to strip them, and because the emitter still produces them, the
+    next sweep puts them straight back. The files and the tool that writes them
+    would drift apart on every refresh, each side "correct" by its own rule. Only
+    leading blank lines are dropped, so the separator between tables survives.
     """
-    report = "\n".join(lines) + "\n"
+    body = [line.rstrip() for line in lines]
+    while body and not body[0]:
+        body.pop(0)
+    report = "\n".join(body) + "\n"
     explicit = os.environ.get("BENCH_RESULTS_FILE")
     if explicit:
         collided = [b for b in _EMITTED_BASENAMES if b != default_basename]
@@ -3529,6 +3546,29 @@ class EmitReportTest(unittest.TestCase):
         self.assertIn("TUNING RUN", tuning)
         self.assertIn("1 KB", tuning)
         self.assertNotEqual(shipped, tuning)
+
+    def test_emitted_report_has_no_lint_bait_whitespace(self) -> None:
+        """The emitter's own bytes must be what a formatter would leave alone.
+
+        Centered band headers pad on both sides and every table leads with "" to
+        separate itself, so trailing whitespace and a leading blank line are
+        produced by construction. arc f strips both from the checked-in
+        snapshots and the next sweep writes them back, so the artefacts and the
+        tool drift apart on every refresh unless the emitter is the one that
+        normalizes. Only LEADING blanks go -- the separator between tables stays.
+        """
+        lines = ["", "", f"{'':>10} | {'FUSED (4 groups)':^33}", "row   ", "", "x"]
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"BENCH_RESULTS_DIR": d}, clear=False):
+                os.environ.pop("BENCH_RESULTS_FILE", None)
+                path = _emit_report(lines, "whitespace_check.txt")
+            with open(path) as f:
+                written = f.read()
+        self.assertFalse(written.startswith("\n"), "leading blank line survived")
+        for i, line in enumerate(written.split("\n")):
+            self.assertEqual(line, line.rstrip(), f"line {i} has trailing space")
+        # The interior blank line is a separator and must NOT be swallowed.
+        self.assertIn("\n\nx\n", written)
 
     def test_results_file_accepts_a_single_report(self) -> None:
         with tempfile.TemporaryDirectory() as d:
