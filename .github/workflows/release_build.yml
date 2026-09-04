@@ -39,6 +39,10 @@ jobs:
             python-version: '3.14'
             python-tag: "py314"
             cuda-tag: "cu126"
+          - os: linux.2xlarge
+            python-version: '3.15'
+            python-tag: "py315"
+            cuda-tag: "cu126"
     steps:
       # Checkout the repository to the GitHub Actions runner
       - name: Check ldd --version
@@ -59,7 +63,12 @@ jobs:
           echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
       - name: create conda env
         run: |
-          conda create --name build_binary python=${{ matrix.python-version }}
+          if [[ "${{ matrix.python-version }}" == "3.15" ]]; then
+            conda create -y --name build_binary --override-channels \
+              -c conda-forge/label/python_rc -c conda-forge python=3.15
+          else
+            conda create --name build_binary python=${{ matrix.python-version }}
+          fi
           conda info
       - name: check python version no Conda
         run: |
@@ -73,12 +82,12 @@ jobs:
       - name: Install PyTorch and CUDA
         shell: bash
         run: |
-          conda run -n build_binary pip install torch
+          conda run -n build_binary pip install torch==2.14
       - name: Install fbgemm
         shell: bash
         run: |
           conda run -n build_binary pip install numpy
-          conda run -n build_binary pip install fbgemm-gpu
+          conda run -n build_binary pip install fbgemm-gpu==1.9
       - name: Install Dependencies
         shell: bash
         run: |
@@ -120,6 +129,7 @@ jobs:
           - "3.12"
           - "3.13"
           - "3.14"
+          - "3.15"
         cuda-tag:
           - "cu126"
     needs: build_on_cpu
@@ -171,7 +181,12 @@ jobs:
           echo "CONDA=/home/ec2-user/miniconda" >> $GITHUB_PATH
       - name: create conda env
         run: |
-          conda create --name build_binary python=${{ matrix.python-version }}
+          if [[ "${{ matrix.python-version }}" == "3.15" ]]; then
+            conda create -y --name build_binary --override-channels \
+              -c conda-forge/label/python_rc -c conda-forge python=3.15
+          else
+            conda create --name build_binary python=${{ matrix.python-version }}
+          fi
           conda info
       - name: check python version no Conda
         run: |
@@ -185,13 +200,13 @@ jobs:
       - name: Install PyTorch and CUDA
         shell: bash
         run: |
-          conda run -n build_binary pip install torch
+          conda run -n build_binary pip install torch==2.14
       # download wheel from GHA
       - name: Install fbgemm
         shell: bash
         run: |
           conda run -n build_binary pip install numpy
-          conda run -n build_binary pip install fbgemm-gpu
+          conda run -n build_binary pip install fbgemm-gpu==1.9
       - name: Install torchmetrics
         shell: bash
         run: |

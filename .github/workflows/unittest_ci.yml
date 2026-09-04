@@ -61,6 +61,11 @@ jobs:
           - version: "3.14"
             tag: "py314"
             free_threaded: true
+          - version: "3.15"
+            tag: "py315"
+          - version: "3.15"
+            tag: "py315"
+            free_threaded: true
         is_pr:
           - ${{ github.event_name == 'pull_request' }}
         is_main_push:  # for main branch
@@ -109,8 +114,14 @@ jobs:
       timeout: 60
       script: |
         ldd --version
-        if [[ "${{ matrix.python.free_threaded }}" == "true" ]]; then
+        if [[ "${{ matrix.python.version }}" == "3.15" && "${{ matrix.python.free_threaded }}" == "true" ]]; then
+          conda create -y --name build_binary --override-channels \
+            -c conda-forge/label/python_rc -c conda-forge python-freethreading=3.15
+        elif [[ "${{ matrix.python.free_threaded }}" == "true" ]]; then
           conda create -y --name build_binary python-freethreading=${{ matrix.python.version }}
+        elif [[ "${{ matrix.python.version }}" == "3.15" ]]; then
+          conda create -y --name build_binary --override-channels \
+            -c conda-forge/label/python_rc -c conda-forge python=3.15
         else
           conda create -y --name build_binary python=${{ matrix.python.version }}
         fi
@@ -128,7 +139,7 @@ jobs:
         fi
         echo "index_url: $index_url"
         conda run -n build_binary \
-          pip install torch --index-url $index_url
+          pip install torch==2.14.0 --index-url $index_url
         conda run -n build_binary \
           python -c "import torch; print(torch.__version__)"
         echo "torch succeeded"

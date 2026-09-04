@@ -65,9 +65,13 @@ echo "Expected torch version: $EXPECTED_TORCH_VERSION.*"
 export PYTORCH_CUDA_PKG=""
 export CONDA_ENV="build_binary"
 
-if [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
-    # use conda-forge to install python3.14t
-    conda create -y -n "${CONDA_ENV}" python-freethreading=3.14
+if [[ ${MATRIX_PYTHON_VERSION} = '3.15t' ]]; then
+    conda create -y -n "${CONDA_ENV}" --override-channels \
+        -c conda-forge/label/python_rc -c conda-forge python-freethreading=3.15
+    conda run -n "${CONDA_ENV}" python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}')"
+elif [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
+    # use conda-forge to install free-threaded python
+    conda create -y -n "${CONDA_ENV}" python-freethreading="${MATRIX_PYTHON_VERSION%t}"
     conda run -n "${CONDA_ENV}" python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}')"
 elif [[ ${MATRIX_PYTHON_VERSION} = '3.13t' ]]; then
     # use conda-forge to install python3.13t
@@ -137,7 +141,7 @@ conda env config vars set -n ${CONDA_ENV}  \
 #     export PYTORCH_CUDA_PKG="pytorch-cuda=${MATRIX_GPU_ARCH_VERSION}"
 # fi
 
-conda run -n "${CONDA_ENV}" pip install torch --index-url "$PYTORCH_URL"
+conda run -n "${CONDA_ENV}" pip install torch==2.14.0 --index-url "$PYTORCH_URL"
 
 # install fbgemm
 conda run -n "${CONDA_ENV}" pip install fbgemm-gpu --index-url "$PYTORCH_URL"
@@ -181,9 +185,17 @@ if [[ ${MATRIX_CHANNEL} != 'release' ]]; then
     exit 0
 fi
 
-if [[ ${MATRIX_PYTHON_VERSION} = '3.14' ]]; then
-    # conda currently doesn't support 3.14 unless using the forge channel
-    conda create -y -n "${CONDA_ENV}" python="3.14" -c conda-forge
+if [[ ${MATRIX_PYTHON_VERSION} = '3.15' ]]; then
+    conda create -y -n "${CONDA_ENV}" --override-channels \
+        -c conda-forge/label/python_rc -c conda-forge python=3.15
+elif [[ ${MATRIX_PYTHON_VERSION} = '3.15t' ]]; then
+    conda create -y -n "${CONDA_ENV}" --override-channels \
+        -c conda-forge/label/python_rc -c conda-forge python-freethreading=3.15
+elif [[ ${MATRIX_PYTHON_VERSION} = '3.14' ]]; then
+    # use conda-forge for the newest Python versions
+    conda create -y -n "${CONDA_ENV}" python="${MATRIX_PYTHON_VERSION}" -c conda-forge
+elif [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
+    conda create -y -n "${CONDA_ENV}" python-freethreading="${MATRIX_PYTHON_VERSION%t}"
 elif [[ ${MATRIX_PYTHON_VERSION} = '3.13t' ]]; then
     # use conda-forge to install python3.13t
     conda create -y -n "${CONDA_ENV}" python="3.13" python-freethreading -c conda-forge
@@ -201,7 +213,7 @@ if [[ ${MATRIX_GPU_ARCH_VERSION} != '12.6' ]]; then
 fi
 
 echo "checking pypi release"
-conda run -n "${CONDA_ENV}" pip install torch
+conda run -n "${CONDA_ENV}" pip install torch==2.14.0
 conda run -n "${CONDA_ENV}" pip install fbgemm-gpu
 conda run -n "${CONDA_ENV}" pip install torchrec
 
