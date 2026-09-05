@@ -465,21 +465,67 @@ def _report_basename(scope: str, lp: bool) -> str:
     )
 
 
+def _sweep_size_label(mb: float) -> str:
+    """Axis label for a size in MB, matching the fixed axis's own style."""
+    return f"{int(mb)} MB" if float(mb).is_integer() else f"{mb:g} MB"
+
+
+def _sweep_extra_sizes() -> list[tuple[str, int]]:
+    """Sizes ADDED to the axis by BENCH_SWEEP_EXTRA_MB (comma-separated MB).
+
+    The axis is a fixed list and BENCH_SWEEP_MIN_MB / BENCH_SWEEP_MAX_MB only CLIP
+    it, so until now there was no way to look BETWEEN two of its points. That is
+    the one thing a crossover investigation needs: the axis jumps 40 MB -> 63 MB,
+    and "the ratio steps somewhere in that gap" is not a threshold. A shape whose
+    two dtypes appear to cross at the same size across that gap cannot be
+    distinguished from one that crosses at different sizes inside it.
+
+    Ad hoc on purpose. These do NOT belong in the fixed axis: adding five points
+    permanently would put five more rows in all twelve checked-in snapshots to
+    settle one question about one shape, and every future sweep would pay for
+    them. A run that sets this is a TUNING run by construction -- it is only
+    useful alongside BENCH_LP_MIN_KB, since the shipped gate declines below its
+    crossover and those rows read 1.00x whatever the size axis says -- so it
+    writes tuning-tagged filenames and cannot overwrite a shipped snapshot.
+
+    Sizes that are already on the axis are ignored rather than duplicated, and
+    the merged axis is sorted by bytes so the per-size result keys stay in the
+    order every worker and every formatter enumerates.
+    """
+    want = _env_str("BENCH_SWEEP_EXTRA_MB", "")
+    if not want:
+        return []
+    out: list[tuple[str, int]] = []
+    for tok in want.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        mb = float(tok)
+        if mb <= 0:
+            raise ValueError(f"BENCH_SWEEP_EXTRA_MB={want!r} has a non-positive size")
+        out.append((_sweep_size_label(mb), int(mb * _MIB)))
+    return out
+
+
 def _sweep_sizes() -> list[tuple[str, int]]:
     """Message sizes the sweeps cover.
 
     BENCH_SWEEP_MIN_MB / BENCH_SWEEP_MAX_MB clip the size axis so a tuning run
-    can spend its time in the regime being tuned. Every worker and every report
-    formatter enumerates this same list, so the per-size result keys stay
-    consistent when it is clipped.
+    can spend its time in the regime being tuned. BENCH_SWEEP_EXTRA_MB adds
+    points to it, for a regime the fixed axis steps straight over. Every worker
+    and every report formatter enumerates this same list, so the per-size result
+    keys stay consistent when it is clipped or extended.
     """
     lo = int(_env_float("BENCH_SWEEP_MIN_MB", 0.0) * _MIB)
     hi = int(_env_float("BENCH_SWEEP_MAX_MB", 0.0) * _MIB)
-    return [
-        entry
-        for entry in _MSG_SWEEP_SIZES_ALL
-        if entry[1] >= lo and (hi == 0 or entry[1] <= hi)
-    ]
+    merged = list(_MSG_SWEEP_SIZES_ALL)
+    known = {nbytes for _, nbytes in merged}
+    for label, nbytes in _sweep_extra_sizes():
+        if nbytes not in known:
+            known.add(nbytes)
+            merged.append((label, nbytes))
+    merged.sort(key=lambda entry: entry[1])
+    return [entry for entry in merged if entry[1] >= lo and (hi == 0 or entry[1] <= hi)]
 
 
 # ---------------------------------------------------------------------------
@@ -3569,6 +3615,47 @@ class EmitReportTest(unittest.TestCase):
             self.assertEqual(line, line.rstrip(), f"line {i} has trailing space")
         # The interior blank line is a separator and must NOT be swallowed.
         self.assertIn("\n\nx\n", written)
+
+    def test_extra_sweep_sizes_merge_sorted_deduped_and_clip(self) -> None:
+        """BENCH_SWEEP_EXTRA_MB opens up the gaps the fixed axis steps over.
+
+        The axis jumps 40 MB -> 63 MB, which is precisely where the 4-active
+        reduce-scatter's ratio steps, so the two dtypes cannot be told apart
+        there. Order matters beyond tidiness: per-size result keys are positional,
+        so a worker and a formatter that disagreed on the order would silently
+        pair a time with the wrong size.
+        """
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for key in (
+                "BENCH_SWEEP_EXTRA_MB",
+                "BENCH_SWEEP_MIN_MB",
+                "BENCH_SWEEP_MAX_MB",
+            ):
+                os.environ.pop(key, None)
+            base = _sweep_sizes()
+
+            os.environ["BENCH_SWEEP_EXTRA_MB"] = "48,44,60,40"
+            merged = _sweep_sizes()
+            # 40 MB is already on the axis, so it is ignored rather than doubled.
+            self.assertEqual(len(merged), len(base) + 3)
+            self.assertEqual(len(merged), len({b for _, b in merged}))
+            self.assertEqual([b for _, b in merged], sorted(b for _, b in merged))
+            labels = [lbl for lbl, _ in merged]
+            for want in ("44 MB", "48 MB", "60 MB"):
+                self.assertIn(want, labels)
+            self.assertEqual(labels.count("40 MB"), 1)
+
+            # Extras are subject to the same clipping as the fixed axis.
+            os.environ["BENCH_SWEEP_MIN_MB"] = "41"
+            os.environ["BENCH_SWEEP_MAX_MB"] = "63"
+            clipped = [lbl for lbl, _ in _sweep_sizes()]
+            self.assertEqual(clipped, ["44 MB", "48 MB", "60 MB", "63 MB"])
+
+    def test_extra_sweep_size_rejects_a_non_positive_value(self) -> None:
+        """A typo should fail loudly, not silently add a zero-byte size."""
+        with mock.patch.dict(os.environ, {"BENCH_SWEEP_EXTRA_MB": "44,0"}, clear=False):
+            with self.assertRaises(ValueError):
+                _sweep_sizes()
 
     def test_results_file_accepts_a_single_report(self) -> None:
         with tempfile.TemporaryDirectory() as d:
