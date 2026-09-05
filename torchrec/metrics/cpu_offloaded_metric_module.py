@@ -531,6 +531,14 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             assert self._captured_exception is not None
             raise self._captured_exception
 
+        if self._debug_mode and len(self.rec_metrics) > 0 and self.rec_tasks:
+            debug_model_out = self._prepare_model_out_for_metrics(dict(model_out))
+            labels, predictions, weights, _ = parse_task_model_outputs(
+                self.rec_tasks,
+                debug_model_out,
+            )
+            self._validate_rec_metric_inputs(labels, predictions, weights)
+
         if self._clone_model_out:
             snapshot_model_out = _foreach_clone_dict(model_out)
             snapshot_kwargs = _foreach_clone_kwargs(kwargs)

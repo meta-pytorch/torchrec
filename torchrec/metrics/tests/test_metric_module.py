@@ -45,7 +45,12 @@ from torchrec.metrics.metrics_config import (
     validate_batch_size_stages,
 )
 from torchrec.metrics.model_utils import parse_task_model_outputs
-from torchrec.metrics.rec_metric import RecMetricException, RecMetricList, RecTaskInfo
+from torchrec.metrics.rec_metric import (
+    RecMetricException,
+    RecMetricList,
+    RecMetricValidationError,
+    RecTaskInfo,
+)
 from torchrec.metrics.test_utils import gen_test_batch, gen_test_tasks
 from torchrec.metrics.test_utils.mock_metrics import MockRecMetric
 from torchrec.metrics.throughput import ThroughputMetric
@@ -1209,6 +1214,202 @@ def metric_module_gather_state(
             torch.testing.assert_close(tensor, new_tensor, check_device=False)
 
         metric_module.shutdown()
+
+
+class RecMetricDebugModeTest(unittest.TestCase):
+    def _create_config(
+        self,
+        metric_enums: List[RecMetricEnum],
+    ) -> MetricsConfig:
+        return MetricsConfig(
+            rec_tasks=[DefaultTaskInfo],
+            rec_metrics={
+                metric_enum: RecMetricDef(
+                    rec_tasks=[DefaultTaskInfo],
+                    window_size=_DEFAULT_WINDOW_SIZE,
+                )
+                for metric_enum in metric_enums
+            },
+        )
+
+    def _create_module(
+        self,
+        metric_enums: List[RecMetricEnum],
+        debug_mode: bool = True,
+    ) -> RecMetricModule:
+        return generate_metric_module(
+            RecMetricModule,
+            metrics_config=self._create_config(metric_enums),
+            batch_size=4,
+            world_size=1,
+            my_rank=0,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+            debug_mode=debug_mode,
+        )
+
+    def test_debug_mode_disabled_does_not_validate(self) -> None:
+        with patch(METRIC_MODULE_PATH + ".dist.new_group") as new_group:
+            metric_module = self._create_module([RecMetricEnum.NE], debug_mode=False)
+            batch = gen_test_batch(
+                4,
+                label_value=torch.tensor([0.0, float("nan"), 1.0, 0.0]),
+            )
+            metric_module.update(batch)
+
+        self.assertEqual(1, metric_module.trained_batches)
+        new_group.assert_not_called()
+
+    def test_nan_label_fails_before_state_mutation(self) -> None:
+        metric_module = self._create_module([RecMetricEnum.NE])
+        state_before = {
+            name: tensor.detach().clone()
+            for name, tensor in metric_module.state_dict().items()
+        }
+        batch = gen_test_batch(
+            4,
+            label_value=torch.tensor([0.0, float("nan"), 1.0, 0.0]),
+        )
+
+        with self.assertRaises(RecMetricValidationError) as context:
+            metric_module.update(batch)
+
+        message = str(context.exception)
+        self.assertIn("metric=NEMetric", message)
+        self.assertIn("task=DefaultTask", message)
+        self.assertIn("rank=0 labels shape=[4] dtype=torch.float32", message)
+        self.assertIn("numel=4", message)
+        self.assertIn("nan=1", message)
+        self.assertEqual(0, metric_module.trained_batches)
+        for name, tensor in metric_module.state_dict().items():
+            torch.testing.assert_close(tensor, state_before[name])
+
+    def test_num_missing_labels_allows_and_counts_nan_labels(self) -> None:
+        metric_module = self._create_module([RecMetricEnum.NUM_MISSING_LABELS])
+        metric_module.update(
+            gen_test_batch(
+                4,
+                label_value=torch.tensor([float("nan"), 1.0, float("nan"), 0.0]),
+                weight_value=torch.ones(4),
+            )
+        )
+
+        metrics = metric_module.compute().resolve()
+        self.assertEqual(
+            2.0,
+            metrics[
+                "num_missing_labels-DefaultTask|lifetime_num_missing_labels"
+            ].item(),
+        )
+
+    def test_nan_label_shared_with_ne_names_ne(self) -> None:
+        metric_module = self._create_module(
+            [RecMetricEnum.NUM_MISSING_LABELS, RecMetricEnum.NE]
+        )
+        batch = gen_test_batch(
+            4,
+            label_value=torch.tensor([0.0, float("nan"), 1.0, 0.0]),
+        )
+
+        with self.assertRaises(RecMetricValidationError) as context:
+            metric_module.update(batch)
+
+        self.assertIn("metric=NEMetric", str(context.exception))
+        self.assertNotIn("metric=NumMissingLabelsMetric", str(context.exception))
+
+    def test_num_missing_labels_rejects_label_infinity(self) -> None:
+        metric_module = self._create_module([RecMetricEnum.NUM_MISSING_LABELS])
+        batch = gen_test_batch(
+            4,
+            label_value=torch.tensor([0.0, float("inf"), 1.0, 0.0]),
+        )
+
+        with self.assertRaises(RecMetricValidationError) as context:
+            metric_module.update(batch)
+
+        message = str(context.exception)
+        self.assertIn("metric=NumMissingLabelsMetric", message)
+        self.assertIn("+inf=1", message)
+
+    def test_non_finite_predictions_and_weights_fail(self) -> None:
+        cases = [
+            ("predictions", "prediction", float("nan"), "nan=1"),
+            ("predictions", "prediction", float("inf"), "+inf=1"),
+            ("weights", "weight", float("nan"), "nan=1"),
+            ("weights", "weight", float("-inf"), "-inf=1"),
+        ]
+        for tensor_kind, batch_key, value, expected_count in cases:
+            with self.subTest(tensor_kind=tensor_kind, value=value):
+                metric_module = self._create_module([RecMetricEnum.NE])
+                batch = gen_test_batch(4)
+                batch[batch_key][0] = value
+
+                with self.assertRaises(RecMetricValidationError) as context:
+                    metric_module.update(batch)
+
+                message = str(context.exception)
+                self.assertIn(tensor_kind, message)
+                self.assertIn(expected_count, message)
+
+    def test_world_size_one_does_not_create_debug_process_group(self) -> None:
+        with patch(METRIC_MODULE_PATH + ".dist.new_group") as new_group:
+            metric_module = self._create_module([RecMetricEnum.NE])
+            metric_module.update(gen_test_batch(4))
+
+        self.assertEqual(1, metric_module.trained_batches)
+        new_group.assert_not_called()
+
+
+def _run_distributed_input_validation(
+    rank: int,
+    world_size: int,
+    backend: str,
+) -> None:
+    with MultiProcessContext(rank, world_size, backend) as context:
+        config = MetricsConfig(
+            rec_tasks=[DefaultTaskInfo],
+            rec_metrics={
+                RecMetricEnum.NE: RecMetricDef(
+                    rec_tasks=[DefaultTaskInfo],
+                    window_size=_DEFAULT_WINDOW_SIZE,
+                )
+            },
+        )
+        metric_module = generate_metric_module(
+            RecMetricModule,
+            metrics_config=config,
+            batch_size=4,
+            world_size=world_size,
+            my_rank=rank,
+            state_metrics_mapping={},
+            device=torch.device("cpu"),
+            process_group=context.pg,
+            debug_mode=True,
+        )
+        assert metric_module._debug_process_group is not dist.group.WORLD
+        batch = gen_test_batch(4)
+        if rank == 1:
+            batch["label"] = batch["label"].reshape(2, 2)
+            batch["prediction"] = batch["prediction"].reshape(2, 2)
+            batch["label"][0, 0] = float("nan")
+        try:
+            metric_module.update(batch)
+        except RecMetricValidationError as error:
+            assert "ranks=[1]" in str(error)
+            assert "metric=NEMetric" in str(error)
+            assert "shape=[2, 2]" in str(error)
+        else:
+            raise AssertionError("expected coordinated RecMetricValidationError")
+
+
+@skip_if_asan_class
+class RecMetricDebugModeDistributedTest(MultiProcessTestBase):
+    def test_one_bad_rank_causes_all_ranks_to_raise(self) -> None:
+        self._run_multi_process_test(
+            callable=_run_distributed_input_validation,
+            world_size=2,
+            backend="gloo",
+        )
 
 
 class MetricsConfigPostInitTest(unittest.TestCase):
