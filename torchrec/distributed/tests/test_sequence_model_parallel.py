@@ -8,6 +8,7 @@
 # pyre-strict
 
 
+import sys
 import unittest
 from typing import Any, Dict, List, Optional, Tuple, Type
 
@@ -513,6 +514,10 @@ class DedupIndicesWeightAccumulationTest(unittest.TestCase):
         self.assertAlmostEqual(acc_weights[idx_2_pos, 0].item(), 4.0, places=5)
 
 
+@unittest.skipIf(
+    sys.version_info >= (3, 15),
+    "TensorDict sequence model parallel tests do not support Python 3.15+",
+)
 @skip_if_asan_class
 class TDSequenceModelParallelTest(SequenceModelParallelTest):
 
