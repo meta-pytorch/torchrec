@@ -26,6 +26,7 @@ from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     SplitTableBatchedEmbeddingBagsCodegen,
 )
 from hypothesis import given, settings, strategies as st
+from torch._dynamo import is_dynamo_supported
 from torch._dynamo.testing import reduce_to_scalar_loss
 from torchrec.distributed.test_utils.infer_utils import (
     KJTInputExportDynamicShapeWrapper,
@@ -272,6 +273,7 @@ def _test_compile_fwd_bwd(
             _assert_close(compile_bwd_out, eager_bwd_out)
 
 
+@unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
 @unittest.skipIf(
     _is_free_threaded(),
     "torch.compile/torch.export segfaults on free-threaded Python, "

@@ -453,7 +453,7 @@ def calculate_shard_storages(
                 count_ephemeral_storage_cost=count_ephemeral_storage_cost,
                 is_inference=is_inference,
             )
-            if compute_device in {"cuda", "mtia"}
+            if compute_device in {"cuda", "mtia", "tpu"}
             else 0
         )
         for input_size, output_size, hbm_specific_size in zip(

@@ -130,6 +130,7 @@ import tempfile
 import unittest
 from functools import partial
 from typing import Any
+from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -317,21 +318,214 @@ def _sweep_reps() -> int:
     return max(1, _env_int("BENCH_SWEEP_REPS", 10))
 
 
+def _apply_lp_min_kb_env() -> None:
+    """Export BENCH_LP_MIN_KB as NCCL_SHARDED_RELAY_LP_MIN_KB, if set.
+
+    OPT-IN, and the default matters. Left unset, low precision uses the crossover
+    that SHIPS, so the checked-in snapshots show what a caller actually gets --
+    including 1.00x rows below the crossover, which is an honest record of where
+    the gate declines rather than a gap in the data.
+
+    Set it (BENCH_LP_MIN_KB=1) for a TUNING run: the built-in threshold refuses
+    small messages before anything is timed, so the crossover is the one number a
+    default run cannot measure. A tuning run makes the whole size axis eligible,
+    reads the crossover off the LP-vs-Relay column, and that measured value is what
+    then goes into lpMinBytes().
+
+    Must be exported before the communicator exists: NCCL_PARAM caches on first
+    read. Called at the top of each relay worker, which is a fresh process per
+    mp.spawn, so the export is always ahead of the first relay call.
+    """
+    min_kb = os.environ.get("BENCH_LP_MIN_KB")
+    if min_kb:
+        os.environ["NCCL_SHARDED_RELAY_LP_MIN_KB"] = min_kb
+
+
+def _lp_min_kb_override() -> str:
+    """The BENCH_LP_MIN_KB in force, or "" when the shipped gate applies.
+
+    Read from the parent process, which is where the sweep composes its reports;
+    _apply_lp_min_kb_env() exports the NCCL_ name in each worker.
+    """
+    return (os.environ.get("BENCH_LP_MIN_KB") or "").strip()
+
+
+def _lp_gate_regime() -> str:
+    """One-line marker naming the gate regime a low-precision table ran under.
+
+    In the FILE, not only in a docstring. A tuning run and a shipped run produce
+    tables that are identical in shape and differ only in which rows were
+    eligible, so a snapshot that does not say which one it is cannot be read.
+    """
+    override = _lp_min_kb_override()
+    if override:
+        return (
+            f"  LP gate: FORCED to >= {override} KB via BENCH_LP_MIN_KB "
+            "-- TUNING RUN, not shipped behaviour"
+        )
+    return "  LP gate: the shipped lpMinBytes() thresholds"
+
+
+def _lp_gate_preamble() -> list[str]:
+    """How to read a 1.00x LP-vs-Relay cell. Emitted once per report file.
+
+    This convention used to live only in _format_lp_sweep_table's docstring,
+    which nobody reading the checked-in .txt ever sees. It was also STATED TOO
+    BROADLY: it is sound for the SIZE gate, but lpEligible() declines on route,
+    count alignment, graph capture and ARENA CAPACITY as well, none of which
+    depend on the threshold and all of which are equally silent. A capacity
+    decline lands ABOVE the crossover, where the old rule says "tie" and is
+    simply wrong -- which is how the 4-active allreduce's 1.00x at 1 GB was read
+    as a plateau for as long as it was.
+    """
+    width = 78
+    out = ["", "=" * width, "HOW TO READ THE 'LP vs Relay' COLUMN", "=" * width]
+    out.append(_lp_gate_regime())
+    out.extend(
+        [
+            "  1.00x BELOW the crossover is a DECLINE, not a tie. The size gate",
+            "  is silent, so Relay-LP there runs Relay's exact code path and the",
+            "  ratio is 1 by construction rather than by measurement.",
+            "",
+            "  1.00x ABOVE the crossover is NOT proof of a tie. Route, count",
+            "  alignment, graph capture and arena capacity decline just as",
+            "  silently and do NOT depend on message size, so a shape can be",
+            "  past its threshold and still be running full precision twice.",
+            "  Confirm before believing a plateau:",
+            "    NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=COLL,INIT",
+            "  and look for 'low precision declined (<reason>)'.",
+            "=" * width,
+        ]
+    )
+    return out
+
+
+# Data type for the message-size sweep comparison. See _sweep_dtype().
+_MSG_SWEEP_DTYPE_DEFAULT: torch.dtype = torch.bfloat16
+_MSG_SWEEP_DTYPES: dict[str, torch.dtype] = {
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp32": torch.float32,
+    "float32": torch.float32,
+}
+
+
+def _sweep_dtype() -> torch.dtype:
+    """Element type the sweeps run in.
+
+    BENCH_SWEEP_DTYPE picks bf16 (default) or fp32. It exists because the two
+    are different tuning problems for low precision, not one problem measured
+    twice: fp32 sends twice the wire bytes per element, so quantizing to fp8
+    saves twice as much, and its crossover lands at a smaller message. A
+    threshold read off a bf16 sweep is therefore conservative for fp32, and the
+    only way to know by how much is to sweep fp32 with the same harness.
+    """
+    want = _env_str("BENCH_SWEEP_DTYPE", "")
+    if not want:
+        return _MSG_SWEEP_DTYPE_DEFAULT
+    dtype = _MSG_SWEEP_DTYPES.get(want.strip().lower())
+    if dtype is None:
+        raise ValueError(
+            f"BENCH_SWEEP_DTYPE={want!r} is not one of {sorted(_MSG_SWEEP_DTYPES)}"
+        )
+    return dtype
+
+
+def _dtype_tag(dtype: torch.dtype) -> str:
+    """Short filename token for a sweep dtype ("bf16" / "fp32")."""
+    for tag, candidate in (("bf16", torch.bfloat16), ("fp32", torch.float32)):
+        if dtype == candidate:
+            return tag
+    return str(dtype).replace("torch.", "")
+
+
+def _report_basename(scope: str, lp: bool) -> str:
+    """Snapshot filename for one report, with the sweep dtype in it.
+
+    The dtype is in the NAME and not only in the table header because the
+    element type is a tuning axis, not a formatting detail: bf16 and fp32 have
+    different low-precision crossovers, so their snapshots are different
+    results. Without the tag an fp32 run writes over the bf16 snapshot it was
+    supposed to be compared against, and the file still looks plausible --
+    exactly the stale-data failure that has already invalidated conclusions on
+    this workstream once.
+
+    A TUNING run gets its own token for the same reason and the same hazard. It
+    forces the size gate open, so its low-precision tables describe a policy
+    that does not ship; writing those over the shipped snapshot leaves a file
+    that still looks plausible. Tagging both reports -- not just the LP one --
+    keeps the invariant simple: a tuning run overwrites no shipped snapshot at
+    all, so it needs no manual revert afterwards.
+    """
+    lp_part = "lp_" if lp else ""
+    tuning_part = "tuning_" if _lp_min_kb_override() else ""
+    return (
+        f"bench_sharded_relay_{scope}_{_dtype_tag(_sweep_dtype())}_"
+        f"{lp_part}{tuning_part}sweep_results.txt"
+    )
+
+
+def _sweep_size_label(mb: float) -> str:
+    """Axis label for a size in MB, matching the fixed axis's own style."""
+    return f"{int(mb)} MB" if float(mb).is_integer() else f"{mb:g} MB"
+
+
+def _sweep_extra_sizes() -> list[tuple[str, int]]:
+    """Sizes ADDED to the axis by BENCH_SWEEP_EXTRA_MB (comma-separated MB).
+
+    The axis is a fixed list and BENCH_SWEEP_MIN_MB / BENCH_SWEEP_MAX_MB only CLIP
+    it, so until now there was no way to look BETWEEN two of its points. That is
+    the one thing a crossover investigation needs: the axis jumps 40 MB -> 63 MB,
+    and "the ratio steps somewhere in that gap" is not a threshold. A shape whose
+    two dtypes appear to cross at the same size across that gap cannot be
+    distinguished from one that crosses at different sizes inside it.
+
+    Ad hoc on purpose. These do NOT belong in the fixed axis: adding five points
+    permanently would put five more rows in all twelve checked-in snapshots to
+    settle one question about one shape, and every future sweep would pay for
+    them. A run that sets this is a TUNING run by construction -- it is only
+    useful alongside BENCH_LP_MIN_KB, since the shipped gate declines below its
+    crossover and those rows read 1.00x whatever the size axis says -- so it
+    writes tuning-tagged filenames and cannot overwrite a shipped snapshot.
+
+    Sizes that are already on the axis are ignored rather than duplicated, and
+    the merged axis is sorted by bytes so the per-size result keys stay in the
+    order every worker and every formatter enumerates.
+    """
+    want = _env_str("BENCH_SWEEP_EXTRA_MB", "")
+    if not want:
+        return []
+    out: list[tuple[str, int]] = []
+    for tok in want.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        mb = float(tok)
+        if mb <= 0:
+            raise ValueError(f"BENCH_SWEEP_EXTRA_MB={want!r} has a non-positive size")
+        out.append((_sweep_size_label(mb), int(mb * _MIB)))
+    return out
+
+
 def _sweep_sizes() -> list[tuple[str, int]]:
     """Message sizes the sweeps cover.
 
     BENCH_SWEEP_MIN_MB / BENCH_SWEEP_MAX_MB clip the size axis so a tuning run
-    can spend its time in the regime being tuned. Every worker and every report
-    formatter enumerates this same list, so the per-size result keys stay
-    consistent when it is clipped.
+    can spend its time in the regime being tuned. BENCH_SWEEP_EXTRA_MB adds
+    points to it, for a regime the fixed axis steps straight over. Every worker
+    and every report formatter enumerates this same list, so the per-size result
+    keys stay consistent when it is clipped or extended.
     """
     lo = int(_env_float("BENCH_SWEEP_MIN_MB", 0.0) * _MIB)
     hi = int(_env_float("BENCH_SWEEP_MAX_MB", 0.0) * _MIB)
-    return [
-        entry
-        for entry in _MSG_SWEEP_SIZES_ALL
-        if entry[1] >= lo and (hi == 0 or entry[1] <= hi)
-    ]
+    merged = list(_MSG_SWEEP_SIZES_ALL)
+    known = {nbytes for _, nbytes in merged}
+    for label, nbytes in _sweep_extra_sizes():
+        if nbytes not in known:
+            known.add(nbytes)
+            merged.append((label, nbytes))
+    merged.sort(key=lambda entry: entry[1])
+    return [entry for entry in merged if entry[1] >= lo and (hi == 0 or entry[1] <= hi)]
 
 
 # ---------------------------------------------------------------------------
@@ -1754,15 +1948,12 @@ def _benchmark_worker(
 #           sub-group.
 # The single-group scenario is benchmarked separately (see the parallel
 # independent-comm sweep, test_parallel_collectives_msg_size_sweep).
-# Fixed at bf16. NCCL allreduce/reduce-scatter baselines use SUM + manual divide
+# bf16 by default, fp32 via BENCH_SWEEP_DTYPE.
+# NCCL allreduce/reduce-scatter baselines use SUM + manual divide
 # (RCCL on MI350X lacks the AVG kernel); the relay path uses AVG in the kernel.
 # all-to-all / all-gather do no reduction. The swept nbytes is the per-active-rank
 # input tensor byte size, so sizes stay comparable across collectives.
 # ---------------------------------------------------------------------------
-
-# Data type for the message-size sweep comparison.
-_MSG_SWEEP_DTYPE: torch.dtype = torch.bfloat16
-
 
 # ----- Per-collective buffer/shape helpers (shared by NCCL + relay) ---------
 
@@ -1880,6 +2071,7 @@ def _run_relay_once(
     num_groups: int,
     my_sparse_group: int,
     all_active_ranks: list[list[int]],
+    low_precision: bool = False,
 ) -> None:
     """One sharded-relay collective call with PRE-BUILT per-group tensor lists.
 
@@ -1895,6 +2087,7 @@ def _run_relay_once(
             all_active_ranks=all_active_ranks,
             op=dist.ReduceOp.AVG,
             skip_validation=True,
+            low_precision=low_precision,
         )
     elif collective == "reduce_scatter":
         relay.reduce_scatter_multi_group(
@@ -1905,6 +2098,7 @@ def _run_relay_once(
             all_active_ranks=all_active_ranks,
             op=dist.ReduceOp.AVG,
             skip_validation=True,
+            low_precision=low_precision,
         )
     elif collective == "all_to_all":
         relay.all_to_all_multi_group(
@@ -1914,6 +2108,7 @@ def _run_relay_once(
             per_group_segment_counts=counts,
             all_active_ranks=all_active_ranks,
             skip_validation=True,
+            low_precision=low_precision,
         )
     elif collective == "all_gather":
         relay.all_gather_multi_group(
@@ -1923,6 +2118,7 @@ def _run_relay_once(
             per_group_send_counts=counts,
             all_active_ranks=all_active_ranks,
             skip_validation=True,
+            low_precision=low_precision,
         )
     else:
         raise ValueError(f"unknown collective {collective!r}")
@@ -2056,7 +2252,7 @@ def _msg_sweep_nccl_worker(
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
-    dtype = _MSG_SWEEP_DTYPE
+    dtype = _sweep_dtype()
     warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
     bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
 
@@ -2129,6 +2325,7 @@ def _measure_relay_for(
     world_size: int,
     warmup: int,
     bench_iters: int,
+    low_precision: bool = False,
 ) -> tuple[float, float]:
     """Time the FUSED (num_groups = world // A) relay collective for one message
     size. Returns (best_ms, std_ms)."""
@@ -2167,6 +2364,7 @@ def _measure_relay_for(
             num_groups,
             my_sparse_group,
             fused_active_ranks,
+            low_precision,
         ),
         warmup,
         bench_iters,
@@ -2217,6 +2415,13 @@ def _msg_sweep_relay_warmup(
             in_list, out_list = _build_relay_group_lists(
                 a_in, a_out, bufs, num_groups, my_sparse_group
             )
+            # FULL PRECISION ONLY, deliberately. warm_elems is 2048, which is
+            # below every relay-route crossover, so a low-precision call here
+            # DECLINES on route: it would compile none of the low-precision
+            # kernels and would only fill the log with declines. Low precision is
+            # warmed instead by _measure_ms's own untimed warmup iterations, which
+            # run at the measured size -- where it actually engages, and which is
+            # also where the one-time arena bootstrap belongs.
             for _ in range(3):
                 _run_relay_once(
                     collective,
@@ -2252,6 +2457,8 @@ def _msg_sweep_relay_worker(
     os.environ["RANK"] = str(rank)
     os.environ["WORLD_SIZE"] = str(world_size)
 
+    _apply_lp_min_kb_env()
+
     local_rank = rank
     is_master = rank == 0
 
@@ -2269,7 +2476,7 @@ def _msg_sweep_relay_worker(
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
-    dtype = _MSG_SWEEP_DTYPE
+    dtype = _sweep_dtype()
     warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
     bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
 
@@ -2291,25 +2498,34 @@ def _msg_sweep_relay_worker(
     # Pre-compile every distinct HIP kernel config before timing.
     _msg_sweep_relay_warmup(fused_by_a, rank, world_size, dtype, device)
 
+    # Full precision and low precision measured BACK TO BACK in the same worker on
+    # the same communicator. That is only possible because low precision is a
+    # per-call argument, and it is what makes the LP-vs-FP ratio meaningful: a
+    # second process would carry its own placement, channel assignment and clock
+    # state, so the ratio would mix the wire format with process-to-process
+    # variance. Same buffers, same comm, adjacent in time.
     for active_ranks in _sweep_active_ranks():
         relay_fused = fused_by_a[active_ranks]
         for collective in _sweep_collectives():
             for i, (_label, nbytes) in enumerate(_sweep_sizes()):
-                best_f, std_f = _measure_relay_for(
-                    collective=collective,
-                    active_ranks=active_ranks,
-                    relay_fused=relay_fused,
-                    nbytes=nbytes,
-                    dtype=dtype,
-                    device=device,
-                    rank=rank,
-                    world_size=world_size,
-                    warmup=warmup,
-                    bench_iters=bench_iters,
-                )
-                if rank == 0:
-                    key = f"{collective}_a{active_ranks}"
-                    results_dict[f"relay_{key}_fused_{i}"] = (best_f, std_f)
+                for lp in (False, True):
+                    best_f, std_f = _measure_relay_for(
+                        collective=collective,
+                        active_ranks=active_ranks,
+                        relay_fused=relay_fused,
+                        nbytes=nbytes,
+                        dtype=dtype,
+                        device=device,
+                        rank=rank,
+                        world_size=world_size,
+                        warmup=warmup,
+                        bench_iters=bench_iters,
+                        low_precision=lp,
+                    )
+                    if rank == 0:
+                        key = f"{collective}_a{active_ranks}"
+                        prefix = "relay_lp" if lp else "relay"
+                        results_dict[f"{prefix}_{key}_fused_{i}"] = (best_f, std_f)
 
     dist.barrier()
     dist.destroy_process_group()
@@ -2328,31 +2544,83 @@ def _sweep_fmt_speedup(nccl: float, relay: float) -> str:
     return f"{nccl / relay:.2f}x" if nccl > 0 and relay > 0 else "N/A"
 
 
-def _emit_report(lines: list[str], default_basename: str) -> None:
+_EMITTED_BASENAMES: list[str] = []
+
+
+def _emit_report(lines: list[str], default_basename: str) -> str:
     """Write the assembled results tables to a dedicated file AND to stdout as a
-    single atomic write.
+    single atomic write. Returns the path written, or "" if the write failed.
 
     The sweep spawns up to N * NUM_GPUS worker processes, each emitting glog /
     thrift / RCCLX C++ init logging to the shared stdout/stderr. Interleaving
     that firehose with per-line print() mangles the tables (a stray token can
     land mid-row). Assembling the whole report as one string and writing it once
     — and also to an isolated file no other process touches — keeps the results
-    clean and diffable. BENCH_RESULTS_FILE overrides the file path.
+    clean and diffable.
+
+    TWO env vars, and the distinction only started to matter once a run emitted
+    more than one report:
+
+      BENCH_RESULTS_DIR   directory; every report keeps its own basename. Use
+                          this. It is the only one that works for a run emitting
+                          several reports, which is now every full run.
+      BENCH_RESULTS_FILE  an exact path for ONE report. Kept because it is what
+                          existing callers pass, but it now RAISES on the second
+                          distinct report instead of silently collapsing them all
+                          onto one path and leaving only the last -- which is what
+                          it used to do, and which looked like the earlier reports
+                          had never been produced.
+
+    Re-emitting the SAME basename is allowed and overwrites, because that is a
+    re-run of one report rather than two reports colliding.
+
+    The bytes are NORMALIZED here, in the one place that decides them, rather
+    than in each table formatter. Two artefacts are produced by construction and
+    not by accident: the band headers are centered (`f"{band:^33}"` in three
+    places, `:^65` in a fourth), which pads on BOTH sides and so leaves trailing
+    spaces, and every table leads with "" to separate itself from the previous
+    one, which puts a blank line at the start of the file. Both tripped TXT6 and
+    TXT8 on all twelve checked-in snapshots.
+
+    That mattered for a reason beyond tidiness: `arc f` will silently rewrite the
+    snapshots to strip them, and because the emitter still produces them, the
+    next sweep puts them straight back. The files and the tool that writes them
+    would drift apart on every refresh, each side "correct" by its own rule. Only
+    leading blank lines are dropped, so the separator between tables survives.
     """
-    report = "\n".join(lines) + "\n"
-    path = os.environ.get(
-        "BENCH_RESULTS_FILE",
-        os.path.join(tempfile.gettempdir(), default_basename),
-    )
+    body = [line.rstrip() for line in lines]
+    while body and not body[0]:
+        body.pop(0)
+    report = "\n".join(body) + "\n"
+    explicit = os.environ.get("BENCH_RESULTS_FILE")
+    if explicit:
+        collided = [b for b in _EMITTED_BASENAMES if b != default_basename]
+        if collided:
+            raise RuntimeError(
+                f"BENCH_RESULTS_FILE={explicit!r} names a single path, but this "
+                f"run already wrote {collided} and is now emitting "
+                f"{default_basename!r}. Every report would land on that one path "
+                f"and only the last would survive. Set BENCH_RESULTS_DIR instead "
+                f"to get one file per report."
+            )
+        path = explicit
+    else:
+        path = os.path.join(
+            os.environ.get("BENCH_RESULTS_DIR", tempfile.gettempdir()),
+            default_basename,
+        )
     try:
         with open(path, "w") as f:
             f.write(report)
     except OSError:
         path = ""
+    if default_basename not in _EMITTED_BASENAMES:
+        _EMITTED_BASENAMES.append(default_basename)
     banner = "#" * 55
     header = "# BENCH RESULTS" + (f" (also written to {path})" if path else "")
     sys.stdout.write(f"\n{banner}\n{header}\n{banner}\n{report}{banner}\n")
     sys.stdout.flush()
+    return path
 
 
 def _format_sweep_table(
@@ -2401,7 +2669,7 @@ def _print_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> None:
             lines.extend(
                 _format_sweep_table(results_dict, dtype, collective, active_ranks)
             )
-    _emit_report(lines, "bench_sharded_relay_fused_sweep_results.txt")
+    _emit_report(lines, _report_basename("fused", lp=False))
 
 
 # ---------------------------------------------------------------------------
@@ -2422,7 +2690,8 @@ def _print_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> None:
 #   comm 1: active [2,3], helpers [0,1,4,5,6,7]  ... (N=4 comms)
 # Each rank is active in exactly one comm and a helper in the others.
 #
-# Fixed at bf16. NCCL baseline: N disjoint A-rank NCCL collectives running
+# bf16 by default, fp32 via BENCH_SWEEP_DTYPE.
+# NCCL baseline: N disjoint A-rank NCCL collectives running
 # concurrently (identical to the FUSED sweep's baseline; reuses _nccl_baseline_op).
 # NCCL allreduce/reduce-scatter use SUM + manual divide (RCCL on MI350X lacks the
 # AVG kernel); the relay path uses AVG in the RCCLX kernel.
@@ -2522,7 +2791,7 @@ def _parallel_msg_sweep_nccl_worker(
     )
     job_device_group = _build_per_job_nccl_group(total_procs, job)
 
-    dtype = _MSG_SWEEP_DTYPE
+    dtype = _sweep_dtype()
     warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
     bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
 
@@ -2591,6 +2860,7 @@ def _issue_relay_async(
     out_list: list[torch.Tensor],
     count_list: list[int],
     all_active_ranks: list[list[int]],
+    low_precision: bool = False,
 ) -> Any:
     """Issue ONE single-group (num_groups=1) sharded relay collective on a comm
     with async_op=True; returns its work handle."""
@@ -2603,6 +2873,7 @@ def _issue_relay_async(
             op=dist.ReduceOp.AVG,
             skip_validation=True,
             async_op=True,
+            low_precision=low_precision,
         )
     if collective == "reduce_scatter":
         return comm.reduce_scatter_multi_group(
@@ -2614,6 +2885,7 @@ def _issue_relay_async(
             op=dist.ReduceOp.AVG,
             skip_validation=True,
             async_op=True,
+            low_precision=low_precision,
         )
     if collective == "all_to_all":
         return comm.all_to_all_multi_group(
@@ -2624,6 +2896,7 @@ def _issue_relay_async(
             all_active_ranks=all_active_ranks,
             skip_validation=True,
             async_op=True,
+            low_precision=low_precision,
         )
     if collective == "all_gather":
         return comm.all_gather_multi_group(
@@ -2634,6 +2907,7 @@ def _issue_relay_async(
             all_active_ranks=all_active_ranks,
             skip_validation=True,
             async_op=True,
+            low_precision=low_precision,
         )
     raise ValueError(f"unknown collective {collective!r}")
 
@@ -2646,6 +2920,7 @@ def _run_parallel_relay_once(
     count_list: list[int],
     active_ranks_per_comm: list[list[list[int]]],
     num_parallel: int,
+    low_precision: bool = False,
 ) -> None:
     """Issue N single-group relay collectives (one per comm) in parallel.
 
@@ -2666,6 +2941,7 @@ def _run_parallel_relay_once(
                 out_tensors[k],
                 count_list,
                 active_ranks_per_comm[k],
+                low_precision,
             )
         )
     for work in works:
@@ -2682,6 +2958,7 @@ def _parallel_relay_single_call(
     elements: int,
     dtype: torch.dtype,
     device: torch.device,
+    low_precision: bool = False,
 ) -> Any:
     """Zero-arg closure that issues this process's ONE single-group relay call.
 
@@ -2711,6 +2988,7 @@ def _parallel_relay_single_call(
         count_list,
         [[active_group]],
         1,
+        low_precision,
     )
 
 
@@ -2729,6 +3007,10 @@ def _parallel_relay_warmup_single(
     dist.barrier()
     warm_elems = 2048
     for collective in _sweep_collectives():
+        # FULL PRECISION ONLY: 2048 elements is below every relay-route crossover,
+        # so a low-precision call here declines on route and compiles nothing. Low
+        # precision is warmed by _measure_ms's untimed iterations at the measured
+        # size instead, which is also where the one-time arena bootstrap belongs.
         fn = _parallel_relay_single_call(
             collective,
             comm,
@@ -2782,6 +3064,8 @@ def _parallel_msg_sweep_relay_worker(
     os.environ["RANK"] = str(p)
     os.environ["WORLD_SIZE"] = str(total_procs)
 
+    _apply_lp_min_kb_env()
+
     store = dist.TCPStore(
         host_name="localhost",
         port=store_port,
@@ -2808,7 +3092,7 @@ def _parallel_msg_sweep_relay_worker(
     )
     job_device_group = _build_per_job_nccl_group(total_procs, job)
 
-    dtype = _MSG_SWEEP_DTYPE
+    dtype = _sweep_dtype()
     warmup = max(1, _env_int("BENCH_WARMUP_ITERS", 10))
     bench_iters = max(1, _env_int("BENCH_BENCH_ITERS", 100))
 
@@ -2847,30 +3131,35 @@ def _parallel_msg_sweep_relay_worker(
             elements = nbytes // dtype.itemsize
             if elements % active_ranks != 0:
                 continue
-            fn = _parallel_relay_single_call(
-                collective,
-                comm,
-                active_group,
-                rank_in_job,
-                active_ranks,
-                elements,
-                dtype,
-                device,
-            )
-            best, std = _measure_ms(
-                fn,
-                warmup,
-                bench_iters,
-                device_barrier_group=job_device_group,
-                reps=_sweep_reps(),
-            )
-            del fn
-            torch.cuda.empty_cache()
-            if is_job_rank0:
-                results_dict[f"relay_parallel_{collective}_{key}_{i}_job{job}"] = (
-                    best,
-                    std,
+            # FP then LP back to back on the same comm; see the fused worker for
+            # why the ratio is only meaningful measured this way.
+            for lp in (False, True):
+                fn = _parallel_relay_single_call(
+                    collective,
+                    comm,
+                    active_group,
+                    rank_in_job,
+                    active_ranks,
+                    elements,
+                    dtype,
+                    device,
+                    lp,
                 )
+                best, std = _measure_ms(
+                    fn,
+                    warmup,
+                    bench_iters,
+                    device_barrier_group=job_device_group,
+                    reps=_sweep_reps(),
+                )
+                del fn
+                torch.cuda.empty_cache()
+                if is_job_rank0:
+                    prefix = "relay_parallel_lp" if lp else "relay_parallel"
+                    results_dict[f"{prefix}_{collective}_{key}_{i}_job{job}"] = (
+                        best,
+                        std,
+                    )
 
     dist.barrier()
     dist.destroy_process_group()
@@ -2896,7 +3185,11 @@ def _reduce_parallel_jobs_max(results_dict: Any) -> None:
         for collective in _sweep_collectives():
             key = f"{collective}_a{active_ranks}"
             for i, (label, _nbytes) in enumerate(_sweep_sizes()):
-                for prefix in ("relay_parallel", "nccl_parallel"):
+                for prefix in (
+                    "relay_parallel",
+                    "relay_parallel_lp",
+                    "nccl_parallel",
+                ):
                     vals = [
                         results_dict.get(f"{prefix}_{key}_{i}_job{j}")
                         for j in range(num_jobs)
@@ -2963,7 +3256,7 @@ def _print_parallel_msg_sweep_report(results_dict: Any, dtype: torch.dtype) -> N
                     results_dict, dtype, collective, active_ranks
                 )
             )
-    _emit_report(lines, "bench_sharded_relay_parallel_sweep_results.txt")
+    _emit_report(lines, _report_basename("parallel", lp=False))
 
 
 def _format_single_group_sweep_table(
@@ -3024,13 +3317,383 @@ def _print_single_group_msg_sweep_report(results_dict: Any, dtype: torch.dtype) 
                     results_dict, dtype, collective, active_ranks
                 )
             )
-    _emit_report(lines, "bench_sharded_relay_single_group_sweep_results.txt")
+    _emit_report(lines, _report_basename("single_group", lp=False))
 
 
 # ---------------------------------------------------------------------------
 # TestCase — works with both "buck2 test" and "buck2 run" (same as the old
 # test_sharded_relay_2d_integration.py pattern).
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Low-precision comparison reports
+#
+# Three more files rather than three more columns in the existing ones. The
+# full-precision reports are checked-in snapshots that get diffed across
+# revisions, so widening them would churn every row of every snapshot for a
+# column most readers of those files are not asking about. The LP tables carry
+# the full-precision numbers alongside instead, so each file still stands alone.
+# ---------------------------------------------------------------------------
+
+
+def _format_lp_sweep_table(
+    results_dict: Any,
+    dtype: torch.dtype,
+    collective: str,
+    active_ranks: int,
+    heading: str,
+    subheadings: list[str],
+    band: str,
+    nccl_key: str,
+    relay_key: str,
+    relay_lp_key: str,
+) -> list[str]:
+    """One (collective, A) low-precision comparison table.
+
+    Five data columns rather than three: NCCL, Relay, Relay-LP and BOTH ratios.
+    LP-vs-NCCL is what a caller choosing between NCCL and the relay-with-LP cares
+    about; LP-vs-Relay is the one this table exists for, because it isolates the
+    wire format from everything else the relay does.
+
+    WHERE LP-vs-Relay READS 1.00x BELOW THE CROSSOVER, LOW PRECISION DECLINED.
+    The size gate is silent, so below the crossover Relay-LP runs the identical
+    code path as Relay and the ratio is 1 by construction rather than by
+    measurement. That is the signal these tables are for: the size at which the
+    ratio leaves 1.00x IS the crossover. It is also why
+    NCCL_SHARDED_RELAY_LP_MIN_KB exists -- with the built-in threshold the small
+    end of the axis is refused before it is timed, so the crossover is the one
+    number the sweep could not otherwise see.
+
+    The converse does NOT hold, and reading it as though it did has cost real
+    time on this workstream. Size is only one of lpEligible()'s decline reasons;
+    route, count alignment, graph capture and arena capacity are the others, none
+    of them size-dependent and all of them just as silent. So a 1.00x ABOVE the
+    crossover means "either a tie or a non-size decline" and has to be
+    disambiguated with NCCL_DEBUG rather than assumed. _lp_gate_preamble() says
+    so in the emitted file, which is the only place a reader of the checked-in
+    snapshot can see it.
+    """
+    width = 78
+    line = "=" * width
+    out: list[str] = ["", line, heading, *subheadings, _lp_gate_regime(), line]
+    out.append(f"{'':>10} | {band:^65}")
+    out.append(
+        f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} "
+        f"{'RelayLP(ms)':>12} {'LP vs NCCL':>11} {'LP vs Relay':>12}"
+    )
+    out.append("-" * width)
+    for i, (label, nbytes) in enumerate(_sweep_sizes()):
+        elements = nbytes // dtype.itemsize
+        if elements % active_ranks != 0:
+            continue
+        n = _sweep_get_ms(results_dict, nccl_key.format(i=i))
+        r = _sweep_get_ms(results_dict, relay_key.format(i=i))
+        rl = _sweep_get_ms(results_dict, relay_lp_key.format(i=i))
+        out.append(
+            f"{label:>10} | {_sweep_fmt_ms(n):>10} {_sweep_fmt_ms(r):>10} "
+            f"{_sweep_fmt_ms(rl):>12} {_sweep_fmt_speedup(n, rl):>11} "
+            f"{_sweep_fmt_speedup(r, rl):>12}"
+        )
+    out.append(line)
+    return out
+
+
+def _print_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -> None:
+    """FUSED sweep, full precision vs low precision."""
+    lines: list[str] = _lp_gate_preamble()
+    for collective in _sweep_collectives():
+        for active_ranks in _sweep_active_ranks():
+            num_groups = NUM_GPUS // active_ranks
+            key = f"{collective}_a{active_ranks}"
+            title = collective.replace("_", "-").upper()
+            lines.extend(
+                _format_lp_sweep_table(
+                    results_dict,
+                    dtype,
+                    collective,
+                    active_ranks,
+                    f"Sharded Relay {title} — Low-Precision Message-Size Sweep "
+                    f"(MI350X, {NUM_GPUS} GPUs, {dtype})",
+                    [
+                        f"  {active_ranks} active ranks/group; times = "
+                        "best-of-N (min), barrier-aligned + hipEvent-timed",
+                        f"  FUSED = {num_groups}-group sharded relay; "
+                        "Relay and Relay-LP measured back to back on the SAME comm",
+                    ],
+                    f"FUSED ({num_groups} groups)",
+                    f"nccl_{key}_fused_{{i}}",
+                    f"relay_{key}_fused_{{i}}",
+                    f"relay_lp_{key}_fused_{{i}}",
+                )
+            )
+    _emit_report(lines, _report_basename("fused", lp=True))
+
+
+def _print_parallel_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -> None:
+    """Parallel separate-job sweep, full precision vs low precision."""
+    lines: list[str] = _lp_gate_preamble()
+    for collective in _sweep_collectives():
+        for active_ranks in _sweep_active_ranks():
+            num_parallel = NUM_GPUS // active_ranks
+            key = f"{collective}_a{active_ranks}"
+            title = collective.replace("_", "-").upper()
+            lines.extend(
+                _format_lp_sweep_table(
+                    results_dict,
+                    dtype,
+                    collective,
+                    active_ranks,
+                    f"Sharded Relay {title} — Low-Precision {num_parallel}x "
+                    f"Parallel Sweep (MI350X, {NUM_GPUS} GPUs, {dtype})",
+                    [
+                        f"  {active_ranks} active ranks/group; times = "
+                        "best-of-N (min), max across jobs",
+                        f"  PARALLEL = {num_parallel} co-resident jobs; Relay and "
+                        "Relay-LP measured back to back on the SAME comm",
+                    ],
+                    f"PARALLEL ({num_parallel} jobs)",
+                    f"nccl_parallel_{key}_{{i}}",
+                    f"relay_parallel_{key}_{{i}}",
+                    f"relay_parallel_lp_{key}_{{i}}",
+                )
+            )
+    _emit_report(lines, _report_basename("parallel", lp=True))
+
+
+def _print_single_group_msg_sweep_lp_report(
+    results_dict: Any, dtype: torch.dtype
+) -> None:
+    """Single-group best case, full precision vs low precision.
+
+    Reads the same reduced base keys the parallel LP report reads -- this sweep is
+    the parallel sweep's num_jobs == 1 point.
+    """
+    lines: list[str] = _lp_gate_preamble()
+    for collective in _sweep_collectives():
+        for active_ranks in _sweep_active_ranks():
+            key = f"{collective}_a{active_ranks}"
+            title = collective.replace("_", "-").upper()
+            lines.extend(
+                _format_lp_sweep_table(
+                    results_dict,
+                    dtype,
+                    collective,
+                    active_ranks,
+                    f"Sharded Relay {title} — Low-Precision Single-Group "
+                    f"Best-Case Sweep (MI350X, {NUM_GPUS} GPUs, {dtype})",
+                    [
+                        f"  {active_ranks} active ranks/group; times = "
+                        "best-of-N (min), no co-resident jobs",
+                        "  Relay and Relay-LP measured back to back on the SAME "
+                        "comm",
+                    ],
+                    "SINGLE GROUP (1 job)",
+                    f"nccl_parallel_{key}_{{i}}",
+                    f"relay_parallel_{key}_{{i}}",
+                    f"relay_parallel_lp_{key}_{{i}}",
+                )
+            )
+    _emit_report(lines, _report_basename("single_group", lp=True))
+
+
+class EmitReportTest(unittest.TestCase):
+    """CPU-only cover for the report writer.
+
+    Deliberately its own TestCase: BenchShardedRelayPerfTest skips without 8 GPUs,
+    and this is the one part of the bench that is pure Python and can go wrong
+    without any GPU at all -- which is exactly what happened. With three reports
+    per run BENCH_RESULTS_FILE silently kept only the last, and nothing failed.
+    """
+
+    def setUp(self) -> None:
+        _EMITTED_BASENAMES.clear()
+
+    def tearDown(self) -> None:
+        _EMITTED_BASENAMES.clear()
+
+    def test_results_dir_gives_one_file_per_report(self) -> None:
+        """The case the run actually needs: six reports, six files."""
+        basenames = [
+            "bench_sharded_relay_fused_sweep_results.txt",
+            "bench_sharded_relay_parallel_sweep_results.txt",
+            "bench_sharded_relay_single_group_sweep_results.txt",
+            "bench_sharded_relay_fused_lp_sweep_results.txt",
+            "bench_sharded_relay_parallel_lp_sweep_results.txt",
+            "bench_sharded_relay_single_group_lp_sweep_results.txt",
+        ]
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"BENCH_RESULTS_DIR": d}, clear=False):
+                os.environ.pop("BENCH_RESULTS_FILE", None)
+                written = [_emit_report([f"body {b}"], b) for b in basenames]
+        self.assertEqual(len(set(written)), len(basenames))
+        for path, basename in zip(written, basenames):
+            self.assertEqual(os.path.basename(path), basename)
+
+    def test_report_basenames_separate_the_dtypes(self) -> None:
+        """The two dtypes are different results, so they must not share a path.
+
+        This is the case that motivated putting the dtype in the name: an fp32
+        run used to write over the bf16 snapshot it was meant to be compared
+        against, and the file still looked plausible afterwards.
+        """
+        scopes = ("fused", "parallel", "single_group")
+        names = set()
+        for dtype in ("bf16", "fp32"):
+            with mock.patch.dict(os.environ, {"BENCH_SWEEP_DTYPE": dtype}, clear=False):
+                for scope in scopes:
+                    for lp in (False, True):
+                        name = _report_basename(scope, lp=lp)
+                        self.assertIn(dtype, name)
+                        names.add(name)
+        self.assertEqual(len(names), len(scopes) * 2 * 2)
+
+    def test_report_basenames_separate_tuning_from_shipped(self) -> None:
+        """A tuning run must not overwrite a shipped snapshot.
+
+        Same hazard the dtype tag exists for. A tuning run forces the size gate
+        open, so its low-precision tables describe a policy that does not ship,
+        and the shipped file it would clobber still looks plausible afterwards.
+        Both reports are tagged, not just the LP one, so the invariant is simply
+        "a tuning run overwrites nothing" and needs no manual revert after.
+        """
+        scopes = ("fused", "parallel", "single_group")
+        names = set()
+        for min_kb in ("", "1"):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                if min_kb:
+                    os.environ["BENCH_LP_MIN_KB"] = min_kb
+                else:
+                    os.environ.pop("BENCH_LP_MIN_KB", None)
+                for scope in scopes:
+                    for lp in (False, True):
+                        name = _report_basename(scope, lp=lp)
+                        self.assertEqual("tuning" in name, bool(min_kb))
+                        names.add(name)
+        self.assertEqual(len(names), len(scopes) * 2 * 2)
+
+    def test_lp_preamble_states_the_regime_and_the_non_size_declines(self) -> None:
+        """The reading rule belongs in the FILE, and it has to be correct.
+
+        "1.00x means declined" is sound below the crossover and wrong above it:
+        arena capacity, route, alignment and graph capture decline just as
+        silently and do not depend on size. The preamble has to say so, because
+        assuming the converse is how a silent capacity decline reads as a
+        plateau.
+        """
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BENCH_LP_MIN_KB", None)
+            shipped = "\n".join(_lp_gate_preamble())
+        self.assertIn("lpMinBytes", shipped)
+        self.assertIn("arena capacity", shipped)  # the non-size reason
+        self.assertIn("NCCL_DEBUG", shipped)  # how to disambiguate
+        with mock.patch.dict(os.environ, {"BENCH_LP_MIN_KB": "1"}, clear=False):
+            tuning = "\n".join(_lp_gate_preamble())
+        self.assertIn("TUNING RUN", tuning)
+        self.assertIn("1 KB", tuning)
+        self.assertNotEqual(shipped, tuning)
+
+    def test_emitted_report_has_no_lint_bait_whitespace(self) -> None:
+        """The emitter's own bytes must be what a formatter would leave alone.
+
+        Centered band headers pad on both sides and every table leads with "" to
+        separate itself, so trailing whitespace and a leading blank line are
+        produced by construction. arc f strips both from the checked-in
+        snapshots and the next sweep writes them back, so the artefacts and the
+        tool drift apart on every refresh unless the emitter is the one that
+        normalizes. Only LEADING blanks go -- the separator between tables stays.
+        """
+        lines = ["", "", f"{'':>10} | {'FUSED (4 groups)':^33}", "row   ", "", "x"]
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"BENCH_RESULTS_DIR": d}, clear=False):
+                os.environ.pop("BENCH_RESULTS_FILE", None)
+                path = _emit_report(lines, "whitespace_check.txt")
+            with open(path) as f:
+                written = f.read()
+        self.assertFalse(written.startswith("\n"), "leading blank line survived")
+        for i, line in enumerate(written.split("\n")):
+            self.assertEqual(line, line.rstrip(), f"line {i} has trailing space")
+        # The interior blank line is a separator and must NOT be swallowed.
+        self.assertIn("\n\nx\n", written)
+
+    def test_extra_sweep_sizes_merge_sorted_deduped_and_clip(self) -> None:
+        """BENCH_SWEEP_EXTRA_MB opens up the gaps the fixed axis steps over.
+
+        The axis jumps 40 MB -> 63 MB, which is precisely where the 4-active
+        reduce-scatter's ratio steps, so the two dtypes cannot be told apart
+        there. Order matters beyond tidiness: per-size result keys are positional,
+        so a worker and a formatter that disagreed on the order would silently
+        pair a time with the wrong size.
+        """
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for key in (
+                "BENCH_SWEEP_EXTRA_MB",
+                "BENCH_SWEEP_MIN_MB",
+                "BENCH_SWEEP_MAX_MB",
+            ):
+                os.environ.pop(key, None)
+            base = _sweep_sizes()
+
+            os.environ["BENCH_SWEEP_EXTRA_MB"] = "48,44,60,40"
+            merged = _sweep_sizes()
+            # 40 MB is already on the axis, so it is ignored rather than doubled.
+            self.assertEqual(len(merged), len(base) + 3)
+            self.assertEqual(len(merged), len({b for _, b in merged}))
+            self.assertEqual([b for _, b in merged], sorted(b for _, b in merged))
+            labels = [lbl for lbl, _ in merged]
+            for want in ("44 MB", "48 MB", "60 MB"):
+                self.assertIn(want, labels)
+            self.assertEqual(labels.count("40 MB"), 1)
+
+            # Extras are subject to the same clipping as the fixed axis.
+            os.environ["BENCH_SWEEP_MIN_MB"] = "41"
+            os.environ["BENCH_SWEEP_MAX_MB"] = "63"
+            clipped = [lbl for lbl, _ in _sweep_sizes()]
+            self.assertEqual(clipped, ["44 MB", "48 MB", "60 MB", "63 MB"])
+
+    def test_extra_sweep_size_rejects_a_non_positive_value(self) -> None:
+        """A typo should fail loudly, not silently add a zero-byte size."""
+        with mock.patch.dict(os.environ, {"BENCH_SWEEP_EXTRA_MB": "44,0"}, clear=False):
+            with self.assertRaises(ValueError):
+                _sweep_sizes()
+
+    def test_results_file_accepts_a_single_report(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "only.txt")
+            with mock.patch.dict(
+                os.environ, {"BENCH_RESULTS_FILE": target}, clear=False
+            ):
+                path = _emit_report(["body"], "whatever.txt")
+                self.assertEqual(path, target)
+                with open(target) as f:
+                    self.assertIn("body", f.read())
+
+    def test_results_file_rejects_a_second_distinct_report(self) -> None:
+        """The regression. It used to overwrite and report success."""
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "only.txt")
+            with mock.patch.dict(
+                os.environ, {"BENCH_RESULTS_FILE": target}, clear=False
+            ):
+                _emit_report(["first"], "first.txt")
+                with self.assertRaises(RuntimeError) as cm:
+                    _emit_report(["second"], "second.txt")
+        msg = str(cm.exception)
+        self.assertIn("BENCH_RESULTS_DIR", msg)  # names the fix
+        self.assertIn("first.txt", msg)  # names what would have been lost
+        self.assertIn("second.txt", msg)
+
+    def test_results_file_allows_re_emitting_the_same_report(self) -> None:
+        """A re-run of one report is not two reports colliding."""
+        with tempfile.TemporaryDirectory() as d:
+            target = os.path.join(d, "only.txt")
+            with mock.patch.dict(
+                os.environ, {"BENCH_RESULTS_FILE": target}, clear=False
+            ):
+                _emit_report(["first"], "same.txt")
+                _emit_report(["second"], "same.txt")
+                with open(target) as f:
+                    self.assertIn("second", f.read())
 
 
 class BenchShardedRelayPerfTest(unittest.TestCase):
@@ -3138,7 +3801,8 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
             join=True,
         )
 
-        _print_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
+        _print_msg_sweep_report(results, _sweep_dtype())
+        _print_msg_sweep_lp_report(results, _sweep_dtype())
 
         manager.shutdown()
 
@@ -3214,7 +3878,8 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
 
         # Reduce per-job entries to max-across-jobs, then print the tables.
         _reduce_parallel_jobs_max(results)
-        _print_parallel_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
+        _print_parallel_msg_sweep_report(results, _sweep_dtype())
+        _print_parallel_msg_sweep_lp_report(results, _sweep_dtype())
 
         manager.shutdown()
 
@@ -3268,7 +3933,8 @@ class BenchShardedRelayPerfTest(unittest.TestCase):
 
         # Collapse the single job's per-job entries to the base keys, then print.
         _reduce_parallel_jobs_max(results)
-        _print_single_group_msg_sweep_report(results, _MSG_SWEEP_DTYPE)
+        _print_single_group_msg_sweep_report(results, _sweep_dtype())
+        _print_single_group_msg_sweep_lp_report(results, _sweep_dtype())
 
         manager.shutdown()
 

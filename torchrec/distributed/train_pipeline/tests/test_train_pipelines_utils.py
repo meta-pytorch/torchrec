@@ -14,6 +14,7 @@ from typing import cast, List, NamedTuple, Optional, Tuple, Union
 from unittest.mock import MagicMock, patch
 
 import torch
+from torch._dynamo import is_dynamo_supported
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.test_utils.test_model import (
     ModelInput,
@@ -148,6 +149,7 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         self.assertEqual(missing_keys, [])
         self.assertEqual(unexpected_keys, [])
 
+    @unittest.skipIf(not is_dynamo_supported(), "Dynamo not supported")
     @unittest.skipIf(
         not torch.cuda.is_available(),
         "Not enough GPUs, this test requires at least one GPU",

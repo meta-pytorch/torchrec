@@ -61,6 +61,11 @@ jobs:
           - version: "3.14"
             tag: "py314"
             free_threaded: true
+          - version: "3.15"
+            tag: "py315"
+          - version: "3.15"
+            tag: "py315"
+            free_threaded: true
         is_pr:
           - ${{ github.event_name == 'pull_request' }}
         is_main_push:  # for main branch
@@ -68,10 +73,6 @@ jobs:
         exclude:
           - is_pr: true
             cuda-tag: "cu126"
-          - is_pr: true
-            cuda-tag: "cu128"
-          - is_pr: true
-            cuda-tag: "cu129"
           - is_pr: true
             cuda-tag: "cu130"
             python:
@@ -84,6 +85,15 @@ jobs:
             cuda-tag: "cu130"
             python:
               version: "3.13"
+          - is_pr: true
+            cuda-tag: "cu130"
+            python:
+              version: "3.15"
+          - is_pr: true
+            cuda-tag: "cu130"
+            python:
+              version: "3.15"
+              free_threaded: true
           - is_main_push: true
             cuda-tag: "cu126"
             python:
@@ -92,6 +102,15 @@ jobs:
             cuda-tag: "cu126"
             python:
               version: "3.13"
+          - is_main_push: true
+            cuda-tag: "cu126"
+            python:
+              version: "3.15"
+          - is_main_push: true
+            cuda-tag: "cu126"
+            python:
+              version: "3.15"
+              free_threaded: true
           - is_main_push: true
             cuda-tag: "cu130"
             python:
@@ -109,10 +128,15 @@ jobs:
       timeout: 60
       script: |
         ldd --version
-        if [[ "${{ matrix.python.free_threaded }}" == "true" ]]; then
-          conda create -y --name build_binary python-freethreading=${{ matrix.python.version }}
+        if [[ "${{ matrix.python.version }}" == "3.15" ]]; then
+          conda_channel_args=(--override-channels -c conda-forge/label/python_rc -c conda-forge)
         else
-          conda create -y --name build_binary python=${{ matrix.python.version }}
+          conda_channel_args=()
+        fi
+        if [[ "${{ matrix.python.free_threaded }}" == "true" ]]; then
+          conda create -y --name build_binary "${conda_channel_args[@]}" python-freethreading=${{ matrix.python.version }}
+        else
+          conda create -y --name build_binary "${conda_channel_args[@]}" python=${{ matrix.python.version }}
         fi
         conda run -n build_binary \
           python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}') if sys.version >= '3.13' else print('python GIL enabled: true')"

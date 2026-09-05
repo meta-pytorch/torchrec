@@ -941,7 +941,7 @@ class PerfWrapper:
 
         self._cur += 1
 
-    def measure(self, fn: Callable[[], None]) -> None:
+    def measure(self, fn: Callable[[], None], gpu_backlog_cycles: int = 0) -> None:
         """Run ``fn`` bracketed by start/end measurement.
 
         When a process group is set, all ranks rendezvous at a ``dist.barrier``
@@ -961,6 +961,12 @@ class PerfWrapper:
             # the barrier's stream op precedes the start event).
             if torch.cuda.is_available():
                 torch.cuda.synchronize(self._device)
+        if gpu_backlog_cycles > 0:
+            # Keep the GPU behind the host before recording the start event. This
+            # prevents host launch gaps from becoming idle time inside the CUDA-event
+            # interval while leaving the synthetic delay itself outside that interval.
+            # pyrefly: ignore[missing-module-attribute]
+            torch.cuda._sleep(gpu_backlog_cycles)
         self._start()
         fn()
         self._end()
@@ -1087,6 +1093,7 @@ def _run_cuda_benchmark(
     reset_accumulated_memory_stats: bool = True,
     sample_count: int = 0,
     pg: Optional[dist.ProcessGroup] = None,
+    gpu_backlog_cycles: int = 0,
 ) -> PerfWrapper:
     """Run benchmark iterations on CUDA, collecting GPU/CPU timing and memory stats.
 
@@ -1107,7 +1114,7 @@ def _run_cuda_benchmark(
         if i > 0:
             torch.cuda.synchronize(perf.device)
 
-        perf.measure(run_iter_fn)
+        perf.measure(run_iter_fn, gpu_backlog_cycles)
     logger.info(f"Cuda benchmark finished on rank {rank}")
 
     return perf
@@ -1135,6 +1142,8 @@ def _run_cuda_profiling(
     all_rank_traces: bool,
     memory_snapshot: bool,
     profile_all_threads: bool = False,
+    gpu_backlog_cycles: int = 0,
+    gpu_backlog_ms: float = 0.0,
 ) -> None:
     """Run optional CUDA profiling with chrome trace export and memory snapshot."""
     try:
@@ -1198,6 +1207,10 @@ def _run_cuda_profiling(
         on_trace_ready=_trace_handler,
         experimental_config=experimental_config,
     ) as prof:
+        if gpu_backlog_cycles > 0:
+            with record_function(f"## GPU backlog ({gpu_backlog_ms:.1f} ms) ##"):
+                # pyrefly: ignore[missing-module-attribute]
+                torch.cuda._sleep(gpu_backlog_cycles)
         profile_iter_fn(prof)
 
     # Synchronize again after profiling to guarantee deterministic ordering
@@ -1237,6 +1250,7 @@ def _run_benchmark_core(
     sample_count: int = 0,
     test_name: str = "",
     pg: Optional[dist.ProcessGroup] = None,
+    gpu_backlog_ms: float = 0.0,
 ) -> BenchmarkResult:
     """Internal helper that contains the core benchmarking logic shared by
     ``benchmark`` and ``benchmark_func``.  All heavy–lifting (timing, memory
@@ -1265,10 +1279,31 @@ def _run_benchmark_core(
         memory_snapshot: Whether to capture memory snapshot during the profiling
             usage: https://docs.pytorch.org/memory_viz
         sample_count: Number of samples per iteration, used to calculate QPS.
+        gpu_backlog_ms: Synthetic GPU delay queued before CUDA timing events. This
+            keeps a CPU-bound launch sequence queued behind the device so event timing
+            measures GPU execution rather than GPU idle time waiting for the host.
     """
+
+    if gpu_backlog_ms < 0:
+        raise ValueError("gpu_backlog_ms must be non-negative")
 
     # Preparation
     _pre_gpu_load(pre_gpu_load, device_type)
+
+    gpu_backlog_cycles = 0
+    if device_type == "cuda" and gpu_backlog_ms > 0:
+        calibration_cycles = 1_000_000
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        # pyrefly: ignore[missing-module-attribute]
+        torch.cuda._sleep(calibration_cycles)
+        end_event.record()
+        end_event.synchronize()
+        calibration_ms = start_event.elapsed_time(end_event)
+        gpu_backlog_cycles = max(
+            1, int(calibration_cycles * gpu_backlog_ms / calibration_ms)
+        )
 
     # Timings and memory statistics collection
     if device_type == "cuda":
@@ -1279,6 +1314,7 @@ def _run_benchmark_core(
             reset_accumulated_memory_stats,
             sample_count,
             pg,
+            gpu_backlog_cycles,
         )
         result = perf.to_benchmark_result(name, rank, world_size)
     else:  # CPU benchmarking
@@ -1316,6 +1352,8 @@ def _run_benchmark_core(
             all_rank_traces=all_rank_traces,
             memory_snapshot=memory_snapshot,
             profile_all_threads=profile_all_threads,
+            gpu_backlog_cycles=gpu_backlog_cycles,
+            gpu_backlog_ms=gpu_backlog_ms,
         )
 
     # Dump benchmark result to local storage
@@ -1399,6 +1437,7 @@ class BenchFuncConfig:
     profile_all_threads: bool = False
     loglevel: str = "WARNING"
     test_name: str = ""
+    gpu_backlog_ms: float = 0.0
     # When True, enable PyTorch's CUDA ``expandable_segments`` caching-allocator
     # mode for the benchmark process(es). expandable_segments reserves a growable
     # virtual address range and maps physical pages on demand, so the allocator
@@ -1435,6 +1474,7 @@ class BenchFuncConfig:
             "memory_snapshot": self.memory_snapshot,
             "profile_all_threads": self.profile_all_threads,
             "test_name": self.test_name,
+            "gpu_backlog_ms": self.gpu_backlog_ms,
         } | kwargs_to_override
 
     def set_log_level(self) -> None:
@@ -1472,6 +1512,7 @@ def benchmark_func(
     sample_count: int = 0,
     test_name: str = "",
     pg: Optional[dist.ProcessGroup] = None,
+    gpu_backlog_ms: float = 0.0,
 ) -> BenchmarkResult:
     """
     Args:
@@ -1497,6 +1538,8 @@ def benchmark_func(
         all_rank_traces: Whether to export traces from all ranks.
         memory_snapshot: Whether to capture memory snapshot during the profiling
             usage: https://docs.pytorch.org/memory_viz
+        gpu_backlog_ms: Synthetic GPU delay queued ahead of measured work so CUDA
+            event timing does not include GPU idle time waiting on CPU launches.
         pg: Optional process group. When provided, all ranks barrier before each
             measured iteration so cross-rank arrival skew is absorbed outside the
             timing window -- important for collective (e.g. all-to-all) benchmarks
@@ -1548,4 +1591,5 @@ def benchmark_func(
         sample_count=sample_count,
         test_name=test_name,
         pg=pg,
+        gpu_backlog_ms=gpu_backlog_ms,
     )

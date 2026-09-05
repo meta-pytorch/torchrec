@@ -2310,5 +2310,74 @@ class FusedAllGather4ActiveValidationTest(unittest.TestCase):
         self.assertNotIsInstance(cm.exception, ValueError)
 
 
+# ---------------------------------------------------------------------------
+# Tests for the low_precision kwarg
+# ---------------------------------------------------------------------------
+
+
+class LowPrecisionForwardingTest(unittest.TestCase):
+    """
+    That `low_precision` reaches the backend, and defaults to False.
+
+    This suite is CPU-only and fully mocked, so low precision never actually
+    executes here -- forwarding is the only thing it can meaningfully cover, and
+    it is worth covering: the kwarg is threaded through four independent wrappers
+    and a dropped one would be invisible, because the backend silently declines
+    to full precision anyway and the numbers would still be correct.
+    """
+
+    def test_allreduce_defaults_to_full_precision(self) -> None:
+        state = _make_state(rank=0)
+        allreduce_tensors_with_sharded_relay(
+            state, {torch.float32: [torch.zeros(100)]}, "test"
+        )
+        kwargs = state.fused.allreduce_multi_group.call_args_list[0].kwargs
+        self.assertFalse(kwargs["low_precision"])
+
+    def test_allreduce_forwards_low_precision(self) -> None:
+        state = _make_state(rank=0)
+        allreduce_tensors_with_sharded_relay(
+            state, {torch.float32: [torch.zeros(100)]}, "test", low_precision=True
+        )
+        kwargs = state.fused.allreduce_multi_group.call_args_list[0].kwargs
+        self.assertTrue(kwargs["low_precision"])
+
+    def test_reduce_scatter_forwards_low_precision(self) -> None:
+        state = _make_state(rank=0)
+        reduce_scatter_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(200)]},
+            {torch.float32: [torch.zeros(100)]},
+            "test",
+            low_precision=True,
+        )
+        kwargs = state.fused.reduce_scatter_multi_group.call_args_list[0].kwargs
+        self.assertTrue(kwargs["low_precision"])
+
+    def test_all_to_all_forwards_low_precision(self) -> None:
+        state = _make_state(rank=0)
+        all_to_all_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(200)]},
+            {torch.float32: [torch.zeros(200)]},
+            "test",
+            low_precision=True,
+        )
+        kwargs = state.fused.all_to_all_multi_group.call_args_list[0].kwargs
+        self.assertTrue(kwargs["low_precision"])
+
+    def test_all_gather_forwards_low_precision(self) -> None:
+        state = _make_state(rank=0)
+        all_gather_tensors_with_sharded_relay(
+            state,
+            {torch.float32: [torch.zeros(100)]},
+            {torch.float32: [torch.zeros(200)]},
+            "test",
+            low_precision=True,
+        )
+        kwargs = state.fused.all_gather_multi_group.call_args_list[0].kwargs
+        self.assertTrue(kwargs["low_precision"])
+
+
 if __name__ == "__main__":
     unittest.main()

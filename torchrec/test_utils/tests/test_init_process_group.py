@@ -11,10 +11,14 @@ import os
 import unittest
 from contextlib import contextmanager
 from typing import Iterator
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import torch
 import torch.distributed as dist
-from torchrec.test_utils import init_process_group_single_rank
+from torchrec.test_utils import (
+    init_distributed_single_host,
+    init_process_group_single_rank,
+)
 
 
 @contextmanager
@@ -73,3 +77,29 @@ class InitProcessGroupSingleRankTest(unittest.TestCase):
                 init_process_group_single_rank("gloo")
 
         self.assertIn("already_initialized=True", logs.output[0])
+
+
+class InitDistributedSingleHostTest(unittest.TestCase):
+    @patch("torchrec.test_utils.dist.init_process_group")
+    @patch("torchrec.test_utils.dist.is_initialized", return_value=False)
+    def test_forwards_bound_device_to_process_group(
+        self,
+        _is_initialized: Mock,
+        init_process_group: Mock,
+    ) -> None:
+        device = torch.device("cuda:3")
+
+        init_distributed_single_host(
+            rank=3,
+            world_size=4,
+            backend="nccl",
+            local_size=2,
+            device_id=device,
+        )
+
+        init_process_group.assert_called_once_with(
+            rank=3,
+            world_size=4,
+            backend="nccl",
+            device_id=device,
+        )
