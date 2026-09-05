@@ -341,6 +341,65 @@ def _apply_lp_min_kb_env() -> None:
         os.environ["NCCL_SHARDED_RELAY_LP_MIN_KB"] = min_kb
 
 
+def _lp_min_kb_override() -> str:
+    """The BENCH_LP_MIN_KB in force, or "" when the shipped gate applies.
+
+    Read from the parent process, which is where the sweep composes its reports;
+    _apply_lp_min_kb_env() exports the NCCL_ name in each worker.
+    """
+    return (os.environ.get("BENCH_LP_MIN_KB") or "").strip()
+
+
+def _lp_gate_regime() -> str:
+    """One-line marker naming the gate regime a low-precision table ran under.
+
+    In the FILE, not only in a docstring. A tuning run and a shipped run produce
+    tables that are identical in shape and differ only in which rows were
+    eligible, so a snapshot that does not say which one it is cannot be read.
+    """
+    override = _lp_min_kb_override()
+    if override:
+        return (
+            f"  LP gate: FORCED to >= {override} KB via BENCH_LP_MIN_KB "
+            "-- TUNING RUN, not shipped behaviour"
+        )
+    return "  LP gate: the shipped lpMinBytes() thresholds"
+
+
+def _lp_gate_preamble() -> list[str]:
+    """How to read a 1.00x LP-vs-Relay cell. Emitted once per report file.
+
+    This convention used to live only in _format_lp_sweep_table's docstring,
+    which nobody reading the checked-in .txt ever sees. It was also STATED TOO
+    BROADLY: it is sound for the SIZE gate, but lpEligible() declines on route,
+    count alignment, graph capture and ARENA CAPACITY as well, none of which
+    depend on the threshold and all of which are equally silent. A capacity
+    decline lands ABOVE the crossover, where the old rule says "tie" and is
+    simply wrong -- which is how the 4-active allreduce's 1.00x at 1 GB was read
+    as a plateau for as long as it was.
+    """
+    width = 78
+    out = ["", "=" * width, "HOW TO READ THE 'LP vs Relay' COLUMN", "=" * width]
+    out.append(_lp_gate_regime())
+    out.extend(
+        [
+            "  1.00x BELOW the crossover is a DECLINE, not a tie. The size gate",
+            "  is silent, so Relay-LP there runs Relay's exact code path and the",
+            "  ratio is 1 by construction rather than by measurement.",
+            "",
+            "  1.00x ABOVE the crossover is NOT proof of a tie. Route, count",
+            "  alignment, graph capture and arena capacity decline just as",
+            "  silently and do NOT depend on message size, so a shape can be",
+            "  past its threshold and still be running full precision twice.",
+            "  Confirm before believing a plateau:",
+            "    NCCL_DEBUG=INFO NCCL_DEBUG_SUBSYS=COLL,INIT",
+            "  and look for 'low precision declined (<reason>)'.",
+            "=" * width,
+        ]
+    )
+    return out
+
+
 # Data type for the message-size sweep comparison. See _sweep_dtype().
 _MSG_SWEEP_DTYPE_DEFAULT: torch.dtype = torch.bfloat16
 _MSG_SWEEP_DTYPES: dict[str, torch.dtype] = {
@@ -390,11 +449,19 @@ def _report_basename(scope: str, lp: bool) -> str:
     supposed to be compared against, and the file still looks plausible --
     exactly the stale-data failure that has already invalidated conclusions on
     this workstream once.
+
+    A TUNING run gets its own token for the same reason and the same hazard. It
+    forces the size gate open, so its low-precision tables describe a policy
+    that does not ship; writing those over the shipped snapshot leaves a file
+    that still looks plausible. Tagging both reports -- not just the LP one --
+    keeps the invariant simple: a tuning run overwrites no shipped snapshot at
+    all, so it needs no manual revert afterwards.
     """
     lp_part = "lp_" if lp else ""
+    tuning_part = "tuning_" if _lp_min_kb_override() else ""
     return (
         f"bench_sharded_relay_{scope}_{_dtype_tag(_sweep_dtype())}_"
-        f"{lp_part}sweep_results.txt"
+        f"{lp_part}{tuning_part}sweep_results.txt"
     )
 
 
@@ -3226,17 +3293,27 @@ def _format_lp_sweep_table(
     about; LP-vs-Relay is the one this table exists for, because it isolates the
     wire format from everything else the relay does.
 
-    WHERE LP-vs-Relay READS 1.00x, LOW PRECISION DECLINED. The gate is size-only
-    and silent, so below the crossover Relay-LP runs the identical code path as
-    Relay and the ratio is 1 by construction rather than by measurement. That is
-    the signal these tables are for: the size at which the ratio leaves 1.00x IS
-    the crossover. It is also why NCCL_SHARDED_RELAY_LP_MIN_KB exists -- with the
-    built-in threshold the small end of the axis is refused before it is timed, so
-    the crossover is the one number the sweep could not otherwise see.
+    WHERE LP-vs-Relay READS 1.00x BELOW THE CROSSOVER, LOW PRECISION DECLINED.
+    The size gate is silent, so below the crossover Relay-LP runs the identical
+    code path as Relay and the ratio is 1 by construction rather than by
+    measurement. That is the signal these tables are for: the size at which the
+    ratio leaves 1.00x IS the crossover. It is also why
+    NCCL_SHARDED_RELAY_LP_MIN_KB exists -- with the built-in threshold the small
+    end of the axis is refused before it is timed, so the crossover is the one
+    number the sweep could not otherwise see.
+
+    The converse does NOT hold, and reading it as though it did has cost real
+    time on this workstream. Size is only one of lpEligible()'s decline reasons;
+    route, count alignment, graph capture and arena capacity are the others, none
+    of them size-dependent and all of them just as silent. So a 1.00x ABOVE the
+    crossover means "either a tie or a non-size decline" and has to be
+    disambiguated with NCCL_DEBUG rather than assumed. _lp_gate_preamble() says
+    so in the emitted file, which is the only place a reader of the checked-in
+    snapshot can see it.
     """
     width = 78
     line = "=" * width
-    out: list[str] = ["", line, heading, *subheadings, line]
+    out: list[str] = ["", line, heading, *subheadings, _lp_gate_regime(), line]
     out.append(f"{'':>10} | {band:^65}")
     out.append(
         f"{'Msg Size':>10} | {'NCCL(ms)':>10} {'Relay(ms)':>10} "
@@ -3261,7 +3338,7 @@ def _format_lp_sweep_table(
 
 def _print_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -> None:
     """FUSED sweep, full precision vs low precision."""
-    lines: list[str] = []
+    lines: list[str] = _lp_gate_preamble()
     for collective in _sweep_collectives():
         for active_ranks in _sweep_active_ranks():
             num_groups = NUM_GPUS // active_ranks
@@ -3292,7 +3369,7 @@ def _print_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -> None:
 
 def _print_parallel_msg_sweep_lp_report(results_dict: Any, dtype: torch.dtype) -> None:
     """Parallel separate-job sweep, full precision vs low precision."""
-    lines: list[str] = []
+    lines: list[str] = _lp_gate_preamble()
     for collective in _sweep_collectives():
         for active_ranks in _sweep_active_ranks():
             num_parallel = NUM_GPUS // active_ranks
@@ -3329,7 +3406,7 @@ def _print_single_group_msg_sweep_lp_report(
     Reads the same reduced base keys the parallel LP report reads -- this sweep is
     the parallel sweep's num_jobs == 1 point.
     """
-    lines: list[str] = []
+    lines: list[str] = _lp_gate_preamble()
     for collective in _sweep_collectives():
         for active_ranks in _sweep_active_ranks():
             key = f"{collective}_a{active_ranks}"
@@ -3407,6 +3484,51 @@ class EmitReportTest(unittest.TestCase):
                         self.assertIn(dtype, name)
                         names.add(name)
         self.assertEqual(len(names), len(scopes) * 2 * 2)
+
+    def test_report_basenames_separate_tuning_from_shipped(self) -> None:
+        """A tuning run must not overwrite a shipped snapshot.
+
+        Same hazard the dtype tag exists for. A tuning run forces the size gate
+        open, so its low-precision tables describe a policy that does not ship,
+        and the shipped file it would clobber still looks plausible afterwards.
+        Both reports are tagged, not just the LP one, so the invariant is simply
+        "a tuning run overwrites nothing" and needs no manual revert after.
+        """
+        scopes = ("fused", "parallel", "single_group")
+        names = set()
+        for min_kb in ("", "1"):
+            with mock.patch.dict(os.environ, {}, clear=False):
+                if min_kb:
+                    os.environ["BENCH_LP_MIN_KB"] = min_kb
+                else:
+                    os.environ.pop("BENCH_LP_MIN_KB", None)
+                for scope in scopes:
+                    for lp in (False, True):
+                        name = _report_basename(scope, lp=lp)
+                        self.assertEqual("tuning" in name, bool(min_kb))
+                        names.add(name)
+        self.assertEqual(len(names), len(scopes) * 2 * 2)
+
+    def test_lp_preamble_states_the_regime_and_the_non_size_declines(self) -> None:
+        """The reading rule belongs in the FILE, and it has to be correct.
+
+        "1.00x means declined" is sound below the crossover and wrong above it:
+        arena capacity, route, alignment and graph capture decline just as
+        silently and do not depend on size. The preamble has to say so, because
+        assuming the converse is how a silent capacity decline reads as a
+        plateau.
+        """
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BENCH_LP_MIN_KB", None)
+            shipped = "\n".join(_lp_gate_preamble())
+        self.assertIn("lpMinBytes", shipped)
+        self.assertIn("arena capacity", shipped)  # the non-size reason
+        self.assertIn("NCCL_DEBUG", shipped)  # how to disambiguate
+        with mock.patch.dict(os.environ, {"BENCH_LP_MIN_KB": "1"}, clear=False):
+            tuning = "\n".join(_lp_gate_preamble())
+        self.assertIn("TUNING RUN", tuning)
+        self.assertIn("1 KB", tuning)
+        self.assertNotEqual(shipped, tuning)
 
     def test_results_file_accepts_a_single_report(self) -> None:
         with tempfile.TemporaryDirectory() as d:
