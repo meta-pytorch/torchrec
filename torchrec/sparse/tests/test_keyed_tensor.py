@@ -8,6 +8,7 @@
 # pyre-strict
 
 
+import sys
 import unittest
 from typing import Callable, Dict, List, Tuple
 
@@ -27,7 +28,7 @@ from torchrec.sparse.jagged_tensor import (
 from torchrec.sparse.tests.utils import build_groups, build_kts
 from torchrec.test_utils import skip_if_asan_class
 
-if torch.cuda.is_available():
+if sys.version_info < (3, 15) and torch.cuda.is_available():
     from torchrec.sparse.triton_permute_multi_embedding import (
         triton_permute_multi_embedding,
     )
@@ -1078,6 +1079,10 @@ class TestKeyedTensorGPU(unittest.TestCase):
         torch.allclose(actual_kt_1_grad, expected_kt_1_grad)
 
 
+@unittest.skipIf(
+    sys.version_info >= (3, 15),
+    "Triton is not available on Python 3.15+",
+)
 class TritonPermuteMultiEmbeddingTest(unittest.TestCase):
     def _inputs(
         self,
