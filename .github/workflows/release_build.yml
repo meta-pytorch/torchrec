@@ -82,12 +82,12 @@ jobs:
       - name: Install PyTorch and CUDA
         shell: bash
         run: |
-          conda run -n build_binary pip install torch==2.14
+          conda run -n build_binary pip install torch==2.14 --index-url https://download.pytorch.org/whl/test/cu126
       - name: Install fbgemm
         shell: bash
         run: |
           conda run -n build_binary pip install numpy
-          conda run -n build_binary pip install fbgemm-gpu==1.9
+          conda run -n build_binary pip install fbgemm-gpu==1.9 --index-url https://download.pytorch.org/whl/test/cu126
       - name: Install Dependencies
         shell: bash
         run: |
@@ -200,13 +200,13 @@ jobs:
       - name: Install PyTorch and CUDA
         shell: bash
         run: |
-          conda run -n build_binary pip install torch==2.14
+          conda run -n build_binary pip install torch==2.14 --index-url https://download.pytorch.org/whl/test/cu126
       # download wheel from GHA
       - name: Install fbgemm
         shell: bash
         run: |
           conda run -n build_binary pip install numpy
-          conda run -n build_binary pip install fbgemm-gpu==1.9
+          conda run -n build_binary pip install fbgemm-gpu==1.9 --index-url https://download.pytorch.org/whl/test/cu126
       - name: Install torchmetrics
         shell: bash
         run: |

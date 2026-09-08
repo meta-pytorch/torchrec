@@ -69,6 +69,9 @@ if [[ ${MATRIX_PYTHON_VERSION} = '3.15t' ]]; then
     conda create -y -n "${CONDA_ENV}" --override-channels \
         -c conda-forge/label/python_rc -c conda-forge python-freethreading=3.15
     conda run -n "${CONDA_ENV}" python -c "import sys; print(f'python GIL enabled: {sys._is_gil_enabled()}')"
+elif [[ ${MATRIX_PYTHON_VERSION} = '3.15' ]]; then
+    conda create -y -n "${CONDA_ENV}" --override-channels \
+        -c conda-forge/label/python_rc -c conda-forge python=3.15
 elif [[ ${MATRIX_PYTHON_VERSION} = '3.14t' ]]; then
     # use conda-forge to install free-threaded python
     conda create -y -n "${CONDA_ENV}" python-freethreading="${MATRIX_PYTHON_VERSION%t}"
