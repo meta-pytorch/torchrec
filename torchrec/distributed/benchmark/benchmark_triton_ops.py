@@ -33,6 +33,12 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import triton
 import triton.language as tl
+from fbgemm_gpu.quantize_utils import (
+    bf16_to_fp32,
+    fp32_to_bf16_with_clamp,
+    fp32_to_mx4,
+    mx4_to_float,
+)
 from torch.autograd.profiler import record_function
 
 try:
@@ -51,6 +57,7 @@ from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
     _repair_offsets_kernel,
 )
 from torchrec.sparse.jagged_tensor import _kt_regroup_arguments, JaggedTensor
+from torchrec.sparse.triton_batch_index_select import triton_batch_index_select_dim0
 from torchrec.sparse.triton_permute_2d import (
     MIN_SEGMENTS,
     PERSEG_MIN_MEAN,
@@ -58,6 +65,14 @@ from torchrec.sparse.triton_permute_2d import (
 )
 from torchrec.sparse.triton_permute_multi_embedding import (
     triton_permute_multi_embedding,
+)
+from torchrec.sparse.triton_quantized_comm import (
+    triton_bfloat16_quantized_to_float,
+    triton_float_to_bfloat16_quantized,
+    triton_float_to_fused8bitrowwise_quantized,
+    triton_float_to_mx4_quantized,
+    triton_fused8bitrowwise_quantized_to_float,
+    triton_mx4_quantized_to_float,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -69,6 +84,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 try:
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops")
     torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu:sparse_ops_cpu")
+    torch.ops.load_library("//deeplearning/fbgemm/fbgemm_gpu/codegen:index_select_ops")
 except OSError:
     pass
 
@@ -185,7 +201,7 @@ def register_benchmark(
     given config class. The decorated function is the per-iteration benchmark and
     its name is the CLI subcommand. Define the config class first, then:
 
-    @register_benchmark(BoundsCheckTritonConfig)
+    @register_benchmark(BoundsCheckConfig)
     def bounds_check_triton(_batch_inputs, offsets, ..., **_kwargs): ...
     """
 
@@ -194,7 +210,7 @@ def register_benchmark(
             single_rank_runner(arg=arg, bench_func=func)
 
         # CLI subcommand key = benchmark function name; the annotation must be the
-        # concrete config subclass so cmd_conf builds its argparse from its fields
+        # concrete config class so cmd_conf builds its argparse from its fields
         dispatch.__name__ = func.__name__
         dispatch.__annotations__ = {"arg": config, "return": None}
         # pyrefly: ignore[missing-attribute]
@@ -762,24 +778,7 @@ def bounds_check_triton(
             )
 
 
-@dataclass
-class BoundsCheckCudaConfig(BoundsCheckConfig):
-    """
-    run commands:
-    1. baseline against bounds_check_triton on identical input
-    > python -m torchrec.distributed.benchmark.benchmark_triton_ops bounds_check_cuda \
-        --name=clean
-
-    use case:
-        the fbgemm CUDA op the Triton kernels replace, run on the same seed and shape.
-        Note it does strictly more work than the Triton offsets kernel: it validates row
-        ids as well as the offsets array, which the Triton path folds into the gather
-        loop instead (_load_checked_index). Read the pair as backend A/B on the offsets
-        sweep, not as an equal-work comparison.
-    """
-
-
-@register_benchmark(BoundsCheckCudaConfig)
+@register_benchmark(BoundsCheckConfig)
 def bounds_check_cuda(
     _batch_inputs: List[Dict[str, Any]],
     indices: torch.Tensor,
@@ -788,6 +787,11 @@ def bounds_check_cuda(
     warning: torch.Tensor,
     **_kwargs: Dict[str, Any],
 ) -> None:
+    """Benchmark FBGEMM's CUDA baseline on the same seed and shape.
+
+    It validates row IDs and offsets, while the Triton benchmark only times its offsets
+    kernel because row validation is fused into the gather loop.
+    """
     with record_function("## zero warning counter ##"):
         warning.zero_()
 
@@ -878,28 +882,7 @@ class Permute2dConfig(TritonOpConfig):
         }
 
 
-@dataclass
-class Permute2dTritonConfig(Permute2dConfig):
-    """
-    run commands:
-    1. blocked kernel (default): many short segments
-    > python -m torchrec.distributed.benchmark.benchmark_triton_ops permute_2d_triton \
-        --name=blocked
-
-    2. per-segment kernel: fewer, longer segments
-    > python -m torchrec.distributed.benchmark.benchmark_triton_ops permute_2d_triton \
-        --name=perseg \
-        --mean_pooling_factor=1024
-
-    use case:
-        the Triton replacement for fbgemm.permute_2D_sparse_data, which wins on the two
-        regimes fbgemm's per-segment launch shape handles badly: very many short
-        segments, and length skew across keys. Pair with permute_2d_fbgemm on the same
-        seed and shape.
-    """
-
-
-@register_benchmark(Permute2dTritonConfig)
+@register_benchmark(Permute2dConfig)
 def permute_2d_triton(
     _batch_inputs: List[Dict[str, Any]],
     permute: torch.Tensor,
@@ -909,33 +892,14 @@ def permute_2d_triton(
     permuted_lengths_sum: int,
     **_kwargs: Dict[str, Any],
 ) -> None:
+    """Benchmark TorchRec's Triton replacement for permute_2D_sparse_data."""
     with record_function("## triton_permute_2d_sparse_data ##"):
         triton_permute_2d_sparse_data(
             permute, lengths, values, weights, permuted_lengths_sum
         )
 
 
-@dataclass
-class Permute2dFbgemmConfig(Permute2dConfig):
-    """
-    run commands:
-    1. baseline against permute_2d_triton on identical input
-    > python -m torchrec.distributed.benchmark.benchmark_triton_ops permute_2d_fbgemm \
-        --name=blocked
-
-    2. baseline against permute_2d_triton on identical input with pf=1024
-    > python -m torchrec.distributed.benchmark.benchmark_triton_ops permute_2d_fbgemm \
-        --name=blocked_1024 \
-        --mean_pooling_factor=1024
-
-    use case:
-        the fbgemm CUDA baseline. It hands each block 32 consecutive segments and picks
-        vectorised or scalar loads per segment, which is efficient for few long aligned
-        segments and degrades as segment count and key-level length skew grow.
-    """
-
-
-@register_benchmark(Permute2dFbgemmConfig)
+@register_benchmark(Permute2dConfig)
 def permute_2d_fbgemm(
     _batch_inputs: List[Dict[str, Any]],
     permute: torch.Tensor,
@@ -945,10 +909,390 @@ def permute_2d_fbgemm(
     permuted_lengths_sum: int,
     **_kwargs: Dict[str, Any],
 ) -> None:
+    """Benchmark FBGEMM's CUDA permute_2D_sparse_data baseline."""
     with record_function("## permute_2D_sparse_data ##"):
         torch.ops.fbgemm.permute_2D_sparse_data(
             permute, lengths, values, weights, permuted_lengths_sum
         )
+
+
+######################## batch index select dim 0 configs ############################
+@dataclass
+class BatchIndexSelectDim0Config(TritonOpConfig):
+    """Inputs matching VariableBatchEmbeddingBagCollectionAwaitable.
+
+    Embedding dimensions cycle through embedding_dims. Setting different minimum
+    and maximum input row counts exercises variable batch sizes before all-to-all;
+    output_batch_size is the common reconstructed batch size.
+    """
+
+    num_features: int = 165
+    min_input_rows: int = 1024
+    max_input_rows: int = 4096
+    output_batch_size: int = 4096
+    embedding_dims: str = "16,16,16,16,48,80,112,128,160"
+    run_backward: bool = False
+    dtype: str = "float16"
+    gpu_backlog_ms: float = 20.0
+
+    def make_inputs(self, device: torch.device) -> Dict[str, Any]:
+        dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(self.dtype)
+        if dtype is None:
+            raise ValueError("dtype must be float32, float16, or bfloat16")
+        if self.min_input_rows <= 0 or self.max_input_rows < self.min_input_rows:
+            raise ValueError("input row bounds must be positive and ordered")
+        if self.max_input_rows > self.output_batch_size:
+            raise ValueError(
+                "input row counts cannot exceed the reconstructed output batch size"
+            )
+        dimensions = [int(value) for value in self.embedding_dims.split(",")]
+        if not dimensions or any(dimension <= 0 for dimension in dimensions):
+            raise ValueError("embedding_dims must contain positive integers")
+        input_columns = [
+            dimensions[index % len(dimensions)] for index in range(self.num_features)
+        ]
+        input_rows = torch.randint(
+            self.min_input_rows,
+            self.max_input_rows + 1,
+            (self.num_features,),
+        ).tolist()
+        inputs = torch.randn(
+            sum(rows * columns for rows, columns in zip(input_rows, input_columns)),
+            device=device,
+            dtype=dtype,
+            requires_grad=self.run_backward,
+        )
+        indices = torch.cat(
+            [
+                torch.cat(
+                    [
+                        torch.arange(rows, device=device, dtype=torch.int64),
+                        torch.randint(
+                            0,
+                            rows,
+                            (self.output_batch_size - rows,),
+                            device=device,
+                            dtype=torch.int64,
+                        ),
+                    ]
+                )[torch.randperm(self.output_batch_size, device=device)]
+                for rows in input_rows
+            ]
+        )
+        grad_output = (
+            torch.randn(
+                self.output_batch_size * sum(input_columns),
+                device=device,
+                dtype=dtype,
+            )
+            if self.run_backward
+            else None
+        )
+        return {
+            "inputs": inputs,
+            "indices": indices,
+            "input_rows": input_rows,
+            "input_columns": input_columns,
+            "grad_output": grad_output,
+        }
+
+
+def _run_batch_index_select_backward(
+    output: torch.Tensor,
+    inputs: torch.Tensor,
+    grad_output: Optional[torch.Tensor],
+    run_backward: bool,
+) -> None:
+    if run_backward:
+        assert grad_output is not None
+        torch.autograd.grad(output, inputs, grad_output)
+
+
+@register_benchmark(BatchIndexSelectDim0Config)
+def batch_index_select_dim0_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    inputs: torch.Tensor,
+    indices: torch.Tensor,
+    input_rows: List[int],
+    input_columns: List[int],
+    grad_output: Optional[torch.Tensor],
+    output_batch_size: int,
+    run_backward: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_batch_index_select_dim0 ##"):
+        output = triton_batch_index_select_dim0(
+            inputs, indices, output_batch_size, input_rows, input_columns
+        )
+        _run_batch_index_select_backward(output, inputs, grad_output, run_backward)
+
+
+@register_benchmark(BatchIndexSelectDim0Config)
+def batch_index_select_dim0_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    inputs: torch.Tensor,
+    indices: torch.Tensor,
+    input_rows: List[int],
+    input_columns: List[int],
+    grad_output: Optional[torch.Tensor],
+    output_batch_size: int,
+    run_backward: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## fbgemm_batch_index_select_dim0 ##"):
+        output = torch.ops.fbgemm.batch_index_select_dim0(
+            inputs=inputs,
+            indices=indices,
+            input_num_indices=[output_batch_size] * len(input_columns),
+            input_rows=input_rows,
+            input_columns=input_columns,
+            permute_output_dim_0_1=True,
+        )
+        _run_batch_index_select_backward(output, inputs, grad_output, run_backward)
+
+
+@register_benchmark(BatchIndexSelectDim0Config)
+def batch_index_select_dim0_torch(
+    _batch_inputs: List[Dict[str, Any]],
+    inputs: torch.Tensor,
+    indices: torch.Tensor,
+    input_rows: List[int],
+    input_columns: List[int],
+    grad_output: Optional[torch.Tensor],
+    output_batch_size: int,
+    run_backward: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## torch_batch_index_select_dim0 ##"):
+        input_splits = inputs.split(
+            [rows * columns for rows, columns in zip(input_rows, input_columns)]
+        )
+        index_splits = indices.split(output_batch_size)
+        output = torch.cat(
+            [
+                input_part.view(rows, columns).index_select(0, index_part)
+                for input_part, index_part, rows, columns in zip(
+                    input_splits, index_splits, input_rows, input_columns
+                )
+            ],
+            dim=1,
+        ).flatten()
+        _run_batch_index_select_backward(output, inputs, grad_output, run_backward)
+
+
+######################## quantized communication configs ############################
+@dataclass
+class QuantizedCommConfig(TritonOpConfig):
+    """FP32 communication tensors quantized independently by their last dimension."""
+
+    num_rows: int = 65536
+    num_columns: int = 32
+    gpu_backlog_ms: float = 20.0
+
+    def make_inputs(self, device: torch.device) -> Dict[str, Any]:
+        if self.num_rows < 0 or self.num_columns <= 0:
+            raise ValueError("num_rows must be nonnegative and num_columns positive")
+        input = torch.randn(
+            self.num_rows,
+            self.num_columns,
+            dtype=torch.float32,
+            device=device,
+        )
+        quantized = torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
+        return {
+            "input": input,
+            "fused_8bit": quantized,
+            "bfloat16": fp32_to_bf16_with_clamp(input),
+            "mx4": fp32_to_mx4(input),
+        }
+
+
+@register_benchmark(QuantizedCommConfig)
+def fused_8bit_rowwise_quantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_float_to_fused8bitrowwise_quantized ##"):
+        triton_float_to_fused8bitrowwise_quantized(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def fused_8bit_rowwise_quantize_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## fbgemm_float_to_fused8bitrowwise_quantized ##"):
+        torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def fused_8bit_rowwise_dequantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    fused_8bit: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_fused8bitrowwise_quantized_to_float ##"):
+        triton_fused8bitrowwise_quantized_to_float(fused_8bit)
+
+
+@register_benchmark(QuantizedCommConfig)
+def fused_8bit_rowwise_dequantize_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    fused_8bit: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## fbgemm_fused8bitrowwise_quantized_to_float ##"):
+        torch.ops.fbgemm.Fused8BitRowwiseQuantizedToFloat(fused_8bit)
+
+
+@register_benchmark(QuantizedCommConfig)
+def fused_8bit_rowwise_roundtrip_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_fused8bitrowwise_roundtrip ##"):
+        triton_fused8bitrowwise_quantized_to_float(
+            triton_float_to_fused8bitrowwise_quantized(input)
+        )
+
+
+@register_benchmark(QuantizedCommConfig)
+def fused_8bit_rowwise_roundtrip_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## fbgemm_fused8bitrowwise_roundtrip ##"):
+        torch.ops.fbgemm.Fused8BitRowwiseQuantizedToFloat(
+            torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
+        )
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_quantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_float_to_bfloat16_quantized ##"):
+        triton_float_to_bfloat16_quantized(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_quantize_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_float_to_bfloat16_quantized ##"):
+        fp32_to_bf16_with_clamp(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_dequantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    bfloat16: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_bfloat16_quantized_to_float ##"):
+        triton_bfloat16_quantized_to_float(bfloat16)
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_dequantize_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    bfloat16: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_bfloat16_quantized_to_float ##"):
+        bf16_to_fp32(bfloat16)
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_roundtrip_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_bfloat16_roundtrip ##"):
+        triton_bfloat16_quantized_to_float(triton_float_to_bfloat16_quantized(input))
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_roundtrip_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_bfloat16_roundtrip ##"):
+        bf16_to_fp32(fp32_to_bf16_with_clamp(input))
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_quantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## torchrec_triton_float_to_mx4_quantized ##"):
+        triton_float_to_mx4_quantized(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_quantize_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_triton_float_to_mx4_quantized ##"):
+        fp32_to_mx4(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_dequantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    mx4: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## torchrec_triton_mx4_quantized_to_float ##"):
+        triton_mx4_quantized_to_float(mx4)
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_dequantize_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    mx4: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_triton_mx4_quantized_to_float ##"):
+        mx4_to_float(mx4)
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_roundtrip_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## torchrec_triton_mx4_roundtrip ##"):
+        triton_mx4_quantized_to_float(triton_float_to_mx4_quantized(input))
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_roundtrip_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_triton_mx4_roundtrip ##"):
+        mx4_to_float(fp32_to_mx4(input))
 
 
 ############################ pooled regroup configs ###################################
@@ -1014,10 +1358,14 @@ class RegroupConfig(TritonOpConfig):
         permutes, in_shapes, out_shapes, out_lengths = _kt_regroup_arguments(
             values[0], keys, lengths, groups
         )
-        grad_outputs = [
-            torch.randn(self.batch_size, length, device=device, dtype=dtype)
-            for length in out_lengths
-        ]
+        grad_outputs = (
+            [
+                torch.randn(self.batch_size, length, device=device, dtype=dtype)
+                for length in out_lengths
+            ]
+            if self.run_backward
+            else None
+        )
         return {
             "values": values,
             "permutes": permutes,
@@ -1031,19 +1379,15 @@ class RegroupConfig(TritonOpConfig):
 def _run_backward(
     outputs: List[torch.Tensor],
     values: List[torch.Tensor],
-    grad_outputs: List[torch.Tensor],
+    grad_outputs: Optional[List[torch.Tensor]],
     run_backward: bool,
 ) -> None:
     if run_backward:
+        assert grad_outputs is not None
         torch.autograd.grad(outputs, values, grad_outputs)
 
 
-@dataclass
-class RegroupTritonConfig(RegroupConfig):
-    """Benchmark the Triton multi-tensor pooled-embedding regroup."""
-
-
-@register_benchmark(RegroupTritonConfig)
+@register_benchmark(RegroupConfig)
 def regroup_triton(
     _batch_inputs: List[Dict[str, Any]],
     values: List[torch.Tensor],
@@ -1051,7 +1395,7 @@ def regroup_triton(
     in_shapes: torch.Tensor,
     out_shapes: torch.Tensor,
     out_lengths: List[int],
-    grad_outputs: List[torch.Tensor],
+    grad_outputs: Optional[List[torch.Tensor]],
     run_backward: bool = False,
     **_kwargs: Dict[str, Any],
 ) -> None:
@@ -1062,12 +1406,7 @@ def regroup_triton(
         _run_backward(outputs, values, grad_outputs, run_backward)
 
 
-@dataclass
-class RegroupFbgemmConfig(RegroupConfig):
-    """Benchmark the FBGEMM multi-tensor pooled-embedding regroup."""
-
-
-@register_benchmark(RegroupFbgemmConfig)
+@register_benchmark(RegroupConfig)
 def regroup_fbgemm(
     _batch_inputs: List[Dict[str, Any]],
     values: List[torch.Tensor],
@@ -1075,7 +1414,7 @@ def regroup_fbgemm(
     in_shapes: torch.Tensor,
     out_shapes: torch.Tensor,
     out_lengths: List[int],
-    grad_outputs: List[torch.Tensor],
+    grad_outputs: Optional[List[torch.Tensor]],
     run_backward: bool = False,
     **_kwargs: Dict[str, Any],
 ) -> None:
