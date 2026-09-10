@@ -528,6 +528,8 @@ M = TypeVar("M", bound=nn.Module)
 
 
 class BaseEmbeddingSharder(ModuleSharder[M]):
+    supports_fused_triton: bool = False
+
     def __init__(
         self,
         fused_params: Optional[Dict[str, Any]] = None,
@@ -587,6 +589,8 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
                     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE.value,
                     EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE.value,
                 ]
+                if self.supports_fused_triton:
+                    ret.append(EmbeddingComputeKernel.FUSED_TRITON.value)
             if compute_device_type in {"tpu"}:
                 ret += [EmbeddingComputeKernel.UNFUSED_TPU.value]
         else:
