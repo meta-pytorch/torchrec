@@ -1568,10 +1568,15 @@ class DMPCollection(DistributedModelParallel):
         """
         assert ctx.replica_pg is not None, "replica_pg is not initialized!"
 
+        sync_modules = [module for module, _ in ctx.modules_to_sync]
         if (
             self._custom_all_reduce is None
             and not self._use_sharded_relay
             and ctx.replica_pg.size() == 1
+            and (
+                not sync_modules
+                or all(_is_triton_tbe(module) for module in sync_modules)
+            )
         ):
             return
 
