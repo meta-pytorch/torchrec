@@ -816,6 +816,8 @@ class ParameterSharding:
         bounds_check_mode (Optional[BoundsCheckMode]): bounds check mode.
         output_dtype (Optional[DataType]): output dtype.
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE or PS.
+        bag_size_hints (Optional[List[int]]): expected bag size for each feature,
+            used only by FUSED_TRITON.
 
     NOTE:
       ShardingType.TABLE_WISE - rank where this embedding is placed
@@ -835,6 +837,7 @@ class ParameterSharding:
     bounds_check_mode: Optional[BoundsCheckMode] = None
     output_dtype: Optional[DataType] = None
     key_value_params: Optional[KeyValueParams] = None
+    bag_size_hints: Optional[List[int]] = None
 
 
 class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterSharding]):

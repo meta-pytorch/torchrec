@@ -215,6 +215,43 @@ def _get_table_names_by_groups(
 
 
 class TestGroupTablesPerRank(unittest.TestCase):
+    def test_triton_bag_size_hints_follow_grouped_feature_order(self) -> None:
+        tables = [
+            ShardedEmbeddingTable(
+                name="table_0",
+                feature_names=["feature_0", "feature_1"],
+                embedding_names=["feature_0", "feature_1"],
+                data_type=DataType.FP16,
+                pooling=PoolingType.SUM,
+                fused_params={"bag_size_hints": [64, 80]},
+                compute_kernel=EmbeddingComputeKernel.FUSED_TRITON,
+                embedding_dim=64,
+                local_cols=64,
+                num_embeddings=64,
+            ),
+            ShardedEmbeddingTable(
+                name="table_1",
+                feature_names=["feature_2"],
+                embedding_names=["feature_2"],
+                data_type=DataType.FP16,
+                pooling=PoolingType.SUM,
+                fused_params={"bag_size_hints": [128]},
+                compute_kernel=EmbeddingComputeKernel.FUSED_TRITON,
+                embedding_dim=64,
+                local_cols=64,
+                num_embeddings=64,
+            ),
+        ]
+
+        table_groups = group_tables([tables])[0]
+
+        self.assertEqual(len(table_groups), 1)
+        self.assertIsNotNone(table_groups[0].fused_params)
+        self.assertEqual(
+            table_groups[0].fused_params.get("bag_size_hints"),
+            [64, 80, 128],
+        )
+
     @given(
         data_type=st.sampled_from([DataType.FP16, DataType.FP32]),
         has_feature_processor=st.sampled_from([False, True]),
