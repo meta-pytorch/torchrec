@@ -1250,6 +1250,7 @@ KNOWN_CONDITIONAL_STATE: Set[Tuple[str, str]] = {
     ("MSEMetric", "include_r_squared"),
     ("MultiLabelPrecisionMetric", "label_names"),
     ("MultiLabelPrecisionMetric", "num_labels"),
+    ("SessionPairwiseAUCMetric", "report_batch_coverage"),
     ("ThroughputMetric", "batch_size_stages"),
     ("TowerQPSMetric", "batch_size_stages"),
 }
@@ -1296,6 +1297,7 @@ KNOWN_SAFE_PARAMS: Set[Tuple[str, str]] = {
 # Subset with proper always-pop hooks (cross-config load tests use these).
 RECMETRIC_CONDITIONAL_STATE: Dict[Tuple[Type[RecMetric], str], List[Any]] = {
     (MSEMetric, "include_r_squared"): [True],
+    (SessionPairwiseAUCMetric, "report_batch_coverage"): [True],
     (TowerQPSMetric, "batch_size_stages"): [_BATCH_SIZE_STAGES_ALTERNATIVE],
 }
 
