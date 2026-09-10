@@ -29,6 +29,7 @@ class RecMetricEnum(RecMetricEnumBase):
     AUC = "auc"
     AUPRC = "auprc"
     RAUC = "rauc"
+    SESSION_PAIRWISE_AUC = "session_pairwise_auc"
     CALIBRATION = "calibration"
     MSE = "mse"
     MAE = "mae"

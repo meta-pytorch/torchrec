@@ -111,6 +111,7 @@ from torchrec.metrics.scalar import ScalarMetric
 from torchrec.metrics.segmented_ne import SegmentedNEMetric
 from torchrec.metrics.serving_calibration import ServingCalibrationMetric
 from torchrec.metrics.serving_ne import ServingNEMetric
+from torchrec.metrics.session_pairwise_auc import SessionPairwiseAUCMetric
 from torchrec.metrics.sum_weights import SumWeightsMetric
 from torchrec.metrics.tensor_weighted_avg import TensorWeightedAvgMetric
 from torchrec.metrics.throughput import ThroughputMetric
@@ -160,6 +161,9 @@ REC_METRICS_MAPPING: Dict[RecMetricEnumBase, Type[RecMetric]] = {
     RecMetricEnum.WEIGHTED_SUM_PREDICTIONS: WeightedSumPredictionsMetric,
     RecMetricEnum.NUM_POSITIVE_SAMPLES: NumPositiveSamplesMetric,
     RecMetricEnum.SUM_WEIGHTS: SumWeightsMetric,
+    # Append new metrics so the indices of existing metrics remain stable in
+    # RecMetricModule checkpoints built from REC_METRICS_MAPPING order.
+    RecMetricEnum.SESSION_PAIRWISE_AUC: SessionPairwiseAUCMetric,
 }
 
 
