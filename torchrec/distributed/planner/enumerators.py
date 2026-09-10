@@ -493,15 +493,16 @@ class EmbeddingEnumerator(Enumerator):
                 if compute_kernel not in GUARDED_COMPUTE_KERNELS
             ]
 
-        # setup filtered_compute_kernels
-        # Filter in ``allowed_compute_kernels`` order rather than iterating a set:
-        # set-of-str iteration order is PYTHONHASHSEED-dependent, which makes the
-        # search space -- and the planner context hash keyed off it -- differ
-        # between processes.
         constrained_compute_kernel_set = set(constrained_compute_kernels)
         filtered_compute_kernels = [
             k for k in allowed_compute_kernels if k in constrained_compute_kernel_set
         ]
+        if EmbeddingComputeKernel.FUSED_TRITON.value in filtered_compute_kernels:
+            filtered_compute_kernels = [
+                k
+                for k in filtered_compute_kernels
+                if k != EmbeddingComputeKernel.FUSED.value
+            ]
 
         # Remove KEY_VALUE if no device has SSD capacity — avoids expanding
         # the search space with infeasible options that fits_in() would reject.
