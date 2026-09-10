@@ -92,6 +92,8 @@ class WeightedSumPredictionsMetricComputation(RecMetricComputation):
 
 
 class WeightedSumPredictionsMetric(RecMetric):
+    allowed_nan_inputs: frozenset[str] = frozenset({RecMetric.PREDICTIONS})
+    ignored_input_values: frozenset[str] = frozenset({RecMetric.LABELS})
     # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.WEIGHTED_SUM_PREDICTIONS
     _computation_class: Type[RecMetricComputation] = (

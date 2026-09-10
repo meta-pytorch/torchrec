@@ -211,6 +211,10 @@ class RecMetricException(Exception):
     pass
 
 
+class RecMetricValidationError(RecMetricException):
+    pass
+
+
 class WindowBuffer:
     def __init__(self, max_size: int, max_buffer_count: int) -> None:
         self._max_size: int = max_size
@@ -573,6 +577,8 @@ class RecMetric(nn.Module, abc.ABC):
     PREDICTIONS: str = "predictions"
     LABELS: str = "labels"
     WEIGHTS: str = "weights"
+    allowed_nan_inputs: frozenset[str] = frozenset()
+    ignored_input_values: frozenset[str] = frozenset()
 
     def __init__(
         self,
