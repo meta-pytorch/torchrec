@@ -25,11 +25,13 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Set,
     Tuple,
     Type,
 )
 
 import torch
+from torch.nn.parallel import DistributedDataParallel
 from torch.profiler import record_function
 from torch.utils._pytree import tree_flatten
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
@@ -72,7 +74,11 @@ except Exception:
     )
 
     one_time_rank0_logger = logging.getLogger(__name__)
-from torchrec.distributed.model_parallel import DistributedModelParallel, ShardedModule
+from torchrec.distributed.model_parallel import (
+    DistributedModelParallel,
+    get_module,
+    ShardedModule,
+)
 from torchrec.distributed.train_pipeline.pipeline_context import (
     EmbeddingTrainPipelineContext,
     In,
@@ -102,6 +108,26 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable, Pipelineable
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def find_ddp_modules(module: torch.nn.Module) -> List[DistributedDataParallel]:
+    """Returns all DDP instances in a module tree, including hidden lookups."""
+    ddp_modules: List[DistributedDataParallel] = []
+    seen: Set[int] = set()
+
+    def collect(candidate: torch.nn.Module) -> None:
+        if isinstance(candidate, DistributedDataParallel) and id(candidate) not in seen:
+            seen.add(id(candidate))
+            ddp_modules.append(candidate)
+
+    for submodule in get_module(module).modules():
+        collect(submodule)
+        # Sharded embedding modules keep per-sharding lookups in a plain list,
+        # so those DDP wrappers are not visible to nn.Module.modules().
+        for lookup in getattr(submodule, "_lookups", ()):
+            collect(lookup)
+
+    return ddp_modules
 
 
 def _batch_tensor_size(batch: Any) -> int:
