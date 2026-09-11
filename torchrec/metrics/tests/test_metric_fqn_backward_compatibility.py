@@ -31,8 +31,9 @@ import json
 import os
 import sys
 import unittest
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Type
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Set, Tuple, Type
 
 import torch
 from torchrec.metrics.accuracy import AccuracyMetric
@@ -274,21 +275,30 @@ def generate_golden_snapshot() -> Dict[str, Dict[str, Any]]:
         Dictionary mapping metric keys to their FQN information.
     """
     snapshot: Dict[str, Dict[str, Any]] = {}
+    failures: List[str] = []
 
     for metric_class, compute_modes, kwargs, variants in METRICS_TO_TEST:
         for compute_mode in compute_modes:
             for variant in variants:
+                key = get_metric_snapshot_key(metric_class, compute_mode, variant)
                 try:
-                    key = get_metric_snapshot_key(metric_class, compute_mode, variant)
                     state_dict_keys = extract_state_dict_keys(
                         metric_class, compute_mode, **kwargs
                     )
-                    snapshot[key] = {"state_dict_keys": state_dict_keys}
                 except Exception as e:
-                    # pyrefly: ignore[unbound-name]
-                    print(f"Warning: Failed to generate snapshot for {key}: {e}")
+                    failures.append(f"  {key}: {type(e).__name__}: {e}")
                     continue
 
+                snapshot[key] = {"state_dict_keys": state_dict_keys}
+
+    if failures:
+        detail = "\n".join(failures)
+        raise RuntimeError(
+            f"Could not build every metric:\n{detail}\n"
+            "Skipping one drops its entry from the file, and the per-metric "
+            "test then skips for want of an entry, so the coverage disappears "
+            "without a failure anywhere."
+        )
     return snapshot
 
 
@@ -297,6 +307,20 @@ def load_golden_snapshot() -> Dict[str, Dict[str, Any]]:
         return {}
     with open(GOLDEN_SNAPSHOT_PATH, "r") as f:
         return json.load(f)
+
+
+def load_required_golden_snapshot() -> Dict[str, Dict[str, Any]]:
+    """The golden snapshot, or raise.
+
+    Regenerating here would bless whatever the code produces today.
+    """
+    snapshot = load_golden_snapshot()
+    if not snapshot:
+        raise RuntimeError(
+            f"{GOLDEN_SNAPSHOT_PATH} is missing or empty. It is checked in, so "
+            "restore it from source control rather than writing a new one."
+        )
+    return snapshot
 
 
 def save_golden_snapshot(snapshot: Dict[str, Dict[str, Any]]) -> None:
@@ -319,12 +343,7 @@ class MetricFQNBackwardCompatibilityTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.golden_snapshot = load_golden_snapshot()
-        if not cls.golden_snapshot:
-            print("No golden snapshot found. Generating initial snapshot...")
-            cls.golden_snapshot = generate_golden_snapshot()
-            save_golden_snapshot(cls.golden_snapshot)
-            print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH}")
+        cls.golden_snapshot = load_required_golden_snapshot()
         cls.current_snapshot = None
 
     def _check_metric_compatibility(
@@ -635,370 +654,236 @@ class MetricFQNBackwardCompatibilityTest(unittest.TestCase):
         )
 
 
-class MetricStateSnapshotTest(unittest.TestCase):
+# Fixture values for the golden cases.
+_THROUGHPUT_BATCH_SIZE_STAGES: List[BatchSizeStage] = [
+    BatchSizeStage(batch_size=32, max_iters=100),
+    BatchSizeStage(batch_size=64, max_iters=None),
+]
+
+
+def _make_throughput_metric(
+    batch_size_stages: Optional[List[BatchSizeStage]] = None,
+) -> ThroughputMetric:
+    return ThroughputMetric(
+        batch_size=32,
+        world_size=1,
+        window_seconds=100,
+        warmup_steps=10,
+        batch_size_stages=batch_size_stages,
+    )
+
+
+def _make_rec_metric_module(
+    throughput_metric: Optional[ThroughputMetric] = None,
+) -> RecMetricModule:
+    tasks = [create_test_task("task1")]
+    return RecMetricModule(
+        batch_size=32,
+        world_size=1,
+        rec_tasks=tasks,
+        rec_metrics=RecMetricList(
+            [
+                NEMetric(
+                    world_size=1,
+                    my_rank=0,
+                    batch_size=32,
+                    tasks=tasks,
+                    compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+                    window_size=100,
+                )
+            ]
+        ),
+        throughput_metric=throughput_metric,
+    )
+
+
+@dataclass(frozen=True)
+class _GoldenCase:
+    """One golden snapshot: which entry it is, and how to build it.
+
+    The builder is self-contained, so a case cannot be paired with another
+    case's configuration. `stable_id` is written by hand rather than derived
+    from the class, so moving a file does not silently change the key and
+    abandon the entry it used to match.
     """
-    Test suite for verifying metric state snapshot capabilities.
 
-    These tests verify that metrics properly register their states
-    and can be serialized/deserialized correctly.
-    """
+    # Snake_case, not the class name: this is the golden file's key, so it
+    # must survive a class rename.
+    stable_id: str
+    expected_class: Type[torch.nn.Module]
+    variant: str
+    build: Callable[[], torch.nn.Module]
 
-    def _test_metric_state_roundtrip(
-        self,
-        metric_class: Type[RecMetric],
-        compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-        **kwargs: Any,
-    ) -> None:
-        tasks = [create_test_task("task1")]
+    @property
+    def key(self) -> str:
+        return f"{self.stable_id}_{self.variant}" if self.variant else self.stable_id
 
-        original = metric_class(
-            world_size=1,
-            my_rank=0,
-            batch_size=32,
-            tasks=tasks,
-            compute_mode=compute_mode,
-            window_size=100,
-            **kwargs,
+
+_REC_METRIC_MODULE_DEFAULT = _GoldenCase(
+    "rec_metric_module", RecMetricModule, "", _make_rec_metric_module
+)
+
+_SCHEMA_CASES: Tuple[_GoldenCase, ...] = (
+    _GoldenCase("throughput_metric", ThroughputMetric, "", _make_throughput_metric),
+    _GoldenCase(
+        "throughput_metric",
+        ThroughputMetric,
+        "with_batch_size_stages",
+        lambda: _make_throughput_metric(_THROUGHPUT_BATCH_SIZE_STAGES),
+    ),
+    _REC_METRIC_MODULE_DEFAULT,
+    _GoldenCase(
+        "rec_metric_module",
+        RecMetricModule,
+        "with_throughput",
+        lambda: _make_rec_metric_module(_make_throughput_metric()),
+    ),
+)
+
+
+def _validate_case_entry(
+    case: _GoldenCase, entry: Dict[str, Any], current_keys: Set[str]
+) -> None:
+    """Compare one case against its golden entry. Raises on any disagreement."""
+    baseline_keys = set(entry["state_dict_keys"])
+
+    removed = baseline_keys - current_keys
+    if removed:
+        raise AssertionError(
+            f"BREAKING CHANGE in {case.key}: state_dict keys removed: "
+            f"{sorted(removed)}."
         )
 
-        initial_state = original.state_dict()
-
-        restored = metric_class(
-            world_size=1,
-            my_rank=0,
-            batch_size=32,
-            tasks=tasks,
-            compute_mode=compute_mode,
-            window_size=100,
-            **kwargs,
+    added = current_keys - baseline_keys
+    if added:
+        raise AssertionError(
+            f"BREAKING CHANGE in {case.key}: state_dict keys added: "
+            f"{sorted(added)}.\n"
+            "DCP validates every model FQN against checkpoint metadata before "
+            "load_state_dict runs, so the planner rejects a checkpoint written "
+            "before these keys existed. Loading one in process proves nothing: "
+            "state torchmetrics holds by setattr is invisible to the strict "
+            "check and still demanded by the planner."
         )
 
-        restored.load_state_dict(initial_state, strict=True)
 
-        restored_state = restored.state_dict()
-        self.assertEqual(
-            set(initial_state.keys()),
-            set(restored_state.keys()),
-            f"State dict keys mismatch for {metric_class.__name__}",
-        )
+class GoldenCaseTest(unittest.TestCase):
+    """Compares each golden case against its recorded entry.
 
-        for key in initial_state:
-            torch.testing.assert_close(
-                initial_state[key],
-                restored_state[key],
-                msg=f"State mismatch for key {key} in {metric_class.__name__}",
-            )
-
-    def test_ne_metric_state_roundtrip(self) -> None:
-        self._test_metric_state_roundtrip(NEMetric)
-
-    def test_calibration_metric_state_roundtrip(self) -> None:
-        self._test_metric_state_roundtrip(CalibrationMetric)
-
-    def test_mse_metric_state_roundtrip(self) -> None:
-        self._test_metric_state_roundtrip(MSEMetric)
-
-    def test_weighted_avg_metric_state_roundtrip(self) -> None:
-        self._test_metric_state_roundtrip(WeightedAvgMetric)
-
-
-# Golden snapshot keys for ThroughputMetric and RecMetricModule. These are
-# hand-written and must outlive the class names, so they are not class names.
-THROUGHPUT_SNAPSHOT_KEY = "throughput_metric"
-THROUGHPUT_WITH_STAGES_SNAPSHOT_KEY = "throughput_metric_with_batch_size_stages"
-REC_METRIC_MODULE_SNAPSHOT_KEY = "rec_metric_module"
-REC_METRIC_MODULE_WITH_THROUGHPUT_KEY = "rec_metric_module_with_throughput"
-
-
-class ThroughputMetricBackwardCompatibilityTest(unittest.TestCase):
+    The entry records the state_dict keys and nothing else, so that is the
+    whole comparison. A case pointed at another class is caught by the type
+    assertion in _check_case, not by anything stored in the file.
     """
-    Test suite for ThroughputMetric FQN backward compatibility.
 
-    ThroughputMetric is an nn.Module (not RecMetric) with its own state_dict structure.
-    """
+    golden_snapshot: Dict[str, Dict[str, Any]]
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.golden_snapshot = load_golden_snapshot()
+        cls.golden_snapshot = load_required_golden_snapshot()
 
-    def _create_throughput_metric(
-        self, with_batch_size_stages: bool = False
-    ) -> ThroughputMetric:
-        from torchrec.metrics.metrics_config import BatchSizeStage
+    def _check_case(self, case: _GoldenCase) -> None:
+        module = case.build()
+        self.assertIs(type(module), case.expected_class)
 
-        batch_size_stages = None
-        if with_batch_size_stages:
-            batch_size_stages = [
-                BatchSizeStage(batch_size=32, max_iters=100),
-                BatchSizeStage(batch_size=64, max_iters=None),
-            ]
+        if case.key not in self.golden_snapshot:
+            self.fail(
+                f"No golden entry for {case.key}. Run with --update-golden "
+                "to create it. Writing one here would bless whatever the "
+                "code currently produces, and concurrent tests writing the "
+                "whole file at once corrupt it."
+            )
 
-        return ThroughputMetric(
-            batch_size=32,
-            world_size=1,
-            window_seconds=100,
-            warmup_steps=10,
-            batch_size_stages=batch_size_stages,
+        _validate_case_entry(
+            case, self.golden_snapshot[case.key], set(module.state_dict())
         )
 
-    def _get_state_dict_keys(self, with_batch_size_stages: bool = False) -> List[str]:
-        metric = self._create_throughput_metric(with_batch_size_stages)
-        return sorted(metric.state_dict().keys())
+    def test_golden_cases(self) -> None:
+        for case in _SCHEMA_CASES:
+            with self.subTest(case.key):
+                self._check_case(case)
 
-    def test_throughput_metric_compatibility(self) -> None:
-        key = THROUGHPUT_SNAPSHOT_KEY
+    def test_key_drift_is_rejected(self) -> None:
+        """Checks that the drift check works.
 
-        if key not in self.golden_snapshot:
-            current_keys = self._get_state_dict_keys(with_batch_size_stages=False)
-            self.golden_snapshot[key] = {
-                "state_dict_keys": current_keys,
-            }
-            save_golden_snapshot(self.golden_snapshot)
-            return
+        Neither failure path runs in a green suite. This makes both run.
+        """
+        case = _GoldenCase("probe", torch.nn.Module, "", torch.nn.Module)
+        for label, baseline, expected in (
+            ("removed", ["alpha", "beta", "gamma"], "state_dict keys removed"),
+            ("added", ["alpha"], "state_dict keys added"),
+        ):
+            with self.subTest(label):
+                entry = {"state_dict_keys": baseline}
+                with self.assertRaisesRegex(AssertionError, expected):
+                    _validate_case_entry(case, entry, {"alpha", "beta"})
 
-        baseline = self.golden_snapshot[key]
-        current_keys = set(self._get_state_dict_keys(with_batch_size_stages=False))
-        baseline_keys = set(baseline["state_dict_keys"])
+    def test_regeneration_reproduces_the_checked_in_file(self) -> None:
+        """The file must equal what --update-golden writes, field for field.
 
-        removed_keys = baseline_keys - current_keys
-        if removed_keys:
-            self.fail(
-                f"BREAKING CHANGE in {key}: state_dict keys removed: {sorted(removed_keys)}. "
-                "This will cause old checkpoints to fail loading."
-            )
+        The per-case check reads only state_dict_keys, so an entry carrying
+        anything else passes it. Comparing whole entries is what catches a
+        stale field, a reordered key list, or a drifting generator.
+        """
+        regenerated = generate_golden_snapshot()
+        regenerated.update(generate_schema_case_entries())
+        self.assertEqual(regenerated, load_golden_snapshot())
 
-        added_keys = current_keys - baseline_keys
-        if added_keys:
-            if not self._verify_backward_compatibility(added_keys):
-                self.fail(
-                    f"BREAKING CHANGE in {key}: state_dict keys added: {sorted(added_keys)}. "
-                    "Implement load_state_dict hooks to handle missing keys."
+    def test_one_class_per_stable_id(self) -> None:
+        """A stable id names one class, however many variants it has.
+
+        The key carries the variant, so two classes could share an id and still
+        keep distinct keys. Anything that maps id to class would then silently
+        keep whichever row it read last.
+        """
+        classes_by_id: Dict[str, Set[Type[torch.nn.Module]]] = {}
+        for case in _SCHEMA_CASES:
+            classes_by_id.setdefault(case.stable_id, set()).add(case.expected_class)
+
+        for stable_id, classes in classes_by_id.items():
+            with self.subTest(stable_id):
+                self.assertEqual(
+                    len(classes),
+                    1,
+                    f"{stable_id} is claimed by "
+                    f"{sorted(c.__name__ for c in classes)}.",
                 )
 
-    def test_throughput_metric_with_stages_compatibility(self) -> None:
-        key = THROUGHPUT_WITH_STAGES_SNAPSHOT_KEY
+    def test_cases_for_same_id_have_distinct_key_sets(self) -> None:
+        """Every case under one id must snapshot a different key set.
 
-        if key not in self.golden_snapshot:
-            current_keys = self._get_state_dict_keys(with_batch_size_stages=True)
-            self.golden_snapshot[key] = {
-                "state_dict_keys": current_keys,
-            }
-            save_golden_snapshot(self.golden_snapshot)
-            return
-
-        baseline = self.golden_snapshot[key]
-        current_keys = set(self._get_state_dict_keys(with_batch_size_stages=True))
-        baseline_keys = set(baseline["state_dict_keys"])
-
-        removed_keys = baseline_keys - current_keys
-        if removed_keys:
-            self.fail(
-                f"BREAKING CHANGE in {key}: state_dict keys removed: {sorted(removed_keys)}. "
-                "This will cause old checkpoints to fail loading."
+        The unnamed case counts too, so this catches a named variant whose
+        builder forgot the argument that distinguishes it. The key and the
+        stored metadata both agree with themselves in that case; only the
+        resulting shape disagrees.
+        """
+        by_id: Dict[str, List[FrozenSet[str]]] = {}
+        for case in _SCHEMA_CASES:
+            module = case.build()
+            by_id.setdefault(case.stable_id, []).append(
+                frozenset(module.state_dict().keys())
             )
 
-        added_keys = current_keys - baseline_keys
-        if added_keys:
-            if not self._verify_backward_compatibility(added_keys, with_stages=True):
-                self.fail(
-                    f"BREAKING CHANGE in {key}: state_dict keys added: {sorted(added_keys)}. "
-                    "Implement load_state_dict hooks to handle missing keys."
+        for stable_id, entries in by_id.items():
+            with self.subTest(stable_id):
+                self.assertEqual(
+                    len(set(entries)),
+                    len(entries),
+                    f"{stable_id} has {len(entries)} cases but "
+                    f"{len(set(entries))} distinct key sets. One builder is carrying "
+                    "another's configuration.",
                 )
-
-    def _verify_backward_compatibility(
-        self, added_keys: Set[str], with_stages: bool = False
-    ) -> bool:
-        try:
-            metric = self._create_throughput_metric(with_batch_size_stages=with_stages)
-            state_dict = metric.state_dict()
-            old_checkpoint = {
-                k: v for k, v in state_dict.items() if k not in added_keys
-            }
-
-            fresh_metric = self._create_throughput_metric(
-                with_batch_size_stages=with_stages
-            )
-            fresh_metric.load_state_dict(old_checkpoint, strict=True)
-            return True
-        except Exception:
-            return False
-
-    def test_throughput_metric_state_roundtrip(self) -> None:
-        metric = self._create_throughput_metric()
-        initial_state = metric.state_dict()
-
-        fresh_metric = self._create_throughput_metric()
-        fresh_metric.load_state_dict(initial_state, strict=True)
-
-        restored_state = fresh_metric.state_dict()
-        self.assertEqual(set(initial_state.keys()), set(restored_state.keys()))
-
-        for key in initial_state:
-            torch.testing.assert_close(
-                initial_state[key],
-                restored_state[key],
-                msg=f"State mismatch for key {key}",
-            )
 
 
 class RecMetricModuleBackwardCompatibilityTest(unittest.TestCase):
-    """
-    Test suite for RecMetricModule FQN backward compatibility.
-
-    RecMetricModule is a container that holds RecMetrics, ThroughputMetric, and StateMetrics.
-    """
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        """Load the golden snapshot."""
-        cls.golden_snapshot = load_golden_snapshot()
-
-    def _create_rec_metric_module(
-        self, with_throughput: bool = False, with_metrics: bool = True
-    ) -> RecMetricModule:
-        tasks = [create_test_task("task1")]
-
-        rec_metrics = None
-        if with_metrics:
-            ne_metric = NEMetric(
-                world_size=1,
-                my_rank=0,
-                batch_size=32,
-                tasks=tasks,
-                compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-                window_size=100,
-            )
-            rec_metrics = RecMetricList([ne_metric])
-
-        throughput_metric = None
-        if with_throughput:
-            throughput_metric = ThroughputMetric(
-                batch_size=32,
-                world_size=1,
-                window_seconds=100,
-                warmup_steps=10,
-            )
-
-        return RecMetricModule(
-            batch_size=32,
-            world_size=1,
-            rec_tasks=tasks,
-            rec_metrics=rec_metrics,
-            throughput_metric=throughput_metric,
-        )
-
-    def _get_state_dict_keys(
-        self, with_throughput: bool = False, with_metrics: bool = True
-    ) -> List[str]:
-        module = self._create_rec_metric_module(
-            with_throughput=with_throughput, with_metrics=with_metrics
-        )
-        return sorted(module.state_dict().keys())
-
-    def test_rec_metric_module_compatibility(self) -> None:
-        key = REC_METRIC_MODULE_SNAPSHOT_KEY
-
-        if key not in self.golden_snapshot:
-            current_keys = self._get_state_dict_keys(with_throughput=False)
-            self.golden_snapshot[key] = {
-                "state_dict_keys": current_keys,
-            }
-            save_golden_snapshot(self.golden_snapshot)
-            return
-
-        baseline = self.golden_snapshot[key]
-        current_keys = set(self._get_state_dict_keys(with_throughput=False))
-        baseline_keys = set(baseline["state_dict_keys"])
-
-        removed_keys = baseline_keys - current_keys
-        if removed_keys:
-            self.fail(
-                f"BREAKING CHANGE in {key}: state_dict keys removed: {sorted(removed_keys)}."
-            )
-
-        added_keys = current_keys - baseline_keys
-        if added_keys:
-            if not self._verify_backward_compatibility(
-                added_keys, with_throughput=False
-            ):
-                self.fail(
-                    f"BREAKING CHANGE in {key}: state_dict keys added: {sorted(added_keys)}. "
-                    "Implement load_state_dict hooks to handle missing keys."
-                )
-
-    def test_rec_metric_module_with_throughput_compatibility(self) -> None:
-        key = REC_METRIC_MODULE_WITH_THROUGHPUT_KEY
-
-        if key not in self.golden_snapshot:
-            current_keys = self._get_state_dict_keys(with_throughput=True)
-            self.golden_snapshot[key] = {
-                "state_dict_keys": current_keys,
-            }
-            save_golden_snapshot(self.golden_snapshot)
-            return
-
-        baseline = self.golden_snapshot[key]
-        current_keys = set(self._get_state_dict_keys(with_throughput=True))
-        baseline_keys = set(baseline["state_dict_keys"])
-
-        removed_keys = baseline_keys - current_keys
-        if removed_keys:
-            self.fail(
-                f"BREAKING CHANGE in {key}: state_dict keys removed: {sorted(removed_keys)}."
-            )
-
-        added_keys = current_keys - baseline_keys
-        if added_keys:
-            if not self._verify_backward_compatibility(
-                added_keys, with_throughput=True
-            ):
-                self.fail(
-                    f"BREAKING CHANGE in {key}: state_dict keys added: {sorted(added_keys)}. "
-                    "Implement load_state_dict hooks to handle missing keys."
-                )
-
-    def _verify_backward_compatibility(
-        self, added_keys: Set[str], with_throughput: bool = False
-    ) -> bool:
-        try:
-            module = self._create_rec_metric_module(with_throughput=with_throughput)
-            state_dict = module.state_dict()
-            old_checkpoint = {
-                k: v for k, v in state_dict.items() if k not in added_keys
-            }
-
-            fresh_module = self._create_rec_metric_module(
-                with_throughput=with_throughput
-            )
-            fresh_module.load_state_dict(old_checkpoint, strict=True)
-            return True
-        except Exception:
-            return False
-
-    def test_rec_metric_module_state_roundtrip(self) -> None:
-        module = self._create_rec_metric_module(with_throughput=True)
-        initial_state = module.state_dict()
-
-        fresh_module = self._create_rec_metric_module(with_throughput=True)
-        fresh_module.load_state_dict(initial_state, strict=True)
-
-        restored_state = fresh_module.state_dict()
-        self.assertEqual(set(initial_state.keys()), set(restored_state.keys()))
-
-        for key in initial_state:
-            torch.testing.assert_close(
-                initial_state[key],
-                restored_state[key],
-                msg=f"State mismatch for key {key}",
-            )
+    """Load checks for RecMetricModule that are not golden comparisons."""
 
     def test_rec_metric_module_backward_compat_trained_batches(self) -> None:
-        module = self._create_rec_metric_module()
+        module = _make_rec_metric_module()
         state_dict = module.state_dict()
 
         state_dict["_trained_batches"] = torch.tensor(100)
 
-        fresh_module = self._create_rec_metric_module()
+        fresh_module = _make_rec_metric_module()
         # strict=True matches production. Under strict=False this test passes
         # even without the pop hook.
         fresh_module.load_state_dict(state_dict, strict=True)
@@ -1545,9 +1430,37 @@ class CrossConfigLoadTest(unittest.TestCase):
             variant_b.load_state_dict(variant_a.state_dict(), strict=True)
 
 
+def generate_schema_case_entries() -> Dict[str, Dict[str, Any]]:
+    """Golden entries for the _SCHEMA_CASES table.
+
+    The comparison path fails rather than writing a missing entry, so this is
+    the only way a new case gets one.
+    """
+    entries: Dict[str, Dict[str, Any]] = {}
+    for case in _SCHEMA_CASES:
+        if case.key in entries:
+            raise ValueError(
+                f"Two cases share the key {case.key!r}. One would overwrite the "
+                "other's golden entry."
+            )
+        module = case.build()
+        entries[case.key] = {
+            "state_dict_keys": sorted(module.state_dict().keys()),
+        }
+    return entries
+
+
 def update_golden_snapshot() -> None:
     print("Generating golden snapshot...")
     snapshot = generate_golden_snapshot()
+    case_entries = generate_schema_case_entries()
+    collisions = sorted(set(snapshot) & set(case_entries))
+    if collisions:
+        raise ValueError(
+            f"Case keys collide with metric snapshot keys: {collisions}. "
+            "One generator would overwrite the other."
+        )
+    snapshot.update(case_entries)
     save_golden_snapshot(snapshot)
     print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH}")
     print(f"Total metrics captured: {len(snapshot)}")
