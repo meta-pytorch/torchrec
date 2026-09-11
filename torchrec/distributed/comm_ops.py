@@ -1422,14 +1422,27 @@ def reduce_scatter_v_per_feature_pooled(
 def _recat_pooled_embedding_grad_out(
     grad_output: Tensor, num_features_per_rank: List[int]
 ) -> Tensor:
-    grad_outputs_by_rank = grad_output.split(num_features_per_rank, dim=1)
-    return torch.cat(
-        [
-            grad_output_by_rank.contiguous().view(-1)
-            for grad_output_by_rank in grad_outputs_by_rank
-        ],
-        dim=0,
+    """
+    [B_local, D_global] -> flat [rank][B_local, D_rank], the layout
+    all_to_all_single expects. One pass over the data: each column block is
+    copied straight into its slot of the output, and grad_output may be a
+    non-contiguous view (a slice of a larger gradient), which needs no
+    contiguous() of its own.
+    """
+    B_local = grad_output.shape[0]
+    out = torch.empty(
+        grad_output.numel(), dtype=grad_output.dtype, device=grad_output.device
     )
+    grad_outputs_by_rank = grad_output.split(num_features_per_rank, dim=1)
+    out_by_rank = [
+        chunk.view(B_local, dim)
+        for chunk, dim in zip(
+            out.split([B_local * dim for dim in num_features_per_rank]),
+            num_features_per_rank,
+        )
+    ]
+    torch._foreach_copy_(out_by_rank, list(grad_outputs_by_rank))
+    return out
 
 
 def _recat_seq_embedding(
@@ -1534,13 +1547,17 @@ class All2All_Pooled_Req(Function):
             device=sharded_input_embeddings.device,
         )
 
-        sharded_input_embeddings_registered = all_to_all_single_comm.allocate(
-            sharded_input_embeddings.shape,
-            dtype=sharded_input_embeddings.dtype,
-            device=sharded_input_embeddings.device,
-        )
-
-        sharded_input_embeddings_registered.copy_(sharded_input_embeddings)
+        if isinstance(all_to_all_single_comm, DefaultAll2AllSingle):
+            # The default comm allocates with torch.empty, so staging the input
+            # through a second buffer only costs a full copy of the embeddings.
+            sharded_input_embeddings_registered = sharded_input_embeddings
+        else:
+            sharded_input_embeddings_registered = all_to_all_single_comm.allocate(
+                sharded_input_embeddings.shape,
+                dtype=sharded_input_embeddings.dtype,
+                device=sharded_input_embeddings.device,
+            )
+            sharded_input_embeddings_registered.copy_(sharded_input_embeddings)
 
         with record_function("## All2All_Pooled_fwd ##"):
             req = all_to_all_single_comm(
@@ -1667,7 +1684,7 @@ class All2All_Pooled_Wait(Function):
         assert sum(dim_sum_per_rank) == D_global_sum
 
         sharded_grad_output = _recat_pooled_embedding_grad_out(
-            grad_output.contiguous(),
+            grad_output,
             dim_sum_per_rank,
         )
 
