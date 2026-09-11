@@ -26,13 +26,28 @@ To update the golden snapshot after intentional changes:
     python -m torchrec.metrics.tests.test_metric_fqn_backward_compatibility --update-golden
 """
 
+import contextlib
 import inspect
 import json
 import os
 import sys
 import unittest
+import unittest.mock
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Type
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterator,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Type,
+)
 
 import torch
 from torchrec.metrics.accuracy import AccuracyMetric
@@ -44,6 +59,8 @@ from torchrec.metrics.calibration import CalibrationMetric
 from torchrec.metrics.calibration_with_recalibration import (
     RecalibratedCalibrationMetric,
 )
+from torchrec.metrics.cpu_comms_metric_module import CPUCommsRecMetricModule
+from torchrec.metrics.cpu_offloaded_metric_module import CPUOffloadedRecMetricModule
 from torchrec.metrics.ctr import CTRMetric
 from torchrec.metrics.gauc import GAUCMetric
 from torchrec.metrics.hindsight_target_pr import HindsightTargetPRMetric
@@ -58,6 +75,7 @@ from torchrec.metrics.ne import NEMetric
 from torchrec.metrics.ne_positive import NEPositiveMetric
 from torchrec.metrics.ne_with_recalibration import RecalibratedNEMetric
 from torchrec.metrics.nmse import NMSEMetric
+from torchrec.metrics.noop_metric_module import NoOpMetricModule
 from torchrec.metrics.num_missing_labels import NumMissingLabelsMetric
 from torchrec.metrics.num_positive_samples import NumPositiveSamplesMetric
 from torchrec.metrics.output import OutputMetric
@@ -110,88 +128,47 @@ def create_test_task(
     )
 
 
+def build_metric(
+    metric_class: Type[RecMetric],
+    compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+    task_names: Optional[List[str]] = None,
+    use_tensor_task: bool = False,
+    use_session_task: bool = False,
+    **kwargs: Any,
+) -> RecMetric:
+    """One metric under the fixed configuration every golden entry is taken at."""
+    if task_names is None:
+        task_names = ["test_task"]
+
+    tasks = [
+        create_test_task(
+            name,
+            with_tensor_name=use_tensor_task,
+            with_session_metric_def=use_session_task,
+        )
+        for name in task_names
+    ]
+
+    return metric_class(
+        world_size=1,
+        my_rank=0,
+        batch_size=32,
+        tasks=tasks,
+        compute_mode=compute_mode,
+        window_size=100,
+        fused_update_limit=0,
+        **kwargs,
+    )
+
+
 def extract_state_dict_keys(
     metric_class: Type[RecMetric],
     compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-    task_names: Optional[List[str]] = None,
-    use_tensor_task: bool = False,
-    use_session_task: bool = False,
     **kwargs: Any,
 ) -> List[str]:
-    if task_names is None:
-        task_names = ["test_task"]
-
-    tasks = [
-        create_test_task(
-            name,
-            with_tensor_name=use_tensor_task,
-            with_session_metric_def=use_session_task,
-        )
-        for name in task_names
-    ]
-
-    metric = metric_class(
-        world_size=1,
-        my_rank=0,
-        batch_size=32,
-        tasks=tasks,
-        compute_mode=compute_mode,
-        window_size=100,
-        fused_update_limit=0,
-        **kwargs,
+    return sorted(
+        build_metric(metric_class, compute_mode, **kwargs).state_dict().keys()
     )
-
-    state_dict = metric.state_dict()
-    return sorted(state_dict.keys())
-
-
-def extract_named_buffer_fqns(
-    metric_class: Type[RecMetric],
-    compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-    task_names: Optional[List[str]] = None,
-    use_tensor_task: bool = False,
-    use_session_task: bool = False,
-    **kwargs: Any,
-) -> Tuple[List[str], List[str]]:
-    if task_names is None:
-        task_names = ["test_task"]
-
-    tasks = [
-        create_test_task(
-            name,
-            with_tensor_name=use_tensor_task,
-            with_session_metric_def=use_session_task,
-        )
-        for name in task_names
-    ]
-
-    metric = metric_class(
-        world_size=1,
-        my_rank=0,
-        batch_size=32,
-        tasks=tasks,
-        compute_mode=compute_mode,
-        window_size=100,
-        fused_update_limit=0,
-        **kwargs,
-    )
-
-    all_buffer_fqns = [name for name, _ in metric.named_buffers()]
-    state_dict_keys = set(metric.state_dict().keys())
-
-    persistent = []
-    non_persistent = []
-
-    for fqn in all_buffer_fqns:
-        is_persistent = any(
-            fqn == key or key.endswith(fqn) or fqn in key for key in state_dict_keys
-        )
-        if is_persistent:
-            persistent.append(fqn)
-        else:
-            non_persistent.append(fqn)
-
-    return sorted(persistent), sorted(non_persistent)
 
 
 def get_metric_snapshot_key(
@@ -206,150 +183,107 @@ def get_metric_snapshot_key(
 
 
 # List of metrics to test with their configurations
-# Format: (metric_class, compute_modes_to_test, extra_kwargs, variants)
+# Format: (metric_class, compute_mode, extra_kwargs, variant)
 # ThroughputMetric is excluded as it's not a RecMetric subclass (it's nn.Module)
-METRICS_TO_TEST: List[
-    Tuple[Type[RecMetric], List[RecComputeMode], Dict[str, Any], List[str]]
-] = [
+METRICS_TO_TEST: List[Tuple[Type[RecMetric], RecComputeMode, Dict[str, Any], str]] = [
     # Core metrics with persistent state
-    (NEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (
-        NEMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
-        {"include_logloss": True},
-        ["with_logloss"],
-    ),
-    (CalibrationMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (CTRMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (MSEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    # There is no include_logloss row: it only gates which metrics _compute
+    # reports, so its entry was identical to the default row below.
+    (NEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (CalibrationMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (CTRMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (MSEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
     (
         MSEMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         {"include_r_squared": True},
-        ["with_r_squared"],
+        "with_r_squared",
     ),
-    (MAEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (WeightedAvgMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (AccuracyMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (PrecisionMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (RecallMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (TowerQPSMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (NMSEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (AverageMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (HindsightTargetPRMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (NDCGMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (XAUCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (ScalarMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    (MAEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (WeightedAvgMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (AccuracyMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (PrecisionMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (RecallMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (TowerQPSMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (NMSEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (AverageMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (HindsightTargetPRMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (NDCGMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (XAUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (ScalarMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
     (
         MultiLabelPrecisionMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         {"num_labels": 1},
-        [""],
+        "",
     ),
     # Metrics with non-persistent state (AUC family)
-    (AUCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (AUPRCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (RAUCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (GAUCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    (AUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (AUPRCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (RAUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (GAUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
     # TensorWeightedAvgMetric requires tensor_name in tasks
     (
         TensorWeightedAvgMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         {"use_tensor_task": True},
-        [""],
+        "",
     ),
-    (CaliFreeNEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (NEPositiveMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (ServingNEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (UnweightedNEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (RecalibratedNEMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (ServingCalibrationMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    (CaliFreeNEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (NEPositiveMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (ServingNEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (UnweightedNEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (RecalibratedNEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (ServingCalibrationMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
     (
         RecalibratedCalibrationMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         {},
-        [""],
+        "",
     ),
-    (OutputMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    (OutputMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
     # MulticlassRecallMetric requires number_of_classes
     (
         MulticlassRecallMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         {"number_of_classes": 3},
-        [""],
+        "",
     ),
     # SegmentedNEMetric requires num_groups and grouping_keys
     (
         SegmentedNEMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         {"num_groups": 2, "grouping_keys": "test_task-grouping"},
-        [""],
+        "",
     ),
     # Session-level metrics require session_metric_def in tasks
     (
         PrecisionSessionMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         {"use_session_task": True},
-        [""],
+        "",
     ),
     (
         RecallSessionMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         {"use_session_task": True},
-        [""],
+        "",
     ),
     # FUSED mode tests
-    (NEMetric, [RecComputeMode.FUSED_TASKS_COMPUTATION], {}, [""]),
-    (CalibrationMetric, [RecComputeMode.FUSED_TASKS_COMPUTATION], {}, [""]),
-    (WeightedAvgMetric, [RecComputeMode.FUSED_TASKS_COMPUTATION], {}, [""]),
+    (NEMetric, RecComputeMode.FUSED_TASKS_COMPUTATION, {}, ""),
+    (CalibrationMetric, RecComputeMode.FUSED_TASKS_COMPUTATION, {}, ""),
+    (WeightedAvgMetric, RecComputeMode.FUSED_TASKS_COMPUTATION, {}, ""),
     # New utility metrics
-    (NumMissingLabelsMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (NumPositiveSamplesMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
-    (SumWeightsMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    (NumMissingLabelsMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (NumPositiveSamplesMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
+    (SumWeightsMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION, {}, ""),
     (
         WeightedSumPredictionsMetric,
-        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        RecComputeMode.UNFUSED_TASKS_COMPUTATION,
         {},
-        [""],
+        "",
     ),
 ]
-
-
-def generate_golden_snapshot() -> Dict[str, Dict[str, Any]]:
-    """
-    Generate a complete golden snapshot of all metrics.
-
-    Returns:
-        Dictionary mapping metric keys to their FQN information.
-    """
-    snapshot: Dict[str, Dict[str, Any]] = {}
-
-    for metric_class, compute_modes, kwargs, variants in METRICS_TO_TEST:
-        for compute_mode in compute_modes:
-            for variant in variants:
-                try:
-                    key = get_metric_snapshot_key(metric_class, compute_mode, variant)
-                    state_dict_keys = extract_state_dict_keys(
-                        metric_class, compute_mode, **kwargs
-                    )
-                    persistent_fqns, non_persistent_fqns = extract_named_buffer_fqns(
-                        metric_class, compute_mode, **kwargs
-                    )
-
-                    snapshot[key] = {
-                        "metric_class": metric_class.__name__,
-                        "compute_mode": compute_mode.name,
-                        "variant": variant,
-                        "state_dict_keys": state_dict_keys,
-                        "persistent_buffer_fqns": persistent_fqns,
-                        "non_persistent_buffer_fqns": non_persistent_fqns,
-                    }
-                except Exception as e:
-                    # pyrefly: ignore[unbound-name]
-                    print(f"Warning: Failed to generate snapshot for {key}: {e}")
-                    continue
-
-    return snapshot
 
 
 def load_golden_snapshot() -> Dict[str, Dict[str, Any]]:
@@ -359,737 +293,386 @@ def load_golden_snapshot() -> Dict[str, Dict[str, Any]]:
         return json.load(f)
 
 
+def load_required_golden_snapshot() -> Dict[str, Dict[str, Any]]:
+    """The golden snapshot, or raise.
+
+    An empty file makes the orphan check pass by having nothing to compare.
+    """
+    snapshot = load_golden_snapshot()
+    if not snapshot:
+        raise RuntimeError(
+            f"{GOLDEN_SNAPSHOT_PATH} is missing or empty. Run with "
+            "--update-golden to generate it.\n"
+            "Regenerating from a test would write whatever the code currently "
+            "produces, and each class knows only its own part of the file."
+        )
+    return snapshot
+
+
 def save_golden_snapshot(snapshot: Dict[str, Dict[str, Any]]) -> None:
     with open(GOLDEN_SNAPSHOT_PATH, "w") as f:
         json.dump(snapshot, f, indent=2, sort_keys=True)
         f.write("\n")
 
 
-class MetricFQNBackwardCompatibilityTest(unittest.TestCase):
+# Fixture values for the golden cases.
+_THROUGHPUT_BATCH_SIZE_STAGES: List[BatchSizeStage] = [
+    BatchSizeStage(batch_size=32, max_iters=100),
+    BatchSizeStage(batch_size=64, max_iters=None),
+]
+
+
+def _make_throughput_metric(
+    batch_size_stages: Optional[List[BatchSizeStage]] = None,
+) -> ThroughputMetric:
+    return ThroughputMetric(
+        batch_size=32,
+        world_size=1,
+        window_seconds=100,
+        warmup_steps=10,
+        batch_size_stages=batch_size_stages,
+    )
+
+
+def _make_rec_metric_module(
+    throughput_metric: Optional[ThroughputMetric] = None,
+) -> RecMetricModule:
+    return RecMetricModule(
+        **_module_fixture_kwargs(),
+        throughput_metric=throughput_metric,
+    )
+
+
+@dataclass(frozen=True)
+class _GoldenCase:
+    """One golden snapshot: which entry it is, and how to build it.
+
+    The builder is self-contained, so a case cannot be paired with another
+    case's configuration. `stable_id` is written by hand rather than derived
+    from the class, so moving a file does not silently change the key and
+    abandon the entry it used to match.
     """
-    Test suite for metric FQN backward compatibility.
 
-    These tests ensure that changes to metrics don't break checkpoint loading
-    by verifying that:
-    1. No persistent buffer FQNs are removed
-    2. No state_dict keys are removed
+    # Snake_case, not the class name: this is the golden file's key, so it
+    # must survive a class rename.
+    stable_id: str
+    expected_class: Type[torch.nn.Module]
+    variant: str
+    build: Callable[[], torch.nn.Module]
+    # Called on every module this case builds. A case whose module owns threads
+    # or other process state declares how to release it.
+    cleanup: Optional[Callable[[torch.nn.Module], None]] = None
 
-    New additions are allowed as long as they have proper load_state_dict hooks
+    @property
+    def key(self) -> str:
+        return f"{self.stable_id}_{self.variant}" if self.variant else self.stable_id
+
+
+_REC_METRIC_MODULE_DEFAULT = _GoldenCase(
+    "rec_metric_module", RecMetricModule, "", _make_rec_metric_module
+)
+
+# Each stable_id is the golden file's key. It has to survive a rename of the
+# class beside it, which is why it is snake_case and not a class name.
+_CORE_SCHEMA_CASES: Tuple[_GoldenCase, ...] = (
+    _GoldenCase("throughput_metric", ThroughputMetric, "", _make_throughput_metric),
+    _GoldenCase(
+        "throughput_metric",
+        ThroughputMetric,
+        "with_batch_size_stages",
+        lambda: _make_throughput_metric(_THROUGHPUT_BATCH_SIZE_STAGES),
+    ),
+    _REC_METRIC_MODULE_DEFAULT,
+    _GoldenCase(
+        "rec_metric_module",
+        RecMetricModule,
+        "with_throughput",
+        lambda: _make_rec_metric_module(_make_throughput_metric()),
+    ),
+)
+
+
+def _module_fixture_kwargs() -> Dict[str, Any]:
+    """Construction args shared by every RecMetricModule case.
+
+    One real metric, because an empty RecMetricList produces an empty
+    state_dict. Shared so the enrolled modules keep describing comparable
+    shapes.
     """
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.golden_snapshot = load_golden_snapshot()
-        if not cls.golden_snapshot:
-            print("No golden snapshot found. Generating initial snapshot...")
-            cls.golden_snapshot = generate_golden_snapshot()
-            save_golden_snapshot(cls.golden_snapshot)
-            print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH}")
-        cls.current_snapshot = None
-
-    def _check_metric_compatibility(
-        self,
-        metric_class: Type[RecMetric],
-        compute_mode: RecComputeMode,
-        variant: str = "",
-        **kwargs: Any,
-    ) -> None:
-        """
-        Check a single metric for backward compatibility with DCP CheckpointClient.
-
-        This test simulates what happens when a new model version (with potentially
-        new state_dict keys) tries to load an old checkpoint:
-
-        1. REMOVED keys: Old checkpoint has keys that new model doesn't expect.
-           - This typically works fine (load_state_dict ignores extra keys)
-           - But indicates the metric structure changed unexpectedly
-
-        2. ADDED keys: New model has keys that old checkpoint doesn't have.
-           - This BREAKS DCP CheckpointClient! The client validates that ALL model
-             FQNs exist in the checkpoint metadata before loading.
-           - Raises InvalidParamQualNameException at the DCP level.
-
-        Raises assertion error if incompatible changes are detected.
-        """
-        key = get_metric_snapshot_key(metric_class, compute_mode, variant)
-
-        if key not in self.golden_snapshot:
-            self.skipTest(
-                f"No golden snapshot for {key}. Run with --update-golden to create."
-            )
-
-        baseline = self.golden_snapshot[key]
-
-        current_state_dict_keys = set(
-            extract_state_dict_keys(metric_class, compute_mode, **kwargs)
-        )
-        current_persistent_fqns, _ = extract_named_buffer_fqns(
-            metric_class, compute_mode, **kwargs
-        )
-        current_persistent_fqns_set = set(current_persistent_fqns)
-
-        baseline_state_dict_keys = set(baseline["state_dict_keys"])
-        baseline_persistent_fqns = set(baseline["persistent_buffer_fqns"])
-
-        removed_keys = baseline_state_dict_keys - current_state_dict_keys
-        if removed_keys:
-            self.fail(
-                f"BREAKING CHANGE in {key}: state_dict keys removed: {sorted(removed_keys)}. "
-                "This will cause old checkpoints to fail loading. "
-                "If this is intentional, update the golden snapshot."
-            )
-
-        removed_fqns = baseline_persistent_fqns - current_persistent_fqns_set
-        if removed_fqns:
-            self.fail(
-                f"BREAKING CHANGE in {key}: persistent buffer FQNs removed: {sorted(removed_fqns)}. "
-                "This will cause old checkpoints to fail loading. "
-                "If this is intentional, update the golden snapshot."
-            )
-
-        added_keys = current_state_dict_keys - baseline_state_dict_keys
-        added_fqns = current_persistent_fqns_set - baseline_persistent_fqns
-
-        if added_keys or added_fqns:
-            has_backward_compat = self._verify_backward_compatibility(
-                metric_class, compute_mode, added_keys, **kwargs
-            )
-
-            if not has_backward_compat:
-                self.fail(
-                    f"BREAKING CHANGE in {key}: state_dict keys added: {sorted(added_keys)}.\n"
-                    "This will cause DCP CheckpointClient to fail with InvalidParamQualNameException "
-                    "when loading old checkpoints (the client validates that ALL model FQNs exist "
-                    "in checkpoint metadata before loading).\n\n"
-                    "To fix:\n"
-                    "1. Make the new state non-persistent (use persistent=False in add_state)\n"
-                    "2. OR coordinate with trainers to enable allow_partial_load for metrics\n"
-                    "3. OR run with --update-golden if this change is intentional and coordinated"
+    tasks = [create_test_task("task1")]
+    return {
+        "batch_size": 32,
+        "world_size": 1,
+        "rec_tasks": tasks,
+        "rec_metrics": RecMetricList(
+            [
+                NEMetric(
+                    world_size=1,
+                    my_rank=0,
+                    batch_size=32,
+                    tasks=tasks,
+                    compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+                    window_size=100,
                 )
-
-    def _verify_backward_compatibility(
-        self,
-        metric_class: Type[RecMetric],
-        compute_mode: RecComputeMode,
-        added_keys: Set[str],
-        **kwargs: Any,
-    ) -> bool:
-        """
-        Check if added state_dict keys are backward compatible.
-
-        Note: While torchmetrics.Metric handles missing keys gracefully at the
-        PyTorch load_state_dict level (keeping default values), this does NOT
-        help at the DCP CheckpointClient level. The DCP client validates FQNs
-        BEFORE calling load_state_dict, so it fails before PyTorch hooks run.
-
-        For added keys, we always return False to require explicit acknowledgment:
-        1. Confirm the change is intentional
-        2. Verify coordination with trainer teams
-        3. Update the golden snapshot with --update-golden
-
-        Returns:
-            True if no added keys (backward compatible)
-            False if there are added keys (requires developer acknowledgment)
-        """
-        # If there are added keys, require user to update golden snapshot
-        return len(added_keys) == 0
-
-    def test_ne_metric_unfused(self) -> None:
-        self._check_metric_compatibility(
-            NEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_ne_metric_fused(self) -> None:
-        self._check_metric_compatibility(
-            NEMetric, RecComputeMode.FUSED_TASKS_COMPUTATION
-        )
-
-    def test_ne_metric_with_logloss(self) -> None:
-        self._check_metric_compatibility(
-            NEMetric,
-            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-            variant="with_logloss",
-            include_logloss=True,
-        )
-
-    def test_calibration_metric_unfused(self) -> None:
-        self._check_metric_compatibility(
-            CalibrationMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_calibration_metric_fused(self) -> None:
-        self._check_metric_compatibility(
-            CalibrationMetric, RecComputeMode.FUSED_TASKS_COMPUTATION
-        )
-
-    def test_ctr_metric(self) -> None:
-        self._check_metric_compatibility(
-            CTRMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_mse_metric(self) -> None:
-        self._check_metric_compatibility(
-            MSEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_mse_metric_with_r_squared(self) -> None:
-        self._check_metric_compatibility(
-            MSEMetric,
-            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-            variant="with_r_squared",
-            include_r_squared=True,
-        )
-
-    def test_mae_metric(self) -> None:
-        self._check_metric_compatibility(
-            MAEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_weighted_avg_metric_unfused(self) -> None:
-        self._check_metric_compatibility(
-            WeightedAvgMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_weighted_avg_metric_fused(self) -> None:
-        self._check_metric_compatibility(
-            WeightedAvgMetric, RecComputeMode.FUSED_TASKS_COMPUTATION
-        )
-
-    def test_accuracy_metric(self) -> None:
-        self._check_metric_compatibility(
-            AccuracyMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_precision_metric(self) -> None:
-        self._check_metric_compatibility(
-            PrecisionMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_recall_metric(self) -> None:
-        self._check_metric_compatibility(
-            RecallMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_tower_qps_metric(self) -> None:
-        self._check_metric_compatibility(
-            TowerQPSMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_nmse_metric(self) -> None:
-        self._check_metric_compatibility(
-            NMSEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_average_metric(self) -> None:
-        self._check_metric_compatibility(
-            AverageMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_hindsight_target_pr_metric(self) -> None:
-        self._check_metric_compatibility(
-            HindsightTargetPRMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_auc_metric(self) -> None:
-        self._check_metric_compatibility(
-            AUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_auprc_metric(self) -> None:
-        self._check_metric_compatibility(
-            AUPRCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_rauc_metric(self) -> None:
-        self._check_metric_compatibility(
-            RAUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_gauc_metric(self) -> None:
-        self._check_metric_compatibility(
-            GAUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_ndcg_metric(self) -> None:
-        self._check_metric_compatibility(
-            NDCGMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_xauc_metric(self) -> None:
-        self._check_metric_compatibility(
-            XAUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_scalar_metric(self) -> None:
-        self._check_metric_compatibility(
-            ScalarMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_tensor_weighted_avg_metric(self) -> None:
-        self._check_metric_compatibility(
-            TensorWeightedAvgMetric,
-            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-            variant="",
-            use_tensor_task=True,
-        )
-
-    def test_cali_free_ne_metric(self) -> None:
-        self._check_metric_compatibility(
-            CaliFreeNEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_ne_positive_metric(self) -> None:
-        self._check_metric_compatibility(
-            NEPositiveMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_serving_ne_metric(self) -> None:
-        self._check_metric_compatibility(
-            ServingNEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_unweighted_ne_metric(self) -> None:
-        self._check_metric_compatibility(
-            UnweightedNEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_recalibrated_ne_metric(self) -> None:
-        self._check_metric_compatibility(
-            RecalibratedNEMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_serving_calibration_metric(self) -> None:
-        self._check_metric_compatibility(
-            ServingCalibrationMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_recalibrated_calibration_metric(self) -> None:
-        self._check_metric_compatibility(
-            RecalibratedCalibrationMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_output_metric(self) -> None:
-        self._check_metric_compatibility(
-            OutputMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
-        )
-
-    def test_multiclass_recall_metric(self) -> None:
-        self._check_metric_compatibility(
-            MulticlassRecallMetric,
-            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-            number_of_classes=3,
-        )
-
-    def test_multi_label_precision_metric(self) -> None:
-        self._check_metric_compatibility(
-            MultiLabelPrecisionMetric,
-            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-            num_labels=1,
-        )
-
-    def test_segmented_ne_metric(self) -> None:
-        self._check_metric_compatibility(
-            SegmentedNEMetric,
-            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-            num_groups=2,
-            grouping_keys="test_task-grouping",
-        )
-
-    def test_precision_session_metric(self) -> None:
-        self._check_metric_compatibility(
-            PrecisionSessionMetric,
-            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-            use_session_task=True,
-        )
-
-    def test_recall_session_metric(self) -> None:
-        self._check_metric_compatibility(
-            RecallSessionMetric,
-            RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-            use_session_task=True,
-        )
-
-
-class MetricStateSnapshotTest(unittest.TestCase):
-    """
-    Test suite for verifying metric state snapshot capabilities.
-
-    These tests verify that metrics properly register their states
-    and can be serialized/deserialized correctly.
-    """
-
-    def _test_metric_state_roundtrip(
-        self,
-        metric_class: Type[RecMetric],
-        compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-        **kwargs: Any,
-    ) -> None:
-        tasks = [create_test_task("task1")]
-
-        original = metric_class(
-            world_size=1,
-            my_rank=0,
-            batch_size=32,
-            tasks=tasks,
-            compute_mode=compute_mode,
-            window_size=100,
-            **kwargs,
-        )
-
-        initial_state = original.state_dict()
-
-        restored = metric_class(
-            world_size=1,
-            my_rank=0,
-            batch_size=32,
-            tasks=tasks,
-            compute_mode=compute_mode,
-            window_size=100,
-            **kwargs,
-        )
-
-        restored.load_state_dict(initial_state, strict=True)
-
-        restored_state = restored.state_dict()
-        self.assertEqual(
-            set(initial_state.keys()),
-            set(restored_state.keys()),
-            f"State dict keys mismatch for {metric_class.__name__}",
-        )
-
-        for key in initial_state:
-            torch.testing.assert_close(
-                initial_state[key],
-                restored_state[key],
-                msg=f"State mismatch for key {key} in {metric_class.__name__}",
-            )
-
-    def test_ne_metric_state_roundtrip(self) -> None:
-        self._test_metric_state_roundtrip(NEMetric)
-
-    def test_calibration_metric_state_roundtrip(self) -> None:
-        self._test_metric_state_roundtrip(CalibrationMetric)
-
-    def test_mse_metric_state_roundtrip(self) -> None:
-        self._test_metric_state_roundtrip(MSEMetric)
-
-    def test_weighted_avg_metric_state_roundtrip(self) -> None:
-        self._test_metric_state_roundtrip(WeightedAvgMetric)
-
-
-# Golden snapshot keys for ThroughputMetric and RecMetricModule
-THROUGHPUT_SNAPSHOT_KEY = "ThroughputMetric"
-THROUGHPUT_WITH_STAGES_SNAPSHOT_KEY = "ThroughputMetric_with_batch_size_stages"
-REC_METRIC_MODULE_SNAPSHOT_KEY = "RecMetricModule"
-REC_METRIC_MODULE_WITH_THROUGHPUT_KEY = "RecMetricModule_with_throughput"
-
-
-class ThroughputMetricBackwardCompatibilityTest(unittest.TestCase):
-    """
-    Test suite for ThroughputMetric FQN backward compatibility.
-
-    ThroughputMetric is an nn.Module (not RecMetric) with its own state_dict structure.
-    """
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.golden_snapshot = load_golden_snapshot()
-
-    def _create_throughput_metric(
-        self, with_batch_size_stages: bool = False
-    ) -> ThroughputMetric:
-        from torchrec.metrics.metrics_config import BatchSizeStage
-
-        batch_size_stages = None
-        if with_batch_size_stages:
-            batch_size_stages = [
-                BatchSizeStage(batch_size=32, max_iters=100),
-                BatchSizeStage(batch_size=64, max_iters=None),
             ]
+        ),
+    }
 
-        return ThroughputMetric(
-            batch_size=32,
-            world_size=1,
-            window_seconds=100,
-            warmup_steps=10,
-            batch_size_stages=batch_size_stages,
+
+def _shutdown(module: torch.nn.Module) -> None:
+    """Release resources owned by CPUOffloadedRecMetricModule."""
+    # pyre-ignore[16]
+    module.shutdown()
+
+
+class _InertThread:
+    """A Thread that never runs.
+
+    This file only reads a module's state_dict, so CPUOffloadedRecMetricModule's
+    workers do nothing here. It constructs its threads directly, with no seam to
+    pass a substitute through, which is why this one arrives by patch.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def start(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return False
+
+    def join(self, timeout: Optional[float] = None) -> None:
+        pass
+
+
+def _make_cpu_offloaded_module() -> CPUOffloadedRecMetricModule:
+    with unittest.mock.patch(
+        "torchrec.metrics.cpu_offloaded_metric_module.threading.Thread",
+        new=_InertThread,
+    ):
+        return CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"), **_module_fixture_kwargs()
         )
 
-    def _get_state_dict_keys(self, with_batch_size_stages: bool = False) -> List[str]:
-        metric = self._create_throughput_metric(with_batch_size_stages)
-        return sorted(metric.state_dict().keys())
 
-    def test_throughput_metric_compatibility(self) -> None:
-        key = THROUGHPUT_SNAPSHOT_KEY
+# Not RecMetric subclasses, so _discover_all_recmetric_subclasses cannot see
+# them. A row here is the only thing that enrolls one.
+_MODULE_CASES: Tuple[_GoldenCase, ...] = (
+    _GoldenCase("noop_metric_module", NoOpMetricModule, "", NoOpMetricModule),
+    _GoldenCase(
+        "cpu_comms_rec_metric_module",
+        CPUCommsRecMetricModule,
+        "",
+        lambda: CPUCommsRecMetricModule(**_module_fixture_kwargs()),
+    ),
+    # state_dict() reads the comms tree and load_state_dict() writes the offloaded
+    # one, but both carry the same keys, so this pins the shape and not which tree
+    # a load reached. test_cpu_offloaded_metric_module covers the load direction.
+    _GoldenCase(
+        "cpu_offloaded_rec_metric_module",
+        CPUOffloadedRecMetricModule,
+        "",
+        _make_cpu_offloaded_module,
+        cleanup=_shutdown,
+    ),
+)
 
-        if key not in self.golden_snapshot:
-            current_keys = self._get_state_dict_keys(with_batch_size_stages=False)
-            self.golden_snapshot[key] = {
-                "metric_class": "ThroughputMetric",
-                "variant": "",
-                "state_dict_keys": current_keys,
-                "persistent_buffer_fqns": [],
-                "non_persistent_buffer_fqns": [],
-            }
-            save_golden_snapshot(self.golden_snapshot)
-            return
+# Enrolled by a row here and nowhere else.
 
-        baseline = self.golden_snapshot[key]
-        current_keys = set(self._get_state_dict_keys(with_batch_size_stages=False))
-        baseline_keys = set(baseline["state_dict_keys"])
 
-        removed_keys = baseline_keys - current_keys
-        if removed_keys:
-            self.fail(
-                f"BREAKING CHANGE in {key}: state_dict keys removed: {sorted(removed_keys)}. "
-                "This will cause old checkpoints to fail loading."
-            )
+def _metric_cases() -> Tuple[_GoldenCase, ...]:
+    """One case per METRICS_TO_TEST row.
 
-        added_keys = current_keys - baseline_keys
-        if added_keys:
-            if not self._verify_backward_compatibility(added_keys):
-                self.fail(
-                    f"BREAKING CHANGE in {key}: state_dict keys added: {sorted(added_keys)}. "
-                    "Implement load_state_dict hooks to handle missing keys."
-                )
+    The id comes from get_metric_snapshot_key rather than a second copy of its
+    formula, so the two cannot drift.
+    """
+    return tuple(
+        _GoldenCase(
+            stable_id=get_metric_snapshot_key(metric_class, compute_mode),
+            expected_class=metric_class,
+            variant=variant,
+            build=partial(build_metric, metric_class, compute_mode, **kwargs),
+        )
+        for metric_class, compute_mode, kwargs, variant in METRICS_TO_TEST
+    )
 
-    def test_throughput_metric_with_stages_compatibility(self) -> None:
-        key = THROUGHPUT_WITH_STAGES_SNAPSHOT_KEY
 
-        if key not in self.golden_snapshot:
-            current_keys = self._get_state_dict_keys(with_batch_size_stages=True)
-            self.golden_snapshot[key] = {
-                "metric_class": "ThroughputMetric",
-                "variant": "with_batch_size_stages",
-                "state_dict_keys": current_keys,
-                "persistent_buffer_fqns": [],
-                "non_persistent_buffer_fqns": [],
-            }
-            save_golden_snapshot(self.golden_snapshot)
-            return
+_SCHEMA_CASES: Tuple[_GoldenCase, ...] = (
+    _CORE_SCHEMA_CASES + _MODULE_CASES + _metric_cases()
+)
 
-        baseline = self.golden_snapshot[key]
-        current_keys = set(self._get_state_dict_keys(with_batch_size_stages=True))
-        baseline_keys = set(baseline["state_dict_keys"])
 
-        removed_keys = baseline_keys - current_keys
-        if removed_keys:
-            self.fail(
-                f"BREAKING CHANGE in {key}: state_dict keys removed: {sorted(removed_keys)}. "
-                "This will cause old checkpoints to fail loading."
-            )
+def _validate_case_entry(
+    case: _GoldenCase, entry: Dict[str, Any], current_keys: Set[str]
+) -> None:
+    """Compare one case against its golden entry. Raises on any disagreement."""
+    baseline_keys = set(entry["state_dict_keys"])
 
-        added_keys = current_keys - baseline_keys
-        if added_keys:
-            if not self._verify_backward_compatibility(added_keys, with_stages=True):
-                self.fail(
-                    f"BREAKING CHANGE in {key}: state_dict keys added: {sorted(added_keys)}. "
-                    "Implement load_state_dict hooks to handle missing keys."
-                )
+    removed = baseline_keys - current_keys
+    if removed:
+        raise AssertionError(
+            f"BREAKING CHANGE in {case.key}: state_dict keys removed: "
+            f"{sorted(removed)}."
+        )
 
-    def _verify_backward_compatibility(
-        self, added_keys: Set[str], with_stages: bool = False
-    ) -> bool:
+    added = current_keys - baseline_keys
+    if added:
+        raise AssertionError(
+            f"BREAKING CHANGE in {case.key}: state_dict keys added: "
+            f"{sorted(added)}.\n"
+            "DCP validates every model FQN against checkpoint metadata before "
+            "load_state_dict runs, so the planner rejects a checkpoint written "
+            "before these keys existed. Loading one in process proves nothing: "
+            "state torchmetrics holds by setattr is invisible to the strict "
+            "check and still demanded by the planner."
+        )
+
+
+class GoldenCaseTest(unittest.TestCase):
+    """Compares each golden case against its recorded entry.
+
+    The entry records the state_dict keys and nothing else, so that is the
+    whole comparison. A case pointed at another class is caught by the type
+    assertion in _check_case, not by anything stored in the file.
+    """
+
+    golden_snapshot: Dict[str, Dict[str, Any]]
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.golden_snapshot = load_required_golden_snapshot()
+
+    @contextlib.contextmanager
+    def _built(self, case: _GoldenCase) -> Iterator[torch.nn.Module]:
+        module = case.build()
         try:
-            metric = self._create_throughput_metric(with_batch_size_stages=with_stages)
-            state_dict = metric.state_dict()
-            old_checkpoint = {
-                k: v for k, v in state_dict.items() if k not in added_keys
-            }
+            yield module
+        finally:
+            if case.cleanup is not None:
+                case.cleanup(module)
 
-            fresh_metric = self._create_throughput_metric(
-                with_batch_size_stages=with_stages
+    def _check_case(self, case: _GoldenCase) -> None:
+        with self._built(case) as module:
+            self.assertIs(type(module), case.expected_class)
+
+            if case.key not in self.golden_snapshot:
+                self.fail(
+                    f"No golden entry for {case.key}. Run with --update-golden "
+                    "to create it. Writing one here would bless whatever the "
+                    "code currently produces, and concurrent tests writing the "
+                    "whole file at once corrupt it."
+                )
+
+            _validate_case_entry(
+                case, self.golden_snapshot[case.key], set(module.state_dict())
             )
-            fresh_metric.load_state_dict(old_checkpoint, strict=True)
-            return True
-        except Exception:
-            return False
 
-    def test_throughput_metric_state_roundtrip(self) -> None:
-        metric = self._create_throughput_metric()
-        initial_state = metric.state_dict()
+    def test_golden_cases(self) -> None:
+        for case in _SCHEMA_CASES:
+            with self.subTest(case.key):
+                self._check_case(case)
 
-        fresh_metric = self._create_throughput_metric()
-        fresh_metric.load_state_dict(initial_state, strict=True)
+    def test_key_drift_is_rejected(self) -> None:
+        """Checks that the drift check works.
 
-        restored_state = fresh_metric.state_dict()
-        self.assertEqual(set(initial_state.keys()), set(restored_state.keys()))
+        Neither failure path runs in a green suite. This makes both run.
+        """
+        case = _GoldenCase("probe", torch.nn.Module, "", torch.nn.Module)
+        for label, baseline, expected in (
+            ("removed", ["alpha", "beta", "gamma"], "state_dict keys removed"),
+            ("added", ["alpha"], "state_dict keys added"),
+        ):
+            with self.subTest(label):
+                entry = {"state_dict_keys": baseline}
+                with self.assertRaisesRegex(AssertionError, expected):
+                    _validate_case_entry(case, entry, {"alpha", "beta"})
 
-        for key in initial_state:
-            torch.testing.assert_close(
-                initial_state[key],
-                restored_state[key],
-                msg=f"State mismatch for key {key}",
+    def test_regeneration_reproduces_the_checked_in_file(self) -> None:
+        """The file must equal what --update-golden writes, field for field.
+
+        The per-case check reads only state_dict_keys, so an entry carrying
+        anything else passes it. Comparing whole entries is what catches a
+        stale field, a reordered key list, or a drifting generator.
+        """
+        self.assertEqual(generate_schema_case_entries(), load_golden_snapshot())
+
+    def test_no_orphaned_golden_entries(self) -> None:
+        """Every golden entry must belong to something that checks it.
+
+        An entry nobody claims is dead weight that still looks like coverage.
+        That happens when a metric is dropped from METRICS_TO_TEST, or a case is
+        removed, and the entry is left behind. Metric rows are cases now, so
+        the case table is the only thing this consults.
+        """
+        expected = {case.key for case in _SCHEMA_CASES}
+        orphans = sorted(set(self.golden_snapshot) - expected)
+        if orphans:
+            self.fail(
+                f"Golden entries that no test claims: {orphans}.\n"
+                "Either restore whatever used to check them, or delete the "
+                "entries."
             )
+
+    def test_one_class_per_stable_id(self) -> None:
+        """A stable id names one class, however many variants it has.
+
+        The key carries the variant, so two classes could share an id and still
+        keep distinct keys. Anything that maps id to class would then silently
+        keep whichever row it read last.
+        """
+        classes_by_id: Dict[str, Set[Type[torch.nn.Module]]] = {}
+        for case in _SCHEMA_CASES:
+            classes_by_id.setdefault(case.stable_id, set()).add(case.expected_class)
+
+        for stable_id, classes in classes_by_id.items():
+            with self.subTest(stable_id):
+                self.assertEqual(
+                    len(classes),
+                    1,
+                    f"{stable_id} is claimed by "
+                    f"{sorted(c.__name__ for c in classes)}.",
+                )
+
+    def test_cases_for_same_id_have_distinct_key_sets(self) -> None:
+        """Every case under one id must snapshot a different key set.
+
+        The unnamed case counts too, so this catches a named variant whose
+        builder forgot the argument that distinguishes it. The key and the
+        stored metadata both agree with themselves in that case; only the
+        resulting shape disagrees.
+        """
+        by_id: Dict[str, List[FrozenSet[str]]] = {}
+        for case in _SCHEMA_CASES:
+            with self._built(case) as module:
+                by_id.setdefault(case.stable_id, []).append(
+                    frozenset(module.state_dict().keys())
+                )
+
+        for stable_id, entries in by_id.items():
+            with self.subTest(stable_id):
+                self.assertEqual(
+                    len(set(entries)),
+                    len(entries),
+                    f"{stable_id} has {len(entries)} cases but "
+                    f"{len(set(entries))} distinct key sets. One builder is carrying "
+                    "another's configuration.",
+                )
 
 
 class RecMetricModuleBackwardCompatibilityTest(unittest.TestCase):
-    """
-    Test suite for RecMetricModule FQN backward compatibility.
-
-    RecMetricModule is a container that holds RecMetrics, ThroughputMetric, and StateMetrics.
-    """
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        """Load the golden snapshot."""
-        cls.golden_snapshot = load_golden_snapshot()
-
-    def _create_rec_metric_module(
-        self, with_throughput: bool = False, with_metrics: bool = True
-    ) -> RecMetricModule:
-        tasks = [create_test_task("task1")]
-
-        rec_metrics = None
-        if with_metrics:
-            ne_metric = NEMetric(
-                world_size=1,
-                my_rank=0,
-                batch_size=32,
-                tasks=tasks,
-                compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-                window_size=100,
-            )
-            rec_metrics = RecMetricList([ne_metric])
-
-        throughput_metric = None
-        if with_throughput:
-            throughput_metric = ThroughputMetric(
-                batch_size=32,
-                world_size=1,
-                window_seconds=100,
-                warmup_steps=10,
-            )
-
-        return RecMetricModule(
-            batch_size=32,
-            world_size=1,
-            rec_tasks=tasks,
-            rec_metrics=rec_metrics,
-            throughput_metric=throughput_metric,
-        )
-
-    def _get_state_dict_keys(
-        self, with_throughput: bool = False, with_metrics: bool = True
-    ) -> List[str]:
-        module = self._create_rec_metric_module(
-            with_throughput=with_throughput, with_metrics=with_metrics
-        )
-        return sorted(module.state_dict().keys())
-
-    def test_rec_metric_module_compatibility(self) -> None:
-        key = REC_METRIC_MODULE_SNAPSHOT_KEY
-
-        if key not in self.golden_snapshot:
-            current_keys = self._get_state_dict_keys(with_throughput=False)
-            self.golden_snapshot[key] = {
-                "metric_class": "RecMetricModule",
-                "variant": "",
-                "state_dict_keys": current_keys,
-                "persistent_buffer_fqns": [],
-                "non_persistent_buffer_fqns": [],
-            }
-            save_golden_snapshot(self.golden_snapshot)
-            return
-
-        baseline = self.golden_snapshot[key]
-        current_keys = set(self._get_state_dict_keys(with_throughput=False))
-        baseline_keys = set(baseline["state_dict_keys"])
-
-        removed_keys = baseline_keys - current_keys
-        if removed_keys:
-            self.fail(
-                f"BREAKING CHANGE in {key}: state_dict keys removed: {sorted(removed_keys)}."
-            )
-
-        added_keys = current_keys - baseline_keys
-        if added_keys:
-            if not self._verify_backward_compatibility(
-                added_keys, with_throughput=False
-            ):
-                self.fail(
-                    f"BREAKING CHANGE in {key}: state_dict keys added: {sorted(added_keys)}. "
-                    "Implement load_state_dict hooks to handle missing keys."
-                )
-
-    def test_rec_metric_module_with_throughput_compatibility(self) -> None:
-        key = REC_METRIC_MODULE_WITH_THROUGHPUT_KEY
-
-        if key not in self.golden_snapshot:
-            current_keys = self._get_state_dict_keys(with_throughput=True)
-            self.golden_snapshot[key] = {
-                "metric_class": "RecMetricModule",
-                "variant": "with_throughput",
-                "state_dict_keys": current_keys,
-                "persistent_buffer_fqns": [],
-                "non_persistent_buffer_fqns": [],
-            }
-            save_golden_snapshot(self.golden_snapshot)
-            return
-
-        baseline = self.golden_snapshot[key]
-        current_keys = set(self._get_state_dict_keys(with_throughput=True))
-        baseline_keys = set(baseline["state_dict_keys"])
-
-        removed_keys = baseline_keys - current_keys
-        if removed_keys:
-            self.fail(
-                f"BREAKING CHANGE in {key}: state_dict keys removed: {sorted(removed_keys)}."
-            )
-
-        added_keys = current_keys - baseline_keys
-        if added_keys:
-            if not self._verify_backward_compatibility(
-                added_keys, with_throughput=True
-            ):
-                self.fail(
-                    f"BREAKING CHANGE in {key}: state_dict keys added: {sorted(added_keys)}. "
-                    "Implement load_state_dict hooks to handle missing keys."
-                )
-
-    def _verify_backward_compatibility(
-        self, added_keys: Set[str], with_throughput: bool = False
-    ) -> bool:
-        try:
-            module = self._create_rec_metric_module(with_throughput=with_throughput)
-            state_dict = module.state_dict()
-            old_checkpoint = {
-                k: v for k, v in state_dict.items() if k not in added_keys
-            }
-
-            fresh_module = self._create_rec_metric_module(
-                with_throughput=with_throughput
-            )
-            fresh_module.load_state_dict(old_checkpoint, strict=True)
-            return True
-        except Exception:
-            return False
-
-    def test_rec_metric_module_state_roundtrip(self) -> None:
-        module = self._create_rec_metric_module(with_throughput=True)
-        initial_state = module.state_dict()
-
-        fresh_module = self._create_rec_metric_module(with_throughput=True)
-        fresh_module.load_state_dict(initial_state, strict=True)
-
-        restored_state = fresh_module.state_dict()
-        self.assertEqual(set(initial_state.keys()), set(restored_state.keys()))
-
-        for key in initial_state:
-            torch.testing.assert_close(
-                initial_state[key],
-                restored_state[key],
-                msg=f"State mismatch for key {key}",
-            )
+    """Load checks for RecMetricModule that are not golden comparisons."""
 
     def test_rec_metric_module_backward_compat_trained_batches(self) -> None:
-        module = self._create_rec_metric_module()
+        module = _make_rec_metric_module()
         state_dict = module.state_dict()
 
         state_dict["_trained_batches"] = torch.tensor(100)
 
-        fresh_module = self._create_rec_metric_module()
-        fresh_module.load_state_dict(state_dict, strict=False)
+        fresh_module = _make_rec_metric_module()
+        # strict=True matches production. Under strict=False this test passes
+        # even without the pop hook.
+        fresh_module.load_state_dict(state_dict, strict=True)
 
 
 class MetricCoverageTest(unittest.TestCase):
@@ -1128,9 +711,9 @@ class MetricCoverageTest(unittest.TestCase):
                 f"The following RecMetric subclasses are not covered by backward "
                 f"compatibility tests: {sorted(missing_metrics)}.\n\n"
                 f"To fix this:\n"
-                f"1. Add the metric to METRICS_TO_TEST in this file\n"
-                f"2. Add a corresponding test_<metric>_metric() method\n"
-                f"3. Run the tests to generate the golden snapshot\n\n"
+                f"1. Add a METRICS_TO_TEST row. The check runs from the table, "
+                f"so the row is the whole registration.\n"
+                f"2. Run with --update-golden to write its entry.\n\n"
                 f"If the metric should be excluded, add it to EXCLUDED_METRICS with a reason."
             )
 
@@ -1633,18 +1216,42 @@ class CrossConfigLoadTest(unittest.TestCase):
             variant_b.load_state_dict(variant_a.state_dict(), strict=True)
 
 
+def generate_schema_case_entries() -> Dict[str, Dict[str, Any]]:
+    """Golden entries for the _SCHEMA_CASES table.
+
+    The comparison path fails rather than writing a missing entry, so this is
+    the only way a new case gets one.
+
+    """
+    entries: Dict[str, Dict[str, Any]] = {}
+    for case in _SCHEMA_CASES:
+        if case.key in entries:
+            raise ValueError(
+                f"Two cases share the key {case.key!r}. One would overwrite "
+                "the other's golden entry."
+            )
+        module = case.build()
+        try:
+            entries[case.key] = {
+                "state_dict_keys": sorted(module.state_dict().keys()),
+            }
+        finally:
+            if case.cleanup is not None:
+                case.cleanup(module)
+    return entries
+
+
 def update_golden_snapshot() -> None:
     print("Generating golden snapshot...")
-    snapshot = generate_golden_snapshot()
+    snapshot = generate_schema_case_entries()
     save_golden_snapshot(snapshot)
-    print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH}")
+    # Resolved: the path runs through buck-out's link tree, which symlinks back
+    # to the source. Printing it unresolved suggests the write went to buck-out.
+    print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH.resolve()}")
     print(f"Total metrics captured: {len(snapshot)}")
     for key in sorted(snapshot.keys()):
         info = snapshot[key]
-        print(
-            f"  - {key}: {len(info['state_dict_keys'])} state_dict keys, "
-            f"{len(info['persistent_buffer_fqns'])} persistent buffers"
-        )
+        print(f"  - {key}: {len(info['state_dict_keys'])} state_dict keys")
 
 
 if __name__ == "__main__":
