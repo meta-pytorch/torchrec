@@ -802,15 +802,15 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 )
                 return
 
-            if synchronization_marker.throughput_only:
-                synchronization_marker.future.set_result(
-                    super().compute_throughput().resolve()
+            if synchronization_marker.throughput_only or not self.rec_metrics:
+                deferred_metrics = (
+                    super().compute_throughput()
+                    if synchronization_marker.throughput_only
+                    else super().compute()
                 )
+                synchronization_marker.future.set_result(deferred_metrics.resolve())
                 self._total_computes_processed += 1
                 return
-
-            if not self.rec_metrics:
-                raise RecMetricException("No metrics to compute.")
 
             metric_state_snapshot = MetricStateSnapshot.from_metrics(
                 self.rec_metrics,

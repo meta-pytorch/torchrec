@@ -31,7 +31,12 @@ from torchrec.metrics.cpu_offloaded_metric_module import (
 )
 from torchrec.metrics.deferrable_metrics import transfer_tensors_to_cpu
 from torchrec.metrics.metric_job_types import SynchronizationMarker
-from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
+from torchrec.metrics.metric_module import (
+    generate_metric_module,
+    MetricsResult,
+    RecMetricModule,
+    StateMetric,
+)
 from torchrec.metrics.metrics_config import (
     DefaultMetricsConfig,
     MetricsConfig,
@@ -70,6 +75,43 @@ class _PreparingCPUOffloadedRecMetricModule(CPUOffloadedRecMetricModule):
             "task1-label": model_out["raw_label"],
             "task1-weight": model_out["raw_weight"],
         }
+
+
+class _TestStateMetric(StateMetric):
+    def get_metrics(self) -> MetricsResult:
+        return {"value": torch.tensor(1.0)}
+
+
+class CPUOffloadedRecMetricModuleEmptyMetricsTest(unittest.TestCase):
+    def test_async_compute_returns_local_metrics(self) -> None:
+        module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=1,
+            world_size=1,
+            rec_tasks=[],
+            rec_metrics=RecMetricList([]),
+            throughput_metric=ThroughputMetric(
+                world_size=1,
+                batch_size=1,
+                window_seconds=1,
+            ),
+            state_metrics={"state": _TestStateMetric()},
+            update_batch_size=1,
+        )
+        try:
+            module.update({})
+
+            result = module.async_compute().resolve()
+
+            self.assertEqual(result["throughput-throughput|total_examples"], 1)
+            torch.testing.assert_close(result["state|value"], torch.tensor(1.0))
+            self.assertEqual(module.compute_count, 1)
+            self.assertEqual(module._total_updates_processed, 1)
+            self.assertEqual(module._total_computes_processed, 1)
+            self.assertTrue(module.compute_queue.empty())
+            self.assertIsNone(module.cpu_process_group)
+        finally:
+            module.shutdown()
 
 
 class CPUOffloadedRecMetricModulePreparationTest(unittest.TestCase):
