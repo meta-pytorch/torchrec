@@ -1,5 +1,5 @@
 # Production-like metric scaling benchmark
-# Tests ZORM overhead with 20 tasks x 5 metrics (~25% update overhead)
+# Tests ZORM overhead with 10 tasks x 5 metrics (~20% update overhead)
 # Uses lighter embeddings so metric update is a meaningful fraction of iter time
 #
 # Usage:
@@ -38,7 +38,7 @@ PlannerConfig:
 RecMetricConfig:
   enable_metrics: true
   metrics: [ne, calibration, ctr, mse, auc]
-  num_tasks: 20
+  num_tasks: 10
   rec_compute_mode: "unfused"
   compute_interval: 25
   window_size: 10000000
