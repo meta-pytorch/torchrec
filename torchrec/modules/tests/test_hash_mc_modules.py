@@ -2276,3 +2276,381 @@ class TestPersistHashZchBucket(unittest.TestCase):
         count = make_hash_zch_buckets_non_persistent(parent)
         self.assertGreaterEqual(count, 1)
         self.assertNotIn("child._hash_zch_bucket", parent.state_dict())
+
+
+class TestFreshRegionSplit(unittest.TestCase):
+    def _build(
+        self,
+        zch_size: int,
+        total_num_buckets: int,
+        percent_fresh_region: float,
+        output_segments: Optional[list[int]] = None,
+        disable_fallback: bool = True,
+        opt_in_prob: int = -1,
+        write_to_fresh_region: bool = False,
+        device: str = "cpu",
+    ) -> HashZchManagedCollisionModule:
+        return HashZchManagedCollisionModule(
+            zch_size=zch_size,
+            device=torch.device(device),
+            total_num_buckets=total_num_buckets,
+            percent_fresh_region=percent_fresh_region,
+            output_segments=output_segments,
+            disable_fallback=disable_fallback,
+            opt_in_prob=opt_in_prob,
+            write_to_fresh_region=write_to_fresh_region,
+        )
+
+    def test_no_fresh_region_by_default(self) -> None:
+        m = self._build(1000, 2, 0)
+        self.assertIsNone(m._main_size)
+        self.assertIsNone(m._fresh_size)
+
+    def test_no_fresh_region_skips_validation(self) -> None:
+        # percent=0 skips the split, so an otherwise-rejected config (non-uniform
+        # buckets) still constructs — backward compatible for existing callers.
+        m = self._build(100, 3, 0, output_segments=[0, 34, 67, 100])
+        self.assertIsNone(m._main_size)
+        self.assertIsNone(m._fresh_size)
+
+    def test_region_sizes(self) -> None:
+        m = self._build(1000, 2, 20.0)  # bucket_size 500, 20% fresh
+        self.assertEqual(m._main_size, 400)
+        self.assertEqual(m._fresh_size, 100)
+
+    def test_split_floors_not_rounds(self) -> None:
+        m = self._build(10, 1, 39.0)  # bucket_size 10 -> 3.9 -> 3
+        self.assertEqual(m._main_size, 7)
+        self.assertEqual(m._fresh_size, 3)
+
+    def test_fractional_percent(self) -> None:
+        m = self._build(1000, 2, 12.5)  # bucket_size 500 -> 62.5 -> 62
+        self.assertEqual(m._main_size, 438)
+        self.assertEqual(m._fresh_size, 62)
+
+    def test_sharded_module_keeps_split(self) -> None:
+        shard = self._build(1000, 2, 20.0).rebuild_with_output_id_range((500, 1000))
+        self.assertEqual(shard._main_size, 400)
+        self.assertEqual(shard._fresh_size, 100)
+
+    def test_percent_out_of_range_raises(self) -> None:
+        with self.assertRaises(AssertionError):
+            self._build(1000, 2, -1.0)
+        with self.assertRaises(AssertionError):
+            self._build(1000, 2, 100.0)
+
+    def test_percent_too_small_raises(self) -> None:
+        # 10% of a 4-slot bucket floors to 0 fresh slots.
+        with self.assertRaises(AssertionError):
+            self._build(4, 1, 10.0)
+
+    def test_non_uniform_buckets_raises(self) -> None:
+        with self.assertRaises(AssertionError):
+            self._build(100, 3, 20.0, output_segments=[0, 34, 67, 100])
+
+    def test_requires_disable_fallback(self) -> None:
+        with self.assertRaises(AssertionError):
+            self._build(1000, 2, 20.0, disable_fallback=False)
+
+    def test_rejects_opt_in(self) -> None:
+        with self.assertRaises(AssertionError):
+            self._build(1000, 2, 20.0, opt_in_prob=0)
+
+    def test_write_to_fresh_region_requires_percent_fresh_region(self) -> None:
+        # Can't target the Fresh region when there is no split.
+        with self.assertRaises(AssertionError):
+            self._build(1000, 2, 0, write_to_fresh_region=True)
+
+    # bucket_size 500, main 400, fresh 100; sample per-id mapper output:
+    # two ids in buckets 0 and 1 -> local_sizes [500, 500], offsets [0, 500].
+    def test_region_window_main(self) -> None:
+        # Main: modulo -> main_size (400); base unchanged.
+        m = self._build(1000, 2, 20.0)
+        local_sizes, offsets = torch.tensor([500, 500]), torch.tensor([0, 500])
+        region_sizes, region_offsets = m._region_window(
+            local_sizes, offsets, is_fresh=False
+        )
+        self.assertTrue(torch.equal(region_sizes, torch.tensor([400, 400])))
+        self.assertTrue(torch.equal(region_offsets, torch.tensor([0, 500])))
+
+    def test_region_window_fresh(self) -> None:
+        # Fresh: modulo -> fresh_size (100); base += main_size (400).
+        m = self._build(1000, 2, 20.0)
+        local_sizes, offsets = torch.tensor([500, 500]), torch.tensor([0, 500])
+        region_sizes, region_offsets = m._region_window(
+            local_sizes, offsets, is_fresh=True
+        )
+        self.assertTrue(torch.equal(region_sizes, torch.tensor([100, 100])))
+        self.assertTrue(torch.equal(region_offsets, torch.tensor([400, 900])))
+
+    def test_region_window_asserts_without_region(self) -> None:
+        # Precondition: caller must gate on a configured region; without one the
+        # helper asserts rather than silently no-op'ing.
+        m = self._build(1000, 2, 0)  # no split configured
+        local_sizes, offsets = torch.tensor([500, 500]), torch.tensor([0, 500])
+        with self.assertRaises(AssertionError):
+            m._region_window(local_sizes, offsets, is_fresh=False)
+
+    def test_rebuild_preserves_write_to_fresh_region(self) -> None:
+        shard = self._build(
+            1000, 2, 20.0, write_to_fresh_region=True
+        ).rebuild_with_output_id_range((0, 500))
+        self.assertTrue(shard._write_to_fresh_region)
+
+    def _assert_remap_insert_region(self, write_to_fresh_region: bool) -> None:
+        # End-to-end insert through remap (input_mapper -> _region_window -> kernel):
+        # every assigned slot must land in the target region's within-bucket window.
+        zch_size, total_num_buckets, percent = 100, 2, 20.0
+        bucket_size = zch_size // total_num_buckets  # 50
+        main_size = 40  # bucket_size * (1 - percent/100)
+        # ids alternate buckets (x % num_buckets), so 8 ids -> 4 per bucket,
+        # comfortably under the tighter Fresh capacity (10/bucket) -> no misses.
+        num_ids = 8
+        m = self._build(
+            zch_size,
+            total_num_buckets,
+            percent,
+            write_to_fresh_region=write_to_fresh_region,
+            device="cuda",
+        )
+        values = torch.arange(0, num_ids, dtype=torch.int64, device="cuda")
+        out = m(
+            {
+                "f": JaggedTensor(
+                    values=values,
+                    lengths=torch.tensor([num_ids], dtype=torch.int64, device="cuda"),
+                )
+            }
+        )["f"].values()
+        self.assertFalse(bool(torch.any(out < 0)), f"unexpected insert misses: {out=}")
+        in_bucket = out % bucket_size
+        if write_to_fresh_region:
+            self.assertTrue(bool(torch.all(in_bucket >= main_size)), f"{in_bucket=}")
+        else:
+            self.assertTrue(bool(torch.all(in_bucket < main_size)), f"{in_bucket=}")
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "This test requires at least one GPU",
+    )
+    def test_remap_insert_targets_main_region(self) -> None:
+        self._assert_remap_insert_region(write_to_fresh_region=False)
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "This test requires at least one GPU",
+    )
+    def test_remap_insert_targets_fresh_region(self) -> None:
+        self._assert_remap_insert_region(write_to_fresh_region=True)
+
+    def _assert_full_region_does_not_spill(self, write_to_fresh_region: bool) -> None:
+        # Saturate the target region in EVERY bucket, then overflow each by one id.
+        # Circular probing must wrap WITHIN each bucket's region (filling all its
+        # slots); the overflow ids must NOT spill into the other region. With
+        # disable_fallback a miss is dropped from the output (not returned as -1),
+        # so a confined carve yields exactly region_size outputs per bucket, all
+        # inside the region; a leak would place an overflow in the neighbor region.
+        zch_size, total_num_buckets, percent = 20, 2, 20.0
+        bucket_size = zch_size // total_num_buckets  # 10
+        main_size, fresh_size = 8, 2
+        region_size = fresh_size if write_to_fresh_region else main_size
+        in_bucket_lo = main_size if write_to_fresh_region else 0
+        in_bucket_hi = bucket_size if write_to_fresh_region else main_size
+        m = self._build(
+            zch_size,
+            total_num_buckets,
+            percent,
+            write_to_fresh_region=write_to_fresh_region,
+            device="cuda",
+        )
+        # ids alternate buckets (x % num_buckets), so arange(0, 2*(region_size+1))
+        # puts region_size+1 ids in each bucket: region_size fill it, one overflows.
+        num_ids = total_num_buckets * (region_size + 1)
+        values = torch.arange(0, num_ids, dtype=torch.int64, device="cuda")
+        out = m(
+            {
+                "f": JaggedTensor(
+                    values=values,
+                    lengths=torch.tensor([num_ids], dtype=torch.int64, device="cuda"),
+                )
+            }
+        )["f"].values()
+        # Exactly region_size placed per bucket (overflows dropped, not spilled),
+        # all distinct and inside the region -> each bucket's region fully covered.
+        in_bucket = out % bucket_size
+        self.assertEqual(int(out.numel()), total_num_buckets * region_size, f"{out=}")
+        self.assertEqual(
+            int(torch.unique(out).numel()), total_num_buckets * region_size, f"{out=}"
+        )
+        self.assertTrue(
+            bool(torch.all((in_bucket >= in_bucket_lo) & (in_bucket < in_bucket_hi))),
+            f"{out=}",
+        )
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "This test requires at least one GPU",
+    )
+    def test_full_main_region_does_not_spill_into_fresh(self) -> None:
+        self._assert_full_region_does_not_spill(write_to_fresh_region=False)
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "This test requires at least one GPU",
+    )
+    def test_full_fresh_region_does_not_spill_into_main(self) -> None:
+        self._assert_full_region_does_not_spill(write_to_fresh_region=True)
+
+    # ----- Fresh-wins read path -----
+    def test_fresh_wins_read_prefers_fresh_over_main(self) -> None:
+        # _region_read maps each id to a SLOT, or -1 on a miss.
+        # Mock it so the 1st call is the Fresh probe and the 2nd is the Main probe.
+        m = self._build(20, 2, 20.0)
+        ids = torch.tensor([10001, 10002, 10003, 10004], dtype=torch.int64)
+        # Placeholders: the mock ignores sizes/offsets, only their length matters.
+        sizes = torch.full((4,), 10, dtype=torch.int64)
+        offsets = torch.zeros(4, dtype=torch.int64)
+        with patch.object(
+            m,
+            "_region_read",
+            side_effect=[
+                # Fresh: 10001->slot 8, 10003->slot 9; 10002 and 10004 miss.
+                torch.tensor([8, -1, 9, -1], dtype=torch.int64),
+                # Main (only the two misses): 10002->slot 2, 10004->slot 4.
+                torch.tensor([2, 4], dtype=torch.int64),
+            ],
+        ) as region_read:
+            out = m._fresh_wins_read(ids, sizes, offsets)
+        # Fresh wins where it hit (slots 1, 2); Main fills the misses (slots 3, 4).
+        self.assertTrue(
+            torch.equal(out, torch.tensor([8, 2, 9, 4], dtype=torch.int64)), f"{out=}"
+        )
+        # Main was probed with only the two ids that missed Fresh.
+        _, main_call = region_read.call_args_list
+        self.assertTrue(
+            torch.equal(
+                main_call.args[0], torch.tensor([10002, 10004], dtype=torch.int64)
+            ),
+            f"{main_call=}",
+        )
+
+    def _assert_remap_dispatch(
+        self, feature_name: str, expect_fresh_wins: bool
+    ) -> None:
+        # Read-only region enabled requests routes remap() to _fresh_wins_read;
+        # any other feature uses the insert kernel. Both are
+        # mocked so the test asserts which branch ran, not its result.
+        m = self._build(20, 2, 20.0)
+        values = torch.tensor([1, 2], dtype=torch.int64)
+        lengths = torch.tensor([1, 1], dtype=torch.int64)
+        remapped = torch.tensor([0, 1], dtype=torch.int64)
+        with patch.object(m, "_fresh_wins_read", return_value=remapped) as fresh_wins:
+            with patch.object(
+                m, "_zero_collision_hash", return_value=(remapped, None)
+            ) as kernel:
+                m.remap({feature_name: JaggedTensor(values=values, lengths=lengths)})
+        if expect_fresh_wins:
+            fresh_wins.assert_called_once()
+            kernel.assert_not_called()
+        else:
+            fresh_wins.assert_not_called()
+            kernel.assert_called_once()
+
+    def test_remap_read_dispatches_to_fresh_wins(self) -> None:
+        self._assert_remap_dispatch("f_readonly", expect_fresh_wins=True)
+
+    def test_remap_write_does_not_use_fresh_wins(self) -> None:
+        self._assert_remap_dispatch("f", expect_fresh_wins=False)
+
+    def _assert_readonly_region(
+        self,
+        values: torch.Tensor,
+        write_main: bool,
+        write_fresh: bool,
+        expect_fresh: bool,
+    ) -> None:
+        # E2E via the real kernel: populate the region(s), then assert each id
+        # resolves into its expected window (Fresh slots >= main_size, else Main).
+        zch_size, total_num_buckets, percent = 100, 2, 20.0
+        bucket_size = zch_size // total_num_buckets
+        main_size = 40
+        m = self._build(zch_size, total_num_buckets, percent, device="cuda")
+        if write_main:
+            m._write_to_fresh_region = False
+            m.remap(
+                {
+                    "f": JaggedTensor(
+                        values=values,
+                        lengths=torch.tensor(
+                            [values.numel()], dtype=torch.int64, device=values.device
+                        ),
+                    )
+                }
+            )
+        if write_fresh:
+            m._write_to_fresh_region = True
+            m.remap(
+                {
+                    "f": JaggedTensor(
+                        values=values,
+                        lengths=torch.tensor(
+                            [values.numel()], dtype=torch.int64, device=values.device
+                        ),
+                    )
+                }
+            )
+        out = m.remap(
+            {
+                "f_readonly": JaggedTensor(
+                    values=values,
+                    lengths=torch.tensor(
+                        [values.numel()], dtype=torch.int64, device=values.device
+                    ),
+                )
+            }
+        )["f_readonly"].values()
+        self.assertEqual(int(out.numel()), int(values.numel()), f"{out=}")
+        slot_in_bucket = out % bucket_size
+        if expect_fresh:
+            self.assertTrue(
+                bool(torch.all(slot_in_bucket >= main_size)),
+                f"expected Fresh slots: {out=}",
+            )
+        else:
+            self.assertTrue(
+                bool(torch.all(slot_in_bucket < main_size)),
+                f"expected Main slots: {out=}",
+            )
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "This test requires at least one GPU",
+    )
+    def test_fresh_wins_read_returns_fresh_slot(self) -> None:
+        # An id written to BOTH regions resolves to its Fresh slot.
+        self._assert_readonly_region(
+            torch.tensor([0, 1], dtype=torch.int64, device="cuda"),
+            write_main=True,
+            write_fresh=True,
+            expect_fresh=True,
+        )
+
+    # pyre-ignore[56]
+    @unittest.skipIf(
+        torch.cuda.device_count() < 1,
+        "This test requires at least one GPU",
+    )
+    def test_fresh_wins_read_falls_back_to_main_on_fresh_miss(self) -> None:
+        # An id present only in Main is resolved from Main; with Fresh empty this
+        # is also the Phase-1 "every read is Main-only" (zero serving change) path.
+        self._assert_readonly_region(
+            torch.tensor([0, 1], dtype=torch.int64, device="cuda"),
+            write_main=True,
+            write_fresh=False,
+            expect_fresh=False,
+        )
