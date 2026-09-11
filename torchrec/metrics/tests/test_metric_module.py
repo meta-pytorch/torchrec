@@ -234,6 +234,26 @@ class MetricModuleTest(unittest.TestCase):
             )
         )
 
+    def test_rejects_non_metric_model_output_as_task_input(self) -> None:
+        tasks = [
+            dataclasses.replace(DefaultTaskInfo, label_name="user_embeddings"),
+            dataclasses.replace(DefaultTaskInfo, prediction_name="user_embeddings"),
+            dataclasses.replace(DefaultTaskInfo, weight_name="user_embeddings"),
+            dataclasses.replace(DefaultTaskInfo, tensor_name="user_embeddings"),
+        ]
+        for task in tasks:
+            with self.subTest(task=task):
+                with self.assertRaisesRegex(
+                    RecMetricException,
+                    "user_embeddings.*Export a metric-aligned tensor",
+                ):
+                    RecMetricModule(
+                        batch_size=1,
+                        world_size=1,
+                        rec_tasks=[task],
+                        non_metric_model_out_keys={"user_embeddings"},
+                    )
+
     def test_compute_throughput_excludes_other_metrics(self) -> None:
         config = dataclasses.replace(
             DefaultMetricsConfig,
