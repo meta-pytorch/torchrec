@@ -2895,6 +2895,11 @@ class PlannerSessionContext:
     # Caller-provided session metadata (e.g. training_framework, model_type,
     # entitlement). Populated by the caller/adapter at context construction.
     client_metadata: Dict[str, str] = field(default_factory=dict)
+    # Framework-specific Stats sinks the adapter contributes (e.g. MVAI's
+    # MVAISharderStats), appended to the reporter's sink list so per-framework
+    # telemetry runs inside the planner with the real StorageReservation in hand.
+    # Populated by the adapter at context construction; observability only.
+    extra_stats: List[Stats] = field(default_factory=list)
     # Whether each SKU's result came from cache — per SKU (SKU -> hit). Set by the
     # planner when it consults its plan cache; left unset when that path did not
     # run, so "did not attempt" stays distinct from a miss. Note this tracks the
