@@ -122,6 +122,34 @@ class CPUOffloadedRecMetricModulePreparationTest(unittest.TestCase):
             cast(dict[str, torch.Tensor], weights)["task1"], raw_weight
         )
 
+    def test_excludes_non_metric_model_output_before_batching(self) -> None:
+        with patch.object(self.module, "_process_metric_compute_job", return_value={}):
+            self.module.shutdown()
+        self.module = _PreparingCPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=3,
+            world_size=1,
+            rec_tasks=self.tasks,
+            rec_metrics=RecMetricList([self.mock_metric]),
+            update_batch_size=2,
+            non_metric_model_out_keys={"user_embeddings"},
+        )
+        model_out = {
+            "raw_prediction": torch.tensor([0.25, 0.5, 0.75]),
+            "raw_label": torch.tensor([1.0, 0.0, 1.0]),
+            "raw_weight": torch.ones(3),
+            "user_embeddings": torch.ones(2, 4),
+        }
+
+        self.module.update(model_out)
+        self.module.update(model_out)
+        wait_until_true(self.mock_metric.update_called, timeout=5.0)
+
+        predictions = cast(
+            dict[str, torch.Tensor], self.mock_metric.predictions_update_calls[0]
+        )
+        self.assertEqual(predictions["task1"].numel(), 6)
+
 
 class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
 

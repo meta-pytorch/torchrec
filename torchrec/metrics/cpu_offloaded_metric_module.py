@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Collection
 from typing import Any, cast, Dict, Mapping, Optional, Union
 
 import torch
@@ -330,6 +331,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         update_batch_size: int = 10,
         clone_model_out: bool = False,
         *args: Any,
+        non_metric_model_out_keys: Collection[str] | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -346,10 +348,15 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 worker by ~K× with no added trainer-thread work. Drain
                 stops at any SynchronizationMarker, which is processed
                 after the merged batch. Default is 10; set to 1 to disable.
+            non_metric_model_out_keys: Keys to remove before snapshot and batching.
             *args: Additional positional arguments passed to RecMetricModule.
             **kwargs: Additional keyword arguments passed to RecMetricModule.
         """
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            *args,
+            non_metric_model_out_keys=non_metric_model_out_keys,
+            **kwargs,
+        )
         self._model_out_device = model_out_device
         self._requested_update_batch_size: int = max(1, update_batch_size)
         self._update_batch_size: int = self._capped_update_batch_size(
@@ -531,13 +538,18 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             assert self._captured_exception is not None
             raise self._captured_exception
 
+        metric_model_out = model_out
+        if self._non_metric_model_out_keys:
+            metric_model_out = {
+                key: value
+                for key, value in model_out.items()
+                if key not in self._non_metric_model_out_keys
+            }
         if self._clone_model_out:
-            snapshot_model_out = _foreach_clone_dict(model_out)
+            snapshot_model_out = _foreach_clone_dict(metric_model_out)
             snapshot_kwargs = _foreach_clone_kwargs(kwargs)
         else:
-            # Shallow-copy the containers (cheap; no tensor copy) so dict-level
-            # mutation by the caller is isolated; tensor refs are shared.
-            snapshot_model_out = dict(model_out)
+            snapshot_model_out = dict(metric_model_out)
             snapshot_kwargs = dict(kwargs)
 
         try:

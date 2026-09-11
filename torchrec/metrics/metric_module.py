@@ -14,6 +14,7 @@ import concurrent
 import logging
 import time
 from collections import defaultdict, OrderedDict
+from collections.abc import Collection
 from typing import Any, Dict, List, Optional, Type, TypeVar, Union
 
 import torch
@@ -217,6 +218,8 @@ class RecMetricModule(nn.Module):
         throughput_metric (Optional[ThroughputMetric]): the ThroughputMetric.
         state_metrics (Optional[Dict[str, StateMetric]]): the dict of StateMetrics.
         compute_interval_steps (int): the intervals between two compute calls in the unit of batch number
+        non_metric_model_out_keys (Optional[Collection[str]]): model outputs reserved
+            for non-metric consumers and invalid as metric inputs.
 
     Call Args:
         Not supported.
@@ -264,11 +267,34 @@ class RecMetricModule(nn.Module):
         compute_interval_steps: int = 100,
         min_compute_interval: float = 0.0,
         max_compute_interval: float = float("inf"),
+        non_metric_model_out_keys: Collection[str] | None = None,
     ) -> None:
         super().__init__()
         self.rec_tasks = rec_tasks if rec_tasks else []
         # pyrefly: ignore[not-callable]
         self.rec_metrics = rec_metrics if rec_metrics else RecMetricList([])
+        self._non_metric_model_out_keys = frozenset(non_metric_model_out_keys or ())
+        metric_input_keys = set(self.rec_metrics.get_required_inputs() or [])
+        for task in self.rec_tasks:
+            metric_input_keys.update(
+                key
+                for key in (
+                    task.label_name,
+                    task.prediction_name,
+                    task.weight_name,
+                    task.tensor_name,
+                )
+                if key
+            )
+        invalid_metric_input_keys = sorted(
+            self._non_metric_model_out_keys.intersection(metric_input_keys)
+        )
+        if invalid_metric_input_keys:
+            raise RecMetricException(
+                "model_out keys reserved for non-metric consumers cannot be "
+                f"configured as metric inputs: {invalid_metric_input_keys}. "
+                "Export a metric-aligned tensor under a different key."
+            )
         self.throughput_metric = throughput_metric
         self.state_metrics = state_metrics if state_metrics else {}
         self.trained_batches: int = 0
