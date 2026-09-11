@@ -27,6 +27,7 @@ FUSED_PARAM_BOUNDS_CHECK_MODE: str = "__register_tbe_bounds_check_mode"
 # with certain ways to split models.
 FUSED_PARAM_LENGTHS_TO_OFFSETS_LOOKUP: str = "__register_lengths_to_offsets_lookup"
 FUSED_PARAM_IS_DEVICE_RO: str = "__register_is_device_ro"
+FUSED_PARAM_USE_CPU_KJT_FOR_FX_TRACING: str = "__use_cpu_kjt_for_fx_tracing"
 
 # Fused param storing list of cpu embedding tables offloaded to ssd to scale
 # the embedding table size
@@ -106,6 +107,14 @@ def is_fused_param_device_ro(fused_params: Optional[Dict[str, Any]]) -> bool:
     )
 
 
+def is_fused_param_use_cpu_kjt_for_fx_tracing(
+    fused_params: Optional[Dict[str, Any]],
+) -> bool:
+    return bool(
+        fused_params and fused_params.get(FUSED_PARAM_USE_CPU_KJT_FOR_FX_TRACING, False)
+    )
+
+
 def is_fused_param_quant_state_dict_split_scale_bias(
     fused_params: Optional[Dict[str, Any]],
 ) -> bool:
@@ -136,6 +145,8 @@ def tbe_fused_params(
         fused_params_for_tbe.pop(FUSED_PARAM_LENGTHS_TO_OFFSETS_LOOKUP)
     if FUSED_PARAM_IS_DEVICE_RO in fused_params_for_tbe:
         fused_params_for_tbe.pop(FUSED_PARAM_IS_DEVICE_RO)
+    if FUSED_PARAM_USE_CPU_KJT_FOR_FX_TRACING in fused_params_for_tbe:
+        fused_params_for_tbe.pop(FUSED_PARAM_USE_CPU_KJT_FOR_FX_TRACING)
     if FUSED_PARAM_SSD_TABLE_LIST in fused_params_for_tbe:
         fused_params_for_tbe.pop(FUSED_PARAM_SSD_TABLE_LIST)
 

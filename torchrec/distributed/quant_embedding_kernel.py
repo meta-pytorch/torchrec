@@ -38,6 +38,7 @@ from torchrec.distributed.fused_params import (
     is_fused_param_device_ro,
     is_fused_param_quant_state_dict_split_scale_bias,
     is_fused_param_register_tbe,
+    is_fused_param_use_cpu_kjt_for_fx_tracing,
     tbe_fused_params,
     TBEToRegisterMixIn,
 )
@@ -213,6 +214,13 @@ def _unwrap_kjt_for_cpu(
 
 
 @torch.fx.wrap
+def _unwrap_kjt_for_cpu_fx(
+    features: KeyedJaggedTensor, weighted: bool
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    return _unwrap_kjt_for_cpu(features, weighted)
+
+
+@torch.fx.wrap
 def _unwrap_kjt_lengths(
     features: KeyedJaggedTensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -288,6 +296,9 @@ class QuantBatchedEmbeddingBag(
             is_fused_param_quant_state_dict_split_scale_bias(fused_params)
         )
         self._is_device_ro: bool = is_fused_param_device_ro(fused_params)
+        self._use_cpu_kjt_for_fx_tracing: bool = (
+            is_fused_param_use_cpu_kjt_for_fx_tracing(fused_params)
+        )
         bounds_check_mode: Optional[BoundsCheckMode] = fused_param_bounds_check_mode(
             fused_params
         )
@@ -439,7 +450,12 @@ class QuantBatchedEmbeddingBag(
             if self.lengths_to_tbe:
                 indices, lengths, per_sample_weights = _unwrap_kjt_lengths(features)
             else:
-                indices, offsets, per_sample_weights = _unwrap_kjt_for_cpu(
+                cpu_unwrap = (
+                    _unwrap_kjt_for_cpu_fx
+                    if getattr(self, "_use_cpu_kjt_for_fx_tracing", False)
+                    else _unwrap_kjt_for_cpu
+                )
+                indices, offsets, per_sample_weights = cpu_unwrap(
                     features, self._config.is_weighted
                 )
         else:
@@ -561,6 +577,9 @@ class QuantBatchedEmbedding(
         self._runtime_device: torch.device = _get_runtime_device(
             device, config, shard_index
         )
+        self._use_cpu_kjt_for_fx_tracing: bool = (
+            is_fused_param_use_cpu_kjt_for_fx_tracing(fused_params)
+        )
         # 16 for CUDA, 1 for others like CPU and MTIA.
         self._tbe_row_alignment: int = 16 if self._runtime_device.type == "cuda" else 1
         embedding_clazz = (
@@ -654,9 +673,12 @@ class QuantBatchedEmbedding(
     def forward(self, features: KeyedJaggedTensor) -> torch.Tensor:
         if self._runtime_device.type == "cpu":
             # To distinguish fx tracing on CPU embedding.
-            values, offsets, _ = _unwrap_kjt_for_cpu(
-                features, weighted=self._config.is_weighted
+            cpu_unwrap = (
+                _unwrap_kjt_for_cpu_fx
+                if getattr(self, "_use_cpu_kjt_for_fx_tracing", False)
+                else _unwrap_kjt_for_cpu
             )
+            values, offsets, _ = cpu_unwrap(features, weighted=self._config.is_weighted)
         else:
             values, offsets, _ = _unwrap_kjt(features)
 
