@@ -557,6 +557,96 @@ def multi_async_comms(
 
 
 @dataclass
+class SamePGAsyncA2ASyncAllReduceConfig(CommsConfig):
+    """
+    run commands:
+    > python -m torchrec.distributed.benchmark.benchmark_comms \
+        same_pg_async_a2a_sync_all_reduce
+
+    use case:
+        show the ordering between an async all_to_all_single and a synchronous
+        all_reduce on the same process group, with independent compute between
+        them. The profiler trace shows the compute overlapping the async a2a and
+        whether the collectives overlap, while the logged completion state shows
+        whether the all_reduce call waits for the earlier all-to-all on the CPU.
+    """
+
+    all_rank_traces: bool = True
+
+
+@register_benchmark(SamePGAsyncA2ASyncAllReduceConfig)
+def same_pg_async_a2a_sync_all_reduce(
+    _batch_inputs: List[Dict[str, Any]],
+    dim: int,
+    num_mul: int,
+    num_concat: int,
+    ctx: MultiProcessContext,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    """
+    Issue an async a2a, overlapping compute, and a sync all-reduce on ctx.pg,
+    without an explicit wait between the collectives. Every rank must issue the
+    collectives in this same order because they share one communicator.
+    """
+    with record_function("## pre-comms compute ##"):
+        input_a = _compute(
+            dim=dim,
+            num_mul=num_mul,
+            num_concat=num_concat,
+            ctx=ctx,
+        )
+        input_b = _compute(
+            dim=dim,
+            num_mul=num_mul,
+            num_concat=num_concat,
+            ctx=ctx,
+        )
+
+    with record_function("## async a2a on shared pg ##"):
+        out_a = torch.zeros_like(input_a)
+        req_a = dist.all_to_all_single(
+            output=out_a,
+            input=input_a,
+            group=ctx.pg,
+            async_op=True,
+        )
+        assert req_a is not None
+
+    with record_function("## compute overlapping async a2a ##"):
+        _compute(dim=dim, num_mul=num_mul, num_concat=num_concat, ctx=ctx)
+
+    with record_function("## sync all_reduce on shared pg ##"):
+        dist.all_reduce(
+            input_b,
+            op=dist.ReduceOp.SUM,
+            group=ctx.pg,
+            async_op=False,
+        )
+
+    with record_function("## a2a completion probe after sync all_reduce ##"):
+        a2a_completed_after_all_reduce = req_a.is_completed()
+
+    with record_function("## wait and validate ##"):
+        req_a.wait()
+        checks_a = _validate(out_a, ctx)
+        expected_sum = ctx.world_size * (ctx.world_size - 1) // 2
+        checks_b = torch.all(input_b.to(torch.int) >= expected_sum)
+        checks = DeviceToHostTensorAwaitable(checks_a & checks_b)
+
+    with record_function(
+        f"## async a2a completed when sync all_reduce returned: "
+        f"{a2a_completed_after_all_reduce} ##"
+    ):
+        logger.info(
+            f"[rank-{ctx.rank}] async a2a completed when sync all_reduce returned: "
+            f"{a2a_completed_after_all_reduce}"
+        )
+
+    with record_function("## assert ##"):
+        assert checks.item()
+
+
+@dataclass
 class CompetingCommsConfig(CommsConfig):
     """
     run commands:
