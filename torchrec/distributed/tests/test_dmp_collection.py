@@ -338,6 +338,7 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
     def _dmp_shell(self, module: nn.Module) -> DMPCollection:
         dmp = DMPCollection.__new__(DMPCollection)
         nn.Module.__init__(dmp)
+        dmp._all_reduce_hook = None
         dmp._dmp_wrapped_module = module
         return dmp
 
