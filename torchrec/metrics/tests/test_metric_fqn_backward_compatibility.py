@@ -99,6 +99,20 @@ from torchrec.metrics.unweighted_ne import UnweightedNEMetric
 from torchrec.metrics.weighted_avg import WeightedAvgMetric
 from torchrec.metrics.weighted_sum_predictions import WeightedSumPredictionsMetric
 from torchrec.metrics.xauc import XAUCMetric
+from torchrec.modules.hash_mc_evictions import (
+    HashZchEvictionConfig,
+    HashZchEvictionPolicyName,
+)
+from torchrec.modules.hash_mc_modules import HashZchManagedCollisionModule
+from torchrec.modules.keyed_jagged_tensor_pool import KeyedJaggedTensorPool
+from torchrec.modules.mc_modules import (
+    DistanceLFU_EvictionPolicy,
+    LFU_EvictionPolicy,
+    LRU_EvictionPolicy,
+    MCHEvictionPolicy,
+    MCHManagedCollisionModule,
+)
+from torchrec.modules.tensor_pool import TensorPool
 
 
 # Path to the golden snapshot file
@@ -458,6 +472,24 @@ def _make_cpu_offloaded_module() -> CPUOffloadedRecMetricModule:
         )
 
 
+def _make_mch_module(policy: MCHEvictionPolicy) -> MCHManagedCollisionModule:
+    return MCHManagedCollisionModule(
+        zch_size=64,
+        device=torch.device("cpu"),
+        eviction_interval=2,
+        eviction_policy=policy,
+    )
+
+
+def _make_hash_zch_module(**overrides: Any) -> HashZchManagedCollisionModule:
+    return HashZchManagedCollisionModule(
+        zch_size=64,
+        device=torch.device("cpu"),
+        total_num_buckets=4,
+        **overrides,
+    )
+
+
 # Not RecMetric subclasses, so _discover_all_recmetric_subclasses cannot see
 # them. A row here is the only thing that enrolls one.
 _MODULE_CASES: Tuple[_GoldenCase, ...] = (
@@ -477,6 +509,104 @@ _MODULE_CASES: Tuple[_GoldenCase, ...] = (
         "",
         _make_cpu_offloaded_module,
         cleanup=_shutdown,
+    ),
+    # torchrec.modules containers with real buffers, so a key here can actually
+    # go missing on a load. Buffer names come from the eviction policy, and
+    # DistanceLFU is the union of the other two, so each policy needs its own row.
+    _GoldenCase(
+        "mch_managed_collision_module",
+        MCHManagedCollisionModule,
+        "",
+        lambda: _make_mch_module(DistanceLFU_EvictionPolicy()),
+    ),
+    _GoldenCase(
+        "mch_managed_collision_module",
+        MCHManagedCollisionModule,
+        "lfu",
+        lambda: _make_mch_module(LFU_EvictionPolicy()),
+    ),
+    _GoldenCase(
+        "mch_managed_collision_module",
+        MCHManagedCollisionModule,
+        "lru",
+        lambda: _make_mch_module(LRU_EvictionPolicy()),
+    ),
+    _GoldenCase(
+        "tensor_pool",
+        TensorPool,
+        "",
+        lambda: TensorPool(
+            pool_size=16, dim=4, dtype=torch.float, device=torch.device("cpu")
+        ),
+    ),
+    # enable_uvm adds two more shapes, both needing CUDA. This target is CPU
+    # only, and those shapes cannot load today anyway.
+    _GoldenCase(
+        "keyed_jagged_tensor_pool",
+        KeyedJaggedTensorPool,
+        "",
+        lambda: KeyedJaggedTensorPool(
+            pool_size=16,
+            feature_max_lengths={"f1": 2},
+            device=torch.device("cpu"),
+        ),
+    ),
+    # is_weighted adds a "weights" key; both directions are pinned.
+    _GoldenCase(
+        "keyed_jagged_tensor_pool",
+        KeyedJaggedTensorPool,
+        "weighted",
+        lambda: KeyedJaggedTensorPool(
+            pool_size=16,
+            feature_max_lengths={"f1": 2},
+            is_weighted=True,
+            device=torch.device("cpu"),
+        ),
+    ),
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "",
+        _make_hash_zch_module,
+    ),
+    # persist_hash_zch_bucket=False drops the bucket buffer, for warm-loading
+    # checkpoints written before it existed. Both shapes are real.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "without_bucket_buffer",
+        lambda: _make_hash_zch_module(persist_hash_zch_bucket=False),
+    ),
+    # With no eviction policy the metadata buffer is None, which state_dict
+    # leaves out. Production always sets a policy, so pin that shape too.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "with_eviction",
+        lambda: _make_hash_zch_module(
+            eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
+            eviction_config=HashZchEvictionConfig(features=[], single_ttl=1),
+        ),
+    ),
+    # track_id_freq adds _hash_zch_runtime_meta, which write_runtime_meta_dim
+    # also adds. The two are mutually exclusive, so one case covers the key.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "with_runtime_meta",
+        lambda: _make_hash_zch_module(track_id_freq=True),
+    ),
+    # Eviction and runtime metadata compose. Only whether a policy is set
+    # changes the key set, not which one, so pin the pair.
+    _GoldenCase(
+        "hash_zch_managed_collision_module",
+        HashZchManagedCollisionModule,
+        "with_eviction_and_runtime_meta",
+        lambda: _make_hash_zch_module(
+            eviction_policy_name=HashZchEvictionPolicyName.LRU_EVICTION,
+            eviction_config=HashZchEvictionConfig(features=[], single_ttl=-1),
+            track_id_freq=True,
+        ),
     ),
 )
 

@@ -273,6 +273,80 @@
       "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples"
     ]
   },
+  "hash_zch_managed_collision_module": {
+    "state_dict_keys": [
+      "_hash_zch_bucket",
+      "_hash_zch_identities"
+    ]
+  },
+  "hash_zch_managed_collision_module_with_eviction": {
+    "state_dict_keys": [
+      "_hash_zch_bucket",
+      "_hash_zch_identities",
+      "_hash_zch_metadata"
+    ]
+  },
+  "hash_zch_managed_collision_module_with_eviction_and_runtime_meta": {
+    "state_dict_keys": [
+      "_hash_zch_bucket",
+      "_hash_zch_identities",
+      "_hash_zch_metadata",
+      "_hash_zch_runtime_meta"
+    ]
+  },
+  "hash_zch_managed_collision_module_with_runtime_meta": {
+    "state_dict_keys": [
+      "_hash_zch_bucket",
+      "_hash_zch_identities",
+      "_hash_zch_runtime_meta"
+    ]
+  },
+  "hash_zch_managed_collision_module_without_bucket_buffer": {
+    "state_dict_keys": [
+      "_hash_zch_identities"
+    ]
+  },
+  "keyed_jagged_tensor_pool": {
+    "state_dict_keys": [
+      "key_lengths",
+      "values"
+    ]
+  },
+  "keyed_jagged_tensor_pool_weighted": {
+    "state_dict_keys": [
+      "key_lengths",
+      "values",
+      "weights"
+    ]
+  },
+  "mch_managed_collision_module": {
+    "state_dict_keys": [
+      "_current_iter_tensor",
+      "_mch_counts",
+      "_mch_last_access_iter",
+      "_mch_remapped_ids_mapping",
+      "_mch_sorted_raw_ids",
+      "_output_segments_tensor"
+    ]
+  },
+  "mch_managed_collision_module_lfu": {
+    "state_dict_keys": [
+      "_current_iter_tensor",
+      "_mch_counts",
+      "_mch_remapped_ids_mapping",
+      "_mch_sorted_raw_ids",
+      "_output_segments_tensor"
+    ]
+  },
+  "mch_managed_collision_module_lru": {
+    "state_dict_keys": [
+      "_current_iter_tensor",
+      "_mch_last_access_iter",
+      "_mch_remapped_ids_mapping",
+      "_mch_sorted_raw_ids",
+      "_output_segments_tensor"
+    ]
+  },
   "noop_metric_module": {
     "state_dict_keys": []
   },
@@ -293,6 +367,11 @@
       "throughput_metric.time_lapse_after_warmup",
       "throughput_metric.total_examples",
       "throughput_metric.warmup_examples"
+    ]
+  },
+  "tensor_pool": {
+    "state_dict_keys": [
+      "_pool"
     ]
   },
   "throughput_metric": {
