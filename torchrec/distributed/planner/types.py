@@ -2347,6 +2347,16 @@ class ShardingPlanRequest:
     # request object — use it to tell two otherwise-identical requests apart.
     # Auto-generated; override to thread an externally-supplied id.
     request_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    # Stable per-model identifier used as the hashval for JK Consistent Pass
+    # Rate bucketing when the planner rolls a change out (e.g. "10% of models
+    # get SKUAware"). Must be stable across job retries for the same model so
+    # the same model consistently lands in the same bucket -- prefer the model
+    # TYPE name (e.g. "mtml_ctr_ig_stories_model") over per-job identifiers.
+    # None falls back to `training_framework.name` at the rollout call site,
+    # which is an all-or-nothing gate (every job in the framework hashes to
+    # one bucket); populate this to get true per-model ramp granularity. Not
+    # plan-affecting, so excluded from request_hash.
+    model_id: Optional[str] = None
     # Observability opt-in: when True the executor captures the full enumerated
     # search space onto ctx.search_space (per SKU) and the reproduction upload
     # persists it to Manifold (URL surfaced on the planner_runs Scuba row). Off by
