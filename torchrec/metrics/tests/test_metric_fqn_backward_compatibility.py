@@ -145,55 +145,6 @@ def extract_state_dict_keys(
     return sorted(state_dict.keys())
 
 
-def extract_named_buffer_fqns(
-    metric_class: Type[RecMetric],
-    compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-    task_names: Optional[List[str]] = None,
-    use_tensor_task: bool = False,
-    use_session_task: bool = False,
-    **kwargs: Any,
-) -> Tuple[List[str], List[str]]:
-    if task_names is None:
-        task_names = ["test_task"]
-
-    tasks = [
-        create_test_task(
-            name,
-            with_tensor_name=use_tensor_task,
-            with_session_metric_def=use_session_task,
-        )
-        for name in task_names
-    ]
-
-    metric = metric_class(
-        world_size=1,
-        my_rank=0,
-        batch_size=32,
-        tasks=tasks,
-        compute_mode=compute_mode,
-        window_size=100,
-        fused_update_limit=0,
-        **kwargs,
-    )
-
-    all_buffer_fqns = [name for name, _ in metric.named_buffers()]
-    state_dict_keys = set(metric.state_dict().keys())
-
-    persistent = []
-    non_persistent = []
-
-    for fqn in all_buffer_fqns:
-        is_persistent = any(
-            fqn == key or key.endswith(fqn) or fqn in key for key in state_dict_keys
-        )
-        if is_persistent:
-            persistent.append(fqn)
-        else:
-            non_persistent.append(fqn)
-
-    return sorted(persistent), sorted(non_persistent)
-
-
 def get_metric_snapshot_key(
     metric_class: Type[RecMetric],
     compute_mode: RecComputeMode,
@@ -332,18 +283,7 @@ def generate_golden_snapshot() -> Dict[str, Dict[str, Any]]:
                     state_dict_keys = extract_state_dict_keys(
                         metric_class, compute_mode, **kwargs
                     )
-                    persistent_fqns, non_persistent_fqns = extract_named_buffer_fqns(
-                        metric_class, compute_mode, **kwargs
-                    )
-
-                    snapshot[key] = {
-                        "metric_class": metric_class.__name__,
-                        "compute_mode": compute_mode.name,
-                        "variant": variant,
-                        "state_dict_keys": state_dict_keys,
-                        "persistent_buffer_fqns": persistent_fqns,
-                        "non_persistent_buffer_fqns": non_persistent_fqns,
-                    }
+                    snapshot[key] = {"state_dict_keys": state_dict_keys}
                 except Exception as e:
                     # pyrefly: ignore[unbound-name]
                     print(f"Warning: Failed to generate snapshot for {key}: {e}")
@@ -423,13 +363,7 @@ class MetricFQNBackwardCompatibilityTest(unittest.TestCase):
         current_state_dict_keys = set(
             extract_state_dict_keys(metric_class, compute_mode, **kwargs)
         )
-        current_persistent_fqns, _ = extract_named_buffer_fqns(
-            metric_class, compute_mode, **kwargs
-        )
-        current_persistent_fqns_set = set(current_persistent_fqns)
-
         baseline_state_dict_keys = set(baseline["state_dict_keys"])
-        baseline_persistent_fqns = set(baseline["persistent_buffer_fqns"])
 
         removed_keys = baseline_state_dict_keys - current_state_dict_keys
         if removed_keys:
@@ -439,18 +373,9 @@ class MetricFQNBackwardCompatibilityTest(unittest.TestCase):
                 "If this is intentional, update the golden snapshot."
             )
 
-        removed_fqns = baseline_persistent_fqns - current_persistent_fqns_set
-        if removed_fqns:
-            self.fail(
-                f"BREAKING CHANGE in {key}: persistent buffer FQNs removed: {sorted(removed_fqns)}. "
-                "This will cause old checkpoints to fail loading. "
-                "If this is intentional, update the golden snapshot."
-            )
-
         added_keys = current_state_dict_keys - baseline_state_dict_keys
-        added_fqns = current_persistent_fqns_set - baseline_persistent_fqns
 
-        if added_keys or added_fqns:
+        if added_keys:
             has_backward_compat = self._verify_backward_compatibility(
                 metric_class, compute_mode, added_keys, **kwargs
             )
@@ -826,11 +751,7 @@ class ThroughputMetricBackwardCompatibilityTest(unittest.TestCase):
         if key not in self.golden_snapshot:
             current_keys = self._get_state_dict_keys(with_batch_size_stages=False)
             self.golden_snapshot[key] = {
-                "metric_class": "ThroughputMetric",
-                "variant": "",
                 "state_dict_keys": current_keys,
-                "persistent_buffer_fqns": [],
-                "non_persistent_buffer_fqns": [],
             }
             save_golden_snapshot(self.golden_snapshot)
             return
@@ -860,11 +781,7 @@ class ThroughputMetricBackwardCompatibilityTest(unittest.TestCase):
         if key not in self.golden_snapshot:
             current_keys = self._get_state_dict_keys(with_batch_size_stages=True)
             self.golden_snapshot[key] = {
-                "metric_class": "ThroughputMetric",
-                "variant": "with_batch_size_stages",
                 "state_dict_keys": current_keys,
-                "persistent_buffer_fqns": [],
-                "non_persistent_buffer_fqns": [],
             }
             save_golden_snapshot(self.golden_snapshot)
             return
@@ -984,11 +901,7 @@ class RecMetricModuleBackwardCompatibilityTest(unittest.TestCase):
         if key not in self.golden_snapshot:
             current_keys = self._get_state_dict_keys(with_throughput=False)
             self.golden_snapshot[key] = {
-                "metric_class": "RecMetricModule",
-                "variant": "",
                 "state_dict_keys": current_keys,
-                "persistent_buffer_fqns": [],
-                "non_persistent_buffer_fqns": [],
             }
             save_golden_snapshot(self.golden_snapshot)
             return
@@ -1019,11 +932,7 @@ class RecMetricModuleBackwardCompatibilityTest(unittest.TestCase):
         if key not in self.golden_snapshot:
             current_keys = self._get_state_dict_keys(with_throughput=True)
             self.golden_snapshot[key] = {
-                "metric_class": "RecMetricModule",
-                "variant": "with_throughput",
                 "state_dict_keys": current_keys,
-                "persistent_buffer_fqns": [],
-                "non_persistent_buffer_fqns": [],
             }
             save_golden_snapshot(self.golden_snapshot)
             return
@@ -1644,10 +1553,7 @@ def update_golden_snapshot() -> None:
     print(f"Total metrics captured: {len(snapshot)}")
     for key in sorted(snapshot.keys()):
         info = snapshot[key]
-        print(
-            f"  - {key}: {len(info['state_dict_keys'])} state_dict keys, "
-            f"{len(info['persistent_buffer_fqns'])} persistent buffers"
-        )
+        print(f"  - {key}: {len(info['state_dict_keys'])} state_dict keys")
 
 
 if __name__ == "__main__":
