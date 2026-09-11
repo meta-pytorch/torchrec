@@ -112,14 +112,6 @@
       "_metrics_computations.0.weighted_num_samples"
     ]
   },
-  "NEMetric_UNFUSED_TASKS_COMPUTATION_with_logloss": {
-    "state_dict_keys": [
-      "_metrics_computations.0.cross_entropy_sum",
-      "_metrics_computations.0.neg_labels",
-      "_metrics_computations.0.pos_labels",
-      "_metrics_computations.0.weighted_num_samples"
-    ]
-  },
   "NEPositiveMetric_UNFUSED_TASKS_COMPUTATION": {
     "state_dict_keys": [
       "_metrics_computations.0.cross_entropy_positive_sum",
