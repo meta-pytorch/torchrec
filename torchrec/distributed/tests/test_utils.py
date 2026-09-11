@@ -866,9 +866,14 @@ class AddParamsFromParameterShardingTest(unittest.TestCase):
 
     def test_fused_bounds_check_is_only_forwarded_to_triton(self) -> None:
         fused_params = add_params_from_parameter_sharding(
-            {"fused_bounds_check": True}, self.parameter_sharding
+            {
+                "fused_bounds_check": True,
+                "enable_triton_tbe_optimizations": True,
+            },
+            self.parameter_sharding,
         )
         self.assertNotIn("fused_bounds_check", fused_params)
+        self.assertNotIn("enable_triton_tbe_optimizations", fused_params)
 
         triton_sharding = ParameterSharding(
             sharding_type=ShardingType.TABLE_WISE.value,
@@ -876,9 +881,14 @@ class AddParamsFromParameterShardingTest(unittest.TestCase):
             ranks=[0],
         )
         fused_params = add_params_from_parameter_sharding(
-            {"fused_bounds_check": True}, triton_sharding
+            {
+                "fused_bounds_check": True,
+                "enable_triton_tbe_optimizations": True,
+            },
+            triton_sharding,
         )
         self.assertTrue(fused_params["fused_bounds_check"])
+        self.assertTrue(fused_params["enable_triton_tbe_optimizations"])
 
 
 class ConvertFusedParamsTest(unittest.TestCase):

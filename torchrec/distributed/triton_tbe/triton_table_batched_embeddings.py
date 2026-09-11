@@ -695,6 +695,7 @@ def table_batched_embedding_bag_forward_weighted_kernel(
     vbe: tl.constexpr = False,
     info_B_num_bits=0,
     info_B_mask=0,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
 ):
 
     b_t = tl.program_id(0).to(tl.int64)
@@ -720,7 +721,10 @@ def table_batched_embedding_bag_forward_weighted_kernel(
     col_offsets = tl.arange(0, BLOCK_SIZE)
     mask = col_offsets < embedding_dim
     accumulator_dtype: tl.constexpr = (
-        tl.float64 if weight_ptrs[0].dtype.element_ty == tl.float32 else tl.float32
+        tl.float32
+        if ENABLE_TRITON_TBE_OPTIMIZATIONS
+        or weight_ptrs[0].dtype.element_ty != tl.float32
+        else tl.float64
     )
     bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
 
@@ -947,6 +951,7 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
     BAGS_PER_PROGRAM: tl.constexpr = 1,
     UNROLL8: tl.constexpr = False,
     FUSED_BOUNDS_CHECK: tl.constexpr = False,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
 ) -> None:
     base_b = tl.program_id(0).to(tl.int64) * BAGS_PER_PROGRAM
     col_offsets = tl.arange(0, BLOCK_SIZE)
@@ -982,9 +987,10 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
                 end = tl.load(offsets_ptr + b_t + 1)
                 mask = col_offsets < embedding_dim
                 accumulator_dtype: tl.constexpr = (
-                    tl.float64
-                    if weight_ptr.dtype.element_ty == tl.float32
-                    else tl.float32
+                    tl.float32
+                    if ENABLE_TRITON_TBE_OPTIMIZATIONS
+                    or weight_ptr.dtype.element_ty != tl.float32
+                    else tl.float64
                 )
                 bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
 
@@ -1207,6 +1213,7 @@ def table_batched_embedding_bag_forward_unweighted_single_boundary_kernel(  # no
     FEATURE_END: tl.constexpr = -1,
     BAGS_PER_PROGRAM: tl.constexpr = 1,
     FUSED_BOUNDS_CHECK: tl.constexpr = False,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
 ):
     base_b = tl.program_id(0).to(tl.int64) * BAGS_PER_PROGRAM
     col_offsets = tl.arange(0, BLOCK_SIZE)
@@ -1242,9 +1249,10 @@ def table_batched_embedding_bag_forward_unweighted_single_boundary_kernel(  # no
                 end = tl.load(offsets_ptr + b_t + 1)
                 mask = col_offsets < embedding_dim
                 accumulator_dtype: tl.constexpr = (
-                    tl.float64
-                    if weight_ptrs[0].dtype.element_ty == tl.float32
-                    else tl.float32
+                    tl.float32
+                    if ENABLE_TRITON_TBE_OPTIMIZATIONS
+                    or weight_ptrs[0].dtype.element_ty != tl.float32
+                    else tl.float64
                 )
                 bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
 
@@ -1393,6 +1401,7 @@ def table_batched_embedding_bag_forward_unweighted_chunked_kernel(  # noqa: C901
     UNROLL8: tl.constexpr = False,
     FUSED_BOUNDS_CHECK: tl.constexpr = False,
     PROCESS_MODE: tl.constexpr = 0,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
 ):
     base_b = tl.program_id(0).to(tl.int64) * BAGS_PER_PROGRAM
     col_offsets = tl.arange(0, BLOCK_SIZE)
@@ -1449,9 +1458,10 @@ def table_batched_embedding_bag_forward_unweighted_chunked_kernel(  # noqa: C901
                 end = tl.load(offsets_ptr + b_t + 1)
                 mask = col_offsets < embedding_dim
                 accumulator_dtype: tl.constexpr = (
-                    tl.float64
-                    if weight_ptrs[0].dtype.element_ty == tl.float32
-                    else tl.float32
+                    tl.float32
+                    if ENABLE_TRITON_TBE_OPTIMIZATIONS
+                    or weight_ptrs[0].dtype.element_ty != tl.float32
+                    else tl.float64
                 )
                 bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
 
@@ -1913,6 +1923,7 @@ def triton_tbe_backward_short_run_unweighted(
     info_B_num_bits,
     info_B_mask,
     USE_CLC: tl.constexpr,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr,
     STOCHASTIC_ROUNDING: tl.constexpr,
     stochastic_rounding_seed,
     vbe: tl.constexpr = False,
@@ -1923,7 +1934,7 @@ def triton_tbe_backward_short_run_unweighted(
     # Gather width, tuned per target in TbeBackwardConfig. Each buffered row
     # keeps BLOCK_SIZE 64-bit addresses live, so it trades memory-level
     # parallelism against register footprint and hence occupancy.
-    buffer_size: tl.constexpr = BUFFER_SIZE
+    buffer_size: tl.constexpr = BUFFER_SIZE if ENABLE_TRITON_TBE_OPTIMIZATIONS else 16
     buffer_offsets = tl.arange(0, buffer_size)
 
     if USE_CLC:
@@ -2116,6 +2127,7 @@ def triton_tbe_backward_short_run_weighted(
     info_B_num_bits,
     info_B_mask,
     USE_CLC: tl.constexpr,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr,
     STOCHASTIC_ROUNDING: tl.constexpr,
     stochastic_rounding_seed,
     vbe: tl.constexpr = False,
@@ -2124,7 +2136,7 @@ def triton_tbe_backward_short_run_weighted(
     """Backward kernel for short runs only (weighted). Each program handles one short run."""
     col_offsets = tl.arange(0, BLOCK_SIZE)
     # Gather width, tuned per target in TbeBackwardConfig.
-    buffer_size: tl.constexpr = BUFFER_SIZE
+    buffer_size: tl.constexpr = BUFFER_SIZE if ENABLE_TRITON_TBE_OPTIMIZATIONS else 16
     buffer_offsets = tl.arange(0, buffer_size)
 
     if USE_CLC:
@@ -2431,6 +2443,7 @@ def triton_tbe_backward_long_run_grad_accum_unweighted(
     BLOCK_SIZE: tl.constexpr,
     info_B_num_bits,
     info_B_mask,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr,
     vbe: tl.constexpr = False,
     BUFFER_SIZE: tl.constexpr = 8,
 ) -> None:
@@ -2439,7 +2452,7 @@ def triton_tbe_backward_long_run_grad_accum_unweighted(
     and atomically adds the partial result into a temp gradient buffer.
     """
     col_offsets = tl.arange(0, BLOCK_SIZE)
-    buffer_size: tl.constexpr = BUFFER_SIZE
+    buffer_size: tl.constexpr = BUFFER_SIZE if ENABLE_TRITON_TBE_OPTIMIZATIONS else 16
     buffer_offsets = tl.arange(0, buffer_size)
 
     pid = tl.program_id(0)
@@ -2689,6 +2702,7 @@ class TritonTBE(torch.autograd.Function):
         weight_chunk_starts_tensor: Optional[torch.Tensor] = None,
         feature_weight_chunk_ids_tensor: Optional[torch.Tensor] = None,
         feature_chunk_relative_table_offsets_tensor: Optional[torch.Tensor] = None,
+        enable_triton_tbe_optimizations: bool = False,
     ) -> torch.Tensor:
         assert weight_ptrs
         assert weight_chunk_starts
@@ -2783,7 +2797,8 @@ class TritonTBE(torch.autograd.Function):
         ):
             raise ValueError("Invalid fused bounds-check configuration")
         use_small_table_kernel = (
-            histogram_feature >= 0
+            enable_triton_tbe_optimizations
+            and histogram_feature >= 0
             and not weighted
             and not vbe
             and not is_amd()
@@ -2820,10 +2835,14 @@ class TritonTBE(torch.autograd.Function):
             torch.empty((B, plan.row_bins), device=weight.device, dtype=torch.float16)
             for plan in active_saved_histogram_plans
         )
-        histogram_counts_invalid = torch.zeros(
-            len(active_saved_histogram_plans),
-            device=weight.device,
-            dtype=torch.int32,
+        histogram_counts_invalid = (
+            torch.zeros(
+                len(active_saved_histogram_plans),
+                device=weight.device,
+                dtype=torch.int32,
+            )
+            if active_saved_histogram_plans
+            else None
         )
 
         # For VBE backward, save row_output_offsets, B_offsets, and b_t_map
@@ -2840,7 +2859,7 @@ class TritonTBE(torch.autograd.Function):
             vbe_B_offsets = torch.empty(0, device=weight.device, dtype=torch.int32)
             vbe_b_t_map = torch.empty(0, device=weight.device, dtype=torch.int32)
 
-        ctx.save_for_backward(
+        saved_tensors = (
             indices,
             offsets,
             weight_ptrs[0],
@@ -2853,9 +2872,15 @@ class TritonTBE(torch.autograd.Function):
             vbe_B_offsets,
             vbe_b_t_map,
             *weight_ptrs[1:],
-            *histogram_counts,
-            histogram_counts_invalid,
         )
+        if histogram_counts_invalid is None:
+            ctx.save_for_backward(*saved_tensors)
+        else:
+            ctx.save_for_backward(
+                *saved_tensors,
+                *histogram_counts,
+                histogram_counts_invalid,
+            )
 
         ctx.total_embedding_dim = total_embedding_dim
         ctx.num_weight_ptrs = len(weight_ptrs)
@@ -2880,6 +2905,7 @@ class TritonTBE(torch.autograd.Function):
         ctx.bwd_bucket_block_sizes = bwd_bucket_block_sizes
         ctx.bwd_feature_bucket_id = bwd_feature_bucket_id
         ctx.bwd_bucket_rows = bwd_bucket_rows
+        ctx.enable_triton_tbe_optimizations = enable_triton_tbe_optimizations
 
         if hoist_transpose_to_forward:
             # Hoist the backward index transpose (linearize + sort + run-length
@@ -2983,11 +3009,15 @@ class TritonTBE(torch.autograd.Function):
                     vbe=vbe,
                     info_B_num_bits=info_B_num_bits,
                     info_B_mask=info_B_mask,
+                    ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
                     num_warps=num_warps,
                 )
         else:
             empty_histogram_counts = torch.empty(
                 0, device=weight.device, dtype=torch.float16
+            )
+            empty_histogram_counts_invalid = torch.empty(
+                0, device=weight.device, dtype=torch.int32
             )
             histogram_storage = {
                 plan.feature: (counts, plan_index)
@@ -3006,7 +3036,11 @@ class TritonTBE(torch.autograd.Function):
                 ](
                     output,
                     stored_counts,
-                    histogram_counts_invalid,
+                    (
+                        histogram_counts_invalid
+                        if histogram_counts_invalid is not None
+                        else empty_histogram_counts_invalid
+                    ),
                     indices,
                     offsets,
                     weight,
@@ -3037,7 +3071,11 @@ class TritonTBE(torch.autograd.Function):
                 ](
                     output,
                     stored_counts,
-                    histogram_counts_invalid,
+                    (
+                        histogram_counts_invalid
+                        if histogram_counts_invalid is not None
+                        else empty_histogram_counts_invalid
+                    ),
                     indices,
                     offsets,
                     weight,
@@ -3080,13 +3118,17 @@ class TritonTBE(torch.autograd.Function):
                 )
             else:
                 bags_per_program = (
-                    4
-                    if optimized_histogram_features
-                    else (
-                        2
-                        if not vbe and B >= 65536 and weight.dtype != torch.float32
-                        else 1
+                    (
+                        4
+                        if optimized_histogram_features
+                        else (
+                            2
+                            if not vbe and B >= 65536 and weight.dtype != torch.float32
+                            else 1
+                        )
                     )
+                    if enable_triton_tbe_optimizations
+                    else 1
                 )
                 if len(weight_ptrs) > 1 and bags_per_program == 2:
                     bags_per_program = 4
@@ -3127,6 +3169,7 @@ class TritonTBE(torch.autograd.Function):
                             BAGS_PER_PROGRAM=bags_per_program,
                             UNROLL8=bags_per_program == 2,
                             FUSED_BOUNDS_CHECK=fused_bounds_check,
+                            ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
                             num_warps=num_warps,
                         )
                 else:
@@ -3224,6 +3267,7 @@ class TritonTBE(torch.autograd.Function):
                                     FEATURE_END=process_feature_end,
                                     BAGS_PER_PROGRAM=single_boundary_bags_per_program,
                                     FUSED_BOUNDS_CHECK=fused_bounds_check,
+                                    ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
                                     num_warps=num_warps,
                                     num_stages=2,
                                 )
@@ -3263,6 +3307,7 @@ class TritonTBE(torch.autograd.Function):
                                 UNROLL8=process_bags_per_program == 2,
                                 FUSED_BOUNDS_CHECK=fused_bounds_check,
                                 PROCESS_MODE=process_mode,
+                                ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
                                 num_warps=num_warps,
                             )
 
@@ -3305,9 +3350,11 @@ class TritonTBE(torch.autograd.Function):
         histogram_counts = saved_tensors[
             histogram_tensor_start : histogram_tensor_start + num_saved_histograms
         ]
-        histogram_counts_invalid = saved_tensors[
-            histogram_tensor_start + num_saved_histograms
-        ]
+        histogram_counts_invalid = (
+            saved_tensors[histogram_tensor_start + num_saved_histograms]
+            if num_saved_histograms
+            else None
+        )
 
         total_hash_size_bits = ctx.total_hash_size_bits
         total_embedding_dim = ctx.total_embedding_dim
@@ -3321,6 +3368,7 @@ class TritonTBE(torch.autograd.Function):
         block_size = ctx.block_size
         weight_chunk_starts = ctx.weight_chunk_starts
         split_weight_row_starts = ctx.split_weight_row_starts
+        enable_triton_tbe_optimizations = ctx.enable_triton_tbe_optimizations
 
         stochastic_rounding = ctx.stochastic_rounding
         vbe = ctx.vbe
@@ -3369,7 +3417,10 @@ class TritonTBE(torch.autograd.Function):
 
         feature_table_map = ctx.feature_table_map
         num_valid_histograms = 0
-        if num_saved_histograms and not torch.cuda.is_current_stream_capturing():
+        if (
+            histogram_counts_invalid is not None
+            and not torch.cuda.is_current_stream_capturing()
+        ):
             for invalid in histogram_counts_invalid.tolist():
                 if invalid:
                     break
@@ -3623,6 +3674,13 @@ class TritonTBE(torch.autograd.Function):
                     len(weight_ptrs),
                 )
             )
+            short_run_weighted_kwargs = (
+                {}
+                if _use_amd
+                else {
+                    "ENABLE_TRITON_TBE_OPTIMIZATIONS": enable_triton_tbe_optimizations
+                }
+            )
             for _b, _bucket_bs in enumerate(
                 bucket_block_sizes if use_dim_buckets else (block_size,)
             ):
@@ -3669,10 +3727,11 @@ class TritonTBE(torch.autograd.Function):
                     stochastic_rounding_seed=stochastic_rounding_seed,
                     vbe=vbe,
                     BUFFER_SIZE=cfg.short_run_buffer_size_weighted,
+                    **short_run_weighted_kwargs,
                 )
-            use_fused_clc_long_run = (
-                use_clc
-                and max_num_runs > cfg.long_run_fused_programs * cfg.long_run_threshold
+            use_fused_clc_long_run = use_clc and (
+                not enable_triton_tbe_optimizations
+                or max_num_runs > cfg.long_run_fused_programs * cfg.long_run_threshold
             )
             if use_fused_clc_long_run:
                 # CLC path: fused long-run grad accumulation + optimizer apply
@@ -3715,6 +3774,7 @@ class TritonTBE(torch.autograd.Function):
                     BLOCK_SIZE=block_size,
                     info_B_num_bits=info_B_num_bits,
                     info_B_mask=info_B_mask,
+                    ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
                     num_warps=num_warps,
                     STOCHASTIC_ROUNDING=stochastic_rounding,
                     stochastic_rounding_seed=stochastic_rounding_seed,
@@ -3804,6 +3864,13 @@ class TritonTBE(torch.autograd.Function):
                     len(weight_ptrs),
                 )
             )
+            short_run_unweighted_kwargs = (
+                {}
+                if _use_amd
+                else {
+                    "ENABLE_TRITON_TBE_OPTIMIZATIONS": enable_triton_tbe_optimizations
+                }
+            )
             for _b, _bucket_bs in enumerate(
                 bucket_block_sizes if use_dim_buckets else (block_size,)
             ):
@@ -3849,10 +3916,11 @@ class TritonTBE(torch.autograd.Function):
                     stochastic_rounding_seed=stochastic_rounding_seed,
                     vbe=vbe,
                     BUFFER_SIZE=cfg.short_run_buffer_size_unweighted,
+                    **short_run_unweighted_kwargs,
                 )
-            use_fused_clc_long_run = (
-                use_clc
-                and max_num_runs > cfg.long_run_fused_programs * cfg.long_run_threshold
+            use_fused_clc_long_run = use_clc and (
+                not enable_triton_tbe_optimizations
+                or max_num_runs > cfg.long_run_fused_programs * cfg.long_run_threshold
             )
             if use_fused_clc_long_run:
                 # CLC path: fused long-run grad accumulation + optimizer apply
@@ -3894,6 +3962,7 @@ class TritonTBE(torch.autograd.Function):
                     BLOCK_SIZE=block_size,
                     info_B_num_bits=info_B_num_bits,
                     info_B_mask=info_B_mask,
+                    ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
                     num_warps=num_warps,
                     STOCHASTIC_ROUNDING=stochastic_rounding,
                     stochastic_rounding_seed=stochastic_rounding_seed,
@@ -3912,6 +3981,16 @@ class TritonTBE(torch.autograd.Function):
                     if _use_amd
                     else triton_tbe_backward_long_run_grad_accum_unweighted
                 )
+                long_run_unweighted_kwargs = (
+                    {}
+                    if _use_amd
+                    else {
+                        "ENABLE_TRITON_TBE_OPTIMIZATIONS": (
+                            enable_triton_tbe_optimizations
+                        ),
+                        "BUFFER_SIZE": cfg.long_run_accum_buffer_size_unweighted,
+                    }
+                )
                 bwd_long_accum_uw[(long_accum_grid_size,)](
                     dout,
                     infos_sorted,
@@ -3928,15 +4007,9 @@ class TritonTBE(torch.autograd.Function):
                     BLOCK_SIZE=block_size,
                     info_B_num_bits=info_B_num_bits,
                     info_B_mask=info_B_mask,
-                    num_warps=num_warps,
                     vbe=vbe,
-                    # The AMD variant hardcodes its gather width and does not
-                    # take this constexpr, so only pass it on the CUDA path.
-                    **(
-                        {}
-                        if _use_amd
-                        else {"BUFFER_SIZE": cfg.long_run_accum_buffer_size_unweighted}
-                    ),
+                    num_warps=num_warps,
+                    **long_run_unweighted_kwargs,
                 )
 
                 # Kernel 3: apply optimizer (direct mapping, no while-loop)
@@ -4018,10 +4091,13 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         hoist_transpose_to_forward: bool = False,
         bag_size_hints: Optional[List[int]] = None,
         fused_bounds_check: bool = False,
+        enable_triton_tbe_optimizations: bool = False,
     ) -> None:
         super().__init__()
         logging.info("TritonTableBatchedEmbeddingBags init args: %s", locals())
         self.embedding_specs = embedding_specs
+        self._is_triton_tbe = True
+        self.enable_triton_tbe_optimizations = enable_triton_tbe_optimizations
         # Initialize event as None; it will be set after forward kernel runs
         self._forward_event = None
         T_ = len(embedding_specs)  # num of physical tables
@@ -4153,7 +4229,8 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         self._histogram_block_size = 0
         self._saved_histogram_plans: Tuple[_SavedHistogramPlan, ...] = ()
         if (
-            bag_size_hints is not None
+            enable_triton_tbe_optimizations
+            and bag_size_hints is not None
             and weights_precision == torch.float16
             and self.output_dtype == torch.float32
         ):
@@ -4219,7 +4296,11 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             rows_per_feature, dtype=torch.int64, device=device
         )
         self.bounds_check_warning = torch.tensor([0], device=device, dtype=torch.int64)
-        self.bounds_check_mode: BoundsCheckMode = BoundsCheckMode.V2_WARNING
+        self.bounds_check_mode: BoundsCheckMode = (
+            BoundsCheckMode.V2_WARNING
+            if enable_triton_tbe_optimizations
+            else BoundsCheckMode.WARNING
+        )
         self._disable_offsets_adjustment = (
             FeatureGateName.DISABLE_OFFSETS_ADJUSTMENT.is_enabled()
         )
@@ -4496,6 +4577,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             self._weight_chunk_starts_tensor,
             self._feature_weight_chunk_ids_tensor,
             self._feature_chunk_relative_table_offsets_tensor,
+            self.enable_triton_tbe_optimizations,
         )
 
     def split_embedding_weights(self) -> List[torch.Tensor]:
@@ -4632,6 +4714,7 @@ class ChunkedTritonTableBatchedEmbeddingBags(TritonTableBatchedEmbeddingBags):
         fused_bounds_check: bool = False,
         *,
         weight_chunk_sizes: Sequence[int],
+        enable_triton_tbe_optimizations: bool = False,
     ) -> None:
         if is_amd():
             raise NotImplementedError("Chunked Triton TBE does not support AMD")
@@ -4653,6 +4736,7 @@ class ChunkedTritonTableBatchedEmbeddingBags(TritonTableBatchedEmbeddingBags):
             hoist_transpose_to_forward=hoist_transpose_to_forward,
             bag_size_hints=None,
             fused_bounds_check=fused_bounds_check,
+            enable_triton_tbe_optimizations=enable_triton_tbe_optimizations,
         )
 
         chunk_sizes = tuple(weight_chunk_sizes)
