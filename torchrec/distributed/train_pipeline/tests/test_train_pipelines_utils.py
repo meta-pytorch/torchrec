@@ -10,12 +10,22 @@
 import copy
 import enum
 import unittest
-from typing import cast, List, NamedTuple, Optional, Tuple, Union
+from typing import cast, List, NamedTuple, Optional, Protocol, Tuple, Union
 from unittest.mock import MagicMock, patch
 
 import torch
 from torch._dynamo import is_dynamo_supported
+from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.embeddingbag import (
+    EmbeddingBagCollectionSharder,
+    ShardedEmbeddingBagCollection,
+)
+from torchrec.distributed.model_parallel import DistributedModelParallel
+from torchrec.distributed.sharding_plan import (
+    construct_module_sharding_plan,
+    data_parallel,
+)
 from torchrec.distributed.test_utils.test_model import (
     ModelInput,
     TestNegSamplingModule,
@@ -38,8 +48,18 @@ from torchrec.distributed.train_pipeline.utils import (
     _rewrite_model,
     _start_embedding_lookup,
     DataLoadingThread,
+    find_ddp_modules,
 )
-from torchrec.distributed.types import Awaitable, ShardedModule, ShardingType
+from torchrec.distributed.types import (
+    Awaitable,
+    ModuleSharder,
+    ShardedModule,
+    ShardingEnv,
+    ShardingPlan,
+    ShardingType,
+)
+from torchrec.modules.embedding_configs import EmbeddingBagConfig
+from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Multistreamable
 
@@ -48,6 +68,10 @@ class ModelType(enum.Enum):
     VANILLA = "vanilla"
     SHARDED = "sharded"
     PIPELINED = "pipelined"
+
+
+class _HasSparseModule(Protocol):
+    sparse: torch.nn.Module
 
 
 @torch.fx.wrap
@@ -175,10 +199,12 @@ class TrainPipelineUtilsTest(TrainPipelineSparseDistTestBase):
         # treat it as non-leaf and trace into it, invoking the OptimizedModule's
         # __call__ which goes through dynamo's eval frame and checks
         # error_on_nested_fx_trace.
-        inner = sharded_model.module
-        # pyrefly: ignore[missing-attribute]
-        compiled_sparse = torch.compile(inner.sparse, backend="eager", fullgraph=False)
-        setattr(inner, "sparse", compiled_sparse)
+        inner = cast(_HasSparseModule, sharded_model.module)
+        compiled_sparse = cast(
+            torch.nn.Module,
+            torch.compile(inner.sparse, backend="eager", fullgraph=False),
+        )
+        inner.sparse = compiled_sparse
 
         # Set error_on_nested_fx_trace to True globally — without the fix in
         # _rewrite_model this would cause tracing to raise an error.
@@ -723,3 +749,51 @@ class DataLoadingExceptionTest(unittest.TestCase):
             thread.get_next_batch(none_throws=True)
         self.assertIs(ctx.exception, error)
         self.assertIsNone(thread._exception)
+
+
+class _FindDDPModulesTestModel(torch.nn.Module):
+    def __init__(self, table: EmbeddingBagConfig, device: torch.device) -> None:
+        super().__init__()
+        self.ebc = EmbeddingBagCollection(tables=[table], device=device)
+        self.dense = torch.nn.Linear(1, 1, device=device)
+
+
+class FindDDPModulesTest(TrainPipelineSparseDistTestBase):
+    @unittest.skipIf(
+        not torch.cuda.is_available(),
+        "Not enough GPUs, this test requires at least one GPU",
+    )
+    def test_finds_dp_sharded_ebc_lookup(self) -> None:
+        device = self.device
+        table = self.tables[0]
+        model = _FindDDPModulesTestModel(table, device)
+        sharder = cast(ModuleSharder[torch.nn.Module], EmbeddingBagCollectionSharder())
+        module_plan = construct_module_sharding_plan(
+            model.ebc,
+            per_param_sharding={table.name: data_parallel()},
+            local_size=1,
+            world_size=1,
+            device_type=device.type,
+        )
+        dmp = DistributedModelParallel(
+            module=model,
+            plan=ShardingPlan({"ebc": module_plan}),
+            env=ShardingEnv.from_process_group(self.pg),
+            sharders=[sharder],
+            device=device,
+        )
+
+        ddp_wrapper = dmp._dmp_wrapped_module
+        self.assertIsInstance(ddp_wrapper, DistributedDataParallel)
+        sharded_ebc = next(
+            module
+            for module in dmp.modules()
+            if isinstance(module, ShardedEmbeddingBagCollection)
+        )
+        lookup_ddp = sharded_ebc._lookups[0]
+        self.assertIsInstance(lookup_ddp, DistributedDataParallel)
+
+        ddp_modules = find_ddp_modules(dmp)
+        self.assertEqual(2, len(ddp_modules))
+        self.assertIs(ddp_modules[0], ddp_wrapper)
+        self.assertIs(ddp_modules[1], lookup_ddp)
