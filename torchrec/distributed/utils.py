@@ -355,6 +355,15 @@ _EMB_OPT_TYPE_TO_OPTIMIZER_CLASS: Dict[EmbOptimType, Type[torch.optim.Optimizer]
     EmbOptimType.EXACT_ROWWISE_ADAGRAD: trec_optim.RowWiseAdagrad,
 }
 
+# FTRL requires an fbgemm_gpu build that carries EmbOptimType.FTRL. Registered
+# conditionally so TorchRec still imports against older fbgemm_gpu wheels; once
+# the pinned fbgemm_gpu minimum includes FTRL this can become a plain entry in
+# the two dicts above.
+_FTRL_EMB_OPT_TYPE: Optional[EmbOptimType] = getattr(EmbOptimType, "FTRL", None)
+if _FTRL_EMB_OPT_TYPE is not None:
+    _OPTIMIZER_CLASS_TO_EMB_OPT_TYPE[trec_optim.FTRL] = _FTRL_EMB_OPT_TYPE
+    _EMB_OPT_TYPE_TO_OPTIMIZER_CLASS[_FTRL_EMB_OPT_TYPE] = trec_optim.FTRL
+
 
 def optimizer_type_to_emb_opt_type(
     optimizer_class: Type[torch.optim.Optimizer],

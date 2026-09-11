@@ -1102,6 +1102,14 @@ def calculate_storage_specific_size_data_provider():
             ],
             "clf": 1.0,
         },
+        {
+            "sharding_type": ShardingType.TABLE_ROW_WISE,
+            # FTRL keeps two elementwise states per row (accum + linear), so it
+            # costs 2x the shard tensor, the same as Adam.
+            "optimizer_class": trec_optim.FTRL,
+            "expected_storage": [150, 150],
+            "clf": None,
+        },
     )
 
 
