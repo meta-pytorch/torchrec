@@ -9,6 +9,7 @@
 
 from typing import List, Tuple, Union
 
+import math
 import torch
 import torch.distributed as dist
 from torchrec import EmbeddingBagConfig, EmbeddingConfig, KeyedJaggedTensor
@@ -83,6 +84,10 @@ class IDTransformerCollection:
             self._pg = dist.new_group(backend="gloo")
         self._stream = torch.cuda.Stream()
 
+        self._evict_ratio = 0.5
+        if eviction_config is not None and "ratio" in eviction_config:
+            self._evict_ratio = float(eviction_config["ratio"])
+        
     def _transform(
         self, transformer, global_ids: List[torch.Tensor], cache_ids: List[torch.Tensor]
     ):
@@ -186,7 +191,7 @@ class IDTransformerCollection:
                         # broadcast ids_to_evict
                         if dist.get_rank() == 0:
                             ids_to_evict = transformer.evict(
-                                transformer._num_embedding // 2
+                                math.floor(transformer._num_embedding * self._evict_ratio)
                             )
                         else:
                             ids_to_evict = None
@@ -243,9 +248,8 @@ class IDTransformerCollection:
                         )
                         fetch_handles.append(handle)
                     if not success:
-                        # TODO(zilinzhu): make this configurable
                         ids_to_evict = transformer.evict(
-                            transformer._num_embedding // 2
+                            math.floor(transformer._num_embedding * self._evict_ratio)
                         )
                         ps.evict(ids_to_evict)
                         self._ever_evicted = True
