@@ -22,8 +22,8 @@ If you need to add a new buffer/state to a metric:
 3. Update the golden snapshot with --update-golden after confirming the change
    won't break production training jobs
 
-To update the golden snapshot after intentional changes:
-    python -m torchrec.metrics.tests.test_metric_fqn_backward_compatibility --update-golden
+To update the golden snapshot after intentional changes, from fbcode:
+    buck2 run //torchrec/metrics/tests:update_metric_fqn_golden_snapshot -- --update-golden
 """
 
 import contextlib
@@ -1245,7 +1245,9 @@ def update_golden_snapshot() -> None:
     print("Generating golden snapshot...")
     snapshot = generate_schema_case_entries()
     save_golden_snapshot(snapshot)
-    print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH}")
+    # Resolved: the path runs through buck-out's link tree, which symlinks back
+    # to the source. Printing it unresolved suggests the write went to buck-out.
+    print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH.resolve()}")
     print(f"Total metrics captured: {len(snapshot)}")
     for key in sorted(snapshot.keys()):
         info = snapshot[key]
