@@ -103,10 +103,16 @@ def get_auc_states(
     predictions: torch.Tensor,
     weights: torch.Tensor,
     num_candidates: torch.Tensor,
+    max_num_candidates_cpu: Optional[torch.Tensor] = None,
 ) -> Dict[str, torch.Tensor]:
 
     # predictions, labels: [n_task, n_sample]
-    max_length = int(num_candidates.max().item())
+    if max_num_candidates_cpu is not None:
+        if max_num_candidates_cpu.device.type != "cpu":
+            raise RecMetricException("max_num_candidates_cpu must be on CPU")
+        max_length = int(max_num_candidates_cpu.item())
+    else:
+        max_length = int(num_candidates.max().item())
     predictions_perm = predictions.permute(1, 0)
     labels_perm = labels.permute(1, 0)
     weights_perm = weights.permute(1, 0)
@@ -173,6 +179,7 @@ class GAUCMetricComputation(RecMetricComputation):
         labels: torch.Tensor,
         weights: Optional[torch.Tensor],
         num_candidates: torch.Tensor,
+        max_num_candidates_cpu: Optional[torch.Tensor] = None,
         **kwargs: Dict[str, Any],
     ) -> None:
         if predictions is None or weights is None:
@@ -180,7 +187,13 @@ class GAUCMetricComputation(RecMetricComputation):
                 "Inputs 'predictions' and 'weights' should not be None for GAUCMetricComputation update"
             )
 
-        states = get_auc_states(labels, predictions, weights, num_candidates)
+        states = get_auc_states(
+            labels,
+            predictions,
+            weights,
+            num_candidates,
+            max_num_candidates_cpu,
+        )
         num_samples = predictions.shape[-1]
 
         for state_name, state_value in states.items():
