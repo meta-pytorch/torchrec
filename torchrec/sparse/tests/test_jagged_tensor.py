@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import torch
 import torch.utils._pytree as pytree
+from torch.fx._pytree import tree_flatten_spec
 from torch.testing import FileCheck
 from torchrec.fx import symbolic_trace
 from torchrec.sparse.jagged_tensor import (
@@ -27,6 +28,165 @@ torch.fx.wrap("len")
 
 
 class TestJaggedTensor(unittest.TestCase):
+    def test_fields_stay_legacy(self) -> None:
+        # Callers size fx placeholder lists off `_fields`, and `_jt_flatten` only
+        # emits four elements for a materialized JaggedTensor.
+        self.assertEqual(
+            ["_values", "_weights", "_lengths", "_offsets"], JaggedTensor._fields
+        )
+
+    def test_torchscript_compiles_jagged_tensor_class(self) -> None:
+        # Scripting a caller compiles every JaggedTensor method. `materialize` is
+        # the fragile one: TorchScript resolves the constructor without defaults
+        # mid-compilation, and miscompiles a method that mixes an early return, a
+        # `with` block, and construction of its own class.
+        @torch.jit.script
+        def materialize_packed(
+            packed_values: torch.Tensor,
+            reverse_indices: torch.Tensor,
+            lengths: torch.Tensor,
+        ) -> torch.Tensor:
+            jt = JaggedTensor(
+                values=packed_values,
+                weights=None,
+                lengths=lengths,
+                offsets=None,
+                reverse_indices=reverse_indices,
+            )
+            return jt.materialize().values()
+
+        @torch.jit.script
+        def materialize_unpacked(
+            values: torch.Tensor, lengths: torch.Tensor
+        ) -> torch.Tensor:
+            return JaggedTensor(values=values, lengths=lengths).materialize().values()
+
+        torch.testing.assert_close(
+            materialize_packed(
+                torch.tensor([[1.0], [2.0]]),
+                torch.tensor([0, 1, 0]),
+                torch.tensor([2, 1]),
+            ),
+            torch.tensor([[1.0], [2.0], [1.0]]),
+        )
+        torch.testing.assert_close(
+            materialize_unpacked(torch.tensor([[7.0]]), torch.tensor([1])),
+            torch.tensor([[7.0]]),
+        )
+
+    def test_materialized_values_preserve_legacy_pytree_schema(self) -> None:
+        jt = JaggedTensor(
+            values=torch.tensor([[1.0], [2.0]]),
+            lengths=torch.tensor([2]),
+        )
+
+        elements, spec = pytree.tree_flatten(jt)
+        restored = pytree.tree_unflatten(elements, spec)
+
+        self.assertEqual(4, spec.num_children)
+        self.assertEqual(4, len(elements))
+        self.assertFalse(restored.is_packed())
+        torch.testing.assert_close(restored.values(), jt.values())
+
+    def test_legacy_pytree_spec_rejects_packed_values(self) -> None:
+        materialized_jt = JaggedTensor(
+            values=torch.tensor([[1.0], [2.0], [1.0]]),
+            lengths=torch.tensor([2, 1]),
+        )
+        _, legacy_spec = pytree.tree_flatten(materialized_jt)
+        packed_jt = JaggedTensor.from_packed_values(
+            packed_values=torch.tensor([[1.0], [2.0]]),
+            reverse_indices=torch.tensor([0, 1, 0]),
+            lengths=torch.tensor([2, 1]),
+        )
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "Packed JaggedTensor is incompatible with a legacy TreeSpec",
+        ):
+            tree_flatten_spec(packed_jt, legacy_spec)
+
+        self.assertTrue(packed_jt.is_packed())
+
+    def test_materialize_packed_values(self) -> None:
+        packed_values = torch.tensor([[1.0, 2.0], [3.0, 4.0]], requires_grad=True)
+        jt = JaggedTensor.from_packed_values(
+            packed_values=packed_values,
+            reverse_indices=torch.tensor([0, 1, 0]),
+            lengths=torch.tensor([2, 1]),
+            weights=torch.tensor([10, 11, 10]),
+        )
+
+        self.assertTrue(jt.is_packed())
+        self.assertIs(jt.packed_values(), packed_values)
+        torch.testing.assert_close(jt.reverse_indices(), torch.tensor([0, 1, 0]))
+        torch.testing.assert_close(jt.lengths(), torch.tensor([2, 1]))
+
+        with self.assertRaisesRegex(ValueError, r"call materialize\(\) first"):
+            jt.values()
+
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as profile:
+            materialized = jt.materialize()
+
+        self.assertIsNot(materialized, jt)
+        self.assertTrue(jt.is_packed())
+        self.assertIs(jt.packed_values(), packed_values)
+        self.assertFalse(materialized.is_packed())
+        self.assertIsNone(materialized.reverse_indices_or_none())
+        with self.assertRaisesRegex(ValueError, "values are not packed"):
+            materialized.packed_values()
+        self.assertIn(
+            "## JaggedTensor.materialize ##",
+            {event.key for event in profile.key_averages()},
+        )
+        torch.testing.assert_close(
+            materialized.values(),
+            torch.tensor([[1.0, 2.0], [3.0, 4.0], [1.0, 2.0]]),
+        )
+        materialized.values().sum().backward()
+        torch.testing.assert_close(
+            packed_values.grad,
+            torch.tensor([[2.0, 2.0], [1.0, 1.0]]),
+        )
+
+    def test_packed_str_preserves_packed_values(self) -> None:
+        packed_values = torch.tensor([[1.0], [2.0]])
+        jt = JaggedTensor.from_packed_values(
+            packed_values=packed_values,
+            reverse_indices=torch.tensor([0, 1, 0]),
+            lengths=torch.tensor([2, 1]),
+        )
+
+        rendered = str(jt)
+
+        self.assertIn('"packed_values"', rendered)
+        self.assertIn('"reverse_indices"', rendered)
+        self.assertTrue(jt.is_packed())
+        self.assertIs(jt.packed_values(), packed_values)
+
+    def test_packed_values_pytree_round_trip(self) -> None:
+        jt = JaggedTensor.from_packed_values(
+            packed_values=torch.tensor([[1.0], [2.0]]),
+            reverse_indices=torch.tensor([0, 1, 0]),
+            lengths=torch.tensor([2, 1]),
+        )
+
+        elements, spec = pytree.tree_flatten(jt)
+        restored = pytree.tree_unflatten(elements, spec)
+
+        self.assertEqual(5, spec.num_children)
+        self.assertEqual(5, len(elements))
+        self.assertTrue(restored.is_packed())
+        torch.testing.assert_close(restored.packed_values(), jt.packed_values())
+        torch.testing.assert_close(restored.reverse_indices(), jt.reverse_indices())
+        torch.testing.assert_close(
+            restored.materialize().values(), jt.materialize().values()
+        )
+        self.assertTrue(restored.is_packed())
+        self.assertTrue(jt.is_packed())
+
     def test_equality(self) -> None:
         values = torch.Tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
         lengths = torch.IntTensor([1, 0, 2, 3])

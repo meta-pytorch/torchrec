@@ -18,7 +18,8 @@ from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
     EmbeddingCollection,
 )
-from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+from torchrec.modules.utils import construct_jagged_tensors, SequenceVBEContext
+from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
 
 
 class EmbeddingBagCollectionTest(unittest.TestCase):
@@ -229,6 +230,162 @@ class EmbeddingBagCollectionTest(unittest.TestCase):
 
 
 class EmbeddingCollectionTest(unittest.TestCase):
+    def test_construct_packed_output_preserves_packed_address_space(
+        self,
+    ) -> None:
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["item", "author"],
+            values=torch.tensor([10, 11, 10, 20, 21, 20]),
+            lengths=torch.tensor([2, 1, 2, 1]),
+        )
+        packed_values = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]],
+            requires_grad=True,
+        )
+        reverse_indices = torch.tensor([0, 1, 0, 2, 3, 2])
+
+        output = construct_jagged_tensors(
+            embeddings=packed_values,
+            features=features,
+            embedding_names=["item", "author"],
+            original_features=features,
+            reverse_indices=reverse_indices,
+            use_packed_jagged_tensor=True,
+        )
+
+        self.assertIs(output["item"].packed_values(), packed_values)
+        self.assertIs(output["author"].packed_values(), packed_values)
+        torch.testing.assert_close(
+            output["item"].reverse_indices(), torch.tensor([0, 1, 0])
+        )
+        torch.testing.assert_close(
+            output["author"].reverse_indices(), torch.tensor([2, 3, 2])
+        )
+        reconstructed = torch.cat(
+            [
+                output["item"].materialize().values(),
+                output["author"].materialize().values(),
+            ]
+        )
+        torch.testing.assert_close(
+            reconstructed,
+            torch.index_select(packed_values, 0, reverse_indices),
+        )
+        reconstructed.sum().backward()
+        torch.testing.assert_close(
+            packed_values.grad,
+            torch.tensor([[2.0, 2.0], [1.0, 1.0], [2.0, 2.0], [1.0, 1.0]]),
+        )
+
+    def test_construct_packed_output_supports_vbe(self) -> None:
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["item", "author"],
+            values=torch.tensor([10, 11, 10, 20, 20]),
+            lengths=torch.tensor([1, 2, 2, 0], dtype=torch.int32),
+        )
+        packed_values = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], requires_grad=True
+        )
+        reverse_indices = torch.tensor([0, 1, 0, 2, 2])
+        seq_vbe_ctx = SequenceVBEContext(
+            recat=torch.tensor([0, 1, 2, 2], dtype=torch.int32),
+            unpadded_lengths=torch.tensor([1, 2, 2], dtype=torch.int32),
+            reindexed_lengths=torch.tensor([[1, 2], [2, 2]], dtype=torch.int32),
+            reindexed_length_per_key=[3, 4],
+            reindexed_values=torch.tensor([10, 11, 10, 20, 20, 20, 20]),
+        )
+
+        output = construct_jagged_tensors(
+            embeddings=packed_values,
+            features=features,
+            embedding_names=["item", "author"],
+            need_indices=True,
+            original_features=features,
+            reverse_indices=reverse_indices,
+            seq_vbe_ctx=seq_vbe_ctx,
+            use_packed_jagged_tensor=True,
+        )
+        expected = construct_jagged_tensors(
+            embeddings=packed_values,
+            features=features,
+            embedding_names=["item", "author"],
+            need_indices=True,
+            original_features=features,
+            reverse_indices=reverse_indices,
+            seq_vbe_ctx=seq_vbe_ctx,
+        )
+
+        materialized_values = []
+        for name in ["item", "author"]:
+            values = output[name].materialize().values()
+            materialized_values.append(values)
+            torch.testing.assert_close(
+                values,
+                expected[name].values(),
+            )
+            torch.testing.assert_close(output[name].lengths(), expected[name].lengths())
+            torch.testing.assert_close(output[name].weights(), expected[name].weights())
+        torch.cat(materialized_values).sum().backward()
+        torch.testing.assert_close(
+            packed_values.grad,
+            torch.tensor([[2.0, 2.0], [1.0, 1.0], [4.0, 4.0]]),
+        )
+
+    def test_construct_packed_output_rejects_column_wise_sharding(
+        self,
+    ) -> None:
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["item"],
+            values=torch.tensor([10]),
+            lengths=torch.tensor([1]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "column-wise sharding"):
+            construct_jagged_tensors(
+                embeddings=torch.tensor([[1.0], [2.0]]),
+                features=features,
+                embedding_names=["item", "item"],
+                use_packed_jagged_tensor=True,
+            )
+
+    def test_construct_packed_output_requires_reverse_indices(self) -> None:
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["item"],
+            values=torch.tensor([10]),
+            lengths=torch.tensor([1]),
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires reverse indices"):
+            construct_jagged_tensors(
+                embeddings=torch.tensor([[1.0]]),
+                features=features,
+                embedding_names=["item"],
+                use_packed_jagged_tensor=True,
+            )
+
+    def test_construct_packed_output_has_profiler_annotation(self) -> None:
+        features = KeyedJaggedTensor.from_lengths_sync(
+            keys=["item"],
+            values=torch.tensor([10, 10]),
+            lengths=torch.tensor([2]),
+        )
+
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU]
+        ) as profile:
+            construct_jagged_tensors(
+                embeddings=torch.tensor([[1.0, 2.0]]),
+                features=features,
+                embedding_names=["item"],
+                reverse_indices=torch.tensor([0, 0]),
+                use_packed_jagged_tensor=True,
+            )
+
+        self.assertIn(
+            "## construct_jagged_tensors ##",
+            {event.key for event in profile.key_averages()},
+        )
+
     def test_forward(self) -> None:
         tb1_config = EmbeddingConfig(
             name="t1",
@@ -260,6 +417,7 @@ class EmbeddingCollectionTest(unittest.TestCase):
         sequence_embeddings = ec(
             features=id_list_features,
         )
+        self.assertIsInstance(sequence_embeddings["f1"], JaggedTensor)
         self.assertEqual(sequence_embeddings["f1"].values().size(), (3, 5))
         self.assertEqual(sequence_embeddings["f2@t1"].values().size(), (1, 5))
         self.assertEqual(sequence_embeddings["f2@t2"].values().size(), (1, 5))

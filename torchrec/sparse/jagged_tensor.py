@@ -49,6 +49,10 @@ except OSError:
 
 logger: logging.Logger = logging.getLogger()
 
+_JT_LEGACY_FIELDS: List[str] = ["_values", "_weights", "_lengths", "_offsets"]
+_JT_REVERSE_INDICES_FIELD: str = "_reverse_indices"
+_JT_PACKED_FIELDS: List[str] = [*_JT_LEGACY_FIELDS, _JT_REVERSE_INDICES_FIELD]
+
 
 def _pin_and_move(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
     """
@@ -649,15 +653,22 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         valid lengths, offsets, etc.
 
     Args:
-        values (torch.Tensor): values tensor in dense representation.
+        values (torch.Tensor): values tensor in dense representation. When
+            ``reverse_indices`` is provided, this stores the packed values instead.
         weights (Optional[torch.Tensor]): if values have weights. Tensor with same shape
-            as values.
+            as the logical, materialized values.
         lengths (Optional[torch.Tensor]): jagged slices, represented as lengths.
         offsets (Optional[torch.Tensor]): jagged slices, represented as cumulative
             offsets.
+        reverse_indices (Optional[torch.Tensor]): indices mapping logical values to
+            packed value rows. Call ``materialize()`` to create a JaggedTensor with
+            logical values. Packed JaggedTensors should be created through
+            ``construct_jagged_tensors`` instead of passing this directly.
     """
 
-    _fields = ["_values", "_weights", "_lengths", "_offsets"]
+    # Stays at the legacy four fields: callers use it to size fx placeholder lists.
+    # Packed JaggedTensors flatten through `_jt_fields` instead.
+    _fields = _JT_LEGACY_FIELDS
 
     def __init__(
         self,
@@ -665,6 +676,7 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         weights: Optional[torch.Tensor] = None,
         lengths: Optional[torch.Tensor] = None,
         offsets: Optional[torch.Tensor] = None,
+        reverse_indices: Optional[torch.Tensor] = None,
     ) -> None:
 
         self._values: torch.Tensor = values
@@ -676,6 +688,12 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
             _assert_tensor_has_no_elements_or_has_integers(lengths, "lengths")
         self._lengths: Optional[torch.Tensor] = lengths
         self._offsets: Optional[torch.Tensor] = offsets
+        self._reverse_indices: Optional[torch.Tensor] = reverse_indices
+
+    @torch.jit.unused
+    def __setstate__(self, state: Dict[str, Any]) -> None:
+        state.setdefault(_JT_REVERSE_INDICES_FIELD, None)
+        self.__dict__.update(state)
 
     def size_in_bytes(self) -> int:
         """
@@ -691,6 +709,9 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         offsets = self._offsets
         if offsets is not None:
             size += offsets.element_size() * offsets.numel()
+        reverse_indices = self._reverse_indices
+        if reverse_indices is not None:
+            size += reverse_indices.element_size() * reverse_indices.numel()
         return size
 
     @staticmethod
@@ -725,6 +746,23 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         )
 
     @staticmethod
+    def from_packed_values(
+        packed_values: torch.Tensor,
+        reverse_indices: torch.Tensor,
+        weights: Optional[torch.Tensor] = None,
+        lengths: Optional[torch.Tensor] = None,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> "JaggedTensor":
+        """Internal factory used by ``construct_jagged_tensors`` for packed output."""
+        return JaggedTensor(
+            values=packed_values,
+            weights=weights,
+            lengths=lengths,
+            offsets=offsets,
+            reverse_indices=reverse_indices,
+        )
+
+    @staticmethod
     def empty_like(
         jt: "JaggedTensor",
         device: Optional[torch.device] = None,
@@ -744,19 +782,29 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         Returns:
             JaggedTensor: empty JaggedTensor with same dtypes and optionally same shapes.
         """
+        reverse_indices = jt._reverse_indices
         if device is None:
             return JaggedTensor(
-                values=torch.empty(0, device=jt.device(), dtype=jt.values().dtype),
+                values=torch.empty(0, device=jt.device(), dtype=jt._values.dtype),
                 weights=(
                     None
                     if jt.weights_or_none() is None
                     else torch.empty(0, device=jt.device(), dtype=jt.weights().dtype)
                 ),
                 lengths=torch.empty(0, device=jt.device(), dtype=jt.lengths().dtype),
+                reverse_indices=(
+                    None
+                    if reverse_indices is None
+                    else torch.empty(
+                        0,
+                        device=jt.device(),
+                        dtype=reverse_indices.dtype,
+                    )
+                ),
             )
         else:
             return JaggedTensor(
-                values=torch.empty_like(jt.values(), device=device),
+                values=torch.empty_like(jt._values, device=device),
                 weights=(
                     None
                     if jt.weights_or_none() is None
@@ -772,6 +820,11 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                     if jt.offsets_or_none() is None
                     else torch.empty_like(jt.offsets(), device=device)
                 ),
+                reverse_indices=(
+                    None
+                    if reverse_indices is None
+                    else torch.empty_like(reverse_indices, device=device)
+                ),
             )
 
     def copy_(self, jt: "JaggedTensor", non_blocking: bool = False) -> "JaggedTensor":
@@ -786,6 +839,13 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         Returns:
             JaggedTensor: self after copying.
         """
+        reverse_indices_self = self._reverse_indices
+        reverse_indices_jt = jt._reverse_indices
+        if (reverse_indices_self is None) != (reverse_indices_jt is None):
+            raise ValueError(
+                "Cannot copy between packed and materialized JaggedTensors"
+            )
+
         self._values.copy_(jt._values, non_blocking=non_blocking)
 
         weights_self = self._weights
@@ -802,6 +862,9 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         offsets_jt = jt._offsets
         if offsets_self is not None and offsets_jt is not None:
             offsets_self.copy_(offsets_jt, non_blocking=non_blocking)
+
+        if reverse_indices_self is not None and reverse_indices_jt is not None:
+            reverse_indices_self.copy_(reverse_indices_jt, non_blocking=non_blocking)
 
         return self
 
@@ -1115,12 +1178,61 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
 
     def values(self) -> torch.Tensor:
         """
-        Get JaggedTensor values.
+        Get logical JaggedTensor values.
+
+        Raises if values are packed. Call ``materialize()`` first in that case.
 
         Returns:
             torch.Tensor: the values tensor.
         """
+        if self._reverse_indices is not None:
+            raise ValueError(
+                "Packed JaggedTensor does not expose logical values directly; "
+                "call materialize() first"
+            )
         return self._values
+
+    def packed_values(self) -> torch.Tensor:
+        """Get the packed value storage."""
+        if self._reverse_indices is None:
+            raise ValueError("JaggedTensor values are not packed")
+        return self._values
+
+    def materialize(self) -> "JaggedTensor":
+        """Return a JaggedTensor containing one row per logical value."""
+        # Two TorchScript constraints shape this body, both of them load-bearing:
+        # a method mixing an early return, a `with` block, and construction of its
+        # own class trips an internal assert in the exit transform, so keep the
+        # single exit; and the constructor schema is resolved without defaults
+        # while the class is still compiling, so pass every argument explicitly.
+        reverse_indices = self._reverse_indices
+        if reverse_indices is None:
+            materialized = self
+        else:
+            with record_function("## JaggedTensor.materialize ##"):
+                materialized = JaggedTensor(
+                    values=torch.index_select(self._values, 0, reverse_indices),
+                    weights=self._weights,
+                    lengths=self._lengths,
+                    offsets=self._offsets,
+                    reverse_indices=None,
+                )
+        return materialized
+
+    def reverse_indices(self) -> torch.Tensor:
+        """Get the logical-to-packed row mapping, or raise if values are materialized."""
+        reverse_indices = self._reverse_indices
+        if reverse_indices is None:
+            raise ValueError("JaggedTensor values are not packed")
+        return reverse_indices
+
+    def reverse_indices_or_none(self) -> Optional[torch.Tensor]:
+        """Get the logical-to-packed row mapping if values are packed."""
+        return self._reverse_indices
+
+    def is_packed(self) -> bool:
+        """Whether values use packed storage with a logical-to-packed row mapping."""
+        return self._reverse_indices is not None
 
     def weights(self) -> torch.Tensor:
         """
@@ -1154,6 +1266,7 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         weights = self._weights
         lengths = self._lengths
         offsets = self._offsets
+        reverse_indices = self._reverse_indices
         return JaggedTensor(
             values=self._values.to(device, non_blocking=non_blocking),
             weights=(
@@ -1171,6 +1284,11 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
                 if offsets is not None
                 else None
             ),
+            reverse_indices=(
+                reverse_indices.to(device, non_blocking=non_blocking)
+                if reverse_indices is not None
+                else None
+            ),
         )
 
     @torch.jit.unused
@@ -1181,14 +1299,30 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         weights = self._weights
         lengths = self._lengths
         offsets = self._offsets
+        reverse_indices = self._reverse_indices
         if weights is not None:
             weights.record_stream(stream)
         if lengths is not None:
             lengths.record_stream(stream)
         if offsets is not None:
             offsets.record_stream(stream)
+        if reverse_indices is not None:
+            reverse_indices.record_stream(stream)
 
     def __str__(self) -> str:
+        reverse_indices = self._reverse_indices
+        if reverse_indices is not None:
+            return (
+                "JaggedTensor({\n"
+                + '    "packed_values": '
+                + str(self._values)
+                + ',\n    "reverse_indices": '
+                + str(reverse_indices)
+                + ',\n    "lengths": '
+                + str(self.lengths())
+                + "\n})\n"
+            )
+
         offsets = self.offsets()
 
         if self._weights is None:
@@ -1210,10 +1344,14 @@ class JaggedTensor(Pipelineable, metaclass=JaggedTensorMeta):
         )
 
 
+def _jt_fields(t: JaggedTensor) -> List[str]:
+    return _JT_PACKED_FIELDS if t._reverse_indices is not None else _JT_LEGACY_FIELDS
+
+
 def _jt_flatten(
     t: JaggedTensor,
 ) -> Tuple[List[Optional[torch.Tensor]], None]:
-    return [getattr(t, a) for a in JaggedTensor._fields], None
+    return [getattr(t, a) for a in _jt_fields(t)], None
 
 
 def _jt_flatten_with_keys(
@@ -1222,16 +1360,37 @@ def _jt_flatten_with_keys(
     values, context = _jt_flatten(t)
     # pyre can't tell that GetAttrKey implements the KeyEntry protocol
     # pyrefly: ignore[bad-return]
-    return [(GetAttrKey(k), v) for k, v in zip(JaggedTensor._fields, values)], context
+    return [(GetAttrKey(k), v) for k, v in zip(_jt_fields(t), values)], context
 
 
 def _jt_unflatten(values: List[Optional[torch.Tensor]], context: None) -> JaggedTensor:
+    legacy_num_fields = len(_JT_LEGACY_FIELDS)
+    packed_num_fields = len(_JT_PACKED_FIELDS)
+    if len(values) not in (legacy_num_fields, packed_num_fields):
+        raise ValueError(
+            f"Invalid number of values provided for JaggedTensor: {len(values)}; "
+            f"expected {legacy_num_fields} or {packed_num_fields}"
+        )
     # pyrefly: ignore[bad-argument-type]
     return JaggedTensor(*values)
 
 
 def _jt_flatten_spec(t: JaggedTensor, spec: TreeSpec) -> List[Optional[torch.Tensor]]:
-    return [getattr(t, a) for a in JaggedTensor._fields]
+    legacy_num_fields = len(_JT_LEGACY_FIELDS)
+    packed_num_fields = len(_JT_PACKED_FIELDS)
+    if spec.num_children == legacy_num_fields:
+        if t._reverse_indices is not None:
+            raise ValueError(
+                "Packed JaggedTensor is incompatible with a legacy TreeSpec "
+                "that does not contain reverse indices"
+            )
+        return [getattr(t, a) for a in _JT_LEGACY_FIELDS]
+    if spec.num_children == packed_num_fields:
+        return [getattr(t, a) for a in _JT_PACKED_FIELDS]
+    raise ValueError(
+        f"Unsupported JaggedTensor TreeSpec with {spec.num_children} children; "
+        f"expected {legacy_num_fields} or {packed_num_fields}"
+    )
 
 
 register_pytree_node(
