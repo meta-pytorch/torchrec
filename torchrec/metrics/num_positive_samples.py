@@ -90,6 +90,8 @@ class NumPositiveSamplesMetricComputation(RecMetricComputation):
 
 
 class NumPositiveSamplesMetric(RecMetric):
+    allowed_nan_inputs: frozenset[str] = frozenset({RecMetric.LABELS})
+    ignored_input_values: frozenset[str] = frozenset({RecMetric.PREDICTIONS})
     # pyrefly: ignore[bad-override]
     _namespace: MetricNamespace = MetricNamespace.NUM_POSITIVE_SAMPLES
     _computation_class: Type[RecMetricComputation] = NumPositiveSamplesMetricComputation
