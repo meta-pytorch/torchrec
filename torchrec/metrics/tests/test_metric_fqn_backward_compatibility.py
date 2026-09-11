@@ -1245,7 +1245,9 @@ def update_golden_snapshot() -> None:
     print("Generating golden snapshot...")
     snapshot = generate_schema_case_entries()
     save_golden_snapshot(snapshot)
-    print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH}")
+    # Resolved: the path runs through buck-out's link tree, which symlinks back
+    # to the source. Printing it unresolved suggests the write went to buck-out.
+    print(f"Golden snapshot saved to {GOLDEN_SNAPSHOT_PATH.resolve()}")
     print(f"Total metrics captured: {len(snapshot)}")
     for key in sorted(snapshot.keys()):
         info = snapshot[key]
