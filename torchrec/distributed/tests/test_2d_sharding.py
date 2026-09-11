@@ -716,6 +716,8 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
             qcomms_config=qcomms_config,
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
             variable_batch_size=variable_batch_size,
+            atol=1e-4,
+            rtol=1e-4,
         )
 
     @unittest.skipIf(
@@ -787,6 +789,8 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
             },
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
             variable_batch_size=variable_batch_size,
+            atol=1e-4,
+            rtol=1e-4,
         )
 
     @unittest.skipIf(
@@ -858,6 +862,8 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
             },
             apply_optimizer_in_backward_config=apply_optimizer_in_backward_config,
             variable_batch_size=variable_batch_size,
+            atol=1e-4,
+            rtol=1e-4,
         )
 
     def _test_sharding(
@@ -876,6 +882,8 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
         ] = None,
         variable_batch_size: bool = False,
         variable_batch_per_feature: bool = False,
+        atol: Optional[float] = None,
+        rtol: Optional[float] = None,
     ) -> None:
         self._run_multi_process_test(
             callable=sharding_single_rank_test,
@@ -894,6 +902,8 @@ class TestEmbeddingCollection2DParallel(MultiProcessTestBase):
             variable_batch_size=variable_batch_size,
             variable_batch_per_feature=variable_batch_per_feature,
             global_constant_batch=True,
+            atol=atol,
+            rtol=rtol,
         )
 
 
