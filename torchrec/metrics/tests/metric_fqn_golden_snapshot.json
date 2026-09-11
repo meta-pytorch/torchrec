@@ -265,6 +265,25 @@
       "_metrics_computations.0.weighted_num_pairs"
     ]
   },
+  "cpu_comms_rec_metric_module": {
+    "state_dict_keys": [
+      "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.neg_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.pos_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples"
+    ]
+  },
+  "cpu_offloaded_rec_metric_module": {
+    "state_dict_keys": [
+      "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.neg_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.pos_labels",
+      "rec_metrics.rec_metrics.0._metrics_computations.0.weighted_num_samples"
+    ]
+  },
+  "noop_metric_module": {
+    "state_dict_keys": []
+  },
   "rec_metric_module": {
     "state_dict_keys": [
       "rec_metrics.rec_metrics.0._metrics_computations.0.cross_entropy_sum",
