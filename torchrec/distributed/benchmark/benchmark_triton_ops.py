@@ -60,6 +60,10 @@ from torchrec.sparse.triton_permute_2d import (
 from torchrec.sparse.triton_permute_multi_embedding import (
     triton_permute_multi_embedding,
 )
+from torchrec.sparse.triton_quantized_comm import (
+    triton_float_to_fused8bitrowwise_quantized,
+    triton_fused8bitrowwise_quantized_to_float,
+)
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -1068,6 +1072,92 @@ def batch_index_select_dim0_torch(
             dim=1,
         ).flatten()
         _run_batch_index_select_backward(output, inputs, grad_output, run_backward)
+
+
+######################## fused 8-bit rowwise configs ################################
+@dataclass
+class Fused8BitRowwiseConfig(TritonOpConfig):
+    """FP32 communication tensors quantized independently by their last dimension."""
+
+    num_rows: int = 65536
+    num_columns: int = 32
+    gpu_backlog_ms: float = 20.0
+
+    def make_inputs(self, device: torch.device) -> Dict[str, Any]:
+        if self.num_rows < 0 or self.num_columns <= 0:
+            raise ValueError("num_rows must be nonnegative and num_columns positive")
+        input = torch.randn(
+            self.num_rows,
+            self.num_columns,
+            dtype=torch.float32,
+            device=device,
+        )
+        quantized = torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
+        return {"input": input, "quantized": quantized}
+
+
+@register_benchmark(Fused8BitRowwiseConfig)
+def fused_8bit_rowwise_quantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_float_to_fused8bitrowwise_quantized ##"):
+        triton_float_to_fused8bitrowwise_quantized(input)
+
+
+@register_benchmark(Fused8BitRowwiseConfig)
+def fused_8bit_rowwise_quantize_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## fbgemm_float_to_fused8bitrowwise_quantized ##"):
+        torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
+
+
+@register_benchmark(Fused8BitRowwiseConfig)
+def fused_8bit_rowwise_dequantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    quantized: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_fused8bitrowwise_quantized_to_float ##"):
+        triton_fused8bitrowwise_quantized_to_float(quantized)
+
+
+@register_benchmark(Fused8BitRowwiseConfig)
+def fused_8bit_rowwise_dequantize_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    quantized: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## fbgemm_fused8bitrowwise_quantized_to_float ##"):
+        torch.ops.fbgemm.Fused8BitRowwiseQuantizedToFloat(quantized)
+
+
+@register_benchmark(Fused8BitRowwiseConfig)
+def fused_8bit_rowwise_roundtrip_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_fused8bitrowwise_roundtrip ##"):
+        triton_fused8bitrowwise_quantized_to_float(
+            triton_float_to_fused8bitrowwise_quantized(input)
+        )
+
+
+@register_benchmark(Fused8BitRowwiseConfig)
+def fused_8bit_rowwise_roundtrip_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## fbgemm_fused8bitrowwise_roundtrip ##"):
+        torch.ops.fbgemm.Fused8BitRowwiseQuantizedToFloat(
+            torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
+        )
 
 
 ############################ pooled regroup configs ###################################
