@@ -956,6 +956,7 @@ _PARAM_ALTERNATIVES: Dict[str, List[Any]] = {
     "description": ["test_description"],
     "is_negative_task_mask": [[True]],
     "label_names": [["label_a", "label_b"]],
+    "number_of_classes": [5],
 }
 
 
@@ -976,6 +977,16 @@ def _get_metric_specific_params(
                 params[name] = param
 
     return params
+
+
+_CONSTRUCTION_KWARGS: Dict[str, Dict[str, Any]] = {
+    # Required, so the probe cannot build the metric without it.
+    "MulticlassRecallMetric": {"number_of_classes": 3},
+}
+
+
+def _construction_kwargs(metric_cls: Type[RecMetric]) -> Dict[str, Any]:
+    return _CONSTRUCTION_KWARGS.get(metric_cls.__name__, {})
 
 
 def _generate_alternatives(
@@ -1022,6 +1033,7 @@ KNOWN_SAFE_PARAMS: Set[Tuple[str, str]] = {
     ("AUPRCMetric", "num_bins"),
     ("AccuracyMetric", "threshold"),
     ("HindsightTargetPRMetric", "target_precision"),
+    ("MulticlassRecallMetric", "number_of_classes"),
     ("NDCGMetric", "exponential_gain"),
     ("NDCGMetric", "is_negative_task_mask"),
     ("NDCGMetric", "k"),
@@ -1126,7 +1138,9 @@ def _get_default_keys_cached(
     if default_keys_cache is not None and cls_name in default_keys_cache:
         return default_keys_cache[cls_name]
     try:
-        default_keys = set(extract_state_dict_keys(metric_cls))
+        default_keys = set(
+            extract_state_dict_keys(metric_cls, **_construction_kwargs(metric_cls))
+        )
     except (TypeError, ValueError, KeyError, RecMetricException):
         return None
     if default_keys_cache is not None:
@@ -1144,9 +1158,13 @@ def _probe_alternatives(
     tested_any = False
     for alt_value in alternatives:
         try:
-            variant_keys = set(
-                extract_state_dict_keys(metric_cls, **{param_name: alt_value})
-            )
+            # Merged, not double-splatted: the probed param may BE the hint,
+            # and duplicate keyword arguments raise.
+            probe_kwargs = {
+                **_construction_kwargs(metric_cls),
+                param_name: alt_value,
+            }
+            variant_keys = set(extract_state_dict_keys(metric_cls, **probe_kwargs))
             tested_any = True
         except (TypeError, ValueError, KeyError, RecMetricException):
             continue
