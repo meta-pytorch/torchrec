@@ -749,10 +749,6 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.cpu_module.async_compute()
 
-    @unittest.skipIf(
-        torch.cuda.device_count() < 1,
-        "Not enough GPUs, this test requires at least one GPU",
-    )
     def test_state_dict_save_load(self) -> None:
         """
         Test state_dict() method. Generated from comms module, loaded into offloaded module
@@ -775,8 +771,10 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
                 "state_3": torch.tensor([3.0]),
             },
         )
+        # model_out_device only selects the GPU-to-CPU transfer path inside
+        # _process_update_job. This test never calls update(), so it never
+        # reads the flag and the assertions below hold on any device.
         offloaded_module = self._make_module(
-            model_out_device=torch.device("cuda"),
             rec_metrics=RecMetricList([offloaded_metric]),
         )
 
