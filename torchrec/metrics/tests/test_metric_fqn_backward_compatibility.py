@@ -1323,71 +1323,67 @@ class ConditionalStateRegistryTest(unittest.TestCase):
 
 
 class CrossConfigLoadTest(unittest.TestCase):
+    """Loading a checkpoint written under a different metric configuration.
+
+    A variant configuration adds state_dict keys the default does not have.
+    The two directions are not equally safe, and only one of them is safe.
+    """
 
     def _make_common_kwargs(self) -> Dict[str, Any]:
         return {**_RECMETRIC_COMMON_KWARGS, "tasks": [create_test_task("task1")]}
 
-    def _assert_cross_config_load(
-        self,
-        metric_cls: Type[RecMetric],
-        param_name: str,
-        alt_value: Any,
-        direction: str,
-    ) -> None:
+    def _config_pair(
+        self, metric_cls: Type[RecMetric], param_name: str, alt_value: Any
+    ) -> Tuple[torch.nn.Module, torch.nn.Module]:
         common_kwargs = self._make_common_kwargs()
-        if direction == "variant_to_default":
-            src = metric_cls(**common_kwargs, **{param_name: alt_value})
-            dst = metric_cls(**common_kwargs)
-        else:
-            src = metric_cls(**common_kwargs)
-            dst = metric_cls(**common_kwargs, **{param_name: alt_value})
-        dst.load_state_dict(src.state_dict(), strict=True)
-
-    def test_cross_config_load_variant_to_default(self) -> None:
-        for (
-            metric_cls,
-            param_name,
-        ), alternatives in RECMETRIC_CONDITIONAL_STATE.items():
-            for alt_value in alternatives:
-                with self.subTest(
-                    metric=metric_cls.__name__,
-                    param=param_name,
-                    direction="variant_to_default",
-                ):
-                    self._assert_cross_config_load(
-                        metric_cls, param_name, alt_value, "variant_to_default"
-                    )
-
-    def test_cross_config_load_default_to_variant(self) -> None:
-        for (
-            metric_cls,
-            param_name,
-        ), alternatives in RECMETRIC_CONDITIONAL_STATE.items():
-            for alt_value in alternatives:
-                with self.subTest(
-                    metric=metric_cls.__name__,
-                    param=param_name,
-                    direction="default_to_variant",
-                ):
-                    self._assert_cross_config_load(
-                        metric_cls, param_name, alt_value, "default_to_variant"
-                    )
-
-    def test_throughput_cross_config_load_variant_to_default(self) -> None:
-        variant = ThroughputMetric(
-            **_THROUGHPUT_COMMON_KWARGS,
-            batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
+        return (
+            metric_cls(**common_kwargs),
+            metric_cls(**common_kwargs, **{param_name: alt_value}),
         )
-        default = ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS)
+
+    def _throughput_pair(self) -> Tuple[ThroughputMetric, ThroughputMetric]:
+        return (
+            ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS),
+            ThroughputMetric(
+                **_THROUGHPUT_COMMON_KWARGS,
+                batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
+            ),
+        )
+
+    def _extra_keys(
+        self, default: torch.nn.Module, variant: torch.nn.Module
+    ) -> Set[str]:
+        extra = set(variant.state_dict()) - set(default.state_dict())
+        self.assertTrue(
+            extra,
+            "the variant adds no keys, so neither direction proves anything",
+        )
+        return extra
+
+    def _assert_variant_checkpoint_loads(
+        self, default: torch.nn.Module, variant: torch.nn.Module
+    ) -> None:
+        """The variant's extra keys must not break a default-configured module.
+
+        Nothing in the default module claims them, so a pop hook or
+        torchmetrics' loader has to absorb them.
+        """
+        self._extra_keys(default, variant)
         default.load_state_dict(variant.state_dict(), strict=True)
 
-    def test_throughput_cross_config_load_default_to_variant(self) -> None:
-        default = ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS)
-        variant = ThroughputMetric(
-            **_THROUGHPUT_COMMON_KWARGS,
-            batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
-        )
-        variant.load_state_dict(default.state_dict(), strict=True)
+    def test_variant_checkpoint_loads_into_default(self) -> None:
+        for (
+            metric_cls,
+            param_name,
+        ), alternatives in RECMETRIC_CONDITIONAL_STATE.items():
+            for alt_value in alternatives:
+                with self.subTest(metric=metric_cls.__name__, param=param_name):
+                    self._assert_variant_checkpoint_loads(
+                        *self._config_pair(metric_cls, param_name, alt_value)
+                    )
+
+    def test_throughput_variant_checkpoint_loads_into_default(self) -> None:
+        self._assert_variant_checkpoint_loads(*self._throughput_pair())
 
     def test_multi_label_precision_cross_config_load_fails_without_hook(self) -> None:
         variant_kwargs: Dict[str, Any] = {
