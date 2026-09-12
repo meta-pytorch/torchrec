@@ -1089,7 +1089,9 @@ class RecMetricModuleBackwardCompatibilityTest(unittest.TestCase):
         state_dict["_trained_batches"] = torch.tensor(100)
 
         fresh_module = self._create_rec_metric_module()
-        fresh_module.load_state_dict(state_dict, strict=False)
+        # strict=True matches production. Under strict=False this test passes
+        # even without the pop hook.
+        fresh_module.load_state_dict(state_dict, strict=True)
 
 
 class MetricCoverageTest(unittest.TestCase):
