@@ -129,6 +129,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 if TYPE_CHECKING:
     from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
+        ChunkedTritonTableBatchedEmbeddingBags,
         TritonTableBatchedEmbeddingBags,
     )
     from torchrec.experimental.torch_tpu.modules.embedding_modules import (
@@ -200,6 +201,43 @@ class ReduceScatterResizeAwaitable(LazyAwaitable[torch.Tensor]):
 
         self._completed = True
         return self._shard_buf
+
+
+class ChunkedReduceScatterResizeAwaitable(ReduceScatterResizeAwaitable):
+    """Waits for a group of reduce-scatters before releasing full chunks."""
+
+    def __init__(
+        self,
+        async_works: List[dist.Work],
+        async_event: torch.cuda.Event,
+        shard_bufs: List[torch.Tensor],
+        resize_callback: Callable[[], None],
+    ) -> None:
+        assert shard_bufs
+        super().__init__(
+            async_work=None,
+            async_event=None,
+            shard_buf=shard_bufs[0],
+            resize_callback=resize_callback,
+        )
+        self._async_works = async_works
+        self._async_event = async_event
+        self._shard_bufs = shard_bufs
+        self._resize_callback = resize_callback
+        self._completed = False
+
+    def _wait_impl(self) -> torch.Tensor:
+        if self._completed:
+            return self._shard_bufs[0]
+
+        async_event = self._async_event
+        assert async_event is not None
+        torch.cuda.current_stream().wait_event(async_event)
+        for async_work in self._async_works:
+            async_work.wait()
+        self._resize_callback()
+        self._completed = True
+        return self._shard_bufs[0]
 
 
 def _decode_res_enabled_tables(encoded: Optional[str]) -> Optional[List[str]]:
@@ -4537,6 +4575,498 @@ class TritonEmbeddingFusedOptimizer(FusedOptimizer):
         # Learning rate is updated directly on the module
         # pyrefly: ignore [bad-index]
         self._emb_module.learning_rate = self.param_groups[0]["lr"]
+
+
+def _row_aligned_weight_chunk_sizes(
+    embedding_specs: List[Tuple[int, int]],
+    requested_chunks: int,
+) -> Tuple[int, ...]:
+    total_rows = sum(rows for rows, _ in embedding_specs)
+    if total_rows <= 0:
+        raise ValueError("Chunked Triton TBE requires at least one embedding row")
+
+    num_chunks = min(requested_chunks, total_rows)
+    table_element_starts: List[int] = []
+    table_row_starts: List[int] = []
+    total_elements = 0
+    rows_before_table = 0
+    for rows, dim in embedding_specs:
+        table_element_starts.append(total_elements)
+        table_row_starts.append(rows_before_table)
+        total_elements += rows * dim
+        rows_before_table += rows
+
+    chunk_ends: List[int] = []
+    previous_row = 0
+    for chunk_index in range(1, num_chunks):
+        target = (total_elements * chunk_index + num_chunks // 2) // num_chunks
+        remaining_chunks = num_chunks - chunk_index
+        best_boundary: Optional[Tuple[int, int, int]] = None
+        for table_start, table_row_start, (rows, dim) in zip(
+            table_element_starts,
+            table_row_starts,
+            embedding_specs,
+        ):
+            row_near_target = (target - table_start) // dim
+            for row in {
+                max(0, min(rows, row_near_target)),
+                max(0, min(rows, row_near_target + 1)),
+            }:
+                global_row = table_row_start + row
+                if not (previous_row < global_row <= total_rows - remaining_chunks):
+                    continue
+                boundary = table_start + row * dim
+                candidate = (abs(boundary - target), boundary, global_row)
+                if best_boundary is None or candidate < best_boundary:
+                    best_boundary = candidate
+
+        assert best_boundary is not None
+        _, boundary, previous_row = best_boundary
+        chunk_ends.append(boundary)
+
+    chunk_ends.append(total_elements)
+    chunk_sizes: List[int] = []
+    previous_end = 0
+    for chunk_end in chunk_ends:
+        chunk_sizes.append(chunk_end - previous_end)
+        previous_end = chunk_end
+    return tuple(chunk_sizes)
+
+
+def _logical_table_weight_wrappers(
+    weight_chunks: Tuple[torch.Tensor, ...],
+    weight_chunk_sizes: Tuple[int, ...],
+    embedding_specs: List[Tuple[int, int]],
+) -> List[LocalShardsWrapper]:
+    chunk_starts: List[int] = []
+    next_chunk_start = 0
+    for chunk_size in weight_chunk_sizes:
+        chunk_starts.append(next_chunk_start)
+        next_chunk_start += chunk_size
+
+    table_wrappers: List[LocalShardsWrapper] = []
+    table_start = 0
+    for rows, dim in embedding_specs:
+        table_end = table_start + rows * dim
+        fragments: List[torch.Tensor] = []
+        fragment_offsets: List[Tuple[int, ...]] = []
+        for chunk, chunk_start, chunk_size in zip(
+            weight_chunks,
+            chunk_starts,
+            weight_chunk_sizes,
+        ):
+            overlap_start = max(table_start, chunk_start)
+            overlap_end = min(table_end, chunk_start + chunk_size)
+            if overlap_start >= overlap_end:
+                continue
+            table_relative_start = overlap_start - table_start
+            table_relative_end = overlap_end - table_start
+            assert table_relative_start % dim == 0
+            assert table_relative_end % dim == 0
+            fragment = chunk.narrow(
+                0,
+                overlap_start - chunk_start,
+                overlap_end - overlap_start,
+            ).view(-1, dim)
+            fragments.append(fragment)
+            fragment_offsets.append((table_relative_start // dim, 0))
+        table_wrappers.append(
+            LocalShardsWrapper(
+                local_shards=fragments,
+                local_offsets=fragment_offsets,
+                logical_size=torch.Size([rows, dim]),
+            )
+        )
+        table_start = table_end
+    return table_wrappers
+
+
+class ChunkedShardedTritonBatchedFusedEmbeddingBag(TritonBatchedFusedEmbeddingBag):
+    """Fully sharded Triton TBE backed by persistent disjoint weight chunks."""
+
+    def __init__(
+        self,
+        config: GroupedEmbeddingConfig,
+        pg: Optional[dist.ProcessGroup] = None,
+        device: Optional[torch.device] = None,
+        sharding_type: Optional[ShardingType] = None,
+        env: Optional[ShardingEnv] = None,
+    ) -> None:
+        BaseBatchedEmbeddingBag.__init__(self, config, pg, device, sharding_type)
+        assert isinstance(
+            env, ShardingEnv2D
+        ), "env is required for ChunkedShardedTritonBatchedFusedEmbeddingBag"
+        self._env = env
+        assert (
+            device is not None and device.type == "cuda"
+        ), "ChunkedShardedTritonBatchedFusedEmbeddingBag only supports CUDA devices"
+
+        from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
+            ChunkedTritonTableBatchedEmbeddingBags,
+        )
+
+        _assert_local_cols_divisible_by_4(config)
+        weights_precision = data_type_to_sparse_type(config.data_type)
+        fused_params = config.fused_params or {}
+        optimizer = fused_params.get("optimizer", OptimType.EXACT_SGD)
+        learning_rate = fused_params.get("learning_rate", 0.01)
+        eps = fused_params.get("eps", 0.1)
+        output_dtype_sparse: SparseType = fused_params.get(
+            "output_dtype", SparseType.FP32
+        )
+        stochastic_rounding = fused_params.get("stochastic_rounding", True)
+        fused_bounds_check: bool = fused_params.get("fused_bounds_check", False)
+        requested_chunks = int(fused_params.get("num_weight_chunks", 4))
+        if requested_chunks <= 0:
+            raise ValueError("num_weight_chunks must be positive")
+
+        embedding_specs = list(zip(self._local_rows, self._local_cols))
+        weight_chunk_sizes = _row_aligned_weight_chunk_sizes(
+            embedding_specs,
+            requested_chunks,
+        )
+        self._emb_module = ChunkedTritonTableBatchedEmbeddingBags(
+            embedding_specs=embedding_specs,
+            feature_table_map=self._feature_table_map,
+            weights_precision=weights_precision.as_dtype(),
+            output_dtype=output_dtype_sparse.as_dtype(),
+            stochastic_rounding=stochastic_rounding,
+            learning_rate=learning_rate,
+            eps=eps,
+            optimizer=optimizer,
+            device=device,
+            bag_size_hints=None,
+            fused_bounds_check=fused_bounds_check,
+            weight_chunk_sizes=weight_chunk_sizes,
+        )
+        if "bounds_check_mode" in fused_params:
+            bounds_check_mode = fused_params["bounds_check_mode"]
+            if bounds_check_mode == BoundsCheckMode.WARNING:
+                bounds_check_mode = BoundsCheckMode.V2_WARNING
+            self._emb_module.bounds_check_mode = bounds_check_mode
+
+        self._full_weight_chunks: Tuple[torch.Tensor, ...] = tuple(
+            torch.empty(
+                chunk_size,
+                dtype=weights_precision.as_dtype(),
+                device=device,
+            )
+            for chunk_size in weight_chunk_sizes
+        )
+        self._table_weight_wrappers: List[LocalShardsWrapper] = (
+            _logical_table_weight_wrappers(
+                self._full_weight_chunks,
+                weight_chunk_sizes,
+                embedding_specs,
+            )
+        )
+        self.init_parameters()
+        self._optim = TritonEmbeddingFusedOptimizer(
+            config,
+            self._emb_module,
+            pg,
+            embedding_weights_by_table=cast(
+                List[torch.Tensor], self._table_weight_wrappers
+            ),
+            all_optimizer_states=self._emb_module.get_optimizer_state(),
+        )
+
+        self.weights_sharded = False
+        self._element_size = self._full_weight_chunks[0].element_size()
+        self._shard_bufs: List[Optional[torch.Tensor]] = [
+            None for _ in weight_chunk_sizes
+        ]
+        self._shard_buf_nbytes: List[int] = [0 for _ in weight_chunk_sizes]
+        self._async_stream = torch.cuda.Stream(device=device)
+        self._rs_awaitable: Optional[ChunkedReduceScatterResizeAwaitable] = None
+        self._training_forward_outstanding = False
+        self.register_full_backward_pre_hook(
+            # pyrefly: ignore [bad-argument-type]
+            self._chunked_sharded_backward_hook,
+        )
+        self.register_full_backward_hook(
+            # pyrefly: ignore [bad-argument-type]
+            self._chunked_sharded_backward_complete_hook,
+        )
+
+    @property
+    def weight_chunks(self) -> Tuple[torch.Tensor, ...]:
+        return self._full_weight_chunks
+
+    def get_sync_weight_tensors(self) -> List[torch.Tensor]:
+        return list(self._full_weight_chunks)
+
+    @property
+    def emb_module(self) -> "ChunkedTritonTableBatchedEmbeddingBags":
+        return cast("ChunkedTritonTableBatchedEmbeddingBags", self._emb_module)
+
+    def init_parameters(self) -> None:
+        with torch.no_grad():
+            for table_config, table_weight in zip(
+                self._config.embedding_tables,
+                self._table_weight_wrappers,
+            ):
+                for fragment in table_weight.local_shards():
+                    fragment.uniform_(
+                        table_config.get_weight_init_min(),
+                        table_config.get_weight_init_max(),
+                    )
+
+    @property
+    # pyrefly: ignore [bad-override]
+    def _param_per_table(self) -> Dict[str, TableBatchedEmbeddingSlice]:
+        result: Dict[str, TableBatchedEmbeddingSlice] = {}
+        table_indices: Dict[str, List[int]] = {}
+        for table_index, table_config in enumerate(self._config.embedding_tables):
+            table_indices.setdefault(table_config.name, []).append(table_index)
+
+        all_optimizer_states = self._emb_module.get_optimizer_state()
+        for table_name, indices in table_indices.items():
+            first_config = self._config.embedding_tables[indices[0]]
+            local_cols = first_config.local_cols
+            fragments: List[torch.Tensor] = []
+            fragment_offsets: List[Tuple[int, ...]] = []
+            row_offset = 0
+            for table_index in indices:
+                table_config = self._config.embedding_tables[table_index]
+                if table_config.local_cols != local_cols:
+                    raise ValueError(
+                        f"All local shards for {table_name} must have the same width"
+                    )
+                table_weight = self._table_weight_wrappers[table_index]
+                fragments.extend(table_weight.local_shards())
+                fragment_offsets.extend(
+                    (row_offset + int(offset[0]), int(offset[1]))
+                    for offset in table_weight.local_offsets()
+                )
+                row_offset += table_config.local_rows
+
+            table_wrapper = LocalShardsWrapper(
+                local_shards=fragments,
+                local_offsets=fragment_offsets,
+                logical_size=torch.Size([row_offset, local_cols]),
+            )
+            parameter = nn.Parameter(table_wrapper, requires_grad=False)
+            # pyrefly: ignore [missing-attribute]
+            parameter._in_backward_optimizers = [
+                TritonEmbeddingFusedOptimizer(
+                    config=self._config,
+                    emb_module=self._emb_module,
+                    pg=self._pg,
+                    create_for_table=table_name,
+                    param_weight_for_table=parameter,
+                    embedding_weights_by_table=cast(
+                        List[torch.Tensor], self._table_weight_wrappers
+                    ),
+                    all_optimizer_states=all_optimizer_states,
+                )
+            ]
+            result[table_name] = cast(TableBatchedEmbeddingSlice, parameter)
+        return result
+
+    @_param_per_table.setter
+    def _param_per_table(self, value: Dict[str, TableBatchedEmbeddingSlice]) -> None:
+        self.__dict__["_param_per_table"] = value
+
+    def split_embedding_weights(self) -> List[torch.Tensor]:
+        self._all_gather_table_weights()
+        return cast(List[torch.Tensor], self._table_weight_wrappers)
+
+    def named_split_embedding_weights(
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ) -> Iterator[Tuple[str, torch.Tensor]]:
+        assert remove_duplicate
+        for table_config, table_weight in zip(
+            self._config.embedding_tables,
+            self.split_embedding_weights(),
+        ):
+            yield append_prefix(prefix, f"{table_config.name}.weight"), table_weight
+
+    def forward(
+        self,
+        features: KeyedJaggedTensor,
+        vbe_output: Optional[torch.Tensor] = None,
+        vbe_output_offsets: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self._training_forward_outstanding or self.weights_sharded:
+            raise RuntimeError(
+                "Chunked fully sharded Triton TBE does not support overlapping forwards"
+            )
+
+        weights = features.weights_or_none()
+        if weights is not None and not torch.is_floating_point(weights):
+            weights = None
+        forward_kwargs: Dict[str, Any] = {}
+        if features.variable_stride_per_key():
+            forward_kwargs["batch_size_per_feature_per_rank"] = (
+                features.stride_per_key_per_rank()
+            )
+        with record_function("## chunked_sharded_triton_tbe_lookup ##"):
+            embeddings = self.emb_module(
+                indices=features.values().long(),
+                offsets=features.offsets().long(),
+                per_sample_weights=weights,
+                weight_chunks=self._full_weight_chunks,
+                **forward_kwargs,
+            )
+
+        if self.training:
+            self._training_forward_outstanding = embeddings.requires_grad
+            self.emb_module.wait_for_forward(self._async_stream)
+            with torch.cuda.stream(self._async_stream):
+                self._rs_awaitable = self._reduce_scatter_weights_async()
+        return embeddings
+
+    def _reduce_scatter_weights_async(
+        self,
+    ) -> ChunkedReduceScatterResizeAwaitable:
+        with torch.no_grad():
+            self.weights_sharded = True
+            num_groups = self._env.num_sharding_groups()
+            async_works: List[dist.Work] = []
+            shard_bufs: List[torch.Tensor] = []
+            padded_inputs: List[Optional[torch.Tensor]] = []
+            for chunk_index, full_chunk in enumerate(self._full_weight_chunks):
+                shard_size = (full_chunk.numel() + num_groups - 1) // num_groups
+                padded_total_size = shard_size * num_groups
+                shard_buf = self._shard_bufs[chunk_index]
+                if shard_buf is None:
+                    shard_buf = torch.empty(
+                        shard_size,
+                        dtype=full_chunk.dtype,
+                        device=full_chunk.device,
+                    )
+                    self._shard_bufs[chunk_index] = shard_buf
+                    self._shard_buf_nbytes[chunk_index] = (
+                        shard_buf.untyped_storage().nbytes()
+                    )
+                else:
+                    shard_buf.untyped_storage().resize_(
+                        self._shard_buf_nbytes[chunk_index]
+                    )
+
+                collective_input = full_chunk
+                padded_input: Optional[torch.Tensor] = None
+                if padded_total_size != full_chunk.numel():
+                    padded_input = torch.empty(
+                        padded_total_size,
+                        dtype=full_chunk.dtype,
+                        device=full_chunk.device,
+                    )
+                    padded_input[: full_chunk.numel()].copy_(full_chunk)
+                    padded_input[full_chunk.numel() :].zero_()
+                    collective_input = padded_input
+
+                with record_function(
+                    "## 2d_reduce_scatter_fully_sharded_chunk ##",
+                    f"chunk={chunk_index}, logical={full_chunk.numel()}, padded={padded_total_size}",
+                ):
+                    async_work = dist.reduce_scatter_tensor(
+                        output=shard_buf,
+                        input=collective_input,
+                        op=dist.ReduceOp.AVG,
+                        group=self._env.replica_pg,
+                        async_op=True,
+                    )
+                assert async_work is not None
+                async_works.append(async_work)
+                shard_bufs.append(shard_buf)
+                padded_inputs.append(padded_input)
+
+            async_event = torch.cuda.Event(enable_timing=False, blocking=False)
+            async_event.record(self._async_stream)
+            full_weight_chunks = self._full_weight_chunks
+
+            def resize_callback() -> None:
+                for chunk_index, (full_chunk, padded_input) in enumerate(
+                    zip(
+                        full_weight_chunks,
+                        padded_inputs,
+                    )
+                ):
+                    with record_function(
+                        "## 2d_reduce_scatter_fully_sharded_chunk_free ##",
+                        f"chunk={chunk_index}, logical={full_chunk.numel()}",
+                    ):
+                        full_chunk.untyped_storage().resize_(0)
+                        if padded_input is not None:
+                            padded_input.untyped_storage().resize_(0)
+
+            return ChunkedReduceScatterResizeAwaitable(
+                async_works=async_works,
+                async_event=async_event,
+                shard_bufs=shard_bufs,
+                resize_callback=resize_callback,
+            )
+
+    def _all_gather_table_weights(self) -> None:
+        if not self.weights_sharded:
+            return
+        self.ensure_reduce_scatter_complete()
+        num_groups = self._env.num_sharding_groups()
+        with torch.no_grad():
+            for chunk_index, (full_chunk, shard_buf) in enumerate(
+                zip(self._full_weight_chunks, self._shard_bufs)
+            ):
+                assert shard_buf is not None
+                padded_total_size = shard_buf.numel() * num_groups
+                with record_function(
+                    "## 2d_allgather_fully_sharded_chunk ##",
+                    f"chunk={chunk_index}, logical={full_chunk.numel()}, padded={padded_total_size}",
+                ):
+                    full_chunk.untyped_storage().resize_(
+                        padded_total_size * self._element_size
+                    )
+                    output_alias = torch.empty(
+                        0,
+                        dtype=full_chunk.dtype,
+                        device=full_chunk.device,
+                    )
+                    output_alias.set_(
+                        full_chunk.untyped_storage(),
+                        0,
+                        (padded_total_size,),
+                        (1,),
+                    )
+                    dist.all_gather_into_tensor(
+                        output_tensor=output_alias,
+                        input_tensor=shard_buf,
+                        group=self._env.replica_pg,
+                        async_op=False,
+                    )
+                    full_chunk.untyped_storage().resize_(
+                        full_chunk.numel() * self._element_size
+                    )
+                    shard_buf.untyped_storage().resize_(0)
+        self.weights_sharded = False
+
+    def _chunked_sharded_backward_hook(
+        self,
+        module: nn.Module,
+        grad_input: List[torch.Tensor],
+    ) -> None:
+        self._all_gather_table_weights()
+
+    def _chunked_sharded_backward_complete_hook(
+        self,
+        module: nn.Module,
+        grad_input: List[torch.Tensor],
+        grad_output: List[torch.Tensor],
+    ) -> None:
+        self._training_forward_outstanding = False
+
+    def get_rs_awaitable(
+        self,
+    ) -> Optional[ChunkedReduceScatterResizeAwaitable]:
+        return self._rs_awaitable
+
+    def ensure_reduce_scatter_complete(self) -> None:
+        if self._rs_awaitable is not None:
+            self._rs_awaitable.wait()
+            self._rs_awaitable = None
 
 
 class ShardedBatchedFusedEmbeddingBag(BatchedFusedEmbeddingBag):

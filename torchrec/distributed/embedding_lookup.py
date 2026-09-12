@@ -50,6 +50,7 @@ from torchrec.distributed.batched_embedding_kernel import (
     BatchedFusedEmbeddingBag,
     BatchedTPUEmbedding,
     BatchedTPUEmbeddingBag,
+    ChunkedShardedTritonBatchedFusedEmbeddingBag,
     KeyValueEmbedding,
     KeyValueEmbeddingBag,
     ShardedBatchedFusedEmbedding,
@@ -84,6 +85,7 @@ from torchrec.distributed.quant_embedding_kernel import (
     QuantBatchedEmbedding,
     QuantBatchedEmbeddingBag,
 )
+from torchrec.distributed.shards_wrapper import LocalShardsWrapper
 from torchrec.distributed.types import (
     LazyAwaitable,
     rank_device,
@@ -143,26 +145,29 @@ def _load_state_dict(
                         dst_local_shard.tensor.detach().copy_(src_local_shard.tensor)
                 elif isinstance(dst_param, DTensor):
                     assert isinstance(src_param, DTensor)
-                    # pyrefly: ignore[missing-attribute]
-                    assert len(dst_param.to_local().local_chunks) == len(
-                        # pyrefly: ignore[missing-attribute]
-                        src_param.to_local().local_chunks
-                    )
-                    for i, (dst_local_shard, src_local_shard) in enumerate(
-                        zip(
-                            # pyrefly: ignore[missing-attribute]
-                            dst_param.to_local().local_shards(),
-                            # pyrefly: ignore[missing-attribute]
-                            src_param.to_local().local_shards(),
-                        )
+                    dst_local = dst_param.to_local()
+                    src_local = src_param.to_local()
+                    if isinstance(dst_local, LocalShardsWrapper) and isinstance(
+                        src_local, LocalShardsWrapper
                     ):
-                        assert (
-                            # pyrefly: ignore[missing-attribute]
-                            dst_param.to_local().local_chunks[i]
-                            # pyrefly: ignore[missing-attribute]
-                            == src_param.to_local().local_chunks[i]
+                        dst_local.detach().copy_(src_local)
+                    else:
+                        dst_local_wrapper = cast(Any, dst_local)
+                        src_local_wrapper = cast(Any, src_local)
+                        assert len(dst_local_wrapper.local_chunks) == len(
+                            src_local_wrapper.local_chunks
                         )
-                        dst_local_shard.detach().copy_(src_local_shard)
+                        for i, (dst_local_shard, src_local_shard) in enumerate(
+                            zip(
+                                dst_local_wrapper.local_shards(),
+                                src_local_wrapper.local_shards(),
+                            )
+                        ):
+                            assert (
+                                dst_local_wrapper.local_chunks[i]
+                                == src_local_wrapper.local_chunks[i]
+                            )
+                            dst_local_shard.detach().copy_(src_local_shard)
                 else:
                     assert isinstance(src_param, torch.Tensor) and isinstance(
                         dst_param, torch.Tensor
@@ -727,6 +732,18 @@ class GroupedPooledEmbeddingsLookup(
                     env=env,
                 )
         elif config.compute_kernel == EmbeddingComputeKernel.FUSED_TRITON:
+            if (
+                env
+                and isinstance(env, ShardingEnv2D)
+                and env.sharding_strategy == ShardingStrategy.FULLY_SHARDED
+            ):
+                return ChunkedShardedTritonBatchedFusedEmbeddingBag(
+                    config=config,
+                    pg=pg,
+                    device=device,
+                    sharding_type=sharding_type,
+                    env=env,
+                )
             return TritonBatchedFusedEmbeddingBag(
                 config=config,
                 pg=pg,
@@ -959,11 +976,13 @@ class GroupedPooledEmbeddingsLookup(
                 ],
             ]
         """
-        # Pre-allocates 1D output tensor to avoid expensive merging
+        # Citrine C3: allocate directly on the target device.
+        # Pre-allocates 1D output tensor to avoid expensive merging.
         vbe_output = torch.empty(
             sum([sum(split) for split in vbe_splits]),
             dtype=self._vbe_output_dtype(),
-        ).to(device)
+            device=device,
+        )
 
         # Calculates the offsets for features of each TBE when placed in
         # the 1D pre-allocated output tensor above, ordered by rank.
@@ -1114,9 +1133,17 @@ class GroupedPooledEmbeddingsLookup(
 
         # If VBE is enabled and multiple TBEs are involved, we need to merge
         # the output. The pre-allocated merging path requires TBE modules that
-        # support vbe_output/vbe_output_offsets (SplitTable, SSD). Dense TBE
-        # modules create their own output, so use simple concatenation instead.
+        # support vbe_output/vbe_output_offsets (SplitTable, SSD). Triton and
+        # Dense TBE modules create their own output, so merge them separately.
         if is_vbe_enabled and len(self._emb_modules) > 1:
+            n_triton = sum(
+                isinstance(m, TritonBatchedFusedEmbeddingBag) for m in self._emb_modules
+            )
+            if n_triton > 0:
+                return self._merge_variable_batch_embeddings(
+                    self._forward(features_by_group),
+                    self._vbe_splits(features_by_group),
+                )
             n_dense = sum(
                 isinstance(m, BatchedDenseEmbeddingBag) for m in self._emb_modules
             )

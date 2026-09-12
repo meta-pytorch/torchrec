@@ -8,7 +8,7 @@
 # pyre-strict
 
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
@@ -50,6 +50,47 @@ class MockLookupContainer(nn.Module):
         super().__init__()
         self.kernel = kernel
         self._lookups = [kernel]
+
+
+class MockChunkAwareLookupContainer(MockLookupContainer):
+    def __init__(self, kernel: MockSyncableEmbeddingKernel) -> None:
+        super().__init__(kernel)
+        self.sync_weight_chunks = [torch.ones(4), torch.ones(2)]
+
+    def get_sync_weight_tensors(self) -> list[torch.Tensor]:
+        return self.sync_weight_chunks
+
+
+class MockExactSgdEmbeddingKernel(MockSyncableEmbeddingKernel):
+    def get_optimizer_state(self) -> list[dict[str, torch.Tensor]]:
+        return [{}]
+
+
+class MockCounterOptimizerEmbeddingKernel(MockSyncableEmbeddingKernel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.second_optimizer_state = torch.ones(3)
+        self.prev_iter = torch.ones(2, dtype=torch.int64)
+        self.shared_iter = torch.tensor(7, dtype=torch.int64)
+
+    def get_optimizer_state(self) -> list[dict[str, torch.Tensor]]:
+        return [
+            {
+                "sum": self.optimizer_state,
+                "prev_iter": self.prev_iter,
+                "iter": self.shared_iter,
+            },
+            {
+                "sum": self.second_optimizer_state,
+                "iter": self.shared_iter,
+            },
+        ]
+
+
+class MockManagedCollisionKernel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self._table_to_tbe_and_index = {"table_0": (MagicMock(), 0)}
 
 
 class TestDMPCollectionConfig(unittest.TestCase):
@@ -328,11 +369,15 @@ class TestDMPCollectionAllReduceHook(unittest.TestCase):
 
 
 class TestDMPCollectionSyncTensors(unittest.TestCase):
-    def _context(self) -> DMPCollectionContext:
+    def _context(
+        self,
+        sharding_strategy: ShardingStrategy = ShardingStrategy.DEFAULT,
+    ) -> DMPCollectionContext:
         return DMPCollectionContext(
             module=MockModule,
             plan=MagicMock(spec=ShardingPlan),
             sharding_group_size=1,
+            sharding_strategy=sharding_strategy,
         )
 
     def _dmp_shell(self, module: nn.Module) -> DMPCollection:
@@ -369,6 +414,85 @@ class TestDMPCollectionSyncTensors(unittest.TestCase):
         self.assertEqual(context.modules_to_sync, [])
         self.assertEqual(context.weights_by_dtype, {})
         self.assertEqual(context.optimizer_tensors_by_dtype, {})
+
+    def test_fully_sharded_context_preserves_legacy_sync_tensors(self) -> None:
+        kernel = MockSyncableEmbeddingKernel()
+        dmp = self._dmp_shell(MockLookupContainer(kernel))
+        context = self._context(ShardingStrategy.FULLY_SHARDED)
+
+        dmp._group_sharded_modules([context])
+        dmp._cache_sync_tensors([context])
+
+        self.assertEqual(len(context.modules_to_sync), 1)
+        self.assertEqual(context.weights_by_dtype, {torch.float32: [kernel.weight]})
+        self.assertEqual(
+            context.optimizer_tensors_by_dtype,
+            {torch.float32: [kernel.optimizer_state]},
+        )
+
+    def test_fully_sharded_context_caches_chunk_aware_sync_tensors(self) -> None:
+        kernel = MockSyncableEmbeddingKernel()
+        container = MockChunkAwareLookupContainer(kernel)
+        dmp = self._dmp_shell(container)
+        context = self._context(ShardingStrategy.FULLY_SHARDED)
+
+        dmp._group_sharded_modules([context])
+        dmp._cache_sync_tensors([context])
+
+        self.assertEqual(
+            context.weights_by_dtype,
+            {torch.float32: container.sync_weight_chunks},
+        )
+        self.assertEqual(
+            context.optimizer_tensors_by_dtype,
+            {torch.float32: [kernel.optimizer_state]},
+        )
+
+    def test_exact_sgd_empty_optimizer_state_is_not_cached(self) -> None:
+        kernel = MockExactSgdEmbeddingKernel()
+        dmp = self._dmp_shell(MockLookupContainer(kernel))
+        context = self._context(ShardingStrategy.FULLY_SHARDED)
+
+        dmp._group_sharded_modules([context])
+        dmp._cache_sync_tensors([context])
+
+        self.assertEqual(context.weights_by_dtype, {torch.float32: [kernel.weight]})
+        self.assertEqual(context.optimizer_tensors_by_dtype, {})
+
+    def test_non_sum_optimizer_state_is_not_cached(self) -> None:
+        kernel = MockCounterOptimizerEmbeddingKernel()
+        dmp = self._dmp_shell(MockLookupContainer(kernel))
+        context = self._context(ShardingStrategy.FULLY_SHARDED)
+
+        dmp._group_sharded_modules([context])
+        dmp._cache_sync_tensors([context])
+
+        self.assertEqual(
+            context.optimizer_tensors_by_dtype,
+            {
+                torch.float32: [
+                    kernel.optimizer_state,
+                    kernel.second_optimizer_state,
+                ]
+            },
+        )
+        self.assertNotIn(torch.int64, context.optimizer_tensors_by_dtype)
+
+    def test_fully_sharded_context_retains_managed_collision_tables(self) -> None:
+        kernel = MockManagedCollisionKernel()
+        dmp = self._dmp_shell(kernel)
+        context = self._context(ShardingStrategy.FULLY_SHARDED)
+        context.modules_to_sync = [(kernel, kernel)]
+
+        with patch(
+            "torchrec.distributed.model_parallel.BaseShardedManagedCollisionEmbeddingCollection",
+            MockManagedCollisionKernel,
+        ):
+            dmp._cache_sync_tensors([context])
+
+        self.assertEqual(context.weights_by_dtype, {})
+        self.assertEqual(context.optimizer_tensors_by_dtype, {})
+        self.assertEqual(context.hash_zch_modules, [(kernel, "table_0")])
 
     def test_sync_skips_default_allreduce_for_single_replica(self) -> None:
         dmp = self._dmp_shell(MockModule())

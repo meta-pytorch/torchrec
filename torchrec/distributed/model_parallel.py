@@ -1952,22 +1952,31 @@ class DMPCollection(DistributedModelParallel):
                 list
             )
             hash_zch_modules: List[Tuple[nn.Module, str]] = []
-            for emb_kernel, _ in context.modules_to_sync:
-                if _is_embedding_kernel_with_sync_tensors(emb_kernel):
-                    sync_kernel = cast(Any, emb_kernel)
-                    # If kernel is TBE, then cache the weights and optimizer tensors
-                    for w in sync_kernel.split_embedding_weights():
-                        weights_by_dtype[w.dtype].append(w)
-                    for state in sync_kernel.get_optimizer_state():
-                        opt_tensor = state["sum"]
-                        optimizer_by_dtype[opt_tensor.dtype].append(opt_tensor)
-
-                elif isinstance(
+            for emb_kernel, parent_module in context.modules_to_sync:
+                if isinstance(
                     emb_kernel, BaseShardedManagedCollisionEmbeddingCollection
                 ):
-                    # If kernel is MP-ZCH, then cache the kernel and table name
+                    # Managed-collision metadata still needs periodic replica sync,
+                    # including when table weights use fully sharded collectives.
                     for table_name in emb_kernel._table_to_tbe_and_index.keys():
                         hash_zch_modules.append((emb_kernel, table_name))
+
+                elif _is_embedding_kernel_with_sync_tensors(emb_kernel):
+                    sync_kernel = cast(Any, emb_kernel)
+                    get_sync_weight_tensors = getattr(
+                        parent_module, "get_sync_weight_tensors", None
+                    )
+                    sync_weights = (
+                        get_sync_weight_tensors()
+                        if get_sync_weight_tensors is not None
+                        else sync_kernel.split_embedding_weights()
+                    )
+                    for w in sync_weights:
+                        weights_by_dtype[w.dtype].append(w)
+                    for state in sync_kernel.get_optimizer_state():
+                        opt_tensor = state.get("sum")
+                        if opt_tensor is not None:
+                            optimizer_by_dtype[opt_tensor.dtype].append(opt_tensor)
 
             context.weights_by_dtype = dict(weights_by_dtype)
             context.optimizer_tensors_by_dtype = dict(optimizer_by_dtype)
