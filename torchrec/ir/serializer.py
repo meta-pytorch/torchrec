@@ -206,7 +206,7 @@ class JsonSerializer(SerializerInterface):
         metadata_dict = serializer.serialize_to_dict(module)
         raw_dict = {"typename": typename, "metadata_dict": metadata_dict}
         ir_metadata_tensor = torch.frombuffer(
-            json.dumps(raw_dict).encode(), dtype=torch.uint8
+            bytearray(json.dumps(raw_dict).encode(), dtype=torch.uint8)
         )
         module.register_buffer("ir_metadata", ir_metadata_tensor, persistent=False)
         serializer.swap_meta_forward(module)
