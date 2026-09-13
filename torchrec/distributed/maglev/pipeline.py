@@ -19,6 +19,8 @@ from typing import Any, Callable, ContextManager, Iterator, List, Optional, Sequ
 
 import torch
 import torch.nn as nn
+from torch.autograd.profiler import record_function
+from torch.distributed.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel
 from torchrec.distributed.maglev.stage import StageWrapper
 
@@ -27,11 +29,11 @@ def _no_sync_modules(module: nn.Module) -> List[nn.Module]:
     """The parallel wrappers in ``module``'s tree whose gradient sync to suppress.
 
     Two-tier, following ``GradientAccumulationWrapper._get_ddp_modules``: the root
-    counts if it merely *has* ``no_sync``, which covers DDP, FSDP and custom
-    wrappers alike, while descendants must be ``DistributedDataParallel``
+    counts if it merely *has* ``no_sync``, which covers DDP and custom wrappers,
+    while descendants must be ``DistributedDataParallel``
     instances. The asymmetry is deliberate -- the root is known to be the parallel
-    wrapper, whereas a descendant is an arbitrary submodule and a nested FSDP's
-    ``no_sync`` does not mean the same thing.
+    wrapper, whereas a descendant is an arbitrary submodule. FSDP2 synchronization
+    is controlled separately immediately before each backward.
 
     Descendants matter because a sharded submodule can hold its own inner DDP for
     data-parallel lookups; suppressing only the outer wrapper leaves those
@@ -77,8 +79,9 @@ class MaglevPipelineBase:
 
     Subclasses override :meth:`progress` with their own ordering; what they
     inherit is the stage and optimizer, the boundary-contract check, and
-    :meth:`_forward_context`, which every schedule uses to place the single
-    gradient sync of a pass.
+    :meth:`_forward_context`, which every schedule uses to arm DDP's single
+    gradient sync for a pass. FSDP2 synchronization is configured directly before
+    each backward.
 
     Args:
         stage: this rank's :class:`StageWrapper`. Everything about where this
@@ -90,9 +93,9 @@ class MaglevPipelineBase:
         no_sync: returns a context that suppresses the DP wrapper's gradient
             sync, entered around every forward but the pass's last. Defaults to
             suppressing whatever wrappers :func:`_no_sync_modules` finds on
-            ``stage.module``, so an unwrapped stage needs nothing and a
-            DDP/FSDP/DMP one works unconfigured. Pass your own only if that
-            derivation is wrong for your setup.
+            ``stage.module``, so an unwrapped stage needs nothing and a DDP/DMP
+            one works unconfigured. Pass your own only if that derivation is
+            wrong for your setup. FSDP2 modules are discovered independently.
 
     Raises:
         ValueError: if a boundary stage declares an activation it cannot have (an
@@ -113,6 +116,11 @@ class MaglevPipelineBase:
         self._no_sync: Callable[[], ContextManager[None]] = no_sync or (
             lambda: _no_sync(modules)
         )
+        self._fsdp_modules: List[FSDPModule] = [
+            module
+            for module in stage.module.modules()
+            if isinstance(module, FSDPModule)
+        ]
 
         in_specs = stage.in_activation_specs()
         if stage.is_first and in_specs:
@@ -159,14 +167,16 @@ class MaglevPipelineBase:
         """
         (stage_input,) = self.stage.take_inputs(dataloader_iter, 1)
 
-        self.optimizer.zero_grad()
+        with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
+            self.optimizer.zero_grad()
         self.stage.start_recv_act()
         self.stage.forward_micro(stage_input, microbatch_id=0)
         # Immediately before the backward, never earlier -- see Maglev1F1B.
         self.stage.start_recv_grad()
         loss = self.stage.backward_micro()
         self.stage.drain_sends()
-        self.optimizer.step()
+        with record_function("## torchrec_maglev:optimizer_step ##"):
+            self.optimizer.step()
         return loss
 
     def _forward_context(self, fwd_idx: int, num_forwards: int) -> ContextManager[None]:
@@ -191,6 +201,17 @@ class MaglevPipelineBase:
         if fwd_idx == num_forwards - 1:
             return contextlib.nullcontext()
         return self._no_sync()
+
+    def _configure_fsdp_backward(
+        self,
+        backward_idx: int,
+        num_backwards: int,
+    ) -> None:
+        """Reduce FSDP2 gradients on the final microbatch backward."""
+        should_sync = backward_idx == num_backwards - 1
+        for module in self._fsdp_modules:
+            module.set_requires_gradient_sync(should_sync, recurse=False)
+            module.set_is_last_backward(should_sync)
 
 
 class Maglev1F1B(MaglevPipelineBase):
@@ -270,9 +291,11 @@ class Maglev1F1B(MaglevPipelineBase):
         stage = self.stage
         microbatch_inputs = stage.take_inputs(dataloader_iter, self.num_microbatches)
 
-        self.optimizer.zero_grad()
+        with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
+            self.optimizer.zero_grad()
 
         fwd_idx = 0
+        bwd_idx = 0
 
         def _forward() -> None:
             nonlocal fwd_idx
@@ -282,8 +305,11 @@ class Maglev1F1B(MaglevPipelineBase):
             fwd_idx += 1
 
         def _backward() -> None:
+            nonlocal bwd_idx
+            self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
             stage.start_recv_grad()
             stage.backward_micro()
+            bwd_idx += 1
 
         # Warmup: fill the pipeline.
         for _ in range(self.num_warmup):
@@ -299,7 +325,8 @@ class Maglev1F1B(MaglevPipelineBase):
             _backward()
 
         stage.drain_sends()
-        self.optimizer.step()
+        with record_function("## torchrec_maglev:optimizer_step ##"):
+            self.optimizer.step()
         return None
 
 
@@ -333,9 +360,11 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
         stage = self.stage
         microbatch_inputs = stage.take_inputs(dataloader_iter, self.num_microbatches)
 
-        self.optimizer.zero_grad()
+        with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
+            self.optimizer.zero_grad()
 
         fwd_idx = 0
+        bwd_idx = 0
 
         def _forward() -> None:
             """Run one forward, consuming the activation receive posted before it."""
@@ -355,7 +384,10 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
 
         def _backward() -> None:
             """Run one backward."""
+            nonlocal bwd_idx
+            self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
             stage.backward_micro()
+            bwd_idx += 1
 
         # Steady state: one forward, one backward.
         for i in range(self.num_steady):
@@ -379,5 +411,6 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
             _backward()
 
         stage.drain_sends()
-        self.optimizer.step()
+        with record_function("## torchrec_maglev:optimizer_step ##"):
+            self.optimizer.step()
         return None

@@ -91,6 +91,7 @@ def build_handoff_process_groups(
 
 def build_cascade_process_groups(
     stage_ranks: List[List[int]],
+    backend: Optional[str] = None,
 ) -> List[dist.ProcessGroup]:
     """Create one process group per pipeline "cascade" for input distribution.
 
@@ -104,19 +105,19 @@ def build_cascade_process_groups(
     Like :func:`build_stage_process_groups` / :func:`build_handoff_process_groups`,
     ``dist.new_group`` is collective: every rank creates every cascade group in the
     same order, and building these up front (before any DMP sharding) keeps all
-    ``new_group`` collectives contiguous. The group inherits the job's backend
-    (``cpu:gloo,cuda:nccl``), so the same handle drives both the CPU/gloo size
-    exchange and the CUDA/nccl data exchange.
+    ``new_group`` collectives contiguous.
 
     Args:
         stage_ranks: ``stage_ranks[i]`` is the global ranks of stage ``i``'s HSD;
             every stage must have the same number of ranks (cascades).
+        backend: Optional backend for the groups. ``None`` inherits the default
+            process group's backend.
     """
     num_cascades = len(stage_ranks[0]) if stage_ranks else 0
     pgs: List[dist.ProcessGroup] = []
     for c in range(num_cascades):
         ranks = [stage_ranks[s][c] for s in range(len(stage_ranks))]
-        pg = cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
+        pg = cast(dist.ProcessGroup, dist.new_group(ranks=ranks, backend=backend))
         pgs.append(pg)
     return pgs
 
@@ -125,19 +126,20 @@ def pg_init(stage_size: int, num_stages: int) -> Tuple[
     List[dist.ProcessGroup],
     Tuple[dist.ProcessGroup, dist.ProcessGroup],
     List[dist.ProcessGroup],
+    List[dist.ProcessGroup],
 ]:
-    """Build the three sets of process groups a Maglev pipeline needs.
+    """Build the process groups a Maglev pipeline needs.
 
-    Returns ``(stage_pgs, handoff_pgs, cascade_pgs)``:
+    Returns ``(stage_pgs, handoff_pgs, cascade_nccl_pgs, cascade_gloo_pgs)``:
 
     1. **stage** -- one per stage, joined only by that stage's own ranks; what the
        parallelizer shards over (:func:`build_stage_process_groups`).
-    2. **cascade** -- one per position, holding one rank from each stage; what the
-       input distribution all-to-alls over
-       (:func:`build_cascade_process_groups`).
-    3. **hand-off** -- exactly two, full-membership, one carrying forward
+    2. **hand-off** -- exactly two, full-membership, one carrying forward
        activations and one carrying backward gradients
        (:func:`build_handoff_process_groups`).
+    3. **cascade** -- two per position, holding one rank from each stage: one
+       NCCL group for input tensors and one Gloo group for their CPU size
+       metadata (:func:`build_cascade_process_groups`).
 
     Their memberships overlap -- a cascade contains the very ranks the hand-off
     walks at that position -- but they must stay distinct communicators: the
@@ -163,15 +165,16 @@ def pg_init(stage_size: int, num_stages: int) -> Tuple[
 
     Returns:
         The stage groups (indexed by stage), the ``(act_pg, grad_pg)`` hand-off
-        pair, and the cascade groups (indexed by position).
+        pair, and the NCCL/default and Gloo cascade groups (indexed by position).
     """
     stage_ranks: List[List[int]] = [
         list(range(s * stage_size, (s + 1) * stage_size)) for s in range(num_stages)
     ]
     stage_pgs = build_stage_process_groups(stage_ranks)
     handoff_pgs = build_handoff_process_groups(stage_ranks)
-    cascade_pgs = build_cascade_process_groups(stage_ranks)
-    return stage_pgs, handoff_pgs, cascade_pgs
+    cascade_nccl_pgs = build_cascade_process_groups(stage_ranks)
+    cascade_gloo_pgs = build_cascade_process_groups(stage_ranks, backend="gloo")
+    return stage_pgs, handoff_pgs, cascade_nccl_pgs, cascade_gloo_pgs
 
 
 def remap_plan_to_process_group(
@@ -235,12 +238,12 @@ class _LayerChain(nn.Module):
 
     The stage holding the model's *final* layer is also given the model's
     :meth:`~torchrec.distributed.maglev.module.MaglevModuleList.postproc`, and
-    applies it to the last activation, returning ``(losses, output)``. That is
-    what keeps the two execution modes equivalent: ``MaglevModuleList.forward``
-    ends with ``postproc``, so a pipelined run has to end with it too, or the
-    model's head and loss would simply not run. It happens here, inside the
-    parallelized module, so it stays in the autograd graph and a head with
-    parameters shards with the rest of the stage.
+    applies it to the last activation. By default its complete result is
+    preserved. A caller that wraps the chain in DDP can enable loss-only output,
+    keeping auxiliary predictions out of DDP's backward-root traversal.
+    ``postproc`` still runs inside the parallelized module, so its head and loss
+    remain in the autograd graph and its parameters shard with the rest of the
+    stage.
 
     ``postproc`` is handed the last layer's *input* as well as its activation,
     because that is where the target lives -- which is why the pipeline never has
@@ -252,6 +255,8 @@ class _LayerChain(nn.Module):
             layer; ``None`` on every other stage, which must hand a plain
             activation tuple to the next HSD. Called as
             ``postproc(activations, layer_inputs[-1])``.
+        first_layer_index: global index of this stage's first layer, for tracing.
+        loss_only_output: whether to expose only the loss from ``postproc``.
 
     Example::
 
@@ -263,15 +268,25 @@ class _LayerChain(nn.Module):
         self,
         layers: Sequence[MaglevLayer],
         postproc: Optional[Callable[[Activations, Any], Any]] = None,
+        first_layer_index: int = 0,
+        loss_only_output: bool = False,
     ) -> None:
         super().__init__()
         self.layers: nn.ModuleList = nn.ModuleList(layers)
+        self._profile_names: List[str] = [
+            f"## torchrec_maglev:layer[{first_layer_index + index}] "
+            f"{type(layer).__name__.lstrip('_')} ##"
+            for index, layer in enumerate(layers)
+        ]
         # Plain attribute, not a submodule: postproc is a bound method of the
         # authored model, whose parameters are already owned by ``layers``.
         self._postproc = postproc
+        self._loss_only_output = loss_only_output
 
     def forward(
-        self, layer_inputs: Sequence[Any], in_activations: Activations = ()
+        self,
+        layer_inputs: Sequence[Any],
+        in_activations: Activations = (),
     ) -> Any:
         """Chain the layers, threading each layer's activation into the next.
 
@@ -281,8 +296,8 @@ class _LayerChain(nn.Module):
 
         Returns:
             Any: a plain ``Activations`` tuple, except on the stage owning the
-            final layer, where the model's ``postproc`` has produced
-            ``(losses, output)``.
+            final layer, where the model's ``postproc`` result is returned. In
+            loss-only mode, that result is reduced to a singleton ``(losses,)``.
 
         Raises:
             ValueError: if the input count does not match the layer count.
@@ -292,11 +307,22 @@ class _LayerChain(nn.Module):
                 f"expected {len(self.layers)} layer inputs, got {len(layer_inputs)}"
             )
         activations = in_activations
-        for layer, layer_input in zip(self.layers, layer_inputs):
-            activations = layer(layer_input, activations)
+        for layer, layer_input, profile_name in zip(
+            self.layers, layer_inputs, self._profile_names
+        ):
+            maglev_layer = cast(MaglevLayer, layer)
+            with record_function(profile_name):
+                activations = maglev_layer(layer_input, activations)
         if self._postproc is not None:
             # The last layer's input carries the target postproc scores against.
-            return self._postproc(activations, layer_inputs[-1])
+            with record_function("## torchrec_maglev:postproc ##"):
+                output = self._postproc(activations, layer_inputs[-1])
+            if self._loss_only_output:
+                # DDP treats every returned tensor as a backward root. Auxiliary
+                # predictions must stay out when only the loss is backpropagated.
+                losses, _model_output = output
+                return (losses,)
+            return output
         return activations
 
 
@@ -346,6 +372,9 @@ class StageWrapper(nn.Module):
         stage_size: ranks per stage -- the size of one hardware scale-up domain
             (HSD). Stage ``i`` is the contiguous rank block starting at
             ``i * stage_size``.
+        loss_only_output: whether the final stage returns only the loss. Enable
+            this before wrapping the stage module in DDP so auxiliary prediction
+            tensors are not treated as backward roots.
 
     Raises:
         ValueError: if ``layers_per_stage`` does not describe ``model``, the
@@ -434,6 +463,7 @@ class StageWrapper(nn.Module):
         model: MaglevModuleList,
         layers_per_stage: Sequence[int],
         stage_size: int,  # number of ranks for each stage
+        loss_only_output: bool = False,
     ) -> None:
         super().__init__()
         num_stages = self.count_stages(stage_size)
@@ -466,10 +496,13 @@ class StageWrapper(nn.Module):
         check_layers_chain(layers, f"stage {stage_index}")
         # Every group the pipeline needs, built in one contiguous run before the
         # parallelizer issues a single sharding collective (see pg_init).
-        stage_pgs, handoff_pgs, cascade_pgs = pg_init(stage_size, num_stages)
+        stage_pgs, handoff_pgs, cascade_nccl_pgs, cascade_gloo_pgs = pg_init(
+            stage_size, num_stages
+        )
         self._stage_pg: dist.ProcessGroup = stage_pgs[stage_index]
         self._handoff_pgs: Tuple[dist.ProcessGroup, dist.ProcessGroup] = handoff_pgs
-        self._cascade_pg: dist.ProcessGroup = cascade_pgs[position]
+        self._cascade_pg: dist.ProcessGroup = cascade_nccl_pgs[position]
+        self._cascade_gloo_pg: dist.ProcessGroup = cascade_gloo_pgs[position]
         # Posted receives, oldest first: each entry is one transfer's work
         # handles and the buffers landing into them.
         # pyre-ignore[4]: dist work handles have no public type
@@ -489,7 +522,7 @@ class StageWrapper(nn.Module):
         # Holds this stage's inputs between all-to-all rounds and the schedule
         # asking for microbatches.
         self._input_driver: InputDistDriver[List[Any]] = InputDistDriver(
-            pg_gloo=self._cascade_pg,
+            pg_gloo=self._cascade_gloo_pg,
             pg_nccl=self._cascade_pg,
             self_index=stage_index,
         )
@@ -505,11 +538,20 @@ class StageWrapper(nn.Module):
         self.is_last_stage: bool = stage_index == num_stages - 1
         # Public and reassignable: wrap it in DMP/FSDP/nothing and assign back.
         self.module: nn.Module = _LayerChain(
-            layers, model.postproc if self.is_last_stage else None
+            layers,
+            model.postproc if self.is_last_stage else None,
+            first_layer_index=self.layer_indices.start,
+            loss_only_output=loss_only_output,
         )
+        self._loss_only_output = loss_only_output
         # Set by to(): a meta-authored model has no device to infer, which is the
         # whole point of authoring it there.
         self.device: Optional[torch.device] = None
+
+    @property
+    def loss_only_output(self) -> bool:
+        """Whether the final stage exposes only the postprocessed loss."""
+        return self._loss_only_output
 
     @property
     def num_layers(self) -> int:
@@ -622,7 +664,7 @@ class StageWrapper(nn.Module):
 
         Returns:
             Any: a plain ``Activations`` tuple, except on the last stage, where
-            the model's ``postproc`` has produced ``(losses, output)``.
+            the model's ``postproc`` result follows the configured output mode.
 
         Raises:
             ValueError: if the input count does not match the layers this stage
@@ -876,10 +918,10 @@ class StageWrapper(nn.Module):
         One round, unwaited. Use :meth:`take_inputs` when the schedule wants a
         microbatch count that does not divide evenly into rounds.
 
-        The cascade group inherits the job's backend (``cpu:gloo,cuda:nccl``), so
-        the one handle drives both phases of
-        :func:`~torchrec.distributed.maglev.input_dist.input_dist`: the small size
-        exchange on CPU/gloo and the bulk tensor exchange on CUDA/nccl.
+        Two cascade groups with identical membership drive the exchange:
+        CPU/Gloo carries the small size metadata, while CUDA/NCCL carries the
+        tensor payload. Keeping their collective order independent avoids a
+        backend mismatch when inputs contain tensors of several dtypes.
 
         Args:
             layer_inputs: one input per layer of the whole model, in model order
@@ -918,14 +960,15 @@ class StageWrapper(nn.Module):
             List[List[Any]]: ``result[s]`` is the input list destined for stage
             ``s``'s rank in this cascade.
         """
-        with torch.no_grad():
+        with record_function("## torchrec_maglev:preproc ##"), torch.no_grad():
             layer_inputs = self._preproc(model_input)
         return self.group_by_stage(layer_inputs)
 
     def take_inputs(self, dataloader_iter: Iterator[Any], n: int) -> List[List[Any]]:
         """Hand the schedule ``n`` microbatches for this stage.
 
-        Pulls raw batches from ``dataloader_iter`` and runs as many
+        Each raw batch from ``dataloader_iter`` is already one microbatch; this
+        method redistributes batches but never chunks them. It runs as many
         :meth:`input_dist` rounds as it takes, keeping the remainder queued -- so
         the microbatch count a schedule wants need not equal the ``num_stages`` a
         round produces, and a batch is consumed only when a round actually runs.
@@ -941,7 +984,10 @@ class StageWrapper(nn.Module):
             List[List[Any]]: ``n`` microbatches, each one input per layer this
             stage owns.
         """
-        return self._input_driver.take(lambda: self.send_set(next(dataloader_iter)), n)
+        with record_function("## torchrec_maglev:input_driver ##"):
+            return self._input_driver.take(
+                lambda: self.send_set(next(dataloader_iter)), n
+            )
 
     def backward(self, outputs: Activations, grads: Sequence[torch.Tensor]) -> None:
         """Backward through this stage from the gradients its outputs received.
@@ -1016,7 +1062,7 @@ class StageWrapper(nn.Module):
             in_activations = self.wait_for_act()
 
         with record_function(f"## forward mb{microbatch_id} ##"):
-            outputs = self.forward(stage_input, in_activations)
+            outputs = self.module(stage_input, in_activations)
 
         # The previous microbatch's send, drained before this one is issued.
         with record_function(f"## finish_send_act mb{microbatch_id} ##"):
