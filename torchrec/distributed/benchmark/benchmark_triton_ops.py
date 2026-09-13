@@ -33,6 +33,12 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import triton
 import triton.language as tl
+from fbgemm_gpu.quantize_utils import (
+    bf16_to_fp32,
+    fp32_to_bf16_with_clamp,
+    fp32_to_mx4,
+    mx4_to_float,
+)
 from torch.autograd.profiler import record_function
 
 try:
@@ -61,8 +67,12 @@ from torchrec.sparse.triton_permute_multi_embedding import (
     triton_permute_multi_embedding,
 )
 from torchrec.sparse.triton_quantized_comm import (
+    triton_bfloat16_quantized_to_float,
+    triton_float_to_bfloat16_quantized,
     triton_float_to_fused8bitrowwise_quantized,
+    triton_float_to_mx4_quantized,
     triton_fused8bitrowwise_quantized_to_float,
+    triton_mx4_quantized_to_float,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -1074,9 +1084,9 @@ def batch_index_select_dim0_torch(
         _run_batch_index_select_backward(output, inputs, grad_output, run_backward)
 
 
-######################## fused 8-bit rowwise configs ################################
+######################## quantized communication configs ############################
 @dataclass
-class Fused8BitRowwiseConfig(TritonOpConfig):
+class QuantizedCommConfig(TritonOpConfig):
     """FP32 communication tensors quantized independently by their last dimension."""
 
     num_rows: int = 65536
@@ -1093,10 +1103,15 @@ class Fused8BitRowwiseConfig(TritonOpConfig):
             device=device,
         )
         quantized = torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
-        return {"input": input, "quantized": quantized}
+        return {
+            "input": input,
+            "fused_8bit": quantized,
+            "bfloat16": fp32_to_bf16_with_clamp(input),
+            "mx4": fp32_to_mx4(input),
+        }
 
 
-@register_benchmark(Fused8BitRowwiseConfig)
+@register_benchmark(QuantizedCommConfig)
 def fused_8bit_rowwise_quantize_triton(
     _batch_inputs: List[Dict[str, Any]],
     input: torch.Tensor,
@@ -1106,7 +1121,7 @@ def fused_8bit_rowwise_quantize_triton(
         triton_float_to_fused8bitrowwise_quantized(input)
 
 
-@register_benchmark(Fused8BitRowwiseConfig)
+@register_benchmark(QuantizedCommConfig)
 def fused_8bit_rowwise_quantize_fbgemm(
     _batch_inputs: List[Dict[str, Any]],
     input: torch.Tensor,
@@ -1116,27 +1131,27 @@ def fused_8bit_rowwise_quantize_fbgemm(
         torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
 
 
-@register_benchmark(Fused8BitRowwiseConfig)
+@register_benchmark(QuantizedCommConfig)
 def fused_8bit_rowwise_dequantize_triton(
     _batch_inputs: List[Dict[str, Any]],
-    quantized: torch.Tensor,
+    fused_8bit: torch.Tensor,
     **_kwargs: Dict[str, Any],
 ) -> None:
     with record_function("## triton_fused8bitrowwise_quantized_to_float ##"):
-        triton_fused8bitrowwise_quantized_to_float(quantized)
+        triton_fused8bitrowwise_quantized_to_float(fused_8bit)
 
 
-@register_benchmark(Fused8BitRowwiseConfig)
+@register_benchmark(QuantizedCommConfig)
 def fused_8bit_rowwise_dequantize_fbgemm(
     _batch_inputs: List[Dict[str, Any]],
-    quantized: torch.Tensor,
+    fused_8bit: torch.Tensor,
     **_kwargs: Dict[str, Any],
 ) -> None:
     with record_function("## fbgemm_fused8bitrowwise_quantized_to_float ##"):
-        torch.ops.fbgemm.Fused8BitRowwiseQuantizedToFloat(quantized)
+        torch.ops.fbgemm.Fused8BitRowwiseQuantizedToFloat(fused_8bit)
 
 
-@register_benchmark(Fused8BitRowwiseConfig)
+@register_benchmark(QuantizedCommConfig)
 def fused_8bit_rowwise_roundtrip_triton(
     _batch_inputs: List[Dict[str, Any]],
     input: torch.Tensor,
@@ -1148,7 +1163,7 @@ def fused_8bit_rowwise_roundtrip_triton(
         )
 
 
-@register_benchmark(Fused8BitRowwiseConfig)
+@register_benchmark(QuantizedCommConfig)
 def fused_8bit_rowwise_roundtrip_fbgemm(
     _batch_inputs: List[Dict[str, Any]],
     input: torch.Tensor,
@@ -1158,6 +1173,126 @@ def fused_8bit_rowwise_roundtrip_fbgemm(
         torch.ops.fbgemm.Fused8BitRowwiseQuantizedToFloat(
             torch.ops.fbgemm.FloatToFused8BitRowwiseQuantized(input)
         )
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_quantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_float_to_bfloat16_quantized ##"):
+        triton_float_to_bfloat16_quantized(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_quantize_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_float_to_bfloat16_quantized ##"):
+        fp32_to_bf16_with_clamp(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_dequantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    bfloat16: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_bfloat16_quantized_to_float ##"):
+        triton_bfloat16_quantized_to_float(bfloat16)
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_dequantize_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    bfloat16: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_bfloat16_quantized_to_float ##"):
+        bf16_to_fp32(bfloat16)
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_roundtrip_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_bfloat16_roundtrip ##"):
+        triton_bfloat16_quantized_to_float(triton_float_to_bfloat16_quantized(input))
+
+
+@register_benchmark(QuantizedCommConfig)
+def bfloat16_roundtrip_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_bfloat16_roundtrip ##"):
+        bf16_to_fp32(fp32_to_bf16_with_clamp(input))
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_quantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## torchrec_triton_float_to_mx4_quantized ##"):
+        triton_float_to_mx4_quantized(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_quantize_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_triton_float_to_mx4_quantized ##"):
+        fp32_to_mx4(input)
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_dequantize_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    mx4: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## torchrec_triton_mx4_quantized_to_float ##"):
+        triton_mx4_quantized_to_float(mx4)
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_dequantize_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    mx4: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_triton_mx4_quantized_to_float ##"):
+        mx4_to_float(mx4)
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_roundtrip_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## torchrec_triton_mx4_roundtrip ##"):
+        triton_mx4_quantized_to_float(triton_float_to_mx4_quantized(input))
+
+
+@register_benchmark(QuantizedCommConfig)
+def mx4_roundtrip_qcomm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## qcomm_triton_mx4_roundtrip ##"):
+        mx4_to_float(fp32_to_mx4(input))
 
 
 ############################ pooled regroup configs ###################################
