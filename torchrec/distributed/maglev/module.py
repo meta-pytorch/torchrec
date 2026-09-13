@@ -17,7 +17,7 @@ to process groups, and sharding them lives in
 
 import abc
 from dataclasses import dataclass
-from typing import Any, List, Sequence, Tuple
+from typing import Any, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -90,7 +90,50 @@ def check_activations(
             )
 
 
-class MaglevLayer(abc.ABC, nn.Module):
+def activation_specs_from_tensors(
+    activations: Activations,
+    batch_size: int,
+    floating_dtype: Optional[torch.dtype] = None,
+) -> Tuple[ActivationSpec, ...]:
+    """Create a static communication contract from representative tensors."""
+    specs: List[ActivationSpec] = []
+    for activation in activations:
+        shape = list(activation.shape)
+        if shape:
+            shape[0] = batch_size
+        dtype = (
+            floating_dtype
+            if floating_dtype is not None and activation.dtype.is_floating_point
+            else activation.dtype
+        )
+        specs.append(ActivationSpec(torch.Size(shape), dtype))
+    return tuple(specs)
+
+
+def cast_activations(
+    activations: Activations,
+    dtype: Optional[torch.dtype],
+    specs: Sequence[ActivationSpec] = (),
+) -> Activations:
+    """Cast differentiable activation tensors while preserving integer carriers."""
+    if dtype is None:
+        return activations
+    if specs:
+        if len(activations) != len(specs):
+            raise ValueError(
+                "activation count must match the static communication contract"
+            )
+        return tuple(
+            activation.to(dtype) if spec.dtype.is_floating_point else activation
+            for activation, spec in zip(activations, specs)
+        )
+    return tuple(
+        activation.to(dtype) if activation.dtype.is_floating_point else activation
+        for activation in activations
+    )
+
+
+class MaglevLayer(nn.Module, abc.ABC):
     """Base class for a Maglev layer -- the unit of compute in a Maglev model.
 
     A layer consumes two things and produces one:
@@ -115,9 +158,7 @@ class MaglevLayer(abc.ABC, nn.Module):
     of layers plus the wrapper that distributes it.
 
     Args:
-        None. The base class holds no state; subclasses declare their own
-        constructor arguments and must implement :meth:`in_activation_specs`,
-        :meth:`out_activation_specs`, and :meth:`forward`.
+        Implementations define their own constructor arguments.
 
     Example::
 
@@ -158,7 +199,7 @@ class MaglevLayer(abc.ABC, nn.Module):
     def forward(
         self, layer_input: Any, in_activations: Activations = ()
     ) -> Activations:
-        """Run the layer over its own input and the previous layer's activation.
+        """Run the layer over its input and the previous layer's activation.
 
         Args:
             layer_input: this layer's own input (its feature partition).
@@ -168,9 +209,37 @@ class MaglevLayer(abc.ABC, nn.Module):
 
         Returns:
             Activations: this layer's output activation, matching
-            :meth:`out_activation_specs`.
+                :meth:`out_activation_specs`.
         """
         ...
+
+
+class ObservedActivationSpecsMixin:
+    """Derive a Maglev layer's static contract from representative outputs."""
+
+    _in_specs: Tuple[ActivationSpec, ...] = ()
+    _out_specs: Tuple[ActivationSpec, ...] = ()
+
+    def set_activation_specs(
+        self,
+        in_activations: Activations,
+        out_activations: Activations,
+        batch_size: int,
+        in_dtype: Optional[torch.dtype] = None,
+        out_dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        self._in_specs = activation_specs_from_tensors(
+            in_activations, batch_size, in_dtype
+        )
+        self._out_specs = activation_specs_from_tensors(
+            out_activations, batch_size, out_dtype
+        )
+
+    def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return self._in_specs
+
+    def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
+        return self._out_specs
 
 
 def check_layers_chain(layers: Sequence[MaglevLayer], what: str) -> None:

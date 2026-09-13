@@ -10,11 +10,11 @@
 """
 Benchmark for the Maglev staged pipeline (MVP).
 
-Measures a microbatched 1F1B schedule, selected by ``--pipeline``:
+Measures a microbatched 1F1B schedule, selected by ``--pipeline``: ``1f1b``
+posts each receive immediately before its wait
+(:class:`~torchrec.distributed.maglev.pipeline.Maglev1F1B`, the default), while
 ``1f1b-recv-ahead`` posts each receive a microbatch ahead of the compute it feeds
-(:class:`~torchrec.distributed.maglev.pipeline.Maglev1F1BRecvAhead`, the default)
-and ``1f1b`` posts it immediately before its wait
-(:class:`~torchrec.distributed.maglev.pipeline.Maglev1F1B`). The model is a
+(:class:`~torchrec.distributed.maglev.pipeline.Maglev1F1BRecvAhead`). The model is a
 ``sum(layers_per_stage)``-layer model authored on ``meta`` and cut across
 per-stage process groups (one hardware scale-up domain, HSD, each). One measured
 iteration is the input-dist all-to-all plus one full 1F1B pass over
@@ -199,7 +199,7 @@ class RunOptions(BenchFuncConfig):
             - "1f1b-recv-ahead": each receive posted a microbatch ahead of the
               compute it feeds
             The two 1F1B variants move identical data; only the receive placement
-            differs. Default is "1f1b-recv-ahead".
+            differs. Default is "1f1b".
         num_tables (int): Embedding tables per layer (one feature each). Default is 8.
         num_embeddings (int): Rows per embedding table. Default is 1000000.
         emb_dim (int): Embedding dimension ``D``. Default is 256.
@@ -241,7 +241,7 @@ class RunOptions(BenchFuncConfig):
     # Which schedule to measure; see _PIPELINE_CLS. The two move identical data
     # and differ only in where the receives are posted, so this is the knob that
     # isolates what running the receives ahead is worth.
-    pipeline: str = "1f1b-recv-ahead"
+    pipeline: str = "1f1b"
     # Heavier embedding tables: 1M rows * 256 dim * 8 tables per layer.
     num_tables: int = 8
     num_embeddings: int = 1_000_000
@@ -405,6 +405,7 @@ def runner(
             model=model,
             layers_per_stage=layers_per_stage,
             stage_size=ranks_per_stage,
+            loss_only_output=run_option.shard_embeddings and ranks_per_stage > 1,
         )
         # Parallelism is the caller's: shard the embeddings within the HSD, then
         # materialize. Wrapping before to() is what keeps a meta-authored stage

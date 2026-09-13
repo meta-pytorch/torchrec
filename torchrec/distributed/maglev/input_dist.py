@@ -43,11 +43,12 @@ T = TypeVar("T")
 
 
 def _kjt_tensor_fields(kjt: KeyedJaggedTensor) -> List[Tuple[str, torch.Tensor]]:
-    """The KJT's tensor members in a fixed order: values, [weights], lengths|offsets.
+    """The KJT's required tensor members in a fixed order.
 
     A KJT always has values and exactly one length representation (lengths *or*
-    offsets); weights are present only for weighted features. Flatten and rebuild
-    use this same order so they line up.
+    offsets). Weights, variable-stride metadata, and inverse indices are present
+    only when the source KJT carries them. Flatten and rebuild use this same order
+    so they line up.
     """
     out: List[Tuple[str, torch.Tensor]] = [("values", kjt.values())]
     weights = kjt.weights_or_none()
@@ -58,6 +59,11 @@ def _kjt_tensor_fields(kjt: KeyedJaggedTensor) -> List[Tuple[str, torch.Tensor]]
         out.append(("lengths", lengths))
     else:
         out.append(("offsets", kjt.offsets()))
+    if kjt._stride_per_key_per_rank is not None:
+        out.append(("stride_per_key_per_rank", kjt._stride_per_key_per_rank))
+    inverse_indices = kjt.inverse_indices_or_none()
+    if inverse_indices is not None:
+        out.append(("inverse_indices", inverse_indices[1]))
     return out
 
 
@@ -160,12 +166,19 @@ def _rebuild_kjt(
     parts: Dict[str, torch.Tensor] = {
         name: _next(it) for name, _tensor in _kjt_tensor_fields(example)
     }
+    example_inverse_indices = example.inverse_indices_or_none()
     return KeyedJaggedTensor(
         keys=example.keys(),
         values=parts["values"],
         weights=parts.get("weights"),
         lengths=parts.get("lengths"),
         offsets=parts.get("offsets"),
+        stride_per_key_per_rank=parts.get("stride_per_key_per_rank"),
+        inverse_indices=(
+            (example_inverse_indices[0], parts["inverse_indices"])
+            if example_inverse_indices is not None
+            else None
+        ),
     )
 
 
@@ -347,6 +360,7 @@ def input_size_dist(
     List[List[int]],
     _InputSizeAwaitable,
     List[torch.Tensor],
+    List[torch.dtype],
     Any,
 ]:
     """Flatten and copy the input, then exchange tensor-size metadata.
@@ -371,8 +385,8 @@ def input_size_dist(
 
     Returns:
         The fused GPU input buffers, their per-destination split sizes, the size-
-        exchange awaitable, flattened example tensors, and copy-completion event
-        consumed by :func:`input_data_dist`.
+        exchange awaitable, flattened example tensors, the common dtype-bucket
+        order, and copy-completion event consumed by :func:`input_data_dist`.
 
     Raises:
         ValueError: if ``device`` is not CUDA or ``len(send)`` does not match the
@@ -395,7 +409,8 @@ def input_size_dist(
         in_splits_by_bucket,
         source_tensors,
         destination_tensors,
-    ) = prepare_input_buffers(source_flat_send, example_flat, device)
+        bucket_dtypes,
+    ) = prepare_input_buffers(source_flat_send, device)
     inplace_copy_to_gpu(
         source_tensors,
         destination_tensors,
@@ -416,47 +431,45 @@ def input_size_dist(
             batch_id,
         ),
         example_flat,
+        bucket_dtypes,
         copy_done_event,
     )
 
 
 def prepare_input_buffers(
     source_flat_send: List[List[torch.Tensor]],
-    example_flat: List[torch.Tensor],
     device: torch.device,
 ) -> Tuple[
     List[torch.Tensor],
     List[List[int]],
     List[torch.Tensor],
     List[torch.Tensor],
+    List[torch.dtype],
 ]:
     """Allocate fused GPU input buffers and views for direct CPU-to-GPU copy.
 
     Returns the fused buffers, their per-destination split sizes, CPU source
-    tensors, and matching GPU destination views.
+    tensors, matching GPU destination views, and the deterministic dtype order.
+    The dtype union comes from every destination carrier because different
+    pipeline stages can have different input schemas.
     """
-    slots_by_dtype: Dict[torch.dtype, List[int]] = {}
-    for k, tensor in enumerate(example_flat):
-        slots_by_dtype.setdefault(tensor.dtype, []).append(k)
-
     send_slots: List[Dict[torch.dtype, List[int]]] = []
-    for j, tensors in enumerate(source_flat_send):
+    for tensors in source_flat_send:
         by_dtype: Dict[torch.dtype, List[int]] = {}
         for k, tensor in enumerate(tensors):
-            if tensor.dtype not in slots_by_dtype:
-                raise ValueError(
-                    f"send[{j}] slot {k} has dtype {tensor.dtype}, which the "
-                    "example does not have; a carrier may differ from the "
-                    "example in slot count, not in the dtypes it carries"
-                )
             by_dtype.setdefault(tensor.dtype, []).append(k)
         send_slots.append(by_dtype)
+    # Every rank builds the complete destination send set from the same model
+    # schema, so the dtype union is common across the cascade. Sorting that union
+    # gives every rank the same collective order even when destination schemas
+    # use different dtype subsets.
+    bucket_dtypes = sorted({dtype for slots in send_slots for dtype in slots}, key=str)
 
     in_bufs: List[torch.Tensor] = []
     in_splits_by_bucket: List[List[int]] = []
     source_tensors: List[torch.Tensor] = []
     destination_tensors: List[torch.Tensor] = []
-    for dtype in slots_by_dtype:
+    for dtype in bucket_dtypes:
         in_splits = [
             sum(source_flat_send[j][k].numel() for k in send_slots[j].get(dtype, []))
             for j in range(len(source_flat_send))
@@ -473,12 +486,19 @@ def prepare_input_buffers(
         in_bufs.append(in_buf)
         in_splits_by_bucket.append(in_splits)
 
-    return in_bufs, in_splits_by_bucket, source_tensors, destination_tensors
+    return (
+        in_bufs,
+        in_splits_by_bucket,
+        source_tensors,
+        destination_tensors,
+        bucket_dtypes,
+    )
 
 
 def prepare_output_buffers(
     recv_sizes: List[List[int]],
     example_flat: List[torch.Tensor],
+    bucket_dtypes: List[torch.dtype],
     device: torch.device,
 ) -> Tuple[
     Dict[torch.dtype, List[int]],
@@ -489,9 +509,13 @@ def prepare_output_buffers(
     """Allocate fused receive buffers and their per-source split sizes."""
     world_size = len(recv_sizes)
     row_elems = [math.prod(tensor.shape[1:]) for tensor in example_flat]
-    slots_by_dtype: Dict[torch.dtype, List[int]] = {}
+    # Retain empty local buckets so a receiver with no slots of a dtype still
+    # participates in the matching all-to-all with zero-length splits.
+    slots_by_dtype: Dict[torch.dtype, List[int]] = {
+        dtype: [] for dtype in bucket_dtypes
+    }
     for k, tensor in enumerate(example_flat):
-        slots_by_dtype.setdefault(tensor.dtype, []).append(k)
+        slots_by_dtype[tensor.dtype].append(k)
 
     out_bufs: List[torch.Tensor] = []
     out_splits_by_bucket: List[List[int]] = []
@@ -517,6 +541,7 @@ def input_data_dist(
     recv_sizes: List[List[int]],
     example: T,
     example_flat: List[torch.Tensor],
+    bucket_dtypes: List[torch.dtype],
     pg_nccl: dist.ProcessGroup,
     pp_data_dist_stream: torch.Stream,
     copy_done_event: Any,
@@ -541,7 +566,7 @@ def input_data_dist(
             out_bufs,
             out_splits_by_bucket,
             row_elems,
-        ) = prepare_output_buffers(recv_sizes, example_flat, device)
+        ) = prepare_output_buffers(recv_sizes, example_flat, bucket_dtypes, device)
 
     bucket_slots = list(buckets.values())
 
@@ -609,6 +634,7 @@ def input_dist(
         in_splits_by_bucket,
         size_awaitable,
         example_flat,
+        bucket_dtypes,
         copy_done_event,
     ) = input_size_dist(send, example, pg_gloo, device, memcpy_stream, batch_id)
     return input_data_dist(
@@ -617,6 +643,7 @@ def input_dist(
         size_awaitable.wait(),
         example,
         example_flat,
+        bucket_dtypes,
         pg_nccl,
         pp_data_dist_stream,
         copy_done_event,
@@ -627,7 +654,9 @@ def input_dist(
 class InputDistDriver(Generic[T]):
     """Feeds a pipeline schedule with microbatches produced by :func:`input_dist`.
 
-    One :func:`input_dist` round over a cascade yields one carrier per stage --
+    Every dataloader batch is already one microbatch; this driver redistributes
+    those batches and never splits them. One :func:`input_dist` round over a
+    cascade yields one carrier per stage --
     i.e. as many microbatches as there are stages, all destined for the calling
     rank. A schedule asks for ``n`` microbatches per pass, which need not match.
     This buffers whole rounds in a FIFO and hands out ``n`` at a time,

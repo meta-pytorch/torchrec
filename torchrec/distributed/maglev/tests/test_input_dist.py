@@ -18,6 +18,7 @@ from torchrec.distributed.maglev.input_dist import (
     flatten_to_tensors,
     input_data_dist,
     input_size_dist,
+    prepare_input_buffers,
     unflatten_from_tensors,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -117,6 +118,36 @@ class InputDistTest(unittest.TestCase):
             torch.testing.assert_close(rebuilt[key].lengths(), obj[key].lengths())
             self.assertEqual(rebuilt[key].keys(), ["f1", "f2"])
 
+    def test_variable_stride_kjt_roundtrip(self) -> None:
+        keys = ["f1", "f2"]
+        inverse_indices = torch.tensor([[0, 1, 0], [0, 0, 0]])
+        obj = KeyedJaggedTensor(
+            keys=keys,
+            values=torch.arange(8),
+            lengths=torch.tensor([2, 0, 1, 1, 1, 3]),
+            stride_per_key_per_rank=torch.tensor([[2], [4]], dtype=torch.int32),
+            inverse_indices=(keys, inverse_indices),
+        )
+        example = KeyedJaggedTensor(
+            keys=keys,
+            values=torch.zeros(8),
+            lengths=torch.zeros(6, dtype=torch.int64),
+            stride_per_key_per_rank=torch.tensor([[2], [4]], dtype=torch.int32),
+            inverse_indices=(keys, torch.zeros_like(inverse_indices)),
+        )
+
+        rebuilt = unflatten_from_tensors(flatten_to_tensors(obj), example)
+
+        self.assertTrue(rebuilt.variable_stride_per_key())
+        torch.testing.assert_close(
+            rebuilt._stride_per_key_per_rank, obj._stride_per_key_per_rank
+        )
+        torch.testing.assert_close(rebuilt.lengths(), obj.lengths())
+        self.assertEqual(rebuilt.stride_per_key(), [2, 4])
+        rebuilt_inverse_indices = rebuilt.inverse_indices()
+        self.assertEqual(rebuilt_inverse_indices[0], keys)
+        torch.testing.assert_close(rebuilt_inverse_indices[1], inverse_indices)
+
     def test_too_few_tensors_raises(self) -> None:
         tensors = flatten_to_tensors(_instance())
         with self.assertRaises(ValueError):
@@ -126,6 +157,21 @@ class InputDistTest(unittest.TestCase):
         tensors = flatten_to_tensors(_instance())
         with self.assertRaises(ValueError):
             unflatten_from_tensors(tensors + [torch.zeros(1)], _example())
+
+    def test_input_buffers_include_dtypes_from_every_destination(self) -> None:
+        source_flat_send = [
+            [torch.ones(2, dtype=torch.int32)],
+            [torch.ones(3, dtype=torch.float32)],
+        ]
+
+        in_bufs, in_splits, _, _, bucket_dtypes = prepare_input_buffers(
+            source_flat_send,
+            device=torch.device("cpu"),
+        )
+
+        self.assertEqual(bucket_dtypes, [torch.float32, torch.int32])
+        self.assertEqual([buf.dtype for buf in in_bufs], bucket_dtypes)
+        self.assertEqual(in_splits, [[0, 3], [2, 0]])
 
 
 _DENSE_DIM = 4
@@ -214,6 +260,7 @@ class InputDistInProcessTest(unittest.TestCase):
             in_splits_by_bucket,
             size_awaitable,
             example_flat,
+            bucket_dtypes,
             copy_done_event,
         ) = input_size_dist(send, example, pg, device, memcpy_stream)
         recv_sizes = size_awaitable.wait()
@@ -225,10 +272,11 @@ class InputDistInProcessTest(unittest.TestCase):
         for tensor in source_tensors:
             expected_by_dtype.setdefault(tensor.dtype, []).append(tensor.reshape(-1))
         self.assertEqual(len(in_bufs), len(expected_by_dtype))
+        self.assertCountEqual(bucket_dtypes, expected_by_dtype)
         for in_buf, in_splits, parts in zip(
             in_bufs,
             in_splits_by_bucket,
-            expected_by_dtype.values(),
+            [expected_by_dtype[dtype] for dtype in bucket_dtypes],
         ):
             self.assertEqual(in_buf.device.type, "cuda")
             self.assertEqual(in_splits, [sum(part.numel() for part in parts)])
@@ -274,6 +322,7 @@ class InputDistInProcessTest(unittest.TestCase):
             recv_sizes,
             source,
             source_tensors,
+            list(tensors_by_dtype),
             pg,
             pp_data_dist_stream=pp_data_dist_stream,
             copy_done_event=copy_done_event,
