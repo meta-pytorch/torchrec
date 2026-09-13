@@ -15,9 +15,23 @@ to process groups, and sharding them lives in
 :mod:`torchrec.distributed.maglev.stage`.
 """
 
+from __future__ import annotations
+
 import abc
-from dataclasses import dataclass
-from typing import Any, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, fields
+from typing import (
+    Any,
+    ClassVar,
+    Generic,
+    get_args,
+    get_origin,
+    get_type_hints,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+)
 
 import torch
 import torch.nn as nn
@@ -25,6 +39,412 @@ import torch.nn as nn
 # The carrier between Maglev layers: always a tuple of tensors, empty for a
 # layer with no incoming activation (the first layer of a model).
 Activations = Tuple[torch.Tensor, ...]
+
+_NO_METADATA = object()
+
+TStructuredActivations = TypeVar(
+    "TStructuredActivations", bound="StructuredActivations"
+)
+
+
+@dataclass(frozen=True)
+class StructuredActivations:
+    """Marker base for values crossing a structured Maglev boundary."""
+
+
+@dataclass(frozen=True)
+class _ValueLayout:
+    kind: str
+    children: Tuple["_ValueLayout", ...] = ()
+    keys: Tuple[Any, ...] = ()
+    metadata: Any = None
+    field_name: Optional[str] = None
+
+
+def _is_builtin_layout_type(expected_type: Any) -> bool:
+    if expected_type in (torch.Tensor, int, str):
+        return True
+    origin = get_origin(expected_type)
+    args = get_args(expected_type)
+    if origin is list:
+        return len(args) == 1 and _is_builtin_layout_type(args[0])
+    if origin is dict:
+        return (
+            len(args) == 2
+            and args[0] in (int, str)
+            and _is_builtin_layout_type(args[1])
+        )
+    if origin is tuple:
+        child_types = args[:1] if len(args) == 2 and args[1] is Ellipsis else args
+        return bool(child_types) and all(
+            _is_builtin_layout_type(child_type) for child_type in child_types
+        )
+    return False
+
+
+def _type_requires_metadata(expected_type: Any) -> bool:
+    if expected_type is torch.Tensor:
+        return False
+    origin = get_origin(expected_type)
+    args = get_args(expected_type)
+    if origin is tuple and not (len(args) == 2 and args[1] is Ellipsis):
+        return any(_type_requires_metadata(child_type) for child_type in args)
+    return True
+
+
+def get_structured_activations_layout_metadata_fields(
+    activations_type: type[TStructuredActivations],
+) -> Tuple[str, ...]:
+    """Return the ordered fields required by a structured layout constructor.
+
+    The result contains each dataclass field whose layout cannot be recovered
+    from its annotation alone. Callers must provide a same-named keyword when
+    constructing ``StructuredActivationsLayout[activations_type]``. Tensor-only
+    fields and fixed tensor tuples are omitted. Lists, dictionaries, static
+    ``int`` and ``str`` values, metadata-bearing nested containers, and fields
+    with custom pack and unpack methods are included.
+
+    Raises ``TypeError`` when ``activations_type`` is not a
+    ``StructuredActivations`` subtype, when a custom field defines only one of
+    its pack and unpack methods, or when an unsupported field has no custom
+    methods.
+    """
+    if not isinstance(activations_type, type) or not issubclass(
+        activations_type, StructuredActivations
+    ):
+        raise TypeError("activations type must inherit StructuredActivations")
+
+    type_hints = get_type_hints(activations_type)
+    metadata_fields: List[str] = []
+    for field in fields(activations_type):
+        expected_type = type_hints.get(field.name, field.type)
+        has_custom_pack = hasattr(activations_type, f"_pack_{field.name}")
+        has_custom_unpack = hasattr(activations_type, f"_unpack_{field.name}")
+        if has_custom_pack != has_custom_unpack:
+            raise TypeError(f"field {field.name!r} requires both custom methods")
+        if has_custom_pack:
+            metadata_fields.append(field.name)
+        elif not _is_builtin_layout_type(expected_type):
+            raise TypeError(f"field {field.name!r} requires custom methods")
+        elif _type_requires_metadata(expected_type):
+            metadata_fields.append(field.name)
+    return tuple(metadata_fields)
+
+
+def _check_constant(value: Any, expected_type: Any, what: str) -> None:
+    if type(value) is not expected_type:
+        raise TypeError(f"{what} must be {expected_type.__name__}")
+
+
+def _build_sequence_layout(
+    kind: str,
+    child_type: Any,
+    metadata: Any,
+    what: str,
+) -> _ValueLayout:
+    if _type_requires_metadata(child_type):
+        if not isinstance(metadata, (list, tuple)):
+            raise TypeError(f"{what} metadata must describe each element")
+        child_metadata = metadata
+    else:
+        if type(metadata) is not int or metadata < 0:
+            raise TypeError(f"{what} metadata must be a non-negative length")
+        child_metadata = (_NO_METADATA,) * metadata
+    return _ValueLayout(
+        kind,
+        tuple(
+            _build_value_layout(child_type, item_metadata, what)
+            for item_metadata in child_metadata
+        ),
+    )
+
+
+def _build_tuple_layout(expected_type: Any, metadata: Any, what: str) -> _ValueLayout:
+    args = get_args(expected_type)
+    if len(args) == 2 and args[1] is Ellipsis:
+        return _build_sequence_layout("tuple", args[0], metadata, what)
+    if not any(_type_requires_metadata(child_type) for child_type in args):
+        child_metadata = (_NO_METADATA,) * len(args)
+    else:
+        if not isinstance(metadata, (list, tuple)) or len(metadata) != len(args):
+            raise TypeError(f"{what} metadata must match its tuple annotation")
+        child_metadata = tuple(
+            item_metadata if _type_requires_metadata(child_type) else _NO_METADATA
+            for child_type, item_metadata in zip(args, metadata)
+        )
+    return _ValueLayout(
+        "tuple",
+        tuple(
+            _build_value_layout(child_type, item_metadata, what)
+            for child_type, item_metadata in zip(args, child_metadata)
+        ),
+    )
+
+
+def _build_dict_layout(expected_type: Any, metadata: Any, what: str) -> _ValueLayout:
+    key_type, value_type = get_args(expected_type)
+    if _type_requires_metadata(value_type):
+        if not isinstance(metadata, dict):
+            raise TypeError(f"{what} metadata must be an ordered dict")
+        items = tuple(metadata.items())
+    else:
+        if not isinstance(metadata, (list, tuple)):
+            raise TypeError(f"{what} metadata must be an ordered key sequence")
+        items = tuple((key, _NO_METADATA) for key in metadata)
+    for key, _ in items:
+        _check_constant(key, key_type, f"{what} key")
+    return _ValueLayout(
+        "dict",
+        tuple(
+            _build_value_layout(value_type, child_metadata, what)
+            for _, child_metadata in items
+        ),
+        tuple(key for key, _ in items),
+    )
+
+
+def _build_value_layout(
+    expected_type: Any,
+    metadata: Any,
+    what: str,
+) -> _ValueLayout:
+    if expected_type is torch.Tensor:
+        if metadata is not _NO_METADATA:
+            raise TypeError(f"{what} does not accept metadata")
+        return _ValueLayout("tensor")
+    if expected_type in (int, str):
+        _check_constant(metadata, expected_type, f"{what} metadata")
+        return _ValueLayout("constant", metadata=metadata)
+    origin = get_origin(expected_type)
+    args = get_args(expected_type)
+    if origin is list:
+        return _build_sequence_layout("list", args[0], metadata, what)
+    if origin is tuple:
+        return _build_tuple_layout(expected_type, metadata, what)
+    if origin is dict:
+        return _build_dict_layout(expected_type, metadata, what)
+    raise TypeError(f"{what} requires custom pack and unpack methods")
+
+
+def _pack_value(layout: _ValueLayout, value: Any, owner: Any) -> Activations:
+    if layout.kind == "tensor":
+        return (value,)
+    if layout.kind == "constant":
+        if value != layout.metadata:
+            raise ValueError(
+                f"expected static value {layout.metadata!r}, got {value!r}"
+            )
+        return ()
+    if layout.kind in ("list", "tuple"):
+        expected_container = list if layout.kind == "list" else tuple
+        if not isinstance(value, expected_container) or len(value) != len(
+            layout.children
+        ):
+            raise ValueError(f"value does not match {layout.kind} layout")
+        return tuple(
+            tensor
+            for child, item in zip(layout.children, value)
+            for tensor in _pack_value(child, item, owner)
+        )
+    if layout.kind == "dict":
+        if not isinstance(value, dict) or set(value) != set(layout.keys):
+            raise ValueError("value does not match dict layout")
+        return tuple(
+            tensor
+            for key, child in zip(layout.keys, layout.children)
+            for tensor in _pack_value(child, value[key], owner)
+        )
+    packer = getattr(owner, f"_pack_{layout.field_name}")
+    return packer(value, layout.metadata)
+
+
+def _unpack_value(
+    layout: _ValueLayout,
+    activations: Activations,
+    activations_type: type[Any],
+) -> Tuple[Any, Activations]:
+    if layout.kind == "tensor":
+        if not activations:
+            raise ValueError("not enough tensors to unpack structured activations")
+        return activations[0], activations[1:]
+    if layout.kind == "constant":
+        return layout.metadata, activations
+    if layout.kind in ("list", "tuple", "dict"):
+        values: List[Any] = []
+        remaining = activations
+        for child in layout.children:
+            value, remaining = _unpack_value(child, remaining, activations_type)
+            values.append(value)
+        if layout.kind == "list":
+            return values, remaining
+        if layout.kind == "tuple":
+            return tuple(values), remaining
+        return dict(zip(layout.keys, values)), remaining
+    unpacker = getattr(activations_type, f"_unpack_{layout.field_name}")
+    return unpacker(activations, layout.metadata)
+
+
+class StructuredActivationsLayout(Generic[TStructuredActivations]):
+    """Static layout that maps a structured value to a tensor-only carrier.
+
+    First define a frozen dataclass that inherits ``StructuredActivations``.
+    Specializing this class with that dataclass produces a cached concrete
+    layout class. Instantiate the layout with static metadata named after the
+    activation fields that need it, then reuse the instance for every batch::
+
+        @dataclass(frozen=True)
+        class Boundary(StructuredActivations):
+            hidden: torch.Tensor
+            experts: List[torch.Tensor]
+            named: Dict[str, torch.Tensor]
+            dimensions: List[int]
+            label: str
+
+        BoundaryLayout = StructuredActivationsLayout[Boundary]
+        layout = BoundaryLayout(
+            experts=2,
+            named=("user", "ad"),
+            dimensions=[64, 128],
+            label="frontend",
+        )
+
+        packed = layout.pack(
+            Boundary(
+                hidden=hidden,
+                experts=[expert_0, expert_1],
+                named={"ad": ad, "user": user},
+                dimensions=[64, 128],
+                label="frontend",
+            )
+        )
+        restored = layout.unpack(packed)
+
+    ``get_structured_activations_layout_metadata_fields(Boundary)`` returns the
+    exact constructor fields required by the layout. In this example, those are
+    ``("experts", "named", "dimensions", "label")``.
+
+    The same-name mapping and metadata formats are:
+
+    * ``Tensor`` is one carrier tensor and takes no constructor argument.
+    * A fixed tuple is described by its type arguments. A tensor-only tuple
+      takes no metadata.
+    * A homogeneous list or variadic tuple whose element layout needs no
+      metadata takes its non-negative length. Otherwise it takes a list of the
+      metadata required by each element. For example, ``List[Tensor]`` takes
+      ``3``, while ``List[int]`` takes the actual static values ``[2, 4, 8]``.
+    * A dict whose values need no metadata takes an ordered key sequence. If its
+      values need metadata, it takes an insertion-ordered dict from each key to
+      that value's metadata. Thus ``Dict[str, Tensor]`` takes ``("a", "b")``,
+      while ``Dict[str, int]`` takes ``{"a": 2, "b": 4}``.
+    * ``int`` and ``str`` are static values stored in the layout and restored
+      without occupying the tensor carrier.
+
+    These rules compose recursively. Metadata for a fixed tuple containing
+    metadata-bearing children mirrors the tuple; positions for tensor-only
+    children may be ``None``. Dict keys are restricted to ``int`` and ``str``.
+
+    A field with another type must define both methods below on its activation
+    dataclass. Defining them also overrides built-in handling for that field::
+
+        def _pack_payload(
+            self,
+            value: Payload,
+            metadata: PayloadMetadata,
+        ) -> Activations: ...
+
+        @classmethod
+        def _unpack_payload(
+            cls,
+            activations: Activations,
+            metadata: PayloadMetadata,
+        ) -> Tuple[Payload, Activations]: ...
+
+    The layout constructor requires a ``payload=...`` argument and passes it to
+    both methods unchanged. Custom unpackers must return the reconstructed value
+    and the unconsumed activation suffix.
+
+    Layout metadata must be invariant across batches and identical on both sides
+    of a pipeline boundary. It is neither inferred from runtime tensors nor sent
+    with each microbatch. Values such as dynamic integers must therefore be
+    represented as tensors instead of static layout metadata. Construction
+    rejects missing or unknown metadata; packing validates container structure
+    and constants; unpacking rejects missing or unconsumed tensors.
+    """
+
+    _activations_type: ClassVar[type[Any]]
+    _specializations: ClassVar[dict[type[Any], type[Any]]] = {}
+
+    def __class_getitem__(cls, activations_type: Any) -> Any:
+        if not isinstance(activations_type, type) or not issubclass(
+            activations_type, StructuredActivations
+        ):
+            raise TypeError("layout type must inherit StructuredActivations")
+        specialized = cls._specializations.get(activations_type)
+        if specialized is None:
+            specialized = type(
+                f"{activations_type.__name__}Layout",
+                (cls,),
+                {
+                    "_activations_type": activations_type,
+                    "__module__": activations_type.__module__,
+                },
+            )
+            cls._specializations[activations_type] = specialized
+        return specialized
+
+    def __init__(self, **metadata: Any) -> None:
+        type_hints = get_type_hints(self._activations_type)
+        metadata_fields = set(
+            get_structured_activations_layout_metadata_fields(self._activations_type)
+        )
+        remaining_metadata = dict(metadata)
+        field_layouts: List[Tuple[str, _ValueLayout]] = []
+        for field in fields(self._activations_type):
+            expected_type = type_hints.get(field.name, field.type)
+            has_custom_pack = hasattr(self._activations_type, f"_pack_{field.name}")
+            if field.name in metadata_fields and field.name not in remaining_metadata:
+                raise TypeError(f"missing metadata for field {field.name!r}")
+            if has_custom_pack or not _is_builtin_layout_type(expected_type):
+                layout = _ValueLayout(
+                    "custom",
+                    metadata=remaining_metadata.pop(field.name),
+                    field_name=field.name,
+                )
+            else:
+                field_metadata = remaining_metadata.pop(field.name, _NO_METADATA)
+                layout = _build_value_layout(
+                    expected_type,
+                    field_metadata,
+                    f"field {field.name!r}",
+                )
+            field_layouts.append((field.name, layout))
+        if remaining_metadata:
+            names = ", ".join(sorted(remaining_metadata))
+            raise TypeError(f"unknown structured activation metadata: {names}")
+        self._field_layouts = tuple(field_layouts)
+
+    def pack(self, value: TStructuredActivations) -> Activations:
+        if not isinstance(value, self._activations_type):
+            raise TypeError(f"value must be {self._activations_type.__name__}")
+        return tuple(
+            tensor
+            for field_name, layout in self._field_layouts
+            for tensor in _pack_value(layout, getattr(value, field_name), value)
+        )
+
+    def unpack(self, activations: Activations) -> TStructuredActivations:
+        remaining = activations
+        values: dict[str, Any] = {}
+        for field_name, layout in self._field_layouts:
+            value, remaining = _unpack_value(
+                layout,
+                remaining,
+                self._activations_type,
+            )
+            values[field_name] = value
+        if remaining:
+            raise ValueError(f"{len(remaining)} activation tensors were not consumed")
+        return self._activations_type(**values)
 
 
 @dataclass(frozen=True)

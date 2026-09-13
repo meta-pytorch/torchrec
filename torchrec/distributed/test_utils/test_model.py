@@ -17,9 +17,12 @@ import torch.nn as nn
 from tensordict import TensorDict
 from torchrec.distributed.embedding_types import EmbeddingTableConfig
 from torchrec.distributed.maglev.module import (
+    Activations,
     ActivationSpec,
     MaglevLayer,
     MaglevModuleList,
+    StructuredActivations,
+    StructuredActivationsLayout,
 )
 from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.utils import CopyableMixin
@@ -3158,6 +3161,13 @@ class MaglevScaledAdd(nn.Module):
         return a * (1 + self.alpha) + b * (1 + self.beta)
 
 
+@dataclass(frozen=True)
+class MaglevTestActivations(StructuredActivations):
+    """Named view of the hidden tensor carried between benchmark layers."""
+
+    hidden: torch.Tensor
+
+
 class MaglevTestLayer(MaglevLayer):
     """One Maglev layer for tests and benchmarks.
 
@@ -3177,8 +3187,9 @@ class MaglevTestLayer(MaglevLayer):
     * ``block`` is the layer's dense compute.
 
     The first layer (``is_first=True``) takes no incoming activation, i.e. its
-    :meth:`in_activation_specs` is empty. The output activation is a 1-tuple
-    holding a ``(batch_size, layer_dim)`` tensor.
+    :meth:`in_activation_specs` is empty. The output is authored as a
+    :class:`MaglevTestActivations` value and packed by the supplied structured
+    layout into the tensor-only carrier expected by the pipeline.
 
     Args:
         tables: this layer's embedding tables (its sparse feature partition).
@@ -3186,6 +3197,7 @@ class MaglevTestLayer(MaglevLayer):
         is_first: whether this is the first layer (no incoming activation).
         batch_size: per-microbatch batch size ``B``; only used to declare the
             activation specs.
+        activation_layout: shared layout for the model's structured boundary.
         num_float_features: width of this layer's float feature input. 0 disables
             the dense path.
         device: device to build the layer on.
@@ -3196,8 +3208,9 @@ class MaglevTestLayer(MaglevLayer):
 
         tables = [EmbeddingBagConfig(name="t", embedding_dim=8, num_embeddings=16,
                                      feature_names=["f"])]
+        layout = StructuredActivationsLayout[MaglevTestActivations]()
         layer = MaglevTestLayer(tables, layer_dim=12, is_first=True, batch_size=2,
-                                num_float_features=4)
+                                activation_layout=layout, num_float_features=4)
         mi = ModelInput.generate(batch_size=2, tables=tables, weighted_tables=[],
                                  num_float_features=4)
         (out,) = layer(mi)
@@ -3209,6 +3222,7 @@ class MaglevTestLayer(MaglevLayer):
         layer_dim: int,
         is_first: bool,
         batch_size: int,
+        activation_layout: "StructuredActivationsLayout[MaglevTestActivations]",
         num_float_features: int = 0,
         device: Optional[torch.device] = None,
     ) -> None:
@@ -3217,6 +3231,7 @@ class MaglevTestLayer(MaglevLayer):
         self._spec: ActivationSpec = ActivationSpec(
             torch.Size([batch_size, layer_dim]), torch.float32
         )
+        self.activation_layout = activation_layout
         self.ebc: EmbeddingBagCollection = EmbeddingBagCollection(
             tables=tables, device=device
         )
@@ -3243,8 +3258,8 @@ class MaglevTestLayer(MaglevLayer):
     def forward(
         self,
         layer_input: "ModelInput",
-        in_activations: Tuple[torch.Tensor, ...] = (),
-    ) -> Tuple[torch.Tensor, ...]:
+        in_activations: Activations = (),
+    ) -> Activations:
         """Run this layer over its ``ModelInput`` and the previous activation.
 
         Args:
@@ -3263,9 +3278,12 @@ class MaglevTestLayer(MaglevLayer):
         if self.dense is not None:
             x = x + self.dense(layer_input.float_features)  # add dense features
         if not self.is_first:
-            assert len(in_activations) == 1 and self.scaled_add is not None
-            x = self.scaled_add(in_activations[0], x)
-        return (torch.relu(self.block(x)),)
+            assert self.scaled_add is not None
+            previous = self.activation_layout.unpack(in_activations)
+            x = self.scaled_add(previous.hidden, x)
+        return self.activation_layout.pack(
+            MaglevTestActivations(hidden=torch.relu(self.block(x)))
+        )
 
 
 class MaglevTestModel(MaglevModuleList):
@@ -3281,12 +3299,22 @@ class MaglevTestModel(MaglevModuleList):
 
     Args:
         layers: the model's layers, in execution order.
+        activation_layout: shared layout for the model's structured boundary.
 
     Example::
 
-        model = MaglevTestModel([layer0, layer1])
+        activation_layout = StructuredActivationsLayout[MaglevTestActivations]()
+        model = MaglevTestModel([layer0, layer1], activation_layout)
         losses, output = model([layer_input0, layer_input1])
     """
+
+    def __init__(
+        self,
+        layers: List[MaglevTestLayer],
+        activation_layout: "StructuredActivationsLayout[MaglevTestActivations]",
+    ) -> None:
+        super().__init__(layers)
+        self.activation_layout = activation_layout
 
     def postproc(
         self,
@@ -3304,6 +3332,7 @@ class MaglevTestModel(MaglevModuleList):
             Tuple[torch.Tensor, torch.Tensor]: ``(losses, output)`` -- a scalar
             MSE and the ``(B,)`` prediction.
         """
-        output = activations[0].sum(dim=1)  # (B, layer_dim) -> (B,)
+        values = self.activation_layout.unpack(activations)
+        output = values.hidden.sum(dim=1)  # (B, layer_dim) -> (B,)
         losses = torch.nn.functional.mse_loss(output, layer_input.label)
         return losses, output

@@ -58,7 +58,7 @@ from torchrec.distributed.benchmark.base import (
     GPUMemoryStats,
 )
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
-from torchrec.distributed.maglev.module import MaglevLayer
+from torchrec.distributed.maglev.module import StructuredActivationsLayout
 from torchrec.distributed.maglev.pipeline import (
     Maglev1F1B,
     Maglev1F1BRecvAhead,
@@ -76,7 +76,11 @@ from torchrec.distributed.test_utils.multi_process import (
     run_multi_process_func,
 )
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
-from torchrec.distributed.test_utils.test_model import MaglevTestLayer, MaglevTestModel
+from torchrec.distributed.test_utils.test_model import (
+    MaglevTestActivations,
+    MaglevTestLayer,
+    MaglevTestModel,
+)
 from torchrec.distributed.types import ModuleSharder, ShardingEnv, ShardingPlan
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 from torchrec.modules.embedding_modules import EmbeddingBagCollection
@@ -385,18 +389,20 @@ def runner(
         # costs nothing -- then let StageWrapper keep this rank's stage and
         # materialize only those layers on the device.
         meta_device = torch.device("meta")
-        layers: List[MaglevLayer] = [
+        activation_layout = StructuredActivationsLayout[MaglevTestActivations]()
+        layers: List[MaglevTestLayer] = [
             MaglevTestLayer(
                 tables=all_tables[layer_index],
                 layer_dim=run_option.layer_dim,
                 is_first=(layer_index == 0),
                 batch_size=run_option.batch_size,
+                activation_layout=activation_layout,
                 num_float_features=run_option.num_float_features,
                 device=meta_device,
             )
             for layer_index in range(num_layers)
         ]
-        model = MaglevTestModel(layers)
+        model = MaglevTestModel(layers, activation_layout)
         # Meta construction consumes no randomness, so the weights are drawn when
         # the stage materializes: seed here, per stage, so an HSD's ranks start
         # identical (the sharded path relies on that -- it does not sync weights).
