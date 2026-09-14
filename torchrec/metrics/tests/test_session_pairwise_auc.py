@@ -16,11 +16,20 @@ from torchrec.metrics.rec_metric import RecMetricException
 from torchrec.metrics.session_pairwise_auc import (
     _compute_average_per_batch,
     _compute_pairwise_auc,
+    _compute_ratio,
+    _compute_tied_pair_rate,
     _get_session_pairwise_auc_states,
     CORRECT_PAIR_WEIGHT,
+    DEGENERATE_SESSION_COUNT,
     EFFECTIVE_EXAMPLE_COUNT,
+    EXAMPLE_COUNT,
+    GROUP_SIZE_MAX_SUM,
+    GROUP_SIZE_SUM,
+    SAME_SESSION_PAIR_COUNT,
+    SESSION_COUNT,
     SessionPairwiseAUCMetric,
     SessionPairwiseAUCMetricComputation,
+    SINGLETON_SESSION_COUNT,
     TOTAL_PAIR_WEIGHT,
     VALID_PAIR_COUNT,
 )
@@ -374,6 +383,41 @@ class SessionPairwiseAUCTest(unittest.TestCase):
             states[EFFECTIVE_EXAMPLE_COUNT],
             torch.tensor([3.0], dtype=torch.double),
         )
+        torch.testing.assert_close(
+            states[SAME_SESSION_PAIR_COUNT],
+            torch.tensor([3.0], dtype=torch.double),
+        )
+        torch.testing.assert_close(
+            states[EXAMPLE_COUNT], torch.tensor([4.0], dtype=torch.double)
+        )
+
+    def test_group_health_states(self) -> None:
+        states = _get_session_pairwise_auc_states(
+            predictions=torch.tensor([[0.9, 0.8, 0.1, 0.0]]),
+            labels=torch.tensor([[1.0, 1.0, 5.0, 7.0]]),
+            session_ids=torch.tensor([1, 1, 2, 3]),
+            example_weights=torch.ones(1, 4),
+            report_batch_coverage=True,
+        )
+        # Session 1 is a non-singleton with all labels tied. Sessions 2 and 3
+        # are reported separately as singletons rather than as degenerate.
+        torch.testing.assert_close(
+            states[DEGENERATE_SESSION_COUNT],
+            torch.tensor([1.0], dtype=torch.double),
+        )
+        torch.testing.assert_close(
+            states[SESSION_COUNT], torch.tensor([3.0], dtype=torch.double)
+        )
+        torch.testing.assert_close(
+            states[GROUP_SIZE_SUM], torch.tensor([4.0], dtype=torch.double)
+        )
+        torch.testing.assert_close(
+            states[GROUP_SIZE_MAX_SUM], torch.tensor([2.0], dtype=torch.double)
+        )
+        torch.testing.assert_close(
+            states[SINGLETON_SESSION_COUNT],
+            torch.tensor([2.0], dtype=torch.double),
+        )
 
     def test_no_pairs_has_no_effective_examples(self) -> None:
         states = _get_session_pairwise_auc_states(
@@ -411,6 +455,22 @@ class SessionPairwiseAUCTest(unittest.TestCase):
         )
         torch.testing.assert_close(actual, torch.tensor([4.0, 0.0], dtype=torch.double))
 
+    def test_coverage_ratios(self) -> None:
+        tied_rate = _compute_tied_pair_rate(
+            valid_pair_count=torch.tensor([2.0, 0.0], dtype=torch.double),
+            same_session_pair_count=torch.tensor([3.0, 0.0], dtype=torch.double),
+        )
+        effective_rate = _compute_ratio(
+            numerator=torch.tensor([3.0, 0.0], dtype=torch.double),
+            denominator=torch.tensor([4.0, 0.0], dtype=torch.double),
+        )
+        torch.testing.assert_close(
+            tied_rate, torch.tensor([1.0 / 3.0, 0.0], dtype=torch.double)
+        )
+        torch.testing.assert_close(
+            effective_rate, torch.tensor([0.75, 0.0], dtype=torch.double)
+        )
+
     def test_batch_coverage_metrics_are_opt_in(self) -> None:
         disabled = self._make_computation(report_batch_coverage=False)
         enabled = self._make_computation(report_batch_coverage=True)
@@ -419,5 +479,8 @@ class SessionPairwiseAUCTest(unittest.TestCase):
         self.assertFalse(hasattr(disabled, EFFECTIVE_EXAMPLE_COUNT))
         self.assertEqual(len(disabled._compute()), 2)
         self.assertTrue(hasattr(enabled, VALID_PAIR_COUNT))
+        self.assertTrue(hasattr(enabled, SAME_SESSION_PAIR_COUNT))
         self.assertTrue(hasattr(enabled, EFFECTIVE_EXAMPLE_COUNT))
-        self.assertEqual(len(enabled._compute()), 6)
+        self.assertTrue(hasattr(enabled, DEGENERATE_SESSION_COUNT))
+        self.assertTrue(hasattr(enabled, SINGLETON_SESSION_COUNT))
+        self.assertEqual(len(enabled._compute()), 18)

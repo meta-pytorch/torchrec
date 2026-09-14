@@ -24,7 +24,14 @@ from torchrec.metrics.rec_metric import (
 CORRECT_PAIR_WEIGHT = "correct_pair_weight"
 TOTAL_PAIR_WEIGHT = "total_pair_weight"
 VALID_PAIR_COUNT = "valid_pair_count"
+SAME_SESSION_PAIR_COUNT = "same_session_pair_count"
 EFFECTIVE_EXAMPLE_COUNT = "effective_example_count"
+EXAMPLE_COUNT = "example_count"
+DEGENERATE_SESSION_COUNT = "degenerate_session_count"
+SESSION_COUNT = "session_count"
+GROUP_SIZE_SUM = "group_size_sum"
+GROUP_SIZE_MAX_SUM = "group_size_max_sum"
+SINGLETON_SESSION_COUNT = "singleton_session_count"
 BATCH_COUNT = "batch_count"
 REQUIRED_INPUTS = "required_inputs"
 DEFAULT_SESSION_KEY = "session_id"
@@ -73,9 +80,12 @@ def _get_session_pairwise_auc_states(
             1[abs(label_i - label_j) >= 1e-6] *
             1[weight_i * weight_j > 0])
 
-    The prediction values and the magnitude of the pair weight do not affect
-    this count. Coverage states are not computed or returned when the option is
-    disabled.
+    ``same_session_pair_count`` applies the same example-validity rule before
+    the label-inequality filter, so ``1 - valid / same_session`` measures the
+    tied-label rate rather than conflating ties with zero-weight examples. The
+    group-health states use the raw in-batch sessions and labels, independent of
+    weights. Prediction values and pair-weight magnitude do not affect any
+    coverage state. Coverage states are absent when the option is disabled.
     """
     if predictions.shape != labels.shape or predictions.shape != example_weights.shape:
         raise RecMetricException(
@@ -95,7 +105,14 @@ def _get_session_pairwise_auc_states(
     if report_batch_coverage:
         coverage_states = {
             VALID_PAIR_COUNT: torch.zeros_like(correct_pair_weight),
+            SAME_SESSION_PAIR_COUNT: torch.zeros_like(correct_pair_weight),
             EFFECTIVE_EXAMPLE_COUNT: torch.zeros_like(correct_pair_weight),
+            EXAMPLE_COUNT: torch.zeros_like(correct_pair_weight),
+            DEGENERATE_SESSION_COUNT: torch.zeros_like(correct_pair_weight),
+            SESSION_COUNT: torch.zeros_like(correct_pair_weight),
+            GROUP_SIZE_SUM: torch.zeros_like(correct_pair_weight),
+            GROUP_SIZE_MAX_SUM: torch.zeros_like(correct_pair_weight),
+            SINGLETON_SESSION_COUNT: torch.zeros_like(correct_pair_weight),
         }
 
     order = torch.argsort(session_ids)
@@ -151,7 +168,7 @@ def _get_session_pairwise_auc_states(
         ),
         diagonal=1,
     )
-    valid_pair = (
+    raw_same_session_pair = (
         valid_example.unsqueeze(-1)
         & valid_example.unsqueeze(-2)
         & upper_triangle.unsqueeze(0)
@@ -166,9 +183,13 @@ def _get_session_pairwise_auc_states(
     left_weight = packed_weights.unsqueeze(-1)
     right_weight = packed_weights.unsqueeze(-2)
 
-    valid_pair = valid_pair & (torch.abs(label_diff) >= 1e-6)
+    unequal_label_pair = raw_same_session_pair & (torch.abs(label_diff) >= 1e-6)
+    valid_pair = unequal_label_pair
+    same_session_pair = raw_same_session_pair
     if remove_zero_weight_from_pair:
-        valid_pair = valid_pair & ((left_weight * right_weight) > 0)
+        positive_weight_pair = (left_weight * right_weight) > 0
+        valid_pair = valid_pair & positive_weight_pair
+        same_session_pair = same_session_pair & positive_weight_pair
 
     if report_batch_coverage:
         # valid_pair contains each unordered comparison exactly once because it
@@ -177,9 +198,33 @@ def _get_session_pairwise_auc_states(
         coverage_states[VALID_PAIR_COUNT] += torch.sum(
             valid_pair, dim=(1, 2, 3), dtype=torch.double
         )
+        coverage_states[SAME_SESSION_PAIR_COUNT] += torch.sum(
+            same_session_pair, dim=(1, 2, 3), dtype=torch.double
+        )
         effective_example = valid_pair.any(dim=-1) | valid_pair.any(dim=-2)
         coverage_states[EFFECTIVE_EXAMPLE_COUNT] += torch.sum(
             effective_example, dim=(1, 2), dtype=torch.double
+        )
+        coverage_states[EXAMPLE_COUNT] += predictions.shape[1]
+
+        group_size = session_lengths.to(dtype=torch.double)
+        group_size_per_task = group_size.unsqueeze(0).expand(n_tasks, -1)
+        coverage_states[SESSION_COUNT] += num_sessions
+        coverage_states[GROUP_SIZE_SUM] += torch.sum(group_size_per_task, dim=1)
+        coverage_states[GROUP_SIZE_MAX_SUM] += torch.max(
+            group_size_per_task, dim=1
+        ).values
+        coverage_states[SINGLETON_SESSION_COUNT] += torch.sum(
+            group_size_per_task == 1, dim=1, dtype=torch.double
+        )
+
+        # A non-singleton session is degenerate when every raw label is tied.
+        # Singletons are reported separately because they have no possible pair,
+        # regardless of label quality.
+        has_unequal_label_pair = unequal_label_pair.any(dim=-1).any(dim=-1)
+        degenerate_session = (group_size_per_task > 1) & ~has_unequal_label_pair
+        coverage_states[DEGENERATE_SESSION_COUNT] += torch.sum(
+            degenerate_session, dim=1, dtype=torch.double
         )
 
     pair_weight = (
@@ -227,6 +272,26 @@ def _compute_average_per_batch(
     )
 
 
+def _compute_ratio(
+    *, numerator: torch.Tensor, denominator: torch.Tensor
+) -> torch.Tensor:
+    return torch.where(
+        denominator > 0,
+        numerator / denominator,
+        torch.zeros_like(numerator),
+    )
+
+
+def _compute_tied_pair_rate(
+    *, valid_pair_count: torch.Tensor, same_session_pair_count: torch.Tensor
+) -> torch.Tensor:
+    return torch.where(
+        same_session_pair_count > 0,
+        1.0 - valid_pair_count / same_session_pair_count,
+        torch.zeros_like(valid_pair_count),
+    )
+
+
 class SessionPairwiseAUCMetricComputation(RecMetricComputation):
     def __init__(
         self,
@@ -250,7 +315,20 @@ class SessionPairwiseAUCMetricComputation(RecMetricComputation):
         self._report_batch_coverage = report_batch_coverage
         state_names = [CORRECT_PAIR_WEIGHT, TOTAL_PAIR_WEIGHT]
         if self._report_batch_coverage:
-            state_names.extend([VALID_PAIR_COUNT, EFFECTIVE_EXAMPLE_COUNT, BATCH_COUNT])
+            state_names.extend(
+                [
+                    VALID_PAIR_COUNT,
+                    SAME_SESSION_PAIR_COUNT,
+                    EFFECTIVE_EXAMPLE_COUNT,
+                    EXAMPLE_COUNT,
+                    DEGENERATE_SESSION_COUNT,
+                    SESSION_COUNT,
+                    GROUP_SIZE_SUM,
+                    GROUP_SIZE_MAX_SUM,
+                    SINGLETON_SESSION_COUNT,
+                    BATCH_COUNT,
+                ]
+            )
         for state_name in state_names:
             self._add_state(
                 state_name,
@@ -392,6 +470,114 @@ class SessionPairwiseAUCMetricComputation(RecMetricComputation):
                     value=_compute_average_per_batch(
                         value_sum=self.get_window_state(EFFECTIVE_EXAMPLE_COUNT),
                         batch_count=self.get_window_state(BATCH_COUNT),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.TIED_PAIR_RATE,
+                    metric_prefix=MetricPrefix.LIFETIME,
+                    value=_compute_tied_pair_rate(
+                        valid_pair_count=cast(
+                            torch.Tensor, getattr(self, VALID_PAIR_COUNT)
+                        ),
+                        same_session_pair_count=cast(
+                            torch.Tensor, getattr(self, SAME_SESSION_PAIR_COUNT)
+                        ),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.TIED_PAIR_RATE,
+                    metric_prefix=MetricPrefix.WINDOW,
+                    value=_compute_tied_pair_rate(
+                        valid_pair_count=self.get_window_state(VALID_PAIR_COUNT),
+                        same_session_pair_count=self.get_window_state(
+                            SAME_SESSION_PAIR_COUNT
+                        ),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.EFFECTIVE_TRAINING_EXAMPLE_RATE,
+                    metric_prefix=MetricPrefix.LIFETIME,
+                    value=_compute_ratio(
+                        numerator=cast(
+                            torch.Tensor, getattr(self, EFFECTIVE_EXAMPLE_COUNT)
+                        ),
+                        denominator=cast(torch.Tensor, getattr(self, EXAMPLE_COUNT)),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.EFFECTIVE_TRAINING_EXAMPLE_RATE,
+                    metric_prefix=MetricPrefix.WINDOW,
+                    value=_compute_ratio(
+                        numerator=self.get_window_state(EFFECTIVE_EXAMPLE_COUNT),
+                        denominator=self.get_window_state(EXAMPLE_COUNT),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.DEGENERATE_SESSION_FRACTION,
+                    metric_prefix=MetricPrefix.LIFETIME,
+                    value=_compute_ratio(
+                        numerator=cast(
+                            torch.Tensor, getattr(self, DEGENERATE_SESSION_COUNT)
+                        ),
+                        denominator=cast(torch.Tensor, getattr(self, SESSION_COUNT)),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.DEGENERATE_SESSION_FRACTION,
+                    metric_prefix=MetricPrefix.WINDOW,
+                    value=_compute_ratio(
+                        numerator=self.get_window_state(DEGENERATE_SESSION_COUNT),
+                        denominator=self.get_window_state(SESSION_COUNT),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.SESSION_GROUP_SIZE_MEAN,
+                    metric_prefix=MetricPrefix.LIFETIME,
+                    value=_compute_ratio(
+                        numerator=cast(torch.Tensor, getattr(self, GROUP_SIZE_SUM)),
+                        denominator=cast(torch.Tensor, getattr(self, SESSION_COUNT)),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.SESSION_GROUP_SIZE_MEAN,
+                    metric_prefix=MetricPrefix.WINDOW,
+                    value=_compute_ratio(
+                        numerator=self.get_window_state(GROUP_SIZE_SUM),
+                        denominator=self.get_window_state(SESSION_COUNT),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.SESSION_GROUP_SIZE_MAX_PER_BATCH,
+                    metric_prefix=MetricPrefix.LIFETIME,
+                    value=_compute_average_per_batch(
+                        value_sum=cast(torch.Tensor, getattr(self, GROUP_SIZE_MAX_SUM)),
+                        batch_count=cast(torch.Tensor, getattr(self, BATCH_COUNT)),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.SESSION_GROUP_SIZE_MAX_PER_BATCH,
+                    metric_prefix=MetricPrefix.WINDOW,
+                    value=_compute_average_per_batch(
+                        value_sum=self.get_window_state(GROUP_SIZE_MAX_SUM),
+                        batch_count=self.get_window_state(BATCH_COUNT),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.SINGLETON_SESSION_FRACTION,
+                    metric_prefix=MetricPrefix.LIFETIME,
+                    value=_compute_ratio(
+                        numerator=cast(
+                            torch.Tensor, getattr(self, SINGLETON_SESSION_COUNT)
+                        ),
+                        denominator=cast(torch.Tensor, getattr(self, SESSION_COUNT)),
+                    ),
+                ),
+                MetricComputationReport(
+                    name=MetricName.SINGLETON_SESSION_FRACTION,
+                    metric_prefix=MetricPrefix.WINDOW,
+                    value=_compute_ratio(
+                        numerator=self.get_window_state(SINGLETON_SESSION_COUNT),
+                        denominator=self.get_window_state(SESSION_COUNT),
                     ),
                 ),
             ]
