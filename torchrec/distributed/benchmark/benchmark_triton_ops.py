@@ -813,61 +813,101 @@ def bounds_check_cuda(
 class Permute2dConfig(TritonOpConfig):
     """Shared input generation for both 2D-permute backends.
 
-    Defaults give 1,048,576 segments, above triton_permute_2d.MIN_SEGMENTS (700k) where
-    should_use_triton() takes over, at a mean length below PERSEG_MIN_MEAN so the
-    load-balanced kernel is the one measured. Raise mean_pooling_factor past
-    PERSEG_MIN_MEAN to measure the per-segment kernel instead.
+    Defaults match the largest CMF trace shape: 1440 features, batch size 2048,
+    mean pooling factor 29, and key-level length skew. num_output_features
+    supports the production subset and repeated-feature permutations that a full
+    permutation misses. Set key_skew_sigma to zero for i.i.d. lengths.
     """
 
-    num_features: int = 1024
-    permute_batch_size: int = 1024
-    mean_pooling_factor: int = 1
+    num_features: int = 1440
+    num_output_features: int = 1440
+    permute_batch_size: int = 2048
+    mean_pooling_factor: int = 29
+    key_skew_sigma: float = 4.0
     has_weight: bool = False
-    gpu_backlog_ms: float = 5.0
+    gpu_backlog_ms: float = 20.0
 
     def make_inputs(self, device: torch.device) -> Dict[str, Any]:
         """Build (permute, lengths, values, weights, permuted_lengths_sum).
 
-        ``permute`` is a full permutation, so ``permuted_lengths_sum`` is just the
-        total. Real call sites also pass subsets and repeats, which is why fbgemm
-        carries the sum as a separate argument; this keeps the simple case so the two
-        backends move exactly the same bytes.
+        num_output_features at or below num_features selects a subset without
+        replacement. Larger outputs contain every input feature once and fill the
+        remainder with repeated features.
         """
-        lengths = torch.randint(
-            low=0,
-            high=max(2 * self.mean_pooling_factor, 2),
-            size=(self.num_features, self.permute_batch_size),
-            dtype=torch.int32,
-            device=device,
-        )
-        permuted_lengths_sum = int(lengths.sum().item())
+        if self.num_features <= 0 or self.permute_batch_size <= 0:
+            raise ValueError("num_features and permute_batch_size must be positive")
+        if self.num_output_features <= 0 or self.mean_pooling_factor <= 0:
+            raise ValueError(
+                "num_output_features and mean_pooling_factor must be positive"
+            )
+        if self.key_skew_sigma < 0:
+            raise ValueError("key_skew_sigma must be nonnegative")
+        if self.key_skew_sigma == 0:
+            lengths = torch.randint(
+                low=0,
+                high=max(2 * self.mean_pooling_factor, 2),
+                size=(self.num_features, self.permute_batch_size),
+                dtype=torch.int32,
+                device=device,
+            )
+        else:
+            log_rates = torch.randn(self.num_features, device=device)
+            log_rates *= self.key_skew_sigma
+            rates = torch.exp(log_rates - log_rates.max())
+            rates *= self.mean_pooling_factor * self.num_features / rates.sum()
+            lengths = torch.poisson(
+                rates[:, None].expand(-1, self.permute_batch_size)
+            ).to(torch.int32)
+        input_lengths_sum = int(lengths.sum().item())
         values = torch.randint(
             low=0,
             high=int(1e5),
-            size=(permuted_lengths_sum,),
+            size=(input_lengths_sum,),
             dtype=torch.int32,
             device=device,
         )
-        permute = torch.randperm(self.num_features, device=device).to(torch.int32)
+        base_permute = torch.randperm(self.num_features, device=device)
+        if self.num_output_features <= self.num_features:
+            permute_indices = base_permute[: self.num_output_features]
+        else:
+            permute_indices = torch.cat(
+                [
+                    base_permute,
+                    torch.randint(
+                        self.num_features,
+                        (self.num_output_features - self.num_features,),
+                        device=device,
+                    ),
+                ]
+            )
+        permuted_lengths_sum = int(
+            lengths.index_select(0, permute_indices).sum().item()
+        )
+        permute = permute_indices.to(torch.int32)
 
-        num_segments = self.num_features * self.permute_batch_size
+        input_segments = self.num_features * self.permute_batch_size
+        output_segments = self.num_output_features * self.permute_batch_size
         logger.info(
-            "%d segments (MIN_SEGMENTS=%d), %d values, mean length %.2f -> %s kernel",
-            num_segments,
+            "%d input segments, %d input values, %d output segments "
+            "(MIN_SEGMENTS=%d), %d output values, mean output length %.2f -> %s "
+            "kernel",
+            input_segments,
+            input_lengths_sum,
+            output_segments,
             MIN_SEGMENTS,
             permuted_lengths_sum,
-            permuted_lengths_sum / max(num_segments, 1),
+            permuted_lengths_sum / output_segments,
             (
                 "per-segment"
-                if permuted_lengths_sum >= num_segments * PERSEG_MIN_MEAN
+                if permuted_lengths_sum >= output_segments * PERSEG_MIN_MEAN
                 else "blocked"
             ),
         )
-        if num_segments < MIN_SEGMENTS:
+        if output_segments < MIN_SEGMENTS:
             logger.warning(
                 "%d segments is below MIN_SEGMENTS=%d, where should_use_triton() defers "
                 "to fbgemm; this does not reflect a shape the Triton path would serve.",
-                num_segments,
+                output_segments,
                 MIN_SEGMENTS,
             )
         return {
@@ -875,11 +915,12 @@ class Permute2dConfig(TritonOpConfig):
             "lengths": lengths,
             "values": values,
             "weights": (
-                torch.rand(permuted_lengths_sum, dtype=torch.float32, device=device)
+                torch.rand(input_lengths_sum, dtype=torch.float32, device=device)
                 if self.has_weight
                 else None
             ),
             "permuted_lengths_sum": permuted_lengths_sum,
+            "input_lengths_sum": input_lengths_sum,
         }
 
 
@@ -891,10 +932,14 @@ def permute_2d_triton(
     values: torch.Tensor,
     weights: Optional[torch.Tensor],
     permuted_lengths_sum: int,
+    input_lengths_sum: int,
     **_kwargs: Dict[str, Any],
 ) -> None:
     """Benchmark TorchRec's Triton replacement for permute_2D_sparse_data."""
-    with record_function("## triton_permute_2d_sparse_data ##"):
+    with record_function(
+        "## triton_permute_2d_sparse_data "
+        f"input_values={input_lengths_sum} output_values={permuted_lengths_sum} ##"
+    ):
         triton_permute_2d_sparse_data(
             permute, lengths, values, weights, permuted_lengths_sum
         )
@@ -908,10 +953,14 @@ def permute_2d_fbgemm(
     values: torch.Tensor,
     weights: Optional[torch.Tensor],
     permuted_lengths_sum: int,
+    input_lengths_sum: int,
     **_kwargs: Dict[str, Any],
 ) -> None:
     """Benchmark FBGEMM's CUDA permute_2D_sparse_data baseline."""
-    with record_function("## permute_2D_sparse_data ##"):
+    with record_function(
+        "## permute_2D_sparse_data "
+        f"input_values={input_lengths_sum} output_values={permuted_lengths_sum} ##"
+    ):
         torch.ops.fbgemm.permute_2D_sparse_data(
             permute, lengths, values, weights, permuted_lengths_sum
         )
