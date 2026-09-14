@@ -34,7 +34,10 @@ from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
-from torchrec.distributed.model_parallel import HybridEvalDMP
+from torchrec.distributed.model_parallel import (
+    DefaultDataParallelWrapper,
+    HybridEvalDMP,
+)
 from torchrec.distributed.pec_embedding import PECEmbeddingCollectionSharder
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.planner.constants import POOLING_FACTOR
@@ -365,6 +368,8 @@ class ShardingConfig:
             a real one for dense parameters. Useful for eval-only workflows.
         deepcopy_model: If True (default), deepcopy the model before passing to DMP.
             Set to False to save memory when the original model is not needed.
+        allreduce_comm_precision: Reduced precision for the dense gradient
+            allreduce, e.g. "bf16" or "bf16_stream". None keeps FP32.
     """
 
     fused_params: Dict[str, Any] = field(default_factory=dict)
@@ -377,6 +382,7 @@ class ShardingConfig:
     embedding_device: Optional[str] = None
     skip_dense_optimizer: bool = False
     deepcopy_model: bool = True
+    allreduce_comm_precision: Optional[str] = None
 
     def _convert_fused_params(self) -> Optional[Dict[str, Any]]:
         """
@@ -442,6 +448,16 @@ class ShardingConfig:
         """
         sharders, plan = self._plan_and_sharders(model, pg, planner)
 
+        # Only override the wrapper when a precision is configured; otherwise
+        # let DMP build its default wrapper so existing behavior is unchanged.
+        data_parallel_wrapper = (
+            DefaultDataParallelWrapper(
+                allreduce_comm_precision=self.allreduce_comm_precision,
+            )
+            if self.allreduce_comm_precision is not None
+            else None
+        )
+
         return DistributedModelParallel(
             module=copy.deepcopy(model) if self.deepcopy_model else model,
             env=ShardingEnv.from_process_group(pg),
@@ -449,6 +465,7 @@ class ShardingConfig:
             device=device,
             sharders=sharders,
             plan=plan,
+            data_parallel_wrapper=data_parallel_wrapper,
         ).to(device)
 
     def generate_hybrid_dmp_model(
