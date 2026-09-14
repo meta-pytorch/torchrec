@@ -818,11 +818,15 @@ class ParameterSharding:
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE or PS.
         bag_size_hints (Optional[List[int]]): expected bag size for each feature,
             used only by FUSED_TRITON.
+        num_nodes (Optional[int]): number of nodes this table's rows are split
+            across; see `ParameterConstraints.num_nodes`.
 
     NOTE:
       ShardingType.TABLE_WISE - rank where this embedding is placed
       ShardingType.COLUMN_WISE - rank where the embedding shards are placed, seen as individual tables
-      ShardingType.TABLE_ROW_WISE  - first rank when this embedding is placed
+      ShardingType.TABLE_ROW_WISE  - first rank when this embedding is placed;
+        with num_nodes > 1, one rank per row block, positionally paired with
+        sharding_spec.shards
       ShardingType.ROW_WISE, ShardingType.DATA_PARALLEL - unused
 
     """
@@ -838,6 +842,7 @@ class ParameterSharding:
     output_dtype: Optional[DataType] = None
     key_value_params: Optional[KeyValueParams] = None
     bag_size_hints: Optional[List[int]] = None
+    num_nodes: Optional[int] = None
 
 
 class EmbeddingModuleShardingPlan(ModuleShardingPlan, Dict[str, ParameterSharding]):

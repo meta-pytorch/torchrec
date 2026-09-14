@@ -175,6 +175,14 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             # pyrefly: ignore[missing-attribute]
             shards = info.param_sharding.sharding_spec.shards
 
+            table_name = info.embedding_config.name
+            num_nodes: int = info.param_sharding.num_nodes or 1
+            if num_nodes > 1:
+                raise NotImplementedError(
+                    f"'{table_name}': TABLE_ROW_WISE num_nodes={num_nodes} is "
+                    "not supported by the runtime yet."
+                )
+
             # construct the global sharded_tensor_metadata
             global_metadata = ShardedTensorMetadata(
                 shards_metadata=shards,

@@ -19,6 +19,10 @@ from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
 from torchrec.distributed.planner.constants import BATCH_SIZE
 from torchrec.distributed.planner.enumerators import EmbeddingEnumerator
+from torchrec.distributed.planner.partitioners import (
+    GreedyPerfPartitioner,
+    ShardingOptionGroup,
+)
 from torchrec.distributed.planner.perf_models import NoopPerfModel
 from torchrec.distributed.planner.planners import (
     EmbeddingShardingPlanner,
@@ -35,7 +39,10 @@ from torchrec.distributed.planner.storage_reservations import (
     SKUAwareStorageReservation,
 )
 from torchrec.distributed.planner.types import (
+    DeviceHardware,
     ParameterConstraints,
+    PartitionByType,
+    Perf,
     PlanLoader,
     PlannerContextFingerprintError,
     PlannerError,
@@ -53,6 +60,7 @@ from torchrec.distributed.types import (
     CacheParams,
     DataType,
     EmbeddingModuleShardingPlan,
+    EnumerableShardingSpec,
     KeyValueParams,
     ModuleSharder,
     ShardingPlan,
@@ -386,6 +394,234 @@ class TestEmbeddingShardingPlannerWithConstraints(unittest.TestCase):
                 constraint.bounds_check_mode, sharding_option.bounds_check_mode
             )
             self.assertEqual(constraint.is_weighted, sharding_option.is_weighted)
+
+
+class TWRWSharder(EmbeddingBagCollectionSharder):
+    def sharding_types(self, compute_device_type: str) -> List[str]:
+        return [ShardingType.TABLE_ROW_WISE.value]
+
+    def compute_kernels(
+        self, sharding_type: str, compute_device_type: str
+    ) -> List[str]:
+        return [EmbeddingComputeKernel.FUSED.value]
+
+
+def _multi_host_devices(
+    num_hosts: int, host_load: Optional[List[float]] = None
+) -> List[List[DeviceHardware]]:
+    """`num_hosts` hosts of 2 ranks, optionally pre-loaded to set perf order."""
+    return [
+        [
+            DeviceHardware(
+                rank=host * 2 + local,
+                storage=Storage(hbm=1024 * 1024, ddr=0),
+                perf=Perf(
+                    fwd_compute=host_load[host] if host_load else 0.0,
+                    fwd_comms=0,
+                    bwd_compute=0,
+                    bwd_comms=0,
+                ),
+            )
+            for local in range(2)
+        ]
+        for host in range(num_hosts)
+    ]
+
+
+def _multi_host_group(
+    sharding_type: str, num_nodes: int, rows: int
+) -> ShardingOptionGroup:
+    """One table cut into `num_nodes` nodes' worth of shards at a node width of 2."""
+    num_shards = num_nodes * 2
+    block = rows // num_shards
+    return ShardingOptionGroup(
+        sharding_options=[
+            ShardingOption(
+                name="table_0",
+                tensor=torch.empty((rows, 64), device="meta"),
+                module=("sparse.ebc", nn.Module()),
+                input_lengths=[1.0],
+                batch_size=BATCH_SIZE,
+                sharding_type=sharding_type,
+                partition_by=PartitionByType.MULTI_HOST.value,
+                compute_kernel=EmbeddingComputeKernel.FUSED.value,
+                # Explicit so the bare module above is never walked for a
+                # pooling type it cannot have.
+                is_pooled=True,
+                shards=[
+                    Shard(
+                        size=[block, 64],
+                        offset=[block * i, 0],
+                        storage=Storage(hbm=1024, ddr=0),
+                        perf=Perf(
+                            fwd_compute=0, fwd_comms=0, bwd_compute=0, bwd_comms=0
+                        ),
+                    )
+                    for i in range(num_shards)
+                ],
+                num_nodes=num_nodes,
+            )
+        ],
+        storage_sum=Storage(hbm=num_shards * 1024, ddr=0),
+        perf_sum=0.0,
+        param_count=1,
+    )
+
+
+class TestTableRowWiseNumNodes(unittest.TestCase):
+    """`num_nodes` reaches the plan both as a declared field and as a placement."""
+
+    def setUp(self) -> None:
+        # 2 nodes of 2 ranks: enough for a table to span both.
+        self.topology = Topology(
+            world_size=4,
+            local_world_size=2,
+            hbm_cap=1024 * 1024 * 8,
+            compute_device="cuda",
+        )
+        self.tables = [
+            EmbeddingBagConfig(
+                num_embeddings=1000,
+                embedding_dim=64,
+                name="table_" + str(i),
+                feature_names=["feature_" + str(i)],
+            )
+            for i in range(2)
+        ]
+
+    def _plan(
+        self, constraints: Dict[str, ParameterConstraints]
+    ) -> EmbeddingModuleShardingPlan:
+        planner = EmbeddingShardingPlanner(
+            topology=self.topology, constraints=constraints
+        )
+        model = TestSparseNN(tables=self.tables, sparse_device=torch.device("meta"))
+        plan = planner.plan(
+            module=model,
+            sharders=[cast(ModuleSharder[nn.Module], TWRWSharder())],
+        )
+        return cast(EmbeddingModuleShardingPlan, plan.plan["sparse.ebc"])
+
+    def test_num_nodes_reaches_parameter_sharding(self) -> None:
+        """The constraint reaches `ParameterSharding` and cuts the rows over the
+        span; a table that does not opt in is untouched."""
+        ebc_plan = self._plan(
+            {
+                "table_0": ParameterConstraints(num_nodes=2),
+                "table_1": ParameterConstraints(),
+            }
+        )
+
+        split = ebc_plan["table_0"]
+        self.assertEqual(split.num_nodes, 2)
+        # Exact list, not a set of nodes: `{r // 2 for r in ranks} == {0, 1}`
+        # also holds for [0, 0, 2, 2], the duplicate-rank placement.
+        self.assertEqual(none_throws(split.ranks), [0, 1, 2, 3])
+        # Rows are partitioned across the 4 ranks, not replicated onto each:
+        # giving every rank `rows / num_nodes` stays numerically correct while
+        # silently doubling memory.
+        shards = none_throws(
+            cast(EnumerableShardingSpec, none_throws(split.sharding_spec)).shards
+        )
+        self.assertEqual([tuple(s.shard_sizes) for s in shards], [(250, 64)] * 4)
+        self.assertEqual(
+            [tuple(s.shard_offsets) for s in shards],
+            [(0, 0), (250, 0), (500, 0), (750, 0)],
+        )
+
+        # A table that does not opt in stays indistinguishable from stock: the
+        # field is unset rather than back-filled with 1, over one node's ranks.
+        stock = ebc_plan["table_1"]
+        self.assertIsNone(stock.num_nodes)
+        self.assertIn(none_throws(stock.ranks), ([0, 1], [2, 3]))
+        stock_shards = none_throws(
+            cast(EnumerableShardingSpec, none_throws(stock.sharding_spec)).shards
+        )
+        self.assertEqual([tuple(s.shard_sizes) for s in stock_shards], [(500, 64)] * 2)
+
+    def test_num_nodes_one_hashes_as_unset(self) -> None:
+        """A stored plan refuses to load when the constraint digest differs, so
+        a difference here strands the plan of anyone writing `num_nodes=1`."""
+        self.assertEqual(
+            hash(ParameterConstraints()), hash(ParameterConstraints(num_nodes=1))
+        )
+        self.assertNotEqual(
+            hash(ParameterConstraints()), hash(ParameterConstraints(num_nodes=2))
+        )
+
+    def test_unusable_num_nodes_is_rejected(self) -> None:
+        """0 reaches `_multi_hosts_partition` as a zero-host placement, a
+        negative slices the host list backwards, and an oversized value has no
+        node to put the last row block on."""
+        # Matched on message, not on a bare PlannerError: storage exhaustion and
+        # partition failure raise the same type, so a bare check would pass with
+        # the validation deleted.
+        for num_nodes, message in (
+            (3, "exceeds the 2 node"),
+            (0, "must be >= 1"),
+            (-1, "must be >= 1"),
+        ):
+            with self.subTest(num_nodes=num_nodes):
+                with self.assertRaisesRegex(PlannerError, message):
+                    self._plan({"table_0": ParameterConstraints(num_nodes=num_nodes)})
+
+    def test_unusable_num_nodes_is_rejected_for_another_sharding_type(self) -> None:
+        """A sharder that never offers TABLE_ROW_WISE still fingerprints
+        `num_nodes`, so an unusable value has to be rejected there too."""
+        planner = EmbeddingShardingPlanner(
+            topology=self.topology,
+            constraints={"table_0": ParameterConstraints(num_nodes=3)},
+        )
+        model = TestSparseNN(tables=self.tables, sparse_device=torch.device("meta"))
+        with self.assertRaisesRegex(PlannerError, "exceeds the 2 node"):
+            planner.plan(
+                module=model,
+                sharders=[cast(ModuleSharder[nn.Module], TWvsRWSharder())],
+            )
+
+    def test_multi_host_partition_places_row_blocks_in_rank_order(self) -> None:
+        """`_uniform_partition` consumes the device list positionally, so perf
+        order would decide which node holds row block 0. The runtime takes a
+        feature's bucket from a rank's index there and stored plans persist
+        rank-sorted, so that would reload as a different placement."""
+        # Host 0 is loaded, making perf order the reverse of rank order.
+        row_wise = _multi_host_group(ShardingType.TABLE_ROW_WISE.value, 2, 1000)
+        GreedyPerfPartitioner._multi_hosts_partition(
+            row_wise, _multi_host_devices(2, host_load=[100.0, 0.0])
+        )
+        self.assertEqual(
+            [shard.rank for shard in row_wise.sharding_options[0].shards], [0, 1, 2, 3]
+        )
+
+        # GRID_SHARD shares this path and keeps the perf order it has today.
+        grid = _multi_host_group(ShardingType.GRID_SHARD.value, 2, 1000)
+        GreedyPerfPartitioner._multi_hosts_partition(
+            grid, _multi_host_devices(2, host_load=[100.0, 0.0])
+        )
+        self.assertEqual(
+            [shard.rank for shard in grid.sharding_options[0].shards], [2, 3, 0, 1]
+        )
+
+    def test_multi_host_partition_rejects_a_reused_host(self) -> None:
+        """Host selection wraps circularly, which GRID_SHARD tolerates and
+        row-wise cannot: two row blocks on one rank is a duplicate bucket
+        destination."""
+        # Called directly because `_extract_num_nodes` rejects the oversized
+        # `num_nodes` first; this is the second line of that defense.
+        with self.assertRaisesRegex(PlannerError, "reused a node"):
+            GreedyPerfPartitioner._multi_hosts_partition(
+                _multi_host_group(ShardingType.TABLE_ROW_WISE.value, 3, 1002),
+                _multi_host_devices(2),
+            )
+
+        # Three real hosts must still place, or a check that rejected every
+        # multi-node TABLE_ROW_WISE placement would pass the assertion above.
+        group = _multi_host_group(ShardingType.TABLE_ROW_WISE.value, 3, 1002)
+        GreedyPerfPartitioner._multi_hosts_partition(group, _multi_host_devices(3))
+        self.assertEqual(
+            [shard.rank for shard in group.sharding_options[0].shards],
+            [0, 1, 2, 3, 4, 5],
+        )
 
 
 class TestEmbeddingShardingHashPlannerContextInputs(unittest.TestCase):

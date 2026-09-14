@@ -9,7 +9,7 @@
 
 import copy
 import unittest
-from typing import Any, Dict, List, Optional
+from typing import Any, cast, Dict, List, Optional
 
 import hypothesis.strategies as st
 import torch
@@ -39,6 +39,7 @@ from torchrec.distributed.sharding_plan import (
     QuantEmbeddingCollectionSharder,
     row_wise,
     table_row_wise,
+    table_row_wise_multi_node,
     table_wise,
 )
 from torchrec.distributed.test_utils.multi_process import (
@@ -55,6 +56,7 @@ from torchrec.distributed.types import (
     ShardingType,
     ShardMetadata,
 )
+from torchrec.distributed.utils import none_throws
 from torchrec.modules.embedding_configs import data_type_to_dtype, EmbeddingBagConfig
 from torchrec.modules.embedding_modules import (
     EmbeddingBagCollection,
@@ -1124,6 +1126,98 @@ class ConstructParameterShardingTest(unittest.TestCase):
         self.assertIn(
             "column dim of 65 cannot be evenly divided across [0, 1]",
             str(context.exception),
+        )
+
+    def _multi_node_plan(
+        self,
+        per_param_sharding: Dict[str, ParameterShardingGenerator],
+        world_size: int,
+        num_embeddings: int = 1000,
+    ) -> EmbeddingModuleShardingPlan:
+        tables = [
+            EmbeddingBagConfig(
+                name=name,
+                feature_names=["feature_" + name],
+                embedding_dim=64,
+                num_embeddings=num_embeddings,
+                data_type=DataType.FP32,
+            )
+            for name in per_param_sharding
+        ]
+        return construct_module_sharding_plan(
+            EmbeddingBagCollection(tables=tables),
+            per_param_sharding=per_param_sharding,
+            local_size=2,
+            world_size=world_size,
+            device_type="cuda",
+        )
+
+    def test_table_row_wise_multi_node_rejects_empty_span(self) -> None:
+        """An empty span leaves no ranks to place the table on."""
+        with self.assertRaisesRegex(ValueError, "at least one host"):
+            table_row_wise_multi_node(host_indexes=[])
+
+    def test_table_row_wise_multi_node_rejects_repeated_host(self) -> None:
+        """Two row blocks on one rank is a duplicate bucket destination."""
+        with self.assertRaisesRegex(ValueError, "names a host twice"):
+            table_row_wise_multi_node(host_indexes=[1, 1])
+
+    def test_table_row_wise_multi_node_rejects_host_past_the_end(self) -> None:
+        """Hosts are bounded against the world, or the plan names ranks that do
+        not exist."""
+        for host_indexes in ([1, 2], [-1, 0]):  # a 2-host world
+            with self.subTest(host_indexes=host_indexes):
+                with self.assertRaisesRegex(ValueError, r"but there are only 2"):
+                    self._multi_node_plan(
+                        {
+                            "table_0": table_row_wise_multi_node(
+                                host_indexes=host_indexes
+                            )
+                        },
+                        world_size=4,
+                    )
+
+    def test_table_row_wise_multi_node_sorts_a_scattered_span(self) -> None:
+        """Hosts need not be adjacent; the span is sorted because a plan is
+        persisted rank-ascending and reloaded with offsets in that order. The
+        span ends on the last host, so an off-by-one bound fails here."""
+        plan = self._multi_node_plan(
+            {
+                "table_0": table_row_wise_multi_node(host_indexes=[3, 0]),
+                "table_1": table_row_wise_multi_node(host_indexes=[1]),
+            },
+            world_size=8,
+        )
+        self.assertEqual(none_throws(plan["table_0"].ranks), [0, 1, 6, 7])
+        self.assertEqual(plan["table_0"].num_nodes, 2)
+        # A one-node span stays indistinguishable from a pre-feature plan.
+        self.assertEqual(none_throws(plan["table_1"].ranks), [2, 3])
+        self.assertIsNone(plan["table_1"].num_nodes)
+
+    def test_table_row_wise_multi_node_cuts_rows_across_the_span(self) -> None:
+        """Rows are partitioned over the span, not replicated per node: 10 rows
+        over 4 ranks is a `ceil` cut of 3/3/3/1."""
+        plan = self._multi_node_plan(
+            {
+                "table_0": table_row_wise_multi_node(host_indexes=[2, 0]),
+                "table_1": table_row_wise_multi_node(host_indexes=[1]),
+            },
+            world_size=8,
+            num_embeddings=10,
+        )
+
+        shards = none_throws(
+            cast(
+                EnumerableShardingSpec, none_throws(plan["table_0"].sharding_spec)
+            ).shards
+        )
+        self.assertEqual(
+            [tuple(shard.shard_sizes) for shard in shards],
+            [(3, 64), (3, 64), (3, 64), (1, 64)],
+        )
+        self.assertEqual(
+            [tuple(shard.shard_offsets) for shard in shards],
+            [(0, 0), (3, 0), (6, 0), (9, 0)],
         )
 
 
