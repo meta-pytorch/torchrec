@@ -58,6 +58,7 @@ from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
 )
 from torchrec.sparse.jagged_tensor import _kt_regroup_arguments, JaggedTensor
 from torchrec.sparse.triton_batch_index_select import triton_batch_index_select_dim0
+from torchrec.sparse.triton_pack_segments import triton_pack_segments
 from torchrec.sparse.triton_permute_2d import (
     MIN_SEGMENTS,
     PERSEG_MIN_MEAN,
@@ -1082,6 +1083,117 @@ def batch_index_select_dim0_torch(
             dim=1,
         ).flatten()
         _run_batch_index_select_backward(output, inputs, grad_output, run_backward)
+
+
+############################ pack segments configs ###################################
+@dataclass
+class PackSegmentsConfig(TritonOpConfig):
+    """Jagged sequence shapes observed in the CMF training traces."""
+
+    batch_size: int = 2048
+    max_length: int = 200
+    mean_length: int = 172
+    dim: int = 96
+    run_backward: bool = False
+    dtype: str = "bfloat16"
+    gpu_backlog_ms: float = 20.0
+
+    def make_inputs(self, device: torch.device) -> Dict[str, Any]:
+        dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(self.dtype)
+        if dtype is None:
+            raise ValueError("dtype must be float32, float16, or bfloat16")
+        if self.batch_size <= 0 or self.max_length <= 0 or self.dim <= 0:
+            raise ValueError("batch_size, max_length, and dim must be positive")
+        if self.mean_length <= 0:
+            raise ValueError("mean_length must be positive")
+
+        half_range = min(self.mean_length - 1, self.max_length // 2)
+        low = self.mean_length - half_range
+        high = self.mean_length + half_range + 1
+        lengths = torch.randint(
+            low,
+            high,
+            (self.batch_size,),
+            dtype=torch.int64,
+            device=device,
+        )
+        total_length = int(lengths.sum().item())
+        input = torch.randn(
+            total_length,
+            self.dim,
+            dtype=dtype,
+            device=device,
+            requires_grad=self.run_backward,
+        )
+        grad_output = (
+            torch.randn(
+                self.batch_size,
+                self.max_length,
+                self.dim,
+                dtype=dtype,
+                device=device,
+            )
+            if self.run_backward
+            else None
+        )
+        logger.info(
+            "B=%d max_length=%d mean_length=%.1f D=%d total_rows=%d",
+            self.batch_size,
+            self.max_length,
+            total_length / self.batch_size,
+            self.dim,
+            total_length,
+        )
+        return {
+            "input": input,
+            "lengths": lengths,
+            "grad_output": grad_output,
+        }
+
+
+def _run_pack_segments_backward(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    grad_output: Optional[torch.Tensor],
+    run_backward: bool,
+) -> None:
+    if run_backward:
+        assert grad_output is not None
+        torch.autograd.grad(output, input, grad_output)
+
+
+@register_benchmark(PackSegmentsConfig)
+def pack_segments_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    lengths: torch.Tensor,
+    grad_output: Optional[torch.Tensor],
+    max_length: int,
+    run_backward: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## triton_pack_segments ##"):
+        output = triton_pack_segments(input, lengths, max_length)
+        _run_pack_segments_backward(output, input, grad_output, run_backward)
+
+
+@register_benchmark(PackSegmentsConfig)
+def pack_segments_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    input: torch.Tensor,
+    lengths: torch.Tensor,
+    grad_output: Optional[torch.Tensor],
+    max_length: int,
+    run_backward: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function("## fbgemm_pack_segments ##"):
+        output = torch.ops.fbgemm.pack_segments(input, lengths, max_length)
+        _run_pack_segments_backward(output, input, grad_output, run_backward)
 
 
 ######################## quantized communication configs ############################
