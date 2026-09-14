@@ -777,11 +777,12 @@ class MetricStateSnapshotTest(unittest.TestCase):
         self._test_metric_state_roundtrip(WeightedAvgMetric)
 
 
-# Golden snapshot keys for ThroughputMetric and RecMetricModule
-THROUGHPUT_SNAPSHOT_KEY = "ThroughputMetric"
-THROUGHPUT_WITH_STAGES_SNAPSHOT_KEY = "ThroughputMetric_with_batch_size_stages"
-REC_METRIC_MODULE_SNAPSHOT_KEY = "RecMetricModule"
-REC_METRIC_MODULE_WITH_THROUGHPUT_KEY = "RecMetricModule_with_throughput"
+# Golden snapshot keys for ThroughputMetric and RecMetricModule. These are
+# hand-written and must outlive the class names, so they are not class names.
+THROUGHPUT_SNAPSHOT_KEY = "throughput_metric"
+THROUGHPUT_WITH_STAGES_SNAPSHOT_KEY = "throughput_metric_with_batch_size_stages"
+REC_METRIC_MODULE_SNAPSHOT_KEY = "rec_metric_module"
+REC_METRIC_MODULE_WITH_THROUGHPUT_KEY = "rec_metric_module_with_throughput"
 
 
 class ThroughputMetricBackwardCompatibilityTest(unittest.TestCase):
