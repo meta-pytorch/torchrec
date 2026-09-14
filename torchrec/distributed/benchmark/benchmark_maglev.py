@@ -10,12 +10,9 @@
 """
 Benchmark for the Maglev staged pipeline (MVP).
 
-Measures a microbatched 1F1B schedule, selected by ``--pipeline``: ``1f1b``
-posts each receive immediately before its wait
-(:class:`~torchrec.distributed.maglev.pipeline.Maglev1F1B`, the default), while
-``1f1b-recv-ahead`` posts each receive a microbatch ahead of the compute it feeds
-(:class:`~torchrec.distributed.maglev.pipeline.Maglev1F1BRecvAhead`). The model is a
-``sum(layers_per_stage)``-layer model authored on ``meta`` and cut across
+Measures a microbatched 1F1B schedule, selected by ``--pipeline``. ``1f1b`` is
+the default; ``1f1b-recv-ahead`` remains as a compatibility alias. The model is
+a ``sum(layers_per_stage)``-layer model authored on ``meta`` and cut across
 per-stage process groups (one hardware scale-up domain, HSD, each). One measured
 iteration is the input-dist all-to-all plus one full 1F1B pass over
 ``num_microbatches`` microbatches, including the cross-HSD activation / gradient
@@ -46,6 +43,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torchrec.distributed.maglev.stage as maglev_stage
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )
@@ -64,7 +62,11 @@ from torchrec.distributed.maglev.pipeline import (
     Maglev1F1BRecvAhead,
     MaglevPipelineBase,
 )
-from torchrec.distributed.maglev.stage import remap_plan_to_process_group, StageWrapper
+from torchrec.distributed.maglev.stage import (
+    HandoffPGMode,
+    remap_plan_to_process_group,
+    StageWrapper,
+)
 from torchrec.distributed.model_parallel import (
     DefaultDataParallelWrapper,
     DistributedModelParallel,
@@ -92,10 +94,10 @@ from torchrec.optim.optimizers import in_backward_optimizer_filter
 _WEIGHT_SEED = 100
 
 # Selectable schedules, by --pipeline. "base" runs one microbatch per pass and
-# so is the un-pipelined reference the 1F1B variants are worth measuring against;
-# the two 1F1B entries move identical data and differ only in where the receives
-# are posted. sample_count is taken from the pipeline's microbatches_per_pass, so
-# throughput stays comparable across all three.
+# so is the un-pipelined reference the 1F1B schedule is measured against.
+# sample_count is taken from the pipeline's microbatches_per_pass, so throughput
+# stays comparable across the entries. The recv-ahead name is kept for callers
+# of the earlier experimental schedule.
 _PIPELINE_CLS: Dict[str, Type[MaglevPipelineBase]] = {
     "base": MaglevPipelineBase,
     "1f1b": Maglev1F1B,
@@ -199,11 +201,13 @@ class RunOptions(BenchFuncConfig):
         pipeline (str): Which schedule to measure. Options:
             - "base": one microbatch per pass, no pipelining -- the reference the
               1F1B variants are worth measuring against
-            - "1f1b": each receive posted immediately before its wait
-            - "1f1b-recv-ahead": each receive posted a microbatch ahead of the
-              compute it feeds
-            The two 1F1B variants move identical data; only the receive placement
-            differs. Default is "1f1b".
+            - "1f1b": the standard bidirectional 1F1B schedule
+            - "1f1b-recv-ahead": split-mode 1F1B with receives posted one
+              microbatch ahead; shared mode uses its batched crossover schedule
+            Default is "1f1b".
+        handoff_pg_mode (str): Whether activation and gradient traffic uses
+            separate process groups ("split", the default) or one shared process
+            group with batched steady-state exchanges ("shared").
         num_tables (int): Embedding tables per layer (one feature each). Default is 8.
         num_embeddings (int): Rows per embedding table. Default is 1000000.
         emb_dim (int): Embedding dimension ``D``. Default is 256.
@@ -238,14 +242,14 @@ class RunOptions(BenchFuncConfig):
     ranks_per_stage: int = 2
     # Heavy default: batch_size * layer_dim * 4B = 8192 * 4096 * 4 = 128 MiB
     # cross-stage activation, past NCCL's ~64 MiB P2P buffer cliff, so the
-    # hand-off exercises the large-payload (rendezvous) path -- see the parity
-    # handoff pgs in stage.py and tech-docs/nccl_p2p_execution_order_buffer_size.md.
+    # hand-off exercises the large-payload (rendezvous) path.
     batch_size: int = 8192
     num_microbatches: int = 8
-    # Which schedule to measure; see _PIPELINE_CLS. The two move identical data
-    # and differ only in where the receives are posted, so this is the knob that
-    # isolates what running the receives ahead is worth.
+    # Which schedule to measure; see _PIPELINE_CLS.
     pipeline: str = "1f1b"
+    # Split preserves the established direction-specific communicator topology;
+    # shared exercises the batch_isend_irecv handoff path.
+    handoff_pg_mode: str = "split"
     # Heavier embedding tables: 1M rows * 256 dim * 8 tables per layer.
     num_tables: int = 8
     num_embeddings: int = 1_000_000
@@ -346,6 +350,9 @@ def runner(
         attach_debugger()
 
     run_option.set_log_level()
+    # Every worker receives the same RunOptions and sets this before StageWrapper
+    # performs collective process-group creation.
+    maglev_stage.HANDOFF_PG_MODE = HandoffPGMode(run_option.handoff_pg_mode)
 
     # The cut is the source of truth: it fixes the stage count and the depth.
     layers_per_stage = list(run_option.layers_per_stage)
