@@ -71,6 +71,7 @@ from torchrec.metrics.scalar import ScalarMetric
 from torchrec.metrics.segmented_ne import SegmentedNEMetric
 from torchrec.metrics.serving_calibration import ServingCalibrationMetric
 from torchrec.metrics.serving_ne import ServingNEMetric
+from torchrec.metrics.session_pairwise_auc import SessionPairwiseAUCMetric
 from torchrec.metrics.sum_weights import SumWeightsMetric
 from torchrec.metrics.tensor_weighted_avg import TensorWeightedAvgMetric
 from torchrec.metrics.throughput import ThroughputMetric
@@ -251,6 +252,12 @@ METRICS_TO_TEST: List[
     (AUPRCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (RAUCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
     (GAUCMetric, [RecComputeMode.UNFUSED_TASKS_COMPUTATION], {}, [""]),
+    (
+        SessionPairwiseAUCMetric,
+        [RecComputeMode.UNFUSED_TASKS_COMPUTATION],
+        {},
+        [""],
+    ),
     # TensorWeightedAvgMetric requires tensor_name in tasks
     (
         TensorWeightedAvgMetric,
@@ -608,6 +615,11 @@ class MetricFQNBackwardCompatibilityTest(unittest.TestCase):
     def test_gauc_metric(self) -> None:
         self._check_metric_compatibility(
             GAUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
+        )
+
+    def test_session_pairwise_auc_metric(self) -> None:
+        self._check_metric_compatibility(
+            SessionPairwiseAUCMetric, RecComputeMode.UNFUSED_TASKS_COMPUTATION
         )
 
     def test_ndcg_metric(self) -> None:
@@ -1185,6 +1197,8 @@ _PARAM_ALTERNATIVES: Dict[str, List[Any]] = {
     "description": ["test_description"],
     "is_negative_task_mask": [[True]],
     "label_names": [["label_a", "label_b"]],
+    "pairwise_weight_key": ["pairwise_weight"],
+    "score_key": ["score"],
 }
 
 
@@ -1269,6 +1283,12 @@ KNOWN_SAFE_PARAMS: Set[Tuple[str, str]] = {
     ("SegmentedNEMetric", "grouping_keys"),
     ("SegmentedNEMetric", "include_logloss"),
     ("SegmentedNEMetric", "num_groups"),  # changes tensor shapes, not key names
+    ("SessionPairwiseAUCMetric", "pairwise_weight_key"),
+    ("SessionPairwiseAUCMetric", "rank_order_label"),
+    ("SessionPairwiseAUCMetric", "remove_zero_weight_from_pair"),
+    ("SessionPairwiseAUCMetric", "score_key"),
+    ("SessionPairwiseAUCMetric", "session_key"),
+    ("SessionPairwiseAUCMetric", "weight_pairs"),
     ("TensorWeightedAvgMetric", "description"),
     ("TowerQPSMetric", "warmup_steps"),
 }
