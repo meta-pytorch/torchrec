@@ -35,6 +35,12 @@ from torchrec.distributed.collective_utils import (
     init_collective_validation,
 )
 from torchrec.distributed.comm import get_local_size, get_topology_domain_multiple
+from torchrec.distributed.ddp_comm_hooks import (
+    bf16_stream_compress_hook,
+    CommHook,
+    fp16_stream_compress_hook,
+    StreamCompressState,
+)
 from torchrec.distributed.embedding import ShardedEmbeddingCollection
 from torchrec.distributed.logging_handlers import log_two_dim_sharding_config
 from torchrec.distributed.mc_embedding_modules import (
@@ -170,6 +176,77 @@ class DefaultDataParallelWrapper(DataParallelWrapper):
         self._additional_params_to_ignore: Set[str] = set(params_to_ignore or [])
         self._ddp_kwargs: Dict[str, Any] = ddp_kwargs or {}
 
+    def _select_allreduce_comm_hook(
+        self,
+        pg: dist.ProcessGroup,
+        device: torch.device,
+    ) -> Optional[Tuple[Any, CommHook]]:
+        """
+        Returns the state and hook for this precision, or None for FP32.
+
+        The `_stream` precisions additionally require a CUDA device to create
+        their stream on, and are a no-op without one. Anything unrecognized is
+        a no-op too, as it has always been.
+
+        Args:
+            pg: the process group DDP was built with.
+            device: the device DDP is running on.
+
+        Returns:
+            The `(state, hook)` pair to register, or None to leave gradients in
+            FP32.
+        """
+        stream_hook: CommHook
+        match self._allreduce_comm_precision:
+            # The stock hooks take the process group as their state and fall
+            # back to WORLD when it is None. Keep passing None, as torchrec
+            # always has.
+            case "fp16":
+                return None, ddp_default_hooks.fp16_compress_hook
+            case "bf16":
+                return None, ddp_default_hooks.bf16_compress_hook
+            case "fp16_stream":
+                stream_hook = fp16_stream_compress_hook
+            case "bf16_stream":
+                stream_hook = bf16_stream_compress_hook
+            case _:
+                return None
+
+        if device.type != "cuda":
+            logger.warning(
+                f"No comm hook was registered for "
+                f"allreduce_comm_precision={self._allreduce_comm_precision!r}: "
+                f"the stream compress hooks need a CUDA device to create their "
+                f"decompression stream, but got {device}. Gradients will "
+                "allreduce in FP32."
+            )
+            return None
+
+        return StreamCompressState(process_group=pg), stream_hook
+
+    def _register_allreduce_comm_hook(
+        self,
+        ddp: DistributedDataParallel,
+        pg: dist.ProcessGroup,
+        device: torch.device,
+    ) -> None:
+        """
+        Registers the comm hook for this precision on `ddp`, if any.
+
+        Args:
+            ddp: the freshly constructed DDP module to hook.
+            pg: the process group DDP was built with.
+            device: the device DDP is running on.
+        """
+        selected = self._select_allreduce_comm_hook(pg, device)
+        if selected is None:
+            return
+
+        state, hook = selected
+        ddp.register_comm_hook(state, hook)
+
+        logger.info(f"Registered {hook.__name__} for {self._allreduce_comm_precision}")
+
     def _ddp_wrap(
         self,
         dmp: "DistributedModelParallel",
@@ -188,30 +265,19 @@ class DefaultDataParallelWrapper(DataParallelWrapper):
             params_and_buffers_to_ignore=ddp_ignore_param_names,
         )
         # initialize DDP
-        dmp._dmp_wrapped_module = cast(
-            nn.Module,
-            DistributedDataParallel(
-                module=dmp._dmp_wrapped_module.to(device),
-                device_ids=None if device.type == "cpu" else [device],
-                process_group=pg,
-                gradient_as_bucket_view=True,
-                broadcast_buffers=False,
-                static_graph=self._static_graph,
-                find_unused_parameters=self._find_unused_parameters,
-                bucket_cap_mb=self._bucket_cap_mb,
-                **self._ddp_kwargs,
-            ),
+        ddp = DistributedDataParallel(
+            module=dmp._dmp_wrapped_module.to(device),
+            device_ids=None if device.type == "cpu" else [device],
+            process_group=pg,
+            gradient_as_bucket_view=True,
+            broadcast_buffers=False,
+            static_graph=self._static_graph,
+            find_unused_parameters=self._find_unused_parameters,
+            bucket_cap_mb=self._bucket_cap_mb,
+            **self._ddp_kwargs,
         )
-        if self._allreduce_comm_precision == "fp16":
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-            dmp._dmp_wrapped_module.register_comm_hook(
-                None, ddp_default_hooks.fp16_compress_hook
-            )
-        elif self._allreduce_comm_precision == "bf16":
-            # pyre-fixme[29]: `Union[Module, Tensor]` is not a function.
-            dmp._dmp_wrapped_module.register_comm_hook(
-                None, ddp_default_hooks.bf16_compress_hook
-            )
+        dmp._dmp_wrapped_module = ddp
+        self._register_allreduce_comm_hook(ddp, pg, device)
 
     def wrap(
         self,
