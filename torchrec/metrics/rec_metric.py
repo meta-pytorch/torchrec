@@ -574,6 +574,11 @@ class RecMetric(nn.Module, abc.ABC):
 
     _required_inputs: Set[str]
 
+    # CPUOffloadedRecMetricModule (ZORM) may merge several logical update calls
+    # into one physical update. Metrics whose semantics depend on the original
+    # batch boundary must opt out until logical-update replay is available.
+    supports_cpu_offloaded_metric_module: bool = True
+
     PREDICTIONS: str = "predictions"
     LABELS: str = "labels"
     WEIGHTS: str = "weights"
