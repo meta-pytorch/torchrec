@@ -9,7 +9,8 @@
 
 import random
 import unittest
-from typing import Any, cast, List, Tuple
+from dataclasses import dataclass
+from typing import Any, cast, Dict, List, Tuple
 from unittest.mock import call, MagicMock, patch
 
 import torch
@@ -19,19 +20,64 @@ from torchrec.distributed.maglev.module import (
     Activations,
     ActivationSpec,
     cast_activations,
+    get_structured_activations_layout_metadata_fields,
     MaglevLayer,
     MaglevModuleList,
     ObservedActivationSpecsMixin,
+    StructuredActivations,
+    StructuredActivationsLayout,
 )
 from torchrec.distributed.maglev.pipeline import MaglevPipelineBase
 from torchrec.distributed.maglev.stage import pg_init, StageWrapper
 from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
-from torchrec.distributed.test_utils.test_model import MaglevTestLayer, MaglevTestModel
+from torchrec.distributed.test_utils.test_model import (
+    MaglevTestActivations,
+    MaglevTestLayer,
+    MaglevTestModel,
+)
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 _WEIGHT_SEED = 100
 _INPUT_SEED = 500
+
+
+@dataclass(frozen=True)
+class _WrappedTensor:
+    tensor: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _TestStructuredActivations(StructuredActivations):
+    tensor: torch.Tensor
+    pair: Tuple[torch.Tensor, torch.Tensor]
+    sequence: List[torch.Tensor]
+    mapping: Dict[str, torch.Tensor]
+    numbers: List[int]
+    counts: Dict[str, int]
+    version: int
+    label: str
+    wrapped: _WrappedTensor
+
+    def _pack_wrapped(self, value: _WrappedTensor, metadata: str) -> Activations:
+        if metadata != "wrapped":
+            raise ValueError("unexpected wrapped metadata")
+        return (value.tensor,)
+
+    @classmethod
+    def _unpack_wrapped(
+        cls,
+        activations: Activations,
+        metadata: str,
+    ) -> Tuple[_WrappedTensor, Activations]:
+        if metadata != "wrapped" or not activations:
+            raise ValueError("cannot unpack wrapped tensor")
+        return _WrappedTensor(activations[0]), activations[1:]
+
+
+@dataclass(frozen=True)
+class _TensorStructuredActivations(StructuredActivations):
+    tensor: torch.Tensor
 
 
 def _make_tables(
@@ -84,6 +130,7 @@ def _build_model(
     device: torch.device,
 ) -> MaglevTestModel:
     """Author the model as a list of layers, with weights seeded by layer index."""
+    activation_layout = StructuredActivationsLayout[MaglevTestActivations]()
     layers: List[MaglevTestLayer] = []
     for layer_index in range(num_layers):
         tables = _make_tables(layer_index, num_tables, num_embeddings, emb_dim)
@@ -94,11 +141,12 @@ def _build_model(
                 layer_dim=layer_dim,
                 is_first=(layer_index == 0),
                 batch_size=batch_size,
+                activation_layout=activation_layout,
                 num_float_features=num_float_features,
                 device=device,
             )
         )
-    return MaglevTestModel(layers)
+    return MaglevTestModel(layers, activation_layout)
 
 
 class MaglevModuleListTest(unittest.TestCase):
@@ -244,6 +292,91 @@ class MaglevModuleListTest(unittest.TestCase):
         cast = cast_activations(activations, torch.bfloat16, expected)
         self.assertEqual(cast[0].dtype, torch.bfloat16)
         self.assertEqual(cast[1].dtype, torch.int64)
+
+    def test_structured_activations_round_trip(self) -> None:
+        values = _TestStructuredActivations(
+            tensor=torch.ones(2, 4),
+            pair=(torch.ones(2, 5), torch.ones(2, 1)),
+            sequence=[torch.ones(2), torch.ones(2, dtype=torch.int64)],
+            mapping={
+                "second": torch.ones(2, 6),
+                "first": torch.ones(2, 7),
+            },
+            numbers=[3, 5],
+            counts={"one": 1, "two": 2},
+            version=2,
+            label="static",
+            wrapped=_WrappedTensor(torch.ones(2, 8)),
+        )
+        layout_type = StructuredActivationsLayout[_TestStructuredActivations]
+        layout = layout_type(
+            sequence=2,
+            mapping=("first", "second"),
+            numbers=[3, 5],
+            counts={"one": 1, "two": 2},
+            version=2,
+            label="static",
+            wrapped="wrapped",
+        )
+
+        activations = layout.pack(values)
+        unpacked = layout.unpack(activations)
+
+        self.assertIs(
+            layout_type,
+            StructuredActivationsLayout[_TestStructuredActivations],
+        )
+        self.assertEqual(len(activations), 8)
+        self.assertIs(unpacked.tensor, values.tensor)
+        self.assertIs(unpacked.pair[0], values.pair[0])
+        self.assertIs(unpacked.sequence[0], values.sequence[0])
+        self.assertEqual(tuple(unpacked.mapping), ("first", "second"))
+        self.assertIs(unpacked.mapping["first"], values.mapping["first"])
+        self.assertEqual(unpacked.numbers, [3, 5])
+        self.assertEqual(unpacked.counts, {"one": 1, "two": 2})
+        self.assertEqual(unpacked.version, 2)
+        self.assertEqual(unpacked.label, "static")
+        self.assertIs(unpacked.wrapped.tensor, values.wrapped.tensor)
+
+    def test_structured_activations_require_exact_metadata_names(self) -> None:
+        layout_type = StructuredActivationsLayout[_TestStructuredActivations]
+
+        with self.assertRaisesRegex(TypeError, "sequence"):
+            layout_type()
+        with self.assertRaisesRegex(TypeError, "unknown"):
+            StructuredActivationsLayout[_TensorStructuredActivations](unknown=1)
+
+    def test_structured_activations_report_required_metadata_fields(self) -> None:
+        self.assertEqual(
+            get_structured_activations_layout_metadata_fields(
+                _TestStructuredActivations
+            ),
+            (
+                "sequence",
+                "mapping",
+                "numbers",
+                "counts",
+                "version",
+                "label",
+                "wrapped",
+            ),
+        )
+
+    def test_structured_activations_reject_extra_tensors(self) -> None:
+        layout = StructuredActivationsLayout[_TensorStructuredActivations]()
+        values = _TensorStructuredActivations(tensor=torch.ones(2))
+
+        with self.assertRaisesRegex(ValueError, "1 activation tensors"):
+            layout.unpack(
+                (*layout.pack(values), torch.zeros(1)),
+            )
+
+    def test_structured_activations_use_annotations_for_tensor_proxies(self) -> None:
+        layout = StructuredActivationsLayout[_TensorStructuredActivations]()
+        proxy = object()
+        values = _TensorStructuredActivations(tensor=cast(torch.Tensor, proxy))
+
+        self.assertIs(layout.pack(values)[0], proxy)
 
     def test_layer_class_layout_supports_fsdp2_mixin(self) -> None:
         layer = self._model(num_layers=1)[0]
