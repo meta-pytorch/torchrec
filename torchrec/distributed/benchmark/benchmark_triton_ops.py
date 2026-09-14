@@ -1410,18 +1410,24 @@ def mx4_roundtrip_qcomm(
 ############################ pooled regroup configs ###################################
 @dataclass
 class RegroupConfig(TritonOpConfig):
-    """Inputs for cached-metadata multi-tensor pooled-embedding regroup."""
+    """Inputs for cached-metadata multi-tensor pooled-embedding regroup.
 
-    batch_size: int = 1024
-    num_dense_features: int = 20
-    num_sparse_features: int = 1000
-    dense_dim: int = 64
-    sparse_dim: int = 128
-    num_groups: int = 2
+    Defaults match the dominant BF16 CMF trace shape: batch size 2048, 957
+    features, and total width 100468. The two input partitions use dimensions
+    104 and 108 to reproduce that feature count and width exactly.
+    """
+
+    batch_size: int = 2048
+    num_dense_features: int = 722
+    num_sparse_features: int = 235
+    dense_dim: int = 104
+    sparse_dim: int = 108
+    num_groups: int = 1
     skipped_features: int = 0
     duplicate_features: int = 0
     run_backward: bool = False
-    dtype: str = "float32"
+    dtype: str = "bfloat16"
+    gpu_backlog_ms: float = 20.0
 
     def make_inputs(self, device: torch.device) -> Dict[str, Any]:
         dtype = {
