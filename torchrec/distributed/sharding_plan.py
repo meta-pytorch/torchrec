@@ -99,6 +99,7 @@ def calculate_shard_sizes_and_offsets(
     col_wise_shard_dim: Optional[int] = None,
     device_memory_sizes: Optional[List[int]] = None,
     num_buckets: Optional[int] = None,
+    num_nodes: Optional[int] = None,
 ) -> Tuple[List[List[int]], List[List[int]]]:
     """
     Calculates sizes and offsets for tensor sharded according to provided sharding type.
@@ -109,6 +110,9 @@ def calculate_shard_sizes_and_offsets(
         local_world_size (int): total number of devices in host group topology.
         sharding_type (str): provided ShardingType value.
         col_wise_shard_dim (Optional[int]): dimension for column wise sharding split.
+        num_nodes (Optional[int]): for TABLE_ROW_WISE, number of nodes the
+            table's rows are split across, in units of `local_world_size`.
+            Defaults to 1.
 
     Returns:
         Tuple[List[List[int]], List[List[int]]]: shard sizes, represented as a list of the dimensions of the sharded tensor on each device, and shard offsets, represented as a list of coordinates of placement on each device.
@@ -140,7 +144,9 @@ def calculate_shard_sizes_and_offsets(
             )
         )
     elif sharding_type == ShardingType.TABLE_ROW_WISE.value:
-        return _calculate_rw_shard_sizes_and_offsets(rows, local_world_size, columns)
+        return _calculate_rw_shard_sizes_and_offsets(
+            rows, (num_nodes or 1) * local_world_size, columns
+        )
     elif (
         sharding_type == ShardingType.COLUMN_WISE.value
         or sharding_type == ShardingType.TABLE_COLUMN_WISE.value
@@ -333,6 +339,7 @@ def _get_parameter_size_offsets(
     world_size: int,
     col_wise_shard_dim: Optional[int] = None,
     num_buckets: Optional[int] = None,
+    num_nodes: Optional[int] = None,
 ) -> List[Tuple[List[int], List[int]]]:
     (
         shard_sizes,
@@ -344,6 +351,7 @@ def _get_parameter_size_offsets(
         sharding_type=sharding_type.value,
         col_wise_shard_dim=col_wise_shard_dim,
         num_buckets=num_buckets,
+        num_nodes=num_nodes,
     )
     return list(zip(shard_sizes, shard_offsets))
 
@@ -396,6 +404,7 @@ def _get_parameter_sharding(
     sharder: ModuleSharder[nn.Module],
     placements: Optional[List[str]] = None,
     compute_kernel: Optional[str] = None,
+    num_nodes: Optional[int] = None,
 ) -> ParameterSharding:
     return ParameterSharding(
         sharding_spec=(
@@ -430,6 +439,7 @@ def _get_parameter_sharding(
             else _get_compute_kernel(sharder, param, sharding_type, device_type)
         ),
         ranks=[rank for (_, _, rank) in size_offset_ranks],
+        num_nodes=num_nodes,
     )
 
 
@@ -784,8 +794,11 @@ def table_row_wise(
     """
     Returns a generator of ParameterShardingPlan for `ShardingType::TABLE_ROW_WISE` for construct_module_sharding_plan.
 
+    Cuts the rows over the ranks of a single node. Use
+    `table_row_wise_multi_node` to spread them over several.
+
     Args:
-    host_index (int): index of host (node) to do row wise
+    host_index (int): index of the host (node) to do row wise
 
     Example::
 
@@ -797,6 +810,49 @@ def table_row_wise(
             },
         )
     """
+    return table_row_wise_multi_node(host_indexes=[host_index])
+
+
+def table_row_wise_multi_node(
+    host_indexes: List[int],
+) -> ParameterShardingGenerator:
+    """
+    Returns a generator of ParameterShardingPlan for `ShardingType::TABLE_ROW_WISE` for construct_module_sharding_plan.
+
+    Args:
+    host_indexes (List[int]): indexes of hosts (nodes) to split the rows across.
+        They need not be adjacent. Rows are cut over
+        `len(host_indexes) * local_size` ranks instead of one node's worth;
+        shards stay full width. The planner's equivalent
+        (`ParameterConstraints.num_nodes`) counts `Topology.intra_group_size`
+        ranks per node instead of `local_size`.
+
+    Example::
+
+        ebc = EmbeddingBagCollection(...)
+        plan = construct_module_sharding_plan(
+            ebc,
+            {
+                # rows split over hosts 0 and 3
+                "table_5": table_row_wise_multi_node(host_indexes=[0, 3]),
+            },
+        )
+    """
+    if not host_indexes:
+        raise ValueError(
+            "table_row_wise_multi_node: host_indexes must name at least one host."
+        )
+    if len(set(host_indexes)) != len(host_indexes):
+        raise ValueError(
+            f"table_row_wise_multi_node: host_indexes={host_indexes} names a host "
+            "twice. Two row blocks on one rank is a duplicate bucket destination."
+        )
+    # Sorted rather than caller order: a plan is persisted rank-ascending and
+    # reloaded with row offsets recomputed in that order, so an unsorted span
+    # would come back as a different placement. The planner's
+    # `_multi_hosts_partition` sorts for the same reason.
+    hosts: List[int] = sorted(host_indexes)
+    num_nodes: int = len(hosts)
 
     def _parameter_sharding_generator(
         param: nn.Parameter,
@@ -805,18 +861,30 @@ def table_row_wise(
         device_type: str,
         sharder: ModuleSharder[nn.Module],
     ) -> ParameterSharding:
+        total_num_hosts = world_size // local_size
+        out_of_range = [host for host in hosts if not 0 <= host < total_num_hosts]
+        if out_of_range:
+            raise ValueError(
+                f"table_row_wise_multi_node(host_indexes={hosts}) needs host(s) "
+                f"{out_of_range}, but there are only {total_num_hosts} "
+                f"(world_size={world_size}, local_size={local_size})."
+            )
+
         size_and_offsets = _get_parameter_size_offsets(
             param,
             ShardingType.TABLE_ROW_WISE,
             local_size,
             world_size,
+            num_nodes=num_nodes,
         )
 
         size_offset_ranks = []
-        assert len(size_and_offsets) <= local_size
-        for (size, offset), rank in zip(size_and_offsets, range(local_size)):
-            rank_offset = host_index * local_size
-            size_offset_ranks.append((size, offset, rank_offset + rank))
+        placement_ranks = [
+            host * local_size + rank for host in hosts for rank in range(local_size)
+        ]
+        assert len(size_and_offsets) <= len(placement_ranks)
+        for (size, offset), rank in zip(size_and_offsets, placement_ranks):
+            size_offset_ranks.append((size, offset, rank))
 
         return _get_parameter_sharding(
             param,
@@ -825,6 +893,8 @@ def table_row_wise(
             local_size,
             device_type,
             sharder,
+            # Unset for a single node: keeps pre-feature plans byte-identical.
+            num_nodes=num_nodes if num_nodes > 1 else None,
         )
 
     return _parameter_sharding_generator

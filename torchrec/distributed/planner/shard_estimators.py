@@ -660,6 +660,7 @@ def _calculate_shard_io_sizes(
             output_data_type_size=output_data_type_size,
             num_poolings=num_poolings,
             is_pooled=is_pooled,
+            sharding_type=sharding_type,
         )
     else:
         raise ValueError(
@@ -824,10 +825,23 @@ def _calculate_twrw_shard_io_sizes(
     output_data_type_size: float,
     num_poolings: List[float],
     is_pooled: bool,
+    # Required: this helper serves TABLE_ROW_WISE and GRID_SHARD, and the two
+    # want different divisors below. A default would silently cost a grid
+    # table as row-wise for any caller that forgot to pass it.
+    sharding_type: str,
 ) -> Tuple[List[int], List[int]]:
+    # Ranks the table is bucketized over, matching the perf estimator's
+    # divisor. GRID_SHARD shares this helper, but its extra shards are column
+    # blocks that replicate ids rather than splitting them, so its width stays
+    # `local_world_size`.
+    batch_inputs_divisor = (
+        len(shard_sizes)
+        if sharding_type == ShardingType.TABLE_ROW_WISE.value
+        else local_world_size
+    )
     batch_inputs = (
         sum([x * y * z for x, y, z in zip(input_lengths, num_poolings, batch_sizes)])
-        / local_world_size
+        / batch_inputs_divisor
     )
     if is_pooled:
         batch_outputs = sum(

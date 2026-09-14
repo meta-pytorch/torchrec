@@ -516,6 +516,10 @@ class ShardPerfContext:
     local_world_size: int = 1
     intra_group_size: int = 1  # pod_size * local_world_size; TWRW group size
 
+    # Per-table, not topology: for TABLE_ROW_WISE, how many of the topology's
+    # TWRW groups this table's rows span.
+    num_twrw_nodes: int = 1
+
     # Data type sizes
     input_data_type_size: float = BIGINT_DTYPE
     table_data_type_size: float = 4.0
@@ -747,6 +751,20 @@ class ShardPerfContext:
                 f"compute kernel: {sharding_option.compute_kernel}"
             )
 
+        num_twrw_nodes = 1
+        if sharding_option.sharding_type == ShardingType.TABLE_ROW_WISE.value:
+            num_twrw_nodes = sharding_option.num_nodes or 1
+            expected_shards = num_twrw_nodes * topology.intra_group_size
+            if len(shard_sizes) != expected_shards:
+                # Not PlannerError: MemoryBalancedEmbeddingShardingPlanner
+                # swallows those and retries with less storage, which cannot
+                # fix a shard count.
+                raise ValueError(
+                    f"'{sharding_option.name}': num_nodes={num_twrw_nodes} needs "
+                    f"{expected_shards} shards at an intra_group_size of "
+                    f"{topology.intra_group_size}, got {len(shard_sizes)}."
+                )
+
         # Build contexts
         contexts: List["ShardPerfContext"] = []
         for hash_size, emb_dim in shard_sizes:
@@ -761,6 +779,7 @@ class ShardPerfContext:
                 world_size=topology.world_size,
                 local_world_size=topology.local_world_size,
                 intra_group_size=topology.intra_group_size,
+                num_twrw_nodes=num_twrw_nodes,
                 input_data_type_size=input_data_type_size,
                 table_data_type_size=table_data_type_size,
                 output_data_type_size=output_data_type_size,

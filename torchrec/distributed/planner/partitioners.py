@@ -513,9 +513,13 @@ class GreedyPerfPartitioner(Partitioner):
         """
         # TODO: for now assume just one option for multi_hosts.
         if len(sharding_option_group.sharding_options) != 1:
+            names = [so.name for so in sharding_option_group.sharding_options]
             raise PlannerError(
                 error_type=PlannerErrorType.PARTITION,
-                message=f"Unexpected length for sharding options: {len(sharding_option_group.sharding_options)}. Length needs to be 1",
+                message=(
+                    f"multi-host placement of {len(names)} co-located tables "
+                    f"{sorted(names)} is not supported."
+                ),
             )
         num_shards = sharding_option_group.sharding_options[0].num_shards
 
@@ -531,7 +535,7 @@ class GreedyPerfPartitioner(Partitioner):
         if remainder > 0:
             raise PlannerError(
                 error_type=PlannerErrorType.PARTITION,
-                message=f"Grid Sharding is unable to place shards equally over hosts without overlapping. {num_shards=} % {local_world_size=} != 0",
+                message=f"multi-host sharding is unable to place shards equally over hosts without overlapping. {num_shards=} % {local_world_size=} != 0",
             )
 
         sorted_host_level_devices = _sort_devices_by_perf(_host_level_devices)
@@ -556,11 +560,41 @@ class GreedyPerfPartitioner(Partitioner):
                     )
                 )
             host_index += 1  # shift to next host
+            sharding_option = sharding_option_group.sharding_options[0]
+
+            # `_uniform_partition` pairs shards to `devices` positionally, so
+            # this order becomes `ParameterSharding.ranks`. The runtime keys a
+            # feature's bucket off a rank's index there and stored plans persist
+            # rank-sorted, so perf order would reload as a different placement.
+            if sharding_option.sharding_type == ShardingType.TABLE_ROW_WISE.value:
+                devices = sorted(devices, key=lambda d: d.rank)
+
             host_devices = copy.deepcopy(devices)
             success = True
-            sharding_option = sharding_option_group.sharding_options[0]
+
+            # Circular reuse above can list one host twice, which GRID_SHARD
+            # supports but TABLE_ROW_WISE cannot: two row blocks on one rank means a
+            # duplicate bucket destination. Raised before the `try` because that
+            # swallows a PlannerError to retry the next offset, and no offset
+            # fixes a reuse.
+            if (
+                sharding_option.sharding_type == ShardingType.TABLE_ROW_WISE.value
+                and len({d.rank for d in host_devices}) != len(host_devices)
+            ):
+                raise PlannerError(
+                    error_type=PlannerErrorType.PARTITION,
+                    message=(
+                        f"'{sharding_option.name}': TABLE_ROW_WISE placement over "
+                        f"{num_host_to_allocate} nodes reused a node "
+                        f"(only {len(sorted_host_level_devices)} available)."
+                    ),
+                )
             try:
-                if sharding_option.sharding_type == ShardingType.GRID_SHARD.value:
+                if sharding_option.sharding_type in (
+                    ShardingType.GRID_SHARD.value,
+                    # Same placement as grid: uniform over that many hosts.
+                    ShardingType.TABLE_ROW_WISE.value,
+                ):
                     GreedyPerfPartitioner._uniform_partition(
                         [sharding_option], host_devices
                     )

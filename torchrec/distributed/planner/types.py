@@ -1342,6 +1342,9 @@ class ShardingOption:
             table's weights GPU->CPU during the dense forward/backward. Set on the
             table config before planning; the planner reflects the HBM that stashing
             frees in its storage estimates.
+        num_nodes (Optional[int]): carried from `ParameterConstraints.num_nodes`
+            so the plan states the row split rather than leaving the runtime to
+            infer it from the placement.
     """
 
     def __init__(
@@ -1366,6 +1369,7 @@ class ShardingOption:
         key_value_params: Optional[KeyValueParams] = None,
         num_poolings: Optional[List[float]] = None,
         stash_weights: bool = False,
+        num_nodes: Optional[int] = None,
     ) -> None:
         self.name = name
         self._tensor = tensor
@@ -1394,6 +1398,7 @@ class ShardingOption:
         self.key_value_params: Optional[KeyValueParams] = key_value_params
         self.num_poolings: Optional[List[float]] = num_poolings
         self.stash_weights: bool = stash_weights
+        self.num_nodes: Optional[int] = num_nodes
 
         child_module = module[1]
         self._module_type_key: str = (
@@ -1654,6 +1659,12 @@ class ParameterConstraints:
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE, either for
             SSD or PS.
         use_virtual_table (bool): is virtual table enabled for this table.
+        num_nodes (Optional[int]): TABLE_ROW_WISE only. Number of nodes the
+            table's rows are split across. `None` (the default) and 1 both mean
+            the stock single-node placement; values > 1 spread one logical
+            table over `num_nodes * topology.intra_group_size` ranks at full
+            width. A node is torchrec's topology group, which is one host only
+            when `pod_size == 1`.
     """
 
     sharding_types: Optional[List[str]] = None
@@ -1674,11 +1685,12 @@ class ParameterConstraints:
     device_group: Optional[str] = None
     key_value_params: Optional[KeyValueParams] = None
     use_virtual_table: bool = False
+    num_nodes: Optional[int] = None
 
     def _hashable_values(
         self, cache_params: object, key_value_params: object
     ) -> Tuple[Any, ...]:
-        return (
+        hashable_values = (
             tuple(self.sharding_types) if self.sharding_types else None,
             tuple(self.compute_kernels) if self.compute_kernels else None,
             self.min_partition,
@@ -1696,6 +1708,12 @@ class ParameterConstraints:
             key_value_params,
             self.use_virtual_table,
         )
+        # A stored plan is refused when this digest does not match, so extend
+        # the fingerprint only for a real opt-in. Plans cached before the field
+        # existed stay valid.
+        if self.num_nodes is not None and self.num_nodes > 1:
+            return (*hashable_values, self.num_nodes)
+        return hashable_values
 
     def _persistent_hash(
         self,

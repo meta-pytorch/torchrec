@@ -31,6 +31,8 @@ from torchrec.distributed.planner.types import (
     Enumerator,
     ParameterConstraints,
     PartitionByType,
+    PlannerError,
+    PlannerErrorType,
     Shard,
     SharderDataMap,
     ShardEstimator,
@@ -228,6 +230,7 @@ class EmbeddingEnumerator(Enumerator):
                 for sharding_type in self._filter_sharding_types(
                     name, sharder.sharding_types(self._compute_device), sharder_key
                 ):
+                    num_nodes = self._extract_num_nodes(name, sharding_type)
                     for compute_kernel in self._filter_compute_kernels(
                         name,
                         sharder.compute_kernels(sharding_type, self._compute_device),
@@ -245,6 +248,7 @@ class EmbeddingEnumerator(Enumerator):
                                 col_wise_shard_dim=col_wise_shard_dim,
                                 device_memory_sizes=self._device_memory_sizes,
                                 num_buckets=num_buckets,
+                                num_nodes=num_nodes,
                             )
                         except ZeroDivisionError as e:
                             # Re-raise with additional context about the table and module
@@ -274,7 +278,9 @@ class EmbeddingEnumerator(Enumerator):
                                 batch_size=self._batch_size,
                                 compute_kernel=compute_kernel,
                                 sharding_type=sharding_type,
-                                partition_by=get_partition_by_type(sharding_type),
+                                partition_by=get_partition_by_type(
+                                    sharding_type, num_nodes
+                                ),
                                 shards=[
                                     Shard(size=size, offset=offset)
                                     for size, offset in zip(shard_sizes, shard_offsets)
@@ -291,6 +297,7 @@ class EmbeddingEnumerator(Enumerator):
                                 stash_weights=self._get_stash_weights(
                                     name, child_module
                                 ),
+                                num_nodes=num_nodes,
                             )
                         )
                 if not sharding_options_per_table:
@@ -311,6 +318,47 @@ class EmbeddingEnumerator(Enumerator):
         # Caching the search space with a copy of sharding options, to avoid unexpected modifications to list
         self._last_stored_search_space = copy.deepcopy(sharding_options)
         return sharding_options
+
+    def _extract_num_nodes(self, parameter: str, sharding_type: str) -> Optional[int]:
+        """
+        The validated `num_nodes` constraint, or `None` where it does not apply.
+
+        TABLE_ROW_WISE only. A single node returns `None` so a stored plan stays
+        byte-identical to one planned before the constraint existed.
+
+        Unusable values are rejected here at plan time: `_multi_hosts_partition`
+        wraps host selection circularly, so an oversized value otherwise yields
+        a plan that puts two row blocks of a table on one rank. Validated for
+        every sharding type, since `_hashable_values` fingerprints `num_nodes`
+        whatever the type: an unusable value would otherwise strand a stored
+        plan on a constraint it then drops.
+        """
+        num_nodes = (
+            self._constraints[parameter].num_nodes
+            if self._constraints and self._constraints.get(parameter)
+            else None
+        )
+        if num_nodes is None:
+            return None
+        if num_nodes < 1:
+            raise PlannerError(
+                error_type=PlannerErrorType.STRICT_CONSTRAINTS,
+                message=(f"'{parameter}': num_nodes must be >= 1, got {num_nodes}."),
+            )
+        max_nodes = self._world_size // self._local_world_size
+        if num_nodes > max_nodes:
+            raise PlannerError(
+                error_type=PlannerErrorType.STRICT_CONSTRAINTS,
+                message=(
+                    f"'{parameter}': num_nodes={num_nodes} exceeds the {max_nodes} "
+                    f"node(s) available (world_size={self._world_size}, "
+                    f"intra_group_size={self._local_world_size}). Each node can hold "
+                    "at most one row block of a table."
+                ),
+            )
+        if sharding_type != ShardingType.TABLE_ROW_WISE.value:
+            return None
+        return num_nodes if num_nodes > 1 else None
 
     def _get_num_buckets(self, parameter: str, module: nn.Module) -> Optional[int]:
         """
@@ -584,12 +632,14 @@ def _extract_constraints_for_param(
     )
 
 
-def get_partition_by_type(sharding_type: str) -> str:
+def get_partition_by_type(sharding_type: str, num_nodes: Optional[int] = None) -> str:
     """
     Gets corresponding partition by type for provided sharding type.
 
     Args:
         sharding_type (str): sharding type string.
+        num_nodes (Optional[int]): TABLE_ROW_WISE row split; > 1 selects
+            MULTI_HOST.
 
     Returns:
         str: the corresponding `PartitionByType` value.
@@ -612,6 +662,15 @@ def get_partition_by_type(sharding_type: str) -> str:
     if sharding_type in device_sharding_types:
         return PartitionByType.DEVICE.value
     elif sharding_type in host_sharding_types:
+        # A TABLE_ROW_WISE table spanning several nodes is no longer a
+        # single-host placement, and MULTI_HOST's uniform partition over
+        # `num_shards / local_world_size` hosts is already the row cut it needs.
+        if (
+            sharding_type == ShardingType.TABLE_ROW_WISE.value
+            and num_nodes is not None
+            and num_nodes > 1
+        ):
+            return PartitionByType.MULTI_HOST.value
         return PartitionByType.HOST.value
     elif sharding_type in uniform_sharding_types:
         return PartitionByType.UNIFORM.value

@@ -213,6 +213,7 @@ def to_sharding_plan(
                 == EmbeddingComputeKernel.FUSED_TRITON.value
                 else None
             ),
+            num_nodes=sharding_option.num_nodes,
         )
         plan[sharding_option.path] = module_plan
     # pyrefly: ignore[bad-argument-type]
@@ -490,6 +491,7 @@ def extract_plan(
                     feature_names=so.feature_names,
                     output_dtype=so.output_dtype,
                     key_value_params=so.key_value_params,
+                    num_nodes=so.num_nodes,
                 )
             )
 
