@@ -888,6 +888,71 @@ class TestSKUAwareStorageReservation(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertEqual(cached.devices[0].storage.hbm, reserved.devices[0].storage.hbm)
 
+    def test_matches_fixed_percentage_on_home_sku(self) -> None:
+        # The FixedPercentage counterpart of test_matches_heuristical_on_home_sku:
+        # that policy's percentage is the whole reservation, so with the module
+        # terms off SKUAware reserves exactly what it does on the home SKU.
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 8 * 1024 * 1024 * 1024
+        percentage = 0.25
+
+        fixed = FixedPercentageStorageReservation(percentage=percentage)
+        sku_aware = SKUAwareStorageReservation(
+            margin_bytes=int(percentage * hbm_cap),
+            runtime_overhead_bytes=0,
+            reserve_module_terms=False,
+        )
+
+        kwargs = {"batch_size": 10, "module": model, "sharders": sharders}
+        fixed_topology = fixed.reserve(
+            topology=Topology(world_size=2, compute_device="cuda", hbm_cap=hbm_cap),
+            **kwargs,
+        )
+        sku_aware_topology = sku_aware.reserve(
+            topology=Topology(world_size=2, compute_device="cuda", hbm_cap=hbm_cap),
+            **kwargs,
+        )
+
+        self.assertEqual(
+            sku_aware_topology.devices[0].storage.hbm,
+            fixed_topology.devices[0].storage.hbm,
+        )
+
+    def test_high_percentage_fits_only_without_module_terms(self) -> None:
+        # A percentage calibrated as a whole reservation leaves only a sliver above
+        # the margin, so a real model's dense does not fit on top of it: adding the
+        # module terms exhausts the device. That is the regression
+        # reserve_module_terms=False exists to prevent. dense_tensor_estimate stands
+        # in for a production-sized dense, which the toy model here does not have.
+        model, sharders = self._create_model_and_sharders()
+        hbm_cap = 8 * 1024 * 1024 * 1024
+        margin_bytes = int(0.86 * hbm_cap)
+
+        def reserve(reserve_module_terms: bool) -> Topology:
+            return SKUAwareStorageReservation(
+                margin_bytes=margin_bytes,
+                dense_tensor_estimate=2 * 1024 * 1024 * 1024,
+                reserve_module_terms=reserve_module_terms,
+            ).reserve(
+                topology=Topology(world_size=2, compute_device="cuda", hbm_cap=hbm_cap),
+                batch_size=4096,
+                module=model,
+                sharders=sharders,
+            )
+
+        with self.assertRaises(PlannerError) as context:
+            reserve(reserve_module_terms=True)
+        self.assertEqual(
+            context.exception.error_type, PlannerErrorType.INSUFFICIENT_STORAGE
+        )
+
+        # With the module terms off the dense override is ignored too, so the whole
+        # reservation is the margin and the rest of the device stays available.
+        self.assertEqual(
+            reserve(reserve_module_terms=False).devices[0].storage.hbm,
+            hbm_cap - margin_bytes,
+        )
+
     def test_negative_margin_bytes_raises(self) -> None:
         with self.assertRaises(AssertionError):
             SKUAwareStorageReservation(margin_bytes=-1)
