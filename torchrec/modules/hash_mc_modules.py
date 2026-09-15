@@ -217,6 +217,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         opt_in_prob: the probability of an ID to be opted in from a statistical aspect
         percent_reserved_slots: percentage of slots to be reserved when opt-in is enabled, the value must be in [0, 100)
         persist_hash_zch_bucket: when False, exclude the bucket-count buffer from state_dict. Useful for warm-loading checkpoints saved before this buffer existed.
+        long_dtype: The dtype of the identites/metadata. If true, then dtype is int64, else int32. Default True.
 
     Example::
         module = HashZchManagedCollisionModule(...)
@@ -255,6 +256,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
         no_bag: bool = False,
         write_runtime_meta_dim: int = 0,
         persist_hash_zch_bucket: bool = True,
+        long_dtype: bool = True,
     ) -> None:
         if output_segments is None:
             assert (
@@ -330,11 +332,12 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                 f"ScalarLogger is disabled because {self._tb_logging_frequency=} and {self._device.type=}"
             )
 
+        self._long_dtype = long_dtype
         identities, metadata = self._create_zch_buffer(
             size=self._zch_size,
             support_evict=self._eviction_module is not None,
             device=self._device,
-            long_type=True,  # deprecated, always True
+            long_type=self._long_dtype,
         )
 
         self._hash_zch_identities = torch.nn.Parameter(identities, requires_grad=False)
@@ -409,7 +412,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             f"{self._opt_in_prob=}, {self._percent_reserved_slots=}, {self._disable_fallback=}, "
             f"{self._track_id_freq=}, {self._read_only_suffix=}, {self._enable_per_feature_lookups=}, "
             f"{self._no_bag=}, {self._write_runtime_meta_dim=}, "
-            f"{self._persist_hash_zch_bucket=}"
+            f"{self._persist_hash_zch_bucket=}, {self._long_dtype=}"
         )
 
     def _create_zch_buffer(
@@ -616,6 +619,30 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             / (self._end_bucket - self._start_bucket)
         )
 
+    def _assert_identity_dtype_matches_input(
+        self,
+        feature_name: str,
+        values: torch.Tensor,
+    ) -> None:
+        """Reject a KJT whose dtype disagrees with the identity buffer."""
+        if torch.jit.is_scripting() or not isinstance(values, torch.Tensor):
+            # Skip under torchscript or fx tracing
+            return
+        # Note that FBGEMM kernel accepts that int64 input with int32 identities,
+        # but not the reverse. In the former scenario, it folds the inputs to
+        # be `% MAX_INT32``. To avoid this silent property, we throw
+        # an explicit error, and tell the user to set flag explicitly.
+        if values.dtype == self._hash_zch_identities.dtype:
+            return
+        raise ValueError(
+            f"HashZchManagedCollisionModule[{self._name}]: feature "
+            f"'{feature_name}' has values of dtype {values.dtype}, but the identity "
+            f"buffer is {self._hash_zch_identities.dtype}. These must match. Set "
+            f"long_dtype={values.dtype == torch.int64} to match the input, or cast "
+            f"the input to {self._hash_zch_identities.dtype}, or reach out to "
+            f"TorchRec oncall"
+        )
+
     def remap(
         self,
         features: Dict[str, JaggedTensor],
@@ -659,6 +686,8 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
                     overwrite_readonly = readonly
                     overwrite_metadata = metadata
                 values = feature.values()
+                self._assert_identity_dtype_matches_input(name, values)
+
                 input_metadata, eviction_threshold = (
                     self._eviction_module(feature)
                     if self._eviction_module is not None
@@ -845,6 +874,7 @@ class HashZchManagedCollisionModule(ManagedCollisionModule):
             no_bag=self._no_bag,
             write_runtime_meta_dim=self._write_runtime_meta_dim,
             persist_hash_zch_bucket=self._persist_hash_zch_bucket,
+            long_dtype=self._long_dtype,
         )
 
     def lookup_runtime_meta(

@@ -44,22 +44,26 @@ class TestMCH(unittest.TestCase):
         torch.cuda.device_count() < 1,
         "Not enough GPUs, this test requires at least one GPU",
     )
-    def test_zch_hash_inference(self) -> None:
+    @given(long_dtype=st.booleans())
+    @settings(deadline=None)
+    def test_zch_hash_inference(self, long_dtype: bool) -> None:
         # prepare
+        dtype = torch.int64 if long_dtype else torch.int32
         m1 = HashZchManagedCollisionModule(
             zch_size=20,
             device=torch.device("cuda"),
             total_num_buckets=2,
+            long_dtype=long_dtype,
             eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
             eviction_config=HashZchEvictionConfig(
                 features=[],
                 single_ttl=10,
             ),
         )
-        self.assertEqual(m1._hash_zch_identities.dtype, torch.int64)
+        self.assertEqual(m1._hash_zch_identities.dtype, dtype)
         in1 = {
             "f": JaggedTensor(
-                values=torch.arange(0, 20, 2, dtype=torch.int64, device="cuda"),
+                values=torch.arange(0, 20, 2, dtype=dtype, device="cuda"),
                 lengths=torch.tensor([4, 6], dtype=torch.int64, device="cuda"),
             ),
         }
@@ -71,7 +75,7 @@ class TestMCH(unittest.TestCase):
 
         in2 = {
             "f": JaggedTensor(
-                values=torch.arange(1, 20, 2, dtype=torch.int64, device="cuda"),
+                values=torch.arange(1, 20, 2, dtype=dtype, device="cuda"),
                 lengths=torch.tensor([8, 2], dtype=torch.int64, device="cuda"),
             ),
         }
@@ -87,6 +91,7 @@ class TestMCH(unittest.TestCase):
                 zch_size=20,
                 device=torch.device(device_str),
                 total_num_buckets=2,
+                long_dtype=long_dtype,
             )
 
             m_infer.reset_inference_mode()
@@ -115,7 +120,7 @@ class TestMCH(unittest.TestCase):
             )
             in12 = {
                 "f": JaggedTensor(
-                    values=torch.arange(0, 20, dtype=torch.int64, device=device_str),
+                    values=torch.arange(0, 20, dtype=dtype, device=device_str),
                     lengths=torch.tensor(
                         [4, 6, 8, 2], dtype=torch.int64, device=device_str
                     ),
@@ -130,16 +135,17 @@ class TestMCH(unittest.TestCase):
             zch_size=10,
             device=torch.device("cuda"),
             total_num_buckets=2,
+            long_dtype=long_dtype,
             eviction_policy_name=HashZchEvictionPolicyName.SINGLE_TTL_EVICTION,
             eviction_config=HashZchEvictionConfig(
                 features=[],
                 single_ttl=10,
             ),
         )
-        self.assertEqual(m3._hash_zch_identities.dtype, torch.int64)
+        self.assertEqual(m3._hash_zch_identities.dtype, dtype)
         in3 = {
             "f": JaggedTensor(
-                values=torch.arange(10, 20, dtype=torch.int64, device="cuda"),
+                values=torch.arange(10, 20, dtype=dtype, device="cuda"),
                 lengths=torch.tensor([4, 6], dtype=torch.int64, device="cuda"),
             ),
         }
@@ -152,7 +158,7 @@ class TestMCH(unittest.TestCase):
         self.assertTrue(
             torch.equal(
                 torch.unique(m3._hash_zch_identities),
-                torch.arange(10, 20, device="cuda"),
+                torch.arange(10, 20, dtype=dtype, device="cuda"),
             ),
             f"{torch.unique(m3._hash_zch_identities)=}",
         )
