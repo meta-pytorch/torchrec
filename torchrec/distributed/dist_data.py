@@ -25,6 +25,8 @@ from torchrec.distributed.comm_ops import (
     all_gather_base_pooled,
     alltoall_pooled,
     alltoall_sequence,
+    AllToAllSingle,
+    get_gradient_division,
     pg_name,
     reduce_scatter_base_pooled,
     reduce_scatter_v_per_feature_pooled,
@@ -33,7 +35,12 @@ from torchrec.distributed.comm_ops import (
 )
 from torchrec.distributed.embedding_types import KJTList
 from torchrec.distributed.global_settings import get_propogate_device
-from torchrec.distributed.types import Awaitable, QuantizedCommCodecs, rank_device
+from torchrec.distributed.types import (
+    Awaitable,
+    NoWait,
+    QuantizedCommCodecs,
+    rank_device,
+)
 from torchrec.fx.utils import fx_marker
 from torchrec.pt2.checks import is_torchdynamo_compiling
 from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
@@ -1581,13 +1588,46 @@ class VariableBatchPooledEmbeddingsAllToAll(nn.Module):
             PooledEmbeddingsAwaitable: awaitable of pooled embeddings.
         """
 
-        tensor_awaitable = variable_batch_alltoall_pooled(
-            a2a_pooled_embs_tensor=local_embs,
-            batch_size_per_rank_per_feature=batch_size_per_rank_per_feature,
-            batch_size_per_feature_pre_a2a=batch_size_per_feature_pre_a2a,
-            emb_dim_per_rank_per_feature=self._emb_dim_per_rank_per_feature,
-            group=self._pg,
-            codecs=self._codecs,
+        padded_output = None
+        if getattr(torch, "tpu", None) is not None and torch.tpu.is_available():
+            from torchrec.experimental.torch_tpu.uneven_all_to_all import (
+                maybe_variable_batch_all2all_pooled_uneven_tpu,
+            )
+
+            def even_all_to_all(
+                input_tensor: torch.Tensor, split_size: int
+            ) -> torch.Tensor:
+                split_sizes = [split_size] * self._pg.size()
+                return AllToAllSingle.apply(
+                    input_tensor,
+                    split_sizes,
+                    split_sizes,
+                    pg_name(self._pg),
+                    self._pg.size(),
+                    get_gradient_division(),
+                )
+
+            padded_output = maybe_variable_batch_all2all_pooled_uneven_tpu(
+                self._pg,
+                local_embs,
+                batch_size_per_rank_per_feature,
+                batch_size_per_feature_pre_a2a,
+                self._emb_dim_per_rank_per_feature,
+                has_codecs=self._codecs is not None,
+                even_all_to_all=even_all_to_all,
+            )
+
+        tensor_awaitable = (
+            NoWait(padded_output)
+            if padded_output is not None
+            else variable_batch_alltoall_pooled(
+                a2a_pooled_embs_tensor=local_embs,
+                batch_size_per_rank_per_feature=batch_size_per_rank_per_feature,
+                batch_size_per_feature_pre_a2a=batch_size_per_feature_pre_a2a,
+                emb_dim_per_rank_per_feature=self._emb_dim_per_rank_per_feature,
+                group=self._pg,
+                codecs=self._codecs,
+            )
         )
 
         pooled_embedding_awaitable = PooledEmbeddingsAwaitable(
