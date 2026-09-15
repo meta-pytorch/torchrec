@@ -7,6 +7,7 @@
 
 # pyre-strict
 
+import contextlib
 import logging
 import os
 import queue
@@ -31,7 +32,12 @@ from torchrec.metrics.cpu_offloaded_metric_module import (
 )
 from torchrec.metrics.deferrable_metrics import transfer_tensors_to_cpu
 from torchrec.metrics.metric_job_types import SynchronizationMarker
-from torchrec.metrics.metric_module import generate_metric_module, RecMetricModule
+from torchrec.metrics.metric_module import (
+    generate_metric_module,
+    MetricsResult,
+    RecMetricModule,
+    StateMetric,
+)
 from torchrec.metrics.metrics_config import (
     DefaultMetricsConfig,
     MetricsConfig,
@@ -74,6 +80,91 @@ class _PreparingCPUOffloadedRecMetricModule(CPUOffloadedRecMetricModule):
             "task1-label": model_out["raw_label"],
             "task1-weight": model_out["raw_weight"],
         }
+
+
+class _TestStateMetric(StateMetric):
+    def get_metrics(self) -> MetricsResult:
+        return {"value": torch.tensor(1.0)}
+
+
+class _FailingStateMetric(StateMetric):
+    def get_metrics(self) -> MetricsResult:
+        raise RuntimeError("state metric failure")
+
+
+class CPUOffloadedRecMetricModuleEmptyMetricsTest(unittest.TestCase):
+    def test_async_compute_returns_local_metrics(self) -> None:
+        module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=1,
+            world_size=1,
+            rec_tasks=[],
+            rec_metrics=RecMetricList([]),
+            throughput_metric=ThroughputMetric(
+                world_size=1,
+                batch_size=1,
+                window_seconds=1,
+            ),
+            state_metrics={"state": _TestStateMetric()},
+            update_batch_size=1,
+        )
+        try:
+            module.update({})
+
+            deferrable = module.async_compute()
+            result_event = threading.Event()
+            deferrable.subscribe(callback=lambda _, e=result_event: e.set())
+            self.assertTrue(
+                result_event.wait(timeout=15.0),
+                "empty-metrics async_compute did not complete",
+            )
+            result = deferrable.resolve()
+
+            self.assertEqual(result["throughput-throughput|total_examples"], 1)
+            torch.testing.assert_close(result["state|value"], torch.tensor(1.0))
+            self.assertEqual(module.compute_count, 1)
+            self.assertEqual(module._total_updates_processed, 1)
+            self.assertEqual(module._total_computes_processed, 1)
+            self.assertTrue(module.compute_queue.empty())
+            self.assertIsNone(module.cpu_process_group)
+        finally:
+            module.shutdown()
+
+    def test_async_compute_propagates_local_metric_failure(self) -> None:
+        module = CPUOffloadedRecMetricModule(
+            model_out_device=torch.device("cpu"),
+            batch_size=1,
+            world_size=1,
+            rec_tasks=[],
+            rec_metrics=RecMetricList([]),
+            state_metrics={"state": _FailingStateMetric()},
+            update_batch_size=1,
+        )
+        try:
+            deferrable = module.async_compute()
+            result_event = threading.Event()
+            errors: list[Exception] = []
+
+            def on_error(error: Exception) -> None:
+                errors.append(error)
+                result_event.set()
+
+            deferrable.subscribe(
+                callback=lambda _, e=result_event: e.set(),
+                on_error=on_error,
+            )
+            self.assertTrue(
+                result_event.wait(timeout=15.0),
+                "empty-metrics async_compute failure did not propagate",
+            )
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], RuntimeError)
+            self.assertEqual(str(errors[0]), "state metric failure")
+            with self.assertRaisesRegex(RuntimeError, "state metric failure"):
+                deferrable.resolve()
+        finally:
+            with contextlib.suppress(RuntimeError):
+                module.shutdown()
 
 
 class CPUOffloadedRecMetricModulePreparationTest(unittest.TestCase):
