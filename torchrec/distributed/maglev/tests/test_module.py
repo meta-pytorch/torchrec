@@ -21,6 +21,7 @@ from torchrec.distributed.maglev.module import (
     Activations,
     ActivationSpec,
     cast_activations,
+    check_activations,
     get_structured_activations_layout_metadata_fields,
     MaglevLayer,
     MaglevModuleList,
@@ -130,7 +131,6 @@ def _make_input(
 
 def _build_model(
     num_layers: int,
-    batch_size: int,
     num_tables: int,
     num_embeddings: int,
     emb_dim: int,
@@ -149,7 +149,6 @@ def _build_model(
                 tables=tables,
                 layer_dim=layer_dim,
                 is_first=(layer_index == 0),
-                batch_size=batch_size,
                 activation_layout=activation_layout,
                 num_float_features=num_float_features,
                 device=device,
@@ -161,10 +160,9 @@ def _build_model(
 class MaglevModuleListTest(unittest.TestCase):
     """Single-process checks of the authoring API (no distributed setup needed)."""
 
-    def _model(self, num_layers: int = 4, batch_size: int = 4) -> MaglevTestModel:
+    def _model(self, num_layers: int = 4) -> MaglevTestModel:
         return _build_model(
             num_layers=num_layers,
-            batch_size=batch_size,
             num_tables=2,
             num_embeddings=16,
             emb_dim=4,
@@ -202,12 +200,15 @@ class MaglevModuleListTest(unittest.TestCase):
         torch.testing.assert_close(output, staged_output)
         torch.testing.assert_close(losses, staged_losses)
 
-    def test_postproc_returns_losses_and_output(self) -> None:
-        """The model returns the usual (losses, output) pair."""
-        model = self._model(batch_size=4)
-        losses, output = model(self._inputs(batch_size=4))
-        self.assertEqual(losses.shape, torch.Size([]))  # scalar, backward-able
-        self.assertEqual(output.shape, torch.Size([4]))  # one prediction per row
+    def test_model_accepts_different_batch_sizes(self) -> None:
+        """Batch-sized specs do not bind standalone execution to construction."""
+        model = self._model()
+        for batch_size in (2, 5):
+            inputs = self._inputs(batch_size=batch_size)
+            self.assertEqual(model.get_batch_size(inputs), batch_size)
+            losses, output = model(inputs)
+            self.assertEqual(losses.shape, torch.Size([]))
+            self.assertEqual(output.shape, torch.Size([batch_size]))
 
     @patch("torchrec.distributed.maglev.stage.InputDistDriver")
     @patch("torchrec.distributed.maglev.stage.MaglevProcessGroups.from_scratch")
@@ -220,7 +221,7 @@ class MaglevModuleListTest(unittest.TestCase):
         init_process_groups: Any,
         _input_dist_driver: Any,
     ) -> None:
-        model = self._model(num_layers=1, batch_size=4)
+        model = self._model(num_layers=1)
         inputs = self._inputs(num_layers=1, batch_size=4)
         expected_loss, expected_output = model(inputs)
         process_group = MagicMock()
@@ -303,7 +304,7 @@ class MaglevModuleListTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             MaglevModuleList([])
 
-    def test_observed_activation_contract_preserves_integer_carriers(self) -> None:
+    def test_observed_activation_contract_depends_on_batch_size(self) -> None:
         class ObservedLayer(ObservedActivationSpecsMixin, MaglevLayer):
             def forward(
                 self, layer_input: Any, in_activations: Activations = ()
@@ -319,23 +320,48 @@ class MaglevModuleListTest(unittest.TestCase):
         layer.set_activation_specs(
             activations,
             activations,
-            batch_size=8,
+            batch_size=None,
             in_dtype=torch.bfloat16,
             out_dtype=torch.bfloat16,
         )
 
         expected = (
-            ActivationSpec(torch.Size([8, 3]), torch.bfloat16),
-            ActivationSpec(torch.Size([8]), torch.int64),
+            ActivationSpec(torch.Size([-1, 3]), torch.bfloat16),
+            ActivationSpec(torch.Size([-1]), torch.int64),
         )
         self.assertEqual(layer.in_activation_specs(), expected)
         self.assertEqual(layer.out_activation_specs(), expected)
         self.assertEqual(
-            activation_specs_from_tensors(activations, 8, torch.bfloat16), expected
+            activation_specs_from_tensors(activations, None, torch.bfloat16), expected
         )
+        self.assertEqual(
+            activation_specs_from_tensors(activations, 8, torch.bfloat16),
+            (
+                ActivationSpec(torch.Size([8, 3]), torch.bfloat16),
+                ActivationSpec(torch.Size([8]), torch.int64),
+            ),
+        )
+        self.assertEqual(expected[0].materialize_shape(8), torch.Size([8, 3]))
+        self.assertEqual(expected[1].materialize_shape(5), torch.Size([5]))
+        self.assertEqual(
+            ActivationSpec(torch.Size([3, -1, 5])).materialize_shape(7),
+            torch.Size([3, 7, 5]),
+        )
+        with self.assertRaisesRegex(ValueError, "at most one batch dimension"):
+            ActivationSpec(torch.Size([-1, 3, -1]))
+        with self.assertRaisesRegex(ValueError, "non-negative or -1"):
+            ActivationSpec(torch.Size([3, -2]))
         cast = cast_activations(activations, torch.bfloat16, expected)
+        check_activations(expected, cast, "dynamic boundary")
         self.assertEqual(cast[0].dtype, torch.bfloat16)
         self.assertEqual(cast[1].dtype, torch.int64)
+
+        with self.assertRaisesRegex(ValueError, "expected shape"):
+            check_activations(
+                expected,
+                (torch.zeros(2, 4), torch.zeros(2, dtype=torch.int64)),
+                "dynamic boundary",
+            )
 
     def test_structured_activations_round_trip(self) -> None:
         values = _TestStructuredActivations(
@@ -456,6 +482,8 @@ class MaglevModuleListTest(unittest.TestCase):
         stage.handoff_pg_mode = HandoffPGMode.SHARED
         stage.in_activation_specs.return_value = ()
         stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
+        stage.activation_batch_size.side_effect = [2, 3, 4]
+        stage.wait_for_act.return_value = ()
         output = (torch.ones(1, requires_grad=True),)
         grads = [torch.ones(1)]
         stage.compute_forward_micro.return_value = output
@@ -468,8 +496,18 @@ class MaglevModuleListTest(unittest.TestCase):
         pipeline.progress(iter([object()]))
 
         stage.start_send_act.assert_called_once_with(output)
+        self.assertEqual(
+            stage.compute_forward_micro.call_args_list,
+            [
+                call(["first"], (), 0),
+                call(["second"], (), 1),
+                call(["third"], (), 2),
+            ],
+        )
         stage.send_act_recv_grad.assert_has_calls([call(output), call(output)])
-        stage.send_grad_recv_act.assert_called_once_with((), recv_next=True)
+        stage.send_grad_recv_act.assert_called_once_with(
+            (), recv_next=True, batch_size=4
+        )
         stage.compute_backward_micro.assert_has_calls(
             [
                 call(grads),
@@ -488,6 +526,7 @@ class MaglevModuleListTest(unittest.TestCase):
         stage.handoff_pg_mode = HandoffPGMode.SPLIT
         stage.in_activation_specs.return_value = ()
         stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
+        stage.activation_batch_size.side_effect = [2, 3, 4]
         optimizer = MagicMock(spec=torch.optim.Optimizer)
 
         pipeline = Maglev1F1B(stage, optimizer, num_microbatches=3)
@@ -495,6 +534,18 @@ class MaglevModuleListTest(unittest.TestCase):
 
         self.assertEqual(stage.forward_micro.call_count, 3)
         self.assertEqual(stage.backward_micro.call_count, 3)
+        self.assertEqual(
+            stage.forward_micro.call_args_list,
+            [
+                call(["first"], 0),
+                call(["second"], 1),
+                call(["third"], 2),
+            ],
+        )
+        self.assertEqual(
+            stage.start_recv_act.call_args_list,
+            [call(2), call(3), call(4)],
+        )
         stage.send_act_recv_grad.assert_not_called()
         stage.send_grad_recv_act.assert_not_called()
         optimizer.step.assert_called_once_with()
@@ -507,6 +558,7 @@ class MaglevModuleListTest(unittest.TestCase):
         stage.handoff_pg_mode = HandoffPGMode.SPLIT
         stage.in_activation_specs.return_value = ()
         stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
+        stage.activation_batch_size.side_effect = [2, 3, 4]
         optimizer = MagicMock(spec=torch.optim.Optimizer)
 
         pipeline = Maglev1F1BRecvAhead(stage, optimizer, num_microbatches=3)
@@ -539,6 +591,10 @@ class MaglevModuleListTest(unittest.TestCase):
                 "backward_micro",
                 "backward_micro",
             ],
+        )
+        self.assertEqual(
+            stage.start_recv_act.call_args_list,
+            [call(2), call(3), call(4)],
         )
 
     def test_maglev_layer_defines_its_own_architecture(self) -> None:

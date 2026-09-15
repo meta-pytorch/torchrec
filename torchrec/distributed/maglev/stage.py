@@ -603,6 +603,7 @@ class StageWrapper(nn.Module):
         # holding the model would register every other stage's layers as
         # submodules of this wrapper.
         self._preproc: Callable[[Any], List[Any]] = model.preproc
+        self._get_batch_size: Callable[[Sequence[Any]], int] = model.get_batch_size
         # Holds this stage's inputs between all-to-all rounds and the schedule
         # asking for microbatches.
         self._input_driver: InputDistDriver[List[Any]] = InputDistDriver(
@@ -741,6 +742,15 @@ class StageWrapper(nn.Module):
         """The activation this stage sends to the next HSD."""
         return self._out_specs
 
+    def activation_batch_size(self, stage_input: Sequence[Any]) -> Optional[int]:
+        """Return this microbatch's size when a boundary depends on it."""
+        if not any(spec.batch_size_dependent for spec in self._in_specs):
+            return None
+        batch_size = self._get_batch_size(stage_input)
+        if batch_size < 0:
+            raise ValueError(f"batch size must be non-negative, got {batch_size}")
+        return batch_size
+
     def forward(
         self, stage_input: Sequence[Any], in_activations: Activations = ()
     ) -> Any:
@@ -762,9 +772,9 @@ class StageWrapper(nn.Module):
         .. note::
             The incoming activation is deliberately *not* validated here. On the
             pipeline path it cannot be wrong: the connector allocates each buffer
-            as ``torch.empty(spec.shape, dtype=spec.dtype)`` from these very
-            specs, so a per-microbatch check would only restate its own premise
-            while running on the host's critical path. Call
+            from these very specs after materializing any batch-size-dependent
+            leading dimension, so a per-microbatch check would only restate its
+            own premise while running on the host's critical path. Call
             :func:`~torchrec.distributed.maglev.module.check_activations`
             explicitly when feeding a stage hand-built activations.
         """
@@ -794,7 +804,7 @@ class StageWrapper(nn.Module):
         """Whether this stage ends the pipeline (nothing to send)."""
         return self.stage_index == self.num_stages - 1
 
-    def start_recv_act(self) -> None:
+    def start_recv_act(self, batch_size: Optional[int] = None) -> None:
         """Ensure a receive is posted for the previous HSD's activation.
 
         Allocates one buffer per incoming spec and issues the receives in spec
@@ -804,6 +814,9 @@ class StageWrapper(nn.Module):
         No-op on the first stage. Otherwise each call posts another receive and
         queues it, so a schedule can run several boundaries ahead of the compute;
         :meth:`wait_for_act` dequeues them in issue order.
+
+        Args:
+            batch_size: size used to materialize batch-size-dependent specs.
         """
         if self.is_first:
             return
@@ -813,7 +826,9 @@ class StageWrapper(nn.Module):
         tensors: List[torch.Tensor] = []
         for spec in self._in_specs:
             tensor = torch.empty(
-                spec.shape, device=self._placed_device, dtype=spec.dtype
+                spec.materialize_shape(batch_size),
+                device=self._placed_device,
+                dtype=spec.dtype,
             )
             works.append(dist.irecv(tensor, src=src, group=act_pg))
             tensors.append(tensor)
@@ -887,10 +902,11 @@ class StageWrapper(nn.Module):
         src = self.neighbor_rank(1)
         works: List[Any] = []
         tensors: List[torch.Tensor] = []
-        for spec in self._out_specs:
+        outputs = cast(Activations, self._pending[len(self._recv_grad)][1])
+        for output, spec in zip(outputs, self._out_specs):
             if not spec.requires_grad:
                 continue
-            grad = torch.empty(spec.shape, device=self._placed_device, dtype=spec.dtype)
+            grad = torch.empty_like(output, memory_format=torch.contiguous_format)
             works.append(dist.irecv(grad, src=src, group=grad_pg))
             tensors.append(grad)
         self._recv_grad.append((works, tensors))
@@ -930,9 +946,10 @@ class StageWrapper(nn.Module):
         peer = self.neighbor_rank(1)
         pg = self.handoff_pgs[0]
         send_buffers = [tensor.detach().contiguous() for tensor in outputs]
+        backward_outputs = cast(Activations, self._pending[0][1])
         grad_buffers = [
-            torch.empty(spec.shape, device=self._placed_device, dtype=spec.dtype)
-            for spec in self._out_specs
+            torch.empty_like(output, memory_format=torch.contiguous_format)
+            for output, spec in zip(backward_outputs, self._out_specs)
             if spec.requires_grad
         ]
         ops = [dist.P2POp(dist.isend, tensor, peer, pg) for tensor in send_buffers]
@@ -946,10 +963,16 @@ class StageWrapper(nn.Module):
         self,
         in_activations: Activations,
         recv_next: bool,
+        batch_size: Optional[int] = None,
     ) -> Activations:
         """Exchange an upstream gradient for the next forward activation.
 
         Available only in ``SHARED`` mode; see :meth:`send_act_recv_grad`.
+
+        Args:
+            in_activations: activations whose gradients are sent upstream.
+            recv_next: whether to receive the next forward activation.
+            batch_size: size of that next activation microbatch.
         """
         if self.is_first:
             return ()
@@ -964,7 +987,11 @@ class StageWrapper(nn.Module):
         ]
         activation_buffers = (
             [
-                torch.empty(spec.shape, device=self._placed_device, dtype=spec.dtype)
+                torch.empty(
+                    spec.materialize_shape(batch_size),
+                    device=self._placed_device,
+                    dtype=spec.dtype,
+                )
                 for spec in self._in_specs
             ]
             if recv_next
