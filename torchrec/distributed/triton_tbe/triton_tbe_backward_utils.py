@@ -222,7 +222,8 @@ def _classify_runs_kernel(
     num_long_ptr,
     infos_sorted_ptr,
     feature_bucket_id_ptr,
-    bucket_base_ptr,
+    bucket_rows_ptr,
+    max_num_runs,
     info_B_num_bits,
     threshold: tl.constexpr,
     CLASSIFY_BLOCK: tl.constexpr,
@@ -234,8 +235,8 @@ def _classify_runs_kernel(
 
     With NUM_BUCKETS > 1 the short runs are additionally split by the embedding
     dimension bucket of their feature, so each bucket can be launched with a
-    BLOCK_SIZE that matches its rows instead of the global max. Bucket b's ids
-    live at short_run_ids[bucket_base[b] : bucket_base[b] + num_short[b]].
+    BLOCK_SIZE that matches its rows instead of the global max. Bucket bases
+    are the prefix sums of min(bucket_rows[b], max_num_runs).
     """
     pid = tl.program_id(0)
     num_runs = tl.load(num_runs_ptr)
@@ -268,13 +269,15 @@ def _classify_runs_kernel(
         info = tl.load(infos_sorted_ptr + cum_start, mask=mask, other=0).to(tl.uint32)
         t = (info >> info_B_num_bits).to(tl.int32)
         bucket_id = tl.load(feature_bucket_id_ptr + t, mask=mask, other=0)
+        bucket_base = 0
         for b in tl.static_range(NUM_BUCKETS):
             sel = is_short & (bucket_id == b)
             cnt = tl.sum(sel.to(tl.int32))
             base = tl.atomic_add(num_short_ptr + b, cnt)
             local = tl.cumsum(sel.to(tl.int32), axis=0) - 1
-            pos = (tl.load(bucket_base_ptr + b) + base + local).to(tl.int64)
+            pos = (bucket_base + base + local).to(tl.int64)
             tl.store(short_run_ids_ptr + pos, offsets.to(tl.int32), mask=sel)
+            bucket_base += tl.minimum(tl.load(bucket_rows_ptr + b), max_num_runs)
 
 
 @triton.jit
@@ -326,7 +329,7 @@ def _expand_long_runs(
     max_sl_per_program: int = _LONG_RUN_THRESHOLD,
     infos_sorted: Optional[torch.Tensor] = None,
     feature_bucket_id: Optional[torch.Tensor] = None,
-    bucket_base: Optional[torch.Tensor] = None,
+    bucket_rows: Optional[torch.Tensor] = None,
     short_run_capacity: Optional[int] = None,
     num_buckets: int = 1,
     info_B_num_bits: int = 0,
@@ -375,7 +378,8 @@ def _expand_long_runs(
         num_long_runs_t,
         infos_sorted,
         feature_bucket_id,
-        bucket_base,
+        bucket_rows,
+        max_num_runs,
         info_B_num_bits,
         threshold=max_sl_per_program,
         CLASSIFY_BLOCK=CLASSIFY_BLOCK,

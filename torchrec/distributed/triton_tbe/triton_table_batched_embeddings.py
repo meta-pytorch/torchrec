@@ -2694,6 +2694,7 @@ class TritonTBE(torch.autograd.Function):
         bwd_bucket_block_sizes: Tuple[int, ...] = (),
         bwd_feature_bucket_id: Optional[torch.Tensor] = None,
         bwd_bucket_rows: Tuple[int, ...] = (),
+        bwd_bucket_rows_tensor: Optional[torch.Tensor] = None,
         weight_ptrs: Tuple[torch.Tensor, ...] = (),
         weight_chunk_starts: Tuple[int, ...] = (),
         split_weight_row_starts: Tuple[int, ...] = (),
@@ -2906,6 +2907,7 @@ class TritonTBE(torch.autograd.Function):
         ctx.bwd_feature_bucket_id = bwd_feature_bucket_id
         ctx.bwd_bucket_rows = bwd_bucket_rows
         ctx.enable_triton_tbe_optimizations = enable_triton_tbe_optimizations
+        ctx.bwd_bucket_rows_tensor = bwd_bucket_rows_tensor
 
         if hoist_transpose_to_forward:
             # Hoist the backward index transpose (linearize + sort + run-length
@@ -3569,11 +3571,15 @@ class TritonTBE(torch.autograd.Function):
         bucket_block_sizes: Tuple[int, ...] = getattr(ctx, "bwd_bucket_block_sizes", ())
         feature_bucket_id = getattr(ctx, "bwd_feature_bucket_id", None)
         bucket_rows: Tuple[int, ...] = getattr(ctx, "bwd_bucket_rows", ())
+        bucket_rows_tensor: Optional[torch.Tensor] = getattr(
+            ctx, "bwd_bucket_rows_tensor", None
+        )
         use_dim_buckets = (
             cfg.enable_dim_bucketing
             and not is_amd()
             and len(bucket_block_sizes) > 1
             and feature_bucket_id is not None
+            and bucket_rows_tensor is not None
             # The histogram tier strips leading features and rebases
             # feature_table_map, which would misalign the per-feature bucket ids.
             and num_valid_histograms == 0
@@ -3586,15 +3592,13 @@ class TritonTBE(torch.autograd.Function):
                 bucket_bases[b] = running
                 running += cap
             short_run_capacity = running
-            bucket_base_t = torch.tensor(
-                bucket_bases, dtype=torch.int64, device=weight.device
-            )
+            bucket_rows_for_kernel = bucket_rows_tensor
             num_buckets = len(bucket_caps)
         else:
             bucket_caps = [max_num_runs]
             bucket_bases = [0]
             short_run_capacity = max_num_runs
-            bucket_base_t = None
+            bucket_rows_for_kernel = None
             num_buckets = 1
 
         if is_amd():
@@ -3632,7 +3636,7 @@ class TritonTBE(torch.autograd.Function):
                 max_sl_per_program=cfg.long_run_threshold,
                 infos_sorted=infos_sorted,
                 feature_bucket_id=feature_bucket_id,
-                bucket_base=bucket_base_t,
+                bucket_rows=bucket_rows_for_kernel,
                 short_run_capacity=short_run_capacity,
                 num_buckets=num_buckets,
                 info_B_num_bits=info_B_num_bits,
@@ -4185,6 +4189,13 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         for rows, dim in embedding_specs:
             bucket_rows[bucket_index[max(32, triton.next_power_of_2(dim))]] += rows
         self._bwd_bucket_rows: Tuple[int, ...] = tuple(bucket_rows)
+        # Citrine C3: keep invariant capacities device-resident so backward
+        # never stages their dynamic prefix sums through host memory.
+        self._bwd_bucket_rows_tensor = torch.tensor(
+            bucket_rows,
+            dtype=torch.int64,
+            device=device,
+        )
         total_weight_size = sum(table_sizes)
         (
             self._feature_weight_chunk_ids,
@@ -4569,6 +4580,7 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             self._bwd_bucket_block_sizes,
             self._bwd_feature_bucket_id,
             self._bwd_bucket_rows,
+            self._bwd_bucket_rows_tensor,
             weight_ptrs,
             weight_chunk_starts,
             split_weight_row_starts,
