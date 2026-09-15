@@ -402,7 +402,6 @@ def runner(
                 tables=all_tables[layer_index],
                 layer_dim=run_option.layer_dim,
                 is_first=(layer_index == 0),
-                batch_size=run_option.batch_size,
                 activation_layout=activation_layout,
                 num_float_features=run_option.num_float_features,
                 device=meta_device,

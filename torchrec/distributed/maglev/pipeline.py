@@ -170,10 +170,11 @@ class MaglevPipelineBase:
             no label or criterion is passed in.
         """
         (stage_input,) = self._take_inputs(dataloader_iter, 1)
+        batch_size = self.stage.activation_batch_size(stage_input)
 
         with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
             self.optimizer.zero_grad()
-        self.stage.start_recv_act()
+        self.stage.start_recv_act(batch_size)
         self.stage.forward_micro(stage_input, microbatch_id=0)
         # Immediately before the backward, never earlier -- see Maglev1F1B.
         self.stage.start_recv_grad()
@@ -290,21 +291,28 @@ class Maglev1F1B(MaglevPipelineBase):
         """
         stage = self.stage
         microbatch_inputs = self._take_inputs(dataloader_iter, self.num_microbatches)
+        batch_sizes = [
+            stage.activation_batch_size(inputs) for inputs in microbatch_inputs
+        ]
 
         with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
             self.optimizer.zero_grad()
 
         if stage.handoff_pg_mode is HandoffPGMode.SHARED:
-            self._progress_shared(microbatch_inputs)
+            self._progress_shared(microbatch_inputs, batch_sizes)
         else:
-            self._progress_split(microbatch_inputs)
+            self._progress_split(microbatch_inputs, batch_sizes)
 
         stage.drain_sends()
         with record_function("## torchrec_maglev:optimizer_step ##"):
             self.optimizer.step()
         return None
 
-    def _progress_split(self, microbatch_inputs: List[List[Any]]) -> None:
+    def _progress_split(
+        self,
+        microbatch_inputs: List[List[Any]],
+        batch_sizes: List[Optional[int]],
+    ) -> None:
         """Run 1F1B with independent activation and gradient communicators."""
         stage = self.stage
         fwd_idx = 0
@@ -312,7 +320,8 @@ class Maglev1F1B(MaglevPipelineBase):
 
         def _forward() -> None:
             nonlocal fwd_idx
-            stage.start_recv_act()
+            batch_size = batch_sizes[fwd_idx]
+            stage.start_recv_act(batch_size)
             with self._forward_context(fwd_idx, self.num_microbatches):
                 stage.forward_micro(microbatch_inputs[fwd_idx], fwd_idx)
             fwd_idx += 1
@@ -332,7 +341,11 @@ class Maglev1F1B(MaglevPipelineBase):
         for _ in range(self.num_warmup):
             _backward()
 
-    def _progress_shared(self, microbatch_inputs: List[List[Any]]) -> None:
+    def _progress_shared(
+        self,
+        microbatch_inputs: List[List[Any]],
+        batch_sizes: List[Optional[int]],
+    ) -> None:
         """Run 1F1B with both handoff directions batched on one communicator."""
         stage = self.stage
 
@@ -343,7 +356,9 @@ class Maglev1F1B(MaglevPipelineBase):
             nonlocal fwd_idx
             with self._forward_context(fwd_idx, self.num_microbatches):
                 outputs = stage.compute_forward_micro(
-                    microbatch_inputs[fwd_idx], in_activations, fwd_idx
+                    microbatch_inputs[fwd_idx],
+                    in_activations,
+                    fwd_idx,
                 )
             fwd_idx += 1
             return outputs
@@ -359,17 +374,17 @@ class Maglev1F1B(MaglevPipelineBase):
 
         # Warmup: fill the pipeline with one-way forward hand-offs.
         if self.num_warmup:
-            stage.start_recv_act()
+            stage.start_recv_act(batch_sizes[fwd_idx])
         for i in range(self.num_warmup):
             in_activations = stage.wait_for_act()
             outputs = _compute_forward(in_activations)
             stage.start_send_act(outputs)
             stage.finish_send_act()
             if i < self.num_warmup - 1:
-                stage.start_recv_act()
+                stage.start_recv_act(batch_sizes[fwd_idx])
 
         # Seed the activation consumed by the first steady iteration.
-        stage.start_recv_act()
+        stage.start_recv_act(batch_sizes[fwd_idx])
         in_activations = stage.wait_for_act()
 
         # Steady state: batch the two opposing directions at each boundary.
@@ -379,7 +394,9 @@ class Maglev1F1B(MaglevPipelineBase):
             _loss, backward_inputs = _compute_backward(grads)
             if i < self.num_steady - 1:
                 in_activations = stage.send_grad_recv_act(
-                    backward_inputs, recv_next=True
+                    backward_inputs,
+                    recv_next=True,
+                    batch_size=batch_sizes[fwd_idx],
                 )
             else:
                 stage.start_send_grad(backward_inputs)
@@ -412,12 +429,21 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
             return super().progress(dataloader_iter)
 
         microbatch_inputs = self._take_inputs(dataloader_iter, self.num_microbatches)
+        batch_sizes = [
+            stage.activation_batch_size(inputs) for inputs in microbatch_inputs
+        ]
 
         with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
             self.optimizer.zero_grad()
 
         fwd_idx = 0
         bwd_idx = 0
+        recv_idx = 0
+
+        def _start_recv_act() -> None:
+            nonlocal recv_idx
+            stage.start_recv_act(batch_sizes[recv_idx])
+            recv_idx += 1
 
         def _forward() -> None:
             nonlocal fwd_idx
@@ -425,10 +451,10 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
                 stage.forward_micro(microbatch_inputs[fwd_idx], fwd_idx)
             fwd_idx += 1
 
-        stage.start_recv_act()
+        _start_recv_act()
 
         for _ in range(self.num_warmup):
-            stage.start_recv_act()
+            _start_recv_act()
             _forward()
 
         def _backward() -> None:
@@ -441,7 +467,7 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
             stage.start_recv_grad()
             _forward()
             if i < self.num_steady - 1:
-                stage.start_recv_act()
+                _start_recv_act()
             else:
                 stage.start_recv_grad()
             _backward()
