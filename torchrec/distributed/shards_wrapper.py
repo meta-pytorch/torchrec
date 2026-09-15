@@ -9,7 +9,7 @@
 
 # COPY of the code from torch.distributed._tensor._shards_wrapper - for package compat
 
-from typing import Any, List, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 from torch.distributed.checkpoint.metadata import (
@@ -27,6 +27,16 @@ from torch.distributed.checkpoint.planner import (
 aten = torch.ops.aten
 
 
+def get_combined_local_size(local_sizes: List[torch.Size]) -> torch.Size:
+    assert local_sizes
+    combined_size = list(local_sizes[0])
+    if len(local_sizes) > 1 and len(combined_size) == 2:
+        combined_size[1] = sum(size[1] for size in local_sizes)
+    elif len(local_sizes) > 1 and len(combined_size) == 1:
+        combined_size[0] = sum(size[0] for size in local_sizes)
+    return torch.Size(combined_size)
+
+
 class LocalShardsWrapper(torch.Tensor):
     """
     A wrapper class to hold local shards of a DTensor.
@@ -40,7 +50,10 @@ class LocalShardsWrapper(torch.Tensor):
 
     @staticmethod
     def __new__(
-        cls, local_shards: List[torch.Tensor], local_offsets: List[Tuple[int, ...]]
+        cls,
+        local_shards: List[torch.Tensor],
+        local_offsets: List[Tuple[int, ...]],
+        logical_size: Optional[torch.Size] = None,
     ) -> "LocalShardsWrapper":
         assert all(
             tensor.device == local_shards[0].device for tensor in local_shards[1:]
@@ -48,17 +61,21 @@ class LocalShardsWrapper(torch.Tensor):
 
         # if empty shard, we create a empty tensor
         if len(local_shards) == 0:
+            wrapper_shape = (
+                logical_size if logical_size is not None else torch.Size([0, 0])
+            )
+            empty_chunk_shape = torch.Size([0] * len(wrapper_shape))
             r = torch.Tensor._make_wrapper_subclass(  # type: ignore[attr-defined])
                 cls,
-                torch.Size([0, 0]),
+                wrapper_shape,
             )
             r._local_shards = []
             r._storage_meta = TensorStorageMetadata(
                 properties=TensorProperties(),
-                size=torch.Size([0, 0]),
+                size=wrapper_shape,
                 chunks=[
                     ChunkStorageMetadata(
-                        offsets=torch.Size([0, 0]), sizes=torch.Size([0, 0])
+                        offsets=empty_chunk_shape, sizes=empty_chunk_shape
                     )
                 ],
             )
@@ -76,7 +93,9 @@ class LocalShardsWrapper(torch.Tensor):
                 cat_tensor_shape[0] += shard.size()[0]
 
         wrapper_properties = TensorProperties.create_from_tensor(local_shards[0])
-        wrapper_shape = torch.Size(cat_tensor_shape)
+        wrapper_shape = (
+            logical_size if logical_size is not None else torch.Size(cat_tensor_shape)
+        )
         chunks_meta = [
             ChunkStorageMetadata(
                 offsets=torch.Size(offset),
@@ -87,7 +106,11 @@ class LocalShardsWrapper(torch.Tensor):
 
         r = torch.Tensor._make_wrapper_subclass(  # type: ignore[attr-defined]
             cls,
-            torch.Size(cat_tensor_shape),
+            wrapper_shape,
+            dtype=local_shards[0].dtype,
+            layout=local_shards[0].layout,
+            device=local_shards[0].device,
+            requires_grad=local_shards[0].requires_grad,
         )
         r._local_shards = local_shards
         r._storage_meta = TensorStorageMetadata(
@@ -97,6 +120,14 @@ class LocalShardsWrapper(torch.Tensor):
         )
 
         return r
+
+    def __init__(
+        self,
+        local_shards: List[torch.Tensor],
+        local_offsets: List[Tuple[int, ...]],
+        logical_size: Optional[torch.Size] = None,
+    ) -> None:
+        pass
 
     # necessary for ops dispatching from this subclass to its local shards
     @classmethod
@@ -114,6 +145,7 @@ class LocalShardsWrapper(torch.Tensor):
             aten.clone.default: cls.handle_clone,
             aten.new_empty.default: cls.handle_new_empty,
             aten.copy_.default: cls.handle_copy_,
+            aten.uniform_.default: cls.handle_uniform_,
             aten.zeros_like.default: cls.handle_zeros_like,
             aten.empty_like.default: cls.handle_empty_like,
         }
@@ -130,6 +162,7 @@ class LocalShardsWrapper(torch.Tensor):
         return LocalShardsWrapper(
             [torch.zeros_like(shard, **kwargs) for shard in args[0].local_shards()],
             args[0].local_offsets(),
+            logical_size=args[0].storage_metadata().size,
         )
 
     @staticmethod
@@ -137,6 +170,7 @@ class LocalShardsWrapper(torch.Tensor):
         return LocalShardsWrapper(
             [torch.empty_like(shard, **kwargs) for shard in args[0].local_shards()],
             args[0].local_offsets(),
+            logical_size=args[0].storage_metadata().size,
         )
 
     @staticmethod
@@ -144,10 +178,95 @@ class LocalShardsWrapper(torch.Tensor):
         src = args[1]
         dst = args[0]
 
-        for i, shard in enumerate(src.local_shards()):
-            dst.local_shards()[i].copy_(shard, **kwargs)
+        if isinstance(src, LocalShardsWrapper):
+            LocalShardsWrapper._copy_from_wrapper(
+                dst,
+                src,
+                args[2:],
+                kwargs,
+            )
+        else:
+            expanded_src = src.expand(dst.storage_metadata().size)
+            for dst_shard, offset in zip(dst.local_shards(), dst.local_offsets()):
+                slices = tuple(
+                    slice(dim_offset, dim_offset + dim_size)
+                    for dim_offset, dim_size in zip(offset, dst_shard.size())
+                )
+                dst_shard.copy_(expanded_src[slices], *args[2:], **kwargs)
 
         return args[0]
+
+    @staticmethod
+    def handle_uniform_(args, kwargs):
+        for shard in args[0].local_shards():
+            aten.uniform_.default(shard, *args[1:], **kwargs)
+        return args[0]
+
+    @staticmethod
+    def _copy_from_wrapper(dst, src, extra_args, kwargs) -> None:
+        if dst.storage_metadata().size != src.storage_metadata().size:
+            raise ValueError(
+                "LocalShardsWrapper copy requires matching logical tensor sizes"
+            )
+
+        for dst_shard, dst_offset in zip(
+            dst.local_shards(),
+            dst.local_offsets(),
+        ):
+            copied_numel = 0
+            for src_shard, src_offset in zip(
+                src.local_shards(),
+                src.local_offsets(),
+            ):
+                overlap_start = tuple(
+                    max(int(dst_start), int(src_start))
+                    for dst_start, src_start in zip(dst_offset, src_offset)
+                )
+                overlap_end = tuple(
+                    min(
+                        int(dst_start) + dst_size,
+                        int(src_start) + src_size,
+                    )
+                    for dst_start, dst_size, src_start, src_size in zip(
+                        dst_offset,
+                        dst_shard.shape,
+                        src_offset,
+                        src_shard.shape,
+                    )
+                )
+                if any(start >= end for start, end in zip(overlap_start, overlap_end)):
+                    continue
+
+                dst_slices = tuple(
+                    slice(start - int(offset), end - int(offset))
+                    for start, end, offset in zip(
+                        overlap_start,
+                        overlap_end,
+                        dst_offset,
+                    )
+                )
+                src_slices = tuple(
+                    slice(start - int(offset), end - int(offset))
+                    for start, end, offset in zip(
+                        overlap_start,
+                        overlap_end,
+                        src_offset,
+                    )
+                )
+                dst_shard[dst_slices].copy_(
+                    src_shard[src_slices],
+                    *extra_args,
+                    **kwargs,
+                )
+                overlap_numel = 1
+                for start, end in zip(overlap_start, overlap_end):
+                    overlap_numel *= end - start
+                copied_numel += overlap_numel
+
+            if copied_numel != dst_shard.numel():
+                raise ValueError(
+                    "Source LocalShardsWrapper does not cover the destination layout"
+                )
 
     @staticmethod
     def handle_all_gather_into_tensor(args, kwargs):
@@ -169,7 +288,11 @@ class LocalShardsWrapper(torch.Tensor):
             aten._to_copy.default(shard, *args[1:], **kwargs)
             for shard in args[0].local_shards()
         ]
-        return LocalShardsWrapper(res_shards_list, args[0].local_offsets())
+        return LocalShardsWrapper(
+            res_shards_list,
+            args[0].local_offsets(),
+            logical_size=args[0].storage_metadata().size,
+        )
 
     @staticmethod
     def handle_view(args, kwargs):
@@ -203,7 +326,17 @@ class LocalShardsWrapper(torch.Tensor):
                 aten.view.default(shard, args[1], **kwargs)
                 for shard in args[0].local_shards()
             ]
-        return LocalShardsWrapper(res_shards_list, args[0].local_offsets())
+        if len(res_shards_list) == 0:
+            logical_size = torch.Size(view_shape)
+        elif len(res_shards_list) == 1:
+            logical_size = res_shards_list[0].size()
+        else:
+            logical_size = args[0].storage_metadata().size
+        return LocalShardsWrapper(
+            res_shards_list,
+            args[0].local_offsets(),
+            logical_size=logical_size,
+        )
 
     @staticmethod
     def handle_equal(args, kwargs):
@@ -225,12 +358,14 @@ class LocalShardsWrapper(torch.Tensor):
     @staticmethod
     def handle_detach(args, kwargs):
         self_ls = args[0]
-        deatched_local_shards = [
+        detached_local_shards = [
             aten.detach.default(shard) for shard in self_ls.local_shards()
         ]
-        self_ls._local_shards = deatched_local_shards
-        self_ls._storage_meta.properties.requires_grad = False
-        return self_ls
+        return LocalShardsWrapper(
+            detached_local_shards,
+            self_ls.local_offsets(),
+            logical_size=self_ls.storage_metadata().size,
+        )
 
     @staticmethod
     def handle_clone(args, kwargs):
@@ -244,7 +379,11 @@ class LocalShardsWrapper(torch.Tensor):
             shard.clone(memory_format=desired_memory_format)
             for shard in self_ls._local_shards
         ]
-        return LocalShardsWrapper(cloned_local_shards, self_ls.local_offsets())
+        return LocalShardsWrapper(
+            cloned_local_shards,
+            self_ls.local_offsets(),
+            logical_size=self_ls.storage_metadata().size,
+        )
 
     @staticmethod
     def handle_new_empty(args, kwargs):
@@ -252,6 +391,7 @@ class LocalShardsWrapper(torch.Tensor):
         return LocalShardsWrapper(
             [torch.empty_like(shard) for shard in self_ls._local_shards],
             self_ls.local_offsets(),
+            logical_size=self_ls.storage_metadata().size,
         )
 
     @property
@@ -269,6 +409,7 @@ class LocalShardsWrapper(torch.Tensor):
 
     # pyrefly: ignore[bad-param-name-override]
     def requires_grad_(self, requires_grad: bool = True) -> "LocalShardsWrapper":
+        torch.Tensor.requires_grad_(self, requires_grad)
         self._storage_meta.properties.requires_grad = requires_grad
         [shard.requires_grad_(requires_grad) for shard in self._local_shards]
         return self
