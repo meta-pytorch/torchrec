@@ -208,7 +208,12 @@ class TritonBatchIndexSelectTest(unittest.TestCase):
                         )
                     index_parts.append(index_part)
                 indices = torch.cat(index_parts)
-                reference_inputs = inputs.detach().clone().requires_grad_()
+                # The kernel accumulates high-duplication fp16 gradients in fp32,
+                # so an fp16 reference is the less accurate side: its own fp16
+                # accumulation error over the duplicate indices can exceed the
+                # tolerance. Accumulate the reference in fp32 and compare against
+                # that higher-precision gradient instead.
+                reference_inputs = inputs.detach().clone().float().requires_grad_()
 
                 output = triton_batch_index_select_dim0(
                     inputs, indices, batch_size, input_rows, input_columns
@@ -220,14 +225,17 @@ class TritonBatchIndexSelectTest(unittest.TestCase):
                     input_rows,
                     input_columns,
                 )
-                torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                # The forward gather is exact, so it still matches in fp16.
+                torch.testing.assert_close(
+                    output, expected.to(output.dtype), rtol=0, atol=0
+                )
                 grad_output = torch.randn_like(output)
                 actual_grad = torch.autograd.grad(output, inputs, grad_output)[0]
                 expected_grad = torch.autograd.grad(
-                    expected, reference_inputs, grad_output
+                    expected, reference_inputs, grad_output.float()
                 )[0]
                 torch.testing.assert_close(
-                    actual_grad,
+                    actual_grad.float(),
                     expected_grad,
                     rtol=0,
                     atol=max(16, 2 * batch_size // min(input_rows))
