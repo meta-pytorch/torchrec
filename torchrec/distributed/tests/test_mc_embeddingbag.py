@@ -150,6 +150,7 @@ class SparseArch(nn.Module):
         allow_in_place_embed_weight_update: bool = False,
         use_mpzch: bool = False,
         is_inference: bool = False,
+        long_dtype: bool = True,
     ) -> None:
         super().__init__()
         self._return_remapped = return_remapped
@@ -168,6 +169,7 @@ class SparseArch(nn.Module):
                     single_ttl=1,
                 ),
                 is_inference=is_inference,
+                long_dtype=long_dtype,
             )
 
             mc_modules["table_1"] = HashZchManagedCollisionModule(
@@ -181,6 +183,7 @@ class SparseArch(nn.Module):
                     single_ttl=1,
                 ),
                 is_inference=is_inference,
+                long_dtype=long_dtype,
             )
         else:
             # pyrefly: ignore[unsupported-operation]
@@ -540,6 +543,7 @@ def _run_single_rank_training_step(
     local_size: Optional[int] = None,
     use_mpzch: bool = False,
     kernel_type: Optional[str] = None,
+    long_dtype: bool = True,
 ) -> None:
     with MultiProcessContext(rank, world_size, backend, local_size) as ctx:
         kjt_input = kjt_input_per_rank[rank].to(ctx.device)
@@ -549,6 +553,7 @@ def _run_single_rank_training_step(
             device=torch.device("cuda"),
             return_remapped=False,
             use_mpzch=use_mpzch,
+            long_dtype=long_dtype,
         )
 
         train_sharding_plan = construct_module_sharding_plan(
@@ -725,10 +730,15 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
             ]
         ),
         pooling_type=st.sampled_from([PoolingType.SUM, PoolingType.MEAN]),
+        long_dtype=st.booleans(),
     )
     @settings(deadline=None)
     def test_mc_zch_with_sharded_versus_unsharded_vbe(
-        self, backend: str, kernel_type: str, pooling_type: PoolingType
+        self,
+        backend: str,
+        kernel_type: str,
+        pooling_type: PoolingType,
+        long_dtype: bool,
     ) -> None:
         WORLD_SIZE = 2
         embedding_bag_config: Final[List[EmbeddingBagConfig]] = [
@@ -749,6 +759,7 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
             ),
         ]
 
+        indices_dtype = torch.int64 if long_dtype else torch.int32
         global_input, local_inputs = ModelInput.generate_variable_batch_input(
             average_batch_size=10,
             world_size=WORLD_SIZE,
@@ -758,8 +769,22 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
             pooling_avg=5,
             global_constant_batch=False,
             use_offsets=False,
+            indices_dtype=indices_dtype,
             random_seed=100,
         )
+
+        for model_input in [global_input, *local_inputs]:
+            kjt = model_input.idlist_features
+            assert isinstance(kjt, KeyedJaggedTensor)
+            inverse_indices = kjt.inverse_indices()
+            model_input.idlist_features = KeyedJaggedTensor(
+                keys=kjt.keys(),
+                values=kjt.values(),
+                lengths=kjt.lengths(),
+                weights=kjt.weights_or_none(),
+                stride_per_key_per_rank=kjt.stride_per_key_per_rank(),
+                inverse_indices=(inverse_indices[0], inverse_indices[1].long()),
+            )
 
         # Extract global and local KJT from ModelInput
         global_kjt = global_input.idlist_features
@@ -780,6 +805,7 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
             backend=backend,
             use_mpzch=True,
             kernel_type=kernel_type,
+            long_dtype=long_dtype,
         )
 
         merged_state_dict = _merge_sharded_return_state_dict(
@@ -795,6 +821,7 @@ class ShardedMCEmbeddingBagCollectionParallelTest(MultiProcessTestBase):
             return_remapped=False,
             use_mpzch=True,
             is_inference=True,
+            long_dtype=long_dtype,
         )
         unsharded_model.load_state_dict(merged_state_dict)
 
