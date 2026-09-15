@@ -10,7 +10,18 @@
 import copy
 import random
 from dataclasses import dataclass
-from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Type, Union
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Type,
+    Union,
+)
 
 import torch
 import torch.nn as nn
@@ -3195,8 +3206,6 @@ class MaglevTestLayer(MaglevLayer):
         tables: this layer's embedding tables (its sparse feature partition).
         layer_dim: width of the activation carried between layers.
         is_first: whether this is the first layer (no incoming activation).
-        batch_size: per-microbatch batch size ``B``; only used to declare the
-            activation specs.
         activation_layout: shared layout for the model's structured boundary.
         num_float_features: width of this layer's float feature input. 0 disables
             the dense path.
@@ -3209,7 +3218,7 @@ class MaglevTestLayer(MaglevLayer):
         tables = [EmbeddingBagConfig(name="t", embedding_dim=8, num_embeddings=16,
                                      feature_names=["f"])]
         layout = StructuredActivationsLayout[MaglevTestActivations]()
-        layer = MaglevTestLayer(tables, layer_dim=12, is_first=True, batch_size=2,
+        layer = MaglevTestLayer(tables, layer_dim=12, is_first=True,
                                 activation_layout=layout, num_float_features=4)
         mi = ModelInput.generate(batch_size=2, tables=tables, weighted_tables=[],
                                  num_float_features=4)
@@ -3221,7 +3230,6 @@ class MaglevTestLayer(MaglevLayer):
         tables: List[EmbeddingBagConfig],
         layer_dim: int,
         is_first: bool,
-        batch_size: int,
         activation_layout: "StructuredActivationsLayout[MaglevTestActivations]",
         num_float_features: int = 0,
         device: Optional[torch.device] = None,
@@ -3229,7 +3237,7 @@ class MaglevTestLayer(MaglevLayer):
         super().__init__()
         self.is_first = is_first
         self._spec: ActivationSpec = ActivationSpec(
-            torch.Size([batch_size, layer_dim]), torch.float32
+            torch.Size([-1, layer_dim]), torch.float32
         )
         self.activation_layout = activation_layout
         self.ebc: EmbeddingBagCollection = EmbeddingBagCollection(
@@ -3315,6 +3323,11 @@ class MaglevTestModel(MaglevModuleList):
     ) -> None:
         super().__init__(layers)
         self.activation_layout = activation_layout
+
+    def get_batch_size(self, layer_inputs: Sequence[Any]) -> int:
+        """Read ``B`` from any local layer's dense input."""
+        first = cast(ModelInput, layer_inputs[0])
+        return first.float_features.shape[0]
 
     def postproc(
         self,

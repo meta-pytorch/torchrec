@@ -449,7 +449,7 @@ class StructuredActivationsLayout(Generic[TStructuredActivations]):
 
 @dataclass(frozen=True)
 class ActivationSpec:
-    """Static description of one tensor in an inter-layer activation tuple.
+    """Description of one tensor in an inter-layer activation tuple.
 
     A layer declares the activations it consumes and produces as specs
     (:meth:`MaglevLayer.in_activation_specs` /
@@ -457,19 +457,44 @@ class ActivationSpec:
     can allocate receive buffers -- and match send/recv order -- without running
     a shape-inference forward pass.
 
-    ``shape`` is the full per-microbatch shape, including the batch dimension.
+    A fixed spec stores the full tensor shape. A batch-size-dependent spec uses
+    ``-1`` for its batch dimension, which is materialized from the microbatch
+    being executed.
 
     Args:
-        shape: full shape of the tensor, batch dimension included.
+        shape: tensor shape, with at most one ``-1`` batch-size dimension.
         dtype: dtype of the tensor. Default is ``torch.float32``.
 
     Example::
 
         ActivationSpec(torch.Size([1024, 512]))
+        ActivationSpec(torch.Size([-1, 512]))
     """
 
     shape: torch.Size
     dtype: torch.dtype = torch.float32
+
+    def __post_init__(self) -> None:
+        if self.shape.count(-1) > 1:
+            raise ValueError("an activation spec may have at most one batch dimension")
+        if any(dim < -1 for dim in self.shape):
+            raise ValueError("activation spec dimensions must be non-negative or -1")
+
+    @property
+    def batch_size_dependent(self) -> bool:
+        """Whether ``shape`` contains a runtime batch-size dimension."""
+        return -1 in self.shape
+
+    def materialize_shape(self, batch_size: Optional[int] = None) -> torch.Size:
+        """Return the concrete shape for one microbatch."""
+        if not self.batch_size_dependent:
+            return self.shape
+        if batch_size is None or batch_size < 0:
+            raise ValueError(
+                "a non-negative batch size is required for a batch-size-dependent "
+                "activation"
+            )
+        return torch.Size(batch_size if dim == -1 else dim for dim in self.shape)
 
     @property
     def requires_grad(self) -> bool:
@@ -499,9 +524,12 @@ def check_activations(
             f"{what}: expected {len(specs)} activation tensors, got {len(activations)}"
         )
     for i, (spec, tensor) in enumerate(zip(specs, activations)):
-        if tuple(tensor.shape) != tuple(spec.shape):
+        expected_shape = spec.materialize_shape(
+            tensor.shape[0] if spec.batch_size_dependent and tensor.ndim > 0 else None
+        )
+        if tuple(tensor.shape) != tuple(expected_shape):
             raise ValueError(
-                f"{what}[{i}]: expected shape {tuple(spec.shape)}, got "
+                f"{what}[{i}]: expected shape {tuple(expected_shape)}, got "
                 f"{tuple(tensor.shape)}"
             )
         if tensor.dtype != spec.dtype:
@@ -512,14 +540,22 @@ def check_activations(
 
 def activation_specs_from_tensors(
     activations: Activations,
-    batch_size: int,
+    batch_size: Optional[int],
     floating_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[ActivationSpec, ...]:
-    """Create a static communication contract from representative tensors."""
+    """Create a communication contract from representative tensors.
+
+    Passing ``None`` for ``batch_size`` makes every non-scalar tensor depend on
+    the runtime microbatch size and records only its trailing dimensions.
+    """
     specs: List[ActivationSpec] = []
     for activation in activations:
         shape = list(activation.shape)
-        if shape:
+        batch_size_dependent = bool(shape) and batch_size is None
+        if batch_size_dependent:
+            shape[0] = -1
+        elif shape:
+            assert batch_size is not None
             shape[0] = batch_size
         dtype = (
             floating_dtype
@@ -583,9 +619,8 @@ class MaglevLayer(nn.Module, abc.ABC):
     Example::
 
         class Block(MaglevLayer):
-            def __init__(self, batch_size: int, dim: int, is_first: bool) -> None:
+            def __init__(self, dim: int, is_first: bool) -> None:
                 super().__init__()
-                self._batch_size = batch_size
                 self._dim = dim
                 self._is_first = is_first
                 self.lin: nn.Linear = nn.Linear(dim, dim)
@@ -593,10 +628,10 @@ class MaglevLayer(nn.Module, abc.ABC):
             def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
                 if self._is_first:
                     return ()
-                return (ActivationSpec(torch.Size([self._batch_size, self._dim])),)
+                return (ActivationSpec(torch.Size([-1, self._dim])),)
 
             def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
-                return (ActivationSpec(torch.Size([self._batch_size, self._dim])),)
+                return (ActivationSpec(torch.Size([-1, self._dim])),)
 
             def forward(self, layer_input, in_activations=()):
                 x = self.lin(layer_input)
@@ -644,7 +679,7 @@ class ObservedActivationSpecsMixin:
         self,
         in_activations: Activations,
         out_activations: Activations,
-        batch_size: int,
+        batch_size: Optional[int],
         in_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
     ) -> None:
@@ -738,6 +773,20 @@ class MaglevModuleList(nn.ModuleList):
             List[Any]: one input per layer, index-aligned with the layer list.
         """
         return model_input
+
+    def get_batch_size(self, layer_inputs: Sequence[Any]) -> int:
+        """Return the batch size represented by a local stage's layer inputs.
+
+        Pipeline schedules call this only when a stage boundary uses
+        batch-size-dependent activation specs. Models using such specs must
+        override this method because layer inputs may be arbitrary structured
+        values and the framework cannot infer which tensor carries the logical
+        batch dimension.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} uses batch-size-dependent activation specs "
+            "and must override get_batch_size()"
+        )
 
     def postproc(
         self, activations: Activations, layer_input: Any
