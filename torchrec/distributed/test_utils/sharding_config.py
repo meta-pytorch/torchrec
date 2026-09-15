@@ -9,7 +9,7 @@
 import copy
 import logging
 from dataclasses import dataclass, field
-from typing import Any, cast, Dict, List, Optional, Tuple, Union
+from typing import Any, cast, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -34,6 +34,7 @@ from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding import EmbeddingCollectionSharder
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
+from torchrec.distributed.memory_stashing import MemoryStashingManager
 from torchrec.distributed.model_parallel import (
     DefaultDataParallelWrapper,
     HybridEvalDMP,
@@ -102,6 +103,17 @@ class PlannerConfig:
     storage_reservation_hbm_gb: float = 2.0
     # Hardware configuration for topology (dict with keys: hbm_cap, ddr_cap, etc.)
     hardware: Optional[Dict[str, Any]] = None
+
+    # EMS (embedding memory stashing) knobs, honoured only by planner_type="lp".
+    # They are forwarded to the solver unchanged, so a benchmark run exercises the
+    # same solver path a trainer does. All default to None, which is the solver's own
+    # default -- an unset benchmark plans identically to before. Requires
+    # EmbeddingTablesConfig.stash_weights (or a per-table override) to have flagged
+    # something, or the solver gates the whole EMS path off.
+    stash_hbm_budget_gb: Optional[float] = None
+    hbm_balance_perf_worsening_percentage: Optional[float] = None
+    stash_balance_perf_worsening_percentage: Optional[float] = None
+    stash_balance_hbm_worsening_percentage: Optional[float] = None
 
     def _apply_hardware_config(
         self,
@@ -294,9 +306,59 @@ class PlannerConfig:
                 batch_size=self.batch_size,
                 constraints=constraints if constraints else None,
                 storage_reservation=storage_reservation,
+                stash_hbm_budget_gb=self.stash_hbm_budget_gb,
+                hbm_balance_perf_worsening_percentage=(
+                    self.hbm_balance_perf_worsening_percentage
+                ),
+                stash_balance_perf_worsening_percentage=(
+                    self.stash_balance_perf_worsening_percentage
+                ),
+                stash_balance_hbm_worsening_percentage=(
+                    self.stash_balance_hbm_worsening_percentage
+                ),
             )
         else:
             raise RuntimeError(f"Unknown planner type: {self.planner_type}")
+
+
+def _propagate_ems_stash_selection(
+    planner: ShardingPlanner,
+    pg: Optional[dist.ProcessGroup],
+) -> None:
+    """Feed the LP planner's EMS stash subset to the runtime.
+
+    Without this the benchmark would plan for a budget-selected subset but stash
+    every ``stash_weights`` table at runtime (the config-flag fallback in
+    ``MemoryStashingManager.resolve_stash_weights``), silently measuring something
+    other than the plan. Trainer integrations do the equivalent after planning.
+
+    ``_stashed_tables`` is populated on rank 0 only -- ``collective_plan`` solves
+    there and broadcasts the plan -- so the subset is broadcast over the same pg.
+    Only the budget path sets it; the no-budget default leaves it None and the
+    runtime falls back to the per-table flag, which is the intended behavior there.
+    """
+    if getattr(planner, "_stash_hbm_budget_gb", None) is None:
+        # No budget (or a planner without the knob at all): nothing was selected, so
+        # the runtime uses the per-table flag. Reset and skip the broadcast -- the
+        # gate is the planner's config, which is identical on every rank, rather than
+        # _stashed_tables, which only rank 0 populates and so cannot gate a collective.
+        MemoryStashingManager.set_stashed_tables(None)
+        return
+
+    stashed_tables: Optional[Set[str]] = getattr(planner, "_stashed_tables", None)
+    if pg is not None and dist.get_world_size(pg) > 1:
+        broadcast_list: List[Optional[Set[str]]] = [stashed_tables]
+        dist.broadcast_object_list(broadcast_list, src=0, group=pg)
+        stashed_tables = broadcast_list[0]
+    if stashed_tables:
+        logger.info(
+            "[Stash Budget] runtime stash set restricted to %d planner-selected "
+            "tables",
+            len(stashed_tables),
+        )
+        MemoryStashingManager.set_stashed_tables(stashed_tables)
+    else:
+        MemoryStashingManager.set_stashed_tables(None)
 
 
 def _get_sharders_with_fused_params(
@@ -431,6 +493,7 @@ class ShardingConfig:
             else:
                 # pyrefly: ignore[bad-argument-type, missing-argument]
                 plan = planner.plan(model, sharders)
+            _propagate_ems_stash_selection(planner, pg)
 
         return sharders, plan
 
