@@ -294,6 +294,13 @@ class SKUAwareStorageReservation(StorageReservation):
     are resolved by the framework-side factory (the OSS planner cannot read the internal hardware
     registry).
 
+    FixedPercentageStorageReservation reserves only ``percentage * HBM[current]`` - its percentage
+    is the WHOLE reservation rather than a margin on top of dense and kjt. Set
+    ``reserve_module_terms=False`` to match it: the reservation becomes ``margin + overhead``, again
+    byte-identical on the home SKU. Converting such a model with the module terms left on
+    double-counts dense and kjt, which for a high percentage can exceed the device outright and
+    fail the plan.
+
     Args:
         margin_bytes (int): home-anchored percentage margin (``percentage * HBM[home]``); used
             only when ``model_base_bytes`` is not provided.
@@ -307,6 +314,12 @@ class SKUAwareStorageReservation(StorageReservation):
         dense_tensor_estimate (Optional[int]): explicit DENSE-only override for the computed path
             (keeps the margin); used only when ``model_base_bytes`` is None - e.g. for FSDP /
             dry-run, or a measured-dense value that should still get the margin on top.
+        reserve_module_terms (bool): whether to add the module-derived dense and kjt terms on top
+            of the static base. True (default) matches HeuristicalStorageReservation, which
+            reserves ``dense + kjt + percentage * HBM[current]``. Set False to match
+            FixedPercentageStorageReservation, whose percentage is the WHOLE reservation - for
+            such a model the configured percentage already covers dense and kjt, so adding them
+            double-counts and can exceed the device.
     """
 
     def __init__(
@@ -316,6 +329,7 @@ class SKUAwareStorageReservation(StorageReservation):
         parameter_multiplier: float = 6.0,
         model_base_bytes: Optional[int] = None,
         dense_tensor_estimate: Optional[int] = None,
+        reserve_module_terms: bool = True,
     ) -> None:
         assert margin_bytes >= 0
         assert runtime_overhead_bytes >= 0
@@ -325,9 +339,22 @@ class SKUAwareStorageReservation(StorageReservation):
         self._parameter_multiplier: float = parameter_multiplier
         self._model_base_bytes: Optional[int] = model_base_bytes
         self._dense_tensor_estimate: Optional[int] = dense_tensor_estimate
+        self._reserve_module_terms: bool = reserve_module_terms
         self._dense_storage: Optional[Storage] = None
         self._kjt_storage: Optional[Storage] = None
         self._last_reserved_topology: Optional[Topology] = None
+        # model_base_bytes REPLACES the static base, so with the module terms skipped
+        # it is the entire reservation and margin_bytes is never used -- the configured
+        # percentage does not reach the plan at all. That precedence is intended, but
+        # it is silent, so state it once here rather than leave someone to infer it
+        # from a reservation that does not match the percentage they set.
+        if model_base_bytes is not None and not reserve_module_terms:
+            logger.info(
+                f"SKUAwareStorageReservation: model_base_bytes ({model_base_bytes}) "
+                f"replaces the home-anchored margin ({margin_bytes}) and the module "
+                "terms are skipped, so the reservation is model_base_bytes + "
+                "runtime_overhead_bytes; the configured percentage is not applied."
+            )
 
     def reserve(
         self,
@@ -362,22 +389,23 @@ class SKUAwareStorageReservation(StorageReservation):
         # Computed dense (only when the static base is not explicitly provided) plus the
         # live dynamic (kjt) term, recomputed from the current local batch every plan so
         # the reservation stays correct across batch / world_size changes (VT, eval).
-        if self._model_base_bytes is None:
-            self._dense_storage = _reserve_dense_storage(
+        if self._reserve_module_terms:
+            if self._model_base_bytes is None:
+                self._dense_storage = _reserve_dense_storage(
+                    topology=reserved_topology,
+                    module=module,
+                    shardable_modules=shardable_modules,
+                    multiplier=self._parameter_multiplier,
+                    dense_tensor_estimate=self._dense_tensor_estimate,
+                )
+            self._kjt_storage = _reserve_kjt_storage(
                 topology=reserved_topology,
-                module=module,
-                shardable_modules=shardable_modules,
-                multiplier=self._parameter_multiplier,
-                dense_tensor_estimate=self._dense_tensor_estimate,
+                batch_size=batch_size,
+                batch_inputs=batch_inputs,
+                input_data_type_size=BIGINT_DTYPE,
+                # 2 pipelined batches each with 10 internal copies
+                multiplier=20,
             )
-        self._kjt_storage = _reserve_kjt_storage(
-            topology=reserved_topology,
-            batch_size=batch_size,
-            batch_inputs=batch_inputs,
-            input_data_type_size=BIGINT_DTYPE,
-            # 2 pipelined batches each with 10 internal copies
-            multiplier=20,
-        )
 
         # <= 0 (not < 0): the static base + overhead are flooring absolutes, so at the
         # exact-capacity boundary (they consume all hbm and the module terms add 0) the
@@ -392,31 +420,46 @@ class SKUAwareStorageReservation(StorageReservation):
                 # An explicit static base was supplied, so there is no analytic dense to
                 # replace; the fix is to lower the provided value or the overhead.
                 reduce_static_solution = (
-                    "\n  1) Reduce model_base_bytes (the provided static base) or "
-                    "runtime_overhead_bytes. "
+                    "Reduce model_base_bytes (the provided static base) or "
+                    "runtime_overhead_bytes."
                 )
             else:
                 static_desc = (
-                    f"home-anchored margin {self._margin_bytes / (1024**3):.2f} GB + "
-                    f"dense {storage_repr_in_gb(self._dense_storage)}"
+                    f"home-anchored margin {self._margin_bytes / (1024**3):.2f} GB"
                 )
+                if self._dense_storage is not None:
+                    static_desc += f" + dense {storage_repr_in_gb(self._dense_storage)}"
                 reduce_static_solution = (
-                    "\n  1) Supply a measured model_base_bytes / dense_tensor_estimate "
-                    "(the analytic dense estimate over-counts under FSDP/dry-run). "
+                    "Supply a measured model_base_bytes / dense_tensor_estimate "
+                    "(the analytic dense estimate over-counts under FSDP/dry-run)."
                 )
             overhead_gb = self._runtime_overhead_bytes / (1024**3)
+            kjt_desc = (
+                f" + kjt {storage_repr_in_gb(self._kjt_storage)}"
+                if self._kjt_storage is not None
+                else ""
+            )
+            # Numbered at render time, not in the literals: the kjt entry drops out
+            # when the module terms are skipped, and hardcoded numbers would leave a
+            # gap that reads like a solution went missing.
+            solutions = [reduce_static_solution]
+            if self._kjt_storage is not None:
+                solutions.append(
+                    f"Reduce the local batch size ({batch_size}) to lower the kjt "
+                    "storage."
+                )
+            solutions.append("Use hardware with a higher hbm cap.")
+            numbered_solutions = "".join(
+                f"\n  {i}) {s} " for i, s in enumerate(solutions, start=1)
+            )
             insufficient_storage_solution = (
-                f"The SKU-aware storage reservation ({static_desc} + kjt "
-                f"{storage_repr_in_gb(self._kjt_storage)} + overhead {overhead_gb:.2f} GB) "
+                f"The SKU-aware storage reservation ({static_desc}{kjt_desc} + overhead "
+                f"{overhead_gb:.2f} GB) "
                 f"meets or exceeds the available hbm storage per rank "
                 f"({storage_repr_in_gb(topology.devices[0].storage)}), leaving no hbm "
                 "for sharded embedding tables, so it is not possible to find a valid "
                 "sharding plan. "
-                "\n \n Possible solutions:"
-                + reduce_static_solution
-                + f"\n  2) Reduce the local batch size ({batch_size}) to lower the kjt "
-                "storage. "
-                "\n  3) Use hardware with a higher hbm cap. "
+                "\n \n Possible solutions:" + numbered_solutions
             )
             raise PlannerError(
                 error_type=PlannerErrorType.INSUFFICIENT_STORAGE,

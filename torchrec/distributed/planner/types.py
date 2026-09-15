@@ -2233,6 +2233,14 @@ class PlannerConfig:
     # APF planner-config field); ignored by every other policy. (Appended last
     # to preserve positional construction of the pre-existing fields.)
     home_sku: Optional[str] = None
+    # Whether the SKU_AWARE reservation adds the module-derived dense and kjt terms
+    # on top of its home margin. True (default) matches Heuristical. False matches
+    # FixedPercentage, whose percentage is the whole reservation and already covers
+    # dense and kjt -- adding them for such a model double-counts and, at a high
+    # percentage, can exceed the device. Plan-affecting, so it is carried here to stay
+    # in request_hash. Consumed only by the SKU_AWARE reservation. (Appended last to
+    # preserve positional construction of the pre-existing fields.)
+    reserve_module_terms: bool = True
 
     def request_hash_extension(self) -> Optional[Tuple[object, ...]]:
         """Return package-specific planner config data for the request hash."""
@@ -2448,6 +2456,7 @@ class ShardingPlanRequest:
                     self.planner_config.planner_variant.value,
                     self.planner_config.storage_reservation_policy.value,
                     self.planner_config.storage_reservation_percentage,
+                    self.planner_config.reserve_module_terms,
                     self.planner_config.parameter_multiplier,
                     self.planner_config.proposer_type,
                     self.planner_config.partitioner_type,
