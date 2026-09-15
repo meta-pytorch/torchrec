@@ -22,7 +22,7 @@ import torch.nn as nn
 from torch.autograd.profiler import record_function
 from torch.distributed.fsdp import FSDPModule
 from torch.nn.parallel import DistributedDataParallel
-from torchrec.distributed.maglev.stage import StageWrapper
+from torchrec.distributed.maglev.stage import HandoffPGMode, StageWrapper
 
 
 def _no_sync_modules(module: nn.Module) -> List[nn.Module]:
@@ -150,6 +150,10 @@ class MaglevPipelineBase:
         """
         return 1
 
+    def _take_inputs(self, dataloader_iter: Iterator[Any], n: int) -> List[List[Any]]:
+        """Acquire this stage's inputs; adapters may override the input seam."""
+        return self.stage.take_inputs(dataloader_iter, n)
+
     def progress(self, dataloader_iter: Iterator[Any]) -> Optional[torch.Tensor]:
         """Run one microbatch and apply the gradients.
 
@@ -165,7 +169,7 @@ class MaglevPipelineBase:
             other stage. The last stage's model scored itself in ``postproc``, so
             no label or criterion is passed in.
         """
-        (stage_input,) = self.stage.take_inputs(dataloader_iter, 1)
+        (stage_input,) = self._take_inputs(dataloader_iter, 1)
 
         with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
             self.optimizer.zero_grad()
@@ -215,7 +219,7 @@ class MaglevPipelineBase:
 
 
 class Maglev1F1B(MaglevPipelineBase):
-    """The 1F1B (one-forward-one-backward) schedule, with plain P2P.
+    """The 1F1B (one-forward-one-backward) schedule.
 
     Standard PipeDream-flush: each stage runs ``num_warmup`` forwards, then
     interleaves 1 forward / 1 backward in steady state, then drains the remaining
@@ -223,14 +227,10 @@ class Maglev1F1B(MaglevPipelineBase):
     to the microbatch count), so deeper stages warm up less and the send/recv
     pairs line up across ranks.
 
-    Each receive is posted immediately before the operation that consumes it, so
-    a transfer is issued and then waited on with nothing in between: the stage
-    stalls for the whole latency of every hand-off. That is the straightforward
-    ordering, and the baseline that :class:`Maglev1F1BRecvAhead` is measured
-    against.
-
-    Sends are still asynchronous -- ``forward_micro`` / ``backward_micro`` start
-    one and finish it on the next call -- so only the receive side blocks.
+    Communication follows the stage's global handoff-PG configuration. ``SPLIT``
+    keeps activation and gradient traffic on independent communicators and uses
+    the established start/wait ordering. ``SHARED`` batches the opposing
+    directions at each steady-state crossover with ``batch_isend_irecv``.
 
     Args:
         stage: this rank's :class:`StageWrapper`.
@@ -289,76 +289,129 @@ class Maglev1F1B(MaglevPipelineBase):
             actually needed.
         """
         stage = self.stage
-        microbatch_inputs = stage.take_inputs(dataloader_iter, self.num_microbatches)
+        microbatch_inputs = self._take_inputs(dataloader_iter, self.num_microbatches)
 
         with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
             self.optimizer.zero_grad()
 
-        fwd_idx = 0
-        bwd_idx = 0
-
-        def _forward() -> None:
-            nonlocal fwd_idx
-            stage.start_recv_act()
-            with self._forward_context(fwd_idx, self.num_microbatches):
-                stage.forward_micro(microbatch_inputs[fwd_idx], fwd_idx)
-            fwd_idx += 1
-
-        def _backward() -> None:
-            nonlocal bwd_idx
-            self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
-            stage.start_recv_grad()
-            stage.backward_micro()
-            bwd_idx += 1
-
-        # Warmup: fill the pipeline.
-        for _ in range(self.num_warmup):
-            _forward()
-
-        # Steady state: one forward, one backward.
-        for _ in range(self.num_steady):
-            _forward()
-            _backward()
-
-        # Cooldown: drain remaining backwards.
-        for _ in range(self.num_warmup):
-            _backward()
+        if stage.handoff_pg_mode is HandoffPGMode.SHARED:
+            self._progress_shared(microbatch_inputs)
+        else:
+            self._progress_split(microbatch_inputs)
 
         stage.drain_sends()
         with record_function("## torchrec_maglev:optimizer_step ##"):
             self.optimizer.step()
         return None
 
+    def _progress_split(self, microbatch_inputs: List[List[Any]]) -> None:
+        """Run 1F1B with independent activation and gradient communicators."""
+        stage = self.stage
+        fwd_idx = 0
+        bwd_idx = 0
+
+        def _forward() -> None:
+            nonlocal fwd_idx
+            stage.start_recv_act()
+            with self._forward_context(fwd_idx, self.num_microbatches):
+                stage.forward_micro(microbatch_inputs[fwd_idx], fwd_idx)
+            fwd_idx += 1
+
+        def _backward() -> None:
+            nonlocal bwd_idx
+            self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
+            stage.start_recv_grad()
+            stage.backward_micro()
+            bwd_idx += 1
+
+        for _ in range(self.num_warmup):
+            _forward()
+        for _ in range(self.num_steady):
+            _forward()
+            _backward()
+        for _ in range(self.num_warmup):
+            _backward()
+
+    def _progress_shared(self, microbatch_inputs: List[List[Any]]) -> None:
+        """Run 1F1B with both handoff directions batched on one communicator."""
+        stage = self.stage
+
+        fwd_idx = 0
+        bwd_idx = 0
+
+        def _compute_forward(in_activations: tuple[torch.Tensor, ...]) -> Any:
+            nonlocal fwd_idx
+            with self._forward_context(fwd_idx, self.num_microbatches):
+                outputs = stage.compute_forward_micro(
+                    microbatch_inputs[fwd_idx], in_activations, fwd_idx
+                )
+            fwd_idx += 1
+            return outputs
+
+        def _compute_backward(
+            grads: Sequence[torch.Tensor],
+        ) -> tuple[Optional[torch.Tensor], tuple[torch.Tensor, ...]]:
+            nonlocal bwd_idx
+            self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
+            result = stage.compute_backward_micro(grads)
+            bwd_idx += 1
+            return result
+
+        # Warmup: fill the pipeline with one-way forward hand-offs.
+        if self.num_warmup:
+            stage.start_recv_act()
+        for i in range(self.num_warmup):
+            in_activations = stage.wait_for_act()
+            outputs = _compute_forward(in_activations)
+            stage.start_send_act(outputs)
+            stage.finish_send_act()
+            if i < self.num_warmup - 1:
+                stage.start_recv_act()
+
+        # Seed the activation consumed by the first steady iteration.
+        stage.start_recv_act()
+        in_activations = stage.wait_for_act()
+
+        # Steady state: batch the two opposing directions at each boundary.
+        for i in range(self.num_steady):
+            outputs = _compute_forward(in_activations)
+            grads = stage.send_act_recv_grad(outputs)
+            _loss, backward_inputs = _compute_backward(grads)
+            if i < self.num_steady - 1:
+                in_activations = stage.send_grad_recv_act(
+                    backward_inputs, recv_next=True
+                )
+            else:
+                stage.start_send_grad(backward_inputs)
+                stage.finish_send_grad()
+
+        # Cooldown: drain the backwards left by warmup.
+        for _ in range(self.num_warmup):
+            stage.start_recv_grad()
+            grads = stage.wait_for_grad()
+            _loss, backward_inputs = _compute_backward(grads)
+            stage.start_send_grad(backward_inputs)
+            stage.finish_send_grad()
+
 
 class Maglev1F1BRecvAhead(Maglev1F1B):
-    """1F1B that posts each receive a microbatch ahead of the compute it feeds.
-
-    Same warmup / steady / cooldown structure and the same number of transfers as
-    :class:`Maglev1F1B`; only the *placement* of the receives differs. The
-    transfer for microbatch ``k+1`` is posted before ``k`` is computed, so it
-    lands during that compute instead of being waited on the moment it is issued.
-    That hides the hand-off latency behind the neighbouring stage's work, which is
-    the whole point of splitting the P2P into start/wait.
-
-    .. note::
-        Gradient receives cannot run as far ahead as activation receives. The
-        first one on a rank creates the pair's NCCL communicator and blocks until
-        the peer's matching send, and a peer only touches the gradient direction
-        in its own backward -- so posting one during the forward phase parks this
-        rank mid-wave and deadlocks the pipeline. The first gradient receive
-        therefore waits until warmup is over; from then on running a microbatch
-        ahead is free.
-    """
+    """1F1B that posts each split-mode receive ahead of its compute."""
 
     def progress(self, dataloader_iter: Iterator[Any]) -> Optional[torch.Tensor]:
-        """Run one 1F1B pass, keeping both receive directions one microbatch ahead.
+        """Run receive-ahead 1F1B in split mode.
+
+        Shared mode uses :class:`Maglev1F1B` because its opposing handoffs must
+        be issued together on the shared communicator.
 
         Returns:
             Optional[torch.Tensor]: always ``None``, as
             :meth:`Maglev1F1B.progress`.
         """
         stage = self.stage
-        microbatch_inputs = stage.take_inputs(dataloader_iter, self.num_microbatches)
+        if stage.handoff_pg_mode is HandoffPGMode.SHARED:
+            return super().progress(dataloader_iter)
+
+        microbatch_inputs = self._take_inputs(dataloader_iter, self.num_microbatches)
 
         with record_function("## torchrec_maglev:optimizer_zero_grad ##"):
             self.optimizer.zero_grad()
@@ -367,44 +420,32 @@ class Maglev1F1BRecvAhead(Maglev1F1B):
         bwd_idx = 0
 
         def _forward() -> None:
-            """Run one forward, consuming the activation receive posted before it."""
             nonlocal fwd_idx
             with self._forward_context(fwd_idx, self.num_microbatches):
                 stage.forward_micro(microbatch_inputs[fwd_idx], fwd_idx)
             fwd_idx += 1
 
-        # Two receives outstanding before the first forward: this seed plus the
-        # one the first warmup iteration posts.
         stage.start_recv_act()
 
-        # Warmup: fill the pipeline.
         for _ in range(self.num_warmup):
             stage.start_recv_act()
             _forward()
 
         def _backward() -> None:
-            """Run one backward."""
             nonlocal bwd_idx
             self._configure_fsdp_backward(bwd_idx, self.num_microbatches)
             stage.backward_micro()
             bwd_idx += 1
 
-        # Steady state: one forward, one backward.
         for i in range(self.num_steady):
-            # Warmup is over by now, so the stages below have every activation
-            # they need to reach their own first backward -- see the note on the
-            # class about why this cannot move earlier.
             stage.start_recv_grad()
             _forward()
             if i < self.num_steady - 1:
                 stage.start_recv_act()
             else:
-                # No more forwards to run ahead for; keep the gradient side one
-                # ahead for cooldown instead.
                 stage.start_recv_grad()
             _backward()
 
-        # Cooldown: drain remaining backwards.
         for i in range(self.num_warmup):
             if i < self.num_warmup - 1:
                 stage.start_recv_grad()

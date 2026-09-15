@@ -27,8 +27,12 @@ from torchrec.distributed.maglev.module import (
     StructuredActivations,
     StructuredActivationsLayout,
 )
-from torchrec.distributed.maglev.pipeline import MaglevPipelineBase
-from torchrec.distributed.maglev.stage import pg_init, StageWrapper
+from torchrec.distributed.maglev.pipeline import (
+    Maglev1F1B,
+    Maglev1F1BRecvAhead,
+    MaglevPipelineBase,
+)
+from torchrec.distributed.maglev.stage import HandoffPGMode, pg_init, StageWrapper
 from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.distributed.test_utils.table_config import EmbeddingTablesConfig
 from torchrec.distributed.test_utils.test_model import (
@@ -403,6 +407,100 @@ class MaglevModuleListTest(unittest.TestCase):
             [call(False), call(True)],
         )
 
+    def test_1f1b_pairs_steady_state_handoffs(self) -> None:
+        stage = MagicMock(spec=StageWrapper)
+        stage.module = torch.nn.Linear(1, 1)
+        stage.num_stages = 2
+        stage.stage_index = 0
+        stage.is_first = True
+        stage.handoff_pg_mode = HandoffPGMode.SHARED
+        stage.in_activation_specs.return_value = ()
+        stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
+        output = (torch.ones(1, requires_grad=True),)
+        grads = [torch.ones(1)]
+        stage.compute_forward_micro.return_value = output
+        stage.send_act_recv_grad.return_value = grads
+        stage.compute_backward_micro.return_value = (None, ())
+        stage.send_grad_recv_act.return_value = ()
+        optimizer = MagicMock(spec=torch.optim.Optimizer)
+
+        pipeline = Maglev1F1B(stage, optimizer, num_microbatches=3)
+        pipeline.progress(iter([object()]))
+
+        stage.start_send_act.assert_called_once_with(output)
+        stage.send_act_recv_grad.assert_has_calls([call(output), call(output)])
+        stage.send_grad_recv_act.assert_called_once_with((), recv_next=True)
+        stage.compute_backward_micro.assert_has_calls(
+            [
+                call(grads),
+                call(grads),
+                call(stage.wait_for_grad.return_value),
+            ]
+        )
+        optimizer.step.assert_called_once_with()
+
+    def test_1f1b_split_uses_direction_specific_handoffs(self) -> None:
+        stage = MagicMock(spec=StageWrapper)
+        stage.module = torch.nn.Linear(1, 1)
+        stage.num_stages = 2
+        stage.stage_index = 0
+        stage.is_first = True
+        stage.handoff_pg_mode = HandoffPGMode.SPLIT
+        stage.in_activation_specs.return_value = ()
+        stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
+        optimizer = MagicMock(spec=torch.optim.Optimizer)
+
+        pipeline = Maglev1F1B(stage, optimizer, num_microbatches=3)
+        pipeline.progress(iter([object()]))
+
+        self.assertEqual(stage.forward_micro.call_count, 3)
+        self.assertEqual(stage.backward_micro.call_count, 3)
+        stage.send_act_recv_grad.assert_not_called()
+        stage.send_grad_recv_act.assert_not_called()
+        optimizer.step.assert_called_once_with()
+
+    def test_1f1b_recv_ahead_preserves_split_schedule(self) -> None:
+        stage = MagicMock(spec=StageWrapper)
+        stage.module = torch.nn.Linear(1, 1)
+        stage.num_stages = 2
+        stage.stage_index = 0
+        stage.handoff_pg_mode = HandoffPGMode.SPLIT
+        stage.in_activation_specs.return_value = ()
+        stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
+        optimizer = MagicMock(spec=torch.optim.Optimizer)
+
+        pipeline = Maglev1F1BRecvAhead(stage, optimizer, num_microbatches=3)
+        pipeline.progress(iter([object()]))
+
+        events = [
+            entry[0]
+            for entry in stage.method_calls
+            if entry[0]
+            in {
+                "backward_micro",
+                "forward_micro",
+                "start_recv_act",
+                "start_recv_grad",
+            }
+        ]
+        self.assertEqual(
+            events,
+            [
+                "start_recv_act",
+                "start_recv_act",
+                "forward_micro",
+                "start_recv_grad",
+                "forward_micro",
+                "start_recv_act",
+                "backward_micro",
+                "start_recv_grad",
+                "forward_micro",
+                "start_recv_grad",
+                "backward_micro",
+                "backward_micro",
+            ],
+        )
+
     def test_maglev_layer_defines_its_own_architecture(self) -> None:
         class Sparse(torch.nn.Module):
             def forward(self, value: torch.Tensor) -> torch.Tensor:
@@ -439,11 +537,16 @@ class MaglevModuleListTest(unittest.TestCase):
         (output,) = Layer()(value)
         torch.testing.assert_close(output, torch.full_like(value, 3))
 
+    @patch("torchrec.distributed.maglev.stage.HANDOFF_PG_MODE", HandoffPGMode.SPLIT)
     @patch("torchrec.distributed.maglev.stage.dist.new_group")
-    def test_pg_init_builds_separate_nccl_and_gloo_cascades(
-        self, new_group: Any
+    def test_pg_init_split_builds_direction_specific_handoffs(
+        self,
+        new_group: Any,
     ) -> None:
-        pg_init(stage_size=2, num_stages=3)
+        groups = [MagicMock(name=f"group_{index}") for index in range(9)]
+        new_group.side_effect = groups
+
+        _, handoff_pgs, _, _ = pg_init(stage_size=2, num_stages=3)
 
         self.assertEqual(
             new_group.call_args_list,
@@ -459,3 +562,27 @@ class MaglevModuleListTest(unittest.TestCase):
                 call(ranks=[1, 3, 5], backend="gloo"),
             ],
         )
+        self.assertIsNot(handoff_pgs[0], handoff_pgs[1])
+
+    @patch("torchrec.distributed.maglev.stage.HANDOFF_PG_MODE", HandoffPGMode.SHARED)
+    @patch("torchrec.distributed.maglev.stage.dist.new_group")
+    def test_pg_init_shared_reuses_one_handoff_pg(self, new_group: Any) -> None:
+        groups = [MagicMock(name=f"group_{index}") for index in range(8)]
+        new_group.side_effect = groups
+
+        _, handoff_pgs, _, _ = pg_init(stage_size=2, num_stages=3)
+
+        self.assertEqual(
+            new_group.call_args_list,
+            [
+                call(ranks=[0, 1]),
+                call(ranks=[2, 3]),
+                call(ranks=[4, 5]),
+                call(ranks=[0, 1, 2, 3, 4, 5]),
+                call(ranks=[0, 2, 4], backend=None),
+                call(ranks=[1, 3, 5], backend=None),
+                call(ranks=[0, 2, 4], backend="gloo"),
+                call(ranks=[1, 3, 5], backend="gloo"),
+            ],
+        )
+        self.assertIs(handoff_pgs[0], handoff_pgs[1])

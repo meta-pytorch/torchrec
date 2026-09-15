@@ -17,6 +17,7 @@ wire between stages. The authoring side is in
 """
 
 from collections import deque
+from enum import Enum
 from typing import Any, Callable, cast, Deque, Iterator, List, Optional, Sequence, Tuple
 
 import torch
@@ -33,6 +34,20 @@ from torchrec.distributed.maglev.module import (
 )
 from torchrec.distributed.types import LazyAwaitable, ShardingPlan
 from torchrec.distributed.utils import init_parameters
+
+
+class HandoffPGMode(Enum):
+    """How activation and gradient handoffs share process groups."""
+
+    SHARED = "shared"
+    SPLIT = "split"
+
+
+# Process-group creation is collective, so this must be configured identically
+# on every rank before constructing any StageWrapper and remain unchanged while
+# those stages run. SPLIT preserves the established behavior: activations and
+# gradients use independent communicators.
+HANDOFF_PG_MODE: HandoffPGMode = HandoffPGMode.SPLIT
 
 
 def build_stage_process_groups(
@@ -61,32 +76,15 @@ def build_stage_process_groups(
 
 def build_handoff_process_groups(
     stage_ranks: List[List[int]],
-) -> Tuple[dist.ProcessGroup, dist.ProcessGroup]:
-    """Create the two direction-split P2P communicators for the pipeline hand-off.
+) -> dist.ProcessGroup:
+    """Create one full-pipeline communicator for handoff traffic.
 
-    Returns ``(act_pg, grad_pg)`` -- two full-membership NCCL communicators, split
-    by what they carry: ``act_pg`` for the forward activations (downstream,
-    ``i -> i+1``) and ``grad_pg`` for the backward gradients (upstream,
-    ``i+1 -> i``). Splitting the hand-off by direction puts a boundary's two
-    directions on *different* communicators, so they run on separate NCCL streams
-    instead of serializing on one; and each communicator carries a single flow
-    direction (each rank does recv-then-send on it, never send-first), which avoids
-    the symmetric send-first deadlock and the >64 MiB rendezvous hang that a shared
-    bidirectional communicator hits.
-
-    This mirrors ``torch.distributed.pipelining``'s optional per-direction split
-    (``pp_p2p_downstream`` / ``pp_p2p_upstream``); see the study in
-    ``tech-docs/nccl_p2p_execution_order_buffer_size.md`` (sections 4-5). Both
-    groups are separate from each stage's ``stage_pg`` (the intra-HSD sharded
-    all-to-all), so the P2P never interleaves with the sharding collectives.
-    ``dist.new_group`` is collective: every rank builds both groups in the same
-    order, up front (before any DMP sharding) so the ``new_group`` calls stay
-    contiguous.
+    The caller decides whether activation and gradient traffic share this
+    communicator or use two independently created communicators. Keeping that
+    decision outside this builder makes the process-group creation order explicit.
     """
-    all_ranks = sorted({r for ranks in stage_ranks for r in ranks})
-    act_pg = cast(dist.ProcessGroup, dist.new_group(ranks=all_ranks))
-    grad_pg = cast(dist.ProcessGroup, dist.new_group(ranks=all_ranks))
-    return act_pg, grad_pg
+    ranks = sorted(rank for stage in stage_ranks for rank in stage)
+    return cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
 
 
 def build_cascade_process_groups(
@@ -134,26 +132,21 @@ def pg_init(stage_size: int, num_stages: int) -> Tuple[
 
     1. **stage** -- one per stage, joined only by that stage's own ranks; what the
        parallelizer shards over (:func:`build_stage_process_groups`).
-    2. **hand-off** -- exactly two, full-membership, one carrying forward
-       activations and one carrying backward gradients
-       (:func:`build_handoff_process_groups`).
+    2. **hand-off** -- an ``(activation_pg, gradient_pg)`` pair. In ``SPLIT``
+       mode they are separate communicators; in ``SHARED`` mode both entries
+       reference the same communicator (:func:`build_handoff_process_groups`).
     3. **cascade** -- two per position, holding one rank from each stage: one
        NCCL group for input tensors and one Gloo group for their CPU size
        metadata (:func:`build_cascade_process_groups`).
 
-    Their memberships overlap -- a cascade contains the very ranks the hand-off
-    walks at that position -- but they must stay distinct communicators: the
-    cascade carries a collective, the hand-off carries P2P, and mixing the two on
-    one communicator is the documented NCCL hang. The hand-off is two groups so a
-    boundary's forward and backward run on separate streams rather than
-    serializing.
+    Cascade and hand-off memberships overlap, but their communicators remain
+    distinct so input-distribution collectives never interleave with P2P traffic.
 
     This function exists for the *ordering*, which is the part that is easy to get
     wrong: ``dist.new_group`` is a collective, so every rank must create every
     group in the same order, and interleaving those calls with DMP's sharding
     collectives deadlocks. Building all three sets here, in a fixed order, before
-    any parallelizer runs, makes both properties hold by construction --
-    :class:`StageWrapper` calls this before it shards.
+    any parallelizer runs, makes both properties hold by construction.
 
     The stage layout is implicit in ``stage_size``: stage ``i`` is the contiguous
     rank block starting at ``i * stage_size``. This is the one place that table is
@@ -162,16 +155,21 @@ def pg_init(stage_size: int, num_stages: int) -> Tuple[
     Args:
         stage_size: ranks per stage (one HSD); also the number of cascades.
         num_stages: how many stages the job holds; also each cascade's size.
-
     Returns:
-        The stage groups (indexed by stage), the ``(act_pg, grad_pg)`` hand-off
-        pair, and the NCCL/default and Gloo cascade groups (indexed by position).
+        The stage groups, the ``(activation_pg, gradient_pg)`` pair, and the
+        NCCL/default and Gloo cascade groups.
     """
     stage_ranks: List[List[int]] = [
         list(range(s * stage_size, (s + 1) * stage_size)) for s in range(num_stages)
     ]
     stage_pgs = build_stage_process_groups(stage_ranks)
-    handoff_pgs = build_handoff_process_groups(stage_ranks)
+    activation_pg = build_handoff_process_groups(stage_ranks)
+    gradient_pg = (
+        activation_pg
+        if HANDOFF_PG_MODE is HandoffPGMode.SHARED
+        else build_handoff_process_groups(stage_ranks)
+    )
+    handoff_pgs = (activation_pg, gradient_pg)
     cascade_nccl_pgs = build_cascade_process_groups(stage_ranks)
     cascade_gloo_pgs = build_cascade_process_groups(stage_ranks, backend="gloo")
     return stage_pgs, handoff_pgs, cascade_nccl_pgs, cascade_gloo_pgs
@@ -337,10 +335,9 @@ class StageWrapper(nn.Module):
     the standalone and pipelined executions share parameters.
 
     It builds its own process groups: :attr:`stage_pg` (intra-HSD),
-    :attr:`handoff_pgs` (the two direction-split P2P communicators), and
-    :attr:`cascade_pg` (input distribution). ``dist.new_group`` is a collective,
-    so every rank must create every group in the same order; doing it in the
-    constructor makes that ordering unmissable.
+    :attr:`handoff_pgs` (P2P communicators), and :attr:`cascade_pg` (input
+    distribution). ``dist.new_group`` is a collective, so every rank must select
+    the same :class:`HandoffPGMode` and create every group in the same order.
 
     **Parallelism is the caller's job.** The wrapper cuts the model, builds the
     groups, and reads the boundary contract; it does not shard. Wrap
@@ -574,8 +571,13 @@ class StageWrapper(nn.Module):
 
     @property
     def handoff_pgs(self) -> Tuple[dist.ProcessGroup, dist.ProcessGroup]:
-        """The ``(act_pg, grad_pg)`` pair the pipeline hands activations over."""
+        """The activation and gradient handoff process groups."""
         return self._handoff_pgs
+
+    @property
+    def handoff_pg_mode(self) -> HandoffPGMode:
+        """Whether activation and gradient handoffs share one communicator."""
+        return HANDOFF_PG_MODE
 
     @property
     def cascade_pg(self) -> dist.ProcessGroup:
@@ -684,24 +686,16 @@ class StageWrapper(nn.Module):
     # ---- cross-HSD hand-off ----
     #
     # The stage owns the wire, not just the compute: it knows its neighbours
-    # (:meth:`neighbor_rank`), the two direction-split communicators
+    # (:meth:`neighbor_rank`), the configured communicators
     # (:attr:`handoff_pgs`), and the specs that fix the wire layout. A schedule
     # (see :mod:`torchrec.distributed.maglev.pipeline`) decides
     # *when* to call these; it does not need to know how a boundary is wired.
     # This mirrors ``torch.distributed.pipelining``, where ``PipelineStage`` owns
     # the send/recv ops and the schedule only orders them.
     #
-    # Every transfer is split into a start and a wait, and every one is
-    # non-blocking underneath. Issuing is therefore free of ordering constraints,
-    # and a schedule chooses how much work to slide between the two halves --
-    # posting a receive well before the data is needed is what lets a zero-bubble
-    # schedule hide the hand-off behind compute. Each direction keeps its own
-    # queue. Receives queue: each start posts another, and the matching wait
-    # dequeues in issue order, so a schedule can run several boundaries ahead of
-    # the compute. Sends do not queue -- one per direction is in flight at a time,
-    # and the schedule must finish it before starting the next. No start ever
-    # blocks, so where the wait falls is the schedule's choice, not a side effect
-    # buried in the send.
+    # SPLIT mode uses independent activation and gradient PGs with the start/wait
+    # methods. SHARED mode additionally permits the paired exchange methods:
+    # batch_isend_irecv requires every operation in a batch to use one PG.
 
     @property
     def is_first(self) -> bool:
@@ -769,10 +763,9 @@ class StageWrapper(nn.Module):
     def start_send_act(self, outputs: Activations) -> None:
         """Send this stage's activation to the next HSD; no-op if last.
 
-        Never blocks. One activation send is in flight at a time, so the caller
-        must :meth:`finish_send_act` the previous one first -- keeping the wait
-        where the schedule put it, and bounding the buffers held open to a single
-        transfer.
+        One activation send is in flight at a time, so the caller must
+        :meth:`finish_send_act` the previous one first, bounding the buffers held
+        open to a single transfer. The peer must have posted its matching receive.
 
         Args:
             outputs: this stage's output activation.
@@ -837,13 +830,78 @@ class StageWrapper(nn.Module):
             work.wait()
         return tensors
 
+    def send_act_recv_grad(self, outputs: Activations) -> List[torch.Tensor]:
+        """Exchange a forward activation for its downstream gradient.
+
+        Available only in ``SHARED`` mode because ``batch_isend_irecv`` requires
+        every operation in its batch to use the same process group.
+        """
+        if self.is_last:
+            return []
+        if HANDOFF_PG_MODE is not HandoffPGMode.SHARED:
+            raise RuntimeError("batched handoff requires handoff_pg_mode=shared")
+        peer = self.neighbor_rank(1)
+        pg = self._handoff_pgs[0]
+        send_buffers = [tensor.detach().contiguous() for tensor in outputs]
+        grad_buffers = [
+            torch.empty(spec.shape, device=self._placed_device, dtype=spec.dtype)
+            for spec in self._out_specs
+            if spec.requires_grad
+        ]
+        ops = [dist.P2POp(dist.isend, tensor, peer, pg) for tensor in send_buffers]
+        ops.extend(dist.P2POp(dist.irecv, tensor, peer, pg) for tensor in grad_buffers)
+        works = dist.batch_isend_irecv(ops) if ops else []
+        for work in works:
+            work.wait()
+        return grad_buffers
+
+    def send_grad_recv_act(
+        self,
+        in_activations: Activations,
+        recv_next: bool,
+    ) -> Activations:
+        """Exchange an upstream gradient for the next forward activation.
+
+        Available only in ``SHARED`` mode; see :meth:`send_act_recv_grad`.
+        """
+        if self.is_first:
+            return ()
+        if HANDOFF_PG_MODE is not HandoffPGMode.SHARED:
+            raise RuntimeError("batched handoff requires handoff_pg_mode=shared")
+        peer = self.neighbor_rank(-1)
+        pg = self._handoff_pgs[0]
+        grad_buffers = [
+            (tensor.grad if tensor.grad is not None else torch.zeros_like(tensor))
+            for tensor, spec in zip(in_activations, self._in_specs)
+            if spec.requires_grad
+        ]
+        activation_buffers = (
+            [
+                torch.empty(spec.shape, device=self._placed_device, dtype=spec.dtype)
+                for spec in self._in_specs
+            ]
+            if recv_next
+            else []
+        )
+        ops = [dist.P2POp(dist.isend, tensor, peer, pg) for tensor in grad_buffers]
+        ops.extend(
+            dist.P2POp(dist.irecv, tensor, peer, pg) for tensor in activation_buffers
+        )
+        works = dist.batch_isend_irecv(ops) if ops else []
+        for work in works:
+            work.wait()
+        for spec, tensor in zip(self._in_specs, activation_buffers):
+            if spec.requires_grad:
+                tensor.requires_grad_(True)
+        return tuple(activation_buffers)
+
     def start_send_grad(self, in_activations: Activations) -> None:
         """Send this stage's input gradients upstream; no-op if first.
 
         A slot unused by the stage's graph has no ``.grad``; zeros are sent so the
         previous stage's receive still matches -- the wire layout is fixed by the
-        specs, not by graph connectivity. As with :meth:`start_send_act`, never
-        blocks: the previous gradient send must already have been finished.
+        specs, not by graph connectivity. The previous gradient send must already
+        have been finished and the peer must have posted its matching receive.
 
         Args:
             in_activations: the activation this stage received.
@@ -1018,8 +1076,8 @@ class StageWrapper(nn.Module):
         """
         out: List[Tuple[Any, torch.Tensor]] = []
         for tensor in tensors:
-            buf = tensor.detach().contiguous()
-            out.append((dist.isend(buf, dst=dst, group=pg), buf))
+            buffer = tensor.detach().contiguous()
+            out.append((dist.isend(buffer, dst=dst, group=pg), buffer))
         return out
 
     # pyre-ignore[2]: dist work handle has no public type
@@ -1030,6 +1088,33 @@ class StageWrapper(nn.Module):
         sends.clear()
 
     # ---- one microbatch of this stage's work ----
+
+    def compute_forward_micro(
+        self,
+        stage_input: Sequence[Any],
+        in_activations: Activations,
+        microbatch_id: int,
+    ) -> Any:
+        """Compute one forward and retain its graph for the matching backward."""
+        with record_function(f"## forward mb{microbatch_id} ##"):
+            outputs = self.module(stage_input, in_activations)
+        self._pending.append((in_activations, outputs, microbatch_id))
+        return outputs
+
+    def compute_backward_micro(
+        self, grads: Sequence[torch.Tensor]
+    ) -> Tuple[Optional[torch.Tensor], Activations]:
+        """Compute the oldest pending backward and return its input activation."""
+        in_activations, outputs, microbatch_id = self._pending.pop(0)
+        loss: Optional[torch.Tensor] = None
+        if self.is_last:
+            with record_function(f"## backward mb{microbatch_id} ##"):
+                loss = outputs[0]
+                loss.backward()
+        else:
+            with record_function(f"## backward mb{microbatch_id} ##"):
+                self.backward(outputs, grads)
+        return loss, in_activations
 
     def forward_micro(
         self,
@@ -1061,16 +1146,13 @@ class StageWrapper(nn.Module):
         with record_function(f"## recv_act mb{microbatch_id} ##"):
             in_activations = self.wait_for_act()
 
-        with record_function(f"## forward mb{microbatch_id} ##"):
-            outputs = self.module(stage_input, in_activations)
+        outputs = self.compute_forward_micro(stage_input, in_activations, microbatch_id)
 
         # The previous microbatch's send, drained before this one is issued.
         with record_function(f"## finish_send_act mb{microbatch_id} ##"):
             self.finish_send_act()
         with record_function(f"## send_act mb{microbatch_id} ##"):
             self.start_send_act(outputs)
-
-        self._pending.append((in_activations, outputs, microbatch_id))
 
     def backward_micro(self) -> Optional[torch.Tensor]:
         """One microbatch backward: recv grad, backward, send input grad.
@@ -1084,33 +1166,14 @@ class StageWrapper(nn.Module):
         computed; every other stage collects the receive the schedule posted, and
         :meth:`wait_for_grad` raises if it did not.
 
-        .. warning::
-            The schedule must not post that receive during the forward phase. The
-            hand-off groups are full-membership, so the *first* P2P on a pair
-            lazily creates a 2-rank communicator and **blocks until both ranks
-            touch the pair** -- and a peer only touches the gradient direction in
-            its own backward. Posted too early, this rank parks mid-wave and the
-            pipeline deadlocks: the peer is left waiting for the next activation
-            this rank can no longer send. Once that communicator exists, posting
-            a microbatch ahead is free, which is what
-            :class:`~torchrec.distributed.maglev.pipeline.MaglevPipeline1F1B` does.
-
         Returns:
             Optional[torch.Tensor]: the microbatch loss on the last stage,
             ``None`` on every other stage.
         """
-        in_activations, outputs, microbatch_id = self._pending.pop(0)
-
-        loss: Optional[torch.Tensor] = None
-        if self.is_last:
-            with record_function(f"## backward mb{microbatch_id} ##"):
-                loss = outputs[0]
-                loss.backward()
-        else:
-            with record_function(f"## recv_grad mb{microbatch_id} ##"):
-                grads = self.wait_for_grad()
-            with record_function(f"## backward mb{microbatch_id} ##"):
-                self.backward(outputs, grads)
+        microbatch_id = self._pending[0][2]
+        with record_function(f"## recv_grad mb{microbatch_id} ##"):
+            grads = self.wait_for_grad()
+        loss, in_activations = self.compute_backward_micro(grads)
 
         with record_function(f"## finish_send_grad mb{microbatch_id} ##"):
             self.finish_send_grad()
