@@ -820,7 +820,10 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 return
 
             if not self.rec_metrics:
-                raise RecMetricException("No metrics to compute.")
+                computed_metrics = super().compute().resolve()
+                self._total_computes_processed += 1
+                synchronization_marker.future.set_result(computed_metrics)
+                return
 
             metric_state_snapshot = MetricStateSnapshot.from_metrics(
                 self.rec_metrics,
