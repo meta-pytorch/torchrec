@@ -17,6 +17,7 @@ wire between stages. The authoring side is in
 """
 
 from collections import deque
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Callable, cast, Deque, Iterator, List, Optional, Sequence, Tuple
 
@@ -24,6 +25,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.autograd.profiler import record_function
+from torch.distributed.device_mesh import DeviceMesh
 from torchrec.distributed.maglev.input_dist import InputDistDriver
 from torchrec.distributed.maglev.module import (
     Activations,
@@ -43,136 +45,218 @@ class HandoffPGMode(Enum):
     SPLIT = "split"
 
 
-# Process-group creation is collective, so this must be configured identically
-# on every rank before constructing any StageWrapper and remain unchanged while
-# those stages run. SPLIT preserves the established behavior: activations and
-# gradients use independent communicators.
-HANDOFF_PG_MODE: HandoffPGMode = HandoffPGMode.SPLIT
+@dataclass(frozen=True)
+class MaglevProcessGroups:
+    """The rank-local process groups and global rank layout for a Maglev stage.
 
-
-def build_stage_process_groups(
-    stage_ranks: List[List[int]],
-) -> List[dist.ProcessGroup]:
-    """Create one process group per Maglev stage (one HSD each).
-
-    ``dist.new_group`` is a **collective**: every rank in the job must call it
-    for every stage, in the same order, even though a rank ends up owning only
-    one of the returned groups. Returns the list of stage process groups,
-    index-aligned with ``stage_ranks``.
-
-    Args:
-        stage_ranks: ``stage_ranks[i]`` is the list of global ranks that make up
-            stage ``i``'s HSD.
+    Device-mesh integrations use :meth:`from_device_mesh`. Standalone users such
+    as the benchmark use :meth:`from_scratch`, which creates every group in a
+    fixed collective order. Keeping the rank layout beside the groups lets
+    :class:`StageWrapper` support non-contiguous layouts without independently
+    inferring the topology.
     """
-    pgs: List[dist.ProcessGroup] = []
-    for ranks in stage_ranks:
-        # Collective across the whole job; returns a handle only ranks in
-        # ``ranks`` can actually communicate over. (``new_group`` is typed
-        # ProcessGroup | int | None; on member ranks it is a ProcessGroup.)
-        pg = cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
-        pgs.append(pg)
-    return pgs
 
+    stage_ranks: Tuple[Tuple[int, ...], ...]
+    stage_pg: dist.ProcessGroup
+    handoff_pgs: Tuple[dist.ProcessGroup, dist.ProcessGroup]
+    cascade_pg: dist.ProcessGroup
+    cascade_gloo_pg: dist.ProcessGroup
+    handoff_pg_mode: HandoffPGMode
 
-def build_handoff_process_groups(
-    stage_ranks: List[List[int]],
-) -> dist.ProcessGroup:
-    """Create one full-pipeline communicator for handoff traffic.
+    def __post_init__(self) -> None:
+        normalized_ranks = self._normalize_stage_ranks(self.stage_ranks)
+        object.__setattr__(self, "stage_ranks", normalized_ranks)
+        handoff_pgs_are_shared = self.handoff_pgs[0] is self.handoff_pgs[1]
+        if (self.handoff_pg_mode is HandoffPGMode.SHARED) != handoff_pgs_are_shared:
+            raise ValueError(
+                f"{self.handoff_pg_mode.value} handoff mode does not match the "
+                "supplied process groups"
+            )
 
-    The caller decides whether activation and gradient traffic share this
-    communicator or use two independently created communicators. Keeping that
-    decision outside this builder makes the process-group creation order explicit.
-    """
-    ranks = sorted(rank for stage in stage_ranks for rank in stage)
-    return cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
+    @classmethod
+    def build_stage_process_groups(
+        cls,
+        stage_ranks: Sequence[Sequence[int]],
+    ) -> List[dist.ProcessGroup]:
+        """Create one data-parallel process group per Maglev stage.
 
+        Every rank must call this collective for every stage in the same order.
+        The returned list is index-aligned with ``stage_ranks``.
+        """
+        return [
+            cast(dist.ProcessGroup, dist.new_group(ranks=list(ranks)))
+            for ranks in stage_ranks
+        ]
 
-def build_cascade_process_groups(
-    stage_ranks: List[List[int]],
-    backend: Optional[str] = None,
-) -> List[dist.ProcessGroup]:
-    """Create one process group per pipeline "cascade" for input distribution.
+    @classmethod
+    def build_handoff_process_groups(
+        cls,
+        stage_ranks: Sequence[Sequence[int]],
+        handoff_pg_mode: HandoffPGMode,
+    ) -> Tuple[dist.ProcessGroup, dist.ProcessGroup]:
+        """Create the activation and gradient handoff communicators.
 
-    A *cascade* is the set of same-position ranks across all stages:
-    ``cascade_pgs[c]`` groups ``stage_ranks[0][c], stage_ranks[1][c], ...`` and so
-    has one rank per stage (size == the number of stages). It is the group over
-    which a rank's full per-stage input set is all-to-all'd so every rank ends up
-    holding its own stage's inputs -- one microbatch contributed by each stage's
-    rank in the cascade (see the benchmark's input-dist driver).
+        Shared mode returns the same communicator twice. Split mode creates one
+        communicator per direction, preserving the original P2P behavior.
+        """
+        ranks = sorted(rank for stage in stage_ranks for rank in stage)
+        activation_pg = cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
+        gradient_pg = (
+            activation_pg
+            if handoff_pg_mode is HandoffPGMode.SHARED
+            else cast(dist.ProcessGroup, dist.new_group(ranks=ranks))
+        )
+        return activation_pg, gradient_pg
 
-    Like :func:`build_stage_process_groups` / :func:`build_handoff_process_groups`,
-    ``dist.new_group`` is collective: every rank creates every cascade group in the
-    same order, and building these up front (before any DMP sharding) keeps all
-    ``new_group`` collectives contiguous.
+    @classmethod
+    def build_cascade_process_groups(
+        cls,
+        stage_ranks: Sequence[Sequence[int]],
+        backend: Optional[str] = None,
+    ) -> List[dist.ProcessGroup]:
+        """Create one same-position input-distribution group across all stages.
 
-    Args:
-        stage_ranks: ``stage_ranks[i]`` is the global ranks of stage ``i``'s HSD;
-            every stage must have the same number of ranks (cascades).
-        backend: Optional backend for the groups. ``None`` inherits the default
-            process group's backend.
-    """
-    num_cascades = len(stage_ranks[0]) if stage_ranks else 0
-    pgs: List[dist.ProcessGroup] = []
-    for c in range(num_cascades):
-        ranks = [stage_ranks[s][c] for s in range(len(stage_ranks))]
-        pg = cast(dist.ProcessGroup, dist.new_group(ranks=ranks, backend=backend))
-        pgs.append(pg)
-    return pgs
+        Position ``p`` joins ``stage_ranks[0][p]``, ``stage_ranks[1][p]``, and
+        so on. The default backend carries tensors; Gloo carries CPU metadata.
+        """
+        stage_size = len(stage_ranks[0]) if stage_ranks else 0
+        return [
+            cast(
+                dist.ProcessGroup,
+                dist.new_group(
+                    ranks=[stage[position] for stage in stage_ranks],
+                    backend=backend,
+                ),
+            )
+            for position in range(stage_size)
+        ]
 
+    @classmethod
+    def from_device_mesh(
+        cls,
+        device_mesh: DeviceMesh,
+        *,
+        stage_mesh_dim_name: str,
+        pipeline_mesh_dim_name: str,
+        handoff_pg_mode: HandoffPGMode = HandoffPGMode.SPLIT,
+    ) -> "MaglevProcessGroups":
+        """Build Maglev process groups from a two-dimensional device mesh.
 
-def pg_init(stage_size: int, num_stages: int) -> Tuple[
-    List[dist.ProcessGroup],
-    Tuple[dist.ProcessGroup, dist.ProcessGroup],
-    List[dist.ProcessGroup],
-    List[dist.ProcessGroup],
-]:
-    """Build the process groups a Maglev pipeline needs.
+        The mesh remains the topology owner. Its stage-dimension group is reused
+        for data parallelism, and its pipeline-dimension group is reused for
+        accelerator input distribution. Maglev creates only its dedicated P2P
+        handoff groups and the Gloo counterpart used for input metadata.
 
-    Returns ``(stage_pgs, handoff_pgs, cascade_nccl_pgs, cascade_gloo_pgs)``:
+        Every rank must call this method with the same mesh and handoff mode.
+        """
+        mesh_dim_names = device_mesh.mesh_dim_names
+        if device_mesh.ndim != 2 or mesh_dim_names is None:
+            raise ValueError("Maglev requires a named two-dimensional device mesh")
+        if (
+            stage_mesh_dim_name not in mesh_dim_names
+            or pipeline_mesh_dim_name not in mesh_dim_names
+            or stage_mesh_dim_name == pipeline_mesh_dim_name
+        ):
+            raise ValueError(
+                "stage and pipeline dimensions must be distinct dimensions of "
+                f"the device mesh, got {mesh_dim_names}"
+            )
 
-    1. **stage** -- one per stage, joined only by that stage's own ranks; what the
-       parallelizer shards over (:func:`build_stage_process_groups`).
-    2. **hand-off** -- an ``(activation_pg, gradient_pg)`` pair. In ``SPLIT``
-       mode they are separate communicators; in ``SHARED`` mode both entries
-       reference the same communicator (:func:`build_handoff_process_groups`).
-    3. **cascade** -- two per position, holding one rank from each stage: one
-       NCCL group for input tensors and one Gloo group for their CPU size
-       metadata (:func:`build_cascade_process_groups`).
+        stage_dim = mesh_dim_names.index(stage_mesh_dim_name)
+        pipeline_dim = mesh_dim_names.index(pipeline_mesh_dim_name)
+        stage_ranks = tuple(
+            tuple(int(rank) for rank in ranks)
+            for ranks in device_mesh.mesh.permute(pipeline_dim, stage_dim).tolist()
+        )
+        _, position = cls.locate_rank(stage_ranks, dist.get_rank())
+        handoff_pgs = cls.build_handoff_process_groups(stage_ranks, handoff_pg_mode)
+        cascade_gloo_pgs = cls.build_cascade_process_groups(stage_ranks, backend="gloo")
+        return cls(
+            stage_ranks=stage_ranks,
+            stage_pg=cast(
+                dist.ProcessGroup,
+                device_mesh[stage_mesh_dim_name].get_group(),
+            ),
+            handoff_pgs=handoff_pgs,
+            cascade_pg=cast(
+                dist.ProcessGroup,
+                device_mesh[pipeline_mesh_dim_name].get_group(),
+            ),
+            cascade_gloo_pg=cascade_gloo_pgs[position],
+            handoff_pg_mode=handoff_pg_mode,
+        )
 
-    Cascade and hand-off memberships overlap, but their communicators remain
-    distinct so input-distribution collectives never interleave with P2P traffic.
+    @classmethod
+    def from_scratch(
+        cls,
+        stage_size: int,
+        num_stages: int,
+        handoff_pg_mode: HandoffPGMode = HandoffPGMode.SPLIT,
+    ) -> "MaglevProcessGroups":
+        """Create every Maglev process group for a contiguous rank layout.
 
-    This function exists for the *ordering*, which is the part that is easy to get
-    wrong: ``dist.new_group`` is a collective, so every rank must create every
-    group in the same order, and interleaving those calls with DMP's sharding
-    collectives deadlocks. Building all three sets here, in a fixed order, before
-    any parallelizer runs, makes both properties hold by construction.
+        Process-group creation is collective. Every rank must call this method
+        with identical arguments and before any sharding component creates
+        groups. Stage, handoff, tensor-cascade, and Gloo metadata-cascade groups
+        are created contiguously in that order.
+        """
+        if stage_size <= 0:
+            raise ValueError(f"stage_size must be positive, got {stage_size}")
+        if num_stages <= 0:
+            raise ValueError(f"num_stages must be positive, got {num_stages}")
+        stage_ranks = tuple(
+            tuple(range(stage * stage_size, (stage + 1) * stage_size))
+            for stage in range(num_stages)
+        )
+        stage_pgs = cls.build_stage_process_groups(stage_ranks)
+        handoff_pgs = cls.build_handoff_process_groups(stage_ranks, handoff_pg_mode)
+        cascade_pgs = cls.build_cascade_process_groups(stage_ranks)
+        cascade_gloo_pgs = cls.build_cascade_process_groups(stage_ranks, backend="gloo")
+        stage_index, position = cls.locate_rank(stage_ranks, dist.get_rank())
+        return cls(
+            stage_ranks=stage_ranks,
+            stage_pg=stage_pgs[stage_index],
+            handoff_pgs=handoff_pgs,
+            cascade_pg=cascade_pgs[position],
+            cascade_gloo_pg=cascade_gloo_pgs[position],
+            handoff_pg_mode=handoff_pg_mode,
+        )
 
-    The stage layout is implicit in ``stage_size``: stage ``i`` is the contiguous
-    rank block starting at ``i * stage_size``. This is the one place that table is
-    materialized; the builders take it explicitly.
+    @classmethod
+    def locate_rank(
+        cls,
+        stage_ranks: Sequence[Sequence[int]],
+        global_rank: int,
+    ) -> Tuple[int, int]:
+        """Return a rank's stage index and position within that stage."""
+        for stage_index, ranks in enumerate(stage_ranks):
+            if global_rank in ranks:
+                return stage_index, ranks.index(global_rank)
+        raise ValueError(f"rank {global_rank} is absent from the Maglev rank layout")
 
-    Args:
-        stage_size: ranks per stage (one HSD); also the number of cascades.
-        num_stages: how many stages the job holds; also each cascade's size.
-    Returns:
-        The stage groups, the ``(activation_pg, gradient_pg)`` pair, and the
-        NCCL/default and Gloo cascade groups.
-    """
-    stage_ranks: List[List[int]] = [
-        list(range(s * stage_size, (s + 1) * stage_size)) for s in range(num_stages)
-    ]
-    stage_pgs = build_stage_process_groups(stage_ranks)
-    activation_pg = build_handoff_process_groups(stage_ranks)
-    gradient_pg = (
-        activation_pg
-        if HANDOFF_PG_MODE is HandoffPGMode.SHARED
-        else build_handoff_process_groups(stage_ranks)
-    )
-    handoff_pgs = (activation_pg, gradient_pg)
-    cascade_nccl_pgs = build_cascade_process_groups(stage_ranks)
-    cascade_gloo_pgs = build_cascade_process_groups(stage_ranks, backend="gloo")
-    return stage_pgs, handoff_pgs, cascade_nccl_pgs, cascade_gloo_pgs
+    @classmethod
+    def _normalize_stage_ranks(
+        cls,
+        stage_ranks: Sequence[Sequence[int]],
+    ) -> Tuple[Tuple[int, ...], ...]:
+        normalized = tuple(tuple(ranks) for ranks in stage_ranks)
+        if not normalized or not normalized[0]:
+            raise ValueError("stage_ranks must contain at least one non-empty stage")
+        stage_size = len(normalized[0])
+        if any(len(ranks) != stage_size for ranks in normalized):
+            raise ValueError("every Maglev stage must contain the same number of ranks")
+        flattened = tuple(rank for ranks in normalized for rank in ranks)
+        if len(set(flattened)) != len(flattened):
+            raise ValueError("each rank must occur exactly once in stage_ranks")
+        return normalized
+
+    @property
+    def stage_size(self) -> int:
+        return len(self.stage_ranks[0])
+
+    @property
+    def num_stages(self) -> int:
+        return len(self.stage_ranks)
 
 
 def remap_plan_to_process_group(
@@ -328,19 +412,17 @@ class StageWrapper(nn.Module):
     """Takes a whole Maglev model and keeps the one stage this rank owns.
 
     Every rank passes the same ``model`` and ``layers_per_stage``; only
-    ``dist.get_rank()`` differs. The wrapper derives which stage this rank owns
-    (:meth:`locate_rank` -- HSDs are contiguous blocks of ``stage_size`` ranks, so
-    no rank-to-stage table is carried), keeps that contiguous run of layers, and
-    drops the rest. The kept layers are the model's *own* modules, not copies, so
-    the standalone and pipelined executions share parameters.
+    ``dist.get_rank()`` differs. The wrapper locates that rank in the process-group
+    layout, keeps the corresponding contiguous run of layers, and drops the rest.
+    The kept layers are the model's *own* modules, not copies, so the standalone
+    and pipelined executions share parameters.
 
-    It builds its own process groups: :attr:`stage_pg` (intra-HSD),
-    :attr:`handoff_pgs` (P2P communicators), and :attr:`cascade_pg` (input
-    distribution). ``dist.new_group`` is a collective, so every rank must select
-    the same :class:`HandoffPGMode` and create every group in the same order.
+    By default :class:`MaglevProcessGroups` creates a contiguous topology. A
+    runtime that already owns process-group construction can pass its bundle via
+    ``process_groups`` instead, keeping one source of truth for rank placement.
 
     **Parallelism is the caller's job.** The wrapper cuts the model, builds the
-    groups, and reads the boundary contract; it does not shard. Wrap
+    process-group bundle, and reads the boundary contract; it does not shard. Wrap
     :attr:`module` however you like, assign it back, then :meth:`to` to
     materialize whatever is still on ``meta``::
 
@@ -367,15 +449,16 @@ class StageWrapper(nn.Module):
         layers_per_stage: how many layers each pipeline stage owns; must sum to
             ``len(model)``, with one entry per stage.
         stage_size: ranks per stage -- the size of one hardware scale-up domain
-            (HSD). Stage ``i`` is the contiguous rank block starting at
-            ``i * stage_size``.
+            (HSD). Used to build the default contiguous topology and validated
+            against ``process_groups`` when one is provided.
         loss_only_output: whether the final stage returns only the loss. Enable
             this before wrapping the stage module in DDP so auxiliary prediction
             tensors are not treated as backward roots.
+        process_groups: optional externally constructed Maglev process groups.
 
     Raises:
         ValueError: if ``layers_per_stage`` does not describe ``model``, the
-            number of stages implied by ``stage_size`` does not match
+            process-group layout does not match ``stage_size`` or
             ``layers_per_stage``, or the kept layers disagree on the activation
             they exchange.
 
@@ -461,9 +544,19 @@ class StageWrapper(nn.Module):
         layers_per_stage: Sequence[int],
         stage_size: int,  # number of ranks for each stage
         loss_only_output: bool = False,
+        process_groups: Optional[MaglevProcessGroups] = None,
     ) -> None:
         super().__init__()
-        num_stages = self.count_stages(stage_size)
+        if process_groups is None:
+            num_stages = self.count_stages(stage_size)
+            process_groups = MaglevProcessGroups.from_scratch(stage_size, num_stages)
+        else:
+            num_stages = process_groups.num_stages
+            if process_groups.stage_size != stage_size:
+                raise ValueError(
+                    f"stage_size {stage_size} does not match process-group layout "
+                    f"size {process_groups.stage_size}"
+                )
         if len(layers_per_stage) != num_stages:
             raise ValueError(
                 f"layers_per_stage describes {len(layers_per_stage)} stages, but "
@@ -479,7 +572,9 @@ class StageWrapper(nn.Module):
                 raise ValueError(f"stage {s} must own at least one layer, got {count}")
         # This rank's own role: the wrapper shards collectively, so it can only
         # ever be built for the calling rank.
-        stage_index, position = self.locate_rank(stage_size, dist.get_rank())
+        stage_index, position = MaglevProcessGroups.locate_rank(
+            process_groups.stage_ranks, dist.get_rank()
+        )
         self.stage_index: int = stage_index
         self.position: int = position
         self.stage_size: int = stage_size
@@ -491,15 +586,7 @@ class StageWrapper(nn.Module):
             cast(MaglevLayer, model[i]) for i in self.layer_indices
         ]
         check_layers_chain(layers, f"stage {stage_index}")
-        # Every group the pipeline needs, built in one contiguous run before the
-        # parallelizer issues a single sharding collective (see pg_init).
-        stage_pgs, handoff_pgs, cascade_nccl_pgs, cascade_gloo_pgs = pg_init(
-            stage_size, num_stages
-        )
-        self._stage_pg: dist.ProcessGroup = stage_pgs[stage_index]
-        self._handoff_pgs: Tuple[dist.ProcessGroup, dist.ProcessGroup] = handoff_pgs
-        self._cascade_pg: dist.ProcessGroup = cascade_nccl_pgs[position]
-        self._cascade_gloo_pg: dist.ProcessGroup = cascade_gloo_pgs[position]
+        self._process_groups = process_groups
         # Posted receives, oldest first: each entry is one transfer's work
         # handles and the buffers landing into them.
         # pyre-ignore[4]: dist work handles have no public type
@@ -519,8 +606,8 @@ class StageWrapper(nn.Module):
         # Holds this stage's inputs between all-to-all rounds and the schedule
         # asking for microbatches.
         self._input_driver: InputDistDriver[List[Any]] = InputDistDriver(
-            pg_gloo=self._cascade_gloo_pg,
-            pg_nccl=self._cascade_pg,
+            pg_gloo=process_groups.cascade_gloo_pg,
+            pg_nccl=process_groups.cascade_pg,
             self_index=stage_index,
         )
         # Microbatches forwarded but not yet backwarded, oldest first:
@@ -572,17 +659,17 @@ class StageWrapper(nn.Module):
     @property
     def handoff_pgs(self) -> Tuple[dist.ProcessGroup, dist.ProcessGroup]:
         """The activation and gradient handoff process groups."""
-        return self._handoff_pgs
+        return self._process_groups.handoff_pgs
 
     @property
     def handoff_pg_mode(self) -> HandoffPGMode:
         """Whether activation and gradient handoffs share one communicator."""
-        return HANDOFF_PG_MODE
+        return self._process_groups.handoff_pg_mode
 
     @property
     def cascade_pg(self) -> dist.ProcessGroup:
         """This rank's input-distribution group (one rank per stage)."""
-        return self._cascade_pg
+        return self._process_groups.cascade_pg
 
     def neighbor_rank(self, offset: int) -> int:
         """The global rank at this position in the HSD ``offset`` stages away.
@@ -610,11 +697,11 @@ class StageWrapper(nn.Module):
                 f"stage {self.stage_index} has no neighbor at offset {offset}: "
                 f"the pipeline has {self.num_stages} stages"
             )
-        return stage_index * self.stage_size + self.position
+        return self._process_groups.stage_ranks[stage_index][self.position]
 
     @property
     def stage_pg(self) -> dist.ProcessGroup:
-        return self._stage_pg
+        return self._process_groups.stage_pg
 
     # pyre-ignore[14]: narrower than nn.Module.to by design -- this one
     # materializes meta parameters, which nn.Module.to cannot.
@@ -720,7 +807,7 @@ class StageWrapper(nn.Module):
         """
         if self.is_first:
             return
-        act_pg, _ = self._handoff_pgs
+        act_pg, _ = self.handoff_pgs
         src = self.neighbor_rank(-1)
         works: List[Any] = []
         tensors: List[torch.Tensor] = []
@@ -780,7 +867,7 @@ class StageWrapper(nn.Module):
                 f"stage {self.stage_index}: an activation send is still in "
                 "flight; call finish_send_act() before starting the next"
             )
-        act_pg, _ = self._handoff_pgs
+        act_pg, _ = self.handoff_pgs
         self._send_act = self._isend(outputs, self.neighbor_rank(1), act_pg)
 
     def finish_send_act(self) -> None:
@@ -796,7 +883,7 @@ class StageWrapper(nn.Module):
         """
         if self.is_last:
             return
-        _, grad_pg = self._handoff_pgs
+        _, grad_pg = self.handoff_pgs
         src = self.neighbor_rank(1)
         works: List[Any] = []
         tensors: List[torch.Tensor] = []
@@ -838,10 +925,10 @@ class StageWrapper(nn.Module):
         """
         if self.is_last:
             return []
-        if HANDOFF_PG_MODE is not HandoffPGMode.SHARED:
+        if self.handoff_pg_mode is not HandoffPGMode.SHARED:
             raise RuntimeError("batched handoff requires handoff_pg_mode=shared")
         peer = self.neighbor_rank(1)
-        pg = self._handoff_pgs[0]
+        pg = self.handoff_pgs[0]
         send_buffers = [tensor.detach().contiguous() for tensor in outputs]
         grad_buffers = [
             torch.empty(spec.shape, device=self._placed_device, dtype=spec.dtype)
@@ -866,10 +953,10 @@ class StageWrapper(nn.Module):
         """
         if self.is_first:
             return ()
-        if HANDOFF_PG_MODE is not HandoffPGMode.SHARED:
+        if self.handoff_pg_mode is not HandoffPGMode.SHARED:
             raise RuntimeError("batched handoff requires handoff_pg_mode=shared")
         peer = self.neighbor_rank(-1)
-        pg = self._handoff_pgs[0]
+        pg = self.handoff_pgs[0]
         grad_buffers = [
             (tensor.grad if tensor.grad is not None else torch.zeros_like(tensor))
             for tensor, spec in zip(in_activations, self._in_specs)
@@ -916,7 +1003,7 @@ class StageWrapper(nn.Module):
                 f"stage {self.stage_index}: a gradient send is still in flight; "
                 "call finish_send_grad() before starting the next"
             )
-        _, grad_pg = self._handoff_pgs
+        _, grad_pg = self.handoff_pgs
         grads: List[torch.Tensor] = []
         for tensor, spec in zip(in_activations, self._in_specs):
             if not spec.requires_grad:
