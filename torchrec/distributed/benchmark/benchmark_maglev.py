@@ -43,7 +43,6 @@ logger: logging.Logger = logging.getLogger(__name__)
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-import torchrec.distributed.maglev.stage as maglev_stage
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
 )
@@ -64,6 +63,7 @@ from torchrec.distributed.maglev.pipeline import (
 )
 from torchrec.distributed.maglev.stage import (
     HandoffPGMode,
+    MaglevProcessGroups,
     remap_plan_to_process_group,
     StageWrapper,
 )
@@ -350,10 +350,6 @@ def runner(
         attach_debugger()
 
     run_option.set_log_level()
-    # Every worker receives the same RunOptions and sets this before StageWrapper
-    # performs collective process-group creation.
-    maglev_stage.HANDOFF_PG_MODE = HandoffPGMode(run_option.handoff_pg_mode)
-
     # The cut is the source of truth: it fixes the stage count and the depth.
     layers_per_stage = list(run_option.layers_per_stage)
     num_stages = len(layers_per_stage)
@@ -370,10 +366,14 @@ def runner(
     with MultiProcessContext(rank=rank, world_size=world_size, backend=backend) as ctx:
         device = ctx.device
 
-        # HSD layout is implicit in stage_size: stage i is the contiguous rank
-        # block starting at i * ranks_per_stage. StageWrapper builds every process
-        # group (stage / hand-off / cascade) itself, before it shards.
-        my_stage_index, position = StageWrapper.locate_rank(ranks_per_stage, rank)
+        process_groups = MaglevProcessGroups.from_scratch(
+            stage_size=ranks_per_stage,
+            num_stages=num_stages,
+            handoff_pg_mode=HandoffPGMode(run_option.handoff_pg_mode),
+        )
+        my_stage_index, _ = MaglevProcessGroups.locate_rank(
+            process_groups.stage_ranks, rank
+        )
 
         # All layers' table configs (identical on every rank) so each rank can
         # generate a full per-stage input set for the input-dist all-to-all.
@@ -419,6 +419,7 @@ def runner(
             layers_per_stage=layers_per_stage,
             stage_size=ranks_per_stage,
             loss_only_output=run_option.shard_embeddings and ranks_per_stage > 1,
+            process_groups=process_groups,
         )
         # Parallelism is the caller's: shard the embeddings within the HSD, then
         # materialize. Wrapping before to() is what keeps a meta-authored stage
