@@ -235,7 +235,7 @@ class MaglevModuleListTest(unittest.TestCase):
         )
         stage = StageWrapper(model, layers_per_stage=[1], stage_size=1)
 
-        losses, output = stage(inputs)
+        losses, output = stage.module(inputs)
         torch.testing.assert_close(losses, expected_loss)
         torch.testing.assert_close(output, expected_output)
 
@@ -245,10 +245,99 @@ class MaglevModuleListTest(unittest.TestCase):
             stage_size=1,
             loss_only_output=True,
         )
-        outputs = loss_only_stage(inputs)
+        outputs = loss_only_stage.module(inputs)
 
         self.assertEqual(len(outputs), 1)
         torch.testing.assert_close(outputs[0], expected_loss)
+
+    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
+    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
+    def test_stage_forward_and_backward_drain_an_input_dist_round(
+        self,
+        _get_rank: Any,
+        input_dist_driver: Any,
+    ) -> None:
+        process_group = MagicMock()
+        process_groups = MaglevProcessGroups(
+            stage_ranks=((0,), (1,)),
+            stage_pg=process_group,
+            handoff_pgs=(process_group, process_group),
+            cascade_pg=process_group,
+            cascade_gloo_pg=process_group,
+            handoff_pg_mode=HandoffPGMode.SHARED,
+        )
+        model = self._model(num_layers=2)
+        raw_batch = self._inputs(num_layers=2, batch_size=4)
+        stage = StageWrapper(
+            model,
+            layers_per_stage=[1, 1],
+            stage_size=1,
+            process_groups=process_groups,
+        )
+        microbatch_inputs = [[raw_batch[0]], [raw_batch[0]]]
+        driver = input_dist_driver.return_value
+        driver.exchange.return_value.wait.return_value = microbatch_inputs
+        gradient_hook = MagicMock(side_effect=lambda _grad: None)
+        hook_handle = next(stage.module.parameters()).register_hook(gradient_hook)
+
+        with (
+            patch.object(stage, "finish_send_act"),
+            patch.object(stage, "start_send_act"),
+        ):
+            loss = stage(raw_batch)
+
+        torch.testing.assert_close(loss, torch.tensor(0.0))
+        driver.exchange.assert_called_once()
+        send_set = driver.exchange.call_args.args[0]
+        self.assertIs(send_set[0][0], raw_batch[0])
+        self.assertIs(send_set[1][0], raw_batch[1])
+        received_grads = [[torch.ones(4, 6)], [torch.ones(4, 6)]]
+        with (
+            patch.object(stage, "start_recv_grad") as start_recv_grad,
+            patch.object(stage, "wait_for_grad", side_effect=received_grads),
+        ):
+            loss.backward()
+
+        self.assertEqual(start_recv_grad.call_count, 2)
+        gradient_hook.assert_called_once()
+        hook_handle.remove()
+
+    @patch("torchrec.distributed.maglev.stage.InputDistDriver")
+    @patch("torchrec.distributed.maglev.stage.dist.get_rank", return_value=0)
+    def test_last_stage_loss_backward_drains_retained_graph(
+        self,
+        _get_rank: Any,
+        input_dist_driver: Any,
+    ) -> None:
+        process_group = MagicMock()
+        process_groups = MaglevProcessGroups(
+            stage_ranks=((0,),),
+            stage_pg=process_group,
+            handoff_pgs=(process_group, process_group),
+            cascade_pg=process_group,
+            cascade_gloo_pg=process_group,
+            handoff_pg_mode=HandoffPGMode.SHARED,
+        )
+        model = self._model(num_layers=1)
+        raw_batch = self._inputs(num_layers=1, batch_size=4)
+        expected_loss, _output = model(raw_batch)
+        stage = StageWrapper(
+            model,
+            layers_per_stage=[1],
+            stage_size=1,
+            process_groups=process_groups,
+        )
+        input_dist_driver.return_value.exchange.return_value.wait.return_value = [
+            raw_batch
+        ]
+
+        loss = stage(raw_batch)
+        torch.testing.assert_close(loss, expected_loss)
+        loss.backward()
+
+        self.assertTrue(
+            any(parameter.grad is not None for parameter in stage.module.parameters())
+        )
 
     def test_base_postproc_must_be_overridden(self) -> None:
         """MaglevModuleList itself cannot score a model."""
@@ -473,6 +562,28 @@ class MaglevModuleListTest(unittest.TestCase):
             [call(False), call(True)],
         )
 
+    def test_base_pipeline_delegates_full_round_to_stage(self) -> None:
+        stage = MagicMock(spec=StageWrapper)
+        stage.module = torch.nn.Linear(1, 1)
+        stage.num_stages = 4
+        stage.is_first = True
+        stage.in_activation_specs.return_value = ()
+        stage_loss = torch.tensor(2.0, requires_grad=True)
+        stage.return_value = stage_loss
+        optimizer = MagicMock(spec=torch.optim.Optimizer)
+        pipeline = MaglevPipelineBase(stage, optimizer)
+        raw_batch = object()
+
+        loss = pipeline.progress(iter([raw_batch]))
+
+        self.assertEqual(stage.call_count, 1)
+        self.assertIs(stage.call_args.args[0], raw_batch)
+        self.assertIs(loss, stage_loss)
+        torch.testing.assert_close(stage_loss.grad, torch.tensor(1.0))
+        self.assertEqual(pipeline.microbatches_per_pass, 4)
+        optimizer.zero_grad.assert_called_once_with()
+        optimizer.step.assert_called_once_with()
+
     def test_1f1b_pairs_steady_state_handoffs(self) -> None:
         stage = MagicMock(spec=StageWrapper)
         stage.module = torch.nn.Linear(1, 1)
@@ -482,7 +593,6 @@ class MaglevModuleListTest(unittest.TestCase):
         stage.handoff_pg_mode = HandoffPGMode.SHARED
         stage.in_activation_specs.return_value = ()
         stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
-        stage.activation_batch_size.side_effect = [2, 3, 4]
         stage.wait_for_act.return_value = ()
         output = (torch.ones(1, requires_grad=True),)
         grads = [torch.ones(1)]
@@ -506,7 +616,7 @@ class MaglevModuleListTest(unittest.TestCase):
         )
         stage.send_act_recv_grad.assert_has_calls([call(output), call(output)])
         stage.send_grad_recv_act.assert_called_once_with(
-            (), recv_next=True, batch_size=4
+            (), recv_next=True, next_stage_input=["third"]
         )
         stage.compute_backward_micro.assert_has_calls(
             [
@@ -526,7 +636,6 @@ class MaglevModuleListTest(unittest.TestCase):
         stage.handoff_pg_mode = HandoffPGMode.SPLIT
         stage.in_activation_specs.return_value = ()
         stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
-        stage.activation_batch_size.side_effect = [2, 3, 4]
         optimizer = MagicMock(spec=torch.optim.Optimizer)
 
         pipeline = Maglev1F1B(stage, optimizer, num_microbatches=3)
@@ -544,7 +653,7 @@ class MaglevModuleListTest(unittest.TestCase):
         )
         self.assertEqual(
             stage.start_recv_act.call_args_list,
-            [call(2), call(3), call(4)],
+            [call(["first"]), call(["second"]), call(["third"])],
         )
         stage.send_act_recv_grad.assert_not_called()
         stage.send_grad_recv_act.assert_not_called()
@@ -558,7 +667,6 @@ class MaglevModuleListTest(unittest.TestCase):
         stage.handoff_pg_mode = HandoffPGMode.SPLIT
         stage.in_activation_specs.return_value = ()
         stage.take_inputs.return_value = [["first"], ["second"], ["third"]]
-        stage.activation_batch_size.side_effect = [2, 3, 4]
         optimizer = MagicMock(spec=torch.optim.Optimizer)
 
         pipeline = Maglev1F1BRecvAhead(stage, optimizer, num_microbatches=3)
@@ -594,7 +702,7 @@ class MaglevModuleListTest(unittest.TestCase):
         )
         self.assertEqual(
             stage.start_recv_act.call_args_list,
-            [call(2), call(3), call(4)],
+            [call(["first"]), call(["second"]), call(["third"])],
         )
 
     def test_maglev_layer_defines_its_own_architecture(self) -> None:
