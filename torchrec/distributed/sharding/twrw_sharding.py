@@ -18,6 +18,7 @@ from torch.distributed._tensor import Replicate, Shard
 from torch.distributed.distributed_c10d import get_process_group_ranks
 from torchrec.distributed.comm import (
     get_local_size,
+    get_resolved_pod_size,
     intra_and_cross_node_pg,
     intra_and_cross_node_pg_2D,
 )
@@ -107,9 +108,36 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             )
         self._intra_pg: Optional[dist.ProcessGroup] = intra_pg
         self._cross_pg: Optional[dist.ProcessGroup] = cross_pg
-        self._local_size: int = (
-            intra_pg.size() if intra_pg else get_local_size(self._world_size)
+        self._node_group_size: Optional[int] = (
+            # pyrefly: ignore[missing-attribute]
+            self._env.node_group_size
+            if self._is_2D_parallel
+            else None
         )
+        # Must match the world size the real builder feeds get_local_size(), because
+        # get_local_size() falls back to its argument when LOCAL_WORLD_SIZE is unset or
+        # does not divide it -- any divergence here manufactures the very node-width
+        # mismatch the guard in _shard() exists to catch. intra_and_cross_node_pg_2D
+        # uses dist.get_world_size() (the default WORLD group), so use exactly that;
+        # ShardingEnv2D always implies an initialised dist. The 1D fallback stays on
+        # env.world_size instead, since a ShardingEnv.from_local() env has no process
+        # group at all and calling dist here would raise.
+        self._global_world_size: int = (
+            dist.get_world_size() if self._is_2D_parallel else self._world_size
+        )
+        if intra_pg is not None:
+            local_size = intra_pg.size()
+        else:
+            # Meta-device construction gets no process groups back, so mirror the
+            # width the real intra group would have had -- pod_size included. Without
+            # it this node width disagrees with a plan cut against
+            # Topology.intra_group_size whenever pod_size > 1 (the NVL72 SKUs).
+            local_size = (get_resolved_pod_size() or 1) * (
+                self._node_group_size
+                if self._node_group_size
+                else get_local_size(self._global_world_size)
+            )
+        self._local_size: int = local_size
 
         sharded_tables_per_rank = self._shard(sharding_infos)
         self._grouped_embedding_configs_per_rank: List[List[GroupedEmbeddingConfig]] = (
@@ -174,6 +202,36 @@ class BaseTwRwEmbeddingSharding(EmbeddingSharding[C, F, T, W]):
             table_node = rank // local_size
             # pyrefly: ignore[missing-attribute]
             shards = info.param_sharding.sharding_spec.shards
+
+            # The loop below places exactly local_size shards, one per rank of the
+            # node. A longer list is silently truncated while the global_metadata
+            # built here still advertises the whole tensor, so the model trains on a
+            # partial table and the gap only surfaces later as a checkpoint
+            # validation error; a shorter one indexes past the end. Both mean the
+            # producer and the runtime disagree on the node width, so fail here
+            # while both numbers are still in scope.
+            if len(shards) != local_size:
+                consequence = (
+                    f"placing only the first {local_size} and dropping "
+                    f"{len(shards) - local_size} while still reporting the full "
+                    f"tensor"
+                    if len(shards) > local_size
+                    else f"leaving {local_size - len(shards)} of the node's ranks "
+                    f"with no shard to place"
+                )
+                raise ValueError(
+                    f"TwRw node width mismatch for table "
+                    f"'{info.embedding_config.name}': the plan has {len(shards)} "
+                    f"row shards but the runtime intra-node group has {local_size} "
+                    f"ranks. is_2D={self._is_2D_parallel}, "
+                    f"pod_size={get_resolved_pod_size()}, "
+                    f"node_group_size={self._node_group_size}, "
+                    f"local_world_size={get_local_size(self._global_world_size)}. "
+                    f"A TwRw plan must carry one shard per rank of the node; "
+                    f"continuing would mean {consequence}. Check that the plan was "
+                    f"built against Topology.intra_group_size rather than "
+                    f"local_world_size."
+                )
 
             # construct the global sharded_tensor_metadata
             global_metadata = ShardedTensorMetadata(
