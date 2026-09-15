@@ -59,7 +59,7 @@ T = TypeVar("T")
 W = TypeVar("W")
 
 
-def _build_tpu_permute(
+def build_tpu_permute(
     embedding_dims: List[int],
     embedding_order: List[int],
     device: Optional[torch.device],
@@ -329,7 +329,7 @@ class CwPooledEmbeddingSharding(
                 and torch.tpu.is_available()
             ):
                 callbacks = [
-                    _build_tpu_permute(
+                    build_tpu_permute(
                         self._embedding_dims, self._embedding_order, device
                     )
                 ]
