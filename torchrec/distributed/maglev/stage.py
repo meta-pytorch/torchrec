@@ -408,6 +408,21 @@ class _LayerChain(nn.Module):
         return activations
 
 
+class _StageLoss(torch.autograd.Function):
+    """Expose a stage's ordered cross-rank backward as an autograd edge."""
+
+    @staticmethod
+    def forward(ctx: Any, value: torch.Tensor, stage: "StageWrapper") -> torch.Tensor:
+        ctx.stage = stage
+        return value.clone()
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        stage = cast(StageWrapper, ctx.stage)
+        stage._backward_round(cast(torch.Tensor, grad_outputs[0]))
+        return None, None
+
+
 class StageWrapper(nn.Module):
     """Takes a whole Maglev model and keeps the one stage this rank owns.
 
@@ -435,9 +450,10 @@ class StageWrapper(nn.Module):
     Wrap before materializing, so a sharder places the tables rather than
     resharding ones already allocated at full size.
 
-    The stage reduces no gradients. They accumulate across a pass, and the
-    schedule runs every backward but the last inside a caller-supplied
-    ``no_sync`` context so the DP wrapper's own reducer fires once (see
+    The stage reduces no gradients itself. Functional execution combines the
+    microbatch graphs into one autograd traversal, while explicit schedules use
+    their DP wrapper's synchronization controls; either way, that wrapper's
+    reducer fires once per pass (see
     :class:`~torchrec.distributed.maglev.pipeline.MaglevPipelineBase`).
 
     The activation specs are captured in the constructor, before any wrapping,
@@ -470,7 +486,8 @@ class StageWrapper(nn.Module):
         # stage 1, so layers l2 and l3 -- and only those are materialized.
         stage = StageWrapper(model, [2, 2], stage_size=2)
         stage.to(device)
-        (out,) = stage([layer_inputs[i] for i in stage.layer_indices])
+        loss = stage(raw_batch)
+        loss.backward()
     """
 
     @classmethod
@@ -742,43 +759,59 @@ class StageWrapper(nn.Module):
         """The activation this stage sends to the next HSD."""
         return self._out_specs
 
-    def activation_batch_size(self, stage_input: Sequence[Any]) -> Optional[int]:
+    def _activation_batch_size(
+        self, stage_input: Optional[Sequence[Any]]
+    ) -> Optional[int]:
         """Return this microbatch's size when a boundary depends on it."""
         if not any(spec.batch_size_dependent for spec in self._in_specs):
             return None
+        if stage_input is None:
+            raise ValueError(
+                "stage input is required for a batch-size-dependent activation"
+            )
+        # A layer's inputs and boundary activations describe the same logical
+        # microbatch, so their batch sizes must agree across the whole stage.
         batch_size = self._get_batch_size(stage_input)
         if batch_size < 0:
             raise ValueError(f"batch size must be non-negative, got {batch_size}")
         return batch_size
 
-    def forward(
-        self, stage_input: Sequence[Any], in_activations: Activations = ()
-    ) -> Any:
-        """Run this stage's layers.
+    def forward(self, model_input: Any) -> torch.Tensor:
+        """Distribute and forward every microbatch produced by one raw batch.
 
         Args:
-            stage_input: one input per layer this stage owns.
-            in_activations: the previous stage's activation, ``()`` for the first
-                stage.
+            model_input: one raw dataloader batch. The model's ``preproc`` creates
+                per-layer inputs, and one input-distribution round exchanges them
+                across the cascade. The batch is already a microbatch; it is not
+                split.
 
         Returns:
-            Any: a plain ``Activations`` tuple, except on the last stage, where
-            the model's ``postproc`` result follows the configured output mode.
+            torch.Tensor: the summed microbatch loss on the final stage, and a
+            zero-valued backward token on earlier stages. Every rank must call
+            ``backward`` on this tensor; its autograd edge drains the matching
+            cross-stage backwards in order.
 
-        Raises:
-            ValueError: if the input count does not match the layers this stage
-                owns.
-
-        .. note::
-            The incoming activation is deliberately *not* validated here. On the
-            pipeline path it cannot be wrong: the connector allocates each buffer
-            from these very specs after materializing any batch-size-dependent
-            leading dimension, so a per-microbatch check would only restate its
-            own premise while running on the host's critical path. Call
-            :func:`~torchrec.distributed.maglev.module.check_activations`
-            explicitly when feeding a stage hand-built activations.
+        Pipeline schedules use the lower-level ``*_micro`` methods to choose a
+        different forward/backward ordering. The returned value is meaningful
+        for reporting only on the final stage.
         """
-        return self.module(stage_input, in_activations)
+        with record_function("## torchrec_maglev:input_driver ##"):
+            microbatch_inputs = self._input_driver.exchange(
+                self.send_set(model_input)
+            ).wait()
+
+        outputs: List[Any] = []
+        for microbatch_id, stage_input in enumerate(microbatch_inputs):
+            self.start_recv_act(stage_input)
+            outputs.append(self.forward_micro(stage_input, microbatch_id))
+        self.finish_send_act()
+        if self.is_last:
+            value = torch.stack([output[0] for output in outputs]).sum().detach()
+        else:
+            first_outputs = cast(Activations, outputs[0])
+            value = first_outputs[0].new_zeros(())
+        value.requires_grad_(True)
+        return cast(torch.Tensor, _StageLoss.apply(value, self))
 
     # ---- cross-HSD hand-off ----
     #
@@ -804,7 +837,7 @@ class StageWrapper(nn.Module):
         """Whether this stage ends the pipeline (nothing to send)."""
         return self.stage_index == self.num_stages - 1
 
-    def start_recv_act(self, batch_size: Optional[int] = None) -> None:
+    def start_recv_act(self, stage_input: Optional[Sequence[Any]] = None) -> None:
         """Ensure a receive is posted for the previous HSD's activation.
 
         Allocates one buffer per incoming spec and issues the receives in spec
@@ -816,10 +849,12 @@ class StageWrapper(nn.Module):
         :meth:`wait_for_act` dequeues them in issue order.
 
         Args:
-            batch_size: size used to materialize batch-size-dependent specs.
+            stage_input: the local inputs for the activation being received. Only
+                required when an incoming spec has a dynamic batch dimension.
         """
         if self.is_first:
             return
+        batch_size = self._activation_batch_size(stage_input)
         act_pg, _ = self.handoff_pgs
         src = self.neighbor_rank(-1)
         works: List[Any] = []
@@ -963,7 +998,7 @@ class StageWrapper(nn.Module):
         self,
         in_activations: Activations,
         recv_next: bool,
-        batch_size: Optional[int] = None,
+        next_stage_input: Optional[Sequence[Any]] = None,
     ) -> Activations:
         """Exchange an upstream gradient for the next forward activation.
 
@@ -972,7 +1007,9 @@ class StageWrapper(nn.Module):
         Args:
             in_activations: activations whose gradients are sent upstream.
             recv_next: whether to receive the next forward activation.
-            batch_size: size of that next activation microbatch.
+            next_stage_input: local inputs for the next activation microbatch.
+                Only required when ``recv_next`` and an incoming spec has a
+                dynamic batch dimension.
         """
         if self.is_first:
             return ()
@@ -980,6 +1017,9 @@ class StageWrapper(nn.Module):
             raise RuntimeError("batched handoff requires handoff_pg_mode=shared")
         peer = self.neighbor_rank(-1)
         pg = self.handoff_pgs[0]
+        batch_size = (
+            self._activation_batch_size(next_stage_input) if recv_next else None
+        )
         grad_buffers = [
             (tensor.grad if tensor.grad is not None else torch.zeros_like(tensor))
             for tensor, spec in zip(in_activations, self._in_specs)
@@ -1161,7 +1201,9 @@ class StageWrapper(nn.Module):
                 lambda: self.send_set(next(dataloader_iter)), n
             )
 
-    def backward(self, outputs: Activations, grads: Sequence[torch.Tensor]) -> None:
+    def _backward_activations(
+        self, outputs: Activations, grads: Sequence[torch.Tensor]
+    ) -> None:
         """Backward through this stage from the gradients its outputs received.
 
         Args:
@@ -1227,14 +1269,14 @@ class StageWrapper(nn.Module):
                 loss.backward()
         else:
             with record_function(f"## backward mb{microbatch_id} ##"):
-                self.backward(outputs, grads)
+                self._backward_activations(outputs, grads)
         return loss, in_activations
 
     def forward_micro(
         self,
         stage_input: Sequence[Any],
         microbatch_id: int = 0,
-    ) -> None:
+    ) -> Any:
         """One microbatch forward: recv activation, compute, send activation.
 
         The result is parked on an internal FIFO for the matching
@@ -1267,6 +1309,7 @@ class StageWrapper(nn.Module):
             self.finish_send_act()
         with record_function(f"## send_act mb{microbatch_id} ##"):
             self.start_send_act(outputs)
+        return outputs
 
     def backward_micro(self) -> Optional[torch.Tensor]:
         """One microbatch backward: recv grad, backward, send input grad.
@@ -1295,6 +1338,49 @@ class StageWrapper(nn.Module):
             self.start_send_grad(in_activations)
 
         return loss
+
+    def _backward_round(self, loss_grad: torch.Tensor) -> None:
+        """Drain one functional forward as a single autograd traversal.
+
+        DDP shares one reducer across all outstanding forwards. Separate
+        backwards would therefore reduce the first microbatch before the later
+        graphs contribute their gradients; one traversal makes its parameter
+        hooks observe the accumulated pass instead.
+        """
+        pending = self._pending
+        if self.is_last:
+            losses = [outputs[0] for _inputs, outputs, _id in pending]
+            with record_function("## backward round ##"):
+                torch.autograd.backward(losses, [loss_grad] * len(losses))
+        else:
+            for _ in pending:
+                self.start_recv_grad()
+
+            backward_outputs: List[torch.Tensor] = []
+            backward_grads: List[torch.Tensor] = []
+            for _in_activations, outputs, microbatch_id in pending:
+                with record_function(f"## recv_grad mb{microbatch_id} ##"):
+                    grads = self.wait_for_grad()
+                grad_carrying = [
+                    output
+                    for output, spec in zip(cast(Activations, outputs), self._out_specs)
+                    if spec.requires_grad
+                ]
+                for output, grad in zip(grad_carrying, grads):
+                    if output.requires_grad:
+                        backward_outputs.append(output)
+                        backward_grads.append(grad)
+            if backward_outputs:
+                with record_function("## backward round ##"):
+                    torch.autograd.backward(backward_outputs, backward_grads)
+
+        self._pending = []
+        for in_activations, _outputs, microbatch_id in pending:
+            with record_function(f"## finish_send_grad mb{microbatch_id} ##"):
+                self.finish_send_grad()
+            with record_function(f"## send_grad mb{microbatch_id} ##"):
+                self.start_send_grad(in_activations)
+        self.finish_send_grad()
 
     def drain_sends(self) -> None:
         """Complete the in-flight send in each direction, if any.

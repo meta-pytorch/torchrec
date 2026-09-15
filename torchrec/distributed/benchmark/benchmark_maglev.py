@@ -286,7 +286,8 @@ class RunOptions(BenchFuncConfig):
             )
         match self.pipeline:
             case "base":
-                # One microbatch per pass; takes no microbatch count.
+                # One input-distribution round per pass; takes no configured
+                # microbatch count.
                 return MaglevPipelineBase(stage=stage, optimizer=optimizer)
             case _:
                 # Every non-"base" entry is a Maglev1F1B subclass, which is what
@@ -481,8 +482,8 @@ def runner(
                 "dataloader_iter": dataloader_iter,
             },
             # A pass consumes microbatches_per_pass per-rank batches -- which is
-            # num_microbatches for 1F1B but 1 for the base schedule, so this has
-            # to come from the pipeline, not the config.
+            # num_microbatches for 1F1B but num_stages for the base schedule, so
+            # this has to come from the pipeline, not the config.
             sample_count=run_option.batch_size * pipeline.microbatches_per_pass,
             **run_option.benchmark_func_kwargs(rank=rank),
         )
