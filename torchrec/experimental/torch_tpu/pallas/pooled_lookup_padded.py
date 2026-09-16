@@ -108,6 +108,7 @@ def build(B, K, D):
             pltpu.SemaphoreType.DMA((2,)),
         ],
         mesh=mesh,
+        name="pooled_lookup_lengths_sc",
     )
 
     def run(table, idx):
