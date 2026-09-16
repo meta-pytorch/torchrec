@@ -957,6 +957,9 @@ def _get_optimizer_multipler(
         return 0
     elif optimizer_class in [torch.optim.Adam, trec_optim.Adam]:
         return 2
+    elif optimizer_class == trec_optim.FTRL:
+        # FTRL keeps two elementwise states per row: accum and linear.
+        return 2
     elif optimizer_class == trec_optim.RowWiseAdagrad:
         return 1 / shape[-1]
     else:
