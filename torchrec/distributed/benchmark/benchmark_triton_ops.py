@@ -59,6 +59,9 @@ from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
 from torchrec.sparse.jagged_tensor import _kt_regroup_arguments, JaggedTensor
 from torchrec.sparse.triton_batch_index_select import triton_batch_index_select_dim0
 from torchrec.sparse.triton_jagged_to_padded_dense import triton_jagged_to_padded_dense
+from torchrec.sparse.triton_keyed_jagged_index_select import (
+    triton_keyed_jagged_index_select_dim1,
+)
 from torchrec.sparse.triton_pack_segments import triton_pack_segments
 from torchrec.sparse.triton_permute_2d import (
     MIN_SEGMENTS,
@@ -1388,6 +1391,214 @@ def jagged_to_padded_dense_fbgemm(
             output,
             values,
             grad_output,
+            run_backward,
+        )
+
+
+##################### keyed jagged index select configs #############################
+@dataclass
+class KeyedJaggedIndexSelectConfig(TritonOpConfig):
+    """KJT index-select shapes observed in the CMF training traces."""
+
+    num_keys: int = 1
+    input_batch_size: int = 14
+    output_batch_size: int = 56
+    num_values: int = 7_780_593
+    has_weights: bool = False
+    provide_selected_lengths_sum: bool = False
+    run_backward: bool = False
+    dtype: str = "int32"
+    gpu_backlog_ms: float = 20.0
+
+    def make_inputs(self, device: torch.device) -> Dict[str, Any]:
+        dtype = {
+            "int32": torch.int32,
+            "int64": torch.int64,
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(self.dtype)
+        if dtype is None:
+            raise ValueError(
+                "dtype must be int32, int64, float32, float16, or bfloat16"
+            )
+        if self.num_keys <= 0 or self.input_batch_size <= 0:
+            raise ValueError("num_keys and input_batch_size must be positive")
+        if self.output_batch_size <= 0 or self.num_values < 0:
+            raise ValueError(
+                "output_batch_size must be positive and num_values nonnegative"
+            )
+        if self.run_backward and not dtype.is_floating_point:
+            raise ValueError("run_backward requires a floating-point dtype")
+
+        num_input_segments = self.num_keys * self.input_batch_size
+        base_length, remainder = divmod(self.num_values, num_input_segments)
+        lengths = torch.full(
+            (num_input_segments,),
+            base_length,
+            dtype=torch.int64,
+            device=device,
+        )
+        if remainder > 0:
+            lengths[:remainder] += 1
+        offsets = torch.zeros(
+            num_input_segments + 1,
+            dtype=torch.int64,
+            device=device,
+        )
+        torch.cumsum(lengths, dim=0, out=offsets[1:])
+        indices = torch.arange(self.output_batch_size, device=device)
+        indices %= self.input_batch_size
+        indices = indices[torch.randperm(self.output_batch_size, device=device)]
+        selected_lengths_sum = int(
+            lengths.view(self.num_keys, self.input_batch_size)[:, indices].sum().item()
+        )
+        if dtype.is_floating_point:
+            values = torch.randn(
+                self.num_values,
+                dtype=dtype,
+                device=device,
+                requires_grad=self.run_backward,
+            )
+        else:
+            values = torch.randint(
+                1 << 20,
+                (self.num_values,),
+                dtype=dtype,
+                device=device,
+            )
+        weights = (
+            torch.randn(
+                self.num_values,
+                device=device,
+                requires_grad=self.run_backward,
+            )
+            if self.has_weights
+            else None
+        )
+        grad_output_values = (
+            torch.randn(selected_lengths_sum, dtype=dtype, device=device)
+            if self.run_backward
+            else None
+        )
+        grad_output_weights = (
+            torch.randn(selected_lengths_sum, device=device)
+            if self.run_backward and self.has_weights
+            else None
+        )
+        return {
+            "values": values,
+            "lengths": lengths,
+            "offsets": offsets,
+            "indices": indices,
+            "weights": weights,
+            "selected_lengths_sum": selected_lengths_sum,
+            "grad_output_values": grad_output_values,
+            "grad_output_weights": grad_output_weights,
+        }
+
+
+def _run_keyed_jagged_index_select_backward(
+    outputs: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+    values: torch.Tensor,
+    weights: Optional[torch.Tensor],
+    grad_output_values: Optional[torch.Tensor],
+    grad_output_weights: Optional[torch.Tensor],
+    run_backward: bool,
+) -> None:
+    if not run_backward:
+        return
+    assert grad_output_values is not None
+    if weights is None:
+        torch.autograd.grad(outputs[0], values, grad_output_values)
+        return
+    assert outputs[2] is not None and grad_output_weights is not None
+    torch.autograd.grad(
+        (outputs[0], outputs[2]),
+        (values, weights),
+        (grad_output_values, grad_output_weights),
+    )
+
+
+@register_benchmark(KeyedJaggedIndexSelectConfig)
+def keyed_jagged_index_select_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    offsets: torch.Tensor,
+    indices: torch.Tensor,
+    weights: Optional[torch.Tensor],
+    selected_lengths_sum: int,
+    grad_output_values: Optional[torch.Tensor],
+    grad_output_weights: Optional[torch.Tensor],
+    input_batch_size: int,
+    provide_selected_lengths_sum: bool,
+    run_backward: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function(
+        "## triton_keyed_jagged_index_select_dim1 "
+        f"input_values={values.numel()} output_values={selected_lengths_sum} ##"
+    ):
+        outputs = triton_keyed_jagged_index_select_dim1(
+            values,
+            lengths,
+            offsets,
+            indices,
+            input_batch_size,
+            weights,
+            selected_lengths_sum if provide_selected_lengths_sum else None,
+        )
+        _run_keyed_jagged_index_select_backward(
+            outputs,
+            values,
+            weights,
+            grad_output_values,
+            grad_output_weights,
+            run_backward,
+        )
+
+
+@register_benchmark(KeyedJaggedIndexSelectConfig)
+def keyed_jagged_index_select_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    values: torch.Tensor,
+    lengths: torch.Tensor,
+    offsets: torch.Tensor,
+    indices: torch.Tensor,
+    weights: Optional[torch.Tensor],
+    selected_lengths_sum: int,
+    grad_output_values: Optional[torch.Tensor],
+    grad_output_weights: Optional[torch.Tensor],
+    input_batch_size: int,
+    provide_selected_lengths_sum: bool,
+    run_backward: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function(
+        "## fbgemm_keyed_jagged_index_select_dim1 "
+        f"input_values={values.numel()} output_values={selected_lengths_sum} ##"
+    ):
+        raw_outputs = torch.ops.fbgemm.keyed_jagged_index_select_dim1(
+            values,
+            lengths,
+            offsets,
+            indices,
+            input_batch_size,
+            weights,
+            selected_lengths_sum if provide_selected_lengths_sum else None,
+        )
+        outputs = (
+            raw_outputs[0],
+            raw_outputs[1],
+            raw_outputs[2] if weights is not None else None,
+        )
+        _run_keyed_jagged_index_select_backward(
+            outputs,
+            values,
+            weights,
+            grad_output_values,
+            grad_output_weights,
             run_backward,
         )
 
