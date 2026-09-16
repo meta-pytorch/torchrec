@@ -122,6 +122,7 @@ def permute_pooled_embs_auto_grad_split_kernel(
             needs_layout_passes=False,  # pyre-ignore[28]
         ),
         mesh=mesh,
+        name="permute_pooled_embs_auto_grad_split_sc",
     )
     permuted_embeddings = ker(src_start, dst_start, n_units, pooled_embs)
     return permuted_embeddings
