@@ -108,7 +108,11 @@ from torchrec.modules.embedding_modules import (
     EmbeddingCollectionInterface,
     should_skip_data_parallel_grad_sync,
 )
-from torchrec.modules.utils import construct_jagged_tensors, SequenceVBEContext
+from torchrec.modules.utils import (
+    construct_jagged_tensors,
+    construct_packed_jagged_tensors,
+    SequenceVBEContext,
+)
 from torchrec.optim.fused import EmptyFusedOptimizer, FusedOptimizerModule
 from torchrec.optim.keyed import CombinedOptimizer, KeyedOptimizer
 from torchrec.sparse.jagged_tensor import _to_offsets, JaggedTensor, KeyedJaggedTensor
@@ -362,6 +366,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         use_gather_select_per_sharding: Optional[Dict[str, bool]] = None,
         use_sorted_select: bool = False,
         resize_awaitables: Optional[List[Awaitable[torch.Tensor]]] = None,
+        use_packed_jagged_tensor: bool = False,
     ) -> None:
         super().__init__()
         self._awaitables_per_sharding = awaitables_per_sharding
@@ -376,6 +381,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
         self._use_gather_select_per_sharding = use_gather_select_per_sharding
         self._use_sorted_select = use_sorted_select
         self._resize_awaitables = resize_awaitables
+        self._use_packed_jagged_tensor = use_packed_jagged_tensor
 
     def _wait_impl(self) -> Dict[str, JaggedTensor]:
         jt_dict: Dict[str, JaggedTensor] = {}
@@ -416,8 +422,18 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                 use_gather_select = self._use_gather_select_per_sharding[sharding_type]
             else:
                 use_gather_select = self._use_gather_select
-            jt_dict.update(
-                construct_jagged_tensors(
+            if self._use_packed_jagged_tensor:
+                constructed_jagged_tensors = construct_packed_jagged_tensors(
+                    embeddings=embeddings,
+                    features=f,
+                    embedding_names=e,
+                    need_indices=self._need_indices,
+                    original_features=original_features,
+                    reverse_indices=reverse_indices,
+                    seq_vbe_ctx=seq_vbe_ctx,
+                )
+            else:
+                constructed_jagged_tensors = construct_jagged_tensors(
                     embeddings=embeddings,
                     features=f,
                     embedding_names=e,
@@ -429,7 +445,7 @@ class EmbeddingCollectionAwaitable(LazyAwaitable[Dict[str, JaggedTensor]]):
                     use_gather_select=use_gather_select,
                     use_sorted_select=self._use_sorted_select,
                 )
-            )
+            jt_dict.update(constructed_jagged_tensors)
 
         # free memory and resize
         if self._resize_awaitables:
@@ -464,6 +480,7 @@ class ShardedEmbeddingCollection(
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
         use_index_dedup: bool = False,
         module_fqn: Optional[str] = None,
+        use_packed_jagged_tensor: bool = False,
     ) -> None:
         # pyrefly: ignore[missing-attribute]
         super().__init__(qcomm_codecs_registry=qcomm_codecs_registry)
@@ -503,6 +520,11 @@ class ShardedEmbeddingCollection(
         self._output_dtensor: bool = env.output_dtensor
         # TODO get rid of get_ec_index_dedup global flag
         self._use_index_dedup: bool = use_index_dedup or get_ec_index_dedup()
+        if use_packed_jagged_tensor and not self._use_index_dedup:
+            raise ValueError(
+                "Packed JaggedTensor outputs require EmbeddingCollection index dedup"
+            )
+        self._use_packed_jagged_tensor: bool = use_packed_jagged_tensor
         sharding_type_to_sharding_infos = self.create_grouped_sharding_infos(
             module,
             table_name_to_parameter_sharding,
@@ -1686,6 +1708,7 @@ class ShardedEmbeddingCollection(
             use_gather_select=self._use_gather_select,
             use_gather_select_per_sharding=self._use_gather_select_per_sharding,
             use_sorted_select=self._use_sorted_select,
+            use_packed_jagged_tensor=self._use_packed_jagged_tensor,
         )
 
     def compute_and_output_dist(
@@ -1750,6 +1773,7 @@ class ShardedEmbeddingCollection(
             use_gather_select=self._use_gather_select,
             use_gather_select_per_sharding=self._use_gather_select_per_sharding,
             use_sorted_select=self._use_sorted_select,
+            use_packed_jagged_tensor=self._use_packed_jagged_tensor,
             resize_awaitables=resize_awaitables,
         )
 
@@ -1824,9 +1848,11 @@ class EmbeddingCollectionSharder(BaseEmbeddingSharder[EmbeddingCollection]):
         fused_params: Optional[Dict[str, Any]] = None,
         qcomm_codecs_registry: Optional[Dict[str, QuantizedCommCodecs]] = None,
         use_index_dedup: bool = False,
+        use_packed_jagged_tensor: bool = False,
     ) -> None:
         super().__init__(fused_params, qcomm_codecs_registry)
         self._use_index_dedup = use_index_dedup
+        self._use_packed_jagged_tensor = use_packed_jagged_tensor
 
     @EventLoggingHandler.event_logger(TorchrecComponent.SHARDER)
     def shard(
@@ -1845,6 +1871,7 @@ class EmbeddingCollectionSharder(BaseEmbeddingSharder[EmbeddingCollection]):
             device,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
             use_index_dedup=self._use_index_dedup,
+            use_packed_jagged_tensor=self._use_packed_jagged_tensor,
             module_fqn=module_fqn,
         )
 
