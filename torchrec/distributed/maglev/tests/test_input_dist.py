@@ -136,12 +136,18 @@ class InputDistTest(unittest.TestCase):
             inverse_indices=(keys, torch.zeros_like(inverse_indices)),
         )
 
-        rebuilt = unflatten_from_tensors(flatten_to_tensors(obj), example)
+        rebuilt = unflatten_from_tensors(
+            flatten_to_tensors(obj),
+            example,
+            [*obj.stride_per_key(), *obj.length_per_key()],
+        )
 
         self.assertTrue(rebuilt.variable_stride_per_key())
         torch.testing.assert_close(
             rebuilt._stride_per_key_per_rank, obj._stride_per_key_per_rank
         )
+        self.assertEqual(rebuilt._stride_per_key, [2, 4])
+        self.assertEqual(rebuilt.length_per_key_or_none(), [2, 6])
         torch.testing.assert_close(rebuilt.lengths(), obj.lengths())
         self.assertEqual(rebuilt.stride_per_key(), [2, 4])
         rebuilt_inverse_indices = rebuilt.inverse_indices()
@@ -263,10 +269,17 @@ class InputDistInProcessTest(unittest.TestCase):
             bucket_dtypes,
             copy_done_event,
         ) = input_size_dist(send, example, pg, device, memcpy_stream)
-        recv_sizes = size_awaitable.wait()
+        recv_sizes, recv_kjt_metadata = size_awaitable.wait()
         copy_done_event.synchronize()
 
         self.assertEqual(recv_sizes[0], [tensor.shape[0] for tensor in source_tensors])
+        self.assertEqual(
+            recv_kjt_metadata[0],
+            [
+                *send[0].features.stride_per_key(),
+                *send[0].features.length_per_key(),
+            ],
+        )
         self.assertEqual(len(example_flat), len(source_tensors))
         expected_by_dtype: Dict[torch.dtype, List[torch.Tensor]] = {}
         for tensor in source_tensors:
@@ -330,3 +343,7 @@ class InputDistInProcessTest(unittest.TestCase):
 
         for expected, actual in zip(source_tensors, flatten_to_tensors(received)):
             torch.testing.assert_close(actual.cpu(), expected)
+        self.assertEqual(
+            received.features.length_per_key_or_none(),
+            source.features.length_per_key(),
+        )
