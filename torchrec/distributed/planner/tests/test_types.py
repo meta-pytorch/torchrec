@@ -2414,6 +2414,22 @@ class ShardingPlanRequestTest(unittest.TestCase):
             ).request_hash,
         )
 
+    def test_request_hash_includes_reserve_module_terms(self) -> None:
+        """The flag decides whether dense and kjt are added on top of the margin, so
+        it changes the reservation and therefore the plan. If it fell out of the hash
+        the two requests would collide in the plan cache and a FixedPercentage model
+        could be served a plan computed with the module terms included -- the
+        double-count this flag exists to prevent, reintroduced silently via the
+        cache."""
+        self.assertNotEqual(
+            self._create_request(
+                planner_config=PlannerConfig(reserve_module_terms=True)
+            ).request_hash,
+            self._create_request(
+                planner_config=PlannerConfig(reserve_module_terms=False)
+            ).request_hash,
+        )
+
     def test_parameter_multiplier_rejects_negative_and_non_finite(self) -> None:
         for bad in (-1.0, float("nan"), float("inf")):
             with self.assertRaisesRegex(ValueError, "parameter_multiplier"):
