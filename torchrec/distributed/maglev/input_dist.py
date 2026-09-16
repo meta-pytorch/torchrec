@@ -11,9 +11,9 @@
 
 A "carrier" (dataclass of tensors / ``KeyedJaggedTensor`` / nested containers) is
 flattened on the sender and rebuilt on the receiver from a known *example*
-instance: only tensors cross the wire, and every non-tensor part comes from the
-example. :func:`input_dist` all-to-alls a list of carriers in two phases -- sizes
-over CPU/gloo, then bulk tensors over nccl -- both async, returning a
+instance. :func:`input_dist` all-to-alls a list of carriers in two phases --
+sizes and KJT host metadata over CPU/gloo, then bulk tensors over nccl -- both
+async, returning a
 :class:`~torchrec.distributed.types.LazyAwaitable`.
 """
 
@@ -86,6 +86,22 @@ def flatten_to_tensors(obj: Any) -> List[torch.Tensor]:
     return out
 
 
+def _flatten_kjt_metadata(obj: Any, out: List[int]) -> None:
+    """Collect source-specific KJT caches that must remain host resident."""
+    if isinstance(obj, KeyedJaggedTensor):
+        out.extend(obj.stride_per_key())
+        out.extend(obj.length_per_key())
+    elif is_dataclass(obj) and not isinstance(obj, type):
+        for f in fields(obj):
+            _flatten_kjt_metadata(getattr(obj, f.name), out)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            _flatten_kjt_metadata(item, out)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            _flatten_kjt_metadata(value, out)
+
+
 def _flatten(obj: Any, out: List[torch.Tensor]) -> None:
     if isinstance(obj, torch.Tensor):
         out.append(obj)
@@ -104,7 +120,11 @@ def _flatten(obj: Any, out: List[torch.Tensor]) -> None:
     # else: non-tensor leaf -> nothing to collect.
 
 
-def unflatten_from_tensors(tensors: List[torch.Tensor], example: T) -> T:
+def unflatten_from_tensors(
+    tensors: List[torch.Tensor],
+    example: T,
+    kjt_metadata: Optional[List[int]] = None,
+) -> T:
     """Rebuild a value shaped like ``example`` from a flat list of tensors.
 
     ``tensors`` must be in the order :func:`flatten_to_tensors` produces for a
@@ -117,56 +137,80 @@ def unflatten_from_tensors(tensors: List[torch.Tensor], example: T) -> T:
         tensors: the flattened tensors (e.g. received over the wire).
         example: a template instance defining the structure and non-tensor
             values.
+        kjt_metadata: source-specific stride and length per key, if available.
 
     Returns:
         A new value of the same type/structure as ``example``.
 
     Raises:
-        ValueError: if ``tensors`` has too few or too many tensors for
-            ``example``.
+        ValueError: if ``tensors`` or ``kjt_metadata`` does not match ``example``.
     """
     it = iter(tensors)
-    result: T = _unflatten(example, it)
+    metadata_length = len(kjt_metadata) if kjt_metadata is not None else 0
+    metadata_it = iter(kjt_metadata) if kjt_metadata is not None else None
+    result: T = _unflatten(example, it, metadata_it)
     remaining = sum(1 for _ in it)
     if remaining:
         raise ValueError(
             f"too many tensors for the example: {len(tensors)} given, "
             f"{len(tensors) - remaining} used"
         )
+    if metadata_it is not None:
+        remaining_metadata = sum(1 for _ in metadata_it)
+        if remaining_metadata:
+            raise ValueError(
+                f"too much KJT metadata: {metadata_length} given, "
+                f"{metadata_length - remaining_metadata} used"
+            )
     return result
 
 
-def _unflatten(example: Any, it: Iterator[torch.Tensor]) -> Any:
+def _unflatten(
+    example: Any,
+    it: Iterator[torch.Tensor],
+    metadata_it: Optional[Iterator[int]],
+) -> Any:
     if isinstance(example, torch.Tensor):
         return _next(it)
     if isinstance(example, KeyedJaggedTensor):
-        return _rebuild_kjt(example, it)
+        return _rebuild_kjt(example, it, metadata_it)
     if is_dataclass(example) and not isinstance(example, type):
         kwargs = {
-            f.name: _unflatten(getattr(example, f.name), it) for f in fields(example)
+            f.name: _unflatten(getattr(example, f.name), it, metadata_it)
+            for f in fields(example)
         }
         return type(example)(**kwargs)
     if isinstance(example, tuple):
-        values = [_unflatten(item, it) for item in example]
+        values = [_unflatten(item, it, metadata_it) for item in example]
         # Preserve namedtuple type (constructed positionally) vs plain tuple.
         if hasattr(example, "_fields"):
             return type(example)(*values)
         return type(example)(values)
     if isinstance(example, list):
-        return [_unflatten(item, it) for item in example]
+        return [_unflatten(item, it, metadata_it) for item in example]
     if isinstance(example, dict):
-        return {key: _unflatten(value, it) for key, value in example.items()}
+        return {
+            key: _unflatten(value, it, metadata_it) for key, value in example.items()
+        }
     # Non-tensor leaf: reuse the example's value.
     return example
 
 
 def _rebuild_kjt(
-    example: KeyedJaggedTensor, it: Iterator[torch.Tensor]
+    example: KeyedJaggedTensor,
+    it: Iterator[torch.Tensor],
+    metadata_it: Optional[Iterator[int]],
 ) -> KeyedJaggedTensor:
     parts: Dict[str, torch.Tensor] = {
         name: _next(it) for name, _tensor in _kjt_tensor_fields(example)
     }
     example_inverse_indices = example.inverse_indices_or_none()
+    stride_per_key: Optional[List[int]] = None
+    length_per_key: Optional[List[int]] = None
+    if metadata_it is not None:
+        num_keys = len(example.keys())
+        stride_per_key = [_next_metadata(metadata_it) for _ in range(num_keys)]
+        length_per_key = [_next_metadata(metadata_it) for _ in range(num_keys)]
     return KeyedJaggedTensor(
         keys=example.keys(),
         values=parts["values"],
@@ -174,6 +218,10 @@ def _rebuild_kjt(
         lengths=parts.get("lengths"),
         offsets=parts.get("offsets"),
         stride_per_key_per_rank=parts.get("stride_per_key_per_rank"),
+        # Citrine C6: preserve the source's CPU-side metadata so consumers do
+        # not derive it from received CUDA tensors with Tensor.tolist().
+        stride_per_key=stride_per_key,
+        length_per_key=length_per_key,
         inverse_indices=(
             (example_inverse_indices[0], parts["inverse_indices"])
             if example_inverse_indices is not None
@@ -189,6 +237,13 @@ def _next(it: Iterator[torch.Tensor]) -> torch.Tensor:
         raise ValueError(
             "not enough tensors to reconstruct the example structure"
         ) from None
+
+
+def _next_metadata(it: Iterator[int]) -> int:
+    try:
+        return next(it)
+    except StopIteration:
+        raise ValueError("not enough KJT metadata to reconstruct the example") from None
 
 
 def inplace_copy_to_gpu(
@@ -214,48 +269,68 @@ def inplace_copy_to_gpu(
                 destination.copy_(source, non_blocking=True)
 
 
-class _InputSizeAwaitable(LazyAwaitable[List[List[int]]]):
-    """Awaitable for the size-metadata all-to-all (:func:`input_size_dist`).
+class _InputSizeAwaitable(LazyAwaitable[Tuple[List[List[int]], List[List[int]]]]):
+    """Awaitable for the input-metadata all-to-all (:func:`input_size_dist`).
 
-    ``wait()`` completes the async size exchange and returns ``recv_sizes``, where
-    ``recv_sizes[i][k]`` is the dim-0 size of slot ``k`` of the carrier rank ``i``
-    is sending to this rank.
+    ``wait()`` completes the async exchange and returns tensor sizes plus KJT
+    host metadata for each source rank.
     """
 
     def __init__(
         self,
         flat_send: List[List[torch.Tensor]],
+        send_kjt_metadata: List[List[int]],
         recv_slots: int,
+        recv_kjt_metadata_slots: int,
         world_size: int,
         pg_gloo: dist.ProcessGroup,
         batch_id: int,
     ) -> None:
         super().__init__()
         self._recv_slots = recv_slots
+        self._recv_kjt_metadata_slots = recv_kjt_metadata_slots
         self._batch_id = batch_id
-        send_sizes = torch.tensor(
-            [tensor.shape[0] for tensors in flat_send for tensor in tensors],
+        send_metadata = torch.tensor(
+            [
+                value
+                for tensors, metadata in zip(flat_send, send_kjt_metadata)
+                for value in [
+                    *(tensor.shape[0] for tensor in tensors),
+                    *metadata,
+                ]
+            ],
             dtype=torch.int64,
         )
-        in_splits = [len(tensors) for tensors in flat_send]
-        out_splits = [recv_slots] * world_size
-        self._recv_sizes = torch.empty(recv_slots * world_size, dtype=torch.int64)
+        in_splits = [
+            len(tensors) + len(metadata)
+            for tensors, metadata in zip(flat_send, send_kjt_metadata)
+        ]
+        recv_metadata_slots = recv_slots + recv_kjt_metadata_slots
+        out_splits = [recv_metadata_slots] * world_size
+        self._recv_metadata = torch.empty(
+            recv_metadata_slots * world_size, dtype=torch.int64
+        )
         with record_function(f"## input_size_dist batch{batch_id} ##"):
             self._work = dist.all_to_all_single(
-                self._recv_sizes,
-                send_sizes,
+                self._recv_metadata,
+                send_metadata,
                 out_splits,
                 in_splits,
                 group=pg_gloo,
                 async_op=True,
             )
 
-    def _wait_impl(self) -> List[List[int]]:
+    def _wait_impl(self) -> Tuple[List[List[int]], List[List[int]]]:
         with record_function(f"## input_size_dist wait batch{self._batch_id} ##"):
             if self._work is not None:
                 self._work.wait()
+            width = self._recv_slots + self._recv_kjt_metadata_slots
             # Flat on the wire, [source rank][slot] to the caller.
-            return self._recv_sizes.view(-1, self._recv_slots).tolist()
+            rows = self._recv_metadata.view(-1, width).tolist()
+            return (
+                [row[: self._recv_slots] for row in rows],
+                [row[self._recv_slots :] for row in rows],
+            )
 
 
 class _InputDataAwaitable(LazyAwaitable[List[T]]):
@@ -274,6 +349,7 @@ class _InputDataAwaitable(LazyAwaitable[List[T]]):
         in_splits_by_bucket: List[List[int]],
         bucket_slots: List[List[int]],
         recv_sizes: List[List[int]],
+        recv_kjt_metadata: List[List[int]],
         row_elems: List[int],
         trailing: List[Tuple[int, ...]],
         example: T,
@@ -312,6 +388,7 @@ class _InputDataAwaitable(LazyAwaitable[List[T]]):
         self._in_bufs = in_bufs
         self._bucket_slots = bucket_slots
         self._recv_sizes = recv_sizes
+        self._recv_kjt_metadata = recv_kjt_metadata
         self._row_elems = row_elems
         self._trailing = trailing
         self._example = example
@@ -344,7 +421,13 @@ class _InputDataAwaitable(LazyAwaitable[List[T]]):
             recv: List[T] = []
             for i in range(self._world_size):
                 recv_tensors = [recv_slot[(k, i)] for k in range(self._num_tensors)]
-                recv.append(unflatten_from_tensors(recv_tensors, self._example))
+                recv.append(
+                    unflatten_from_tensors(
+                        recv_tensors,
+                        self._example,
+                        self._recv_kjt_metadata[i],
+                    )
+                )
             return recv
 
 
@@ -363,13 +446,13 @@ def input_size_dist(
     List[torch.dtype],
     Any,
 ]:
-    """Flatten and copy the input, then exchange tensor-size metadata.
+    """Flatten and copy the input, then exchange host metadata.
 
     ``send`` must have one carrier per rank in ``pg_gloo``. Each carrier is
     flattened and grouped by dtype. One fused GPU input buffer is allocated per
     dtype, and the CPU tensors are copied directly into views of those buffers on
-    ``memcpy_stream``. The CPU dim-0 sizes are exchanged asynchronously over gloo
-    while that copy is in flight.
+    ``memcpy_stream``. CPU dim-0 sizes and source-specific KJT stride/length
+    caches are exchanged asynchronously over gloo while that copy is in flight.
 
     Only each tensor's dim-0 size varies; trailing dims and dtype are fixed per
     slot and recovered from ``example`` in :func:`input_data_dist`.
@@ -384,9 +467,10 @@ def input_size_dist(
             ranges (``## input_size_dist batch{batch_id} ##``).
 
     Returns:
-        The fused GPU input buffers, their per-destination split sizes, the size-
-        exchange awaitable, flattened example tensors, the common dtype-bucket
-        order, and copy-completion event consumed by :func:`input_data_dist`.
+        The fused GPU input buffers, their per-destination split sizes, the
+        metadata-exchange awaitable, flattened example tensors, the common
+        dtype-bucket order, and copy-completion event consumed by
+        :func:`input_data_dist`.
 
     Raises:
         ValueError: if ``device`` is not CUDA or ``len(send)`` does not match the
@@ -403,6 +487,13 @@ def input_size_dist(
         )
 
     source_flat_send = [flatten_to_tensors(item) for item in send]
+    send_kjt_metadata: List[List[int]] = []
+    for item in send:
+        metadata: List[int] = []
+        _flatten_kjt_metadata(item, metadata)
+        send_kjt_metadata.append(metadata)
+    example_kjt_metadata: List[int] = []
+    _flatten_kjt_metadata(example, example_kjt_metadata)
     example_flat = flatten_to_tensors(example)
     (
         in_bufs,
@@ -425,7 +516,9 @@ def input_size_dist(
         in_splits_by_bucket,
         _InputSizeAwaitable(
             source_flat_send,
+            send_kjt_metadata,
             len(example_flat),
+            len(example_kjt_metadata),
             world_size,
             pg_gloo,
             batch_id,
@@ -546,12 +639,15 @@ def input_data_dist(
     pp_data_dist_stream: torch.Stream,
     copy_done_event: Any,
     batch_id: int = 0,
+    recv_kjt_metadata: Optional[List[List[int]]] = None,
 ) -> LazyAwaitable[List[T]]:
     """Launch CUDA input-data distribution and return its awaitable.
 
     Receive buffers are allocated from the exchanged sizes. The collectives use
     the fused input buffers prepared by :func:`input_size_dist` and are enqueued on
-    ``pp_data_dist_stream`` after the CPU-to-GPU copy.
+    ``pp_data_dist_stream`` after the CPU-to-GPU copy. Received KJTs retain their
+    source-specific host metadata so downstream sparse input distribution does
+    not recover it from CUDA tensors.
     """
     device = in_bufs[0].device
     device_module = torch.get_device_module(device)
@@ -559,6 +655,10 @@ def input_data_dist(
     world_size = len(recv_sizes)
     num_tensors = len(example_flat)
     trailing = [tuple(tensor.shape[1:]) for tensor in example_flat]
+    if recv_kjt_metadata is None:
+        example_kjt_metadata: List[int] = []
+        _flatten_kjt_metadata(example, example_kjt_metadata)
+        recv_kjt_metadata = [example_kjt_metadata] * world_size
 
     with record_function(f"## input_data_dist batch{batch_id} ##"):
         (
@@ -580,6 +680,7 @@ def input_data_dist(
         in_splits_by_bucket,
         bucket_slots,
         recv_sizes,
+        recv_kjt_metadata,
         row_elems,
         trailing,
         example,
@@ -637,10 +738,11 @@ def input_dist(
         bucket_dtypes,
         copy_done_event,
     ) = input_size_dist(send, example, pg_gloo, device, memcpy_stream, batch_id)
+    recv_sizes, recv_kjt_metadata = size_awaitable.wait()
     return input_data_dist(
         in_bufs,
         in_splits_by_bucket,
-        size_awaitable.wait(),
+        recv_sizes,
         example,
         example_flat,
         bucket_dtypes,
@@ -648,6 +750,7 @@ def input_dist(
         pp_data_dist_stream,
         copy_done_event,
         batch_id,
+        recv_kjt_metadata,
     )
 
 
