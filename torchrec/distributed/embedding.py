@@ -75,7 +75,10 @@ from torchrec.distributed.sharding.sequence_sharding import SequenceShardingCont
 from torchrec.distributed.sharding.tw_sequence_sharding import (
     TwSequenceEmbeddingSharding,
 )
-from torchrec.distributed.shards_wrapper import LocalShardsWrapper
+from torchrec.distributed.shards_wrapper import (
+    get_combined_local_size,
+    LocalShardsWrapper,
+)
 from torchrec.distributed.types import (
     Awaitable,
     EmbeddingEvent,
@@ -942,7 +945,7 @@ class ShardedEmbeddingCollection(
                 continue
             self._model_parallel_name_to_local_shards[table_name] = []
             self._model_parallel_name_to_shards_wrapper[table_name] = OrderedDict(
-                [("local_tensors", []), ("local_offsets", [])]
+                [("local_tensors", []), ("local_offsets", []), ("local_sizes", [])]
             )
 
         self._name_to_table_size = {}
@@ -980,6 +983,9 @@ class ShardedEmbeddingCollection(
                         shards_wrapper["local_offsets"].extend(
                             # pyrefly: ignore[missing-attribute]
                             local_shards_wrapper.local_offsets()
+                        )
+                        shards_wrapper["local_sizes"].append(
+                            local_shards_wrapper.size()
                         )
                         shards_wrapper["global_size"] = v.size()
                         shards_wrapper["global_stride"] = v.stride()
@@ -1032,6 +1038,9 @@ class ShardedEmbeddingCollection(
                             local_tensor=LocalShardsWrapper(
                                 local_shards=shards_wrapper_map["local_tensors"],
                                 local_offsets=shards_wrapper_map["local_offsets"],
+                                logical_size=get_combined_local_size(
+                                    shards_wrapper_map["local_sizes"]
+                                ),
                             ),
                             device_mesh=self._env.device_mesh,
                             placements=shards_wrapper_map["placements"],

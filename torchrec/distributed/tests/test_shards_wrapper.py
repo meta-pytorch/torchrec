@@ -8,10 +8,13 @@
 # pyre-strict
 
 import unittest
+from types import SimpleNamespace
 from typing import Any, cast, List, Optional, Union
+from unittest.mock import patch
 
 import torch
 from torch import distributed as dist
+from torchrec.distributed.embedding_kernel import get_state_dict
 from torchrec.distributed.shards_wrapper import LocalShardsWrapper
 from torchrec.distributed.test_utils.multi_process import (
     MultiProcessContext,
@@ -96,6 +99,47 @@ def all_gather_object(
 
 
 class LocalShardsWrapperTest(unittest.TestCase):
+    def test_dtensor_state_dict_flattens_fragmented_table(self) -> None:
+        fragments = [torch.ones((2, 3)), torch.full((3, 3), 2.0)]
+        wrapper = LocalShardsWrapper(
+            local_shards=fragments,
+            local_offsets=[(0, 0), (2, 0)],
+            logical_size=torch.Size([5, 3]),
+        )
+        embedding_table: Any = SimpleNamespace(
+            name="table",
+            use_virtual_table=False,
+            compute_kernel="fused_triton",
+            local_rows=5,
+            local_cols=3,
+            local_metadata=SimpleNamespace(shard_offsets=[10, 4]),
+            dtensor_metadata=SimpleNamespace(
+                mesh=object(),
+                placements=(),
+                size=(20, 12),
+                stride=(12, 1),
+            ),
+            global_metadata=None,
+        )
+
+        with patch("torchrec.distributed.embedding_kernel.DTensor") as dtensor:
+            state = get_state_dict(
+                [embedding_table],
+                [wrapper],
+                pg=cast(Any, object()),
+            )
+
+        local_tensor = dtensor.from_local.call_args.kwargs["local_tensor"]
+        self.assertIs(state["table.weight"], dtensor.from_local.return_value)
+        self.assertIsInstance(local_tensor, LocalShardsWrapper)
+        self.assertEqual(torch.Size([5, 3]), local_tensor.size())
+        self.assertEqual(
+            [torch.Size([10, 4]), torch.Size([12, 4])],
+            local_tensor.local_offsets(),
+        )
+        self.assertIs(fragments[0], local_tensor.local_shards()[0])
+        self.assertIs(fragments[1], local_tensor.local_shards()[1])
+
     def test_explicit_logical_size_for_row_fragments(self) -> None:
         fragments = [torch.zeros((2, 3)), torch.zeros((3, 3))]
         logical_size = torch.Size([5, 3])

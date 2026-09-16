@@ -29,7 +29,10 @@ from torchrec.distributed.embedding_types import (
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
-from torchrec.distributed.shards_wrapper import LocalShardsWrapper
+from torchrec.distributed.shards_wrapper import (
+    get_combined_local_size,
+    LocalShardsWrapper,
+)
 from torchrec.distributed.types import (
     Shard,
     ShardedTensor,
@@ -373,6 +376,7 @@ def get_state_dict(
     key_to_global_metadata: Dict[str, ShardedTensorMetadata] = {}
     key_to_dtensor_metadata: Dict[str, DTensorMetadata] = {}
     key_to_local_tensor_shards: Dict[str, List[Any]] = defaultdict(list)
+    key_to_local_tensor_sizes: Dict[str, List[torch.Size]] = defaultdict(list)
 
     # validate on the function input for kv zch cases
     use_virtual_size = None
@@ -416,14 +420,31 @@ def get_state_dict(
 
         if embedding_table.dtensor_metadata is not None and pg is not None:
             # DTensor path
+            assert isinstance(param, torch.Tensor)
+            local_metadata = embedding_table.local_metadata
+            assert local_metadata is not None
             key_to_dtensor_metadata[weights_key] = embedding_table.dtensor_metadata
-            key_to_local_tensor_shards[weights_key].append(
-                [
-                    param,
-                    # pyrefly: ignore[missing-attribute]
-                    embedding_table.local_metadata.shard_offsets,
-                ]
-            )
+            key_to_local_tensor_sizes[weights_key].append(param.size())
+            local_tensor_shards = key_to_local_tensor_shards[weights_key]
+            if isinstance(param, LocalShardsWrapper):
+                for local_shard, fragment_offset in zip(
+                    param.local_shards(),
+                    param.local_offsets(),
+                ):
+                    local_tensor_shards.append(
+                        [
+                            local_shard,
+                            [
+                                int(shard_offset) + int(inner_offset)
+                                for shard_offset, inner_offset in zip(
+                                    local_metadata.shard_offsets,
+                                    fragment_offset,
+                                )
+                            ],
+                        ]
+                    )
+            else:
+                local_tensor_shards.append([param, local_metadata.shard_offsets])
         elif embedding_table.global_metadata is not None and pg is not None:
             # set additional field of sharded tensor based on local tensor properties
             # pyrefly: ignore[missing-attribute]
@@ -498,6 +519,7 @@ def get_state_dict(
         # DTensor path
         for key in key_to_local_tensor_shards:
             dtensor_metadata = key_to_dtensor_metadata[key]
+            local_tensor_sizes = key_to_local_tensor_sizes[key]
             destination[key] = DTensor.from_local(
                 # pyrefly: ignore[no-matching-overload]
                 local_tensor=LocalShardsWrapper(
@@ -509,6 +531,7 @@ def get_state_dict(
                         tensor_shards[1]
                         for tensor_shards in key_to_local_tensor_shards[key]
                     ],
+                    logical_size=get_combined_local_size(local_tensor_sizes),
                 ),
                 device_mesh=dtensor_metadata.mesh,
                 placements=dtensor_metadata.placements,
