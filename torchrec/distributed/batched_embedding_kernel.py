@@ -77,7 +77,7 @@ from fbgemm_gpu.tbe.ssd.utils.partially_materialized_tensor import (
 from torch import nn
 from torch.autograd.profiler import record_function
 from torch.distributed._tensor import DTensor, Replicate, Shard as DTensorShard
-from torchrec.distributed.comm import get_local_rank, get_node_group_size
+from torchrec.distributed.comm import get_local_rank
 from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
@@ -736,6 +736,15 @@ def _get_sharded_local_buckets_for_zero_collision(
     return sharded_local_buckets
 
 
+def _get_grid_shard_cw_count(shards_metadata: List[ShardMetadata]) -> int:
+    """
+    Number of column-wise blocks a grid-sharded table is split into.
+
+    Must come from shard metadata, not process topology: a pod can span several hosts.
+    """
+    return len({shard.shard_offsets[1] for shard in shards_metadata})
+
+
 @dataclass
 class ShardParams:
     optimizer_states: List[Optional[Tuple[torch.Tensor]]]
@@ -1115,8 +1124,8 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
             else 1
         )
         # for grid sharding, the row dimension is replicated CW shard times
-        grid_shard_nodes = (
-            len(table_global_shards_metadata) // get_node_group_size()
+        grid_shard_cw_count = (
+            _get_grid_shard_cw_count(table_global_shards_metadata)
             if is_grid_sharded
             else 1
         )
@@ -1125,7 +1134,7 @@ class KeyValueEmbeddingFusedOptimizer(FusedOptimizer):
                 table_shard_metadata_to_optimizer_shard_metadata.values()
             ),
             size=torch.Size(
-                [table_global_metadata.size[0] * len_rw_shards * grid_shard_nodes]
+                [table_global_metadata.size[0] * len_rw_shards * grid_shard_cw_count]
             ),
             tensor_properties=tensor_properties,
         )
@@ -1442,8 +1451,8 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                 else 1
             )
             # for grid sharding, the row dimension is replicated CW shard times
-            grid_shard_nodes = (
-                len(table_global_shards_metadata) // get_node_group_size()
+            grid_shard_cw_count = (
+                _get_grid_shard_cw_count(table_global_shards_metadata)
                 if is_grid_sharded
                 else 1
             )
@@ -1452,7 +1461,11 @@ class EmbeddingFusedOptimizer(FusedOptimizer):
                     table_shard_metadata_to_optimizer_shard_metadata.values()
                 ),
                 size=torch.Size(
-                    [table_global_metadata.size[0] * len_rw_shards * grid_shard_nodes]
+                    [
+                        table_global_metadata.size[0]
+                        * len_rw_shards
+                        * grid_shard_cw_count
+                    ]
                 ),
                 tensor_properties=tensor_properties,
             )
