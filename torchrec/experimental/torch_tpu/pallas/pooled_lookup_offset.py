@@ -82,6 +82,7 @@ def run_sc_pooled_lookup(  # noqa: C901
             pltpu.VMEM((RB, emb_dim), dev_weights.dtype),  # RB pooled rows
             pltpu.SemaphoreType.DMA((2,)),  # per-slot gather completion
         ],
+        name="pooled_lookup_offset_sc",
         mesh=mesh,
     )
     def _kernel(
@@ -438,6 +439,7 @@ def run_sc_pooled_lookup_batch_parallel(  # noqa: C901
             pltpu.SemaphoreType.DMA(()),
             pltpu.SemaphoreType.DMA(()),
         ],
+        name="batched_pooled_lookup_offset_sc",
     )
     def lookup_kernel(
         weights_hbm,

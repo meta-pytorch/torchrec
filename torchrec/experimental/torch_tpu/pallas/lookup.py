@@ -86,7 +86,7 @@ def run_tpu_lookup(
         ],
         out_specs=pl.BlockSpec((indices_chunk, emb_dim), lambda i: (i, 0)),
         out_shape=jax.ShapeDtypeStruct((indices.shape[0], emb_dim), jnp.float32),
-        debug=False,  # True,
+        name="embedding_lookup_tpu",
     )(indices, dev_weights)[:n, :]
 
 
@@ -148,6 +148,7 @@ def run_sc_lookup(
     @pl.kernel(  # pyre-ignore[16]
         out_type=jax.ShapeDtypeStruct((padded_n, emb_dim), dev_weights.dtype),
         mesh=vector_mesh,
+        name="embedding_lookup_sc",
     )
     def _kernel_v2(weights_hbm, indices_hbm, out_hbm):
         # idx_smem and out_vmem are mapped automatically by emit_pipeline
