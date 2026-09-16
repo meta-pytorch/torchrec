@@ -58,6 +58,7 @@ from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
 )
 from torchrec.sparse.jagged_tensor import _kt_regroup_arguments, JaggedTensor
 from torchrec.sparse.triton_batch_index_select import triton_batch_index_select_dim0
+from torchrec.sparse.triton_jagged_to_padded_dense import triton_jagged_to_padded_dense
 from torchrec.sparse.triton_pack_segments import triton_pack_segments
 from torchrec.sparse.triton_permute_2d import (
     MIN_SEGMENTS,
@@ -1243,6 +1244,152 @@ def pack_segments_fbgemm(
     with record_function("## fbgemm_pack_segments ##"):
         output = torch.ops.fbgemm.pack_segments(input, lengths, max_length)
         _run_pack_segments_backward(output, input, grad_output, run_backward)
+
+
+######################## jagged to padded dense configs #############################
+@dataclass
+class JaggedToPaddedDenseConfig(TritonOpConfig):
+    """One-dimensional jagged shapes observed in the CMF training traces."""
+
+    batch_size: int = 140472
+    max_length: int = 320
+    mean_length: int = 320
+    dim: int = 1
+    padding_value: float = 0.0
+    run_backward: bool = False
+    dtype: str = "float32"
+    gpu_backlog_ms: float = 20.0
+
+    def make_inputs(self, device: torch.device) -> Dict[str, Any]:
+        dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(self.dtype)
+        if dtype is None:
+            raise ValueError("dtype must be float32, float16, or bfloat16")
+        if self.batch_size <= 0 or self.max_length <= 0 or self.dim <= 0:
+            raise ValueError("batch_size, max_length, and dim must be positive")
+        if self.mean_length <= 0 or self.mean_length > self.max_length:
+            raise ValueError("mean_length must be in [1, max_length]")
+
+        if self.mean_length == self.max_length:
+            lengths = torch.full(
+                (self.batch_size,),
+                self.max_length,
+                dtype=torch.int64,
+                device=device,
+            )
+        else:
+            minimum_length = max(0, 2 * self.mean_length - self.max_length)
+            lengths = torch.randint(
+                minimum_length,
+                self.max_length + 1,
+                (self.batch_size,),
+                dtype=torch.int64,
+                device=device,
+            )
+        offsets = torch.zeros(
+            self.batch_size + 1,
+            dtype=torch.int64,
+            device=device,
+        )
+        torch.cumsum(lengths, dim=0, out=offsets[1:])
+        num_input_rows = int(offsets[-1].item())
+        input_shape = (num_input_rows,) if self.dim == 1 else (num_input_rows, self.dim)
+        values = torch.randn(
+            input_shape,
+            dtype=dtype,
+            device=device,
+            requires_grad=self.run_backward,
+        )
+        output_shape = (
+            (self.batch_size, self.max_length)
+            if self.dim == 1
+            else (self.batch_size, self.max_length, self.dim)
+        )
+        grad_output = (
+            torch.randn(output_shape, dtype=dtype, device=device)
+            if self.run_backward
+            else None
+        )
+        return {
+            "values": values,
+            "offsets": offsets,
+            "grad_output": grad_output,
+            "num_input_rows": num_input_rows,
+        }
+
+
+def _run_jagged_to_padded_dense_backward(
+    output: torch.Tensor,
+    values: torch.Tensor,
+    grad_output: Optional[torch.Tensor],
+    run_backward: bool,
+) -> None:
+    if run_backward:
+        assert grad_output is not None
+        torch.autograd.grad(output, values, grad_output)
+
+
+@register_benchmark(JaggedToPaddedDenseConfig)
+def jagged_to_padded_dense_triton(
+    _batch_inputs: List[Dict[str, Any]],
+    values: torch.Tensor,
+    offsets: torch.Tensor,
+    grad_output: Optional[torch.Tensor],
+    num_input_rows: int,
+    max_length: int,
+    padding_value: float,
+    run_backward: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function(
+        "## triton_jagged_to_padded_dense "
+        f"input_rows={num_input_rows} output_rows={offsets.numel() - 1}x{max_length} ##"
+    ):
+        output = triton_jagged_to_padded_dense(
+            values,
+            offsets,
+            max_length,
+            padding_value,
+        )
+        _run_jagged_to_padded_dense_backward(
+            output,
+            values,
+            grad_output,
+            run_backward,
+        )
+
+
+@register_benchmark(JaggedToPaddedDenseConfig)
+def jagged_to_padded_dense_fbgemm(
+    _batch_inputs: List[Dict[str, Any]],
+    values: torch.Tensor,
+    offsets: torch.Tensor,
+    grad_output: Optional[torch.Tensor],
+    num_input_rows: int,
+    max_length: int,
+    padding_value: float,
+    run_backward: bool,
+    **_kwargs: Dict[str, Any],
+) -> None:
+    with record_function(
+        "## fbgemm_jagged_to_padded_dense "
+        f"input_rows={num_input_rows} output_rows={offsets.numel() - 1}x{max_length} ##"
+    ):
+        output = torch.ops.fbgemm.jagged_to_padded_dense(
+            values,
+            [offsets],
+            [max_length],
+            padding_value,
+        )
+        _run_jagged_to_padded_dense_backward(
+            output,
+            values,
+            grad_output,
+            run_backward,
+        )
 
 
 ######################## quantized communication configs ############################
