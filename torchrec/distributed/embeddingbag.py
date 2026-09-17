@@ -80,7 +80,10 @@ from torchrec.distributed.sharding.rw_sharding import RwPooledEmbeddingSharding
 from torchrec.distributed.sharding.tw_sharding import TwPooledEmbeddingSharding
 from torchrec.distributed.sharding.twcw_sharding import TwCwPooledEmbeddingSharding
 from torchrec.distributed.sharding.twrw_sharding import TwRwPooledEmbeddingSharding
-from torchrec.distributed.shards_wrapper import LocalShardsWrapper
+from torchrec.distributed.shards_wrapper import (
+    get_combined_local_size,
+    LocalShardsWrapper,
+)
 from torchrec.distributed.types import (
     Awaitable,
     EmbeddingEvent,
@@ -1216,7 +1219,7 @@ class ShardedEmbeddingBagCollection(
                 continue
             self._model_parallel_name_to_local_shards[table_name] = []
             self._model_parallel_name_to_shards_wrapper[table_name] = OrderedDict(
-                [("local_tensors", []), ("local_offsets", [])]
+                [("local_tensors", []), ("local_offsets", []), ("local_sizes", [])]
             )
 
         self._name_to_table_size = {}
@@ -1252,6 +1255,9 @@ class ShardedEmbeddingBagCollection(
                         shards_wrapper["local_offsets"].extend(
                             # pyrefly: ignore [missing-attribute]
                             local_shards_wrapper.local_offsets()
+                        )
+                        shards_wrapper["local_sizes"].append(
+                            local_shards_wrapper.size()
                         )
                         shards_wrapper["global_size"] = v.size()
                         shards_wrapper["global_stride"] = v.stride()
@@ -1301,6 +1307,9 @@ class ShardedEmbeddingBagCollection(
                             local_tensor=LocalShardsWrapper(
                                 local_shards=shards_wrapper_map["local_tensors"],
                                 local_offsets=shards_wrapper_map["local_offsets"],
+                                logical_size=get_combined_local_size(
+                                    shards_wrapper_map["local_sizes"]
+                                ),
                             ),
                             device_mesh=self._env.device_mesh,
                             placements=shards_wrapper_map["placements"],

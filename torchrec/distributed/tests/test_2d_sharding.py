@@ -1262,6 +1262,88 @@ class TestFullySharded2DEBCParallel(ModelParallelTestShared):
         super().setUp(backend=backend)
 
     @unittest.skipIf(
+        CUDA_DEVICE_COUNT <= 3,
+        "Not enough GPUs, this test requires at least four GPUs",
+    )
+    def test_fully_sharded_rw_triton(self) -> None:
+        self._build_tables_and_groups()
+        self._test_sharding(
+            world_size=4,
+            world_size_2D=2,
+            sharders=[
+                cast(
+                    ModuleSharder[nn.Module],
+                    create_test_sharder(
+                        SharderType.EMBEDDING_BAG_COLLECTION.value,
+                        ShardingType.ROW_WISE.value,
+                        EmbeddingComputeKernel.FUSED_TRITON.value,
+                        fused_params={
+                            "optimizer": EmbOptimType.EXACT_SGD,
+                            "learning_rate": 0.01,
+                            "num_weight_chunks": 4,
+                            "stochastic_rounding": False,
+                        },
+                        device=self.device,
+                    ),
+                ),
+            ],
+            backend=self.backend,
+            constraints={
+                table.name: ParameterConstraints(
+                    min_partition=2,
+                    compute_kernels=[EmbeddingComputeKernel.FUSED_TRITON.value],
+                )
+                for table in self.tables
+            },
+            has_weighted_tables=False,
+            pooling=PoolingType.SUM,
+            sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+    @unittest.skipIf(
+        CUDA_DEVICE_COUNT <= 3,
+        "Not enough GPUs, this test requires at least four GPUs",
+    )
+    def test_fully_sharded_cw_triton_equal_width(self) -> None:
+        self._build_tables_and_groups()
+        self._test_sharding(
+            world_size=4,
+            world_size_2D=2,
+            sharders=[
+                cast(
+                    ModuleSharder[nn.Module],
+                    create_test_sharder(
+                        SharderType.EMBEDDING_BAG_COLLECTION.value,
+                        ShardingType.COLUMN_WISE.value,
+                        EmbeddingComputeKernel.FUSED_TRITON.value,
+                        fused_params={
+                            "optimizer": EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+                            "learning_rate": 0.01,
+                            "num_weight_chunks": 4,
+                            "stochastic_rounding": False,
+                        },
+                        device=self.device,
+                    ),
+                ),
+            ],
+            backend=self.backend,
+            constraints={
+                table.name: ParameterConstraints(
+                    min_partition=4,
+                    compute_kernels=[EmbeddingComputeKernel.FUSED_TRITON.value],
+                )
+                for table in self.tables
+            },
+            has_weighted_tables=False,
+            pooling=PoolingType.SUM,
+            sharding_strategy=ShardingStrategy.FULLY_SHARDED,
+            rs_awaitable_hook_module="sparse",
+        )
+
+    @unittest.skipIf(
         CUDA_DEVICE_COUNT <= 7,
         "Not enough GPUs, this test requires at least four GPUs",
     )
