@@ -3157,6 +3157,17 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
                     weight_init_max,
                 )
 
+    def _no_weight_grad_mask(self, device: torch.device) -> torch.Tensor:
+        # int32 zeros, one per feature: the fused backward reads this as "no
+        # per_sample_weights gradient is needed for this feature".
+        mask = getattr(self, "_frg_mask", None)
+        if mask is None or mask.device != device:
+            mask = torch.zeros(
+                self._config.num_features(), dtype=torch.int32, device=device
+            )
+            self._frg_mask = mask
+        return mask
+
     def forward(
         self,
         features: KeyedJaggedTensor,
@@ -3174,6 +3185,20 @@ class BaseBatchedEmbeddingBag(BaseEmbedding, Generic[SplitWeightType]):
         weights = features.weights_or_none()
         if weights is not None and not torch.is_floating_point(weights):
             weights = None
+        if (
+            weights is not None
+            and not weights.requires_grad
+            and isinstance(self.emb_module, SplitTableBatchedEmbeddingBagsCodegen)
+        ):
+            # The fused backward computes d(loss)/d(per_sample_weights) whenever
+            # per_sample_weights is given, whether or not autograd will use it. A
+            # zero feature_requires_grad mask makes that kernel return early for
+            # every feature; the (unused) gradient is zeros instead of the true
+            # value. Nothing downstream reads it, since the weights are a leaf
+            # that requires no grad.
+            forward_args["feature_requires_grad"] = self._no_weight_grad_mask(
+                weights.device
+            )
         if features.variable_stride_per_key():
             if isinstance(self.emb_module, DenseTableBatchedEmbeddingBagsCodegen):
                 forward_args.update(
