@@ -322,6 +322,17 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         jobs before the SynchronizationMarker is processed.
     """
 
+    @staticmethod
+    def _resolve_cpu_process_group(
+        cpu_process_group: Optional[dist.ProcessGroup],
+    ) -> Optional[dist.ProcessGroup]:
+        """Use an injected group, preserving the historical WORLD fallback."""
+        if cpu_process_group is not None:
+            return cpu_process_group
+        if not dist.is_initialized():
+            return None
+        return cast(Optional[dist.ProcessGroup], dist.new_group(backend="gloo"))
+
     def __init__(
         self,
         model_out_device: torch.device,
@@ -330,6 +341,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         update_batch_size: int = 10,
         clone_model_out: bool = False,
         *args: Any,
+        cpu_process_group: Optional[dist.ProcessGroup] = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -346,6 +358,8 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 worker by ~K× with no added trainer-thread work. Drain
                 stops at any SynchronizationMarker, which is processed
                 after the merged batch. Default is 10; set to 1 to disable.
+            cpu_process_group: Optional gloo process group used for the
+                metric-state all_gather.
             *args: Additional positional arguments passed to RecMetricModule.
             **kwargs: Additional keyword arguments passed to RecMetricModule.
         """
@@ -381,14 +395,12 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             target=self._compute_loop, name=metric_compute_thread_name, daemon=True
         )
 
-        # Created lazily on first compute so the module can be constructed without
-        # an initialized process group (e.g. single-process model validation).
-        # new_group returns a real ProcessGroup here (ranks=None => every rank is a
-        # member, never NON_GROUP_MEMBER); narrow away the int/None sentinels.
+        # None only when dist is uninitialized (e.g. single-process model
+        # validation); the lazy branch in _process_metric_compute_job covers
+        # that case. Resolved on the main thread, in __init__, so the creation
+        # order is the trainer's and not the compute thread's.
         self.cpu_process_group: Optional[dist.ProcessGroup] = (
-            cast(Optional[dist.ProcessGroup], dist.new_group(backend="gloo"))
-            if dist.is_initialized()
-            else None
+            self._resolve_cpu_process_group(cpu_process_group)
         )
         self.comms_module: CPUCommsRecMetricModule = CPUCommsRecMetricModule(
             *args,
@@ -861,6 +873,19 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 # Manual distributed sync (replaces TorchMetrics.metric.Metric.sync())
                 all_gather_start_ms = time.time()
                 if self.cpu_process_group is None:
+                    # Reachable when no PG was resolvable at construction. A
+                    # single-rank group is harmless -- that is the single-process
+                    # model-validation path this branch exists for. Beyond one
+                    # rank it would be a collective issued from the compute
+                    # thread, racing whatever the trainer builds next, so refuse.
+                    if dist.is_initialized() and dist.get_world_size() > 1:
+                        raise RuntimeError(
+                            "cpu_process_group was not resolved at construction "
+                            f"but world_size is {dist.get_world_size()}. Pass "
+                            "cpu_process_group to "
+                            "CPUOffloadedRecMetricModule instead of creating a "
+                            "process group from the compute thread."
+                        )
                     self.cpu_process_group = cast(
                         dist.ProcessGroup, dist.new_group(backend="gloo")
                     )
