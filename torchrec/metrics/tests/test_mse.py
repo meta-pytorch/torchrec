@@ -9,11 +9,11 @@
 
 import unittest
 from functools import partial, update_wrapper
-from typing import Callable, Dict, Optional, Type
+from typing import Callable, Dict, Optional, Set, Type
 
 import torch
 from torchrec.metrics.mse import compute_mse, compute_r_squared, compute_rmse, MSEMetric
-from torchrec.metrics.rec_metric import RecComputeMode, RecMetric
+from torchrec.metrics.rec_metric import RecComputeMode, RecMetric, RecTaskInfo
 from torchrec.metrics.test_utils import (
     metric_test_helper,
     rec_metric_gpu_sync_test_launcher,
@@ -257,3 +257,77 @@ class MSEGPUSyncTest(unittest.TestCase):
             batch_window_size=20,
             entry_point=sync_test_helper,
         )
+
+
+# The two states include_r_squared adds. The golden snapshot pins MSEMetric's
+# default keys and has no row for this variant, so nothing else pins the delta.
+_R_SQUARED_KEYS: Set[str] = {
+    "_metrics_computations.0.label_squared_sum",
+    "_metrics_computations.0.label_sum",
+}
+
+
+class MSECheckpointCompatibilityTest(unittest.TestCase):
+    """Loading an r_squared checkpoint into a metric built without r_squared.
+
+    Whether the load survives is not a property of the key sets, so the golden
+    snapshot in `test_metric_fqn_backward_compatibility.py` cannot answer it.
+    """
+
+    @staticmethod
+    def _build(include_r_squared: bool = False) -> MSEMetric:
+        return MSEMetric(
+            world_size=1,
+            my_rank=0,
+            batch_size=32,
+            tasks=[RecTaskInfo(name="task1")],
+            compute_mode=RecComputeMode.UNFUSED_TASKS_COMPUTATION,
+            window_size=100,
+            include_r_squared=include_r_squared,
+        )
+
+    def test_r_squared_checkpoint_loads_into_default(self) -> None:
+        """`mse.py` registers the r_squared states unconditionally and only
+        toggles `persistent`. That leaves them in torchmetrics' `_defaults`, so
+        a default-configured metric can still pop them off a checkpoint that
+        has them. Moving the registration itself behind the flag moves no
+        `state_dict` key, so the golden snapshot stays green.
+        """
+        default = self._build()
+        variant = self._build(include_r_squared=True)
+
+        default_keys = set(default.state_dict())
+        variant_keys = set(variant.state_dict())
+        # Both directions, both exact. Compared against the union instead, a
+        # variant that stopped adding anything would still match, and the load
+        # below would be feeding a module its own key set.
+        self.assertEqual(
+            default_keys - variant_keys,
+            set(),
+            "the variant drops keys the default has",
+        )
+        self.assertEqual(
+            variant_keys - default_keys,
+            _R_SQUARED_KEYS,
+            "include_r_squared no longer adds exactly the r_squared states",
+        )
+
+        default.load_state_dict(variant.state_dict(), strict=True)
+
+    def test_default_checkpoint_loads_into_r_squared(self) -> None:
+        """The other direction: turning r_squared on and resuming.
+
+        The older checkpoint carries none of the r_squared keys. torchmetrics
+        pops by `_defaults`, which holds every registered state, so the load
+        tolerates their absence instead of demanding them.
+        """
+        default = self._build()
+        variant = self._build(include_r_squared=True)
+
+        self.assertEqual(
+            set(variant.state_dict()) - set(default.state_dict()),
+            _R_SQUARED_KEYS,
+            "include_r_squared no longer adds exactly the r_squared states",
+        )
+
+        variant.load_state_dict(default.state_dict(), strict=True)

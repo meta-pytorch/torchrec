@@ -409,6 +409,30 @@ class MultiLabelPrecisionMetricTest(unittest.TestCase):
         ]
         self.assertAlmostEqual(window_precision.item(), 1.0, places=4)
 
+    def test_rejects_a_narrowed_label_set(self) -> None:
+        """A checkpoint with more labels must not load into fewer.
+
+        State is named per label, so dropping labels leaves keys nobody claims.
+        Absorbing them would discard real measurements, so the load should
+        raise rather than succeed quietly.
+        """
+        variant = self._create_metric(num_labels=3)
+        default = self._create_metric(num_labels=1)
+
+        with self.assertRaises(RuntimeError):
+            default.load_state_dict(variant.state_dict(), strict=True)
+
+    def test_rejects_a_renamed_label_set(self) -> None:
+        """Same label count, different names, so the keys do not line up.
+
+        Loading anyway would file one label's counters under another's name.
+        """
+        cat = self._create_metric(num_labels=1, label_names=["cat"])
+        dog = self._create_metric(num_labels=1, label_names=["dog"])
+
+        with self.assertRaises(RuntimeError):
+            dog.load_state_dict(cat.state_dict(), strict=True)
+
 
 if __name__ == "__main__":
     unittest.main()

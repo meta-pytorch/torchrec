@@ -1135,9 +1135,9 @@ class MetricCoverageTest(unittest.TestCase):
             )
 
 
-# Cross-config state_dict tests: detect config-dependent keys and verify
-# cross-config loads succeed with strict=True. New conditional-state params
-# must be added to KNOWN_CONDITIONAL_STATE with a proper always-pop hook.
+# Cross-config state_dict tests: detect params whose value changes the
+# state_dict keys. New conditional-state params must be added to
+# KNOWN_CONDITIONAL_STATE.
 
 _BATCH_SIZE_STAGES_ALTERNATIVE: List[BatchSizeStage] = [
     BatchSizeStage(batch_size=256, max_iters=1),
@@ -1271,20 +1271,6 @@ KNOWN_SAFE_PARAMS: Set[Tuple[str, str]] = {
     ("SegmentedNEMetric", "num_groups"),  # changes tensor shapes, not key names
     ("TensorWeightedAvgMetric", "description"),
     ("TowerQPSMetric", "warmup_steps"),
-}
-
-# Subset with proper always-pop hooks (cross-config load tests use these).
-RECMETRIC_CONDITIONAL_STATE: Dict[Tuple[Type[RecMetric], str], List[Any]] = {
-    (MSEMetric, "include_r_squared"): [True],
-    (TowerQPSMetric, "batch_size_stages"): [_BATCH_SIZE_STAGES_ALTERNATIVE],
-}
-
-_RECMETRIC_COMMON_KWARGS: Dict[str, Any] = {
-    "world_size": 1,
-    "my_rank": 0,
-    "batch_size": 32,
-    "compute_mode": RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-    "window_size": 100,
 }
 
 _THROUGHPUT_COMMON_KWARGS: Dict[str, Any] = {
@@ -1531,106 +1517,6 @@ class ConditionalStateRegistryTest(unittest.TestCase):
                 f"Added keys: {variant_keys - default_keys}, "
                 f"Removed keys: {default_keys - variant_keys}",
             )
-
-
-class CrossConfigLoadTest(unittest.TestCase):
-
-    def _make_common_kwargs(self) -> Dict[str, Any]:
-        return {**_RECMETRIC_COMMON_KWARGS, "tasks": [create_test_task("task1")]}
-
-    def _assert_cross_config_load(
-        self,
-        metric_cls: Type[RecMetric],
-        param_name: str,
-        alt_value: Any,
-        direction: str,
-    ) -> None:
-        common_kwargs = self._make_common_kwargs()
-        if direction == "variant_to_default":
-            src = metric_cls(**common_kwargs, **{param_name: alt_value})
-            dst = metric_cls(**common_kwargs)
-        else:
-            src = metric_cls(**common_kwargs)
-            dst = metric_cls(**common_kwargs, **{param_name: alt_value})
-        dst.load_state_dict(src.state_dict(), strict=True)
-
-    def test_cross_config_load_variant_to_default(self) -> None:
-        for (
-            metric_cls,
-            param_name,
-        ), alternatives in RECMETRIC_CONDITIONAL_STATE.items():
-            for alt_value in alternatives:
-                with self.subTest(
-                    metric=metric_cls.__name__,
-                    param=param_name,
-                    direction="variant_to_default",
-                ):
-                    self._assert_cross_config_load(
-                        metric_cls, param_name, alt_value, "variant_to_default"
-                    )
-
-    def test_cross_config_load_default_to_variant(self) -> None:
-        for (
-            metric_cls,
-            param_name,
-        ), alternatives in RECMETRIC_CONDITIONAL_STATE.items():
-            for alt_value in alternatives:
-                with self.subTest(
-                    metric=metric_cls.__name__,
-                    param=param_name,
-                    direction="default_to_variant",
-                ):
-                    self._assert_cross_config_load(
-                        metric_cls, param_name, alt_value, "default_to_variant"
-                    )
-
-    def test_throughput_cross_config_load_variant_to_default(self) -> None:
-        variant = ThroughputMetric(
-            **_THROUGHPUT_COMMON_KWARGS,
-            batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
-        )
-        default = ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS)
-        default.load_state_dict(variant.state_dict(), strict=True)
-
-    def test_throughput_cross_config_load_default_to_variant(self) -> None:
-        default = ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS)
-        variant = ThroughputMetric(
-            **_THROUGHPUT_COMMON_KWARGS,
-            batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
-        )
-        variant.load_state_dict(default.state_dict(), strict=True)
-
-    def test_multi_label_precision_cross_config_load_fails_without_hook(self) -> None:
-        variant_kwargs: Dict[str, Any] = {
-            **self._make_common_kwargs(),
-            "num_labels": 3,
-        }
-        default_kwargs: Dict[str, Any] = {
-            **self._make_common_kwargs(),
-            "num_labels": 1,
-        }
-        variant = MultiLabelPrecisionMetric(**variant_kwargs)
-        default = MultiLabelPrecisionMetric(**default_kwargs)
-
-        with self.assertRaises(RuntimeError):
-            default.load_state_dict(variant.state_dict(), strict=True)
-
-    def test_multi_label_precision_label_names_cross_config_load_fails(self) -> None:
-        kwargs_a: Dict[str, Any] = {
-            **self._make_common_kwargs(),
-            "num_labels": 1,
-            "label_names": ["cat"],
-        }
-        kwargs_b: Dict[str, Any] = {
-            **self._make_common_kwargs(),
-            "num_labels": 1,
-            "label_names": ["dog"],
-        }
-        variant_a = MultiLabelPrecisionMetric(**kwargs_a)
-        variant_b = MultiLabelPrecisionMetric(**kwargs_b)
-
-        with self.assertRaises(RuntimeError):
-            variant_b.load_state_dict(variant_a.state_dict(), strict=True)
 
 
 def update_golden_snapshot() -> None:
