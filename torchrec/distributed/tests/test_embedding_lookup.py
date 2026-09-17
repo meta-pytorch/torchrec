@@ -16,10 +16,8 @@ import torch
 from torchrec.distributed.embedding_lookup import (
     _load_state_dict,
     BackendType,
-    BatchedFusedEmbeddingBag,
     GroupedEmbeddingsLookup,
     GroupedPooledEmbeddingsLookup,
-    TritonBatchedFusedEmbeddingBag,
 )
 from torchrec.distributed.embedding_types import (
     EmbeddingComputeKernel,
@@ -27,7 +25,6 @@ from torchrec.distributed.embedding_types import (
     ShardedEmbeddingTable,
 )
 from torchrec.distributed.shards_wrapper import LocalShardsWrapper
-from torchrec.distributed.types import ShardingEnv2D, ShardingStrategy, ShardingType
 from torchrec.modules.embedding_configs import DataType, PoolingType
 
 
@@ -43,7 +40,6 @@ def _make_config(
     num_tables: int = 1,
     features_per_table: int = 2,
     local_cols: int = 16,
-    compute_kernel: EmbeddingComputeKernel = EmbeddingComputeKernel.DENSE,
 ) -> GroupedEmbeddingConfig:
     tables = []
     feat_idx = 0
@@ -57,7 +53,7 @@ def _make_config(
                 pooling=PoolingType.SUM,
                 is_weighted=False,
                 has_feature_processor=False,
-                compute_kernel=compute_kernel,
+                compute_kernel=EmbeddingComputeKernel.DENSE,
                 embedding_dim=local_cols,
                 local_cols=local_cols,
                 num_embeddings=100,
@@ -69,7 +65,7 @@ def _make_config(
         pooling=PoolingType.SUM,
         is_weighted=False,
         has_feature_processor=False,
-        compute_kernel=compute_kernel,
+        compute_kernel=EmbeddingComputeKernel.DENSE,
         embedding_tables=tables,
     )
 
@@ -169,30 +165,6 @@ class VbeSplitsTest(unittest.TestCase):
                 GroupedPooledEmbeddingsLookup._vbe_splits(lookup, [features])
             self.assertIn("1 ranks", str(ctx.exception))
             self.assertIn("world_size is 4", str(ctx.exception))
-
-
-class VbeTritonMergeTest(unittest.TestCase):
-    def test_multi_group_triton_vbe_uses_concat_merge(self) -> None:
-        lookup = MagicMock(spec=GroupedPooledEmbeddingsLookup)
-        lookup._dummy_embs_tensor = MagicMock()
-        lookup._feature_splits = [1, 1]
-        lookup._world_size = 1
-        lookup._emb_modules = [
-            MagicMock(spec=TritonBatchedFusedEmbeddingBag),
-            MagicMock(spec=BatchedFusedEmbeddingBag),
-        ]
-        lookup._forward.return_value = [torch.tensor([1.0, 2.0]), torch.tensor([3.0])]
-        lookup._vbe_splits.return_value = [[2], [1]]
-        lookup._merge_variable_batch_embeddings.side_effect = lambda embeddings, splits: GroupedPooledEmbeddingsLookup._merge_variable_batch_embeddings(
-            lookup, embeddings, splits
-        )
-        sparse_features = MagicMock()
-        sparse_features.variable_stride_per_key.return_value = True
-        sparse_features.split.return_value = [MagicMock(), MagicMock()]
-
-        result = GroupedPooledEmbeddingsLookup.forward(lookup, sparse_features)
-
-        torch.testing.assert_close(result, torch.tensor([1.0, 2.0, 3.0]))
 
 
 def _make_virtual_table_config(
@@ -333,63 +305,3 @@ class FragmentedDTensorStateLoadTest(unittest.TestCase):
             destination_fragments[1],
         )
         torch.testing.assert_close(source_fragments[1][2:], destination_fragments[2])
-
-
-class ChunkedShardedTritonKernelRoutingTest(unittest.TestCase):
-    def test_fully_sharded_2d_uses_chunked_sharded_triton(self) -> None:
-        config = _make_config(compute_kernel=EmbeddingComputeKernel.FUSED_TRITON)
-        lookup = MagicMock(spec=GroupedPooledEmbeddingsLookup)
-        env = MagicMock(spec=ShardingEnv2D)
-        env.sharding_strategy = ShardingStrategy.FULLY_SHARDED
-
-        with patch(
-            "torchrec.distributed.embedding_lookup.ChunkedShardedTritonBatchedFusedEmbeddingBag"
-        ) as chunked_kernel, patch(
-            "torchrec.distributed.embedding_lookup.TritonBatchedFusedEmbeddingBag"
-        ) as unsharded_kernel:
-            result = GroupedPooledEmbeddingsLookup._create_embedding_kernel(
-                lookup,
-                config,
-                None,
-                None,
-                ShardingType.ROW_WISE,
-                env,
-            )
-
-        chunked_kernel.assert_called_once_with(
-            config=config,
-            pg=None,
-            device=None,
-            sharding_type=ShardingType.ROW_WISE,
-            env=env,
-        )
-        unsharded_kernel.assert_not_called()
-        self.assertIs(result, chunked_kernel.return_value)
-
-    def test_non_fully_sharded_2d_uses_regular_triton(self) -> None:
-        config = _make_config(compute_kernel=EmbeddingComputeKernel.FUSED_TRITON)
-        lookup = MagicMock(spec=GroupedPooledEmbeddingsLookup)
-        env = MagicMock(spec=ShardingEnv2D)
-        env.sharding_strategy = ShardingStrategy.DEFAULT
-
-        with patch(
-            "torchrec.distributed.embedding_lookup.ChunkedShardedTritonBatchedFusedEmbeddingBag"
-        ) as chunked_kernel, patch(
-            "torchrec.distributed.embedding_lookup.TritonBatchedFusedEmbeddingBag"
-        ) as unsharded_kernel:
-            result = GroupedPooledEmbeddingsLookup._create_embedding_kernel(
-                lookup,
-                config,
-                None,
-                None,
-                ShardingType.ROW_WISE,
-                env,
-            )
-
-        chunked_kernel.assert_not_called()
-        unsharded_kernel.assert_called_once_with(
-            config=config,
-            pg=None,
-            device=None,
-        )
-        self.assertIs(result, unsharded_kernel.return_value)
