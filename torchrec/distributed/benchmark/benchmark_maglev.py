@@ -10,13 +10,12 @@
 """
 Benchmark for the Maglev staged pipeline (MVP).
 
-Measures a microbatched 1F1B schedule, selected by ``--pipeline``. ``1f1b`` is
-the default; ``1f1b-recv-ahead`` remains as a compatibility alias. The model is
-a ``sum(layers_per_stage)``-layer model authored on ``meta`` and cut across
-per-stage process groups (one hardware scale-up domain, HSD, each). One measured
-iteration is the input-dist all-to-all plus one full 1F1B pass over
-``num_microbatches`` microbatches, including the cross-HSD activation / gradient
-hand-off and the DP grad all-reduce + optimizer step.
+Measures the schedule selected by ``--pipeline``. ``1f1b`` is the default;
+``rail`` batches each layer's sparse work over the whole pass before running a
+dense 1F1B schedule. The model is a ``sum(layers_per_stage)``-layer model
+authored on ``meta`` and cut across per-stage process groups (one hardware
+scale-up domain, HSD, each). One measured iteration includes input distribution,
+cross-HSD activation and gradient handoff, backward, and the optimizer step.
 
 Runs on GPU + nccl by default (the cross-HSD P2P hand-off and the profiler path
 are CUDA-only); `all_rank_traces` defaults on so every stage's HSD shows up in
@@ -43,8 +42,12 @@ logger: logging.Logger = logging.getLogger(__name__)
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed._composable.replicate_with_fsdp import replicate
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import fully_shard
 from torch.distributed.optim import (
     _apply_optimizer_in_backward as apply_optimizer_in_backward,
+    ZeroRedundancyOptimizer,
 )
 from torchrec.distributed.benchmark.base import (
     BenchFuncConfig,
@@ -55,11 +58,12 @@ from torchrec.distributed.benchmark.base import (
     GPUMemoryStats,
 )
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
-from torchrec.distributed.maglev.module import StructuredActivationsLayout
+from torchrec.distributed.maglev.module import MaglevLayer, StructuredActivationsLayout
 from torchrec.distributed.maglev.pipeline import (
     Maglev1F1B,
     Maglev1F1BRecvAhead,
     MaglevPipelineBase,
+    MaglevRail,
 )
 from torchrec.distributed.maglev.stage import (
     HandoffPGMode,
@@ -67,10 +71,7 @@ from torchrec.distributed.maglev.stage import (
     remap_plan_to_process_group,
     StageWrapper,
 )
-from torchrec.distributed.model_parallel import (
-    DefaultDataParallelWrapper,
-    DistributedModelParallel,
-)
+from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, Topology
 from torchrec.distributed.test_utils.model_input import ModelInput
 from torchrec.distributed.test_utils.multi_process import (
@@ -102,7 +103,26 @@ _PIPELINE_CLS: Dict[str, Type[MaglevPipelineBase]] = {
     "base": MaglevPipelineBase,
     "1f1b": Maglev1F1B,
     "1f1b-recv-ahead": Maglev1F1BRecvAhead,
+    "rail": MaglevRail,
 }
+
+
+# What each mode shards, and what it costs per pass. FSDP2 offers exactly two
+# storage modes -- replicated or fully sharded -- so ZeRO-1 is not an FSDP2 mode
+# at all: it is ZeRO-0 storage with the optimizer state split, which is the
+# optimizer's business rather than the schedule's.
+#
+#   zero0  params full, grads full, optim full   1 AllReduce
+#          `replicate` -- semantically DDP, and the FSDP2 path Maglev can drive.
+#   zero1  params full, grads full, optim 1/N    1 AllReduce + param AllGather
+#          `replicate` + ZeroRedundancyOptimizer over the stage group.
+#   zero3  params 1/N, grads 1/N, optim 1/N      1 AllGather + 1 ReduceScatter
+#          `fully_shard`. reshard_after_forward is forced off by MaglevRail, so
+#          the all-gather is once per pass rather than once per microbatch.
+#
+# Only zero0 and zero3 change what the *schedule* has to interleave with; zero1
+# differs from zero0 only after the backward is over.
+_DP_MODES: tuple[str, ...] = ("zero0", "zero1", "zero3")
 
 
 def _shard_embeddings_in_hsd(
@@ -110,6 +130,7 @@ def _shard_embeddings_in_hsd(
     stage_pg: dist.ProcessGroup,
     device: torch.device,
     embedding_lr: float,
+    dp_mode: str = "zero0",
 ) -> nn.Module:
     """Shard a stage's ``EmbeddingBagCollection`` within its HSD, via DMP.
 
@@ -117,11 +138,25 @@ def _shard_embeddings_in_hsd(
     a caller is free to use any other wrapper (FSDP, none) instead. It lives in
     the benchmark rather than the library for exactly that reason.
 
-    The tables are sharded over ``stage_pg``, so the lookup all-to-all stays local
-    to the HSD with no global cross-HSD exchange, and the embedding optimizer is
-    fused into the TBE backward. Dense params are replicated in DDP over the same
-    group and reduced once per pass, the schedule having suppressed DDP's sync on
-    every backward but the last.
+    Two different mechanisms, one per half:
+
+    * **sparse** -- DMP shards the tables over ``stage_pg``, so the lookup
+      all-to-all stays local to the HSD with no global cross-HSD exchange, and
+      the embedding optimizer is fused into the TBE backward.
+    * **dense** -- ``replicate`` over the same group, i.e. FSDP2 in its ZeRO-0
+      shape, reduced once per pass by the schedule.
+
+    Dense used to go through DMP's own ``DefaultDataParallelWrapper``, which
+    builds raw DDP. ``MaglevRail`` cannot reduce that: its split backward writes
+    ``.grad`` without running ``AccumulateGrad``, and DDP's reducer is driven
+    only by the hooks on that node, with no entry point to drive it by hand.
+    FSDP2 does expose one (``FSDPParamGroup.post_backward``), so both schedules
+    use it here -- ``Maglev1F1B`` through ``_configure_fsdp_backward``, and
+    ``MaglevRail`` through its end-of-pass reduction.
+
+    ``replicate`` goes on each layer's **dense half**, not the layer: applied to
+    a whole layer it would try to shard the table DMP has already sharded, and
+    ``aten._embedding_bag`` rejects a DTensor weight against plain indices.
     """
     sharders: List[ModuleSharder[nn.Module]] = [
         cast(ModuleSharder[nn.Module], EmbeddingBagCollectionSharder())
@@ -155,21 +190,30 @@ def _shard_embeddings_in_hsd(
     plan = plan_holder[0]
     assert plan is not None
     remap_plan_to_process_group(plan, stage_pg, device)
-    return DistributedModelParallel(
+    dmp = DistributedModelParallel(
         module=module,
         env=env,
         device=device,
         plan=plan,
         sharders=sharders,
-        # Dense params go into DDP over the stage pg; the schedule suppresses its
-        # sync around every forward but the pass's last, so one all-reduce lands
-        # per pass. static_graph is off: it requires the reducer to be armed on
-        # the first backward, which cannot hold when the first microbatch's
-        # forward is deliberately inside no_sync.
-        init_data_parallel=True,
-        data_parallel_wrapper=DefaultDataParallelWrapper(static_graph=False),
+        # No DDP: the dense halves are replicated with FSDP2 below instead.
+        init_data_parallel=False,
         init_parameters=True,
     )
+    dense_mesh = DeviceMesh.from_group(stage_pg, device.type)
+    for layer in dmp.modules():
+        if isinstance(layer, MaglevLayer) and layer.dense is not None:
+            dense = layer.require_dense()
+            if dp_mode == "zero3":
+                # Explicit, so the two schedules are comparable: MaglevRail
+                # forces this off for itself, but Maglev1F1B does not, and at
+                # the default the baseline would pay one all-gather per
+                # microbatch (measured 96 vs 12 at m=8) against Rail's one per
+                # pass. That is a property of the flag, not of the schedule.
+                fully_shard(dense, mesh=dense_mesh, reshard_after_forward=False)
+            else:
+                replicate(dense, mesh=dense_mesh)
+    return dmp
 
 
 @dataclass
@@ -195,7 +239,8 @@ class RunOptions(BenchFuncConfig):
             parallelism). Default is 2.
         batch_size (int): Per-microbatch batch size ``B``. Default is 8192, which
             with ``layer_dim`` gives a 128 MiB cross-stage activation (past NCCL's
-            ~64 MiB P2P buffer cliff).
+            ~64 MiB P2P buffer cliff). Rail constructs one whole-pass input of
+            ``B * num_microbatches`` samples and splits it after sparse pooling.
         num_microbatches (int): Number of microbatches per 1F1B pass.
             Default is 8.
         pipeline (str): Which schedule to measure. Options:
@@ -204,6 +249,8 @@ class RunOptions(BenchFuncConfig):
             - "1f1b": the standard bidirectional 1F1B schedule
             - "1f1b-recv-ahead": split-mode 1F1B with receives posted one
               microbatch ahead; shared mode uses its batched crossover schedule
+            - "rail": one whole-pass sparse lookup per layer followed by dense
+              1F1B over ``num_microbatches``
             Default is "1f1b".
         handoff_pg_mode (str): Whether activation and gradient traffic uses
             separate process groups ("split", the default) or one shared process
@@ -213,12 +260,15 @@ class RunOptions(BenchFuncConfig):
         emb_dim (int): Embedding dimension ``D``. Default is 256.
         num_float_features (int): Width of each stage's dense/float feature input.
             Default is 64.
+        pooling_avg (int): Average sparse indices per sample and feature.
+            Default is 10.
         layer_dim (int): Width of the activation carried between layers (and so
             between stages). Default is 4096 (128 MiB activation with the default
             batch size).
         lr (float): Learning rate for the per-stage SGD optimizer.
             Default is 0.05.
-        shard_embeddings (bool): Shard each stage's embedding tables within its
+        shard_embeddings (bool): Shard each stage's
+            embedding tables within its
             HSD via DMP scoped to the stage's process group (real intra-HSD
             embedding sharding; the lookup all-to-all stays local to the pg).
             Default is True. Requires ``device_type="cuda"`` (nccl) -- gloo cannot
@@ -250,11 +300,15 @@ class RunOptions(BenchFuncConfig):
     # Split preserves the established direction-specific communicator topology;
     # shared exercises the batch_isend_irecv handoff path.
     handoff_pg_mode: str = "split"
+    # How the dense halves are data-parallelized, when --shard_embeddings.
+    # See _DP_MODES.
+    dp_mode: str = "zero0"
     # Heavier embedding tables: 1M rows * 256 dim * 8 tables per layer.
     num_tables: int = 8
     num_embeddings: int = 1_000_000
     emb_dim: int = 256
     num_float_features: int = 64
+    pooling_avg: int = 10
     layer_dim: int = 4096
     lr: float = 0.05
     # Intra-HSD embedding sharding (DMP per stage), scoped to each stage's pg so
@@ -289,9 +343,14 @@ class RunOptions(BenchFuncConfig):
                 # One input-distribution round per pass; takes no configured
                 # microbatch count.
                 return MaglevPipelineBase(stage=stage, optimizer=optimizer)
+            case "rail":
+                return MaglevRail(
+                    stage=stage,
+                    optimizer=optimizer,
+                    num_microbatches=self.num_microbatches,
+                )
             case _:
-                # Every non-"base" entry is a Maglev1F1B subclass, which is what
-                # makes num_microbatches a valid argument.
+                # The remaining entries are Maglev1F1B subclasses.
                 Pipeline = cast(Type[Maglev1F1B], _PIPELINE_CLS[self.pipeline])
                 return Pipeline(
                     stage=stage,
@@ -324,6 +383,7 @@ def _make_input(
     batch_size: int,
     num_float_features: int,
     device: torch.device,
+    pooling_avg: int,
 ) -> ModelInput:
     """A ModelInput (float + sparse) for the given tables (canonical generator)."""
     return ModelInput.generate(
@@ -334,6 +394,7 @@ def _make_input(
         device=device,
         # Citrine C0: pin host input memory for efficient CPU-to-GPU transfer.
         pin_memory=True,
+        pooling_avg=pooling_avg,
     )
 
 
@@ -360,7 +421,6 @@ def runner(
         f"world_size ({world_size}) must equal len(layers_per_stage) "
         f"({num_stages}) * ranks_per_stage ({ranks_per_stage})"
     )
-
     # CUDA uses nccl for the cross-HSD P2P hand-off (falls back to gloo for the
     # CPU repro). The profiler path is CUDA-only, so traces require device_type=cuda.
     backend = "cpu:gloo,cuda:nccl" if run_option.device_type == "cuda" else "gloo"
@@ -420,29 +480,39 @@ def runner(
             stage_size=ranks_per_stage,
             loss_only_output=run_option.shard_embeddings and ranks_per_stage > 1,
             process_groups=process_groups,
+            enable_rail=run_option.pipeline == "rail",
         )
         # Parallelism is the caller's: shard the embeddings within the HSD, then
         # materialize. Wrapping before to() is what keeps a meta-authored stage
         # from allocating full-size tables the sharder is about to cut up.
         if run_option.shard_embeddings:
             stage.module = _shard_embeddings_in_hsd(
-                stage.module, stage.stage_pg, device, run_option.lr
+                stage.module,
+                stage.stage_pg,
+                device,
+                run_option.lr,
+                run_option.dp_mode,
             )
         stage.to(device)
         # Dense params only, as benchmark_train_pipeline does: when the stage is
         # sharded the embeddings train in backward via the fused TBE optimizer, so
         # they neither need nor belong in the outer step.
         # (Citrine C2: foreach=True for multi-tensor execution.)
-        optimizer = torch.optim.SGD(
-            [
-                p
-                for _, p in in_backward_optimizer_filter(
-                    stage.module.named_parameters()
-                )
-            ],
-            lr=run_option.lr,
-            foreach=True,
-        )
+        dense_params = [
+            p for _, p in in_backward_optimizer_filter(stage.module.named_parameters())
+        ]
+        if run_option.dp_mode == "zero1" and run_option.shard_embeddings:
+            # ZeRO-1 is ZeRO-0 comms plus a 1/N optimizer. The schedule is
+            # untouched by this -- it drives the gradient reduction, not the step.
+            optimizer = ZeroRedundancyOptimizer(
+                dense_params,
+                optimizer_class=torch.optim.SGD,
+                process_group=stage.stage_pg,
+                lr=run_option.lr,
+            )
+        else:
+            # (Citrine C2: foreach=True for multi-tensor execution.)
+            optimizer = torch.optim.SGD(dense_params, lr=run_option.lr, foreach=True)
         pipeline = run_option.generate_pipeline(stage=stage, optimizer=optimizer)
 
         # One CPU batch, replayed forever: data loading is not what we benchmark,
@@ -451,12 +521,18 @@ def runner(
         # the model's (passthrough) preproc consumes. Input distribution owns the
         # H2D copy, as it does for a real dataloader.
         cpu_device = torch.device("cpu")
+        input_batch_size = (
+            run_option.batch_size * run_option.num_microbatches
+            if pipeline.takes_whole_pass_input
+            else run_option.batch_size
+        )
         model_input = [
             _make_input(
                 all_tables[l],
-                run_option.batch_size,
+                input_batch_size,
                 run_option.num_float_features,
                 cpu_device,
+                run_option.pooling_avg,
             )
             for l in range(num_layers)
         ]

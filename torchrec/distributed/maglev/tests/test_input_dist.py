@@ -9,7 +9,7 @@
 
 import unittest
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import patch
 
 import torch
@@ -19,6 +19,7 @@ from torchrec.distributed.maglev.input_dist import (
     input_data_dist,
     input_size_dist,
     prepare_input_buffers,
+    split_dense_inputs,
     unflatten_from_tensors,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -32,6 +33,16 @@ class _Carrier:
     pair: Tuple[torch.Tensor, int]  # mixed tensor + non-tensor
     named: Dict[str, torch.Tensor]
     features: KeyedJaggedTensor
+
+
+@dataclass
+class _DenseCarrier:
+    values: torch.Tensor
+    labels: torch.Tensor
+    static: torch.Tensor
+    features: Optional[KeyedJaggedTensor]
+    nested: Dict[str, List[torch.Tensor]]
+    name: str
 
 
 def _kjt(values: torch.Tensor) -> KeyedJaggedTensor:
@@ -178,6 +189,61 @@ class InputDistTest(unittest.TestCase):
         self.assertEqual(bucket_dtypes, [torch.float32, torch.int32])
         self.assertEqual([buf.dtype for buf in in_bufs], bucket_dtypes)
         self.assertEqual(in_splits, [[0, 3], [2, 0]])
+
+    def test_split_dense_inputs_returns_views_and_drops_sparse_fields(self) -> None:
+        value = _DenseCarrier(
+            values=torch.arange(18).view(6, 3),
+            labels=torch.arange(6),
+            static=torch.arange(3),
+            features=_kjt(torch.arange(6)),
+            nested={
+                "batch": [torch.arange(12).view(6, 2)],
+                "static": [torch.arange(4)],
+            },
+            name="batch",
+        )
+
+        parts = split_dense_inputs(value, batch_size=6, num_microbatches=3)
+
+        self.assertEqual([part.values.shape[0] for part in parts], [2, 2, 2])
+        self.assertEqual([part.labels.shape[0] for part in parts], [2, 2, 2])
+        torch.testing.assert_close(
+            torch.cat([part.values for part in parts]), value.values
+        )
+        torch.testing.assert_close(
+            torch.cat([part.labels for part in parts]), value.labels
+        )
+        torch.testing.assert_close(
+            torch.cat([part.nested["batch"][0] for part in parts]),
+            value.nested["batch"][0],
+        )
+        for part in parts:
+            self.assertEqual(
+                part.values.untyped_storage().data_ptr(),
+                value.values.untyped_storage().data_ptr(),
+            )
+            self.assertIs(part.static, value.static)
+            self.assertIsNone(part.features)
+            self.assertEqual(part.nested["batch"][0].shape, torch.Size([2, 2]))
+            self.assertIs(part.nested["static"][0], value.nested["static"][0])
+            self.assertIs(part.name, value.name)
+
+    def test_split_dense_inputs_rejects_invalid_counts(self) -> None:
+        value = _DenseCarrier(
+            values=torch.ones(2, 3),
+            labels=torch.ones(2),
+            static=torch.ones(3),
+            features=_kjt(torch.arange(6)),
+            nested={},
+            name="batch",
+        )
+
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            split_dense_inputs(value, batch_size=2, num_microbatches=0)
+        with self.assertRaisesRegex(ValueError, "non-empty microbatches"):
+            split_dense_inputs(value, batch_size=2, num_microbatches=3)
+        with self.assertRaisesRegex(ValueError, "divide evenly"):
+            split_dense_inputs(value, batch_size=6, num_microbatches=4)
 
 
 _DENSE_DIM = 4
