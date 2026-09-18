@@ -393,6 +393,14 @@ class CPUOffloadedRecMetricModuleTest(unittest.TestCase):
         # pyrefly: ignore[bad-argument-type]
         return CPUOffloadedRecMetricModule(**{**defaults, **overrides})
 
+    def test_rejects_metric_marked_unsupported(self) -> None:
+        self.mock_metric.supports_cpu_offloaded_metric_module = False
+        with self.assertRaisesRegex(
+            RecMetricException,
+            "does not support metrics whose semantics depend on logical update boundaries: MockRecMetric",
+        ):
+            self._make_module()
+
     def tearDown(self) -> None:
         if dist.is_initialized():
             dist.destroy_process_group()

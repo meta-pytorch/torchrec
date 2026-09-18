@@ -392,6 +392,14 @@
     ],
     "variant": ""
   },
+  "SessionPairwiseAUCMetric_UNFUSED_TASKS_COMPUTATION": {
+    "compute_mode": "UNFUSED_TASKS_COMPUTATION",
+    "metric_class": "SessionPairwiseAUCMetric",
+    "non_persistent_buffer_fqns": [],
+    "persistent_buffer_fqns": [],
+    "state_dict_keys": [],
+    "variant": ""
+  },
   "ServingCalibrationMetric_UNFUSED_TASKS_COMPUTATION": {
     "compute_mode": "UNFUSED_TASKS_COMPUTATION",
     "metric_class": "ServingCalibrationMetric",

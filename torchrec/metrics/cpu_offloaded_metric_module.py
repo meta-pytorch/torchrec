@@ -370,6 +370,17 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         self._non_metric_model_out_keys = (
             requested_non_metric_model_out_keys.difference(metric_input_keys)
         )
+        unsupported_metrics = [
+            type(metric).__name__
+            for metric in self.rec_metrics.rec_metrics
+            if not metric.supports_cpu_offloaded_metric_module
+        ]
+        if unsupported_metrics:
+            raise RecMetricException(
+                "CPUOffloadedRecMetricModule does not support metrics whose "
+                "semantics depend on logical update boundaries: "
+                + ", ".join(sorted(unsupported_metrics))
+            )
         self._model_out_device = model_out_device
         self._requested_update_batch_size: int = max(1, update_batch_size)
         self._update_batch_size: int = self._capped_update_batch_size(
