@@ -193,16 +193,6 @@ def build_metric(
     )
 
 
-def extract_state_dict_keys(
-    metric_class: Type[RecMetric],
-    compute_mode: RecComputeMode = RecComputeMode.UNFUSED_TASKS_COMPUTATION,
-    **kwargs: Any,
-) -> List[str]:
-    return sorted(
-        build_metric(metric_class, compute_mode, **kwargs).state_dict().keys()
-    )
-
-
 def get_metric_snapshot_key(
     metric_class: Type[RecMetric],
     compute_mode: RecComputeMode,
@@ -1139,6 +1129,9 @@ _PARAM_ALTERNATIVES: Dict[str, List[Any]] = {
     "description": ["test_description"],
     "is_negative_task_mask": [[True]],
     "label_names": [["label_a", "label_b"]],
+    # default + 1.0 is 1.0, which collides with max_prediction and trips the
+    # min < max check, so the auto-generated value is never usable.
+    "min_prediction": [0.1],
     "number_of_classes": [5],
     "pairwise_weight_key": ["pairwise_weight"],
     "score_key": ["score"],
@@ -1167,6 +1160,8 @@ def _get_metric_specific_params(
 _CONSTRUCTION_KWARGS: Dict[str, Dict[str, Any]] = {
     # Required, so the probe cannot build the metric without it.
     "MulticlassRecallMetric": {"number_of_classes": 3},
+    # Its computation rejects any task without a tensor_name.
+    "TensorWeightedAvgMetric": {"use_tensor_task": True},
 }
 
 
@@ -1176,8 +1171,14 @@ def _construction_kwargs(metric_cls: Type[RecMetric]) -> Dict[str, Any]:
 
 def _generate_alternatives(
     param: inspect.Parameter,
+    baseline: Any = None,
 ) -> List[Any]:
-    """Auto-generate alternative values for a param based on its default."""
+    """Auto-generate alternative values for a param based on its default.
+
+    A required param has no signature default, so the caller can supply the
+    value its fixture builds with instead. Without that, every required param
+    reads as unprobeable even when varying it is trivial.
+    """
     name = param.name
     default = param.default
 
@@ -1185,6 +1186,9 @@ def _generate_alternatives(
         return _PARAM_ALTERNATIVES[name]
 
     if default is inspect.Parameter.empty:
+        default = baseline
+
+    if default is inspect.Parameter.empty or default is None:
         return []
 
     if isinstance(default, bool):
@@ -1198,7 +1202,8 @@ def _generate_alternatives(
     return []
 
 
-# Params that produce different state_dict keys. Uses strings (includes ThroughputMetric/nn.Module).
+# Params that change the state_dict keys. Compared for exact equality, so a
+# param that stops changing them must lose its entry here.
 KNOWN_CONDITIONAL_STATE: Set[Tuple[str, str]] = {
     ("MSEMetric", "include_r_squared"),
     ("MultiLabelPrecisionMetric", "label_names"),
@@ -1207,44 +1212,46 @@ KNOWN_CONDITIONAL_STATE: Set[Tuple[str, str]] = {
     ("TowerQPSMetric", "batch_size_stages"),
 }
 
-# Params that do NOT affect state_dict keys. Every non-base param must be here
-# or in KNOWN_CONDITIONAL_STATE.
-KNOWN_SAFE_PARAMS: Set[Tuple[str, str]] = {
-    ("AUCMetric", "apply_bin"),
-    ("AUCMetric", "grouped_auc"),
-    ("AUPRCMetric", "grouped_auprc"),
-    ("AUPRCMetric", "max_prediction"),
-    ("AUPRCMetric", "min_prediction"),
-    ("AUPRCMetric", "num_bins"),
-    ("AccuracyMetric", "threshold"),
-    ("HindsightTargetPRMetric", "target_precision"),
-    ("MulticlassRecallMetric", "number_of_classes"),
-    ("NDCGMetric", "exponential_gain"),
-    ("NDCGMetric", "is_negative_task_mask"),
-    ("NDCGMetric", "k"),
-    ("NDCGMetric", "remove_single_length_sessions"),
-    ("NDCGMetric", "report_ndcg_as_decreasing_curve"),
-    ("NDCGMetric", "scale_by_weights_tensor"),
-    ("NDCGMetric", "session_key"),
-    ("NEMetric", "include_logloss"),
-    ("PrecisionMetric", "threshold"),
-    ("RAUCMetric", "grouped_rauc"),
-    ("RecalibratedCalibrationMetric", "recalibration_coefficient"),
-    ("RecalibratedNEMetric", "include_logloss"),
-    ("RecalibratedNEMetric", "recalibration_coefficient"),
-    ("RecallMetric", "threshold"),
-    ("SegmentedNEMetric", "cast_keys_to_int"),
-    ("SegmentedNEMetric", "grouping_keys"),
-    ("SegmentedNEMetric", "include_logloss"),
-    ("SegmentedNEMetric", "num_groups"),  # changes tensor shapes, not key names
-    ("SessionPairwiseAUCMetric", "pairwise_weight_key"),
-    ("SessionPairwiseAUCMetric", "rank_order_label"),
-    ("SessionPairwiseAUCMetric", "remove_zero_weight_from_pair"),
-    ("SessionPairwiseAUCMetric", "score_key"),
-    ("SessionPairwiseAUCMetric", "session_key"),
-    ("SessionPairwiseAUCMetric", "weight_pairs"),
-    ("TensorWeightedAvgMetric", "description"),
-    ("TowerQPSMetric", "warmup_steps"),
+# Params no probe can settle, each with the reason the probe gives. Safe is
+# the default: a param in neither this map nor KNOWN_CONDITIONAL_STATE was
+# probed and left the keys alone, so it needs no entry anywhere.
+#
+# The reason is declared, not just reported. "empty state_dict" means the
+# probe ran and found nothing; the others mean it never ran. A param sliding
+# between those is a regression from verified to unprobed, and comparing only
+# the pairs would not see it.
+UNVERIFIABLE_PARAMS: Dict[Tuple[str, str], str] = {
+    ("AUCMetric", "apply_bin"): "state_dict is empty under every probed value",
+    ("AUCMetric", "grouped_auc"): "state_dict is empty under every probed value",
+    ("AUPRCMetric", "grouped_auprc"): "state_dict is empty under every probed value",
+    ("AUPRCMetric", "max_prediction"): "state_dict is empty under every probed value",
+    ("AUPRCMetric", "min_prediction"): "state_dict is empty under every probed value",
+    ("AUPRCMetric", "num_bins"): "state_dict is empty under every probed value",
+    ("RAUCMetric", "grouped_rauc"): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "pairwise_weight_key",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "rank_order_label",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "remove_zero_weight_from_pair",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "score_key",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "session_key",
+    ): "state_dict is empty under every probed value",
+    (
+        "SessionPairwiseAUCMetric",
+        "weight_pairs",
+    ): "state_dict is empty under every probed value",
 }
 
 # Subset with proper always-pop hooks (cross-config load tests use these).
@@ -1322,72 +1329,126 @@ def _discover_all_recmetric_subclasses() -> Set[Type[RecMetric]]:
     return _cached_recmetric_subclasses
 
 
-def _get_default_keys_cached(
-    metric_cls: Type[RecMetric],
-    cls_name: str,
-    default_keys_cache: Optional[Dict[str, Set[str]]] = None,
-) -> Optional[Set[str]]:
-    """Get default state_dict keys for a metric, using cache if available."""
-    if default_keys_cache is not None and cls_name in default_keys_cache:
-        return default_keys_cache[cls_name]
+def _default_keys(metric_cls: Type[RecMetric]) -> Optional[Set[str]]:
+    """The state_dict keys a metric has under its default configuration.
+
+    None when it will not build, which the caller reports as unverifiable.
+    """
     try:
-        default_keys = set(
-            extract_state_dict_keys(metric_cls, **_construction_kwargs(metric_cls))
+        return set(
+            build_metric(metric_cls, **_construction_kwargs(metric_cls)).state_dict()
         )
     except (TypeError, ValueError, KeyError, RecMetricException):
         return None
-    if default_keys_cache is not None:
-        default_keys_cache[cls_name] = default_keys
-    return default_keys
 
 
-def _probe_alternatives(
-    metric_cls: Type[RecMetric],
-    param_name: str,
-    alternatives: List[Any],
-    default_keys: Set[str],
-) -> Optional[str]:
-    """Probe alternative param values. Returns 'misclassified', 'unprobed', or None."""
+def _recmetric_variant_keys(
+    metric_cls: Type[RecMetric], param_name: str, alt_value: Any
+) -> Optional[Set[str]]:
+    try:
+        # Merged, not double-splatted: the probed param may BE the hint, and
+        # duplicate keyword arguments raise.
+        probe_kwargs = {
+            **_construction_kwargs(metric_cls),
+            param_name: alt_value,
+        }
+        return set(build_metric(metric_cls, **probe_kwargs).state_dict())
+    except (TypeError, ValueError, KeyError, RecMetricException):
+        return None
+
+
+def _throughput_keys(**overrides: Any) -> Optional[Set[str]]:
+    try:
+        return set(
+            ThroughputMetric(**{**_THROUGHPUT_COMMON_KWARGS, **overrides}).state_dict()
+        )
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _classify_param(
+    pair: Tuple[str, str],
+    param: inspect.Parameter,
+    default_keys: Optional[Set[str]],
+    probe: Callable[[str, Any], Optional[Set[str]]],
+    conditional: Set[Tuple[str, str]],
+    unverifiable: Dict[Tuple[str, str], str],
+    baseline: Any = None,
+) -> None:
+    """File one param into exactly one bucket, or neither when it is safe.
+
+    Probed even when the baseline is empty. An alternative that adds the first
+    key is still a change, and skipping the probe would file it as unverifiable
+    for good.
+    """
+    if default_keys is None:
+        unverifiable[pair] = "the metric will not build"
+        return
+
+    alternatives = _generate_alternatives(param, baseline)
+    if not alternatives:
+        unverifiable[pair] = "no alternative value to probe with"
+        return
+
     tested_any = False
     for alt_value in alternatives:
-        try:
-            # Merged, not double-splatted: the probed param may BE the hint,
-            # and duplicate keyword arguments raise.
-            probe_kwargs = {
-                **_construction_kwargs(metric_cls),
-                param_name: alt_value,
-            }
-            variant_keys = set(extract_state_dict_keys(metric_cls, **probe_kwargs))
-            tested_any = True
-        except (TypeError, ValueError, KeyError, RecMetricException):
+        variant_keys = probe(pair[1], alt_value)
+        if variant_keys is None:
             continue
-        if default_keys != variant_keys:
-            return "misclassified"
+        tested_any = True
+        if variant_keys != default_keys:
+            conditional.add(pair)
+            return
+
     if not tested_any:
-        return "unprobed"
-    return None
+        unverifiable[pair] = "no alternative value could be built"
+    elif not default_keys:
+        unverifiable[pair] = "state_dict is empty under every probed value"
 
 
-def _classify_known_safe_param(
-    cls_name: str,
-    param_name: str,
-    metrics_by_name: Dict[str, Type[RecMetric]],
-    default_keys_cache: Optional[Dict[str, Set[str]]] = None,
-) -> Optional[str]:
-    """Classify a KNOWN_SAFE_PARAMS entry. Returns category or None if verified safe."""
-    metric_cls = metrics_by_name.get(cls_name)
-    if metric_cls is None:
-        return "stale"
-    params = _get_metric_specific_params(metric_cls)
-    if param_name not in params:
-        return "stale"
-    alternatives = _generate_alternatives(params[param_name])
-    if not alternatives:
-        return "unprobed"
-    default_keys = _get_default_keys_cached(metric_cls, cls_name, default_keys_cache)
-    if default_keys is None:
-        return "unprobed"
-    return _probe_alternatives(metric_cls, param_name, alternatives, default_keys)
+def classify_params() -> Tuple[Set[Tuple[str, str]], Dict[Tuple[str, str], str]]:
+    """Probe every metric-specific param once.
+
+    Returns the pairs observed to change the state_dict keys, and the pairs no
+    probe can settle mapped to why not. A pair in neither was probed and left
+    the keys alone.
+    """
+    conditional: Set[Tuple[str, str]] = set()
+    unverifiable: Dict[Tuple[str, str], str] = {}
+
+    for metric_cls in _discover_all_recmetric_subclasses():
+        cls_name = metric_cls.__name__
+        default_keys = _default_keys(metric_cls)
+        for param_name, param in _get_metric_specific_params(metric_cls).items():
+            _classify_param(
+                (cls_name, param_name),
+                param,
+                default_keys,
+                partial(_recmetric_variant_keys, metric_cls),
+                conditional,
+                unverifiable,
+            )
+
+    # ThroughputMetric is not a RecMetric, so discovery misses it. Walked the
+    # same way rather than varying one argument by hand, so every param of it
+    # is classified and not just the one the golden happens to cover.
+    throughput_default = _throughput_keys()
+    for param_name, param in inspect.signature(
+        ThroughputMetric.__init__
+    ).parameters.items():
+        if param_name == "self":
+            continue
+        _classify_param(
+            ("ThroughputMetric", param_name),
+            param,
+            throughput_default,
+            lambda name, value: _throughput_keys(**{name: value}),
+            conditional,
+            unverifiable,
+            baseline=_THROUGHPUT_COMMON_KWARGS.get(param_name),
+        )
+
+    return conditional, unverifiable
 
 
 class ConditionalStateRegistryTest(unittest.TestCase):
@@ -1396,141 +1457,20 @@ class ConditionalStateRegistryTest(unittest.TestCase):
         sys.version_info < (3, 11),
         "concurrent.futures._base.Future is type but not a class",
     )
-    def test_validate_state_affecting_params_recmetrics(self) -> None:
-        all_metrics = _discover_all_recmetric_subclasses()
-        for metric_cls in all_metrics:
-            try:
-                default_keys = set(extract_state_dict_keys(metric_cls))
-            except (TypeError, ValueError, KeyError, RecMetricException):
-                continue
-            for param_name, param in _get_metric_specific_params(metric_cls).items():
-                alternatives = _generate_alternatives(param)
-                if not alternatives:
-                    continue
-                for alt_value in alternatives:
-                    with self.subTest(metric=metric_cls.__name__, param=param_name):
-                        try:
-                            variant_keys = set(
-                                extract_state_dict_keys(
-                                    metric_cls, **{param_name: alt_value}
-                                )
-                            )
-                        except (TypeError, ValueError, KeyError, RecMetricException):
-                            continue
+    def test_param_classification_is_exactly_declared(self) -> None:
+        """One probe pass, both maps compared for equality, both directions.
 
-                        if default_keys != variant_keys:
-                            self.assertIn(
-                                (metric_cls.__name__, param_name),
-                                KNOWN_CONDITIONAL_STATE,
-                                f"{metric_cls.__name__}.{param_name} affects "
-                                f"state_dict keys but is not in "
-                                f"KNOWN_CONDITIONAL_STATE. "
-                                f"Added: {variant_keys - default_keys}, "
-                                f"Removed: {default_keys - variant_keys}",
-                            )
-
-    @unittest.skipIf(
-        sys.version_info < (3, 11),
-        "concurrent.futures._base.Future is type but not a class",
-    )
-    def test_all_params_categorized(self) -> None:
-        all_metrics = _discover_all_recmetric_subclasses()
-        uncategorized = []
-        for metric_cls in all_metrics:
-            for param_name in _get_metric_specific_params(metric_cls):
-                pair = (metric_cls.__name__, param_name)
-                if (
-                    pair not in KNOWN_CONDITIONAL_STATE
-                    and pair not in KNOWN_SAFE_PARAMS
-                ):
-                    uncategorized.append(pair)
-
-        if uncategorized:
-            formatted = "\n".join(
-                f'    ("{cls}", "{param}"),' for cls, param in sorted(uncategorized)
-            )
-            self.fail(
-                f"Found {len(uncategorized)} uncategorized metric param(s).\n"
-                f"Each param must be in KNOWN_CONDITIONAL_STATE (if it conditionally\n"
-                f"registers buffers/state) or KNOWN_SAFE_PARAMS (if it does not).\n"
-                f"Add these to the appropriate set:\n{formatted}"
-            )
-
-    @unittest.skipIf(
-        sys.version_info < (3, 11),
-        "concurrent.futures._base.Future is type but not a class",
-    )
-    def test_none_default_params_have_test_values(self) -> None:
-        all_metrics = _discover_all_recmetric_subclasses()
-        missing = []
-        for metric_cls in all_metrics:
-            for param_name, param in _get_metric_specific_params(metric_cls).items():
-                if param.default is None and param_name not in _PARAM_ALTERNATIVES:
-                    missing.append((metric_cls.__name__, param_name))
-
-        if missing:
-            formatted = "\n".join(
-                f'    "{p}",' for _, p in sorted(set(missing), key=lambda x: x[1])
-            )
-            self.fail(
-                f"Found None-default params without _PARAM_ALTERNATIVES entries.\n"
-                f"These params can't be auto-probed for conditional state.\n"
-                f"Add test values to _PARAM_ALTERNATIVES for:\n{formatted}"
-            )
-
-    @unittest.skipIf(
-        sys.version_info < (3, 11),
-        "concurrent.futures._base.Future is type but not a class",
-    )
-    def test_known_safe_params_are_actually_safe(self) -> None:
-        all_metrics = _discover_all_recmetric_subclasses()
-        metrics_by_name = {cls.__name__: cls for cls in all_metrics}
-        default_keys_cache: Dict[str, Set[str]] = {}
-        buckets: Dict[str, List[Tuple[str, str]]] = {
-            "stale": [],
-            "misclassified": [],
-            "unprobed": [],
-        }
-        for cls_name, param_name in sorted(KNOWN_SAFE_PARAMS):
-            category = _classify_known_safe_param(
-                cls_name, param_name, metrics_by_name, default_keys_cache
-            )
-            if category is not None:
-                buckets[category].append((cls_name, param_name))
-
-        error_messages = {
-            "stale": "Stale entries (param not in any signature)",
-            "misclassified": (
-                "Misclassified (actually affects state_dict keys, "
-                "move to KNOWN_CONDITIONAL_STATE)"
-            ),
-        }
-        errors = []
-        for key, label in error_messages.items():
-            if buckets[key]:
-                formatted = "\n".join(f'    ("{c}", "{p}"),' for c, p in buckets[key])
-                errors.append(f"{label}:\n{formatted}")
-        if errors:
-            self.fail("KNOWN_SAFE_PARAMS issues:\n" + "\n\n".join(errors))
-
-    def test_validate_state_affecting_params_throughput(self) -> None:
-        default_metric = ThroughputMetric(**_THROUGHPUT_COMMON_KWARGS)
-        variant_metric = ThroughputMetric(
-            **_THROUGHPUT_COMMON_KWARGS,
-            batch_size_stages=_BATCH_SIZE_STAGES_ALTERNATIVE,
-        )
-        default_keys = set(default_metric.state_dict().keys())
-        variant_keys = set(variant_metric.state_dict().keys())
-
-        if default_keys != variant_keys:
-            self.assertIn(
-                ("ThroughputMetric", "batch_size_stages"),
-                KNOWN_CONDITIONAL_STATE,
-                f"ThroughputMetric.batch_size_stages affects state_dict "
-                f"keys but is not in KNOWN_CONDITIONAL_STATE. "
-                f"Added keys: {variant_keys - default_keys}, "
-                f"Removed keys: {default_keys - variant_keys}",
-            )
+        A param that starts changing the keys has to be declared. One that
+        stops has to lose its entry, which an assertIn would never notice.
+        The conditional set is compared against the whole declaration, so an
+        entry naming a class that no longer exists fails here too.
+        """
+        observed, unverifiable = classify_params()
+        self.assertEqual(observed, KNOWN_CONDITIONAL_STATE)
+        # Reasons compared too. A pair whose reason changes has moved between
+        # "probed, nothing to see" and "never probed", which the pairs alone
+        # would not show.
+        self.assertEqual(unverifiable, UNVERIFIABLE_PARAMS)
 
 
 class CrossConfigLoadTest(unittest.TestCase):
