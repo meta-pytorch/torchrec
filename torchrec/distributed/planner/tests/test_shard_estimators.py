@@ -1914,6 +1914,17 @@ class TestComputeStorageUsage(unittest.TestCase):
         expected = get_tensor_size_bytes(tensor)
         self.assertEqual(result, {"ddr": expected})
 
+    def test_base_triton_uvm(self) -> None:
+        tensor = torch.zeros(100, 64)
+        result = compute_storage_usage(
+            tensor,
+            compute_device_type="cuda",
+            compute_kernel="triton_uvm",
+            storage_usage_type=StorageUsageType.BASE,
+        )
+        expected = get_tensor_size_bytes(tensor)
+        self.assertEqual(result, {"ddr": expected})
+
     def test_base_cuda(self) -> None:
         tensor = torch.zeros(100, 64)
         result = compute_storage_usage(

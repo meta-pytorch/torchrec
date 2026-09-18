@@ -106,6 +106,12 @@ torch.fx.wrap("len")
 
 CACHE_LOAD_FACTOR_STR: str = "cache_load_factor"
 USE_ONE_TBE_PER_TABLE: str = "use_one_tbe_per_table"
+TRITON_UVM_ONLY_FUSED_PARAMS: frozenset[str] = frozenset(
+    {
+        "forward_block_limit",
+        "vbe_forward_block_limit",
+    }
+)
 
 
 # torch.Tensor.to can not be fx symbolic traced as it does not go through __torch_dispatch__ => fx.wrap it
@@ -667,6 +673,10 @@ def group_tables(
                 k: v
                 for k, v in fused_params_tuple
                 if k not in ["_batch_key", USE_ONE_TBE_PER_TABLE]
+                and (
+                    compute_kernel_type == EmbeddingComputeKernel.TRITON_UVM
+                    or k not in TRITON_UVM_ONLY_FUSED_PARAMS
+                )
             }
             cache_load_factor = _get_weighted_avg_cache_load_factor(grouped_tables)
             if cache_load_factor is not None:
