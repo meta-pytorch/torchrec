@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 
 logger: logging.Logger = logging.getLogger(__name__)
 
+_BYTES_PER_GIB: int = 1024**3
+
 
 def _peak_per_rank_storage(best_plan: List[ShardingOption]) -> Tuple[int, int]:
     """Peak per-rank (HBM, DDR) in bytes across the chosen shards.
@@ -233,9 +235,30 @@ class DefaultPlannerExecutor(PlannerExecutor):
         # provider — the single dispatch point across OSS/LP/Manifold variants.
         # Each phase is timed onto ctx.timing (observability only), keyed per SKU
         # so a multi-SKU dry-run sweep stays comparable. Times are wall-clock ms.
+        # Per-phase lines are emitted only on the planning rank: every rank runs
+        # this method on the collective path, so unguarded these would multiply by
+        # world_size (thousands of identical lines per job). The request-level line
+        # in create_sharding_plan stays on all ranks precisely to catch rank skew;
+        # from here on the phases are rank-invariant, so one voice is enough.
         t0 = time.perf_counter()
         topology = self._provider.build_topology(sku, ctx.request, ctx)
         ctx.timing[f"topology_build:{sku}"] = (time.perf_counter() - t0) * 1000.0
+        if is_planning_rank:
+            # Per-device caps come off device 0 (the topology is homogeneous), but
+            # an observability line must not be the thing that aborts planning, so
+            # an empty device list degrades to "unknown" rather than IndexError.
+            storage = topology.devices[0].storage if topology.devices else None
+            logger.info(
+                "[planner] %s topology: world_size=%s local_world_size=%s "
+                "compute_device=%s hbm=%s ddr=%s (%.0fms)",
+                sku,
+                topology.world_size,
+                topology.local_world_size,
+                topology.compute_device,
+                f"{storage.hbm / _BYTES_PER_GIB:.1f}GiB" if storage else "unknown",
+                f"{storage.ddr / _BYTES_PER_GIB:.1f}GiB" if storage else "unknown",
+                ctx.timing[f"topology_build:{sku}"],
+            )
         # Record the modeled topology per SKU so callers can inspect the hardware
         # each SKU was planned against, keyed by the dims that make it reusable.
         ctx.topology_cache[(sku, topology.world_size, topology.local_world_size)] = (
@@ -246,6 +269,16 @@ class DefaultPlannerExecutor(PlannerExecutor):
         storage_reservation = self._provider.build_storage_reservation(sku, ctx.request)
         ctx.timing[f"storage_reservation:{sku}"] = (time.perf_counter() - t0) * 1000.0
         ctx.storage_reservations_used[sku] = storage_reservation
+        if is_planning_rank:
+            # The concrete class, not the configured policy: SKU_AWARE silently
+            # falls back to Heuristical when its JK is off, and that substitution
+            # changes how much HBM is carved out before planning.
+            logger.info(
+                "[planner] %s storage reservation: %s (%.0fms)",
+                sku,
+                type(storage_reservation).__name__,
+                ctx.timing[f"storage_reservation:{sku}"],
+            )
 
         t0 = time.perf_counter()
         planner = self._provider.build_planner(
@@ -255,6 +288,14 @@ class DefaultPlannerExecutor(PlannerExecutor):
             ctx=ctx,
         )
         ctx.timing[f"planner_construction:{sku}"] = (time.perf_counter() - t0) * 1000.0
+        if is_planning_rank:
+            logger.info(
+                "[planner] %s planner: %s (%.0fms); planning on %s",
+                sku,
+                type(planner).__name__,
+                ctx.timing[f"planner_construction:{sku}"],
+                "this rank, broadcasting" if pg is not None else "this rank (local)",
+            )
 
         start = time.perf_counter()
         try:
@@ -270,6 +311,28 @@ class DefaultPlannerExecutor(PlannerExecutor):
             # planner and is a separate follow-up.
             solve_time_ms = (time.perf_counter() - start) * 1000.0
             ctx.timing[f"plan_call:{sku}"] = solve_time_ms
+            # A PlannerError becomes a success=False result rather than an
+            # exception, so without this an infeasible SKU leaves no trace in the
+            # job log at all -- the caller just receives a result object. Warning,
+            # not error: on a dry-run sweep infeasibility is an expected outcome
+            # for some SKUs, and the sweep continues.
+            # exc_info so a chained cause survives: PlannerError frequently wraps
+            # an underlying failure, and because this path returns a result rather
+            # than propagating, the traceback is destroyed here if it is not
+            # recorded -- which defeats the point of logging the failure at all.
+            #
+            # Unlike the per-phase lines this is NOT gated on is_planning_rank: a
+            # failure here is rare and a non-planning rank failing is itself worth
+            # seeing. Only the traceback is rank-gated, so a fleet-wide failure
+            # costs one line per rank rather than one full traceback per rank.
+            logger.warning(
+                "[planner] %s FAILED after %.0fms: %s: %s",
+                sku,
+                solve_time_ms,
+                e.error_type,
+                e,
+                exc_info=is_planning_rank,
+            )
             return ShardingPlanResult(
                 sku=sku,
                 success=False,
@@ -321,6 +384,19 @@ class DefaultPlannerExecutor(PlannerExecutor):
             mean_rank_perf,
             perf_imbalance_ratio,
         ) = _plan_quality(best_plan)
+        if is_planning_rank:
+            # Peak HBM against the device budget is the number that decides whether
+            # this plan OOMs in training, and shard count is the cheapest sanity
+            # check that the plan covers the model.
+            logger.info(
+                "[planner] %s planned in %.0fms: %d shard(s), peak/rank "
+                "hbm=%.1fGiB ddr=%.1fGiB",
+                sku,
+                solve_time_ms,
+                len(best_plan),
+                max_hbm_bytes / _BYTES_PER_GIB,
+                max_ddr_bytes / _BYTES_PER_GIB,
+            )
         return ShardingPlanResult(
             sku=sku,
             success=True,
