@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import traceback
+from collections.abc import Collection
 from typing import Any, cast, Dict, Mapping, Optional, Union
 
 import torch
@@ -330,6 +331,7 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
         update_batch_size: int = 10,
         clone_model_out: bool = False,
         *args: Any,
+        non_metric_model_out_keys: Collection[str] | None = None,
         **kwargs: Any,
     ) -> None:
         """
@@ -346,10 +348,28 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
                 worker by ~K× with no added trainer-thread work. Drain
                 stops at any SynchronizationMarker, which is processed
                 after the merged batch. Default is 10; set to 1 to disable.
+            non_metric_model_out_keys: Keys to remove before snapshot and batching
+                unless a configured metric consumes them.
             *args: Additional positional arguments passed to RecMetricModule.
             **kwargs: Additional keyword arguments passed to RecMetricModule.
         """
         super().__init__(*args, **kwargs)
+        requested_non_metric_model_out_keys = frozenset(non_metric_model_out_keys or ())
+        metric_input_keys = set(self.rec_metrics.get_required_inputs() or [])
+        for task in self.rec_tasks:
+            metric_input_keys.update(
+                key
+                for key in (
+                    task.label_name,
+                    task.prediction_name,
+                    task.weight_name,
+                    task.tensor_name,
+                )
+                if key
+            )
+        self._non_metric_model_out_keys = (
+            requested_non_metric_model_out_keys.difference(metric_input_keys)
+        )
         self._model_out_device = model_out_device
         self._requested_update_batch_size: int = max(1, update_batch_size)
         self._update_batch_size: int = self._capped_update_batch_size(
@@ -531,10 +551,20 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             assert self._captured_exception is not None
             raise self._captured_exception
 
+        metric_model_out = model_out
+        if self._non_metric_model_out_keys:
+            metric_model_out = {
+                key: value
+                for key, value in model_out.items()
+                if key not in self._non_metric_model_out_keys
+            }
+
         # Debug validation runs on the caller thread and may synchronize GPU inputs.
         # Use it only for targeted diagnostics.
         if self._debug_mode and len(self.rec_metrics) > 0 and self.rec_tasks:
-            debug_model_out = self._prepare_model_out_for_metrics(dict(model_out))
+            debug_model_out = self._prepare_model_out_for_metrics(
+                dict(metric_model_out)
+            )
             labels, predictions, weights, _ = parse_task_model_outputs(
                 self.rec_tasks,
                 debug_model_out,
@@ -542,12 +572,10 @@ class CPUOffloadedRecMetricModule(RecMetricModule):
             self._validate_rec_metric_inputs(labels, predictions, weights)
 
         if self._clone_model_out:
-            snapshot_model_out = _foreach_clone_dict(model_out)
+            snapshot_model_out = _foreach_clone_dict(metric_model_out)
             snapshot_kwargs = _foreach_clone_kwargs(kwargs)
         else:
-            # Shallow-copy the containers (cheap; no tensor copy) so dict-level
-            # mutation by the caller is isolated; tensor refs are shared.
-            snapshot_model_out = dict(model_out)
+            snapshot_model_out = dict(metric_model_out)
             snapshot_kwargs = dict(kwargs)
 
         try:
