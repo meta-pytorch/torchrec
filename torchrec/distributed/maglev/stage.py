@@ -19,13 +19,29 @@ wire between stages. The authoring side is in
 from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, cast, Deque, Iterator, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    cast,
+    Deque,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.autograd.profiler import record_function
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.pipelining._backward import (
+    _get_grad_fn_or_grad_acc,
+    stage_backward_input,
+    stage_backward_weight,
+)
 from torchrec.distributed.maglev.input_dist import InputDistDriver
 from torchrec.distributed.maglev.module import (
     Activations,
@@ -408,6 +424,291 @@ class _LayerChain(nn.Module):
         return activations
 
 
+@dataclass
+class LayerSparseOutput:
+    r"""LayerSparseOutput(pooled, seams)
+
+    Store one whole-pass sparse output and its detached microbatch leaves.
+
+    Args:
+        pooled (torch.Tensor): Whole-pass output attached to the sparse graph.
+        seams (List[torch.Tensor]): Detached leaves consumed by dense forwards.
+    """
+
+    pooled: torch.Tensor
+    seams: List[torch.Tensor]
+
+
+@dataclass
+class MaglevRailPassState:
+    r"""MaglevRailPassState(sparse_outputs, dense_inputs)
+
+    Hold data shared by the sparse and dense phases of one Rail pass.
+
+    Args:
+        sparse_outputs (List[Optional[LayerSparseOutput]]): Per-layer sparse
+            graphs and seams. ``None`` identifies a dense-only layer.
+        dense_inputs (List[List[Any]]): Per-microbatch inputs for local layers.
+    """
+
+    sparse_outputs: List[Optional[LayerSparseOutput]]
+    dense_inputs: List[List[Any]]
+
+    def seams_for(self, microbatch_id: int) -> List[Optional[torch.Tensor]]:
+        r"""seams_for(microbatch_id) -> List[Optional[torch.Tensor]]
+
+        Return one sparse seam per local layer for a dense microbatch.
+
+        Args:
+            microbatch_id (int): Dense microbatch index.
+
+        Returns:
+            List[Optional[torch.Tensor]]: Per-layer sparse outputs.
+        """
+        return [
+            None if output is None else output.seams[microbatch_id]
+            for output in self.sparse_outputs
+        ]
+
+
+_RailLayerForward = Tuple[Optional[torch.Tensor], List[Any]]
+
+
+def _reject_unhalved_parameters(layers: Sequence[MaglevLayer]) -> None:
+    """Require every trainable layer parameter to live in one of the two halves.
+
+    The split backward computes weight gradients for ``dense_parameters()`` only,
+    and reaches the sparse side through the seams. A parameter registered on the
+    layer body is in neither set: ``torch.autograd.grad`` runs no
+    ``AccumulateGrad`` for it, so its ``.grad`` stays ``None`` after
+    ``zero_grad()`` and the optimizer skips it. It never trains, with no error --
+    which is exactly the mistake a layer migrating to the split API makes by
+    leaving one submodule behind.
+
+    Raises:
+        ValueError: if a layer owns a trainable parameter outside both halves.
+    """
+    for index, layer in enumerate(layers):
+        halved = {
+            id(parameter)
+            for half in (layer.sparse, layer.dense)
+            if half is not None
+            for parameter in half.parameters()
+        }
+        stray = sorted(
+            name
+            for name, parameter in layer.named_parameters()
+            if parameter.requires_grad and id(parameter) not in halved
+        )
+        if stray:
+            raise ValueError(
+                f"{type(layer).__name__} at index {index} owns trainable "
+                f"parameters outside its sparse and dense halves: {stray}. "
+                "MaglevRail computes weight gradients from the dense half only, "
+                "so these would silently never train -- move them into the "
+                "sparse or dense submodule"
+            )
+
+
+def _reject_uncovered_weights(
+    param_groups: Sequence[Mapping[str, Any]],
+    weights: Sequence[nn.Parameter],
+) -> None:
+    """Refuse a weight half that would silently skip some of its parameters.
+
+    ``get_param_groups`` records a parameter only when its reverse closure
+    intersects the closure of the ``input_values`` it was given, and upstream's
+    own coverage assertion for that is commented out
+    (``pipelining/_backward.py``). A dense parameter whose path to the output
+    never merges with a path descended from a received activation or a sparse
+    seam therefore produces no weight group, ``stage_backward_weight`` writes no
+    ``.grad`` for it, and it never trains -- with no exception anywhere.
+
+    Cheap: a set of ids over the stage's dense parameters, once per microbatch.
+
+    Raises:
+        RuntimeError: if a trainable dense parameter has no weight group.
+    """
+    trainable = [weight for weight in weights if weight.requires_grad]
+    # By identity, not by count. ``param_groups`` holds grad-accumulator nodes,
+    # the same keys ``stage_backward_weight`` looks weights up by, and a count
+    # comparison passes when one node appears in two groups while another
+    # parameter is missing entirely -- which is exactly the case this exists to
+    # catch.
+    covered = {id(node) for group in param_groups for node in group["params"]}
+    missing = [
+        weight
+        for weight in trainable
+        if id(_get_grad_fn_or_grad_acc(weight)) not in covered
+    ]
+    if not missing:
+        return
+    raise RuntimeError(
+        f"the split backward reached {len(trainable) - len(missing)} of "
+        f"{len(trainable)} trainable dense parameters, so {len(missing)} would "
+        "receive no gradient and never train. A dense parameter is reachable "
+        "only if its path to the stage output merges with one descended from an "
+        "incoming activation or a sparse seam; one fed solely by "
+        "non-differentiable inputs is not"
+    )
+
+
+class _RailLayerChain(_LayerChain):
+    r"""A layer chain with separate sparse and dense Rail execution phases."""
+
+    def __init__(
+        self,
+        layers: Sequence[MaglevLayer],
+        postproc: Optional[Callable[[Activations, Any], Any]] = None,
+        first_layer_index: int = 0,
+        loss_only_output: bool = False,
+    ) -> None:
+        super().__init__(layers, postproc, first_layer_index, loss_only_output)
+        # Author time, before any wrapper obscures which half owns what.
+        _reject_unhalved_parameters(layers)
+
+    def forward(
+        self,
+        layer_inputs: Sequence[Any],
+        in_activations: Activations = (),
+        *,
+        sparse_outputs: Optional[Sequence[Optional[torch.Tensor]]] = None,
+        batch_size: Optional[int] = None,
+        num_microbatches: Optional[int] = None,
+    ) -> Any:
+        r"""forward(layer_inputs, in_activations=(), *, sparse_outputs=None, batch_size=None, num_microbatches=None) -> Any
+
+        Run the global sparse phase, or dispatch a dense microbatch through the
+        wrapper-visible ``forward`` entry point.
+
+        Args:
+            layer_inputs (Sequence[Any]): One input per local layer.
+            in_activations (Activations): Activation entering the stage.
+                Default: ``()``
+            sparse_outputs (Sequence[Optional[torch.Tensor]], optional): One
+                precomputed sparse output per layer. Supplying this dispatches
+                to :meth:`forward_dense`. Default: ``None``
+            batch_size (int, optional): Whole-pass batch size. Required when
+                ``sparse_outputs`` is ``None``. Default: ``None``
+            num_microbatches (int, optional): Number of dense microbatches,
+                required when ``sparse_outputs`` is ``None``. Default: ``None``
+
+        Returns:
+            Any: Per-layer sparse outputs and dense inputs, or the result of
+            :meth:`forward_dense` when ``sparse_outputs`` is supplied.
+
+        Raises:
+            ValueError: If the input counts or phase arguments are invalid.
+        """
+        if len(layer_inputs) != len(self.layers):
+            raise ValueError(
+                f"expected {len(self.layers)} layer inputs, got {len(layer_inputs)}"
+            )
+        if sparse_outputs is not None:
+            # Dispatch through forward so an outer DMP/DDP/FSDP wrapper observes
+            # the dense call before this implementation-specific method runs.
+            if batch_size is not None or num_microbatches is not None:
+                raise ValueError(
+                    "dense forward does not accept batch_size or num_microbatches"
+                )
+            return self.forward_dense(
+                layer_inputs,
+                in_activations,
+                sparse_outputs,
+            )
+        if in_activations:
+            raise ValueError("sparse forward does not accept incoming activations")
+        if batch_size is None or num_microbatches is None:
+            raise ValueError("sparse forward requires batch_size and num_microbatches")
+
+        rail_outputs: List[_RailLayerForward] = []
+        for layer, layer_input, profile_name in zip(
+            self.layers, layer_inputs, self._profile_names
+        ):
+            maglev_layer = cast(MaglevLayer, layer)
+            with record_function(profile_name):
+                sparse = maglev_layer.sparse
+                pooled = None if sparse is None else sparse(layer_input)
+                if sparse is not None:
+                    if not isinstance(pooled, torch.Tensor):
+                        raise TypeError(
+                            f"{type(maglev_layer).__name__} sparse half returned "
+                            f"{type(pooled).__name__}, expected torch.Tensor"
+                        )
+                    if pooled.ndim == 0 or pooled.shape[0] != batch_size:
+                        raise ValueError(
+                            f"{type(maglev_layer).__name__} sparse output has shape "
+                            f"{tuple(pooled.shape)}, expected leading dimension "
+                            f"{batch_size}"
+                        )
+                    if not pooled.dtype.is_floating_point:
+                        raise ValueError(
+                            f"{type(maglev_layer).__name__} sparse output must be "
+                            f"floating point, got {pooled.dtype}"
+                        )
+                dense_inputs = maglev_layer.split_dense_input(
+                    layer_input,
+                    batch_size,
+                    num_microbatches,
+                )
+                if len(dense_inputs) != num_microbatches:
+                    raise ValueError(
+                        f"{type(maglev_layer).__name__}.split_dense_input() returned "
+                        f"{len(dense_inputs)} inputs, expected {num_microbatches}"
+                    )
+            rail_outputs.append((pooled, dense_inputs))
+        return rail_outputs
+
+    def forward_dense(
+        self,
+        layer_inputs: Sequence[Any],
+        in_activations: Activations,
+        sparse_outputs: Sequence[Optional[torch.Tensor]],
+    ) -> Any:
+        r"""forward_dense(layer_inputs, in_activations, sparse_outputs) -> Any
+
+        Run one dense microbatch through the stage's layers and postprocessor.
+
+        Args:
+            layer_inputs (Sequence[Any]): One dense input per local layer.
+            in_activations (Activations): Activation entering the stage.
+            sparse_outputs (Sequence[Optional[torch.Tensor]]): One precomputed
+                sparse output per local layer.
+
+        Returns:
+            Any: The stage activation or final-stage postprocessor result.
+
+        Raises:
+            ValueError: If an input count does not match the layer count.
+        """
+        if len(layer_inputs) != len(self.layers):
+            raise ValueError(
+                f"expected {len(self.layers)} layer inputs, got {len(layer_inputs)}"
+            )
+        if len(sparse_outputs) != len(self.layers):
+            raise ValueError(
+                f"expected {len(self.layers)} sparse outputs, got "
+                f"{len(sparse_outputs)}"
+            )
+        activations = in_activations
+        for index, (layer, layer_input, profile_name) in enumerate(
+            zip(self.layers, layer_inputs, self._profile_names)
+        ):
+            maglev_layer = cast(MaglevLayer, layer)
+            with record_function(profile_name):
+                activations = maglev_layer.require_dense()(
+                    sparse_outputs[index], layer_input, activations
+                )
+        if self._postproc is not None:
+            with record_function("## torchrec_maglev:postproc ##"):
+                output = self._postproc(activations, layer_inputs[-1])
+            if self._loss_only_output:
+                losses, _model_output = output
+                return (losses,)
+            return output
+        return activations
+
+
 class _StageLoss(torch.autograd.Function):
     """Expose a stage's ordered cross-rank backward as an autograd edge."""
 
@@ -471,6 +772,9 @@ class StageWrapper(nn.Module):
             this before wrapping the stage module in DDP so auxiliary prediction
             tensors are not treated as backward roots.
         process_groups: optional externally constructed Maglev process groups.
+        enable_rail: whether to build the Rail-specific sparse/dense stage module.
+            This must be selected before wrapping :attr:`module`. Default is
+            ``False``.
 
     Raises:
         ValueError: if ``layers_per_stage`` does not describe ``model``, the
@@ -562,6 +866,7 @@ class StageWrapper(nn.Module):
         stage_size: int,  # number of ranks for each stage
         loss_only_output: bool = False,
         process_groups: Optional[MaglevProcessGroups] = None,
+        enable_rail: bool = False,
     ) -> None:
         super().__init__()
         if process_groups is None:
@@ -639,12 +944,23 @@ class StageWrapper(nn.Module):
         # the pipelined run ends exactly where MaglevModuleList.forward does.
         self.is_last_stage: bool = stage_index == num_stages - 1
         # Public and reassignable: wrap it in DMP/FSDP/nothing and assign back.
-        self.module: nn.Module = _LayerChain(
+        layer_chain = _RailLayerChain if enable_rail else _LayerChain
+        self.module: nn.Module = layer_chain(
             layers,
             model.postproc if self.is_last_stage else None,
             first_layer_index=self.layer_indices.start,
             loss_only_output=loss_only_output,
         )
+        self._rail_enabled: bool = enable_rail
+        # Kept because :attr:`module` is reassignable: once a caller wraps it in
+        # DMP/DDP/FSDP the authored layers are no longer reachable from it, and
+        # the split backward needs their dense halves by then.
+        self._layers: List[MaglevLayer] = list(layers)
+        # Rail only. Sparse seams parallel to :attr:`_pending`, so the split
+        # backward can list them among its differentiable inputs; and the weight
+        # work each ``I`` deferred, oldest first.
+        self._rail_seams: List[Optional[Sequence[Optional[torch.Tensor]]]] = []
+        self._wdense: List[Tuple[Any, int]] = []
         self._loss_only_output = loss_only_output
         # Set by to(): a meta-authored model has no device to infer, which is the
         # whole point of authoring it there.
@@ -654,6 +970,11 @@ class StageWrapper(nn.Module):
     def loss_only_output(self) -> bool:
         """Whether the final stage exposes only the postprocessed loss."""
         return self._loss_only_output
+
+    @property
+    def rail_enabled(self) -> bool:
+        r"""Return whether this stage was built with Rail phase support."""
+        return self._rail_enabled
 
     @property
     def num_layers(self) -> int:
@@ -759,6 +1080,25 @@ class StageWrapper(nn.Module):
         """The activation this stage sends to the next HSD."""
         return self._out_specs
 
+    def get_batch_size(self, stage_input: Sequence[Any]) -> int:
+        r"""get_batch_size(stage_input) -> int
+
+        Return and validate the logical batch size of local layer inputs.
+
+        Args:
+            stage_input (Sequence[Any]): One input per local layer.
+
+        Returns:
+            int: Logical batch size.
+
+        Raises:
+            ValueError: If the model reports a negative batch size.
+        """
+        batch_size = self._get_batch_size(stage_input)
+        if batch_size < 0:
+            raise ValueError(f"batch size must be non-negative, got {batch_size}")
+        return batch_size
+
     def _activation_batch_size(
         self, stage_input: Optional[Sequence[Any]]
     ) -> Optional[int]:
@@ -769,12 +1109,7 @@ class StageWrapper(nn.Module):
             raise ValueError(
                 "stage input is required for a batch-size-dependent activation"
             )
-        # A layer's inputs and boundary activations describe the same logical
-        # microbatch, so their batch sizes must agree across the whole stage.
-        batch_size = self._get_batch_size(stage_input)
-        if batch_size < 0:
-            raise ValueError(f"batch size must be non-negative, got {batch_size}")
-        return batch_size
+        return self.get_batch_size(stage_input)
 
     def forward(self, model_input: Any) -> torch.Tensor:
         """Distribute and forward every microbatch produced by one raw batch.
@@ -1177,29 +1512,48 @@ class StageWrapper(nn.Module):
         return self.group_by_stage(layer_inputs)
 
     def take_inputs(self, dataloader_iter: Iterator[Any], n: int) -> List[List[Any]]:
-        """Hand the schedule ``n`` microbatches for this stage.
+        """Hand the schedule ``n`` redistributed inputs for this stage.
 
-        Each raw batch from ``dataloader_iter`` is already one microbatch; this
-        method redistributes batches but never chunks them. It runs as many
-        :meth:`input_dist` rounds as it takes, keeping the remainder queued -- so
-        the microbatch count a schedule wants need not equal the ``num_stages`` a
-        round produces, and a batch is consumed only when a round actually runs.
+        This method redistributes batches but never chunks them. The schedule
+        decides whether each input is a microbatch or a whole pass. It runs as
+        many :meth:`input_dist` rounds as needed and keeps the remainder queued,
+        so the requested count need not equal the ``num_stages`` a round
+        produces, and a batch is consumed only when a round actually runs.
         Every rank in the cascade runs the same number of rounds, so every rank
         advances its dataloader in lock-step -- see
         :class:`~torchrec.distributed.maglev.input_dist.InputDistDriver`.
 
         Args:
             dataloader_iter: yields raw batches, one per round.
-            n: how many microbatches the schedule wants.
+            n: how many redistributed inputs the schedule wants.
 
         Returns:
-            List[List[Any]]: ``n`` microbatches, each one input per layer this
-            stage owns.
+            List[List[Any]]: ``n`` inputs, each containing one value per local
+            layer.
         """
         with record_function("## torchrec_maglev:input_driver ##"):
             return self._input_driver.take(
                 lambda: self.send_set(next(dataloader_iter)), n
             )
+
+    def take_global_inputs(self, dataloader_iter: Iterator[Any]) -> List[Any]:
+        r"""take_global_inputs(dataloader_iter) -> List[Any]
+
+        Return one local-stage input whose batch covers an entire Rail pass.
+
+        The input driver does not reshape the batch. A Rail dataloader therefore
+        supplies whole-pass batches, while ordinary schedules supply individual
+        microbatches through :meth:`take_inputs`.
+
+        Args:
+            dataloader_iter (Iterator[Any]): Iterator over whole-pass batches.
+
+        Returns:
+            List[Any]: One whole-pass input per local layer.
+        """
+        with record_function("## torchrec_maglev:global_inputs ##"):
+            (global_inputs,) = self.take_inputs(dataloader_iter, 1)
+        return global_inputs
 
     def _backward_activations(
         self, outputs: Activations, grads: Sequence[torch.Tensor]
@@ -1394,3 +1748,386 @@ class StageWrapper(nn.Module):
         """
         self.finish_send_act()
         self.finish_send_grad()
+
+    # ---- MaglevRail's global sparse pass and dense microbatch work ----
+
+    def _prepare_rail_layer(
+        self,
+        pooled: Optional[torch.Tensor],
+        dense_inputs: List[Any],
+        num_microbatches: int,
+    ) -> Tuple[Optional[LayerSparseOutput], List[Any]]:
+        sparse_output: Optional[LayerSparseOutput] = None
+        if pooled is not None:
+            seams = [
+                part.detach().requires_grad_(True)
+                for part in torch.tensor_split(pooled, num_microbatches, dim=0)
+            ]
+            sparse_output = LayerSparseOutput(pooled=pooled, seams=seams)
+        return sparse_output, dense_inputs
+
+    def sparse_forward_global(
+        self,
+        global_inputs: Sequence[Any],
+        num_microbatches: int,
+    ) -> MaglevRailPassState:
+        r"""sparse_forward_global(global_inputs, num_microbatches) -> MaglevRailPassState
+
+        Run each sparse half once and create detached dense microbatch seams.
+
+        Args:
+            global_inputs (Sequence[Any]): One whole-pass input per local layer.
+            num_microbatches (int): Number of dense microbatches.
+
+        Returns:
+            MaglevRailPassState: Sparse graphs, seams, and dense inputs.
+
+        Raises:
+            RuntimeError: If this stage was not built with Rail support.
+            TypeError: If a sparse half does not return a tensor.
+            ValueError: If input counts or batch dimensions are invalid.
+        """
+        if not self.rail_enabled:
+            raise RuntimeError(
+                "sparse_forward_global requires StageWrapper(..., enable_rail=True)"
+            )
+        if len(global_inputs) != self.num_layers:
+            raise ValueError(
+                f"expected {self.num_layers} layer inputs, got {len(global_inputs)}"
+            )
+        if num_microbatches <= 0:
+            raise ValueError(
+                f"num_microbatches must be positive, got {num_microbatches}"
+            )
+        batch_size = self.get_batch_size(global_inputs)
+        if batch_size < num_microbatches:
+            raise ValueError(
+                f"batch size {batch_size} cannot produce {num_microbatches} "
+                "non-empty microbatches"
+            )
+        if batch_size % num_microbatches:
+            raise ValueError(
+                f"batch size {batch_size} must divide evenly into "
+                f"{num_microbatches} microbatches"
+            )
+
+        sparse_outputs: List[Optional[LayerSparseOutput]] = []
+        dense_inputs_by_layer: List[List[Any]] = []
+        with record_function("## torchrec_maglev:sparse_forward_global ##"):
+            layer_outputs = cast(
+                List[_RailLayerForward],
+                self.module(
+                    global_inputs,
+                    batch_size=batch_size,
+                    num_microbatches=num_microbatches,
+                ),
+            )
+            if len(layer_outputs) != self.num_layers:
+                raise ValueError(
+                    f"sparse phase returned {len(layer_outputs)} layer outputs, "
+                    f"expected {self.num_layers}"
+                )
+            for pooled, dense_inputs in layer_outputs:
+                sparse_output, dense_inputs = self._prepare_rail_layer(
+                    pooled,
+                    dense_inputs,
+                    num_microbatches,
+                )
+                sparse_outputs.append(sparse_output)
+                dense_inputs_by_layer.append(dense_inputs)
+
+        dense_inputs = [
+            [
+                dense_inputs_by_layer[layer][microbatch]
+                for layer in range(self.num_layers)
+            ]
+            for microbatch in range(num_microbatches)
+        ]
+        expected_batch_size = batch_size // num_microbatches
+        for microbatch, dense_input in enumerate(dense_inputs):
+            actual_batch_size = self.get_batch_size(dense_input)
+            if actual_batch_size != expected_batch_size:
+                raise ValueError(
+                    f"dense microbatch {microbatch} has batch size "
+                    f"{actual_batch_size}, expected {expected_batch_size}"
+                )
+        return MaglevRailPassState(
+            sparse_outputs=sparse_outputs,
+            dense_inputs=dense_inputs,
+        )
+
+    def sparse_backward_global(self, state: MaglevRailPassState) -> None:
+        r"""sparse_backward_global(state) -> None
+
+        Resume each whole-pass sparse graph from its dense seam gradients.
+
+        Args:
+            state (MaglevRailPassState): State produced by
+                :meth:`sparse_forward_global`.
+        """
+        with record_function("## torchrec_maglev:sparse_backward_global ##"):
+            for output in state.sparse_outputs:
+                if output is None or not output.pooled.requires_grad:
+                    continue
+                gradient = torch.cat(
+                    [
+                        seam.grad if seam.grad is not None else torch.zeros_like(seam)
+                        for seam in output.seams
+                    ],
+                    dim=0,
+                )
+                torch.autograd.backward(output.pooled, gradient)
+
+    def compute_dense_forward_micro(
+        self,
+        stage_input: Sequence[Any],
+        in_activations: Activations,
+        microbatch_id: int,
+        sparse_outputs: Sequence[Optional[torch.Tensor]],
+    ) -> Any:
+        r"""compute_dense_forward_micro(stage_input, in_activations, microbatch_id, sparse_outputs) -> Any
+
+        Compute one dense-only forward and retain its graph for backward.
+
+        Args:
+            stage_input (Sequence[Any]): One dense input per local layer.
+            in_activations (Activations): Activation entering this stage.
+            microbatch_id (int): Identifier used in profiler ranges.
+            sparse_outputs (Sequence[Optional[torch.Tensor]]): Precomputed sparse
+                outputs for each local layer.
+
+        Returns:
+            Any: Stage outputs retained for backward.
+
+        Raises:
+            RuntimeError: If this stage was not built with Rail support.
+        """
+        if not self.rail_enabled:
+            raise RuntimeError(
+                "compute_dense_forward_micro requires "
+                "StageWrapper(..., enable_rail=True)"
+            )
+        with record_function(f"## dense_forward mb{microbatch_id} ##"):
+            outputs = self.module(
+                stage_input,
+                in_activations,
+                sparse_outputs=sparse_outputs,
+            )
+        self._pending.append((in_activations, outputs, microbatch_id))
+        # A whole backward fills every leaf's ``.grad`` implicitly; the split
+        # backward fills only the inputs it is handed, so the seams must survive.
+        self._rail_seams.append(sparse_outputs)
+        return outputs
+
+    def dense_forward_micro(
+        self,
+        stage_input: Sequence[Any],
+        microbatch_id: int,
+        sparse_outputs: Sequence[Optional[torch.Tensor]],
+    ) -> Any:
+        r"""dense_forward_micro(stage_input, microbatch_id, sparse_outputs) -> Any
+
+        Receive, compute, and send one Rail dense microbatch.
+
+        Args:
+            stage_input (Sequence[Any]): One dense input per local layer.
+            microbatch_id (int): Identifier used in profiler ranges.
+            sparse_outputs (Sequence[Optional[torch.Tensor]]): Precomputed sparse
+                outputs for each local layer.
+
+        Returns:
+            Any: Stage outputs retained for dense backward.
+        """
+        with record_function(f"## dense_recv_act mb{microbatch_id} ##"):
+            in_activations = self.wait_for_act()
+        outputs = self.compute_dense_forward_micro(
+            stage_input,
+            in_activations,
+            microbatch_id,
+            sparse_outputs,
+        )
+        with record_function(f"## dense_finish_send_act mb{microbatch_id} ##"):
+            self.finish_send_act()
+        with record_function(f"## dense_send_act mb{microbatch_id} ##"):
+            self.start_send_act(outputs)
+        return outputs
+
+    def reset_pass_state(self) -> None:
+        r"""reset_pass_state() -> None
+
+        Drop the per-microbatch state a pass accumulates.
+
+        The queues are FIFOs: appended in forward, popped in backward. A pass
+        that raises part-way leaves them populated, and a caller that catches
+        the exception and calls :meth:`progress` again then pops the *previous*
+        pass's entries, pairing one microbatch's saved activations with
+        another's gradients. Clearing them turns that silent mispairing into an
+        ordinary empty-queue error.
+
+        This is local cleanup, not recovery. Outstanding point-to-point work is
+        abandoned rather than waited on -- waiting deadlocks, because the peer
+        that would match a posted recv is typically the rank that already
+        failed. After a raised pass the handoff communicators are out of step
+        across ranks and the job cannot continue; restart it. What this buys is
+        that the wreckage is loud rather than quiet.
+        """
+        self._send_act = []
+        self._send_grad = []
+        self._recv_act.clear()
+        self._recv_grad.clear()
+        self._pending = []
+        self._rail_seams = []
+        self._wdense = []
+
+    def dense_parameters(self) -> List[nn.Parameter]:
+        r"""dense_parameters() -> List[nn.Parameter]
+
+        The parameters the split backward computes weight gradients for.
+
+        A list, not an iterator: the ``I`` and ``W`` halves each need the full
+        set, and handing the same exhausted generator to both fails as a
+        ``KeyError`` deep inside torch rather than as anything legible.
+
+        Exact by construction rather than by name filtering: whatever the layers'
+        dense halves own. A final-stage postprocessor with parameters of its own
+        is therefore *not* included -- a Rail model's head must have no
+        parameters of its own.
+
+        Returns:
+            Iterator[nn.Parameter]: dense parameters, in layer order.
+        """
+        return [
+            parameter
+            for layer in self._layers
+            for parameter in layer.dense_parameters()
+        ]
+
+    @property
+    def pending_weight_work(self) -> int:
+        """Microbatches whose input gradient is done but weight gradient is not."""
+        return len(self._wdense)
+
+    def dense_backward_act_micro(self) -> Optional[torch.Tensor]:
+        r"""dense_backward_act_micro() -> Optional[torch.Tensor]
+
+        The ``I`` half: gradients w.r.t. this stage's inputs, and nothing else.
+
+        Computes only what the pipeline is waiting for. The input gradient is what
+        the previous stage needs, so it is produced and sent immediately; the
+        weight gradient gates nothing until the optimizer step, so it is deferred
+        to :meth:`dense_backward_weight_micro`.
+
+        The win is not that ``W`` fills this stage's idle time -- during warmup a
+        stage has run forwards and no backwards, so no ``W`` exists yet. It is
+        that every hop of the returning gradient wave costs ``I`` instead of
+        ``I + W``, so the wave reaches stage 0 sooner and its stall is shorter.
+
+        ``stage_backward_input`` writes ``.grad`` on everything in
+        ``input_values``, which is why both classes of input go in together: the
+        received activations, whose gradients go upstream, and the sparse seams,
+        whose gradients :meth:`sparse_backward_global` resumes from. The seams are
+        filled here, by ``I``, never by the weight half.
+
+        Returns:
+            Optional[torch.Tensor]: the microbatch loss on the last stage, ``None``
+            elsewhere. ``stage_backward_input`` detaches its roots, so that loss
+            keeps its value but is no longer a graph root.
+        """
+        in_activations, outputs, microbatch_id = self._pending.pop(0)
+        seams = self._rail_seams.pop(0)
+
+        loss: Optional[torch.Tensor] = None
+        root_grads: Optional[List[torch.Tensor]] = None
+        if self.is_last:
+            # postproc produced the loss; it is the graph root and its gradient
+            # is implicit, so no output gradients are supplied.
+            loss = cast(Activations, outputs)[0]
+            roots: List[torch.Tensor] = [loss]
+        else:
+            with record_function(f"## dense_recv_grad mb{microbatch_id} ##"):
+                grads = self.wait_for_grad()
+            grad_carrying = [
+                tensor
+                for tensor, spec in zip(cast(Activations, outputs), self._out_specs)
+                if spec.requires_grad
+            ]
+            if len(grads) != len(grad_carrying):
+                # zip would truncate to the shorter side and drop the tail
+                # output's gradient without a word -- a spec/wire mismatch is a
+                # wiring bug, not something to silently absorb.
+                raise ValueError(
+                    f"stage {self.stage_index} received {len(grads)} gradients "
+                    f"for {len(grad_carrying)} grad-carrying outputs"
+                )
+            pairs = [
+                (output, grad)
+                for output, grad in zip(grad_carrying, grads)
+                if output.requires_grad
+            ]
+            roots = [output for output, _ in pairs]
+            root_grads = [grad for _, grad in pairs]
+
+        input_values: List[torch.Tensor] = [
+            tensor
+            for tensor, spec in zip(in_activations, self._in_specs)
+            if spec.requires_grad
+        ]
+        if seams is not None:
+            input_values.extend(seam for seam in seams if seam is not None)
+
+        if roots and input_values:
+            with record_function(f"## dense_backward_act mb{microbatch_id} ##"):
+                _input_grads, param_groups = stage_backward_input(
+                    stage_outputs_or_loss=roots,
+                    output_grads=root_grads,
+                    input_values=input_values,
+                    # iter() only to satisfy upstream's Iterator annotation;
+                    # both halves traverse the same list, so the weight groups
+                    # the I half records line up with what W looks up.
+                    weights=iter(self.dense_parameters()),
+                )
+            _reject_uncovered_weights(param_groups, self.dense_parameters())
+            self._wdense.append((param_groups, microbatch_id))
+        elif roots:
+            # Nothing differentiable coming in: the first stage, holding only
+            # layers with no sparse half. ``stage_backward_input`` traces *from*
+            # the inputs, so with none it returns empty weight groups and the
+            # weight gradients would silently never be computed. There is also
+            # nothing worth deferring -- no input gradient means no wave to start,
+            # which is the only reason to split -- so run the whole backward.
+            with record_function(f"## dense_backward_act mb{microbatch_id} (whole) ##"):
+                torch.autograd.backward(roots, root_grads)
+
+        with record_function(f"## dense_finish_send_grad mb{microbatch_id} ##"):
+            self.finish_send_grad()
+        with record_function(f"## dense_send_grad mb{microbatch_id} ##"):
+            self.start_send_grad(in_activations)
+        return loss
+
+    def dense_backward_weight_micro(self) -> None:
+        r"""dense_backward_weight_micro() -> None
+
+        The ``W`` half: gradients w.r.t. the dense weights, for one microbatch.
+
+        Runs what :meth:`dense_backward_act_micro` deferred, resuming from the
+        intermediates it saved. It writes ``.grad`` through ``torch.autograd.grad``
+        rather than through an ``AccumulateGrad`` node, so no data-parallel
+        wrapper's hook observes it -- which is why a schedule using this must
+        either issue the pass's gradient reduction itself or refuse to run under a
+        wrapper. The accumulation order also differs from a whole backward, so the
+        two dense schedules agree to floating-point tolerance, not bit-exactly.
+
+        Gates nothing: place it wherever the stage would otherwise idle. The queue
+        must be drained before the optimizer step.
+
+        Raises:
+            ValueError: if no deferred weight work is queued.
+        """
+        if not self._wdense:
+            raise ValueError(
+                f"stage {self.stage_index}: dense_backward_weight_micro() with no "
+                "deferred weight work; call dense_backward_act_micro() first"
+            )
+        param_groups, microbatch_id = self._wdense.pop(0)
+        with record_function(f"## dense_backward_weight mb{microbatch_id} ##"):
+            stage_backward_weight(iter(self.dense_parameters()), param_groups)

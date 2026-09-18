@@ -27,6 +27,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 from torchrec.distributed.embedding_types import EmbeddingTableConfig
+from torchrec.distributed.maglev.input_dist import split_dense_inputs
 from torchrec.distributed.maglev.module import (
     Activations,
     ActivationSpec,
@@ -3179,50 +3180,167 @@ class MaglevTestActivations(StructuredActivations):
     hidden: torch.Tensor
 
 
-class MaglevTestLayer(MaglevLayer):
-    """One Maglev layer for tests and benchmarks.
+class MaglevTestSparse(nn.Module):
+    r"""MaglevTestSparse(tables, device=None)
 
-    A self-contained :class:`~torchrec.distributed.maglev.module.MaglevLayer` that
-    owns its feature partition (sparse + dense) and consumes a
-    :class:`ModelInput`:
-
-    * ``ebc`` pools this layer's sparse features (``layer_input.idlist_features``)
-      into ``(B, sum(F_t * D_t))``; ``input_proj`` projects that to ``layer_dim``.
-      (Unsharded here; sharding within the HSD is applied by
-      :class:`~torchrec.distributed.maglev.stage.EmbeddingShard`.)
-    * ``dense`` projects this layer's float features
-      (``layer_input.float_features``, ``(B, num_float_features)``) to
-      ``layer_dim`` and adds them in (disabled when ``num_float_features == 0``).
-    * non-first layers fold in the previous layer's activation via
-      :class:`MaglevScaledAdd` (the Induct-style residual hand-off),
-    * ``block`` is the layer's dense compute.
-
-    The first layer (``is_first=True``) takes no incoming activation, i.e. its
-    :meth:`in_activation_specs` is empty. The output is authored as a
-    :class:`MaglevTestActivations` value and packed by the supplied structured
-    layout into the tensor-only carrier expected by the pipeline.
+    Pool one Maglev test layer's sparse features.
 
     Args:
-        tables: this layer's embedding tables (its sparse feature partition).
-        layer_dim: width of the activation carried between layers.
-        is_first: whether this is the first layer (no incoming activation).
-        activation_layout: shared layout for the model's structured boundary.
-        num_float_features: width of this layer's float feature input. 0 disables
-            the dense path.
-        device: device to build the layer on.
+        tables (List[EmbeddingBagConfig]): Embedding tables owned by the layer.
+        device (torch.device, optional): Device on which to construct the tables.
+            Default: ``None``
 
     Example::
 
-        from torchrec.distributed.test_utils.model_input import ModelInput
+        >>> tables = [
+        ...     EmbeddingBagConfig(
+        ...         name="table",
+        ...         embedding_dim=4,
+        ...         num_embeddings=16,
+        ...         feature_names=["feature"],
+        ...     )
+        ... ]
+        >>> sparse = MaglevTestSparse(tables)
+    """
 
-        tables = [EmbeddingBagConfig(name="t", embedding_dim=8, num_embeddings=16,
-                                     feature_names=["f"])]
-        layout = StructuredActivationsLayout[MaglevTestActivations]()
-        layer = MaglevTestLayer(tables, layer_dim=12, is_first=True,
-                                activation_layout=layout, num_float_features=4)
-        mi = ModelInput.generate(batch_size=2, tables=tables, weighted_tables=[],
-                                 num_float_features=4)
-        (out,) = layer(mi)
+    def __init__(
+        self,
+        tables: List[EmbeddingBagConfig],
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__()
+        self.ebc: EmbeddingBagCollection = EmbeddingBagCollection(
+            tables=tables, device=device
+        )
+
+    def forward(self, layer_input: "ModelInput") -> torch.Tensor:
+        r"""forward(layer_input) -> torch.Tensor
+
+        Pool the sparse features in ``layer_input``.
+
+        Args:
+            layer_input (ModelInput): Input carrying this layer's sparse features.
+
+        Returns:
+            torch.Tensor: Pooled embeddings with one row per batch element.
+        """
+        kjt = layer_input.idlist_features
+        assert isinstance(kjt, KeyedJaggedTensor)
+        return self.ebc(kjt).values()
+
+
+class MaglevTestDense(nn.Module):
+    r"""MaglevTestDense(input_proj, float_proj, scaled_add, block, activation_layout)
+
+    Run everything in a Maglev test layer after embedding pooling.
+
+    Args:
+        input_proj (nn.Linear): Projection from pooled embeddings to the hidden
+            representation.
+        float_proj (nn.Linear, optional): Projection for dense input features.
+            ``None`` disables the dense-feature contribution.
+        scaled_add (MaglevScaledAdd, optional): Residual handoff from the previous
+            layer. ``None`` identifies the first layer.
+        block (nn.Linear): Dense transformation applied before the output
+            activation.
+        activation_layout (StructuredActivationsLayout): Layout used to pack and
+            unpack the structured activation boundary.
+
+    Example::
+
+        >>> layout = StructuredActivationsLayout[MaglevTestActivations]()
+        >>> dense = MaglevTestDense(
+        ...     input_proj=nn.Linear(8, 12),
+        ...     float_proj=nn.Linear(4, 12),
+        ...     scaled_add=None,
+        ...     block=nn.Linear(12, 12),
+        ...     activation_layout=layout,
+        ... )
+    """
+
+    def __init__(
+        self,
+        input_proj: nn.Linear,
+        float_proj: Optional[nn.Linear],
+        scaled_add: Optional[MaglevScaledAdd],
+        block: nn.Linear,
+        activation_layout: "StructuredActivationsLayout[MaglevTestActivations]",
+    ) -> None:
+        super().__init__()
+        self.activation_layout = activation_layout
+        self.input_proj = input_proj
+        self.float_proj = float_proj
+        self.scaled_add = scaled_add
+        self.block = block
+
+    def forward(
+        self,
+        sparse_output: Optional[torch.Tensor],
+        layer_input: "ModelInput",
+        in_activations: Activations = (),
+    ) -> Activations:
+        r"""forward(sparse_output, layer_input, in_activations=()) -> Activations
+
+        Run the post-pooling computation for one layer.
+
+        Args:
+            sparse_output (torch.Tensor, optional): Pooled embeddings from the
+                sparse half.
+            layer_input (ModelInput): Input carrying the layer's dense features.
+            in_activations (Activations): Previous layer's packed activation.
+                Default: ``()``
+
+        Returns:
+            Activations: Packed output activation for the next layer.
+
+        Raises:
+            ValueError: If no sparse output is provided.
+        """
+        if sparse_output is None:
+            raise ValueError("MaglevTestDense requires pooled sparse output")
+        x = self.input_proj(sparse_output)
+        if self.float_proj is not None:
+            x = x + self.float_proj(layer_input.float_features)
+        if self.scaled_add is not None:
+            previous = self.activation_layout.unpack(in_activations)
+            x = self.scaled_add(previous.hidden, x)
+        return self.activation_layout.pack(
+            MaglevTestActivations(hidden=torch.relu(self.block(x)))
+        )
+
+
+class MaglevTestLayer(MaglevLayer):
+    r"""MaglevTestLayer(tables, layer_dim, is_first, activation_layout, ...)
+
+    Maglev test layer composed from explicit sparse and dense submodules.
+
+    Args:
+        tables (List[EmbeddingBagConfig]): Embedding tables owned by the layer.
+        layer_dim (int): Width of the inter-layer activation.
+        is_first (bool): Whether this is the first model layer.
+        activation_layout (StructuredActivationsLayout): Layout used to pack and
+            unpack the structured activation boundary.
+        num_float_features (int): Width of the dense feature input. Default: ``0``
+        device (torch.device, optional): Device on which to construct the layer.
+            Default: ``None``
+
+    Example::
+
+        >>> tables = [
+        ...     EmbeddingBagConfig(
+        ...         name="table",
+        ...         embedding_dim=4,
+        ...         num_embeddings=16,
+        ...         feature_names=["feature"],
+        ...     )
+        ... ]
+        >>> layout = StructuredActivationsLayout[MaglevTestActivations]()
+        >>> layer = MaglevTestLayer(
+        ...     tables,
+        ...     layer_dim=8,
+        ...     is_first=True,
+        ...     activation_layout=layout,
+        ... )
     """
 
     def __init__(
@@ -3234,64 +3352,62 @@ class MaglevTestLayer(MaglevLayer):
         num_float_features: int = 0,
         device: Optional[torch.device] = None,
     ) -> None:
-        super().__init__()
+        in_dim = sum(t.embedding_dim * len(t.feature_names) for t in tables)
+        super().__init__(
+            sparse=MaglevTestSparse(tables=tables, device=device),
+            dense=MaglevTestDense(
+                input_proj=nn.Linear(in_dim, layer_dim, device=device),
+                float_proj=(
+                    nn.Linear(num_float_features, layer_dim, device=device)
+                    if num_float_features > 0
+                    else None
+                ),
+                scaled_add=(
+                    None if is_first else MaglevScaledAdd(layer_dim, device=device)
+                ),
+                block=nn.Linear(layer_dim, layer_dim, device=device),
+                activation_layout=activation_layout,
+            ),
+        )
         self.is_first = is_first
         self._spec: ActivationSpec = ActivationSpec(
             torch.Size([-1, layer_dim]), torch.float32
         )
         self.activation_layout = activation_layout
-        self.ebc: EmbeddingBagCollection = EmbeddingBagCollection(
-            tables=tables, device=device
-        )
-        in_dim = sum(t.embedding_dim * len(t.feature_names) for t in tables)
-        self.input_proj: nn.Linear = nn.Linear(in_dim, layer_dim, device=device)
-        self.dense: Optional[nn.Linear] = (
-            nn.Linear(num_float_features, layer_dim, device=device)
-            if num_float_features > 0
-            else None
-        )
-        self.scaled_add: Optional[MaglevScaledAdd] = (
-            None if is_first else MaglevScaledAdd(layer_dim, device=device)
-        )
-        self.block: nn.Linear = nn.Linear(layer_dim, layer_dim, device=device)
 
     def in_activation_specs(self) -> Tuple[ActivationSpec, ...]:
-        """``()`` for the first layer, else the ``(B, layer_dim)`` residual input."""
+        r"""in_activation_specs() -> Tuple[ActivationSpec, ...]
+
+        Return no input specs for the first layer and one hidden spec otherwise.
+        """
         return () if self.is_first else (self._spec,)
 
     def out_activation_specs(self) -> Tuple[ActivationSpec, ...]:
-        """The ``(B, layer_dim)`` activation handed to the next layer."""
+        r"""out_activation_specs() -> Tuple[ActivationSpec, ...]
+
+        Return the hidden activation specification handed to the next layer.
+        """
         return (self._spec,)
 
-    def forward(
+    def split_dense_input(
         self,
-        layer_input: "ModelInput",
-        in_activations: Activations = (),
-    ) -> Activations:
-        """Run this layer over its ``ModelInput`` and the previous activation.
+        layer_input: Any,
+        batch_size: int,
+        num_microbatches: int,
+    ) -> List[Any]:
+        r"""split_dense_input(layer_input, batch_size, num_microbatches) -> List[Any]
+
+        Split dense fields into views and remove already-consumed sparse fields.
 
         Args:
-            layer_input: this layer's ``ModelInput`` (float + sparse features).
-            in_activations: 1-tuple holding the previous layer's
-                ``(B, layer_dim)`` activation, or ``()`` for the first layer.
+            layer_input (Any): Whole-pass input for this layer.
+            batch_size (int): Logical whole-pass batch size.
+            num_microbatches (int): Number of dense microbatches.
 
         Returns:
-            Tuple[torch.Tensor, ...]: 1-tuple holding this layer's
-            ``(B, layer_dim)`` output activation.
+            List[Any]: One dense-only input per microbatch.
         """
-        kjt = layer_input.idlist_features
-        assert isinstance(kjt, KeyedJaggedTensor)
-        pooled = self.ebc(kjt).values()  # (B, in_dim)
-        x = self.input_proj(pooled)  # (B, layer_dim)
-        if self.dense is not None:
-            x = x + self.dense(layer_input.float_features)  # add dense features
-        if not self.is_first:
-            assert self.scaled_add is not None
-            previous = self.activation_layout.unpack(in_activations)
-            x = self.scaled_add(previous.hidden, x)
-        return self.activation_layout.pack(
-            MaglevTestActivations(hidden=torch.relu(self.block(x)))
-        )
+        return split_dense_inputs(layer_input, batch_size, num_microbatches)
 
 
 class MaglevTestModel(MaglevModuleList):
