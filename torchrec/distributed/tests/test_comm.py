@@ -14,6 +14,7 @@ import os
 import unittest
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Union
+from unittest.mock import MagicMock, patch
 
 import hypothesis.strategies as st
 import torch
@@ -22,6 +23,8 @@ import torchrec
 import torchrec.distributed.comm_ops as comm_ops
 from hypothesis import given, settings
 from torch.distributed.distributed_c10d import GroupMember
+from torchrec.distributed import comm
+from torchrec.distributed.comm import get_2d_pod_size, get_resolved_pod_size
 from torchrec.test_utils import get_free_port, seed_and_log
 
 torch.ops.import_module("fbgemm_gpu.sparse_ops")
@@ -698,3 +701,275 @@ class TestAllToAll(unittest.TestCase):
             # pyrefly: ignore[bad-argument-type]
             callable=self._test_all_gather_base_pooled_cpu,
         )
+
+
+class TestResolvedPodSize(unittest.TestCase):
+    """
+    pod_size is the multiplier that makes the runtime's TwRw/Grid node width match
+    the planner's Topology.intra_group_size. It is absent on every SKU whose NVLink
+    domain is a single host, so these cases pin the unset default as tightly as the
+    NVL72 values -- a regression there silently narrows the runtime group and drops
+    embedding shards rather than failing.
+    """
+
+    def test_unset_is_none_so_non_nvl72_skus_are_unaffected(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(get_resolved_pod_size())
+
+    def test_reads_planner_resolved_value(self) -> None:
+        for raw, expected in (("1", 1), ("2", 2), ("4", 4), ("18", 18), ("36", 36)):
+            with self.subTest(raw=raw), patch.dict(
+                os.environ, {"TORCHREC_RESOLVED_POD_SIZE": raw}, clear=True
+            ):
+                self.assertEqual(get_resolved_pod_size(), expected)
+
+    def test_rejects_non_positive_instead_of_zeroing_the_node_width(self) -> None:
+        # A 0 would zero devices_per_node and turn the callers' divisibility checks
+        # into a ZeroDivisionError, hiding the misconfiguration.
+        for raw in ("0", "-1"):
+            with self.subTest(raw=raw), patch.dict(
+                os.environ, {"TORCHREC_RESOLVED_POD_SIZE": raw}, clear=True
+            ):
+                with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                    get_resolved_pod_size()
+
+    def test_rejects_non_numeric_with_the_same_descriptive_error(self) -> None:
+        # Otherwise a typo'd launcher value surfaces as a bare
+        # "invalid literal for int()" that names neither the variable nor the value.
+        for raw in ("abc", "", "2.5"):
+            with self.subTest(raw=raw), patch.dict(
+                os.environ, {"TORCHREC_RESOLVED_POD_SIZE": raw}, clear=True
+            ):
+                with self.assertRaisesRegex(ValueError, "must be a positive integer"):
+                    get_resolved_pod_size()
+
+    def test_topology_domain_multiple_alone_does_not_set_pod_size(self) -> None:
+        # Parity with the 1D path (get_topology_group_world_size): only the
+        # planner-exported TORCHREC_RESOLVED_POD_SIZE is authoritative, because
+        # TOPOLOGY_DOMAIN_MULTIPLE is the configured *minimum* and can disagree
+        # with the placement MAST actually gave the job.
+        with patch.dict(os.environ, {"TOPOLOGY_DOMAIN_MULTIPLE": "36"}, clear=True):
+            self.assertIsNone(get_resolved_pod_size())
+
+
+class TestTwoDPodSizeKillswitch(unittest.TestCase):
+    """
+    get_2d_pod_size() is the single place the 2D killswitch is read, so these cases
+    pin both of its inputs: the knob and the planner-exported env var. Collapsing to
+    1 when the knob is off is what makes the knob a revert rather than a hard failure
+    -- the TwRw width check is gated on the same knob.
+    """
+
+    def test_knob_on_applies_planner_pod_size(self) -> None:
+        with patch.dict(
+            os.environ, {"TORCHREC_RESOLVED_POD_SIZE": "4"}, clear=True
+        ), patch(
+            "torch._utils_internal.justknobs_check", return_value=True
+        ) as jk_check:
+            self.assertEqual(get_2d_pod_size(), 4)
+        jk_check.assert_called_with("pytorch/torchrec:enable_2D_support_for_pod_size")
+
+    def test_knob_off_collapses_to_one_even_when_planner_exported_a_value(self) -> None:
+        with patch.dict(
+            os.environ, {"TORCHREC_RESOLVED_POD_SIZE": "36"}, clear=True
+        ), patch("torch._utils_internal.justknobs_check", return_value=False):
+            self.assertEqual(get_2d_pod_size(), 1)
+
+    def test_knob_on_with_no_planner_value_is_a_no_op_multiplier(self) -> None:
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "torch._utils_internal.justknobs_check", return_value=True
+        ):
+            self.assertEqual(get_2d_pod_size(), 1)
+
+
+@dataclass
+class _FakeShardingEnv2D:
+    """
+    Stands in for ShardingEnv2D, which cannot be constructed without live process
+    groups. intra_and_cross_node_pg_2D reads exactly these three attributes, so a
+    narrower double would not change the code path under test.
+    """
+
+    sharding_pg: object
+    node_group_size: Optional[int]
+    use_inter_host_allreduce: bool = False
+
+
+class TestIntraAndCrossNodePg2DNodeWidth(unittest.TestCase):
+    """
+    The node width intra_and_cross_node_pg_2D builds must equal the planner's
+    Topology.intra_group_size (pod_size * local_world_size). When it is narrower,
+    TwRw places only the first `local_size` row shards of a longer plan and drops
+    the rest, while the checkpoint metadata still advertises the whole tensor -- the
+    model then trains on a partial embedding table and the gap only surfaces much
+    later as a DCP "Global Plan Validation Failed" tensor-volume vs chunks-volume
+    mismatch. These cases pin the width arithmetic directly, since reproducing it
+    end to end needs an NVL72 job and a checkpoint save.
+    """
+
+    def setUp(self) -> None:
+        # The builder memoizes its groups in module globals and skips rebuilding when
+        # they are already set, so a value leaked from one case would satisfy the next
+        # case's `if _INTRA_PG_2D is None` guard and silently skip the assertions.
+        self._reset_module_globals()
+        self.addCleanup(self._reset_module_globals)
+
+    @staticmethod
+    def _reset_module_globals() -> None:
+        comm._INTRA_PG_2D = None
+        comm._CROSS_PG_2D = None
+        comm._NODE_GROUP_SIZE_2D = None
+
+    @staticmethod
+    def _fake_dist(world_size: int, sharding_group_size: int) -> MagicMock:
+        """A dist double whose get_world_size distinguishes global from sharding-group."""
+        fake = MagicMock()
+        fake.get_backend.return_value = "fake_backend"
+        fake.get_rank.return_value = 0
+        # The builder calls get_world_size(env.sharding_pg) for the sharding group and
+        # get_world_size() for the global world; the argument is what separates them.
+        fake.get_world_size.side_effect = lambda group=None: (
+            sharding_group_size if group is not None else world_size
+        )
+        fake.new_group.side_effect = lambda **kwargs: ("pg", tuple(kwargs["ranks"]))
+        return fake
+
+    def _build(
+        self,
+        world_size: int,
+        sharding_group_size: int,
+        node_group_size: Optional[int],
+        pod_size: Optional[str],
+        local_world_size: Optional[str] = None,
+    ) -> MagicMock:
+        env_vars: dict[str, str] = {}
+        if pod_size is not None:
+            env_vars["TORCHREC_RESOLVED_POD_SIZE"] = pod_size
+        if local_world_size is not None:
+            env_vars["LOCAL_WORLD_SIZE"] = local_world_size
+
+        fake_dist = self._fake_dist(world_size, sharding_group_size)
+        with patch.dict(os.environ, env_vars, clear=True), patch.object(
+            comm, "dist", fake_dist
+        ):
+            comm.intra_and_cross_node_pg_2D(
+                # pyrefly: ignore[bad-argument-type]
+                _FakeShardingEnv2D(
+                    sharding_pg=object(), node_group_size=node_group_size
+                ),
+            )
+        return fake_dist
+
+    def test_pod_size_widens_the_node_group(self) -> None:
+        # The regression this fix exists for. On an NVL72 SKU one NVLink domain spans
+        # pod_size hosts, so the planner cuts pod_size * node_group_size row shards.
+        # Before the fix this width was node_group_size alone -- exactly pod_size too
+        # narrow, which is the 2x volume ratio seen in the field.
+        self._build(
+            world_size=32,
+            sharding_group_size=16,
+            node_group_size=2,
+            pod_size="2",
+        )
+        self.assertEqual(comm.get_node_group_size(), 4)
+
+    def test_node_group_scales_with_each_pod_size(self) -> None:
+        for pod_size, expected in (("1", 2), ("2", 4), ("4", 8)):
+            with self.subTest(pod_size=pod_size):
+                self._reset_module_globals()
+                self._build(
+                    world_size=64,
+                    sharding_group_size=32,
+                    node_group_size=2,
+                    pod_size=pod_size,
+                )
+                self.assertEqual(comm.get_node_group_size(), expected)
+
+    def test_unset_pod_size_leaves_the_width_unchanged(self) -> None:
+        # Every SKU whose NVLink domain is a single host leaves this unset, so the
+        # multiplier must be a no-op there rather than defaulting to something wider.
+        self._build(
+            world_size=32,
+            sharding_group_size=16,
+            node_group_size=2,
+            pod_size=None,
+        )
+        self.assertEqual(comm.get_node_group_size(), 2)
+
+    def test_falls_back_to_local_world_size_when_node_group_size_is_unset(self) -> None:
+        # node_group_size=None routes through get_local_size(world_size), and pod_size
+        # has to multiply that fallback too -- not just the explicit setting.
+        self._build(
+            world_size=32,
+            sharding_group_size=16,
+            node_group_size=None,
+            pod_size="2",
+            local_world_size="4",
+        )
+        self.assertEqual(comm.get_node_group_size(), 8)
+
+    def test_intra_groups_are_exactly_one_node_wide(self) -> None:
+        # The width is what TwRw._shard() iterates when placing row shards, so assert
+        # on the rank lists actually handed to new_group, not only the cached int.
+        fake_dist = self._build(
+            world_size=32,
+            sharding_group_size=16,
+            node_group_size=2,
+            pod_size="2",
+        )
+        intra_calls = [
+            call.kwargs["ranks"]
+            for call in fake_dist.new_group.call_args_list
+            if call.kwargs["group_desc"] == "sharding_intra_pg"
+        ]
+        self.assertTrue(intra_calls)
+        for ranks in intra_calls:
+            self.assertEqual(len(ranks), 4)
+
+    def test_non_tiling_topology_raises_before_building_any_group(self) -> None:
+        # A width that does not divide the sharding group cannot place the plan. It has
+        # to fail here, while both numbers are still in scope, rather than let the
+        # truncating loop below build a malformed group.
+        fake_dist = self._fake_dist(world_size=24, sharding_group_size=6)
+        with patch.dict(
+            os.environ, {"TORCHREC_RESOLVED_POD_SIZE": "2"}, clear=True
+        ), patch.object(comm, "dist", fake_dist):
+            with self.assertRaisesRegex(ValueError, "does not tile the sharding group"):
+                comm.intra_and_cross_node_pg_2D(
+                    # pyrefly: ignore[bad-argument-type]
+                    _FakeShardingEnv2D(sharding_pg=object(), node_group_size=2),
+                )
+        fake_dist.new_group.assert_not_called()
+
+    def test_non_tiling_failure_is_a_valueerror_not_an_assert(self) -> None:
+        # Deliberately not an assert: under `python -O` a stripped assert would let a
+        # non-tiling topology through and reintroduce the silent shard drop.
+        fake_dist = self._fake_dist(world_size=24, sharding_group_size=6)
+        with patch.dict(
+            os.environ, {"TORCHREC_RESOLVED_POD_SIZE": "2"}, clear=True
+        ), patch.object(comm, "dist", fake_dist):
+            with self.assertRaises(ValueError) as ctx:
+                comm.intra_and_cross_node_pg_2D(
+                    # pyrefly: ignore[bad-argument-type]
+                    _FakeShardingEnv2D(sharding_pg=object(), node_group_size=2),
+                )
+        self.assertNotIsInstance(ctx.exception, AssertionError)
+        # The message has to name the operands, otherwise the failure gives no hint
+        # about which of pod_size / node_group_size produced the bad width.
+        message = str(ctx.exception)
+        for expected in ("devices_per_node=4", "sharding_group_size=6", "pod_size=2"):
+            self.assertIn(expected, message)
+
+    def test_meta_device_short_circuits_before_touching_dist(self) -> None:
+        # Meta-device construction has no process groups to build; TwRw mirrors the
+        # width itself in that case, so this must stay a no-op.
+        fake_dist = self._fake_dist(world_size=32, sharding_group_size=16)
+        with patch.object(comm, "dist", fake_dist):
+            intra, cross = comm.intra_and_cross_node_pg_2D(
+                # pyrefly: ignore[bad-argument-type]
+                _FakeShardingEnv2D(sharding_pg=object(), node_group_size=2),
+                device=torch.device("meta"),
+            )
+        self.assertIsNone(intra)
+        self.assertIsNone(cross)
+        fake_dist.new_group.assert_not_called()

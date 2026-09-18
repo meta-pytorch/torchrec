@@ -12,6 +12,7 @@ import os
 from typing import cast, List, Optional, Tuple
 
 import torch
+import torch._utils_internal
 import torch.distributed as dist
 from torchrec.distributed.types import ShardingEnv2D
 
@@ -128,6 +129,63 @@ def get_topology_domain_multiple() -> Optional[int]:
     return topology_domain_multiple
 
 
+def get_resolved_pod_size() -> Optional[int]:
+    """
+    Hosts wired into one high-bandwidth (NVLink) domain, as resolved by the planner
+    and exported via TORCHREC_RESOLVED_POD_SIZE. None when unset.
+
+    The value itself is resolved fb-internally (hardware_utilities.resolve_pod_size,
+    from the MAST host_count_per_domain); it reaches this OSS module only through the
+    env var, which is why it is read rather than passed. This is the single reader --
+    both the 1D and 2D process-group builders go through it so they cannot drift.
+
+    Only the NVL72 parts (GB200/GB300) put several hosts in one domain. Everywhere
+    else a host is its own domain and this is unset, making it a no-op multiplier.
+    """
+    resolved = os.environ.get("TORCHREC_RESOLVED_POD_SIZE")
+    if resolved is None:
+        return None
+    # Validating here keeps a misconfigured launcher from reaching the callers, where
+    # a 0 turns their divisibility checks into a ZeroDivisionError and a non-numeric
+    # value surfaces as a bare "invalid literal for int()" with no hint of the source.
+    invalid = ValueError(
+        f"TORCHREC_RESOLVED_POD_SIZE must be a positive integer, got {resolved!r}"
+    )
+    try:
+        pod_size = int(resolved)
+    except ValueError as e:
+        raise invalid from e
+    if pod_size < 1:
+        raise invalid
+    return pod_size
+
+
+_ENABLE_2D_POD_SIZE_JK = "pytorch/torchrec:enable_2D_support_for_pod_size"
+
+
+def is_2d_pod_size_enabled() -> bool:
+    """
+    Killswitch for applying pod_size to 2D node groups, and for the TwRw node-width
+    check that enforces planner/runtime agreement. Turning it off restores the
+    pre-existing 2D behaviour end to end: no pod_size factor, and no width check to
+    reject the mismatch that its absence creates.
+
+    Scoped to 2D on purpose -- the 1D path has applied pod_size since D105663332 and
+    is not gated here, so flipping this knob cannot regress it.
+    """
+    return torch._utils_internal.justknobs_check(_ENABLE_2D_POD_SIZE_JK)
+
+
+def get_2d_pod_size() -> int:
+    """
+    pod_size to apply to a 2D node group: the planner-resolved value, or 1 when the
+    knob is off or the planner exported nothing.
+    """
+    if not is_2d_pod_size_enabled():
+        return 1
+    return get_resolved_pod_size() or 1
+
+
 def get_topology_group_world_size(world_size: Optional[int] = None) -> int:
     """
     Gets topology group world size, total number of processes linked within a topology group
@@ -142,14 +200,12 @@ def get_topology_group_world_size(world_size: Optional[int] = None) -> int:
     # 'TORCHREC_RESOLVED_POD_SIZE' env variable can be set
     # to the actual allocation while 'TOPOLOGY_DOMAIN_MULTIPLE'
     # will give us the minimum configured pod size.
-    resolved = os.environ.get("TORCHREC_RESOLVED_POD_SIZE")
-    if resolved is None:
+    topology_domain_multiple = get_resolved_pod_size()
+    if topology_domain_multiple is None:
         logger.warning(
             "TORCHREC_RESOLVED_POD_SIZE not set," " utilizing LOCAL_WORLD_SIZE instead."
         )
         return local_world_size
-
-    topology_domain_multiple = int(resolved)
 
     # Total number of processes/gpu in domain = topology_domain_mult * number_gpu_per_domain
     numb_proc_per_pod = topology_domain_multiple * local_world_size
@@ -279,14 +335,30 @@ def intra_and_cross_node_pg_2D(
     )  # Local replica group world size
     world_size = dist.get_world_size()  # Global world size
     step = world_size // sharding_group_size
-    devices_per_node = (
+    # The planner sizes a TWRW/GRID row-shard group as pod_size * local_world_size
+    # (Topology.intra_group_size), because on NVL72 the NVLink domain spans several
+    # hosts. Applying pod_size here too keeps this group the same width as the one
+    # the plan was cut for; omitting it makes the runtime group narrower by exactly
+    # pod_size, and TwRw then silently drops the surplus shards while the checkpoint
+    # metadata still advertises the full tensor. The 1D path already agrees with the
+    # planner via get_topology_group_world_size().
+    pod_size = get_2d_pod_size()
+    devices_per_node = pod_size * (
         env.node_group_size if env.node_group_size else get_local_size(world_size)
     )
     _NODE_GROUP_SIZE_2D = devices_per_node
 
-    assert (
-        sharding_group_size % devices_per_node == 0
-    ), f"node group size is not divisible by sharding group size, {devices_per_node=}, {sharding_group_size=}"
+    # Checked against the sharding group, not the global world: under 2D a node group
+    # is carved out of a sharding group, so the sharding group is what has to tile.
+    # Raised rather than asserted so the check survives `python -O`, where a stripped
+    # assert would let a non-tiling topology build a malformed group instead.
+    if sharding_group_size % devices_per_node != 0:
+        raise ValueError(
+            "2D node group does not tile the sharding group: "
+            f"{devices_per_node=} does not divide {sharding_group_size=} "
+            f"({pod_size=}, node_group_size={env.node_group_size}). "
+            "The plan cannot be placed on this topology."
+        )
     intra_pg_groups: List[List[List[int]]] = [[] for _ in range(step)]
 
     if _INTRA_PG_2D is None:
