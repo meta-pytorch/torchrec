@@ -813,6 +813,99 @@ def table_batched_embedding_bag_forward_weighted_kernel(
 
 
 @triton.jit
+# Triton TR001: BLOCK_SIZE is fixed by the embedding width.
+def table_batched_embedding_bag_forward_weighted_capped_kernel(  # noqa: TR001
+    output_ptr,
+    indices_ptr,
+    offsets_ptr,
+    weight_ptr,
+    table_offsets_ptr,
+    embedding_dims_ptr,
+    embedding_offsets_ptr,
+    feature_table_map_ptr,
+    per_sample_weights_ptr,
+    row_output_offsets_ptr,
+    b_t_map_ptr,
+    total_embedding_dim: tl.constexpr,
+    B,
+    total_B,
+    BLOCK_SIZE: tl.constexpr,
+    BAGS_PER_PROGRAM: tl.constexpr,
+    vbe: tl.constexpr = False,
+    info_B_num_bits=0,
+    info_B_mask=0,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
+) -> None:
+    first_b_t = tl.program_id(0).to(tl.int64) * BAGS_PER_PROGRAM
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    for bag_slot in tl.range(0, BAGS_PER_PROGRAM):
+        b_t = first_b_t + bag_slot
+        if b_t < total_B:
+            if vbe:
+                info = tl.load(b_t_map_ptr + b_t).to(tl.uint32)
+                t = (info >> info_B_num_bits).to(tl.int32)
+                b = (info & info_B_mask).to(tl.int32)
+            else:
+                t = b_t // B
+                b = b_t % B
+
+            table_idx = tl.load(feature_table_map_ptr + t)
+            table_offset = tl.load(table_offsets_ptr + table_idx)
+            embedding_dim = tl.load(embedding_dims_ptr + t)
+            embedding_offset = tl.load(embedding_offsets_ptr + t)
+            start = tl.load(offsets_ptr + b_t)
+            end = tl.load(offsets_ptr + b_t + 1)
+            mask = col_offsets < embedding_dim
+            accumulator_dtype: tl.constexpr = (
+                tl.float32
+                if ENABLE_TRITON_TBE_OPTIMIZATIONS
+                or weight_ptr.dtype.element_ty != tl.float32
+                else tl.float64
+            )
+            bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
+
+            step: tl.constexpr = 4
+            ns = (end - start) // step
+            endn = start + step * ns
+            for idx in range(start, endn, step):
+                for row_offset in tl.static_range(0, step):
+                    row_idx = tl.load(indices_ptr + idx + row_offset)
+                    row = tl.load(
+                        weight_ptr
+                        + table_offset
+                        + row_idx * embedding_dim
+                        + col_offsets,
+                        mask=mask,
+                        other=0.0,
+                        eviction_policy="evict_first",
+                    )
+                    sample_weight = tl.load(per_sample_weights_ptr + idx + row_offset)
+                    bag_output += row.to(tl.float32) * sample_weight
+
+            for idx in range(endn, end):
+                row_idx = tl.load(indices_ptr + idx)
+                row = tl.load(
+                    weight_ptr + table_offset + row_idx * embedding_dim + col_offsets,
+                    mask=mask,
+                    other=0.0,
+                    eviction_policy="evict_first",
+                )
+                sample_weight = tl.load(per_sample_weights_ptr + idx)
+                bag_output += row.to(tl.float32) * sample_weight
+
+            if vbe:
+                output_row_start_ptr = output_ptr + tl.load(
+                    row_output_offsets_ptr + b_t
+                )
+            else:
+                output_row_start_ptr = (
+                    output_ptr + b * total_embedding_dim + embedding_offset
+                )
+            tl.store(output_row_start_ptr + col_offsets, bag_output, mask=mask)
+
+
+@triton.jit
 # Triton TR001: BLOCK_SIZE is the required embedding-width bound, not a tuning choice.
 def table_batched_embedding_bag_grad_per_sample_weights_kernel(  # noqa: TR001
     grad_per_sample_weights_ptr,
@@ -1183,6 +1276,203 @@ def table_batched_embedding_bag_forward_unweighted_kernel(
 
     if FUSED_BOUNDS_CHECK and warning_count > 0:
         tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
+
+
+@triton.jit
+# Triton TR001: BLOCK_SIZE is fixed by the embedding width.
+def table_batched_embedding_bag_forward_unweighted_capped_kernel(  # noqa: TR001
+    output_ptr,
+    indices_ptr,
+    offsets_ptr,
+    weight_ptr,
+    table_offsets_ptr,
+    embedding_dims_ptr,
+    embedding_offsets_ptr,
+    feature_table_map_ptr,
+    rows_cumsum_ptr,
+    bounds_check_warning_ptr,
+    row_output_offsets_ptr,
+    B_offsets_ptr,
+    total_embedding_dim: tl.constexpr,
+    B,
+    T: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BAGS_PER_PROGRAM: tl.constexpr,
+    vbe: tl.constexpr = False,
+    FUSED_BOUNDS_CHECK: tl.constexpr = False,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
+) -> None:
+    base_b = tl.program_id(0).to(tl.int64) * BAGS_PER_PROGRAM
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+    warning_count = 0
+
+    for t in range(0, T):
+        table_idx = tl.load(feature_table_map_ptr + t, eviction_policy="evict_last")
+        table_offset = tl.load(
+            table_offsets_ptr + table_idx, eviction_policy="evict_last"
+        )
+        embedding_dim = tl.load(embedding_dims_ptr + t, eviction_policy="evict_last")
+        embedding_offset = tl.load(
+            embedding_offsets_ptr + t, eviction_policy="evict_last"
+        )
+        if FUSED_BOUNDS_CHECK:
+            num_rows = tl.load(rows_cumsum_ptr + table_idx + 1) - tl.load(
+                rows_cumsum_ptr + table_idx
+            )
+        if vbe:
+            B_start = tl.load(B_offsets_ptr + t).to(tl.int64)
+            B_end = tl.load(B_offsets_ptr + t + 1).to(tl.int64)
+            B_t = B_end - B_start
+
+        for bag_slot in tl.range(0, BAGS_PER_PROGRAM):
+            b = base_b + bag_slot
+            if vbe:
+                b_t = B_start + b
+                in_bounds = b < B_t
+            else:
+                b_t = t * B + b
+                in_bounds = b < B
+
+            if in_bounds:
+                start = tl.load(offsets_ptr + b_t)
+                end = tl.load(offsets_ptr + b_t + 1)
+                mask = col_offsets < embedding_dim
+                accumulator_dtype: tl.constexpr = (
+                    tl.float32
+                    if ENABLE_TRITON_TBE_OPTIMIZATIONS
+                    or weight_ptr.dtype.element_ty != tl.float32
+                    else tl.float64
+                )
+                bag_output = tl.zeros((BLOCK_SIZE,), dtype=accumulator_dtype)
+                for idx in range(start, end):
+                    row_idx, invalid = _load_checked_index(
+                        indices_ptr,
+                        idx,
+                        num_rows if FUSED_BOUNDS_CHECK else 0,
+                        True,
+                        FUSED_BOUNDS_CHECK,
+                    )
+                    if FUSED_BOUNDS_CHECK:
+                        warning_count += invalid.to(tl.int32)
+                    row = tl.load(
+                        weight_ptr
+                        + table_offset
+                        + row_idx * embedding_dim
+                        + col_offsets,
+                        mask=mask,
+                        other=0.0,
+                        eviction_policy="evict_first",
+                    )
+                    bag_output += row.to(tl.float32)
+
+                if vbe:
+                    output_row_ptrs = (
+                        output_ptr + tl.load(row_output_offsets_ptr + b_t) + col_offsets
+                    )
+                else:
+                    output_row_ptrs = (
+                        output_ptr
+                        + b * total_embedding_dim
+                        + embedding_offset
+                        + col_offsets
+                    )
+                tl.store(output_row_ptrs, bag_output, mask=mask)
+
+    if FUSED_BOUNDS_CHECK and warning_count > 0:
+        tl.atomic_add(bounds_check_warning_ptr, warning_count.to(tl.int64))
+
+
+@triton.jit
+# Triton TR001: BLOCK_SIZE is fixed by the embedding width.
+def table_batched_embedding_bag_forward_unweighted_parallel_bags_kernel(  # noqa: TR001
+    output_ptr,
+    indices_ptr,
+    offsets_ptr,
+    weight_ptr,
+    table_offsets_ptr,
+    embedding_dims_ptr,
+    embedding_offsets_ptr,
+    feature_table_map_ptr,
+    total_embedding_dim: tl.constexpr,
+    B,
+    T: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    FEATURE_START: tl.constexpr,
+    FEATURE_END: tl.constexpr,
+    BAGS_PER_PROGRAM: tl.constexpr,
+    PARALLEL_BAGS: tl.constexpr,
+    ENABLE_TRITON_TBE_OPTIMIZATIONS: tl.constexpr = False,
+) -> None:
+    base_b = tl.program_id(0).to(tl.int64) * BAGS_PER_PROGRAM
+    bag_offsets = tl.arange(0, PARALLEL_BAGS)
+    col_offsets = tl.arange(0, BLOCK_SIZE)
+
+    for t in range(FEATURE_START, FEATURE_END):
+        table_idx = tl.load(feature_table_map_ptr + t, eviction_policy="evict_last")
+        table_offset = tl.load(
+            table_offsets_ptr + table_idx, eviction_policy="evict_last"
+        )
+        embedding_dim = tl.load(embedding_dims_ptr + t, eviction_policy="evict_last")
+        embedding_offset = tl.load(
+            embedding_offsets_ptr + t, eviction_policy="evict_last"
+        )
+
+        for bag_slot in tl.range(0, BAGS_PER_PROGRAM, PARALLEL_BAGS):
+            b = base_b + bag_slot + bag_offsets
+            in_bounds = b < B
+            b_t = t * B + b
+            start = tl.load(
+                offsets_ptr + b_t,
+                mask=in_bounds,
+                other=0,
+                eviction_policy="evict_last",
+            )
+            end = tl.load(
+                offsets_ptr + b_t + 1,
+                mask=in_bounds,
+                other=0,
+                eviction_policy="evict_last",
+            )
+            accumulator_dtype: tl.constexpr = (
+                tl.float32
+                if ENABLE_TRITON_TBE_OPTIMIZATIONS
+                or weight_ptr.dtype.element_ty != tl.float32
+                else tl.float64
+            )
+            bag_output = tl.zeros((PARALLEL_BAGS, BLOCK_SIZE), dtype=accumulator_dtype)
+            max_bag_length = tl.max(end - start, axis=0)
+
+            for bag_index in range(0, max_bag_length):
+                active_bag = in_bounds & (start + bag_index < end)
+                row_idx = tl.load(
+                    indices_ptr + start + bag_index,
+                    mask=active_bag,
+                    other=0,
+                    eviction_policy="evict_last",
+                )
+                weight_offsets = (
+                    table_offset
+                    + row_idx[:, None] * embedding_dim
+                    + col_offsets[None, :]
+                )
+                weight_mask = active_bag[:, None] & (
+                    col_offsets[None, :] < embedding_dim
+                )
+                row = tl.load(
+                    weight_ptr + weight_offsets,
+                    mask=weight_mask,
+                    other=0.0,
+                    eviction_policy="evict_first",
+                )
+                bag_output += row.to(tl.float32)
+
+            output_offsets = (
+                b[:, None] * total_embedding_dim
+                + embedding_offset
+                + col_offsets[None, :]
+            )
+            output_mask = in_bounds[:, None] & (col_offsets[None, :] < embedding_dim)
+            tl.store(output_ptr + output_offsets, bag_output, mask=output_mask)
 
 
 @triton.jit
@@ -2704,6 +2994,8 @@ class TritonTBE(torch.autograd.Function):
         feature_weight_chunk_ids_tensor: Optional[torch.Tensor] = None,
         feature_chunk_relative_table_offsets_tensor: Optional[torch.Tensor] = None,
         enable_triton_tbe_optimizations: bool = False,
+        forward_block_limit: int = 0,
+        vbe_forward_block_limit: int = 0,
     ) -> torch.Tensor:
         assert weight_ptrs
         assert weight_chunk_starts
@@ -2713,6 +3005,9 @@ class TritonTBE(torch.autograd.Function):
 
         # VBE support: use pre-computed metadata if available, otherwise compute
         vbe = batch_size_per_feature_per_rank is not None
+        active_forward_block_limit = (
+            vbe_forward_block_limit if vbe else forward_block_limit
+        )
         if vbe:
             if precomputed_vbe_metadata is not None:
                 vbe_metadata = precomputed_vbe_metadata
@@ -2799,6 +3094,7 @@ class TritonTBE(torch.autograd.Function):
             raise ValueError("Invalid fused bounds-check configuration")
         use_small_table_kernel = (
             enable_triton_tbe_optimizations
+            and active_forward_block_limit == 0
             and histogram_feature >= 0
             and not weighted
             and not vbe
@@ -2965,7 +3261,42 @@ class TritonTBE(torch.autograd.Function):
         B_offsets_ptr = vbe_B_offsets
 
         if weighted:
-            if is_amd():
+            if active_forward_block_limit > 0:
+                if is_amd():
+                    raise RuntimeError("forward block limits are not supported on AMD")
+                if len(weight_ptrs) != 1:
+                    raise RuntimeError(
+                        "capped Triton UVM requires one contiguous weight tensor"
+                    )
+                bags_per_program = max(
+                    1, triton.cdiv(total_B, active_forward_block_limit)
+                )
+                table_batched_embedding_bag_forward_weighted_capped_kernel[
+                    (triton.cdiv(total_B, bags_per_program),)
+                ](
+                    output,
+                    indices,
+                    offsets,
+                    weight_ptrs[0],
+                    table_offsets,
+                    embedding_dims,
+                    embedding_offsets,
+                    feature_table_map,
+                    per_sample_weights,
+                    row_output_offsets_ptr,
+                    b_t_map_ptr,
+                    total_embedding_dim,
+                    B,
+                    total_B,
+                    BLOCK_SIZE=block_size,
+                    BAGS_PER_PROGRAM=bags_per_program,
+                    vbe=vbe,
+                    info_B_num_bits=info_B_num_bits,
+                    info_B_mask=info_B_mask,
+                    ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
+                    num_warps=num_warps,
+                )
+            elif is_amd():
                 _amd_fwd_weighted_kernel[(total_B,)](
                     output,
                     indices,
@@ -3099,7 +3430,86 @@ class TritonTBE(torch.autograd.Function):
                 )
                 optimized_histogram_features.append(plan.feature)
 
-            if is_amd():
+            if active_forward_block_limit > 0:
+                if is_amd():
+                    raise RuntimeError("forward block limits are not supported on AMD")
+                if len(weight_ptrs) != 1:
+                    raise RuntimeError(
+                        "capped Triton UVM requires one contiguous weight tensor"
+                    )
+                bags_per_program = max(1, triton.cdiv(B, active_forward_block_limit))
+                if vbe or fused_bounds_check:
+                    table_batched_embedding_bag_forward_unweighted_capped_kernel[
+                        (triton.cdiv(B, bags_per_program),)
+                    ](
+                        output,
+                        indices,
+                        offsets,
+                        weight_ptrs[0],
+                        table_offsets,
+                        embedding_dims,
+                        embedding_offsets,
+                        feature_table_map,
+                        rows_cumsum,
+                        bounds_check_warning_ptr,
+                        row_output_offsets_ptr,
+                        B_offsets_ptr,
+                        total_embedding_dim,
+                        B,
+                        T,
+                        BLOCK_SIZE=block_size,
+                        BAGS_PER_PROGRAM=bags_per_program,
+                        vbe=vbe,
+                        FUSED_BOUNDS_CHECK=fused_bounds_check,
+                        ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
+                        num_warps=num_warps,
+                    )
+                else:
+                    feature_dims = (
+                        cached_feature_dims_cpu.tolist()
+                        if cached_feature_dims_cpu is not None
+                        else embedding_dims.cpu().tolist()
+                    )
+                    feature_start = 0
+                    while feature_start < T:
+                        feature_block_size = triton.next_power_of_2(
+                            int(feature_dims[feature_start])
+                        )
+                        feature_end = feature_start + 1
+                        while (
+                            feature_end < T
+                            and triton.next_power_of_2(int(feature_dims[feature_end]))
+                            == feature_block_size
+                        ):
+                            feature_end += 1
+                        parallel_bags = min(16, max(1, 512 // feature_block_size))
+                        parallel_bags_per_program = (
+                            triton.cdiv(bags_per_program, parallel_bags) * parallel_bags
+                        )
+                        table_batched_embedding_bag_forward_unweighted_parallel_bags_kernel[
+                            (triton.cdiv(B, parallel_bags_per_program),)
+                        ](
+                            output,
+                            indices,
+                            offsets,
+                            weight_ptrs[0],
+                            table_offsets,
+                            embedding_dims,
+                            embedding_offsets,
+                            feature_table_map,
+                            total_embedding_dim,
+                            B,
+                            T,
+                            BLOCK_SIZE=feature_block_size,
+                            FEATURE_START=feature_start,
+                            FEATURE_END=feature_end,
+                            BAGS_PER_PROGRAM=parallel_bags_per_program,
+                            PARALLEL_BAGS=parallel_bags,
+                            ENABLE_TRITON_TBE_OPTIMIZATIONS=enable_triton_tbe_optimizations,
+                            num_warps=16,
+                        )
+                        feature_start = feature_end
+            elif is_amd():
                 _amd_fwd_unweighted_kernel[(B,)](
                     output,
                     indices,
@@ -4102,6 +4512,8 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
         self.embedding_specs = embedding_specs
         self._is_triton_tbe = True
         self.enable_triton_tbe_optimizations = enable_triton_tbe_optimizations
+        self.forward_block_limit = 0
+        self.vbe_forward_block_limit = 0
         # Initialize event as None; it will be set after forward kernel runs
         self._forward_event = None
         T_ = len(embedding_specs)  # num of physical tables
@@ -4590,6 +5002,8 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             self._feature_weight_chunk_ids_tensor,
             self._feature_chunk_relative_table_offsets_tensor,
             self.enable_triton_tbe_optimizations,
+            self.forward_block_limit,
+            self.vbe_forward_block_limit,
         )
 
     def split_embedding_weights(self) -> List[torch.Tensor]:
@@ -4725,6 +5139,27 @@ class TritonUVMTableBatchedEmbeddingBags(TritonTableBatchedEmbeddingBags):
                 per_sample_weights,
                 batch_size_per_feature_per_rank,
             )
+
+
+class TritonUVMCappedTableBatchedEmbeddingBags(TritonUVMTableBatchedEmbeddingBags):
+    """Forward-only Triton UVM TBE with bounded forward launches."""
+
+    def __init__(
+        self,
+        *args: Any,
+        forward_block_limit: int = 0,
+        vbe_forward_block_limit: int = 0,
+        **kwargs: Any,
+    ) -> None:
+        if forward_block_limit < 0:
+            raise ValueError("forward_block_limit must be non-negative")
+        if vbe_forward_block_limit < 0:
+            raise ValueError("vbe_forward_block_limit must be non-negative")
+        if forward_block_limit == 0 and vbe_forward_block_limit == 0:
+            raise ValueError("capped UVM TBE requires a positive forward block limit")
+        super().__init__(*args, **kwargs)
+        self.forward_block_limit = forward_block_limit
+        self.vbe_forward_block_limit = vbe_forward_block_limit
 
 
 class ChunkedTritonTableBatchedEmbeddingBags(TritonTableBatchedEmbeddingBags):

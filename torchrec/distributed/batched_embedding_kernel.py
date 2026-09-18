@@ -4006,6 +4006,7 @@ class TritonBatchedFusedEmbeddingBag(
         # This is necessary for forward compatibility with prod backends
         from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
             TritonTableBatchedEmbeddingBags,
+            TritonUVMCappedTableBatchedEmbeddingBags,
             TritonUVMTableBatchedEmbeddingBags,
         )
 
@@ -4033,12 +4034,25 @@ class TritonBatchedFusedEmbeddingBag(
         enable_triton_tbe_optimizations: bool = fused_params.get(
             "enable_triton_tbe_optimizations", False
         )
+        forward_block_limit: int = fused_params.get("forward_block_limit", 0)
+        vbe_forward_block_limit: int = fused_params.get("vbe_forward_block_limit", 0)
         uses_uvm = config.compute_kernel == EmbeddingComputeKernel.TRITON_UVM
-        triton_tbe_class = (
-            TritonUVMTableBatchedEmbeddingBags
-            if uses_uvm
-            else TritonTableBatchedEmbeddingBags
+        capped_uvm = uses_uvm and (
+            forward_block_limit != 0 or vbe_forward_block_limit != 0
         )
+        if capped_uvm:
+            triton_tbe_class = TritonUVMCappedTableBatchedEmbeddingBags
+            triton_tbe_kwargs: Dict[str, Any] = {
+                "forward_block_limit": forward_block_limit,
+                "vbe_forward_block_limit": vbe_forward_block_limit,
+            }
+        else:
+            triton_tbe_class = (
+                TritonUVMTableBatchedEmbeddingBags
+                if uses_uvm
+                else TritonTableBatchedEmbeddingBags
+            )
+            triton_tbe_kwargs = {}
 
         # Create Triton TBE module with feature_table_map for correct batch size handling
         self._emb_module: TritonTableBatchedEmbeddingBags = triton_tbe_class(
@@ -4054,6 +4068,7 @@ class TritonBatchedFusedEmbeddingBag(
             bag_size_hints=bag_size_hints,
             fused_bounds_check=fused_bounds_check,
             enable_triton_tbe_optimizations=enable_triton_tbe_optimizations,
+            **triton_tbe_kwargs,
         )
         if "bounds_check_mode" in fused_params:
             bounds_check_mode = fused_params["bounds_check_mode"]

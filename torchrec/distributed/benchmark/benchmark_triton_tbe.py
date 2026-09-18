@@ -25,6 +25,8 @@ Run the matching FBGEMM baseline by replacing ``triton_tbe_forward`` with
 
 Run the managed-memory comparison with ``triton_uvm_tbe_forward`` and
 ``fbgemm_uvm_tbe_forward``.
+
+Run bounded managed-memory launches with ``triton_uvm_capped_tbe_forward``.
 """
 
 import logging
@@ -58,6 +60,7 @@ from torchrec.distributed.benchmark.base import (
 )
 from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
     TritonTableBatchedEmbeddingBags,
+    TritonUVMCappedTableBatchedEmbeddingBags,
     TritonUVMTableBatchedEmbeddingBags,
 )
 
@@ -107,17 +110,25 @@ class TraceTBEForwardConfig(BenchFuncConfig):
     shape_index: int = 0
     all_shapes: bool = False
     seed: int = 42
+    forward_block_limit: int = 0
+    vbe_forward_block_limit: int = 0
 
 
 @dataclass(frozen=True)
 class TritonTBEKernelSpec:
     module_class: type[TritonTableBatchedEmbeddingBags]
     uses_managed_memory: bool
+    supports_block_limits: bool = False
 
 
 _TRITON_TBE_KERNELS: dict[str, TritonTBEKernelSpec] = {
     "triton": TritonTBEKernelSpec(TritonTableBatchedEmbeddingBags, False),
     "triton_uvm": TritonTBEKernelSpec(TritonUVMTableBatchedEmbeddingBags, True),
+    "triton_uvm_capped": TritonTBEKernelSpec(
+        TritonUVMCappedTableBatchedEmbeddingBags,
+        True,
+        supports_block_limits=True,
+    ),
 }
 
 
@@ -315,6 +326,8 @@ def _make_triton_tbe(
     device: torch.device,
     *,
     kernel_name: str,
+    forward_block_limit: int = 0,
+    vbe_forward_block_limit: int = 0,
 ) -> TritonTableBatchedEmbeddingBags:
     if kernel_name not in _TRITON_TBE_KERNELS:
         raise ValueError(
@@ -322,6 +335,12 @@ def _make_triton_tbe(
             f"got {kernel_name}"
         )
     kernel = _TRITON_TBE_KERNELS[kernel_name]
+    module_kwargs: dict[str, Any] = {}
+    if kernel.supports_block_limits:
+        module_kwargs = {
+            "forward_block_limit": forward_block_limit,
+            "vbe_forward_block_limit": vbe_forward_block_limit,
+        }
     module = kernel.module_class(
         embedding_specs=list(zip(workload.table_rows, workload.embedding_dims)),
         feature_table_map=list(range(len(workload.table_rows))),
@@ -333,6 +352,7 @@ def _make_triton_tbe(
         optimizer=OptimType.EXACT_ROWWISE_ADAGRAD,
         device=device,
         fused_bounds_check=False,
+        **module_kwargs,
     )
     with torch.no_grad():
         weight = (
@@ -402,6 +422,8 @@ def _run_backend(
             workload,
             device,
             kernel_name=kernel_name,
+            forward_block_limit=config.forward_block_limit,
+            vbe_forward_block_limit=config.vbe_forward_block_limit,
         )
     elif kernel_name in {"fbgemm", "fbgemm_uvm"}:
         module = _make_fbgemm_tbe(
@@ -523,6 +545,19 @@ class TritonUVMTBEForwardConfig(TraceTBEForwardConfig):
 @register_benchmark(TritonUVMTBEForwardConfig)
 def triton_uvm_tbe_forward(config: TraceTBEForwardConfig) -> None:
     _run_trace_workload(config, "triton_uvm")
+
+
+@dataclass
+class TritonUVMCappedTBEForwardConfig(TraceTBEForwardConfig):
+    """Benchmark Triton UVM TBE with bounded forward launches."""
+
+    forward_block_limit: int = 48
+    vbe_forward_block_limit: int = 48
+
+
+@register_benchmark(TritonUVMCappedTBEForwardConfig)
+def triton_uvm_capped_tbe_forward(config: TraceTBEForwardConfig) -> None:
+    _run_trace_workload(config, "triton_uvm_capped")
 
 
 @dataclass

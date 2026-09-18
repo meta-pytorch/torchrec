@@ -1426,7 +1426,7 @@ def compute_storage_usage(
             "mtia": ParameterStorage.DDR,
         }
     elif storage_usage_type == StorageUsageType.BASE:
-        if compute_kernel in {"fused_uvm", "fused_uvm_caching"}:
+        if compute_kernel in {"fused_uvm", "fused_uvm_caching", "triton_uvm"}:
             return {ParameterStorage.DDR.value: tensor_bytes}
         storage_map = {
             "cuda": ParameterStorage.HBM,

@@ -215,6 +215,43 @@ def _get_table_names_by_groups(
 
 
 class TestGroupTablesPerRank(unittest.TestCase):
+    def test_triton_uvm_only_fused_params_are_removed_from_other_groups(self) -> None:
+        fused_params = {
+            "learning_rate": 0.1,
+            "forward_block_limit": 48,
+            "vbe_forward_block_limit": 24,
+        }
+        tables = [
+            ShardedEmbeddingTable(
+                name=f"table_{kernel.value}",
+                feature_names=[f"feature_{kernel.value}"],
+                embedding_names=[f"feature_{kernel.value}"],
+                data_type=DataType.FP16,
+                pooling=PoolingType.SUM,
+                fused_params=fused_params,
+                compute_kernel=kernel,
+                embedding_dim=64,
+                local_cols=64,
+                num_embeddings=64,
+            )
+            for kernel in (
+                EmbeddingComputeKernel.FUSED,
+                EmbeddingComputeKernel.FUSED_TRITON,
+                EmbeddingComputeKernel.TRITON_UVM,
+            )
+        ]
+
+        groups = {group.compute_kernel: group for group in group_tables([tables])[0]}
+        fbgemm_params = groups[EmbeddingComputeKernel.FUSED].fused_params or {}
+        triton_hbm_params = (
+            groups[EmbeddingComputeKernel.FUSED_TRITON].fused_params or {}
+        )
+        triton_uvm_params = groups[EmbeddingComputeKernel.TRITON_UVM].fused_params or {}
+
+        self.assertEqual(fbgemm_params, {"learning_rate": 0.1})
+        self.assertEqual(triton_hbm_params, {"learning_rate": 0.1})
+        self.assertEqual(triton_uvm_params, fused_params)
+
     def test_triton_bag_size_hints_follow_grouped_feature_order(self) -> None:
         tables = [
             ShardedEmbeddingTable(
