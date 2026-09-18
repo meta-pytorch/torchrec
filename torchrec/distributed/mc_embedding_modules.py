@@ -408,6 +408,7 @@ class BaseManagedCollisionEmbeddingCollectionSharder(BaseEmbeddingSharder[M]):
             and self._e_sharder.supports_fused_triton
         ):
             kernels.append(EmbeddingComputeKernel.FUSED_TRITON.value)
+            kernels.append(EmbeddingComputeKernel.TRITON_UVM.value)
         return kernels
 
     def sharding_types(self, compute_device_type: str) -> List[str]:

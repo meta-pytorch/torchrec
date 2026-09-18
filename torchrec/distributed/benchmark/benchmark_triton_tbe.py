@@ -22,6 +22,9 @@ Example:
 
 Run the matching FBGEMM baseline by replacing ``triton_tbe_forward`` with
 ``fbgemm_tbe_forward``.
+
+Run the managed-memory comparison with ``triton_uvm_tbe_forward`` and
+``fbgemm_uvm_tbe_forward``.
 """
 
 import logging
@@ -55,6 +58,7 @@ from torchrec.distributed.benchmark.base import (
 )
 from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
     TritonTableBatchedEmbeddingBags,
+    TritonUVMTableBatchedEmbeddingBags,
 )
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -103,6 +107,18 @@ class TraceTBEForwardConfig(BenchFuncConfig):
     shape_index: int = 0
     all_shapes: bool = False
     seed: int = 42
+
+
+@dataclass(frozen=True)
+class TritonTBEKernelSpec:
+    module_class: type[TritonTableBatchedEmbeddingBags]
+    uses_managed_memory: bool
+
+
+_TRITON_TBE_KERNELS: dict[str, TritonTBEKernelSpec] = {
+    "triton": TritonTBEKernelSpec(TritonTableBatchedEmbeddingBags, False),
+    "triton_uvm": TritonTBEKernelSpec(TritonUVMTableBatchedEmbeddingBags, True),
+}
 
 
 _TRACE_WORKLOADS: dict[str, TraceWorkload] = {
@@ -297,8 +313,16 @@ def _make_request(
 def _make_triton_tbe(
     workload: TraceWorkload,
     device: torch.device,
+    *,
+    kernel_name: str,
 ) -> TritonTableBatchedEmbeddingBags:
-    module = TritonTableBatchedEmbeddingBags(
+    if kernel_name not in _TRITON_TBE_KERNELS:
+        raise ValueError(
+            f"Triton TBE kernel must be one of {sorted(_TRITON_TBE_KERNELS)}, "
+            f"got {kernel_name}"
+        )
+    kernel = _TRITON_TBE_KERNELS[kernel_name]
+    module = kernel.module_class(
         embedding_specs=list(zip(workload.table_rows, workload.embedding_dims)),
         feature_table_map=list(range(len(workload.table_rows))),
         weights_precision=torch.float16,
@@ -311,20 +335,27 @@ def _make_triton_tbe(
         fused_bounds_check=False,
     )
     with torch.no_grad():
-        module.weight.uniform_(-0.01, 0.01)
+        weight = (
+            torch.ops.fbgemm.uvm_to_cpu(module.weight)
+            if kernel.uses_managed_memory
+            else module.weight
+        )
+        weight.uniform_(-0.01, 0.01)
     return module
 
 
 def _make_fbgemm_tbe(
     workload: TraceWorkload,
     device: torch.device,
+    *,
+    uvm: bool = False,
 ) -> SplitTableBatchedEmbeddingBagsCodegen:
     module = SplitTableBatchedEmbeddingBagsCodegen(
         [
             (
                 rows,
                 dim,
-                EmbeddingLocation.DEVICE,
+                EmbeddingLocation.MANAGED if uvm else EmbeddingLocation.DEVICE,
                 ComputeDevice.CUDA,
             )
             for rows, dim in zip(workload.table_rows, workload.embedding_dims)
@@ -356,7 +387,7 @@ def _run_forward(
 
 
 def _run_backend(
-    backend: str,
+    kernel_name: str,
     workload_name: str,
     workload: TraceWorkload,
     shape_index: int,
@@ -366,10 +397,20 @@ def _run_backend(
     device: torch.device,
 ) -> None:
     module: torch.nn.Module
-    if backend == "triton":
-        module = _make_triton_tbe(workload, device)
+    if kernel_name in _TRITON_TBE_KERNELS:
+        module = _make_triton_tbe(
+            workload,
+            device,
+            kernel_name=kernel_name,
+        )
+    elif kernel_name in {"fbgemm", "fbgemm_uvm"}:
+        module = _make_fbgemm_tbe(
+            workload,
+            device,
+            uvm=kernel_name == "fbgemm_uvm",
+        )
     else:
-        module = _make_fbgemm_tbe(workload, device)
+        raise ValueError(f"Unsupported TBE kernel: {kernel_name}")
 
     _run_forward([], module, request)
     torch.cuda.synchronize(device)
@@ -382,14 +423,17 @@ def _run_backend(
         benchmark_func_kwargs={"module": module, "request": request},
         sample_count=shape.num_indices,
         **config.benchmark_func_kwargs(
-            name=f"{backend}_tbe_forward_{workload_name}_shape_{shape_index}{suffix}",
+            name=f"{kernel_name}_tbe_forward_{workload_name}_shape_{shape_index}{suffix}",
             rank=0,
         ),
     )
     print(result)
 
 
-def _run_trace_workload(config: TraceTBEForwardConfig, backend: str) -> None:
+def _run_trace_workload(
+    config: TraceTBEForwardConfig,
+    kernel_name: str,
+) -> None:
     config.maybe_enable_expandable_segments()
     if not torch.cuda.is_available():
         raise RuntimeError("benchmark_triton_tbe requires a CUDA device")
@@ -428,7 +472,7 @@ def _run_trace_workload(config: TraceTBEForwardConfig, backend: str) -> None:
         )
         torch.manual_seed(config.seed)
         _run_backend(
-            backend,
+            kernel_name,
             config.workload,
             workload,
             shape_index,
@@ -469,6 +513,26 @@ class FbgemmTBEForwardConfig(TraceTBEForwardConfig):
 @register_benchmark(FbgemmTBEForwardConfig)
 def fbgemm_tbe_forward(config: TraceTBEForwardConfig) -> None:
     _run_trace_workload(config, "fbgemm")
+
+
+@dataclass
+class TritonUVMTBEForwardConfig(TraceTBEForwardConfig):
+    """Benchmark Triton TBE with managed-memory weights."""
+
+
+@register_benchmark(TritonUVMTBEForwardConfig)
+def triton_uvm_tbe_forward(config: TraceTBEForwardConfig) -> None:
+    _run_trace_workload(config, "triton_uvm")
+
+
+@dataclass
+class FbgemmUVMTBEForwardConfig(TraceTBEForwardConfig):
+    """Benchmark FBGEMM TBE with managed-memory weights."""
+
+
+@register_benchmark(FbgemmUVMTBEForwardConfig)
+def fbgemm_uvm_tbe_forward(config: TraceTBEForwardConfig) -> None:
+    _run_trace_workload(config, "fbgemm_uvm")
 
 
 if __name__ == "__main__":

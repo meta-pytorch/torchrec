@@ -1044,7 +1044,7 @@ class TestEnumerators(unittest.TestCase):
             },
         )
 
-    def test_fused_triton_compute_kernel_requires_constraint(self) -> None:
+    def test_guarded_compute_kernel_requires_constraint(self) -> None:
         sharder = EmbeddingBagCollectionSharder()
         sharding_type = ShardingType.ROW_WISE.value
         sharder_kernels = sharder.compute_kernels(sharding_type, "cuda")
@@ -1053,28 +1053,30 @@ class TestEnumerators(unittest.TestCase):
             topology=MagicMock(),
             batch_size=MagicMock(),
         )
-        self.assertNotIn(
+        unconstrained_kernels = unconstrained._filter_compute_kernels(
+            "table_0", sharder_kernels, sharding_type
+        )
+        for guarded_kernel in (
             EmbeddingComputeKernel.FUSED_TRITON.value,
-            unconstrained._filter_compute_kernels(
-                "table_0", sharder_kernels, sharding_type
-            ),
-        )
-
-        constrained = EmbeddingEnumerator(
-            topology=MagicMock(),
-            batch_size=MagicMock(),
-            constraints={
-                "table_0": ParameterConstraints(
-                    compute_kernels=[EmbeddingComputeKernel.FUSED_TRITON.value]
+            EmbeddingComputeKernel.TRITON_UVM.value,
+        ):
+            with self.subTest(guarded_kernel=guarded_kernel):
+                self.assertNotIn(guarded_kernel, unconstrained_kernels)
+                constrained = EmbeddingEnumerator(
+                    topology=MagicMock(),
+                    batch_size=MagicMock(),
+                    constraints={
+                        "table_0": ParameterConstraints(
+                            compute_kernels=[guarded_kernel]
+                        )
+                    },
                 )
-            },
-        )
-        self.assertEqual(
-            constrained._filter_compute_kernels(
-                "table_0", sharder_kernels, sharding_type
-            ),
-            [EmbeddingComputeKernel.FUSED_TRITON.value],
-        )
+                self.assertEqual(
+                    constrained._filter_compute_kernels(
+                        "table_0", sharder_kernels, sharding_type
+                    ),
+                    [guarded_kernel],
+                )
 
         fallback_constraints = {
             "table_0": ParameterConstraints(

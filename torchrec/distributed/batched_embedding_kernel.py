@@ -90,6 +90,7 @@ from torchrec.distributed.embedding_kernel import (
 from torchrec.distributed.embedding_types import (
     compute_kernel_to_embedding_location,
     DTensorMetadata,
+    EmbeddingComputeKernel,
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
 )
@@ -4005,6 +4006,7 @@ class TritonBatchedFusedEmbeddingBag(
         # This is necessary for forward compatibility with prod backends
         from torchrec.distributed.triton_tbe.triton_table_batched_embeddings import (
             TritonTableBatchedEmbeddingBags,
+            TritonUVMTableBatchedEmbeddingBags,
         )
 
         # Only support CUDA for Triton TBE
@@ -4031,23 +4033,27 @@ class TritonBatchedFusedEmbeddingBag(
         enable_triton_tbe_optimizations: bool = fused_params.get(
             "enable_triton_tbe_optimizations", False
         )
+        uses_uvm = config.compute_kernel == EmbeddingComputeKernel.TRITON_UVM
+        triton_tbe_class = (
+            TritonUVMTableBatchedEmbeddingBags
+            if uses_uvm
+            else TritonTableBatchedEmbeddingBags
+        )
 
         # Create Triton TBE module with feature_table_map for correct batch size handling
-        self._emb_module: TritonTableBatchedEmbeddingBags = (
-            TritonTableBatchedEmbeddingBags(
-                embedding_specs=list(zip(self._local_rows, self._local_cols)),
-                feature_table_map=self._feature_table_map,
-                weights_precision=weights_precision.as_dtype(),
-                output_dtype=output_dtype,
-                stochastic_rounding=stochastic_rounding,
-                learning_rate=learning_rate,
-                eps=eps,
-                optimizer=optimizer,
-                device=device,
-                bag_size_hints=bag_size_hints,
-                fused_bounds_check=fused_bounds_check,
-                enable_triton_tbe_optimizations=enable_triton_tbe_optimizations,
-            )
+        self._emb_module: TritonTableBatchedEmbeddingBags = triton_tbe_class(
+            embedding_specs=list(zip(self._local_rows, self._local_cols)),
+            feature_table_map=self._feature_table_map,
+            weights_precision=weights_precision.as_dtype(),
+            output_dtype=output_dtype,
+            stochastic_rounding=stochastic_rounding,
+            learning_rate=learning_rate,
+            eps=eps,
+            optimizer=optimizer,
+            device=device,
+            bag_size_hints=bag_size_hints,
+            fused_bounds_check=fused_bounds_check,
+            enable_triton_tbe_optimizations=enable_triton_tbe_optimizations,
         )
         if "bounds_check_mode" in fused_params:
             bounds_check_mode = fused_params["bounds_check_mode"]

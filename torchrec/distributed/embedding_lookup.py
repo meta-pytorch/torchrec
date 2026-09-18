@@ -731,9 +731,13 @@ class GroupedPooledEmbeddingsLookup(
                     sharding_type=sharding_type,
                     env=env,
                 )
-        elif config.compute_kernel == EmbeddingComputeKernel.FUSED_TRITON:
+        elif config.compute_kernel in {
+            EmbeddingComputeKernel.FUSED_TRITON,
+            EmbeddingComputeKernel.TRITON_UVM,
+        }:
             if (
-                env
+                config.compute_kernel == EmbeddingComputeKernel.FUSED_TRITON
+                and env
                 and isinstance(env, ShardingEnv2D)
                 and env.sharding_strategy == ShardingStrategy.FULLY_SHARDED
             ):

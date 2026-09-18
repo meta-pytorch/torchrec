@@ -4694,6 +4694,39 @@ class TritonTableBatchedEmbeddingBags(torch.nn.Module):
             target_stream.wait_event(self._forward_event)
 
 
+class TritonUVMTableBatchedEmbeddingBags(TritonTableBatchedEmbeddingBags):
+    """Forward-only Triton TBE with weights allocated in CUDA managed memory."""
+
+    def _allocate_weight(
+        self,
+        total_weight_size: int,
+        weights_precision: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if device.type != "cuda":
+            raise ValueError("Triton UVM TBE requires a CUDA device")
+        reference = torch.empty(0, dtype=weights_precision, device=device)
+        return torch.ops.fbgemm.new_managed_tensor(
+            reference,
+            [total_weight_size],
+        )
+
+    def forward(
+        self,
+        indices: torch.Tensor,
+        offsets: torch.Tensor,
+        per_sample_weights: Optional[torch.Tensor] = None,
+        batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
+    ) -> torch.Tensor:
+        with torch.no_grad():
+            return super().forward(
+                indices,
+                offsets,
+                per_sample_weights,
+                batch_size_per_feature_per_rank,
+            )
+
+
 class ChunkedTritonTableBatchedEmbeddingBags(TritonTableBatchedEmbeddingBags):
     """Triton TBE variant operating on caller-owned flattened weight chunks."""
 
