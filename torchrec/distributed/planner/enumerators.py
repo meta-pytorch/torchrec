@@ -63,6 +63,7 @@ logger: logging.Logger = logging.getLogger(__name__)
 # compute kernels that should only be used if users specified them
 GUARDED_COMPUTE_KERNELS: Set[EmbeddingComputeKernel] = {
     EmbeddingComputeKernel.FUSED_TRITON,
+    EmbeddingComputeKernel.TRITON_UVM,
     EmbeddingComputeKernel.KEY_VALUE,
     EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,
     EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,
@@ -502,6 +503,12 @@ class EmbeddingEnumerator(Enumerator):
                 k
                 for k in filtered_compute_kernels
                 if k != EmbeddingComputeKernel.FUSED.value
+            ]
+        if EmbeddingComputeKernel.TRITON_UVM.value in filtered_compute_kernels:
+            filtered_compute_kernels = [
+                k
+                for k in filtered_compute_kernels
+                if k != EmbeddingComputeKernel.FUSED_UVM.value
             ]
 
         # Remove KEY_VALUE if no device has SSD capacity — avoids expanding

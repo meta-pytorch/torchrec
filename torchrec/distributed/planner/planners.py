@@ -210,7 +210,10 @@ def to_sharding_plan(
                     for input_length in sharding_option.input_lengths
                 ]
                 if sharding_option.compute_kernel
-                == EmbeddingComputeKernel.FUSED_TRITON.value
+                in {
+                    EmbeddingComputeKernel.FUSED_TRITON.value,
+                    EmbeddingComputeKernel.TRITON_UVM.value,
+                }
                 else None
             ),
         )

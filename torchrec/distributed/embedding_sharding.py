@@ -672,7 +672,10 @@ def group_tables(
             if cache_load_factor is not None:
                 per_tbe_fused_params[CACHE_LOAD_FACTOR_STR] = cache_load_factor
 
-            if compute_kernel_type == EmbeddingComputeKernel.FUSED_TRITON:
+            if compute_kernel_type in {
+                EmbeddingComputeKernel.FUSED_TRITON,
+                EmbeddingComputeKernel.TRITON_UVM,
+            }:
                 grouped_bag_size_hints = _get_grouped_bag_size_hints(grouped_tables)
                 if grouped_bag_size_hints is not None:
                     per_tbe_fused_params["bag_size_hints"] = grouped_bag_size_hints
