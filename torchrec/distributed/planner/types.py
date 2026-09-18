@@ -1296,6 +1296,12 @@ class Shard:
         return f"Shard size: {tuple(self.size)}, offset: {tuple(self.offset)}, storage: {str(self.storage)}, perf: {str(self.perf)}, rank: {self.rank}"
 
 
+# (module_fqn, table_name). Identifies a table globally: leaf table names are only
+# unique within a module, so the same name can appear in several modules of a
+# multi-tower model.
+TableIdentity = Tuple[str, str]
+
+
 class ShardingOption:
     """
     One way of sharding an embedding table. In the enumerator, we generate
@@ -1433,6 +1439,17 @@ class ShardingOption:
     @property
     def fqn(self) -> str:
         return self.module[0] + "." + self.name
+
+    @property
+    def table_identity(self) -> TableIdentity:
+        """This table's global identity, ``(module_fqn, table_name)``.
+
+        ``name`` alone is only unique within a module, so a multi-tower model can
+        carry the same leaf table name in several modules. Keying on ``name`` there
+        merges distinct tables; use this instead wherever tables are grouped or
+        counted.
+        """
+        return (self.module[0], self.name)
 
     @property
     def cache_load_factor(self) -> Optional[float]:
