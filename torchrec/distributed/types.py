@@ -817,7 +817,7 @@ class ParameterSharding:
         output_dtype (Optional[DataType]): output dtype.
         key_value_params (Optional[KeyValueParams]): key value params for SSD TBE or PS.
         bag_size_hints (Optional[List[int]]): expected bag size for each feature,
-            used only by FUSED_TRITON.
+            used only by FUSED_TRITON and TRITON_UVM.
 
     NOTE:
       ShardingType.TABLE_WISE - rank where this embedding is placed

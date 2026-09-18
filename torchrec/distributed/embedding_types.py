@@ -106,6 +106,7 @@ class EmbeddingComputeKernel(Enum):
         "dram_ssd_virtual_table"  # dram + ssd composite kv backend for virtual table
     )
     FUSED_TRITON = "fused_triton"
+    TRITON_UVM = "triton_uvm"
     UNFUSED_TPU = "unfused_tpu"
 
 
@@ -120,12 +121,14 @@ def compute_kernel_to_embedding_location(
         EmbeddingComputeKernel.SSD_VIRTUAL_TABLE,  # use hbm for cache
         EmbeddingComputeKernel.DRAM_VIRTUAL_TABLE,  # use hbm for cache
         EmbeddingComputeKernel.DRAM_SSD_VIRTUAL_TABLE,  # use hbm for cache
+        EmbeddingComputeKernel.FUSED_TRITON,
         EmbeddingComputeKernel.UNFUSED_TPU,
     ]:
         return EmbeddingLocation.DEVICE
     elif compute_kernel in [
         EmbeddingComputeKernel.FUSED_UVM,
         EmbeddingComputeKernel.QUANT_UVM,
+        EmbeddingComputeKernel.TRITON_UVM,
     ]:
         return EmbeddingLocation.MANAGED
     elif compute_kernel in [
@@ -591,6 +594,7 @@ class BaseEmbeddingSharder(ModuleSharder[M]):
                 ]
                 if self.supports_fused_triton:
                     ret.append(EmbeddingComputeKernel.FUSED_TRITON.value)
+                    ret.append(EmbeddingComputeKernel.TRITON_UVM.value)
             if compute_device_type in {"tpu"}:
                 ret += [EmbeddingComputeKernel.UNFUSED_TPU.value]
         else:
