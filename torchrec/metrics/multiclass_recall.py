@@ -160,8 +160,14 @@ class MulticlassRecallMetric(RecMetric):
     _namespace: MetricNamespace = MetricNamespace.MULTICLASS_RECALL
     _computation_class: Type[RecMetricComputation] = MulticlassRecallMetricComputation
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args: Any, number_of_classes: int, **kwargs: Any) -> None:
+        # Named here so callers and the type checker see it, then forwarded
+        # because the computation reads it out of kwargs.
+        super().__init__(
+            *args,
+            number_of_classes=number_of_classes,
+            **kwargs,
+        )
         if self._compute_mode == RecComputeMode.FUSED_TASKS_AND_STATES_COMPUTATION:
             logging.warning(
                 f"compute_mode FUSED_TASKS_AND_STATES_COMPUTATION can't support {self._namespace} yet "
