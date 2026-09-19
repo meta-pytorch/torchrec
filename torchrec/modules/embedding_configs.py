@@ -288,6 +288,9 @@ class TimestampBasedEvictionPolicy(VirtualTableEvictionPolicy):
     training_id_eviction_trigger_count: int = (
         0  # max number of training ids per rank to trigger eviction
     )
+    training_id_keep_count: int = (
+        0  # minimum number of training ids per rank to retain after eviction; 0 means no floor
+    )
     eviction_ttl_mins: int = 24 * 60  # 1 day. 0 means no eviction
     inference_eviction_ttl_mins: Optional[int] = None  # 0 means no eviction
     max_inference_id_num_per_rank: int = (
